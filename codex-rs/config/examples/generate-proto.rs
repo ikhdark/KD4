@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(proto_dir_arg) = std::env::args().nth(1) else {
+    let Some(proto_dir_arg) = std::env::args_os().nth(1) else {
         eprintln!("Usage: generate-proto <proto-dir>");
         std::process::exit(1);
     };

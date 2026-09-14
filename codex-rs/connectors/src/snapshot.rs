@@ -38,7 +38,8 @@ impl PluginConnectorSource {
         let mut seen_connector_ids = HashSet::new();
         let connector_ids = connector_ids
             .into_iter()
-            .filter(|connector_id| !connector_id.0.trim().is_empty())
+            .map(|connector_id| AppConnectorId(connector_id.0.trim().to_string()))
+            .filter(|connector_id| !connector_id.0.is_empty())
             .filter(|connector_id| seen_connector_ids.insert(connector_id.clone()))
             .collect();
         Self {

@@ -118,6 +118,7 @@ class SourceMapCheckTest(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 check=True,
+                timeout=30,
             )
             generated = root / ".github" / "generated"
             generated.mkdir(parents=True)
@@ -136,7 +137,8 @@ class SourceMapCheckTest(unittest.TestCase):
 
             self.assertEqual(result, 1)
             self.assertIn(
-                "declared owner has no repository source: .github", errors.getvalue()
+                "top-level ownership entry is not backed by a tracked path: .github",
+                errors.getvalue(),
             )
 
     def test_check_accepts_complete_material_inventory(self) -> None:
@@ -379,6 +381,7 @@ class SourceMapCheckTest(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 check=True,
+                timeout=30,
             )
             (root / "AGENTS.md").write_text("# Policy\n", encoding="utf-8")
             (root / "local-untracked.txt").write_text("local\n", encoding="utf-8")
@@ -408,6 +411,7 @@ class SourceMapCheckTest(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 check=True,
+                timeout=30,
             )
 
             original_run = source_map_check.subprocess.run
@@ -428,7 +432,6 @@ class SourceMapCheckTest(unittest.TestCase):
                     "ls-files",
                     "-t",
                     "--cached",
-                    "--others",
                     "--exclude-standard",
                     "-z",
                 ],

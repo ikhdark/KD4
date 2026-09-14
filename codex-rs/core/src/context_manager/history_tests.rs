@@ -2762,6 +2762,10 @@ fn tool_history_mutation_advances_projection_revision_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::await_holding_lock,
+    reason = "Hold the contested owner to assert cancellation, admission, or cleanup behavior under contention"
+)]
 async fn tool_history_registration_does_not_wait_for_snapshot_cache_locks() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
     let session = Arc::new(session);

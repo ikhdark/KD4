@@ -67,32 +67,24 @@ impl TraceReducer {
 
         let model_visible_call_id = started.model_visible_call_id.clone();
         let requester = self.reduce_tool_call_requester(&thread_id, started.requester.clone())?;
-        let model_visible_call_item_ids = model_visible_call_id
-            .as_deref()
-            .map(|call_id| {
-                self.model_visible_tool_item_ids(
-                    &thread_id,
-                    call_id,
-                    &[
-                        ConversationItemKind::FunctionCall,
-                        ConversationItemKind::CustomToolCall,
-                    ],
-                )
-            })
-            .unwrap_or_default();
-        let model_visible_output_item_ids = model_visible_call_id
-            .as_deref()
-            .map(|call_id| {
-                self.model_visible_tool_item_ids(
-                    &thread_id,
-                    call_id,
-                    &[
-                        ConversationItemKind::FunctionCallOutput,
-                        ConversationItemKind::CustomToolCallOutput,
-                    ],
-                )
-            })
-            .unwrap_or_default();
+        let mut model_visible_call_item_ids = Vec::new();
+        let mut model_visible_output_item_ids = Vec::new();
+        if let Some(call_id) = model_visible_call_id.as_deref() {
+            for item in self.rollout.conversation_items.values().filter(|item| {
+                item.thread_id == thread_id && item.call_id.as_deref() == Some(call_id)
+            }) {
+                match item.kind {
+                    ConversationItemKind::FunctionCall | ConversationItemKind::CustomToolCall => {
+                        model_visible_call_item_ids.push(item.item_id.clone());
+                    }
+                    ConversationItemKind::FunctionCallOutput
+                    | ConversationItemKind::CustomToolCallOutput => {
+                        model_visible_output_item_ids.push(item.item_id.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         self.thread_mut(&thread_id)?;
 
@@ -119,11 +111,13 @@ impl TraceReducer {
             .invocation_payload
             .as_ref()
             .map(|payload| payload.raw_payload_id.clone());
-        self.link_wait_tool_call_from_request_payload(
-            &thread_id,
-            &tool_call_id,
-            started.invocation_payload.as_ref(),
-        )?;
+        if matches!(&started.kind, ToolCallKind::Other { name } if name == "wait") {
+            self.link_wait_tool_call_from_request_payload(
+                &thread_id,
+                &tool_call_id,
+                started.invocation_payload.as_ref(),
+            )?;
+        }
 
         self.rollout.tool_calls.insert(
             tool_call_id.clone(),
@@ -240,7 +234,7 @@ impl TraceReducer {
         tool_call_id: ToolCallId,
         runtime_payload: RawPayloadRef,
     ) -> Result<()> {
-        let (thread_id, _requester, kind, existing_terminal_operation_id) = {
+        let (thread_id, kind) = {
             let Some(tool_call) = self.rollout.tool_calls.get_mut(&tool_call_id) else {
                 bail!("tool runtime start referenced unknown call {tool_call_id}");
             };
@@ -248,18 +242,8 @@ impl TraceReducer {
                 &mut tool_call.raw_runtime_payload_ids,
                 &runtime_payload.raw_payload_id,
             );
-            (
-                tool_call.thread_id.clone(),
-                tool_call.requester.clone(),
-                tool_call.kind.clone(),
-                tool_call.terminal_operation_id.clone(),
-            )
+            (tool_call.thread_id.clone(), tool_call.kind.clone())
         };
-        if existing_terminal_operation_id.is_some()
-            && matches!(kind, ToolCallKind::ExecCommand | ToolCallKind::WriteStdin)
-        {
-            bail!("tool runtime start would create a second terminal operation for {tool_call_id}");
-        }
 
         // Protocol begin events carry runtime facts such as process ids and
         // cwd. These facts should create terminal rows, but they must not
@@ -441,24 +425,6 @@ impl TraceReducer {
         Ok(first)
     }
 
-    fn model_visible_tool_item_ids(
-        &self,
-        thread_id: &str,
-        call_id: &str,
-        kinds: &[ConversationItemKind],
-    ) -> Vec<String> {
-        self.rollout
-            .conversation_items
-            .values()
-            .filter(|item| {
-                item.thread_id == thread_id
-                    && item.call_id.as_deref() == Some(call_id)
-                    && kinds.contains(&item.kind)
-            })
-            .map(|item| item.item_id.clone())
-            .collect::<Vec<_>>()
-    }
-
     fn add_tool_call_item(&mut self, tool_call_id: &str, item_id: &str) -> Result<()> {
         let Some(tool_call) = self.rollout.tool_calls.get_mut(tool_call_id) else {
             bail!("tool call {tool_call_id} disappeared during conversation linking");
@@ -489,22 +455,19 @@ impl TraceReducer {
         let Some(tool_call) = self.rollout.tool_calls.get(tool_call_id) else {
             return;
         };
-        let call_item_ids = tool_call.model_visible_call_item_ids.clone();
-        if call_item_ids.is_empty() {
-            return;
-        }
-        for inference in self.rollout.inference_calls.values_mut() {
-            if inference
-                .response_item_ids
-                .iter()
-                .any(|item_id| call_item_ids.contains(item_id))
-                && !inference
-                    .tool_call_ids_started_by_response
-                    .contains(&tool_call_id.to_string())
-            {
-                inference
-                    .tool_call_ids_started_by_response
-                    .push(tool_call_id.to_string());
+        for item_id in &tool_call.model_visible_call_item_ids {
+            let Some(item) = self.rollout.conversation_items.get(item_id) else {
+                continue;
+            };
+            for producer in &item.produced_by {
+                if let ProducerRef::Inference { inference_call_id } = producer
+                    && let Some(inference) = self.rollout.inference_calls.get_mut(inference_call_id)
+                {
+                    push_unique(
+                        &mut inference.tool_call_ids_started_by_response,
+                        tool_call_id,
+                    );
+                }
             }
         }
     }

@@ -21,11 +21,11 @@
 //!
 //! ## Resize handling
 //!
-//! On terminal width change, `StreamCore::set_width` re-renders at the new
-//! width and rebuilds the queued stable region from the current emitted line
-//! count. This intentionally avoids byte-level remap complexity while the
-//! stream is active; finalized content is canonicalized by transcript
-//! consolidation into source-backed markdown cells.
+//! Width and render-mode changes reflow streams at known source boundaries,
+//! including a fully emitted snapshot or the start of a held table. Partially
+//! emitted streams retain their layout until source-backed transcript
+//! consolidation, since row
+//! counts cannot identify equivalent content in different layouts.
 //!
 //! ## Invariants
 //!
@@ -152,9 +152,6 @@ impl StreamCore {
     /// unambiguous; otherwise the user can briefly see malformed columns that
     /// immediately disappear on the next delta.
     fn push_delta(&mut self, delta: &str) -> bool {
-        if !delta.is_empty() {
-            self.state.has_seen_delta = true;
-        }
         self.state.collector.push_delta(delta);
 
         let mut enqueued = false;
@@ -196,7 +193,7 @@ impl StreamCore {
             && !self.render_dirty
             && self.rendered_source_len == self.raw_source.len()
         {
-            self.rendered_lines.clone()
+            std::mem::take(&mut self.rendered_lines)
         } else {
             #[cfg(test)]
             {
@@ -204,11 +201,7 @@ impl StreamCore {
             }
             self.render_source(&self.raw_source)
         };
-        if self.emitted_stable_len >= rendered.len() {
-            Vec::new()
-        } else {
-            rendered[self.emitted_stable_len..].to_vec()
-        }
+        rendered.into_iter().skip(self.emitted_stable_len).collect()
     }
 
     /// Step animation: dequeue one line, update the emitted count.
@@ -284,46 +277,58 @@ impl StreamCore {
         }
     }
 
-    /// Update rendering width and rebuild queued stable lines for the new layout.
-    ///
-    /// Re-renders once at the new width and rebuilds queue state from the
-    /// current emitted line count.
-    ///
-    /// Resize is the point where source-backed rendering matters most:
-    /// previously emitted prose must stay in scrollback order, while any live
-    /// table tail is free to reshape at the new width. This method preserves
-    /// that split without attempting byte-for-byte line remapping.
+    /// Reflow only at a known source boundary. Partially emitted wrapped
+    /// paragraphs retain their layout until source-backed consolidation.
     fn set_width(&mut self, width: Option<usize>) {
         if self.width == width {
             return;
         }
-        let had_pending_queue = self.state.queued_len() > 0;
-        let had_live_tail = self.has_tail();
+        let Some(source_boundary) = self.emitted_source_boundary() else {
+            return;
+        };
         self.width = width;
         self.state.collector.set_width(width);
+        self.reflow(source_boundary);
+    }
+
+    fn emitted_source_boundary(&mut self) -> Option<usize> {
+        if self.emitted_stable_len == 0 {
+            return Some(0);
+        }
+        if self.emitted_stable_len == self.rendered_lines.len() {
+            // Dirty source beyond this snapshot has not been emitted.
+            return Some(self.rendered_source_len);
+        }
+        if self.render_mode == HistoryRenderMode::Rich {
+            let start = match self.holdback_scanner.state() {
+                TableHoldbackState::Confirmed { table_start } => Some(table_start),
+                TableHoldbackState::PendingHeader { header_start } => Some(header_start),
+                TableHoldbackState::None => None,
+            };
+            if let Some(start) = start
+                && start <= self.rendered_source_len
+                && self.stable_prefix_len_for_source_start(start) == self.emitted_stable_len
+            {
+                return Some(start);
+            }
+        }
+        None
+    }
+
+    fn reflow(&mut self, source_boundary: usize) {
         if self.raw_source.is_empty() {
             return;
         }
-
         self.recompute_streaming_render();
-        self.emitted_stable_len = self.emitted_stable_len.min(self.rendered_lines.len());
-        if had_pending_queue
-            && self.emitted_stable_len == self.rendered_lines.len()
-            && self.emitted_stable_len > 0
-        {
-            // If wrapped remainder compresses into fewer lines at the new width,
-            // keep at least one line un-emitted so pre-resize pending content is
-            // not skipped permanently.
-            self.emitted_stable_len -= 1;
-        }
-        self.state.clear_queue();
-        if self.emitted_stable_len > 0 && !had_pending_queue && !had_live_tail {
-            // Avoid replaying already-emitted content after resize when no
-            // stable lines were waiting in the queue and there was no mutable
-            // tail to preserve.
-            self.enqueued_stable_len = self.rendered_lines.len();
-            return;
-        }
+        self.emitted_stable_len = if source_boundary == self.raw_source.len() {
+            self.rendered_lines.len()
+        } else if source_boundary == 0 {
+            0
+        } else {
+            self.render_source(&self.raw_source[..source_boundary])
+                .len()
+                .min(self.rendered_lines.len())
+        };
         self.rebuild_stable_queue_from_render();
     }
 
@@ -368,27 +373,11 @@ impl StreamCore {
             return;
         }
 
-        let had_pending_queue = self.state.queued_len() > 0;
-        let had_live_tail = self.has_tail();
+        let Some(source_boundary) = self.emitted_source_boundary() else {
+            return;
+        };
         self.render_mode = render_mode;
-        if self.raw_source.is_empty() {
-            return;
-        }
-
-        self.recompute_streaming_render();
-        self.emitted_stable_len = self.emitted_stable_len.min(self.rendered_lines.len());
-        if had_pending_queue
-            && self.emitted_stable_len == self.rendered_lines.len()
-            && self.emitted_stable_len > 0
-        {
-            self.emitted_stable_len -= 1;
-        }
-        self.state.clear_queue();
-        if self.emitted_stable_len > 0 && !had_pending_queue && !had_live_tail {
-            self.enqueued_stable_len = self.rendered_lines.len();
-            return;
-        }
-        self.rebuild_stable_queue_from_render();
+        self.reflow(source_boundary);
     }
 
     /// Compute how many rendered lines should be in the stable region.
@@ -890,6 +879,7 @@ mod tests {
         let mut lines = Vec::new();
         for d in deltas {
             ctrl.push(d);
+            ctrl.flush_render_for_frame();
             while let (Some(cell), idle) = ctrl.on_commit_tick() {
                 lines.extend(cell.transcript_lines(u16::MAX));
                 if idle {
@@ -911,6 +901,7 @@ mod tests {
         let mut lines = Vec::new();
         for d in deltas {
             ctrl.push(d);
+            ctrl.flush_render_for_frame();
             while let (Some(cell), idle) = ctrl.on_commit_tick() {
                 lines.extend(cell.transcript_lines(u16::MAX));
                 if idle {
@@ -998,6 +989,12 @@ mod tests {
             0,
             "already-emitted content must not be re-queued after resize",
         );
+        let (remaining, source) = ctrl.finalize();
+        assert!(
+            remaining.is_none(),
+            "finalization must not replay emitted rows"
+        );
+        assert_eq!(source.as_deref(), Some(line));
     }
 
     #[test]
@@ -1319,6 +1316,7 @@ mod tests {
 
         for d in deltas.iter() {
             ctrl.push(d);
+            ctrl.flush_render_for_frame();
             while let (Some(cell), idle) = ctrl.on_commit_tick() {
                 lines.extend(cell.transcript_lines(u16::MAX));
                 if idle {
@@ -2076,10 +2074,107 @@ mod tests {
         let remaining = cell
             .map(|c| lines_to_plain_strings(&c.transcript_lines(u16::MAX)))
             .unwrap_or_default();
-        let joined = remaining.join(" ");
+        let mut all_lines = lines_to_plain_strings(
+            &first_emit
+                .expect("first wrapped line")
+                .transcript_lines(u16::MAX),
+        );
+        all_lines.extend(remaining);
+        let text = all_lines
+            .into_iter()
+            .map(|line| line.chars().skip(2).collect::<String>())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            text.split_whitespace().collect::<Vec<_>>(),
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu"
+                .split_whitespace()
+                .collect::<Vec<_>>()
+        );
+    }
+    #[test]
+    fn partial_stream_reflow_preserves_every_emitted_and_pending_line() {
+        let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu\n";
+        for change_mode in [false, true] {
+            let mut ctrl = stream_controller(Some(18));
+            ctrl.push(text);
+            ctrl.flush_render_for_frame();
+            let (first, idle) = ctrl.on_commit_tick();
+            assert!(!idle);
+            let mut lines = first.expect("first wrapped row").transcript_lines(u16::MAX);
+            if change_mode {
+                ctrl.set_render_mode(HistoryRenderMode::Raw);
+            } else {
+                ctrl.set_width(Some(80));
+            }
+            let (remaining, source) = ctrl.finalize();
+            lines.extend(
+                remaining
+                    .expect("wrapped remainder")
+                    .transcript_lines(u16::MAX),
+            );
+            let actual: Vec<String> = lines_to_plain_strings(&lines)
+                .into_iter()
+                .map(|line| line.chars().skip(2).collect())
+                .collect();
+            assert_eq!(actual, collect_streamed_lines(&[text], Some(18)));
+            assert_eq!(source.as_deref(), Some(text));
+        }
+    }
+
+    #[test]
+    fn resize_with_unrendered_source_keeps_new_text_pending() {
+        let mut ctrl = stream_controller(Some(80));
+        ctrl.push("first\n");
+        let (first, _) = ctrl.on_commit_tick_batch(usize::MAX);
+        assert!(first.is_some());
+        ctrl.push("second\n");
+        ctrl.set_width(Some(24));
+        let (remaining, source) = ctrl.finalize();
+        let lines = lines_to_plain_strings(
+            &remaining
+                .expect("new source must remain")
+                .transcript_lines(u16::MAX),
+        );
+        let content: Vec<String> = lines
+            .into_iter()
+            .map(|line| line.chars().skip(2).collect())
+            .collect();
+        assert_eq!(content, vec!["second"]);
+        assert_eq!(source.as_deref(), Some("first\nsecond\n"));
+    }
+
+    #[test]
+    fn fully_emitted_mode_change_does_not_replay_source() {
+        let mut ctrl = stream_controller(Some(80));
+        let text = "**bold**\n";
+        ctrl.push(text);
+        let (first, _) = ctrl.on_commit_tick_batch(usize::MAX);
+        assert!(first.is_some());
+        ctrl.set_render_mode(HistoryRenderMode::Raw);
+        let (remaining, source) = ctrl.finalize();
+        assert!(remaining.is_none());
+        assert_eq!(source.as_deref(), Some(text));
+    }
+
+    #[test]
+    fn finalized_table_stream_resets_holdback_for_next_message() {
+        let mut ctrl = stream_controller(Some(80));
+        ctrl.push("| A | B |\n| --- | --- |\n| one | two |\n");
+        ctrl.flush_render_for_frame();
+        assert_eq!(ctrl.queued_lines(), 0);
+        let (table, source) = ctrl.finalize();
+        assert!(table.is_some());
+        assert!(source.expect("table source").contains("one | two"));
+        ctrl.push("next message\n");
+        ctrl.flush_render_for_frame();
+        let (cell, idle) = ctrl.on_commit_tick();
+        assert!(idle);
+        let text =
+            lines_to_plain_strings(&cell.expect("next message must commit").transcript_lines(80));
         assert!(
-            joined.contains("kappa") || joined.contains("lambda") || joined.contains("mu"),
-            "wrapped remainder from partially emitted source line was lost after resize: {remaining:?}",
+            text.iter().any(|line| line.contains("next message")),
+            "{text:?}"
         );
     }
 }

@@ -58,7 +58,7 @@ concern_ids = ["cli", "command-routing"]
 aliases = ["codex cli", "command line entrypoint"]
 phrases = ["cli command routing"]
 roots = ["codex-rs/cli"]
-primary_entries = [{ path = "codex-rs/cli/src/main.rs", symbol = "main", ambiguous = true }]
+primary_entries = [{ path = "codex-rs/cli/src/main.rs", symbol = "main" }]
 instructions = ["AGENTS.md"]
 consumers = []
 contracts = []
@@ -158,6 +158,13 @@ cwd = "."
 argv = ["just", "core-test-fast", "core_lib", "-E", "test(tools::router::tests) | test(tools::registry::tests)"]
 role = "focused_tests"
 
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:codex-rs/core/src/tools/registry.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/core/src/tools/spec_plan.rs", symbol = "build_tool_specs_and_registry" }, { path = "codex-rs/core/src/tools/registry.rs", symbol = "from_unique_registered_tools" }]
+
 [[owners]]
 id = "feature-registry"
 concern_ids = ["features", "rollout"]
@@ -194,6 +201,13 @@ id = "features-focused"
 cwd = "."
 argv = ["just", "test-fast", "-p", "codex-features"]
 role = "focused_tests"
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:codex-rs/features/src/lib.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/features/src/lib.rs", symbol = "define_features" }, { path = "codex-rs/features/src/lib.rs", symbol = "with_defaults" }, { path = "codex-rs/features/src/lib.rs", symbol = "canonical_feature_for_key" }]
 
 [[owners]]
 id = "kd4-capability-manifest"
@@ -542,6 +556,13 @@ cwd = "codex-rs"
 argv = ["just", "core-test-fast", "core_lib", "-E", "test(tools::handlers::plan::tests)"]
 role = "focused_tests"
 
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:codex-rs/core/src/plan_store.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/core/src/tools/handlers/plan.rs", symbol = "handle_call" }, { path = "codex-rs/core/src/plan_store.rs", symbol = "impl PlanStore" }]
+
 [[owners]]
 id = "source-owner-index"
 feature_ids = ["repository-intelligence"]
@@ -549,7 +570,7 @@ concern_ids = ["repository-map", "relationship-index", "architecture-slice"]
 aliases = ["source owner registry", "architecture index"]
 phrases = ["bounded repository relationship graph"]
 roots = ["scripts/source_owners.py", "source_owners.toml"]
-primary_entries = [{ path = "scripts/source_owners.py", symbol = "main", ambiguous = true }]
+primary_entries = [{ path = "scripts/source_owners.py", symbol = "main" }]
 instructions = ["AGENTS.md"]
 consumers = ["SOURCEMAP.md", "architecture_index.json"]
 contracts = ["source_owners.toml"]
@@ -733,7 +754,7 @@ concern_ids = ["app-server-protocol", "schema-generation", "desktop-contract"]
 aliases = ["app server schema", "protocol fixtures"]
 phrases = ["generated desktop protocol contract"]
 roots = ["codex-rs/app-server-protocol"]
-primary_entries = [{ path = "codex-rs/app-server-protocol/src/bin/write_schema_fixtures.rs", symbol = "main", ambiguous = true }]
+primary_entries = [{ path = "codex-rs/app-server-protocol/src/bin/write_schema_fixtures.rs", symbol = "main" }]
 instructions = ["AGENTS.md"]
 consumers = ["codex-rs/app-server/src"]
 contracts = ["codex-rs/app-server-protocol/src/protocol"]
@@ -797,7 +818,7 @@ concern_ids = ["turn-latency", "code-mode-capture", "synthetic-non-inferiority",
 aliases = ["Rust turn latency benchmark", "turn_latency bench", "paired live-agent benchmark"]
 phrases = ["single-build code-mode capture and synthetic latency comparison", "paired live-agent outcome and task-contract compliance benchmark"]
 roots = ["codex-rs/core/benches/turn_latency.rs", "codex-rs/core/benches/turn_latency/ab_contract.rs", "codex-rs/core/benches/turn_latency/ab_runner.rs", "codex-rs/core/benches/turn_latency/runtime_fixtures.rs", "codex-rs/core/benches/turn_latency/tests.rs", "codex-rs/core/tests/turn_latency_bench.rs", "docs/benchmarks/turn-latency/README.md", "scripts/kd4_live_agent_benchmark.py", "scripts/test_kd4_live_agent_benchmark.py"]
-primary_entries = [{ path = "codex-rs/core/benches/turn_latency.rs", symbol = "main", ambiguous = true }, { path = "scripts/kd4_live_agent_benchmark.py", symbol = "main", ambiguous = true }]
+primary_entries = [{ path = "codex-rs/core/benches/turn_latency.rs", symbol = "main" }, { path = "scripts/kd4_live_agent_benchmark.py", symbol = "main" }]
 instructions = ["AGENTS.md"]
 consumers = ["codex-rs/core/Cargo.toml"]
 contracts = ["codex-rs/core/benches/turn_latency.rs", "scripts/kd4_live_agent_benchmark.py"]
@@ -1405,7 +1426,7 @@ concern_ids = ["app-server-test-client-handshake"]
 aliases = ["app server test client handshake"]
 phrases = []
 roots = ["codex-rs/app-server-test-client"]
-primary_entries = [{ path = "codex-rs/app-server-test-client/src/main.rs", symbol = "main", ambiguous = true }]
+primary_entries = [{ path = "codex-rs/app-server-test-client/src/main.rs", symbol = "main" }]
 instructions = ["AGENTS.md"]
 consumers = ["codex-rs/cli/src/main.rs", "justfile"]
 contracts = ["codex-rs/app-server-test-client/src/main.rs"]
@@ -1461,14 +1482,14 @@ evidence = [{ path = "codex-rs/app-server-test-client/src/lib.rs", symbol = "ini
 id = "app-server-test-client-handshake-behavior"
 kind = "semantic"
 statement = "CodexClient::connect over a real loopback WebSocket and its normal initialize method emit an actual Initialize request containing the five independently expected supported opt-out methods and experimentalApi=true, consume independent userAgent/codexHome response values, then emit exactly the initialized notification; constant-only checks cannot satisfy this scenario."
-evidence = [{ path = "codex-rs/app-server-test-client/src/main.rs", symbol = "main", ambiguous = true }]
+evidence = [{ path = "codex-rs/app-server-test-client/src/main.rs", symbol = "main" }]
 tests = ["codex-rs/app-server-test-client/src/lib.rs"]
 
 [[owners.invariants]]
 id = "app-server-test-client-handshake-compatibility"
 kind = "compatibility"
 statement = "Preserve shared app-server JSON-RPC handshake types and method names; advertise supported notification opt-outs without retired methods."
-evidence = [{ path = "codex-rs/app-server-test-client/src/main.rs", symbol = "main", ambiguous = true }]
+evidence = [{ path = "codex-rs/app-server-test-client/src/main.rs", symbol = "main" }]
 tests = ["codex-rs/app-server-test-client/src/lib.rs"]
 
 [[owners.validation]]

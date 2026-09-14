@@ -71,20 +71,29 @@ fn plugin_capability_summary_from_loaded<M>(
 
 /// Normalizes plugin descriptions for inclusion in model-facing capability summaries.
 pub fn prompt_safe_plugin_description(description: Option<&str>) -> Option<String> {
-    let description = description?
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if description.is_empty() {
-        return None;
+    let mut normalized = String::new();
+    let mut length = 0;
+    let mut pending_space = false;
+    for ch in description?.chars() {
+        if ch.is_whitespace() {
+            pending_space = !normalized.is_empty();
+            continue;
+        }
+        if pending_space {
+            normalized.push(' ');
+            length += 1;
+            if length == MAX_CAPABILITY_SUMMARY_DESCRIPTION_LEN {
+                break;
+            }
+            pending_space = false;
+        }
+        normalized.push(ch);
+        length += 1;
+        if length == MAX_CAPABILITY_SUMMARY_DESCRIPTION_LEN {
+            break;
+        }
     }
-
-    Some(
-        description
-            .chars()
-            .take(MAX_CAPABILITY_SUMMARY_DESCRIPTION_LEN)
-            .collect(),
-    )
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 /// Runtime view of loaded plugins and their derived capability summaries.
@@ -227,6 +236,41 @@ mod tests {
             hook_sources: Vec::new(),
             hook_load_warnings: Vec::new(),
             error: None,
+        }
+    }
+
+    #[test]
+    fn capability_summaries_normalize_and_bound_descriptions() {
+        let cases = [
+            (None, None),
+            (Some(String::new()), None),
+            (Some(" \t\n\u{2003}".to_string()), None),
+            (
+                Some(" \tHello\n\u{2003}world! \r\n".to_string()),
+                Some("Hello world!".to_string()),
+            ),
+            (Some("🦀".repeat(100_000)), Some("🦀".repeat(1024))),
+            (
+                Some(format!("{} \t next", "é".repeat(1023))),
+                Some(format!("{} ", "é".repeat(1023))),
+            ),
+            (
+                Some(format!("{} \t\n", "é".repeat(1023))),
+                Some("é".repeat(1023)),
+            ),
+            (
+                Some(" word \t".repeat(100_000)),
+                Some(format!("{}word", "word ".repeat(204))),
+            ),
+        ];
+        for (description, expected) in cases {
+            let mut plugin = loaded_plugin("sample@test", Vec::new());
+            plugin.manifest_description = description;
+            let outcome = PluginLoadOutcome::from_plugins(vec![plugin]);
+            let [summary] = outcome.capability_summaries() else {
+                panic!("active plugin with skills must produce one summary");
+            };
+            assert_eq!(summary.description, expected);
         }
     }
 

@@ -24,6 +24,95 @@ use crate::reducer::test_support::trace_context;
 use crate::replay_bundle;
 
 #[test]
+fn tool_metadata_and_malformed_text_survive_replay() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let writer = create_started_writer(&temp)?;
+    start_turn(&writer, "turn-1")?;
+    let payload = writer.write_json_payload(RawPayloadKind::InferenceRequest, &json!({"input": [
+        {"type": "function_call", "name": "read", "namespace": "files", "call_id": "a", "arguments": "{}"},
+        {"type": "custom_tool_call", "name": "patch", "call_id": "b", "input": "patch contents"},
+        {"type": "message", "role": "assistant", "content": [
+            {"type": "output_text", "text": "visible"}, {"type": "output_text", "text": 7}
+        ]}
+    ]}))?;
+    append_inference_start(&writer, "inference-1", "turn-1", payload.clone())?;
+    let rollout = replay_bundle(temp.path())?;
+    let ids = &rollout.inference_calls["inference-1"].request_item_ids;
+    let function = &rollout.conversation_items[&ids[0]];
+    assert_eq!(function.tool_name.as_deref(), Some("read"));
+    assert_eq!(function.tool_namespace.as_deref(), Some("files"));
+    assert_eq!(
+        rollout.conversation_items[&ids[1]].tool_name.as_deref(),
+        Some("patch")
+    );
+    assert_eq!(
+        rollout.conversation_items[&ids[2]].body.parts,
+        vec![
+            ConversationPart::Text {
+                text: "visible".to_string()
+            },
+            ConversationPart::PayloadRef {
+                label: "malformed_text".to_string(),
+                raw_payload_id: payload.raw_payload_id
+            }
+        ]
+    );
+    let mut old_item = serde_json::to_value(function)?;
+    old_item.as_object_mut().unwrap().remove("tool_name");
+    old_item.as_object_mut().unwrap().remove("tool_namespace");
+    let old_item: crate::model::ConversationItem = serde_json::from_value(old_item)?;
+    assert_eq!(old_item.tool_name, None);
+    assert_eq!(old_item.tool_namespace, None);
+    Ok(())
+}
+
+#[test]
+fn json_identity_uses_content_beyond_the_preview() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let writer = create_started_writer(&temp)?;
+    start_turn(&writer, "turn-1")?;
+    for (index, suffix) in ["first", "first", "different"].iter().enumerate() {
+        let payload = writer.write_json_payload(
+            RawPayloadKind::InferenceRequest,
+            &json!({"input": [{
+                "type": "tool_search_output", "output": format!("{}{suffix}", "x".repeat(1000))
+            }]}),
+        )?;
+        append_inference_start(&writer, &format!("inference-{index}"), "turn-1", payload)?;
+    }
+    let rollout = replay_bundle(temp.path())?;
+    let first = &rollout.inference_calls["inference-0"].request_item_ids[0];
+    let repeated = &rollout.inference_calls["inference-1"].request_item_ids[0];
+    let changed = &rollout.inference_calls["inference-2"].request_item_ids[0];
+    assert_eq!(first, repeated);
+    assert_ne!(first, changed);
+    let preview = |id: &String| match &rollout.conversation_items[id].body.parts[0] {
+        ConversationPart::Json { summary, .. } => summary.clone(),
+        _ => panic!("expected JSON preview"),
+    };
+    assert_eq!(preview(first), preview(changed));
+    Ok(())
+}
+
+#[test]
+fn reused_call_id_rejects_changed_callee() -> anyhow::Result<()> {
+    for field in ["name", "namespace"] {
+        let temp = TempDir::new()?;
+        let writer = create_started_writer(&temp)?;
+        start_turn(&writer, "turn-1")?;
+        for (index, value) in ["first", "second"].iter().enumerate() {
+            let mut item = json!({"type": "function_call", "name": "read", "namespace": "files", "call_id": "call-1", "arguments": "{}"});
+            item[field] = json!(value);
+            let payload = writer
+                .write_json_payload(RawPayloadKind::InferenceRequest, &json!({"input": [item]}))?;
+            append_inference_start(&writer, &format!("inference-{index}"), "turn-1", payload)?;
+        }
+        expect_replay_error(&temp, "was reused with different content")?;
+    }
+    Ok(())
+}
+
+#[test]
 fn request_snapshots_reuse_history_without_deduping_new_identical_items() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let writer = create_started_writer(&temp)?;
@@ -93,13 +182,18 @@ fn replay_preserves_unicode_json_payload_with_a_bounded_summary() -> anyhow::Res
             parts: vec![ConversationPart::Json {
                 summary: format!("{{\"text\":\"{}...", "é".repeat(115)),
                 raw_payload_id: request.raw_payload_id,
+                content_sha256: "21e3c424b3e2de15d25c0ac96cae74d951ed6d93dcecf1779ab563918070fa8b"
+                    .to_string(),
             }],
         }
     );
     let stored_payload: serde_json::Value =
         serde_json::from_slice(&std::fs::read(temp.path().join(request.path))?)?;
     assert_eq!(stored_payload, request_body);
-    assert_eq!(rollout.threads["thread-root"].conversation_item_ids, *item_ids);
+    assert_eq!(
+        rollout.threads["thread-root"].conversation_item_ids,
+        *item_ids
+    );
 
     Ok(())
 }
@@ -851,6 +945,15 @@ fn unknown_previous_response_id_is_reducer_error() -> anyhow::Result<()> {
 
 #[test]
 fn compaction_boundary_repeats_prefix_and_reuses_replacement_items() -> anyhow::Result<()> {
+    assert_compaction_boundary_reuse("compaction")
+}
+
+#[test]
+fn context_compaction_boundary_repeats_prefix_and_reuses_replacement_items() -> anyhow::Result<()> {
+    assert_compaction_boundary_reuse("context_compaction")
+}
+
+fn assert_compaction_boundary_reuse(item_type: &str) -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
@@ -867,7 +970,7 @@ fn compaction_boundary_repeats_prefix_and_reuses_replacement_items() -> anyhow::
 
     let summary = message("user", "summary from compacted history");
     let compaction_summary = json!({
-        "type": "compaction",
+        "type": item_type,
         "encrypted_content": "encrypted-summary",
     });
     let checkpoint = writer.write_json_payload(
@@ -931,75 +1034,6 @@ fn compaction_boundary_repeats_prefix_and_reuses_replacement_items() -> anyhow::
             compaction_id: "compaction-1".to_string()
         }],
     );
-    assert_eq!(
-        rollout.conversation_items[&compaction.replacement_item_ids[2]].channel,
-        Some(ConversationChannel::Summary),
-    );
-    assert_eq!(
-        rollout.conversation_items[&compaction.replacement_item_ids[2]].kind,
-        ConversationItemKind::Message,
-    );
-    assert_eq!(
-        rollout.conversation_items[&compaction.replacement_item_ids[2]]
-            .body
-            .parts,
-        vec![ConversationPart::Encoded {
-            label: "encrypted_content".to_string(),
-            value: "encrypted-summary".to_string(),
-        }],
-    );
-
-    Ok(())
-}
-
-#[test]
-fn context_compaction_boundary_repeats_prefix_and_reuses_replacement_items() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    let writer = create_started_writer(&temp)?;
-    start_turn(&writer, "turn-1")?;
-
-    let developer = message("developer", "follow repo rules");
-    let user = message("user", "count files");
-    let request = writer.write_json_payload(
-        RawPayloadKind::InferenceRequest,
-        &json!({
-            "input": [developer, user]
-        }),
-    )?;
-    append_inference_start(&writer, "inference-1", "turn-1", request)?;
-
-    let summary = message("user", "summary from compacted history");
-    let compaction_summary = json!({
-        "type": "context_compaction",
-        "encrypted_content": "encrypted-summary",
-    });
-    let checkpoint = writer.write_json_payload(
-        RawPayloadKind::CompactionCheckpoint,
-        &json!({
-            "input_history": [developer, user],
-            "replacement_history": [user, summary, compaction_summary]
-        }),
-    )?;
-    writer.append_with_context(
-        trace_context("turn-1"),
-        RawTraceEventPayload::CompactionInstalled {
-            compaction_id: "compaction-1".to_string(),
-            checkpoint_payload: checkpoint,
-        },
-    )?;
-
-    start_turn(&writer, "turn-2")?;
-    let post_compaction_request = writer.write_json_payload(
-        RawPayloadKind::InferenceRequest,
-        &json!({
-            "input": [developer, user, summary, compaction_summary]
-        }),
-    )?;
-    append_inference_start(&writer, "inference-2", "turn-2", post_compaction_request)?;
-
-    let rollout = replay_bundle(temp.path())?;
-    let compaction = &rollout.compactions["compaction-1"];
-
     assert_eq!(
         rollout.conversation_items[&compaction.replacement_item_ids[2]].channel,
         Some(ConversationChannel::Summary),
@@ -1132,4 +1166,183 @@ fn inference_start_rejects_unknown_codex_turn() -> anyhow::Result<()> {
     append_inference_start(&writer, "inference-1", "turn-missing", request)?;
 
     expect_replay_error(&temp, "referenced unknown codex turn turn-missing")
+}
+
+#[test]
+fn reordered_duplicate_consumes_each_previous_item_once() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let writer = create_started_writer(&temp)?;
+    start_turn(&writer, "turn-1")?;
+    for (id, input) in [
+        ("before", vec![message("user", "A"), message("user", "B")]),
+        ("after", vec![message("user", "B"), message("user", "B")]),
+    ] {
+        let payload = writer
+            .write_json_payload(RawPayloadKind::InferenceRequest, &json!({"input": input}))?;
+        append_inference_start(&writer, id, "turn-1", payload)?;
+    }
+    let rollout = replay_bundle(temp.path())?;
+    let before = &rollout.inference_calls["before"].request_item_ids;
+    let after = &rollout.inference_calls["after"].request_item_ids;
+    assert_eq!(after.len(), 2);
+    assert_eq!(after[0], before[1]);
+    assert_ne!(after[0], after[1]);
+    assert_eq!(rollout.conversation_items.len(), 3);
+    Ok(())
+}
+
+#[test]
+fn changed_json_suffix_with_same_call_id_is_rejected() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let writer = create_started_writer(&temp)?;
+    start_turn(&writer, "turn-1")?;
+    for (id, suffix) in [("first", "a"), ("second", "b")] {
+        let payload = writer.write_json_payload(
+            RawPayloadKind::InferenceRequest,
+            &json!({"input": [{
+                "type": "function_call", "name": "read", "call_id": "call-1",
+                "arguments": {"text": format!("{}{suffix}", "x".repeat(1000))}
+            }]}),
+        )?;
+        append_inference_start(&writer, id, "turn-1", payload)?;
+    }
+    expect_replay_error(&temp, "was reused with different content")
+}
+
+#[test]
+fn consecutive_compactions_use_the_installed_replacement_as_input() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let writer = create_started_writer(&temp)?;
+    start_turn(&writer, "turn-1")?;
+    let request = writer.write_json_payload(
+        RawPayloadKind::InferenceRequest,
+        &json!({"input": [message("user", "original")]}),
+    )?;
+    append_inference_start(&writer, "first", "turn-1", request)?;
+    for (id, input, replacement) in [
+        ("compact-1", "original", "summary-1"),
+        ("compact-2", "summary-1", "summary-2"),
+    ] {
+        let checkpoint = writer.write_json_payload(RawPayloadKind::CompactionCheckpoint, &json!({
+            "input_history": [message("user", input)], "replacement_history": [message("user", replacement)]
+        }))?;
+        writer.append_with_context(
+            trace_context("turn-1"),
+            RawTraceEventPayload::CompactionInstalled {
+                compaction_id: id.to_string(),
+                checkpoint_payload: checkpoint,
+            },
+        )?;
+    }
+    let request = writer.write_json_payload(
+        RawPayloadKind::InferenceRequest,
+        &json!({"input": [message("user", "summary-2")]}),
+    )?;
+    append_inference_start(&writer, "next", "turn-1", request)?;
+    let rollout = replay_bundle(temp.path())?;
+    assert_eq!(
+        rollout.compactions["compact-2"].input_item_ids,
+        rollout.compactions["compact-1"].replacement_item_ids
+    );
+    assert_eq!(
+        rollout.inference_calls["next"].request_item_ids,
+        rollout.compactions["compact-2"].replacement_item_ids
+    );
+    assert_eq!(rollout.conversation_items.len(), 5);
+    Ok(())
+}
+
+#[test]
+fn tool_started_before_inference_completion_links_back_to_inference() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let writer = create_started_writer(&temp)?;
+    start_turn(&writer, "turn-1")?;
+    let request = writer.write_json_payload(
+        RawPayloadKind::InferenceRequest,
+        &json!({"input": [message("user", "read")]}),
+    )?;
+    append_inference_start(&writer, "inference-1", "turn-1", request)?;
+    writer.append_with_context(
+        trace_context("turn-1"),
+        RawTraceEventPayload::ToolCallStarted {
+            tool_call_id: "tool-1".to_string(),
+            model_visible_call_id: Some("call-1".to_string()),
+            code_mode_runtime_tool_id: None,
+            requester: crate::raw_event::RawToolCallRequester::Model,
+            kind: ToolCallKind::Other {
+                name: "read".to_string(),
+            },
+            summary: crate::reducer::test_support::generic_summary("read"),
+            invocation_payload: None,
+        },
+    )?;
+    let response = writer.write_json_payload(
+        RawPayloadKind::InferenceResponse,
+        &json!({"output_items": [{
+            "type": "function_call", "name": "read", "call_id": "call-1", "arguments": "{}"
+        }]}),
+    )?;
+    append_inference_completion(&writer, "inference-1", "resp-1", response)?;
+    let rollout = replay_bundle(temp.path())?;
+    assert_eq!(
+        rollout.inference_calls["inference-1"].tool_call_ids_started_by_response,
+        vec!["tool-1"]
+    );
+    assert_eq!(
+        rollout.tool_calls["tool-1"].model_visible_call_item_ids,
+        rollout.inference_calls["inference-1"].response_item_ids
+    );
+    Ok(())
+}
+
+#[test]
+fn compaction_install_rejects_request_from_a_different_turn() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let writer = create_started_writer(&temp)?;
+    start_turn(&writer, "turn-1")?;
+    start_turn(&writer, "turn-2")?;
+    let request =
+        writer.write_json_payload(RawPayloadKind::CompactionRequest, &json!({"input": []}))?;
+    writer.append(RawTraceEventPayload::CompactionRequestStarted {
+        compaction_id: "compact-1".to_string(),
+        compaction_request_id: "attempt-1".to_string(),
+        thread_id: "thread-root".to_string(),
+        codex_turn_id: "turn-1".to_string(),
+        model: "test".to_string(),
+        provider_name: "test".to_string(),
+        request_payload: request,
+    })?;
+    let checkpoint = writer.write_json_payload(
+        RawPayloadKind::CompactionCheckpoint,
+        &json!({"input_history": [], "replacement_history": []}),
+    )?;
+    writer.append_with_context(
+        trace_context("turn-2"),
+        RawTraceEventPayload::CompactionInstalled {
+            compaction_id: "compact-1".to_string(),
+            checkpoint_payload: checkpoint,
+        },
+    )?;
+    expect_replay_error(&temp, "different thread or turn owner")
+}
+
+#[test]
+fn malformed_spawn_parent_is_not_treated_as_a_root() -> anyhow::Result<()> {
+    for parent in [json!(null), json!(7), json!("")] {
+        let temp = TempDir::new()?;
+        let writer = create_started_writer(&temp)?;
+        let metadata = writer.write_json_payload(
+            RawPayloadKind::SessionMetadata,
+            &json!({
+                "session_source": {"subagent": {"thread_spawn": {"parent_thread_id": parent}}}
+            }),
+        )?;
+        writer.append(RawTraceEventPayload::ThreadStarted {
+            thread_id: "child".to_string(),
+            agent_path: "/root/child".to_string(),
+            metadata_payload: Some(metadata),
+        })?;
+        expect_replay_error(&temp, "requires a nonempty string parent_thread_id")?;
+    }
+    Ok(())
 }

@@ -103,7 +103,7 @@ async fn collect_layer_mtimes(stack: &ConfigLayerStack) -> Result<Vec<LayerMtime
         )
         .iter()
         .filter_map(|layer| {
-            let path = match &layer.name {
+            match &layer.name {
                 ConfigLayerSource::System { file } => Some(file.clone()),
                 ConfigLayerSource::User { file, .. } => Some(file.clone()),
                 ConfigLayerSource::Project { dot_codex_folder } => {
@@ -111,8 +111,7 @@ async fn collect_layer_mtimes(stack: &ConfigLayerStack) -> Result<Vec<LayerMtime
                 }
                 ConfigLayerSource::LegacyManagedConfigTomlFromFile { file } => Some(file.clone()),
                 _ => None,
-            };
-            path
+            }
         })
         .collect::<Vec<_>>();
     run_blocking_config_probe(move || paths.into_iter().map(LayerMtime::new).collect())

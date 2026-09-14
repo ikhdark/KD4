@@ -207,10 +207,16 @@ impl ThreadTraceContext {
         else {
             return;
         };
-        context.append_best_effort(RawTraceEventPayload::ProtocolEventObserved {
-            event_type: event_type.to_string(),
-            event_payload,
-        });
+        context.writer.append_with_context_best_effort(
+            RawTraceEventContext {
+                thread_id: Some(context.thread_id.clone()),
+                codex_turn_id: None,
+            },
+            RawTraceEventPayload::ProtocolEventObserved {
+                event_type: event_type.to_string(),
+                event_payload,
+            },
+        );
     }
 
     /// Emits typed Codex turn lifecycle events from protocol lifecycle events.
@@ -218,8 +224,7 @@ impl ThreadTraceContext {
         let ThreadTraceContextState::Enabled(context) = &self.state else {
             return;
         };
-        let Some(trace_event) =
-            codex_turn_trace_event(context.thread_id.clone(), default_turn_id, event)
+        let Some(trace_event) = codex_turn_trace_event(&context.thread_id, default_turn_id, event)
         else {
             return;
         };

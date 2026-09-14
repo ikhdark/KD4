@@ -19,17 +19,34 @@ class SourceOwnersTest(unittest.TestCase):
             root = Path(directory)
             for name in ("selected.rs", "incoming.rs", "unrelated.rs"):
                 (root / name).write_bytes(name.encode())
-            manifest = {"owners": [
-                {"id": "selected", "primary_entries": [{"path": "selected.rs", "symbol": "selected"}]},
-                {"id": "incoming", "relationships": [{
-                    "category": "callers_consumers", "kind": "calls",
-                    "target": "owner:selected", "confidence": "declared",
-                    "evidence": [{"path": "incoming.rs"}],
-                }]},
-                {"id": "unrelated", "primary_entries": [{"path": "unrelated.rs", "symbol": "unrelated"}]},
-            ]}
-            source_owners._snapshot_cache.clear()
-            source_owners._snapshot_cache_bytes = 0
+            manifest = {
+                "owners": [
+                    {
+                        "id": "selected",
+                        "primary_entries": [
+                            {"path": "selected.rs", "symbol": "selected"}
+                        ],
+                    },
+                    {
+                        "id": "incoming",
+                        "relationships": [
+                            {
+                                "category": "callers_consumers",
+                                "kind": "calls",
+                                "target": "owner:selected",
+                                "confidence": "declared",
+                                "evidence": [{"path": "incoming.rs"}],
+                            }
+                        ],
+                    },
+                    {
+                        "id": "unrelated",
+                        "primary_entries": [
+                            {"path": "unrelated.rs", "symbol": "unrelated"}
+                        ],
+                    },
+                ]
+            }
             original_read = Path.read_bytes
             reads = []
 
@@ -40,15 +57,25 @@ class SourceOwnersTest(unittest.TestCase):
 
             def capture(digest="manifest"):
                 reads.clear()
-                with mock.patch.object(Path, "read_bytes", read), mock.patch.object(
-                    source_owners, "_supporting_source_digest",
-                    side_effect=AssertionError("slice hashed the whole graph"),
+                with (
+                    mock.patch.object(Path, "read_bytes", read),
+                    mock.patch.object(
+                        source_owners,
+                        "_supporting_source_digest",
+                        side_effect=AssertionError("slice hashed the whole graph"),
+                    ),
                 ):
-                    result = source_owners.architecture_slice(manifest, digest, root, ["selected"])
-                self.assertEqual({name for name, _ in reads}, {"selected.rs", "incoming.rs"})
+                    result = source_owners.architecture_slice(
+                        manifest, digest, root, ["selected"]
+                    )
+                self.assertEqual(
+                    {name for name, _ in reads}, {"selected.rs", "incoming.rs"}
+                )
                 self.assertEqual(result["metrics"]["files_read"] - 1, len(reads))
-                self.assertEqual(result["metrics"]["bytes_read"], sum(size for _, size in reads))
-                self.assertTrue(result["snapshot"].startswith("slice-v2:selected:"))
+                self.assertEqual(
+                    result["metrics"]["bytes_read"], sum(size for _, size in reads)
+                )
+                self.assertTrue(result["snapshot"].startswith("slice-v3:selected:"))
                 return result["snapshot"]
 
             cold = capture()
@@ -63,9 +90,18 @@ class SourceOwnersTest(unittest.TestCase):
             self.assertNotEqual(incoming, selected)
             self.assertNotEqual(selected, capture("changed manifest"))
             index = root / "architecture_index.json"
-            index.write_text(source_owners.expected_architecture_index(manifest, "manifest", root), encoding="utf-8")
-            with mock.patch.object(source_owners, "_supporting_source_digest", side_effect=AssertionError("index load hashed unrelated sources")):
-                loaded = source_owners.load_architecture_index(index, "manifest", root, refresh_sources=False)
+            index.write_text(
+                source_owners.expected_architecture_index(manifest, "manifest", root),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                source_owners,
+                "_supporting_source_digest",
+                side_effect=AssertionError("index load hashed unrelated sources"),
+            ):
+                loaded = source_owners.load_architecture_index(
+                    index, "manifest", root, refresh_sources=False
+                )
             self.assertIsNotNone(loaded)
             self.assertIsNone(loaded["repository_revision"])
 
@@ -79,7 +115,15 @@ class SourceOwnersTest(unittest.TestCase):
             str(source_owners.REPO_ROOT),
         ]
 
-        with mock.patch.object(sys, "argv", argv), mock.patch("builtins.print") as emit:
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch("builtins.print") as emit,
+            mock.patch.object(
+                Path,
+                "read_text",
+                side_effect=AssertionError("catalog read source files"),
+            ),
+        ):
             self.assertEqual(source_owners.main(), 0)
 
         catalog = json.loads(emit.call_args.args[0])
@@ -172,6 +216,80 @@ role = "focused_tests"
             self.assertIn("`alpha`", block)
             self.assertIn("`control_flow:calls`", block)
             self.assertIn("`semantic:locator-contract`", block)
+
+    def test_distinct_file_entrypoints_are_unambiguous_in_generated_index(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("alpha", "beta"):
+                (root / f"{name}.rs").write_text("fn main() {}\n", encoding="utf-8")
+            manifest_path = root / "source_owners.toml"
+            manifest_path.write_text(
+                "schema_version = 2\n"
+                + "\n".join(
+                    f'[[owners]]\nid = "{name}"\nroots = ["{name}.rs"]\n'
+                    f'primary_entries = [{{ path = "{name}.rs", symbol = "main" }}]\n'
+                    for name in ("alpha", "beta")
+                ),
+                encoding="utf-8",
+            )
+
+            manifest, digest = source_owners.load_and_validate(manifest_path, root)
+            index = json.loads(
+                source_owners.expected_architecture_index(manifest, digest, root)
+            )
+
+            self.assertEqual(
+                {owner["id"]: owner["primary_entries"] for owner in index["owners"]},
+                {
+                    "alpha": [{"path": "alpha.rs", "symbol": "main"}],
+                    "beta": [{"path": "beta.rs", "symbol": "main"}],
+                },
+            )
+
+    def test_shared_file_entrypoint_requires_explicit_ambiguity_for_every_owner(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "shared.rs").write_text("fn main() {}\n", encoding="utf-8")
+            manifest_path = root / "source_owners.toml"
+            for alpha, beta in (
+                (False, False),
+                (True, False),
+                (False, True),
+                (True, True),
+            ):
+                with self.subTest(alpha=alpha, beta=beta):
+                    manifest_path.write_text(
+                        "schema_version = 2\n"
+                        + "\n".join(
+                            f'[[owners]]\nid = "{name}"\nroots = ["shared.rs"]\n'
+                            'primary_entries = [{ path = "shared.rs", symbol = "main", '
+                            f'ambiguous = {str(ambiguous).lower()} }}]\n'
+                            for name, ambiguous in (("alpha", alpha), ("beta", beta))
+                        ),
+                        encoding="utf-8",
+                    )
+                    if alpha and beta:
+                        manifest, digest = source_owners.load_and_validate(
+                            manifest_path, root
+                        )
+                        index = json.loads(
+                            source_owners.expected_architecture_index(manifest, digest, root)
+                        )
+                        self.assertEqual(len(index["owners"]), 2)
+                        self.assertTrue(
+                            all(
+                                owner["primary_entries"][0]["ambiguous"]
+                                for owner in index["owners"]
+                            )
+                        )
+                    else:
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "entry symbol is not explicitly ambiguous: shared.rs::main",
+                        ):
+                            source_owners.load_and_validate(manifest_path, root)
 
     def test_manifest_validation_rejects_stale_evidence_symbols(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -270,7 +388,9 @@ evidence = [{ path = "source.rs", symbol = "live_symbol" }]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "src").mkdir()
-            (root / "src" / "lib.rs").write_text("fn locate() {}\n", encoding="utf-8")
+            (root / "src" / "lib.rs").write_text(
+                "fn alpha_entry() {}\nfn beta_entry() {}\n", encoding="utf-8"
+            )
             (root / "AGENTS.md").write_text("instructions\n", encoding="utf-8")
             owners = []
             for owner_id in ("alpha", "beta"):
@@ -458,16 +578,13 @@ primary_entries = [{ path = "source.rs", symbol = "locate" }]
                 self.assertEqual(source_owners.main(), 0)
             self.assertTrue(print_output.called)
 
-    def test_slice_snapshot_cache_revalidates_content_identity(self) -> None:
+    def test_slice_snapshot_revalidates_content_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "source.rs"
             source.write_bytes(b"first")
             graph = {"relationships": []}
             owners = [{"primary_entries": [{"path": "source.rs"}]}]
-            with source_owners._snapshot_cache_lock:
-                source_owners._snapshot_cache.clear()
-                source_owners._snapshot_cache_bytes = 0
 
             first = source_owners._slice_source_snapshot(root, graph, owners)
             warm = source_owners._slice_source_snapshot(root, graph, owners)
@@ -495,6 +612,34 @@ primary_entries = [{ path = "source.rs", symbol = "locate" }]
             replaced = source_owners._slice_source_snapshot(root, graph, owners)
             self.assertNotEqual(replaced[0], changed[0])
             self.assertEqual(replaced[1:], (1, len(b"third")))
+
+    def test_slice_snapshot_frames_file_contents(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first, second = root / "a.rs", root / "b.rs"
+            manifest = {
+                "owners": [
+                    {
+                        "id": "sample",
+                        "primary_entries": [
+                            {"path": "a.rs", "symbol": "a"},
+                            {"path": "b.rs", "symbol": "b"},
+                        ],
+                    }
+                ]
+            }
+            header = b"b.rs\0file\0"
+            first.write_bytes(b"left" + header)
+            second.write_bytes(b"right")
+            before = source_owners.architecture_slice(
+                manifest, "manifest", root, ["sample"]
+            )["snapshot"]
+            first.write_bytes(b"left")
+            second.write_bytes(header + b"right")
+            after = source_owners.architecture_slice(
+                manifest, "manifest", root, ["sample"]
+            )["snapshot"]
+            self.assertNotEqual(before, after)
 
     def test_slice_snapshot_rejects_a_symlink_that_escapes_the_root(self) -> None:
         with (
@@ -708,16 +853,30 @@ role = "focused_tests"
 
             with (
                 mock.patch.object(
-                    sys, "argv", [
-                        "source_owners.py", "slice", "--owner", "alpha",
-                        "--focus", "lib", "--manifest", str(manifest_path),
-                        "--repo-root", str(root),
-                    ]
+                    sys,
+                    "argv",
+                    [
+                        "source_owners.py",
+                        "slice",
+                        "--owner",
+                        "alpha",
+                        "--focus",
+                        "lib",
+                        "--manifest",
+                        str(manifest_path),
+                        "--repo-root",
+                        str(root),
+                    ],
                 ),
                 mock.patch("builtins.print") as emit,
             ):
                 self.assertEqual(source_owners.main(), 0)
             slice_ = json.loads(emit.call_args.args[0])
+            invariant = slice_["invariants"]["relationships"][0]
+            self.assertEqual(invariant["invariant_kind"], "semantic")
+            self.assertEqual(
+                invariant["statement"], "A submitted write changes the consumer's file."
+            )
             scenario = slice_["tests_and_contracts"]["representative_scenario"]
             self.assertEqual(scenario["target"], "path:src/effect.rs")
             self.assertEqual(

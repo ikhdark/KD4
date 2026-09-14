@@ -114,6 +114,55 @@ fn safety_buffering_notification(
 }
 
 #[tokio::test]
+async fn safety_buffering_retry_uses_updated_model_offer() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
+    for model in ["first-model", "replacement-model"] {
+        chat.handle_server_notification(
+            ServerNotification::ModelSafetyBufferingUpdated(safety_buffering_notification(
+                thread_id,
+                turn_id,
+                Some(model),
+            )),
+            None,
+        );
+    }
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let retry_models: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::RetrySafetyBufferedTurn { model, .. } => Some(model),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(retry_models, vec!["replacement-model".to_string()]);
+}
+
+#[tokio::test]
+async fn safety_buffering_cannot_restart_after_response_begins() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
+    let notification = safety_buffering_notification(thread_id, turn_id, Some("faster-model"));
+    chat.handle_server_notification(
+        ServerNotification::ModelSafetyBufferingUpdated(notification.clone()),
+        None,
+    );
+    chat.mark_safety_buffering_agent_message_started();
+    let mut hidden = notification.clone();
+    hidden.show_buffering_ui = false;
+    chat.handle_server_notification(
+        ServerNotification::ModelSafetyBufferingUpdated(hidden),
+        None,
+    );
+    chat.handle_server_notification(
+        ServerNotification::ModelSafetyBufferingUpdated(notification),
+        None,
+    );
+    assert!(!chat.can_retry_safety_buffered_turn(turn_id));
+    assert!(!chat.safety_buffering_is_waiting());
+    assert!(!render_bottom_popup(&chat, 80).contains("Retry with a faster model"));
+}
+
+#[tokio::test]
 async fn safety_buffering_offers_one_retry_with_app_wording() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);

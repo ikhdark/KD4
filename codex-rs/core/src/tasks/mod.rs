@@ -587,6 +587,9 @@ impl Session {
                     }
                     .instrument(task_span.clone()),
                 );
+                // The supervisor owns terminal publication; dropping its handle
+                // detaches it while worker cancellation remains explicit below.
+                drop(supervisor_handle);
                 let running_task = RunningTask {
                     done,
                     worker_done,
@@ -596,7 +599,6 @@ impl Session {
                     auxiliary_cancellation_token,
                     auxiliary_tasks: tokio::task::JoinSet::new(),
                     worker_abort_handle,
-                    _supervisor_handle: supervisor_handle,
                     task_span,
                     turn_context: Arc::clone(&turn_context),
                     _agent_execution_guard: agent_execution_guard,

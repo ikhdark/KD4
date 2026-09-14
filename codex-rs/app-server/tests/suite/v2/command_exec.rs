@@ -159,7 +159,10 @@ async fn command_exec_env_overrides_merge_with_server_environment_and_support_un
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .with_env_overrides(&[("COMMAND_EXEC_BASELINE", Some("server"))])
+        .with_env_overrides(&[
+            ("COMMAND_EXEC_BASELINE", Some("server")),
+            ("COMMAND_EXEC_REMOVE", Some("server")),
+        ])
         .build()
         .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
@@ -167,7 +170,7 @@ async fn command_exec_env_overrides_merge_with_server_environment_and_support_un
     let command_request_id = mcp
         .send_command_exec_request(CommandExecParams {
             command: powershell(
-                "$rustLog = if ($null -eq $env:RUST_LOG) { 'unset' } else { $env:RUST_LOG }; [Console]::Out.Write(\"$env:COMMAND_EXEC_BASELINE|$env:COMMAND_EXEC_EXTRA|$rustLog|$env:CODEX_HOME\")",
+                "$rustLog = if ($null -eq $env:RUST_LOG) { 'unset' } else { $env:RUST_LOG }; $removed = if ($null -eq $env:COMMAND_EXEC_REMOVE) { 'unset' } else { $env:COMMAND_EXEC_REMOVE }; [Console]::Out.Write(\"$env:COMMAND_EXEC_BASELINE|$env:COMMAND_EXEC_EXTRA|$rustLog|$removed|$env:CODEX_HOME\")",
             ),
             process_id: None,
             tty: false,
@@ -180,11 +183,12 @@ async fn command_exec_env_overrides_merge_with_server_environment_and_support_un
             cwd: None,
             env: Some(HashMap::from([
                 (
-                    "COMMAND_EXEC_BASELINE".to_string(),
+                    "command_exec_baseline".to_string(),
                     Some("request".to_string()),
                 ),
                 ("COMMAND_EXEC_EXTRA".to_string(), Some("added".to_string())),
                 ("RUST_LOG".to_string(), None),
+                ("command_exec_remove".to_string(), None),
             ])),
             size: None,
             sandbox_policy: None,
@@ -200,7 +204,7 @@ async fn command_exec_env_overrides_merge_with_server_environment_and_support_un
         response,
         CommandExecResponse {
             exit_code: 0,
-            stdout: format!("request|added|unset|{}", codex_home.path().display()),
+            stdout: format!("request|added|unset|unset|{}", codex_home.path().display()),
             stderr: String::new(),
         }
     );

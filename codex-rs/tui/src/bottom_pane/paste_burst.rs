@@ -321,6 +321,10 @@ impl PasteBurst {
     /// false otherwise.
     pub fn append_newline_if_active(&mut self, now: Instant) -> bool {
         if self.is_active() {
+            if let Some((ch, _)) = self.pending_first_char.take() {
+                self.buffer.push(ch);
+            }
+            self.last_plain_char_time = Some(now);
             self.buffer.push('\n');
             self.burst_window_until = Some(now + PASTE_ENTER_SUPPRESS_WINDOW);
             true
@@ -470,6 +474,28 @@ pub(crate) fn retro_start_index(before: &str, retro_chars: usize) -> usize {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn newline_after_pending_character_preserves_paste_order() {
+        let mut burst = PasteBurst::default();
+        let now = Instant::now();
+        assert!(matches!(
+            burst.on_plain_char('a', now),
+            CharDecision::RetainFirstChar
+        ));
+        let newline_time = now + Duration::from_millis(1);
+        assert!(burst.append_newline_if_active(newline_time));
+        assert!(matches!(
+            burst.flush_if_due(newline_time),
+            FlushResult::None
+        ));
+        let flush_time =
+            newline_time + PasteBurst::recommended_active_flush_delay() + Duration::from_millis(1);
+        assert!(
+            matches!(burst.flush_if_due(flush_time), FlushResult::Paste(text) if text == "a\n")
+        );
+        assert!(!burst.is_active());
+    }
 
     /// Behavior: for ASCII input we "hold" the first fast char briefly. If no burst follows,
     /// that held char should eventually flush as normal typed input (not as a paste).

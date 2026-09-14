@@ -12,7 +12,6 @@ use codex_exec_server::HttpClient;
 use codex_login::CodexAuth;
 use codex_rmcp_client::McpAuthState;
 use codex_rmcp_client::OAuthProviderError;
-use codex_rmcp_client::determine_streamable_http_auth_status;
 use codex_rmcp_client::determine_streamable_http_auth_status_with_http_client;
 use codex_rmcp_client::discover_streamable_http_oauth;
 use codex_rmcp_client::discover_streamable_http_oauth_with_http_client;
@@ -178,7 +177,9 @@ pub fn resolve_oauth_scopes(
 
 pub fn should_retry_without_scopes(scopes: &ResolvedMcpOAuthScopes, error: &anyhow::Error) -> bool {
     scopes.source == McpOAuthScopesSource::Discovered
-        && error.downcast_ref::<OAuthProviderError>().is_some()
+        && error
+            .downcast_ref::<OAuthProviderError>()
+            .is_some_and(|error| error.error_code() == Some("invalid_scope"))
 }
 
 pub async fn compute_auth_statuses<'a, I>(
@@ -268,37 +269,22 @@ async fn compute_auth_status(
             http_headers,
             env_http_headers,
         } => {
-            if config.is_local_environment() {
-                determine_streamable_http_auth_status(
-                    codex_home,
-                    server_name,
-                    url,
-                    bearer_token_env_var.as_deref(),
-                    http_headers.clone(),
-                    env_http_headers.clone(),
-                    store_mode,
-                    keyring_backend_kind,
-                )
-                .boxed()
-                .await
-            } else {
-                let http_client = runtime_context
-                    .resolve_http_client(server_name, config)
-                    .map_err(anyhow::Error::msg)?;
-                determine_streamable_http_auth_status_with_http_client(
-                    codex_home,
-                    server_name,
-                    url,
-                    bearer_token_env_var.as_deref(),
-                    http_headers.clone(),
-                    env_http_headers.clone(),
-                    store_mode,
-                    keyring_backend_kind,
-                    http_client,
-                )
-                .boxed()
-                .await
-            }
+            let http_client = runtime_context
+                .resolve_http_client(server_name, config)
+                .map_err(anyhow::Error::msg)?;
+            determine_streamable_http_auth_status_with_http_client(
+                codex_home,
+                server_name,
+                url,
+                bearer_token_env_var.as_deref(),
+                http_headers.clone(),
+                env_http_headers.clone(),
+                store_mode,
+                keyring_backend_kind,
+                http_client,
+            )
+            .boxed()
+            .await
         }
     }
 }
@@ -410,6 +396,10 @@ mod tests {
         ));
 
         assert!(should_retry_without_scopes(&discovered, &provider_error));
+        for code in ["access_denied", "server_error", "invalid_client"] {
+            let error = anyhow!(OAuthProviderError::new(Some(code.to_string()), None));
+            assert!(!should_retry_without_scopes(&discovered, &error));
+        }
 
         let configured = ResolvedMcpOAuthScopes {
             scopes: vec!["scope".to_string()],

@@ -23,6 +23,8 @@ pub fn parse_plugin_app_config(contents: &str) -> serde_json::Result<Vec<AppDecl
 }
 
 /// Parses connector declarations from an already-decoded plugin app configuration.
+/// Preserves the order available in the value; use the string entry point when
+/// original declaration order must survive decoding without `preserve_order`.
 pub fn parse_plugin_app_config_value(value: Value) -> serde_json::Result<Vec<AppDeclaration>> {
     serde_json::from_value(value).map(app_declarations_from_file)
 }

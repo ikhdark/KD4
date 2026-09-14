@@ -324,25 +324,36 @@ impl McpRequestProcessor {
         .await;
 
         let McpServerStatusSnapshot {
-            server_infos,
-            tools_by_server,
-            resources,
-            resource_templates,
-            auth_statuses,
+            mut server_infos,
+            mut tools_by_server,
+            mut resources,
+            mut resource_templates,
+            resource_errors,
+            mut auth_statuses,
             server_names: _,
         } = snapshot;
+
+        if !resource_errors.is_empty() {
+            return Err(internal_error(format!(
+                "MCP resource discovery failed: {}",
+                resource_errors
+                    .iter()
+                    .map(|error| format!("{}: {}", error.server, error.message))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )));
+        }
 
         let data: Vec<McpServerStatus> = selected_server_names
             .iter()
             .map(|name| McpServerStatus {
                 name: name.clone(),
-                server_info: server_infos.get(name).cloned(),
-                tools: tools_by_server.get(name).cloned().unwrap_or_default(),
-                resources: resources.get(name).cloned().unwrap_or_default(),
-                resource_templates: resource_templates.get(name).cloned().unwrap_or_default(),
+                server_info: server_infos.remove(name),
+                tools: tools_by_server.remove(name).unwrap_or_default(),
+                resources: resources.remove(name).unwrap_or_default(),
+                resource_templates: resource_templates.remove(name).unwrap_or_default(),
                 auth_status: auth_statuses
-                    .get(name)
-                    .cloned()
+                    .remove(name)
                     .unwrap_or(CoreMcpAuthStatus::Unsupported)
                     .into(),
             })
@@ -425,45 +436,5 @@ impl McpRequestProcessor {
             .await
             .map(McpServerToolCallResponse::from)
             .map_err(|error| internal_error(format!("{error:#}")))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::Ordering;
-
-    struct DropFlag(Arc<AtomicBool>);
-
-    impl Drop for DropFlag {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Release);
-        }
-    }
-
-    #[tokio::test]
-    async fn gate_owned_mcp_response_drops_semantic_work_when_cancelled() {
-        let started = Arc::new(tokio::sync::Notify::new());
-        let dropped = Arc::new(AtomicBool::new(false));
-
-        {
-            let work_started = Arc::clone(&started);
-            let work_dropped = DropFlag(Arc::clone(&dropped));
-            let response = await_mcp_response(async move {
-                let _work_dropped = work_dropped;
-                work_started.notify_one();
-                std::future::pending::<Result<ListMcpServerStatusResponse, JSONRPCErrorError>>()
-                    .await
-            });
-            tokio::pin!(response);
-
-            tokio::select! {
-                result = &mut response => panic!("semantic MCP work completed unexpectedly: {result:?}"),
-                _ = started.notified() => {}
-            }
-        }
-
-        assert!(dropped.load(Ordering::Acquire));
     }
 }

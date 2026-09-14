@@ -446,8 +446,7 @@ fn configure_rule(rule: &INetFwRule3, spec: &BlockRuleSpec<'_>) -> Result<()> {
         return Err(anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperFirewallRuleVerifyFailed,
             format!(
-                "offline firewall rule retained legacy LocalUserAuthorizedList: {}",
-                authorized_users.to_string()
+                "offline firewall rule retained legacy LocalUserAuthorizedList: {authorized_users}"
             ),
         )));
     }

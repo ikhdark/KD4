@@ -44,6 +44,7 @@ FORMATTER_ALIASES = {
 class Command:
     args: tuple[str, ...]
     cwd: Path = REPO_ROOT
+    continue_on_changes: bool = False
 
 
 @dataclass(frozen=True)
@@ -119,7 +120,9 @@ def python_sdk_formatter_group(*, check: bool) -> FormatterGroup:
     return FormatterGroup(
         "Python SDK",
         (
-            Command((*uv_run_args, *lint_args, "sdk/python")),
+            Command(
+                (*uv_run_args, *lint_args, "sdk/python"), continue_on_changes=check
+            ),
             Command((*format_args, "sdk/python")),
         ),
     )
@@ -184,6 +187,7 @@ def formatter_groups(
 def run_formatter_group(group: FormatterGroup) -> FormatterResult:
     """Run one formatter group sequentially and return its buffered output."""
     output: list[str] = []
+    returncode = 0
     for command in group.commands:
         output.append(f"$ {shlex.join(command.args)}\n")
         try:
@@ -205,9 +209,12 @@ def run_formatter_group(group: FormatterGroup) -> FormatterResult:
         if process.stdout and not process.stdout.endswith("\n"):
             output.append("\n")
         if process.returncode != 0:
+            if process.returncode == 1 and command.continue_on_changes:
+                returncode = 1
+                continue
             return FormatterResult(group.name, "".join(output), process.returncode)
 
-    return FormatterResult(group.name, "".join(output), 0)
+    return FormatterResult(group.name, "".join(output), returncode)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -20,7 +20,11 @@ impl RequestUserInputOverlay {
         let has_options = self.has_options();
         let notes_visible = !has_options || self.notes_ui_visible();
         let footer_pref = self.footer_required_height(area.width);
-        let notes_pref_height = self.notes_input_height(area.width);
+        let notes_pref_height = if notes_visible {
+            self.notes_input_height(area.width)
+        } else {
+            0
+        };
         let mut question_lines = self.wrapped_question_lines(area.width);
         let question_height = u16::try_from(question_lines.len()).unwrap_or(u16::MAX);
 
@@ -79,6 +83,7 @@ impl RequestUserInputOverlay {
             question_height = max_question_height;
             question_lines.truncate(question_height as usize);
         }
+        let options_height = self.options_required_height(width);
         self.layout_with_options_normal(
             OptionsNormalArgs {
                 available_height,
@@ -88,8 +93,8 @@ impl RequestUserInputOverlay {
                 notes_visible,
             },
             OptionsHeights {
-                preferred: self.options_preferred_height(width),
-                full: self.options_required_height(width),
+                preferred: options_height,
+                full: options_height,
             },
         )
     }
@@ -208,39 +213,19 @@ impl RequestUserInputOverlay {
         footer_pref: u16,
         question_lines: &mut Vec<String>,
     ) -> LayoutPlan {
-        let required = question_height;
-        if required > available_height {
-            self.layout_without_options_tight(available_height, question_height, question_lines)
+        let minimum_notes = if available_height > super::MIN_COMPOSER_HEIGHT {
+            super::MIN_COMPOSER_HEIGHT
         } else {
-            self.layout_without_options_normal(
-                available_height,
-                question_height,
-                notes_pref_height,
-                footer_pref,
-            )
-        }
-    }
-
-    /// Tight layout for no-options case: truncate question to fit available space.
-    fn layout_without_options_tight(
-        &self,
-        available_height: u16,
-        question_height: u16,
-        question_lines: &mut Vec<String>,
-    ) -> LayoutPlan {
-        let max_question_height = available_height;
-        let adjusted_question_height = question_height.min(max_question_height);
-        question_lines.truncate(adjusted_question_height as usize);
-
-        LayoutPlan {
-            question_height: adjusted_question_height,
-            progress_height: 0,
-            spacer_after_question: 0,
-            options_height: 0,
-            spacer_after_options: 0,
-            notes_height: 0,
-            footer_lines: 0,
-        }
+            0
+        };
+        let question_height = question_height.min(available_height.saturating_sub(minimum_notes));
+        question_lines.truncate(question_height as usize);
+        self.layout_without_options_normal(
+            available_height,
+            question_height,
+            notes_pref_height,
+            footer_pref,
+        )
     }
 
     /// Normal layout for no-options case: allocate space for notes, footer, and progress.

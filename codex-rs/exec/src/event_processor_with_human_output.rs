@@ -300,18 +300,15 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             }
             ServerNotification::TurnCompleted(notification) => match notification.turn.status {
                 TurnStatus::Completed => {
-                    let rendered_message = self
-                        .final_message_rendered
-                        .then(|| self.final_message.clone())
-                        .flatten();
                     if let Some(surfaced_result) = notification.surfaced_result.as_ref() {
-                        self.final_message_rendered = false;
+                        self.final_message_rendered = self.final_message_rendered
+                            && self.final_message == surfaced_result.canonical_message;
                         self.final_message = surfaced_result.canonical_message.clone();
                     } else if let Some(final_message) =
                         final_message_from_turn_items(notification.turn.items.as_slice())
                     {
-                        self.final_message_rendered =
-                            rendered_message.as_deref() == Some(final_message.as_str());
+                        self.final_message_rendered = self.final_message_rendered
+                            && self.final_message.as_deref() == Some(final_message.as_str());
                         self.final_message = Some(final_message);
                     }
                     self.emit_final_message_on_shutdown = true;

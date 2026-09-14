@@ -96,6 +96,7 @@ impl ChatWidget {
             startup_status
         };
         if activated_pending_round {
+            self.mcp_startup_last_finished_status.clear();
             // A promoted buffered round may already contain terminal failures.
             for state in startup_status.values() {
                 if let McpStartupStatus::Failed { error } = state {
@@ -182,7 +183,25 @@ impl ChatWidget {
         self.mcp_startup_expected_servers = Some(server_names.into_iter().collect());
     }
 
-    pub(super) fn finish_mcp_startup(&mut self, failed: Vec<String>, cancelled: Vec<String>) {
+    pub(super) fn finish_mcp_startup(
+        &mut self,
+        mut failed: Vec<String>,
+        mut cancelled: Vec<String>,
+    ) {
+        if self.mcp_startup_status.is_none() {
+            failed.retain(|name| {
+                !matches!(
+                    self.mcp_startup_last_finished_status.get(name),
+                    Some(McpStartupStatus::Failed { .. })
+                )
+            });
+            cancelled.retain(|name| {
+                !matches!(
+                    self.mcp_startup_last_finished_status.get(name),
+                    Some(McpStartupStatus::Cancelled)
+                )
+            });
+        }
         if !cancelled.is_empty() {
             self.on_warning(format!(
                 "MCP startup interrupted. The following servers were not initialized: {}",
@@ -198,7 +217,9 @@ impl ChatWidget {
         }
 
         let mcp_startup_owned_status = self.status_header_is_mcp_startup_owned();
-        self.mcp_startup_status = None;
+        if let Some(status) = self.mcp_startup_status.take() {
+            self.mcp_startup_last_finished_status = status;
+        }
         self.mcp_startup_ignore_updates_until_next_start = true;
         self.mcp_startup_allow_terminal_only_next_round = false;
         self.mcp_startup_pending_next_round.clear();
@@ -293,6 +314,7 @@ impl ChatWidget {
                 .mcp_startup_status
                 .as_ref()
                 .and_then(|status| status.get(&failure.server))
+                .or_else(|| self.mcp_startup_last_finished_status.get(&failure.server))
                 .is_some_and(|status| {
                     matches!(status, McpStartupStatus::Failed { error } if error == &failure.error)
                 });
@@ -301,6 +323,25 @@ impl ChatWidget {
             }
         }
 
+        let completed_status = notification
+            .ready
+            .iter()
+            .map(|name| (name.clone(), McpStartupStatus::Ready))
+            .chain(notification.failed.iter().map(|failure| {
+                (
+                    failure.server.clone(),
+                    McpStartupStatus::Failed {
+                        error: failure.error.clone(),
+                    },
+                )
+            }))
+            .chain(
+                notification
+                    .cancelled
+                    .iter()
+                    .map(|name| (name.clone(), McpStartupStatus::Cancelled)),
+            )
+            .collect();
         let mut failed: Vec<_> = notification
             .failed
             .into_iter()
@@ -312,5 +353,6 @@ impl ChatWidget {
         cancelled.sort();
         cancelled.dedup();
         self.finish_mcp_startup(failed, cancelled);
+        self.mcp_startup_last_finished_status = completed_status;
     }
 }

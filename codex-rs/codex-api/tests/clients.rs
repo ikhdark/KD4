@@ -185,6 +185,46 @@ fn provider(name: &str) -> Provider {
     }
 }
 
+#[tokio::test]
+async fn responses_client_preserves_base_query_when_appending_endpoint() -> Result<()> {
+    let state = RecordingState::default();
+    let mut endpoint = provider("proxy");
+    endpoint.base_url = "https://example.com/v1/?route=regional#configuration".to_string();
+    endpoint.query_params = Some(
+        [("api-version".to_string(), "2026-01-01".to_string())]
+            .into_iter()
+            .collect(),
+    );
+    let client = ResponsesClient::new(
+        RecordingTransport::new(state.clone()),
+        endpoint,
+        Arc::new(NoAuth),
+    );
+    let stream = client
+        .stream(
+            serde_json::json!({}),
+            HeaderMap::new(),
+            Compression::None,
+            None,
+        )
+        .await?;
+    drop(stream);
+    let requests = state.take_stream_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, http::Method::POST);
+    let url = url::Url::parse(&requests[0].url)?;
+    assert_eq!(url.path(), "/v1/responses");
+    assert_eq!(
+        url.query_pairs().collect::<Vec<_>>(),
+        vec![
+            ("route".into(), "regional".into()),
+            ("api-version".into(), "2026-01-01".into())
+        ]
+    );
+    assert_eq!(url.fragment(), Some("configuration"));
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 struct FlakyTransportState {
     attempts: i64,

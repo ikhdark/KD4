@@ -31,6 +31,7 @@ use crate::facts::TurnProfileFact;
 use crate::facts::TurnResolvedConfigFact;
 use crate::facts::TurnTokenUsageFact;
 use crate::reducer::AnalyticsReducer;
+use crate::reducer::tracked_tool_item_id;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ClientResponsePayload;
 use codex_app_server_protocol::InitializeParams;
@@ -57,15 +58,22 @@ use tokio::sync::mpsc;
 const ANALYTICS_EVENTS_QUEUE_SIZE: usize = 256;
 const ANALYTICS_EVENTS_TIMEOUT: Duration = Duration::from_secs(10);
 const ANALYTICS_EVENT_DEDUPE_MAX_KEYS: usize = 4096;
+const ANALYTICS_EVENTS_BATCH_SIZE: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AnalyticsFailureLogMetadata {
     status: u16,
-    body_bytes: usize,
+    declared_body_bytes: Option<u64>,
 }
 
-fn analytics_failure_log_metadata(status: u16, body_bytes: usize) -> AnalyticsFailureLogMetadata {
-    AnalyticsFailureLogMetadata { status, body_bytes }
+fn analytics_failure_log_metadata(
+    status: u16,
+    declared_body_bytes: Option<u64>,
+) -> AnalyticsFailureLogMetadata {
+    AnalyticsFailureLogMetadata {
+        status,
+        declared_body_bytes,
+    }
 }
 
 #[derive(Clone)]
@@ -148,6 +156,12 @@ impl AnalyticsEventsQueue {
             while let Some(input) = receiver.recv().await {
                 let mut events = Vec::new();
                 reducer.ingest(input, &mut events).await;
+                for _ in 1..ANALYTICS_EVENTS_BATCH_SIZE {
+                    let Ok(input) = receiver.try_recv() else {
+                        break;
+                    };
+                    reducer.ingest(input, &mut events).await;
+                }
                 send_track_events(&auth_manager, &destination, &http_clients, events).await;
             }
         });
@@ -165,6 +179,15 @@ impl AnalyticsEventsQueue {
         }
     }
 
+    fn try_reserve(&self) -> Option<mpsc::Permit<'_, AnalyticsFact>> {
+        self.sender
+            .try_reserve()
+            .map_err(|err| {
+                tracing::warn!("dropping analytics events: {err}");
+            })
+            .ok()
+    }
+
     pub(crate) fn should_enqueue_app_used(
         &self,
         tracking: &TrackEventsContext,
@@ -177,10 +200,14 @@ impl AnalyticsEventsQueue {
             .app_used_emitted_keys
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (tracking.turn_id.clone(), connector_id.clone());
+        if emitted.contains(&key) {
+            return false;
+        }
         if emitted.len() >= ANALYTICS_EVENT_DEDUPE_MAX_KEYS {
             emitted.clear();
         }
-        emitted.insert((tracking.turn_id.clone(), connector_id.clone()))
+        emitted.insert(key)
     }
 
     pub(crate) fn should_enqueue_plugin_used(
@@ -192,9 +219,6 @@ impl AnalyticsEventsQueue {
             .plugin_used_emitted_keys
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if emitted.len() >= ANALYTICS_EVENT_DEDUPE_MAX_KEYS {
-            emitted.clear();
-        }
         let Some(plugin_id) = plugin
             .plugin_id
             .as_ref()
@@ -203,7 +227,14 @@ impl AnalyticsEventsQueue {
         else {
             return true;
         };
-        emitted.insert((tracking.turn_id.clone(), plugin_id))
+        let key = (tracking.turn_id.clone(), plugin_id);
+        if emitted.contains(&key) {
+            return false;
+        }
+        if emitted.len() >= ANALYTICS_EVENT_DEDUPE_MAX_KEYS {
+            emitted.clear();
+        }
+        emitted.insert(key)
     }
 }
 
@@ -214,9 +245,9 @@ impl AnalyticsEventsClient {
         analytics_enabled: Option<bool>,
         http_client_factory: HttpClientFactory,
     ) -> Self {
-        let destination = AnalyticsEventsDestination::from_base_url(base_url);
         Self {
             queue: (analytics_enabled != Some(false)).then(|| {
+                let destination = AnalyticsEventsDestination::from_base_url(base_url);
                 AnalyticsEventsQueue::new(
                     Arc::clone(&auth_manager),
                     destination,
@@ -253,7 +284,14 @@ impl AnalyticsEventsClient {
         product_client_id: String,
         rpc_transport: AppServerRpcTransport,
     ) {
-        self.record_fact(AnalyticsFact::Initialize {
+        let Some(permit) = self
+            .queue
+            .as_ref()
+            .and_then(AnalyticsEventsQueue::try_reserve)
+        else {
+            return;
+        };
+        permit.send(AnalyticsFact::Initialize {
             connection_id,
             params,
             product_client_id,
@@ -274,7 +312,14 @@ impl AnalyticsEventsClient {
         result: GuardianReviewAnalyticsResult,
         completed_at_ms: u64,
     ) {
-        self.record_fact(AnalyticsFact::Custom(CustomAnalyticsFact::GuardianReview(
+        let Some(permit) = self
+            .queue
+            .as_ref()
+            .and_then(AnalyticsEventsQueue::try_reserve)
+        else {
+            return;
+        };
+        permit.send(AnalyticsFact::Custom(CustomAnalyticsFact::GuardianReview(
             Box::new(tracking.event_params(result, completed_at_ms)),
         )));
     }
@@ -300,7 +345,14 @@ impl AnalyticsEventsClient {
         ) {
             return;
         }
-        self.record_fact(AnalyticsFact::ClientRequest {
+        let Some(permit) = self
+            .queue
+            .as_ref()
+            .and_then(AnalyticsEventsQueue::try_reserve)
+        else {
+            return;
+        };
+        permit.send(AnalyticsFact::ClientRequest {
             connection_id,
             request_id,
             request: Box::new(request.clone()),
@@ -311,10 +363,13 @@ impl AnalyticsEventsClient {
         let Some(queue) = self.queue.as_ref() else {
             return;
         };
+        let Some(permit) = queue.try_reserve() else {
+            return;
+        };
         if !queue.should_enqueue_app_used(&tracking, &app) {
             return;
         }
-        self.record_fact(AnalyticsFact::Custom(CustomAnalyticsFact::AppUsed(
+        permit.send(AnalyticsFact::Custom(CustomAnalyticsFact::AppUsed(
             AppUsedInput { tracking, app },
         )));
     }
@@ -329,10 +384,13 @@ impl AnalyticsEventsClient {
         let Some(queue) = self.queue.as_ref() else {
             return;
         };
+        let Some(permit) = queue.try_reserve() else {
+            return;
+        };
         if !queue.should_enqueue_plugin_used(&tracking, &plugin) {
             return;
         }
-        self.record_fact(AnalyticsFact::Custom(CustomAnalyticsFact::PluginUsed(
+        permit.send(AnalyticsFact::Custom(CustomAnalyticsFact::PluginUsed(
             crate::facts::PluginUsedInput { tracking, plugin },
         )));
     }
@@ -541,7 +599,10 @@ impl AnalyticsEventsClient {
         ) {
             return;
         }
-        queue.try_send(AnalyticsFact::ServerRequest {
+        let Some(permit) = queue.try_reserve() else {
+            return;
+        };
+        permit.send(AnalyticsFact::ServerRequest {
             connection_id,
             request: Box::new(request.clone()),
         });
@@ -578,19 +639,30 @@ impl AnalyticsEventsClient {
         let Some(queue) = self.queue.as_ref() else {
             return;
         };
-        if !matches!(
-            notification,
+        let relevant = match notification {
+            ServerNotification::ItemStarted(notification) => {
+                tracked_tool_item_id(&notification.item).is_some()
+            }
+            ServerNotification::ItemCompleted(notification) => {
+                tracked_tool_item_id(&notification.item).is_some()
+                    || matches!(
+                        notification.item,
+                        codex_app_server_protocol::ThreadItem::SubAgentActivity { .. }
+                    )
+            }
             ServerNotification::TurnStarted(_)
-                | ServerNotification::TurnCompleted(_)
-                | ServerNotification::TurnDiffUpdated(_)
-                | ServerNotification::ItemStarted(_)
-                | ServerNotification::ItemCompleted(_)
-                | ServerNotification::ItemGuardianApprovalReviewStarted(_)
-                | ServerNotification::ItemGuardianApprovalReviewCompleted(_)
-        ) {
+            | ServerNotification::TurnCompleted(_)
+            | ServerNotification::TurnDiffUpdated(_)
+            | ServerNotification::ItemGuardianApprovalReviewCompleted(_) => true,
+            _ => false,
+        };
+        if !relevant {
             return;
         }
-        queue.try_send(AnalyticsFact::Notification(Box::new(notification.clone())));
+        let Some(permit) = queue.try_reserve() else {
+            return;
+        };
+        permit.send(AnalyticsFact::Notification(Box::new(notification.clone())));
     }
 }
 
@@ -629,6 +701,9 @@ fn track_event_request_batches(events: Vec<TrackEventRequest>) -> Vec<Vec<TrackE
             batches.push(vec![event]);
         } else {
             current_batch.push(event);
+            if current_batch.len() == ANALYTICS_EVENTS_BATCH_SIZE {
+                batches.push(std::mem::take(&mut current_batch));
+            }
         }
     }
 
@@ -674,11 +749,11 @@ async fn send_track_events_request(
         Ok(response) if response.status().is_success() => {}
         Ok(response) => {
             let status = response.status();
-            let body_bytes = response.bytes().await.map_or(0, |body| body.len());
-            let metadata = analytics_failure_log_metadata(status.as_u16(), body_bytes);
+            let metadata =
+                analytics_failure_log_metadata(status.as_u16(), response.content_length());
             tracing::warn!(
                 status = metadata.status,
-                body_bytes = metadata.body_bytes,
+                declared_body_bytes = metadata.declared_body_bytes,
                 "events request failed"
             );
         }

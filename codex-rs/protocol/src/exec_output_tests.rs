@@ -13,6 +13,19 @@ fn test_utf8_shell_output() {
 }
 
 #[test]
+fn decoding_preserves_truncation_metadata() {
+    let output = StreamOutput {
+        text: "retained text".as_bytes().to_vec(),
+        truncated_after_lines: Some(7),
+        truncated: true,
+    }
+    .from_utf8_lossy();
+    assert_eq!(output.text, "retained text");
+    assert_eq!(output.truncated_after_lines, Some(7));
+    assert!(output.truncated);
+}
+
+#[test]
 fn test_cp1251_shell_output() {
     // VS Code shells on Windows frequently surface CP1251 bytes for Cyrillic text.
     assert_eq!(decode_shell_output(b"\xEF\xF0\xE8\xEC\xE5\xF0"), "пример");

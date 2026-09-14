@@ -423,6 +423,304 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn rejected_lifecycle_operations_leave_no_thread_data() {
+        let store = InMemoryThreadStore::default();
+        let missing = ThreadId::new();
+        assert!(matches!(
+            store
+                .update_thread_metadata(UpdateThreadMetadataParams {
+                    thread_id: missing,
+                    patch: ThreadMetadataPatch {
+                        name: Some(Some("orphan".to_string())),
+                        ..Default::default()
+                    },
+                    include_archived: true,
+                })
+                .await,
+            Err(ThreadStoreError::ThreadNotFound { .. })
+        ));
+        assert!(matches!(
+            store
+                .resume_thread(ResumeThreadParams {
+                    thread_id: missing,
+                    rollout_path: Some(PathBuf::from("orphan.jsonl")),
+                    history: Some(Arc::new(Vec::new())),
+                    include_archived: true,
+                    metadata: thread_metadata(),
+                })
+                .await,
+            Err(ThreadStoreError::ThreadNotFound { .. })
+        ));
+        {
+            let state = store.state.lock().await;
+            assert!(state.histories.is_empty());
+            assert!(state.metadata_updates.is_empty());
+            assert!(state.names.is_empty());
+            assert!(state.rollout_paths.is_empty());
+        }
+        store
+            .create_thread(create_thread_params(missing, ThreadHistoryMode::Legacy))
+            .await
+            .expect("create");
+        assert!(matches!(
+            store
+                .create_thread(create_thread_params(missing, ThreadHistoryMode::Legacy))
+                .await,
+            Err(ThreadStoreError::Conflict { .. })
+        ));
+        let read = ReadThreadParams {
+            thread_id: missing,
+            include_archived: false,
+            include_history: true,
+        };
+        let first = store.read_thread(read.clone()).await.expect("first read");
+        let second = store.read_thread(read).await.expect("second read");
+        assert_eq!(first.history.expect("history").items.len(), 1);
+        assert_eq!(first.created_at, second.created_at);
+        assert_eq!(first.updated_at, second.updated_at);
+        assert_eq!(first.recency_at, second.recency_at);
+        assert_eq!(first.model_provider, thread_metadata().model_provider);
+        assert_eq!(first.cwd, thread_metadata().cwd.unwrap_or_default());
+    }
+
+    #[tokio::test]
+    async fn cancelled_resume_discards_the_open_writer() {
+        let store = Arc::new(InMemoryThreadStore::default());
+        let thread_id = ThreadId::new();
+        store
+            .create_thread(create_thread_params(thread_id, ThreadHistoryMode::Legacy))
+            .await
+            .expect("create");
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        store.state.lock().await.history_load_gate = Some((entered.clone(), release));
+        let task = tokio::spawn(LiveThread::resume(
+            store.clone(),
+            ThreadHistoryMode::Legacy,
+            ResumeThreadParams {
+                thread_id,
+                rollout_path: None,
+                history: None,
+                include_archived: false,
+                metadata: thread_metadata(),
+            },
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("history load started");
+        task.abort();
+        let Err(error) = task.await else {
+            panic!("resume should have been cancelled");
+        };
+        assert!(error.is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while store.calls().await.discard_thread == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("guard cleanup");
+        assert_eq!(store.calls().await.discard_thread, 1);
+    }
+
+    #[tokio::test]
+    #[expect(clippy::await_holding_invalid_type, reason = "Blocks discard deliberately to verify cancellation retains cleanup ownership")]
+    async fn cancelled_explicit_discard_keeps_initialization_guard_armed() {
+        let store = Arc::new(InMemoryThreadStore::default());
+        let live = LiveThread::create(
+            store.clone(),
+            create_thread_params(ThreadId::new(), ThreadHistoryMode::Legacy),
+        )
+        .await
+        .expect("create live thread");
+        let mut guard = crate::LiveThreadInitGuard::new(Some(live));
+        let state = store.state.lock().await;
+        {
+            let discard = guard.discard();
+            tokio::pin!(discard);
+            assert!(matches!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                    discard.as_mut(),
+                    cx
+                )))
+                .await,
+                std::task::Poll::Pending
+            ));
+        }
+        assert!(
+            guard.as_ref().is_some(),
+            "cancelled cleanup must retain ownership"
+        );
+        drop(state);
+        guard.discard().await;
+        assert!(guard.as_ref().is_none());
+        assert_eq!(store.calls().await.discard_thread, 1);
+    }
+
+    #[tokio::test]
+    async fn later_user_messages_defer_touch_only_metadata_until_flush() {
+        let store = Arc::new(InMemoryThreadStore::default());
+        let live = LiveThread::create(
+            store.clone(),
+            create_thread_params(ThreadId::new(), ThreadHistoryMode::Legacy),
+        )
+        .await
+        .expect("create live thread");
+        let message = |text: &str| {
+            RolloutItem::EventMsg(EventMsg::UserMessage(
+                codex_protocol::protocol::UserMessageEvent {
+                    message: text.to_string(),
+                    images: None,
+                    local_images: Vec::new(),
+                    text_elements: Vec::new(),
+                    ..Default::default()
+                },
+            ))
+        };
+        live.append_items(&[message("first")])
+            .await
+            .expect("first append");
+        let writes = store.calls().await.update_thread_metadata;
+        live.append_items(&[message("second")])
+            .await
+            .expect("second append");
+        assert_eq!(store.calls().await.update_thread_metadata, writes);
+        live.flush().await.expect("flush touch");
+        assert_eq!(store.calls().await.update_thread_metadata, writes + 1);
+        assert_eq!(
+            live.read_thread(false, false)
+                .await
+                .expect("summary")
+                .preview,
+            "first"
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_honors_filters_and_rejects_unsupported_operations() {
+        let store = InMemoryThreadStore::default();
+        let first = ThreadId::new();
+        let second = ThreadId::new();
+        for (id, provider, seconds) in [(first, "one", 100), (second, "two", 200)] {
+            let mut create = create_thread_params(id, ThreadHistoryMode::Legacy);
+            create.metadata.model_provider = provider.to_string();
+            create.metadata.cwd = Some(PathBuf::from(provider));
+            store.create_thread(create).await.expect("create");
+            store
+                .update_thread_metadata(UpdateThreadMetadataParams {
+                    thread_id: id,
+                    patch: ThreadMetadataPatch {
+                        updated_at: chrono::DateTime::from_timestamp(seconds, 0),
+                        preview: Some(provider.to_string()),
+                        title: Some(format!("title-{provider}")),
+                        ..Default::default()
+                    },
+                    include_archived: false,
+                })
+                .await
+                .expect("metadata");
+        }
+        let base = ListThreadsParams {
+            page_size: 10,
+            cursor: None,
+            sort_key: ThreadSortKey::UpdatedAt,
+            sort_direction: SortDirection::Desc,
+            allowed_sources: Vec::new(),
+            model_providers: None,
+            cwd_filters: None,
+            archived: false,
+            search_term: None,
+            relation_filter: None,
+            storage_mode: crate::ThreadListStorageMode::PreferStateDb,
+        };
+        let list = |params| ThreadStore::list_threads(&store, params);
+        assert_eq!(
+            list(base.clone())
+                .await
+                .expect("sorted")
+                .items
+                .into_iter()
+                .map(|t| t.thread_id)
+                .collect::<Vec<_>>(),
+            vec![second, first]
+        );
+        for filter in [
+            ListThreadsParams {
+                model_providers: Some(vec!["one".to_string()]),
+                ..base.clone()
+            },
+            ListThreadsParams {
+                cwd_filters: Some(vec![PathBuf::from("one")]),
+                ..base.clone()
+            },
+            ListThreadsParams {
+                search_term: Some("one".to_string()),
+                ..base.clone()
+            },
+            ListThreadsParams {
+                search_term: Some("title-one".to_string()),
+                ..base.clone()
+            },
+        ] {
+            assert_eq!(
+                list(filter)
+                    .await
+                    .expect("filtered")
+                    .items
+                    .into_iter()
+                    .map(|t| t.thread_id)
+                    .collect::<Vec<_>>(),
+                vec![first]
+            );
+        }
+        assert!(
+            list(ListThreadsParams {
+                archived: true,
+                ..base.clone()
+            })
+            .await
+            .expect("archived")
+            .items
+            .is_empty()
+        );
+        assert!(
+            list(ListThreadsParams {
+                cwd_filters: Some(Vec::new()),
+                ..base.clone()
+            })
+            .await
+            .expect("empty cwd filter")
+            .items
+            .is_empty()
+        );
+        for params in [
+            ListThreadsParams {
+                page_size: 1,
+                ..base.clone()
+            },
+            ListThreadsParams {
+                cursor: Some("cursor".to_string()),
+                ..base
+            },
+        ] {
+            assert!(matches!(
+                list(params).await,
+                Err(ThreadStoreError::Unsupported {
+                    operation: "in_memory_thread_list_pagination"
+                })
+            ));
+        }
+        assert!(matches!(
+            store
+                .archive_thread(ArchiveThreadParams { thread_id: first })
+                .await,
+            Err(ThreadStoreError::Unsupported {
+                operation: "in_memory_archive_thread"
+            })
+        ));
+    }
+
     fn create_thread_params(
         thread_id: ThreadId,
         history_mode: ThreadHistoryMode,
@@ -521,6 +819,8 @@ struct InMemoryThreadStoreState {
     rollout_paths: HashMap<PathBuf, ThreadId>,
     #[cfg(test)]
     fail_next_shutdown: bool,
+    #[cfg(test)]
+    history_load_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 impl InMemoryThreadStore {
@@ -553,9 +853,16 @@ impl InMemoryThreadStore {
         reject_paginated_history_mode(params.history_mode)?;
         let mut state = self.state.lock().await;
         state.calls.create_thread += 1;
+        if state.created_threads.contains_key(&params.thread_id) {
+            return Err(ThreadStoreError::Conflict {
+                message: format!("thread {} already exists", params.thread_id),
+            });
+        }
+        let created_at = Utc::now();
         let session_meta = SessionMeta {
             session_id: params.session_id,
             id: params.thread_id,
+            timestamp: created_at.to_rfc3339(),
             forked_from_id: params.forked_from_id,
             parent_thread_id: params.parent_thread_id,
             cwd: params.metadata.cwd.clone().unwrap_or_default(),
@@ -584,6 +891,15 @@ impl InMemoryThreadStore {
                 meta: session_meta,
                 git: None,
             }));
+        state.metadata_updates.insert(
+            params.thread_id,
+            ThreadMetadataPatch {
+                created_at: Some(created_at),
+                updated_at: Some(created_at),
+                advance_recency_at: Some(created_at),
+                ..Default::default()
+            },
+        );
         state.created_threads.insert(params.thread_id, params);
         Ok(())
     }
@@ -591,6 +907,7 @@ impl InMemoryThreadStore {
     async fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreResult<()> {
         let mut state = self.state.lock().await;
         state.calls.resume_thread += 1;
+        require_thread(&state, params.thread_id)?;
         let history_mode = params
             .history
             .as_deref()
@@ -606,6 +923,11 @@ impl InMemoryThreadStore {
             state.histories.entry(params.thread_id).or_default();
         }
         if let Some(rollout_path) = params.rollout_path {
+            state
+                .metadata_updates
+                .entry(params.thread_id)
+                .or_default()
+                .rollout_path = Some(rollout_path.clone());
             state.rollout_paths.insert(rollout_path, params.thread_id);
         }
         Ok(())
@@ -623,6 +945,7 @@ impl InMemoryThreadStore {
         state.calls.append_items_requests += 1;
         state.calls.append_owned_item_batches += 1;
         state.calls.owned_items_copied += params.items.len();
+        require_thread(&state, params.thread_id)?;
         let history_mode = history_mode_from_state(&state, params.thread_id);
         let persisted_items = persisted_rollout_items(params.items.as_slice(), history_mode);
         if persisted_items.is_empty() {
@@ -652,6 +975,7 @@ impl InMemoryThreadStore {
         let mut state = self.state.lock().await;
         state.calls.append_items_requests += 1;
         state.calls.append_borrowed_item_batches += 1;
+        require_thread(&state, thread_id)?;
         state.calls.append_items += 1;
         if ordered {
             state.calls.append_items_ordered += 1;
@@ -668,8 +992,25 @@ impl InMemoryThreadStore {
         &self,
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreResult<StoredThreadHistory> {
-        let mut state = self.state.lock().await;
-        state.calls.load_history += 1;
+        #[cfg(test)]
+        {
+            let gate = {
+                let mut state = self.state.lock().await;
+                state.calls.load_history += 1;
+                state.history_load_gate.take()
+            };
+            if let Some((entered, release)) = gate {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
+        let state = self.state.lock().await;
+        #[cfg(not(test))]
+        let state = {
+            let mut state = state;
+            state.calls.load_history += 1;
+            state
+        };
         let items =
             state
                 .histories
@@ -717,22 +1058,98 @@ impl InMemoryThreadStore {
         Ok(thread)
     }
 
-    async fn list_threads(&self) -> ThreadStoreResult<ThreadPage> {
+    async fn list_threads(&self, params: ListThreadsParams) -> ThreadStoreResult<ThreadPage> {
+        if params.cursor.is_some() {
+            return Err(ThreadStoreError::Unsupported {
+                operation: "in_memory_thread_list_pagination",
+            });
+        }
+        if params.storage_mode != crate::ThreadListStorageMode::PreferStateDb {
+            return Err(ThreadStoreError::Unsupported {
+                operation: "in_memory_thread_list_storage_mode",
+            });
+        }
         let mut state = self.state.lock().await;
         state.calls.list_threads += 1;
-        let mut items = state
+        let items = state
             .created_threads
             .keys()
-            .map(|thread_id| {
-                stored_thread_from_state(&state, *thread_id, /*include_history*/ false)
-            })
+            .map(|thread_id| stored_thread_from_state(&state, *thread_id, false))
             .collect::<ThreadStoreResult<Vec<_>>>()?;
-        items.sort_by_key(|item| item.thread_id.to_string());
-        Ok(ThreadPage {
+        let mut page = ThreadPage {
             items,
             next_cursor: None,
             backwards_cursor: None,
-        })
+        };
+        match params.relation_filter {
+            Some(ThreadRelationFilter::DirectChildrenOf(parent_thread_id)) => {
+                page.items
+                    .retain(|thread| thread.parent_thread_id == Some(parent_thread_id));
+            }
+            Some(ThreadRelationFilter::DescendantsOf(ancestor_thread_id)) => {
+                let mut subtree = HashSet::from([ancestor_thread_id]);
+                let mut children: HashMap<ThreadId, Vec<ThreadId>> = HashMap::new();
+                for thread in &page.items {
+                    if let Some(parent) = thread.parent_thread_id {
+                        children.entry(parent).or_default().push(thread.thread_id);
+                    }
+                }
+                let mut pending = vec![ancestor_thread_id];
+                while let Some(parent) = pending.pop() {
+                    for child in children.get(&parent).into_iter().flatten() {
+                        if subtree.insert(*child) {
+                            pending.push(*child);
+                        }
+                    }
+                }
+                page.items.retain(|thread| {
+                    thread.thread_id != ancestor_thread_id && subtree.contains(&thread.thread_id)
+                });
+            }
+            None => {}
+        }
+        page.items.retain(|thread| {
+            !params.archived
+                && (params.allowed_sources.is_empty()
+                    || params.allowed_sources.contains(&thread.source))
+                && params.model_providers.as_ref().is_none_or(|providers| {
+                    providers.is_empty() || providers.contains(&thread.model_provider)
+                })
+                && params
+                    .cwd_filters
+                    .as_ref()
+                    .is_none_or(|cwds| cwds.contains(&thread.cwd))
+                && params.search_term.as_ref().is_none_or(|term| {
+                    thread.preview.contains(term)
+                        || state
+                            .metadata_updates
+                            .get(&thread.thread_id)
+                            .and_then(|metadata| metadata.title.as_ref())
+                            .is_some_and(|title| title.contains(term))
+                        || thread.name.as_ref().is_some_and(|name| name.contains(term))
+                })
+        });
+        drop(state);
+        page.items.sort_by(|left, right| {
+            let timestamp = |thread: &StoredThread| match params.sort_key {
+                crate::ThreadSortKey::CreatedAt => thread.created_at,
+                crate::ThreadSortKey::UpdatedAt => thread.updated_at,
+                crate::ThreadSortKey::RecencyAt => thread.recency_at,
+            };
+            let order = timestamp(left)
+                .cmp(&timestamp(right))
+                .then_with(|| left.thread_id.to_string().cmp(&right.thread_id.to_string()));
+            match params.sort_direction {
+                crate::SortDirection::Asc => order,
+                crate::SortDirection::Desc => order.reverse(),
+            }
+        });
+        if page.items.len() > params.page_size {
+            return Err(ThreadStoreError::Unsupported {
+                operation: "in_memory_thread_list_pagination",
+            });
+        }
+        Ok(page)
     }
 
     async fn update_thread_metadata(
@@ -741,6 +1158,7 @@ impl InMemoryThreadStore {
     ) -> ThreadStoreResult<StoredThread> {
         let mut state = self.state.lock().await;
         state.calls.update_thread_metadata += 1;
+        require_thread(&state, params.thread_id)?;
         if let Some(name) = params.patch.name.clone() {
             state.names.insert(params.thread_id, name);
         }
@@ -873,38 +1291,7 @@ impl ThreadStore for InMemoryThreadStore {
     }
 
     fn list_threads(&self, params: ListThreadsParams) -> ThreadStoreFuture<'_, ThreadPage> {
-        Box::pin(async move {
-            let mut page = InMemoryThreadStore::list_threads(self).await?;
-            match params.relation_filter {
-                Some(ThreadRelationFilter::DirectChildrenOf(parent_thread_id)) => {
-                    page.items
-                        .retain(|thread| thread.parent_thread_id == Some(parent_thread_id));
-                }
-                Some(ThreadRelationFilter::DescendantsOf(ancestor_thread_id)) => {
-                    let mut subtree = HashSet::from([ancestor_thread_id]);
-                    loop {
-                        let mut discovered = false;
-                        for thread in &page.items {
-                            if thread
-                                .parent_thread_id
-                                .is_some_and(|parent_thread_id| subtree.contains(&parent_thread_id))
-                            {
-                                discovered |= subtree.insert(thread.thread_id);
-                            }
-                        }
-                        if !discovered {
-                            break;
-                        }
-                    }
-                    page.items.retain(|thread| {
-                        thread.thread_id != ancestor_thread_id
-                            && subtree.contains(&thread.thread_id)
-                    });
-                }
-                None => {}
-            }
-            Ok(page)
-        })
+        Box::pin(InMemoryThreadStore::list_threads(self, params))
     }
 
     fn update_thread_metadata(
@@ -917,20 +1304,34 @@ impl ThreadStore for InMemoryThreadStore {
     fn archive_thread(&self, _params: ArchiveThreadParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
             self.state.lock().await.calls.archive_thread += 1;
-            Ok(())
+            Err(ThreadStoreError::Unsupported {
+                operation: "in_memory_archive_thread",
+            })
         })
     }
 
-    fn unarchive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreFuture<'_, StoredThread> {
+    fn unarchive_thread(
+        &self,
+        _params: ArchiveThreadParams,
+    ) -> ThreadStoreFuture<'_, StoredThread> {
         Box::pin(async move {
-            let mut state = self.state.lock().await;
-            state.calls.unarchive_thread += 1;
-            stored_thread_from_state(&state, params.thread_id, /*include_history*/ false)
+            self.state.lock().await.calls.unarchive_thread += 1;
+            Err(ThreadStoreError::Unsupported {
+                operation: "in_memory_unarchive_thread",
+            })
         })
     }
 
     fn delete_thread(&self, params: DeleteThreadParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(InMemoryThreadStore::delete_thread(self, params))
+    }
+}
+
+fn require_thread(state: &InMemoryThreadStoreState, thread_id: ThreadId) -> ThreadStoreResult<()> {
+    if state.created_threads.contains_key(&thread_id) {
+        Ok(())
+    } else {
+        Err(ThreadStoreError::ThreadNotFound { thread_id })
     }
 }
 
@@ -943,26 +1344,20 @@ fn stored_thread_from_state(
         .created_threads
         .get(&thread_id)
         .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
-    let history_items = state.histories.get(&thread_id).cloned().unwrap_or_default();
     let history = include_history.then(|| StoredThreadHistory {
         thread_id,
-        items: history_items.clone(),
+        items: state.histories.get(&thread_id).cloned().unwrap_or_default(),
     });
     let name = state.names.get(&thread_id).cloned().flatten();
     let metadata = state.metadata_updates.get(&thread_id);
-    let rollout_path = state
-        .rollout_paths
-        .iter()
-        .find_map(|(path, mapped_thread_id)| {
-            (*mapped_thread_id == thread_id).then(|| path.clone())
-        });
 
+    let missing_timestamp = || ThreadStoreError::Internal {
+        message: format!("thread {thread_id} is missing its creation timestamps"),
+    };
     Ok(StoredThread {
         thread_id,
         extra_config: created.extra_config.clone(),
-        rollout_path: metadata
-            .and_then(|metadata| metadata.rollout_path.clone())
-            .or(rollout_path),
+        rollout_path: metadata.and_then(|metadata| metadata.rollout_path.clone()),
         forked_from_id: created.forked_from_id,
         parent_thread_id: created.parent_thread_id,
         preview: metadata
@@ -971,22 +1366,22 @@ fn stored_thread_from_state(
         name,
         model_provider: metadata
             .and_then(|metadata| metadata.model_provider.clone())
-            .unwrap_or_else(|| "test".to_string()),
+            .unwrap_or_else(|| created.metadata.model_provider.clone()),
         model: metadata.and_then(|metadata| metadata.model.clone()),
         reasoning_effort: metadata.and_then(|metadata| metadata.reasoning_effort.clone().flatten()),
         created_at: metadata
             .and_then(|metadata| metadata.created_at)
-            .unwrap_or_else(Utc::now),
+            .ok_or_else(missing_timestamp)?,
         updated_at: metadata
             .and_then(|metadata| metadata.updated_at)
-            .unwrap_or_else(Utc::now),
+            .ok_or_else(missing_timestamp)?,
         recency_at: metadata
-            .and_then(|metadata| metadata.advance_recency_at.or(metadata.updated_at))
-            .unwrap_or_else(Utc::now),
+            .and_then(|metadata| metadata.advance_recency_at)
+            .ok_or_else(missing_timestamp)?,
         archived_at: None,
         cwd: metadata
             .and_then(|metadata| metadata.cwd.clone())
-            .unwrap_or_default(),
+            .unwrap_or_else(|| created.metadata.cwd.clone().unwrap_or_default()),
         cli_version: metadata
             .and_then(|metadata| metadata.cli_version.clone())
             .unwrap_or_else(|| "test".to_string()),

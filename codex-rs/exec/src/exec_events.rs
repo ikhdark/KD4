@@ -18,7 +18,7 @@ pub enum ThreadEvent {
     TurnStarted(TurnStartedEvent),
     /// Emitted when a turn is completed. Typically right after the assistant's response.
     #[serde(rename = "turn.completed")]
-    TurnCompleted(TurnCompletedEvent),
+    TurnCompleted(Box<TurnCompletedEvent>),
     /// Indicates that a turn failed with an error.
     #[serde(rename = "turn.failed")]
     TurnFailed(TurnFailedEvent),
@@ -117,8 +117,7 @@ pub enum ThreadItemDetails {
     /// Records a failed code-mode cell, including stable call/cell identifiers
     /// and the runtime's error text.
     CodeModeCell(CodeModeCellItem),
-    /// Represents a set of file changes by the agent. The item is emitted only as a
-    /// completed event once the patch succeeds or fails.
+    /// Represents a set of file changes by the agent, from application start through completion.
     FileChange(FileChangeItem),
     /// Represents a call to an MCP tool. The item starts when the invocation is
     /// dispatched and completes when the MCP server reports success or failure.
@@ -220,6 +219,7 @@ pub enum PatchApplyStatus {
     InProgress,
     Completed,
     Failed,
+    Declined,
 }
 
 /// A set of file changes by the agent.

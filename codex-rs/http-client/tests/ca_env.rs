@@ -114,6 +114,28 @@ fn run_probe(envs: &[(&str, &Path)]) -> std::process::Output {
     cmd.output().expect("custom_ca_probe should run")
 }
 
+#[test]
+fn exclusive_ca_probe_rejects_unsupported_settings() {
+    let temp = TempDir::new().expect("temp directory");
+    let cert = write_cert_file(&temp, "exclusive.pem", TRUSTED_TEST_CERT);
+    for (setting, value) in [
+        (PROBE_PROXY_ENV, "http://localhost:8080"),
+        (PROBE_TLS13_ENV, "1"),
+    ] {
+        let output = probe_command()
+            .env(PROBE_EXCLUSIVE_CA_ENV, &cert)
+            .env(setting, value)
+            .output()
+            .expect("run probe");
+        assert!(!output.status.success(), "probe silently ignored {setting}");
+        assert_eq!(
+            String::from_utf8(output.stderr).expect("stderr").trim(),
+            format!("{PROBE_EXCLUSIVE_CA_ENV} cannot be combined with {setting}")
+        );
+        assert!(output.stdout.is_empty());
+    }
+}
+
 fn run_probe_posting_to_tls13_server(envs: &[(&str, &Path)], url: &str) -> std::process::Output {
     let mut cmd = probe_command();
     for (key, value) in envs {

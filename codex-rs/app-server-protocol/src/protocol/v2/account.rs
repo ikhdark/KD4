@@ -61,7 +61,7 @@ impl From<ProviderAccount> for Account {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
 #[serde(tag = "type")]
 #[ts(tag = "type")]
 #[ts(export_to = "v2/")]
@@ -202,7 +202,7 @@ pub struct ChatgptAuthTokensRefreshParams {
     pub previous_account_id: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ChatgptAuthTokensRefreshResponse {
@@ -598,4 +598,49 @@ pub struct AccountLoginCompletedNotification {
     pub login_id: Option<String>,
     pub success: bool,
     pub error: Option<String>,
+}
+
+impl std::fmt::Debug for ChatgptAuthTokensRefreshResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatgptAuthTokensRefreshResponse")
+            .field("access_token", &"[REDACTED]")
+            .field("chatgpt_account_id", &self.chatgpt_account_id)
+            .field("chatgpt_plan_type", &self.chatgpt_plan_type)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for LoginAccountParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApiKey { .. } => f
+                .debug_struct("ApiKey")
+                .field("api_key", &"[REDACTED]")
+                .finish(),
+            Self::Chatgpt {
+                codex_streamlined_login,
+                use_hosted_login_success_page,
+                app_brand,
+            } => f
+                .debug_struct("Chatgpt")
+                .field("codex_streamlined_login", codex_streamlined_login)
+                .field(
+                    "use_hosted_login_success_page",
+                    use_hosted_login_success_page,
+                )
+                .field("app_brand", app_brand)
+                .finish(),
+            Self::ChatgptDeviceCode => f.write_str("ChatgptDeviceCode"),
+            Self::ChatgptAuthTokens {
+                chatgpt_account_id,
+                chatgpt_plan_type,
+                ..
+            } => f
+                .debug_struct("ChatgptAuthTokens")
+                .field("access_token", &"[REDACTED]")
+                .field("chatgpt_account_id", chatgpt_account_id)
+                .field("chatgpt_plan_type", chatgpt_plan_type)
+                .finish(),
+        }
+    }
 }

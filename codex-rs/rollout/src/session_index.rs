@@ -67,10 +67,19 @@ fn append_session_index_entry_blocking(
         let path = session_index_path(codex_home);
         let mut file = std::fs::OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&path)?;
         let mut line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
         line.push('\n');
+        if file.metadata()?.len() > 0 {
+            file.seek(SeekFrom::End(-1))?;
+            let mut tail = [0];
+            file.read_exact(&mut tail)?;
+            if tail[0] != b'\n' {
+                file.write_all(b"\n")?;
+            }
+        }
         file.write_all(line.as_bytes())?;
         file.flush()
     })
@@ -230,9 +239,10 @@ fn scan_index_from_end_by_ids(
     let mut names = HashMap::with_capacity(thread_ids.len());
     match scan_index_from_end_for_each(path, |entry| {
         let name = entry.thread_name.trim();
-        if pending.contains(&entry.id) && !name.is_empty() {
-            names.insert(entry.id, name.to_string());
-            pending.remove(&entry.id);
+        if pending.remove(&entry.id) {
+            if !name.is_empty() {
+                names.insert(entry.id, name.to_string());
+            }
             if pending.is_empty() {
                 return Ok(Some(entry.clone()));
             }
@@ -252,6 +262,9 @@ fn stream_thread_ids_from_end_by_name(
 ) -> std::io::Result<()> {
     let mut seen = HashSet::new();
     scan_index_from_end_for_each(path, |entry| {
+        if tx.is_closed() {
+            return Ok(Some(entry.clone()));
+        }
         // The first row seen for an id is its latest name. Ignore older rows for that id so a
         // historical name cannot be treated as the current one after the thread is renamed.
         if seen.insert(entry.id) && entry.thread_name == name && tx.blocking_send(entry.id).is_err()

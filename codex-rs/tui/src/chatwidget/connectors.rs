@@ -9,7 +9,7 @@ pub(super) enum ConnectorsCacheState {
     Uninitialized,
     Loading,
     Ready(ConnectorsSnapshot),
-    Failed(String),
+    Failed,
 }
 
 #[derive(Debug, Default)]
@@ -95,10 +95,9 @@ impl ChatWidget {
                     self.open_connectors_popup(&snapshot.connectors);
                 }
             }
-            ConnectorsCacheState::Failed(err) => {
-                self.add_to_history(history_cell::new_error_event(err));
-            }
-            ConnectorsCacheState::Loading | ConnectorsCacheState::Uninitialized => {
+            ConnectorsCacheState::Failed
+            | ConnectorsCacheState::Loading
+            | ConnectorsCacheState::Uninitialized => {
                 self.open_connectors_loading_popup();
             }
         }
@@ -239,6 +238,9 @@ impl ChatWidget {
     }
 
     fn refresh_connectors_popup_if_open(&mut self, connectors: &[AppInfo]) {
+        if self.bottom_pane.active_view_id() != Some(CONNECTORS_SELECTION_VIEW_ID) {
+            return;
+        }
         let selected_connector_id =
             if let (Some(selected_index), ConnectorsCacheState::Ready(snapshot)) = (
                 self.bottom_pane
@@ -303,16 +305,19 @@ impl ChatWidget {
 
         match result {
             Ok(mut snapshot) => {
-                if let ConnectorsCacheState::Ready(existing_snapshot) = &self.connectors.cache {
-                    let enabled_by_id: HashMap<&str, bool> = existing_snapshot
-                        .connectors
-                        .iter()
-                        .map(|connector| (connector.id.as_str(), connector.is_enabled))
-                        .collect();
-                    for connector in &mut snapshot.connectors {
-                        if let Some(is_enabled) = enabled_by_id.get(connector.id.as_str()) {
-                            connector.is_enabled = *is_enabled;
-                        }
+                let ready_snapshot = match &self.connectors.cache {
+                    ConnectorsCacheState::Ready(snapshot) => Some(snapshot),
+                    _ => None,
+                };
+                let enabled_by_id: HashMap<&str, bool> = ready_snapshot
+                    .into_iter()
+                    .chain(self.connectors.partial_snapshot.as_ref())
+                    .flat_map(|snapshot| &snapshot.connectors)
+                    .map(|connector| (connector.id.as_str(), connector.is_enabled))
+                    .collect();
+                for connector in &mut snapshot.connectors {
+                    if let Some(is_enabled) = enabled_by_id.get(connector.id.as_str()) {
+                        connector.is_enabled = *is_enabled;
                     }
                 }
                 if is_final {
@@ -338,7 +343,13 @@ impl ChatWidget {
                     self.connectors.cache = ConnectorsCacheState::Ready(snapshot.clone());
                     self.bottom_pane.set_connectors_snapshot(Some(snapshot));
                 } else {
-                    self.connectors.cache = ConnectorsCacheState::Failed(err);
+                    if self
+                        .bottom_pane
+                        .dismiss_active_view_if_id(CONNECTORS_SELECTION_VIEW_ID)
+                    {
+                        self.add_error_message(err);
+                    }
+                    self.connectors.cache = ConnectorsCacheState::Failed;
                     self.bottom_pane.set_connectors_snapshot(/*snapshot*/ None);
                 }
             }
@@ -350,7 +361,18 @@ impl ChatWidget {
     }
 
     pub(crate) fn update_connector_enabled(&mut self, connector_id: &str, enabled: bool) {
+        if let Some(snapshot) = &mut self.connectors.partial_snapshot {
+            for connector in &mut snapshot.connectors {
+                if connector.id == connector_id {
+                    connector.is_enabled = enabled;
+                }
+            }
+        }
         let ConnectorsCacheState::Ready(mut snapshot) = self.connectors.cache.clone() else {
+            if let Some(snapshot) = &self.connectors.partial_snapshot {
+                self.bottom_pane
+                    .set_connectors_snapshot(Some(snapshot.clone()));
+            }
             return;
         };
 
@@ -364,11 +386,17 @@ impl ChatWidget {
         }
 
         if !changed {
+            if let Some(snapshot) = &self.connectors.partial_snapshot {
+                self.bottom_pane
+                    .set_connectors_snapshot(Some(snapshot.clone()));
+            }
             return;
         }
 
         self.refresh_connectors_popup_if_open(&snapshot.connectors);
         self.connectors.cache = ConnectorsCacheState::Ready(snapshot.clone());
-        self.bottom_pane.set_connectors_snapshot(Some(snapshot));
+        self.bottom_pane.set_connectors_snapshot(Some(
+            self.connectors.partial_snapshot.clone().unwrap_or(snapshot),
+        ));
     }
 }

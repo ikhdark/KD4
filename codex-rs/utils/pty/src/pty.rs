@@ -21,11 +21,13 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use anyhow::Result;
+#[cfg(not(unix))]
 use portable_pty::CommandBuilder;
-#[cfg(not(windows))]
+#[cfg(not(any(unix, windows)))]
 use portable_pty::native_pty_system;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+#[cfg(any(not(unix), test))]
 use tokio::task::JoinHandle;
 
 #[cfg(windows)]
@@ -55,58 +57,37 @@ pub fn conpty_supported() -> bool {
     true
 }
 
+#[cfg(not(unix))]
 struct PtyChildTerminator {
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
-    #[cfg(unix)]
-    process_group_id: Option<u32>,
 }
 
+#[cfg(not(unix))]
 impl ChildTerminator for PtyChildTerminator {
     fn signal(&mut self, signal: ProcessSignal) -> std::io::Result<()> {
-        match signal {
-            ProcessSignal::Interrupt => {
-                #[cfg(unix)]
-                if let Some(process_group_id) = self.process_group_id {
-                    return crate::process_group::interrupt_process_group(process_group_id);
-                }
-                Err(crate::process::unsupported_signal(signal))
-            }
-        }
+        Err(crate::process::unsupported_signal(signal))
     }
 
     fn kill(&mut self) -> std::io::Result<()> {
-        #[cfg(unix)]
-        if let Some(process_group_id) = self.process_group_id {
-            let process_group_kill_result =
-                crate::process_group::kill_process_group(process_group_id);
-            let child_kill_result = self.killer.kill();
-            return match child_kill_result {
-                Ok(()) => Ok(()),
-                Err(err) if err.kind() == ErrorKind::NotFound => process_group_kill_result,
-                Err(err) => process_group_kill_result.or(Err(err)),
-            };
-        }
         self.killer.kill()
     }
 }
 
 #[cfg(unix)]
 struct RawPidTerminator {
-    process_group_id: u32,
+    process_group: Arc<crate::process::ProcessGroupControl>,
 }
 
 #[cfg(unix)]
 impl ChildTerminator for RawPidTerminator {
     fn signal(&mut self, signal: ProcessSignal) -> std::io::Result<()> {
         match signal {
-            ProcessSignal::Interrupt => {
-                crate::process_group::interrupt_process_group(self.process_group_id)
-            }
+            ProcessSignal::Interrupt => self.process_group.signal(signal),
         }
     }
 
     fn kill(&mut self) -> std::io::Result<()> {
-        crate::process_group::kill_process_group(self.process_group_id)
+        self.process_group.kill()
     }
 }
 
@@ -116,6 +97,7 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
+#[cfg(not(unix))]
 fn platform_native_pty_system() -> Box<dyn portable_pty::PtySystem + Send> {
     #[cfg(all(test, windows))]
     if let Some(system) = TEST_PTY_SYSTEM.with(|system| system.borrow_mut().take()) {
@@ -134,6 +116,7 @@ fn platform_native_pty_system() -> Box<dyn portable_pty::PtySystem + Send> {
 // Keep the receiver asynchronous so aborting the owning ProcessHandle drops the
 // queue even when external sender clones remain. At most one native write is in
 // flight; terminating/releasing the process closes its PTY and releases that write.
+#[cfg(any(not(unix), test))]
 fn spawn_pty_writer<W>(mut writer: W, mut receiver: mpsc::Receiver<Vec<u8>>) -> JoinHandle<()>
 where
     W: std::io::Write + Send + 'static,
@@ -156,6 +139,53 @@ where
             }
         }
     })
+}
+
+// Native readers return WouldBlock when no bytes are available. Queue backpressure and
+// retry delays belong to this abortable async owner, never to a lifetime-long worker.
+#[cfg(any(not(unix), test))]
+fn spawn_pty_reader<R>(mut reader: R, output: mpsc::Sender<Vec<u8>>) -> JoinHandle<()>
+where
+    R: std::io::Read + Send + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            let result = tokio::task::spawn_blocking(move || {
+                let mut buf = vec![0u8; 8_192];
+                let result = reader.read(&mut buf);
+                (reader, buf, result)
+            })
+            .await;
+            let Ok((returned_reader, mut buf, result)) = result else {
+                break;
+            };
+            reader = returned_reader;
+            match result {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.truncate(n);
+                    if output.send(buf).await.is_err() {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+#[cfg(unix)]
+fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
+    // SAFETY: fcntl receives an owned descriptor and scalar flags only.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Spawn a process attached to a PTY, returning handles for stdin, split output, and exit.
@@ -189,14 +219,16 @@ pub async fn spawn_process_with_inherited_fds(
     let _ = inherited_fds;
 
     #[cfg(unix)]
-    if !inherited_fds.is_empty() {
-        return spawn_process_preserving_fds(program, args, cwd, env, arg0, size, inherited_fds)
-            .await;
+    {
+        spawn_process_preserving_fds(program, args, cwd, env, arg0, size, inherited_fds).await
     }
-
-    spawn_process_portable(program, args, cwd, env, arg0, size).await
+    #[cfg(not(unix))]
+    {
+        spawn_process_portable(program, args, cwd, env, arg0, size).await
+    }
 }
 
+#[cfg(not(unix))]
 async fn spawn_process_portable(
     program: &str,
     args: &[String],
@@ -209,10 +241,11 @@ async fn spawn_process_portable(
     let pair = pty_system.openpty(size.into())?;
     let portable_pty::PtyPair { master, slave } = pair;
     // Complete fallible descriptor setup before starting a child or reader task.
-    let mut reader = master.try_clone_reader()?;
+    let reader = master.try_clone_reader()?;
     let writer = master.take_writer()?;
 
-    let mut command_builder = CommandBuilder::new(arg0.as_ref().unwrap_or(&program.to_string()));
+    let _ = arg0; // Windows has no distinct Unix argv[0] override.
+    let mut command_builder = CommandBuilder::new(program);
     command_builder.cwd(cwd);
     command_builder.env_clear();
     for arg in args {
@@ -234,31 +267,12 @@ async fn spawn_process_portable(
     #[cfg(not(windows))]
     let mut child = slave.spawn_command(command_builder)?;
 
-    #[cfg(unix)]
-    let process_group_id = child.process_id();
-
     let killer = child.clone_killer();
 
     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(128);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
     let (_stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(1);
-    let reader_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
-        let mut buf = [0u8; 8_192];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let _ = stdout_tx.blocking_send(buf[..n].to_vec());
-                }
-                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    let reader_handle = spawn_pty_reader(reader, stdout_tx);
 
     let writer_handle = spawn_pty_writer(writer, writer_rx);
 
@@ -267,10 +281,34 @@ async fn spawn_process_portable(
     let wait_exit_status = Arc::clone(&exit_status);
     let exit_code = Arc::new(StdMutex::new(None));
     let wait_exit_code = Arc::clone(&exit_code);
-    let wait_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
-        let code = match child.wait() {
-            Ok(status) => status.exit_code() as i32,
-            Err(_) => -1,
+    let wait_handle = tokio::spawn(async move {
+        let mut warned = false;
+        let code = loop {
+            // Native status checks are short; an idle child never occupies a blocking
+            // worker needed to deliver the input that will let it exit.
+            let result = match tokio::task::spawn_blocking(move || {
+                let result = child.try_wait();
+                (child, result)
+            })
+            .await {
+                Ok(result) => result,
+                Err(error) => {
+                    log::error!("PTY status worker failed: {error}");
+                    return;
+                }
+            };
+            child = result.0;
+            match result.1 {
+                Ok(Some(status)) => break status.exit_code() as i32,
+                Ok(None) => {}
+                Err(error) => {
+                    if !warned {
+                        log::warn!("failed to observe PTY exit; retaining child: {error}");
+                        warned = true;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         };
         publish_exit_status(&wait_exit_status, &wait_exit_code, code);
         let _ = exit_tx.send(code);
@@ -283,11 +321,7 @@ async fn spawn_process_portable(
 
     let handle = ProcessHandle::new(
         writer_tx,
-        Box::new(PtyChildTerminator {
-            killer,
-            #[cfg(unix)]
-            process_group_id,
-        }),
+        Box::new(PtyChildTerminator { killer }),
         reader_handle,
         Vec::new(),
         writer_handle,
@@ -369,45 +403,77 @@ async fn spawn_process_preserving_fds(
 
     // Finish all fallible parent-side PTY setup before spawning so an error
     // cannot leave a live child without a ProcessHandle.
-    let mut reader = master.try_clone()?;
-    let writer = master.try_clone()?;
+    // All duplicates share O_NONBLOCK; both read and write paths use readiness below.
+    set_nonblocking(master.as_raw_fd())?;
+    let reader = tokio::io::unix::AsyncFd::new(master.try_clone()?)?;
+    let writer = tokio::io::unix::AsyncFd::new(master.try_clone()?)?;
 
     let mut child = command.spawn()?;
     drop(slave);
-    let process_group_id = child.id();
+    let process_group = Arc::new(crate::process::ProcessGroupControl::new(child.id()));
 
     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(128);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
     let (_stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(1);
-    let reader_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
+    let reader_handle = tokio::spawn(async move {
+        use std::io::Read;
         let mut buf = [0u8; 8_192];
-        loop {
-            match std::io::Read::read(&mut reader, &mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let _ = stdout_tx.blocking_send(buf[..n].to_vec());
+        while let Ok(mut ready) = reader.readable().await {
+            match ready.try_io(|fd| fd.get_ref().read(&mut buf)) {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => {
+                    if stdout_tx.send(buf[..n].to_vec()).await.is_err() {
+                        break;
+                    }
                 }
-                Err(ref error) if error.kind() == ErrorKind::Interrupted => continue,
-                Err(ref error) if error.kind() == ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-                Err(_) => break,
+                Ok(Err(error)) if error.kind() == ErrorKind::Interrupted => continue,
+                Ok(Err(_)) => break,
+                Err(_) => continue,
             }
         }
     });
 
-    let writer_handle = spawn_pty_writer(writer, writer_rx);
+    let writer_handle = tokio::spawn(async move {
+        use std::io::Write;
+        let mut writer_rx = writer_rx;
+        while let Some(bytes) = writer_rx.recv().await {
+            let mut remaining = bytes.as_slice();
+            while !remaining.is_empty() {
+                let Ok(mut ready) = writer.writable().await else {
+                    return;
+                };
+                match ready.try_io(|fd| fd.get_ref().write(remaining)) {
+                    Ok(Ok(0)) => return,
+                    Ok(Ok(n)) => remaining = &remaining[n..],
+                    Ok(Err(error)) if error.kind() == ErrorKind::Interrupted => continue,
+                    Ok(Err(_)) => return,
+                    Err(_) => continue,
+                }
+            }
+        }
+    });
 
     let (exit_tx, exit_rx) = oneshot::channel::<i32>();
     let exit_status = Arc::new(AtomicBool::new(false));
     let wait_exit_status = Arc::clone(&exit_status);
     let exit_code = Arc::new(StdMutex::new(None));
     let wait_exit_code = Arc::clone(&exit_code);
-    let wait_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
-        let code = match child.wait() {
-            Ok(status) => exit_code_from_status(status),
-            Err(_) => -1,
+    let wait_group = Arc::clone(&process_group);
+    let wait_handle = tokio::spawn(async move {
+        wait_group.disarm_after_exit().await;
+        let mut warned = false;
+        let code = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break exit_code_from_status(status),
+                Ok(None) => {}
+                Err(error) => {
+                    if !warned {
+                        log::warn!("failed to reap PTY child; retaining owner: {error}");
+                        warned = true;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         };
         publish_exit_status(&wait_exit_status, &wait_exit_code, code);
         let _ = exit_tx.send(code);
@@ -415,15 +481,12 @@ async fn spawn_process_preserving_fds(
 
     let handles = PtyHandles {
         _slave: None,
-        _master: PtyMasterHandle::Opaque {
-            raw_fd: master.as_raw_fd(),
-            _handle: Box::new(master),
-        },
+        _master: PtyMasterHandle::Owned(master),
     };
 
     let handle = ProcessHandle::new(
         writer_tx,
-        Box::new(RawPidTerminator { process_group_id }),
+        Box::new(RawPidTerminator { process_group }),
         reader_handle,
         Vec::new(),
         writer_handle,
@@ -508,6 +571,160 @@ fn configure_owned_pty_files<T>(
 
 #[cfg(test)]
 mod pty_fd_tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn public_pty_preserves_arg0_and_resizes_owned_master() -> anyhow::Result<()> {
+        let spawned = super::spawn_process(
+            "/bin/sh",
+            &[
+                "-c".into(),
+                "printf '%s\\n' \"$0\"; read line; stty size".into(),
+            ],
+            &std::env::current_dir()?,
+            &std::env::vars().collect(),
+            &Some("codex-custom-argv-zero".into()),
+            super::TerminalSize::default(),
+        )
+        .await?;
+        let crate::SpawnedProcess {
+            session,
+            mut stdout_rx,
+            exit_rx,
+            ..
+        } = spawned;
+        session.resize(super::TerminalSize {
+            rows: 41,
+            cols: 113,
+        })?;
+        session.writer_sender().send(b"go\n".to_vec()).await?;
+        let (output, code) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut output = Vec::new();
+            while let Some(chunk) = stdout_rx.recv().await {
+                output.extend(chunk);
+            }
+            (output, exit_rx.await)
+        })
+        .await?;
+        assert_eq!(code?, 0);
+        let output = String::from_utf8(output)?;
+        assert!(output.contains("codex-custom-argv-zero\r\n"), "{output:?}");
+        assert!(output.contains("41 113\r\n"), "{output:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aborting_backpressured_reader_releases_native_owner() {
+        struct Reader(Option<tokio::sync::oneshot::Sender<()>>);
+        impl std::io::Read for Reader {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                bytes[0] = b'x';
+                Ok(1)
+            }
+        }
+        impl Drop for Reader {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
+        let reader = super::spawn_pty_reader(Reader(Some(dropped_tx)), output_tx);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while output_rx.len() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        reader.abort();
+        assert!(reader.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(2), dropped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(output_rx.recv().await.unwrap(), b"x");
+        assert_eq!(output_rx.recv().await, None);
+    }
+
+    #[test]
+    fn idle_ptys_do_not_starve_input_on_a_small_blocking_pool() -> anyhow::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(2)
+            .build()?;
+        // Bound teardown too: a regression must fail rather than hang runtime Drop.
+        let result = runtime.block_on(async {
+            #[cfg(windows)]
+            let (program, args) = (
+                "cmd.exe",
+                vec![
+                    "/D".into(),
+                    "/Q".into(),
+                    "/C".into(),
+                    "set /p CODEX_PTY_INPUT= & echo input-received".into(),
+                ],
+            );
+            #[cfg(not(windows))]
+            let (program, args) = (
+                "/bin/sh",
+                vec!["-c".into(), "read line; printf input-received".into()],
+            );
+            let mut children = Vec::new();
+            for _ in 0..3 {
+                children.push(
+                    super::spawn_process(
+                        program,
+                        &args,
+                        &std::env::current_dir()?,
+                        &std::env::vars().collect(),
+                        &None,
+                        super::TerminalSize::default(),
+                    )
+                    .await?,
+                );
+            }
+            for child in children {
+                let crate::SpawnedProcess {
+                    session,
+                    mut stdout_rx,
+                    exit_rx,
+                    ..
+                } = child;
+                session.writer_sender().send(b"go\n".to_vec()).await?;
+                let mut output = Vec::new();
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while !String::from_utf8_lossy(&output).contains("input-received") {
+                        let chunk = stdout_rx
+                            .recv()
+                            .await
+                            .expect("PTY closed before input was processed");
+                        output.extend(chunk);
+                    }
+                })
+                .await?;
+                assert_eq!(
+                    tokio::time::timeout(std::time::Duration::from_secs(5), exit_rx).await??,
+                    0
+                );
+                session.release_pty_after_exit();
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while let Some(chunk) = stdout_rx.recv().await {
+                        output.extend(chunk);
+                    }
+                })
+                .await?;
+                assert_eq!(
+                    String::from_utf8_lossy(&output)
+                        .matches("input-received")
+                        .count(),
+                    1
+                );
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+        result
+    }
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
@@ -586,7 +803,7 @@ mod pty_fd_tests {
         use std::time::Duration;
 
         let source = std::fs::File::open("/dev/null")?;
-        let duplicate = |minimum| -> std::io::Result<OwnedFd> {
+        let duplicate = |minimum: libc::c_int| -> std::io::Result<OwnedFd> {
             // SAFETY: source owns a live descriptor; F_DUPFD returns a separate inheritable
             // descriptor, with failure checked before ownership is transferred.
             let fd = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD, minimum) };

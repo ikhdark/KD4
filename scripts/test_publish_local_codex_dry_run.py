@@ -183,6 +183,13 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
             user_profile.mkdir()
             env = self.publish_env_without_v8_archive(user_profile)
 
+            calls = temp_path / "cargo-calls.txt"
+            fake_bin = temp_path / "bin"
+            fake_bin.mkdir()
+            (fake_bin / "cargo.cmd").write_text(
+                f'@echo off\necho invoked>>"{calls}"\nexit /b 0\n', encoding="utf-8"
+            )
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
             result = self.run_script(
                 "-SourceExe",
                 str(self.source_exe),
@@ -198,7 +205,9 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
                 f"Rusty V8 archive is missing for v149.2.0 ({target})",
                 combined,
             )
-            self.assertNotIn("cargo check failed", combined)
+            self.assertFalse(
+                calls.exists(), "Cargo must not run before prerequisites pass"
+            )
 
     def test_publish_seeds_windows_rusty_v8_cache_from_archive(self) -> None:
         self.write_cargo_lock_with_v8()
@@ -344,11 +353,7 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
             self.assert_proof_value(
                 result.stdout, "desktopCliPathEnvAction", "would set"
             )
-            self.assert_proof_value(
-                result.stdout,
-                "officialEnvCleanup",
-                "skipped: Process-scoped routing does not modify persisted User environment",
-            )
+            self.assertNotIn("officialEnvCleanup", result.stdout)
             self.assert_proof_value(
                 result.stdout,
                 "desktopUserPathLocalBinAction",
@@ -360,6 +365,14 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
             install_dir = Path(temp_dir) / "install"
             local_codex_home = Path(temp_dir) / "codex-home"
 
+            observed = {
+                name: Path(temp_dir) / (name + ".called")
+                for name in (
+                    "Write-ProofLine",
+                    "Set-EnvironmentVariableForTarget",
+                    "Set-PathEnvironmentVariableForTarget",
+                )
+            }
             result = self.run_script(
                 "-DryRun",
                 "-SkipBuild",
@@ -372,8 +385,14 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
                 str(install_dir),
                 "-LocalCodexHome",
                 str(local_codex_home),
+                observe_commands=observed,
             )
 
+            self.assertTrue(observed["Write-ProofLine"].exists(), result.stderr)
+            self.assertFalse(observed["Set-EnvironmentVariableForTarget"].exists())
+            self.assertFalse(observed["Set-PathEnvironmentVariableForTarget"].exists())
+            self.assertFalse(local_codex_home.exists())
+            self.assertFalse(install_dir.exists())
             self.assertEqual(
                 result.returncode,
                 0,
@@ -436,11 +455,7 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
             "desktopCliPathEnvTarget",
             str(expected_target),
         )
-        self.assert_proof_value(
-            result.stdout,
-            "officialEnvCleanup",
-            "CODEX_HOME unset, CODEX_CLI_PATH unset, CODEX_SQLITE_HOME unset",
-        )
+        self.assertNotIn("officialEnvCleanup", result.stdout)
         self.assertNotEqual(
             self.proof_value(result.stdout, "localCodexHome"),
             str(stale_codex_home),
@@ -610,7 +625,7 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
                     },
                     before,
                 )
-                self.assertFalse((install_dir / "backups").exists())
+                self.assertFalse((install_dir.parent / "publisher-backups").exists())
                 if scenario == "dry-run-noop":
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assert_proof_value(result.stdout, "binaryChanged", "false")

@@ -221,6 +221,9 @@ impl LocalThreadProjection {
     }
 
     fn append_durable(&mut self, items: &[RolloutItem]) -> ThreadStoreResult<()> {
+        if self.pending_items.is_empty() {
+            return self.apply_persisted_items(items);
+        }
         let mut durable_items = std::mem::take(&mut self.pending_items);
         durable_items.extend_from_slice(items);
         self.apply_persisted_items(durable_items.as_slice())
@@ -257,12 +260,11 @@ impl LocalThreadProjection {
             anchor.as_ref().map(|anchor| anchor.include_anchor),
             params.sort_direction,
         );
-        let mut turns = ordered_page_indexes(start, end, params.sort_direction)
-            .take(params.page_size.saturating_add(1))
+        let has_more = end - start > params.page_size;
+        let turns = ordered_page_indexes(start, end, params.sort_direction)
+            .take(params.page_size)
             .map(|index| self.materialize_turn(&self.turn_order[index], params.items_view))
             .collect::<ThreadStoreResult<Vec<_>>>()?;
-        let has_more = turns.len() > params.page_size;
-        turns.truncate(params.page_size);
         let backwards_cursor = turns
             .first()
             .map(|turn| serialize_turn_cursor(turn.turn_id.as_str(), true))
@@ -301,7 +303,8 @@ impl LocalThreadProjection {
             .as_deref()
             .map(parse_item_cursor)
             .transpose()?;
-        let mut page_items = Vec::with_capacity(params.page_size.saturating_add(1));
+        let mut page_items = Vec::new();
+        let has_more;
         if let Some(turn_id) = params.turn_id.as_deref() {
             let turn = self
                 .turns
@@ -324,8 +327,10 @@ impl LocalThreadProjection {
                 anchor.as_ref().map(|anchor| anchor.include_anchor),
                 params.sort_direction,
             );
-            for index in ordered_page_indexes(start, end, params.sort_direction)
-                .take(params.page_size.saturating_add(1))
+            has_more = end - start > params.page_size;
+            page_items.reserve(params.page_size.min(end - start));
+            for index in
+                ordered_page_indexes(start, end, params.sort_direction).take(params.page_size)
             {
                 page_items.push(self.materialize_item(turn_id, &turn.items[index])?);
             }
@@ -350,8 +355,10 @@ impl LocalThreadProjection {
                 anchor.as_ref().map(|anchor| anchor.include_anchor),
                 params.sort_direction,
             );
-            for index in ordered_page_indexes(start, end, params.sort_direction)
-                .take(params.page_size.saturating_add(1))
+            has_more = end - start > params.page_size;
+            page_items.reserve(params.page_size.min(end - start));
+            for index in
+                ordered_page_indexes(start, end, params.sort_direction).take(params.page_size)
             {
                 let key = &self.item_order[index];
                 let item = self
@@ -368,8 +375,6 @@ impl LocalThreadProjection {
                 page_items.push(self.materialize_item(key.turn_id.as_str(), item)?);
             }
         }
-        let has_more = page_items.len() > params.page_size;
-        page_items.truncate(params.page_size);
         let backwards_cursor = page_items
             .first()
             .map(|item| serialize_item_cursor(item, true))
@@ -420,21 +425,19 @@ impl LocalThreadProjection {
             projection_invariant_error("turn order contains an unknown projected turn")
         })?;
         let metadata = projected.metadata.as_ref();
-        let mut items: Vec<ThreadItem> = projected
-            .items
-            .iter()
-            .map(|item| item.item.clone())
-            .collect();
-        let api_items_view = match items_view {
-            StoredTurnItemsView::NotLoaded => {
-                items.clear();
-                TurnItemsView::NotLoaded
-            }
+        let (items, api_items_view) = match items_view {
+            StoredTurnItemsView::NotLoaded => (Vec::new(), TurnItemsView::NotLoaded),
             StoredTurnItemsView::Summary => {
-                items = summary_items(items.as_slice());
-                TurnItemsView::Summary
+                (summary_items(&projected.items), TurnItemsView::Summary)
             }
-            StoredTurnItemsView::Full => TurnItemsView::Full,
+            StoredTurnItemsView::Full => (
+                projected
+                    .items
+                    .iter()
+                    .map(|item| item.item.clone())
+                    .collect(),
+                TurnItemsView::Full,
+            ),
         };
         let status = metadata
             .map(|metadata| metadata.status.clone())
@@ -543,10 +546,11 @@ pub(super) async fn initialize_from_store(
     store: &LocalThreadStore,
     thread_id: ThreadId,
     include_archived: bool,
-) -> ThreadStoreResult<()> {
+) -> ThreadStoreResult<SharedLocalThreadProjection> {
     let projection = projection_entry(store, thread_id).await;
     let _operation = projection.acquire_operation().await?;
-    initialize_entry_from_store(store, thread_id, include_archived, &projection).await
+    initialize_entry_from_store(store, thread_id, include_archived, &projection).await?;
+    Ok(projection)
 }
 
 async fn initialize_entry_from_store(
@@ -612,9 +616,10 @@ pub(super) async fn list_turns(
     store: &LocalThreadStore,
     params: ListTurnsParams,
 ) -> ThreadStoreResult<TurnPage> {
+    require_positive_page_size(params.page_size)?;
     validate_thread_visibility(store, params.thread_id, params.include_archived).await?;
-    initialize_from_store(store, params.thread_id, params.include_archived).await?;
-    let projection = projection_entry(store, params.thread_id).await;
+    let projection =
+        initialize_from_store(store, params.thread_id, params.include_archived).await?;
     projection.list_turns(&params).await
 }
 
@@ -622,9 +627,10 @@ pub(super) async fn list_items(
     store: &LocalThreadStore,
     params: ListItemsParams,
 ) -> ThreadStoreResult<ItemPage> {
+    require_positive_page_size(params.page_size)?;
     validate_thread_visibility(store, params.thread_id, params.include_archived).await?;
-    initialize_from_store(store, params.thread_id, params.include_archived).await?;
-    let projection = projection_entry(store, params.thread_id).await;
+    let projection =
+        initialize_from_store(store, params.thread_id, params.include_archived).await?;
     projection.list_items(&params).await
 }
 
@@ -700,14 +706,16 @@ fn ordered_page_indexes(
     }
 }
 
-fn summary_items(items: &[ThreadItem]) -> Vec<ThreadItem> {
+fn summary_items(items: &[ProjectedItem]) -> Vec<ThreadItem> {
     let first_user_message = items
         .iter()
+        .map(|item| &item.item)
         .find(|item| matches!(item, ThreadItem::UserMessage { .. }))
         .cloned();
     let final_agent_message = items
         .iter()
         .rev()
+        .map(|item| &item.item)
         .find(|item| matches!(item, ThreadItem::AgentMessage { .. }))
         .cloned();
     match (first_user_message, final_agent_message) {
@@ -783,6 +791,26 @@ fn serialize_item_cursor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_item_pages_allocate_only_available_items() {
+        let mut projection = LocalThreadProjection::default();
+        projection.ensure_turn("turn-1");
+        for turn_id in [None, Some("turn-1".to_string())] {
+            let page = projection
+                .list_items(&ListItemsParams {
+                    thread_id: ThreadId::new(),
+                    turn_id,
+                    include_archived: false,
+                    cursor: None,
+                    page_size: usize::MAX,
+                    sort_direction: SortDirection::Asc,
+                })
+                .expect("bounded allocation");
+            assert!(page.items.is_empty());
+            assert!(page.next_cursor.is_none());
+        }
+    }
 
     #[test]
     fn page_index_window_starts_at_the_cursor_without_allocating_the_prefix() {

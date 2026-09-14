@@ -522,10 +522,9 @@ impl GuardianReviewSessionManager {
                 if let Some(trunk) = state.trunk.as_ref()
                     && (trunk.cancel_token.is_cancelled() || trunk.reuse_key != next_reuse_key)
                     && trunk.review_lock.try_acquire().is_ok()
+                    && let Some(review_session) = state.trunk.take()
                 {
-                    if let Some(review_session) = state.trunk.take() {
-                        self.background_shutdowns.shutdown_session(review_session);
-                    }
+                    self.background_shutdowns.shutdown_session(review_session);
                 }
 
                 if state.trunk.is_none() {
@@ -629,16 +628,16 @@ impl GuardianReviewSessionManager {
             deadline,
         ))
         .await;
-        if keep_review_session && matches!(outcome, GuardianReviewSessionOutcome::Completed(_)) {
-            if let Err(expired) = run_before_review_deadline(
+        if keep_review_session
+            && matches!(outcome, GuardianReviewSessionOutcome::Completed(_))
+            && let Err(expired) = run_before_review_deadline(
                 deadline,
                 params.external_cancel.as_ref(),
                 trunk.refresh_last_committed_fork_snapshot(),
             )
             .await
-            {
-                return (expired, analytics_result);
-            }
+        {
+            return (expired, analytics_result);
         }
         if keep_review_session {
             cleanup.disarm();
@@ -2116,6 +2115,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Hold the contested owner to assert cancellation, admission, or cleanup behavior under contention"
+    )]
     async fn guardian_review_deadline_does_not_wait_for_retirement_registry_or_child_shutdown() {
         let (mut child, tx_event, rx_sub) = test_review_session().await;
         let params = test_review_params().await;
@@ -2200,6 +2203,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Hold the contested owner to assert cancellation, admission, or cleanup behavior under contention"
+    )]
     async fn guardian_shutdown_grace_retains_cleanup_when_admitted_review_future_is_dropped() {
         let (mut child, _tx_event, rx_sub) = test_review_session().await;
         let params = test_review_params().await;

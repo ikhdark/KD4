@@ -23,6 +23,7 @@ struct WorkspaceSettingsResponse {
 #[derive(Debug, Default)]
 pub struct WorkspaceSettingsCache {
     entry: RwLock<Option<CachedWorkspaceSettings>>,
+    refresh: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -40,32 +41,13 @@ struct CachedWorkspaceSettings {
 
 impl WorkspaceSettingsCache {
     fn get_codex_plugins_enabled(&self, key: &WorkspaceSettingsCacheKey) -> Option<bool> {
-        {
-            let entry = match self.entry.read() {
-                Ok(entry) => entry,
-                Err(err) => err.into_inner(),
-            };
-            let now = Instant::now();
-            if let Some(cached) = entry.as_ref()
-                && now < cached.expires_at
-                && cached.key == *key
-            {
-                return Some(cached.codex_plugins_enabled);
-            }
-        }
-
-        let mut entry = match self.entry.write() {
+        let entry = match self.entry.read() {
             Ok(entry) => entry,
             Err(err) => err.into_inner(),
         };
-        let now = Instant::now();
-        if entry
-            .as_ref()
-            .is_some_and(|cached| now >= cached.expires_at || cached.key != *key)
-        {
-            *entry = None;
-        }
-        None
+        let cached = entry.as_ref()?;
+        (cached.key == *key && Instant::now() < cached.expires_at)
+            .then_some(cached.codex_plugins_enabled)
     }
 
     fn set_codex_plugins_enabled(&self, key: WorkspaceSettingsCacheKey, enabled: bool) {
@@ -110,6 +92,18 @@ pub async fn codex_plugins_enabled_for_workspace(
     {
         return Ok(enabled);
     }
+
+    // Catalog operations can request this setting concurrently. Serialize
+    // refreshes and reuse a successful response published while waiting.
+    let _refresh = if let Some(cache) = cache {
+        let refresh = cache.refresh.lock().await;
+        if let Some(enabled) = cache.get_codex_plugins_enabled(&cache_key) {
+            return Ok(enabled);
+        }
+        Some(refresh)
+    } else {
+        None
+    };
 
     let encoded_account_id = encode_path_segment(&account_id);
     let http_clients = chatgpt_http_clients(config);

@@ -238,7 +238,7 @@ struct DurableWakePoller {
 
 impl DurableWakePoller {
     fn spawn(
-        pool: SqlitePool,
+        mut connection: sqlx::pool::PoolConnection<sqlx::Sqlite>,
         wake_revision: Arc<watch::Sender<u64>>,
         watermark: i64,
     ) -> Arc<Self> {
@@ -280,7 +280,7 @@ impl DurableWakePoller {
                     _ = tokio::time::sleep(EXTERNAL_WAKE_RECHECK_INTERVAL) => {
                         #[cfg(test)]
                         task_poll_count.fetch_add(1, Ordering::Relaxed);
-                        match durable_wake_watermark(&pool).await {
+                        match durable_wake_watermark(&mut connection).await {
                             Ok(next_watermark) if next_watermark != watermark => {
                                 watermark = next_watermark;
                                 wake_revision.send_modify(|revision| {
@@ -380,9 +380,10 @@ impl LocalAgentTaskStore {
         MIGRATOR.run(&pool).await?;
         upgrade_legacy_repository_bindings(&pool).await?;
         let wake_revision = Arc::new(watch::channel(0).0);
-        let durable_wake_watermark = durable_wake_watermark(&pool).await?;
+        let mut wake_connection = pool.acquire().await?;
+        let durable_wake_watermark = durable_wake_watermark(&mut wake_connection).await?;
         let durable_wake_poller = DurableWakePoller::spawn(
-            pool.clone(),
+            wake_connection,
             Arc::clone(&wake_revision),
             durable_wake_watermark,
         );
@@ -422,18 +423,23 @@ impl LocalAgentTaskStore {
     ) -> StoreResult<WakeRead> {
         let _durable_waiter = self.durable_wake_poller.register();
         let mut wake_rx = self.wake_revision.subscribe();
+        let mut shutdown_rx = self.durable_wake_poller.shutdown.subscribe();
         loop {
+            if *shutdown_rx.borrow() {
+                return Err(sqlx::Error::PoolClosed.into());
+            }
             let current = self
                 .read_wake_events_impl(root_session_id.clone(), after_event_id)
                 .await?;
             if !current.updated_agents.is_empty() {
                 return Ok(current);
             }
-            wake_rx.changed().await.map_err(|_| {
-                StoreError::InvalidAssignment(
-                    "agent-task wake stream closed while waiting".to_string(),
-                )
-            })?;
+            tokio::select! {
+                changed = wake_rx.changed() => {
+                    changed.map_err(|_| StoreError::from(sqlx::Error::PoolClosed))?;
+                }
+                _ = shutdown_rx.changed() => return Err(sqlx::Error::PoolClosed.into()),
+            }
         }
     }
 
@@ -690,12 +696,12 @@ impl LocalAgentTaskStore {
         if assignment.task_capsule.is_some() || tokio::fs::try_exists(&capsule_path).await? {
             return Err(StoreError::TaskCapsuleAlreadyAttached(assignment_id));
         }
-        let temporary_path = task_capsule_staging_path(&self.coordination_root, assignment_id);
-        let staging_path = temporary_path.clone();
+        let staging_path = task_capsule_staging_path(&self.coordination_root, assignment_id);
         let staging_payload = canonical_payload.clone();
-        // Finish the staging write, including failure cleanup, in one worker.
-        // Retain the transaction's assignment lock through the write even if
-        // the caller is cancelled, and never leave partial JSON for recovery.
+        #[cfg(test)]
+        let publication_pause = TEST_SNAPSHOT_CAPTURE_PAUSE.try_with(Arc::clone).ok();
+        // The file is the durable capsule record. Keep the assignment lock through
+        // staging and publication even if the caller is cancelled.
         let transaction = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
             if let Some(parent) = staging_path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -715,16 +721,28 @@ impl LocalAgentTaskStore {
                 let _ = std::fs::remove_file(&staging_path);
                 return Err(error);
             }
+            drop(file);
+            #[cfg(test)]
+            if let Some(pause) = publication_pause {
+                pause.started.add_permits(1);
+                tokio::runtime::Handle::current().block_on(async {
+                    pause
+                        .release
+                        .acquire()
+                        .await
+                        .expect("publication pause open")
+                        .forget();
+                });
+            }
+            std::fs::rename(&staging_path, &capsule_path)?;
             Ok(transaction)
         })
         .await
         .map_err(std::io::Error::other)??;
         assignment.task_capsule = Some(canonical_payload.clone());
-        if let Err(error) = transaction.commit().await {
-            let _ = tokio::fs::remove_file(&temporary_path).await;
-            return Err(error.into());
-        }
-        tokio::fs::rename(&temporary_path, &capsule_path).await?;
+        // No database data was changed: release the serialization lock. Publication
+        // above remains durable even if cancellation rolls this transaction back.
+        transaction.rollback().await?;
         Ok(assignment)
     }
 
@@ -1602,6 +1620,13 @@ LIMIT 1
             });
         }
         if draft.status == AgentStatusClaim::Completed {
+            let missing_obligations =
+                missing_evidence_obligations(&assignment, &validation_summaries);
+            if !missing_obligations.is_empty() {
+                return Err(StoreError::RequiredEvidenceMissing {
+                    obligations: missing_obligations,
+                });
+            }
             if !successful_call_epochs.is_empty() {
                 let commit_revision = capture_complete_repository_revision_tx(
                     &mut transaction,
@@ -1619,13 +1644,6 @@ LIMIT 1
                         call_ids: superseded,
                     });
                 }
-            }
-            let missing_obligations =
-                missing_evidence_obligations(&assignment, &validation_summaries);
-            if !missing_obligations.is_empty() {
-                return Err(StoreError::RequiredEvidenceMissing {
-                    obligations: missing_obligations,
-                });
             }
             validate_completed_mutation_evidence_tx(
                 &mut transaction,
@@ -2958,23 +2976,33 @@ LIMIT 1
         attempt_id: AttemptId,
         limit: Option<usize>,
     ) -> StoreResult<Vec<MutationEvidence>> {
-        let (page, _) = self
-            .list_mutation_evidence_page_with_query_count_impl(attempt_id, limit)
+        let mut page = self
+            .list_mutation_evidence_page_impl(attempt_id, limit, None)
             .await?;
+        page.evidence.reverse();
         Ok(page.evidence)
     }
 
-    async fn list_mutation_evidence_page_with_query_count_impl(
+    async fn list_mutation_evidence_page_impl(
         &self,
         attempt_id: AttemptId,
         limit: Option<usize>,
-    ) -> StoreResult<(crate::MutationEvidencePage, usize)> {
+        cursor: Option<usize>,
+    ) -> StoreResult<crate::MutationEvidencePage> {
         let limit = limit.unwrap_or(DEFAULT_MUTATION_EVIDENCE_LIMIT);
         if limit == 0 || limit > MAX_MUTATION_EVIDENCE_LIMIT {
             return Err(StoreError::InvalidMutationEvidenceLimit(limit));
         }
         let mut transaction = self.pool.begin().await?;
         load_attempt_tx(&mut transaction, attempt_id).await?;
+        let total_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM mutation_files WHERE attempt_id = ?")
+                .bind(attempt_id.to_string())
+                .fetch_one(&mut *transaction)
+                .await?;
+        let total_count = usize::try_from(total_count)
+            .map_err(|_| StoreError::CorruptData("mutation evidence count is negative".into()))?;
+        let offset = cursor.unwrap_or(0).min(total_count);
         let rows = sqlx::query(
             r#"
 SELECT
@@ -2990,41 +3018,31 @@ SELECT
     selected.finalized_at,
     selected.start_epoch,
     selected.end_epoch,
-    selected.total_count,
     events.event_id
 FROM (
     SELECT
-        mutation_files.*,
-        COUNT(*) OVER () AS total_count
+        mutation_files.*
     FROM mutation_files
     WHERE attempt_id = ?
     ORDER BY first_observed_at DESC, path DESC
-    LIMIT ?
+    LIMIT ? OFFSET ?
 ) AS selected
 LEFT JOIN mutation_events AS events
   ON events.attempt_id = selected.attempt_id
  AND events.path = selected.path
 ORDER BY
-    selected.first_observed_at ASC,
-    selected.path ASC,
+    selected.first_observed_at DESC,
+    selected.path DESC,
     events.created_at ASC,
     events.event_id ASC
             "#,
         )
         .bind(attempt_id.to_string())
         .bind(limit as i64)
+        .bind(offset as i64)
         .fetch_all(&mut *transaction)
         .await?;
 
-        let total_count = rows
-            .first()
-            .map(|row| {
-                usize::try_from(row.get::<i64, _>("total_count")).map_err(|_| {
-                    StoreError::CorruptData("mutation evidence count is negative".into())
-                })
-            })
-            .transpose()?
-            .unwrap_or(0);
         let mut evidence = Vec::new();
         for row in rows {
             let path = row.get::<String, _>("path");
@@ -3051,16 +3069,14 @@ ORDER BY
             }
         }
         transaction.commit().await?;
-        let truncated = evidence.len() < total_count;
-        Ok((
-            crate::MutationEvidencePage {
-                next_cursor: truncated.then_some(evidence.len()),
-                evidence,
-                total_count,
-                truncated,
-            },
-            2,
-        ))
+        let next_offset = offset + evidence.len();
+        let truncated = next_offset < total_count;
+        Ok(crate::MutationEvidencePage {
+            next_cursor: truncated.then_some(next_offset),
+            evidence,
+            total_count,
+            truncated,
+        })
     }
 
     async fn read_mutation_snapshot_impl(
@@ -3188,7 +3204,10 @@ ORDER BY
             match tokio::fs::remove_file(snapshot_path).await {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    tracing::warn!(%error, %snapshot_name, "snapshot deletion deferred");
+                    continue;
+                }
             }
             sqlx::query("DELETE FROM snapshot_gc_queue WHERE snapshot_name = ?")
                 .bind(snapshot_name)
@@ -3210,7 +3229,9 @@ ORDER BY
     }
 
     async fn reconcile_snapshot_files(&self) -> StoreResult<()> {
-        let mut transaction = self.pool.begin().await?;
+        // Snapshot publishers hold the same SQLite writer lane until their file and
+        // reference are published. Keep it through orphan removal across instances.
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let rows = sqlx::query("SELECT attempt_id, path, snapshot_name, final_snapshot_name, finalized_at FROM mutation_files WHERE snapshot_retained = 1")
             .fetch_all(&mut *transaction)
             .await?;
@@ -3260,10 +3281,6 @@ ORDER BY
                 );
             }
         }
-        transaction.commit().await?;
-        self.drain_snapshot_gc_queue_best_effort("snapshot reconciliation")
-            .await;
-
         let snapshot_root = self.coordination_root.join("snapshots");
         let mut pending_directories = vec![snapshot_root];
         while let Some(directory) = pending_directories.pop() {
@@ -3282,10 +3299,14 @@ ORDER BY
                 }
             }
         }
+        transaction.commit().await?;
+        self.drain_snapshot_gc_queue_best_effort("snapshot reconciliation")
+            .await;
         Ok(())
     }
 
     async fn reconcile_task_capsules(&self) -> StoreResult<()> {
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let capsule_dir = self.coordination_root.join("task_capsules");
         tokio::fs::create_dir_all(&capsule_dir).await?;
         let mut entries = tokio::fs::read_dir(&capsule_dir).await?;
@@ -3303,7 +3324,7 @@ ORDER BY
                     "SELECT EXISTS(SELECT 1 FROM assignments WHERE assignment_id = ?)",
                 )
                 .bind(capsule.assignment_id.to_string())
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *transaction)
                 .await?
                     != 0;
                 let expected_stage =
@@ -3320,6 +3341,7 @@ ORDER BY
                 }
             }
         }
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -3932,14 +3954,16 @@ impl LocalAgentTaskStore {
         Box::pin(async move { self.list_mutation_evidence_impl(attempt_id, limit).await })
     }
 
-    #[cfg(test)]
-    pub(crate) fn list_mutation_evidence_page_with_query_count(
+    /// Read mutation evidence newest first. Use `next_cursor` for the next
+    /// page; callers requiring a stable view must finish writes before paging.
+    pub fn list_mutation_evidence_page(
         &self,
         attempt_id: AttemptId,
         limit: Option<usize>,
-    ) -> TaskStoreFuture<'_, (crate::MutationEvidencePage, usize)> {
+        cursor: Option<usize>,
+    ) -> TaskStoreFuture<'_, crate::MutationEvidencePage> {
         Box::pin(async move {
-            self.list_mutation_evidence_page_with_query_count_impl(attempt_id, limit)
+            self.list_mutation_evidence_page_impl(attempt_id, limit, cursor)
                 .await
         })
     }
@@ -4217,13 +4241,6 @@ async fn capture_complete_repository_revision_tx(
         vec![crate::workspace::REPOSITORY_WIDE_PATH.to_string()],
     )
     .await?;
-    if revision.complete {
-        return Ok(revision);
-    }
-
-    let revision =
-        crate::workspace::capture_revision_tx(transaction, &repo_root, vec![".".to_string()])
-            .await?;
     require_complete_workspace_capture(&revision)?;
     Ok(revision)
 }
@@ -5366,11 +5383,10 @@ async fn selective_admission_tx(
 ) -> StoreResult<(AdmissionOverlapSummary, IntegrationPlan)> {
     let rows = sqlx::query(
         "SELECT assignments.body_json, repositories.workspace_id, attempts.state,
-                attempts.sealed_at, receipts.status AS receipt_status
+                attempts.sealed_at
          FROM assignments
          JOIN assignment_repositories repositories USING (assignment_id)
          JOIN attempts ON attempts.assignment_id = assignments.assignment_id
-         LEFT JOIN receipts ON receipts.attempt_id = attempts.attempt_id
          WHERE repositories.repository_id = ?
            AND assignments.root_session_id = ?
            AND attempts.ordinal = (
@@ -5395,15 +5411,12 @@ async fn selective_admission_tx(
         let existing_state: AttemptState = decode(row.get::<String, _>("state").as_str())?;
         let existing_is_active = existing_state == AttemptState::Active
             && row.try_get::<Option<String>, _>("sealed_at")?.is_none();
-        let completed_receipt_available = row
-            .try_get::<Option<String>, _>("receipt_status")?
-            .map(|status| decode::<AgentStatusClaim>(&status))
-            .transpose()?
-            == Some(AgentStatusClaim::Completed);
-
+        // In-flight work in this checkout can be shared. A sealed result has no
+        // authoritative input fingerprint, so semantic identity cannot prove reuse.
         if candidate_identity.is_some()
             && candidate_identity == existing.primary_investigation_identity()
-            && (existing_is_active || completed_receipt_available)
+            && existing_workspace_id == assignment.workspace_id
+            && existing_is_active
         {
             return Err(StoreError::AdmissionRejected {
                 reason: AdmissionRejectionReason::DuplicateExplorerInvestigation,
@@ -5713,8 +5726,11 @@ async fn planned_claim_supersessions_tx(
                 scopes
                     .into_iter()
                     .map(|scope| {
-                        normalize_repo_scopes(Path::new(&canonical_root), std::slice::from_ref(&scope))
-                            .map(|mut scopes| scopes.remove(0))
+                        normalize_repo_scopes(
+                            Path::new(&canonical_root),
+                            std::slice::from_ref(&scope),
+                        )
+                        .map(|mut scopes| scopes.remove(0))
                     })
                     .collect::<StoreResult<Vec<_>>>()
             })
@@ -6195,12 +6211,12 @@ async fn remove_unpublished_snapshot(
     }
 }
 
-async fn durable_wake_watermark(pool: &SqlitePool) -> StoreResult<i64> {
+async fn durable_wake_watermark(connection: &mut sqlx::SqliteConnection) -> StoreResult<i64> {
     // SQLite increments data_version on this connection whenever another
     // connection commits. Unlike a MAX(rowid) watermark, it also observes
     // delete-and-reinsert sequences that reuse a rowid.
     Ok(sqlx::query_scalar::<_, i64>("PRAGMA data_version")
-        .fetch_one(pool)
+        .fetch_one(connection)
         .await?)
 }
 

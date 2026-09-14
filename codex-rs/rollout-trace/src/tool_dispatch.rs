@@ -13,7 +13,6 @@ use codex_protocol::models::SandboxPermissions;
 use codex_protocol::models::SearchToolCallParams;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
-use serde_json::json;
 
 use crate::model::AgentThreadId;
 use crate::model::CodeModeRuntimeToolId;
@@ -73,6 +72,8 @@ pub enum ToolDispatchRequester {
 }
 
 /// Tool input observed at the registry boundary.
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
 pub enum ToolDispatchPayload {
     Function {
         arguments: String,
@@ -107,7 +108,7 @@ pub enum ToolDispatchResult {
 struct DispatchedToolTraceRequest<'a> {
     tool_name: &'a str,
     tool_namespace: Option<&'a str>,
-    payload: &'a JsonValue,
+    payload: &'a ToolDispatchPayload,
 }
 
 /// Raw response payload for dispatch-level tool trace events.
@@ -208,14 +209,13 @@ fn suppresses_tool_dispatch_trace(invocation: &ToolDispatchInvocation) -> bool {
 fn record_started(context: &EnabledToolDispatchTraceContext, invocation: ToolDispatchInvocation) {
     let tool_name = invocation.tool_name;
     let tool_namespace = invocation.tool_namespace;
-    let kind = dispatched_tool_kind(&tool_name, &invocation.payload);
+    let kind = dispatched_tool_kind(&tool_name, tool_namespace.as_deref());
     let label = dispatched_tool_label(&tool_name, tool_namespace.as_deref(), &invocation.payload);
     let input_preview = Some(invocation.payload.log_payload_preview());
-    let payload = invocation.payload.into_json_payload();
     let request = DispatchedToolTraceRequest {
         tool_name: tool_name.as_str(),
         tool_namespace: tool_namespace.as_deref(),
-        payload: &payload,
+        payload: &invocation.payload,
     };
     let request_payload =
         write_json_payload_best_effort(&context.writer, RawPayloadKind::ToolInvocation, &request);
@@ -266,7 +266,23 @@ fn requester_fields(
     }
 }
 
-fn dispatched_tool_kind(tool_name: &str, _payload: &ToolDispatchPayload) -> ToolCallKind {
+fn dispatched_tool_kind(tool_name: &str, tool_namespace: Option<&str>) -> ToolCallKind {
+    // These are the built-in identities registered by core's spec_plan.
+    match (tool_namespace, tool_name) {
+        (Some("web"), "run") => return ToolCallKind::Web,
+        (Some("image_gen"), "imagegen") => return ToolCallKind::ImageGeneration,
+        (
+            Some("multi_agent_v1"),
+            "spawn_agent" | "send_message" | "followup_task" | "assign_task" | "wait_agent"
+            | "close_agent" | "interrupt_agent",
+        )
+        | (None, _) => {}
+        (Some(namespace), name) => {
+            return ToolCallKind::Other {
+                name: format!("{namespace}.{name}"),
+            };
+        }
+    }
     match tool_name {
         "exec_command" | "local_shell" | "shell" | "shell_command" => ToolCallKind::ExecCommand,
         "write_stdin" => ToolCallKind::WriteStdin,
@@ -301,49 +317,24 @@ impl ToolDispatchPayload {
             ToolDispatchPayload::Function { arguments } => truncate_preview(arguments),
             ToolDispatchPayload::ToolSearch { arguments } => truncate_preview(&arguments.query),
             ToolDispatchPayload::Custom { input } => truncate_preview(input),
-            ToolDispatchPayload::LocalShell { command, .. } => truncate_preview(&command.join(" ")),
-        }
-    }
-
-    fn into_json_payload(self) -> JsonValue {
-        match self {
-            ToolDispatchPayload::Function { arguments } => json!({
-                "type": "function",
-                "arguments": arguments,
-            }),
-            ToolDispatchPayload::ToolSearch { arguments } => json!({
-                "type": "tool_search",
-                "arguments": arguments,
-            }),
-            ToolDispatchPayload::Custom { input } => json!({
-                "type": "custom",
-                "input": input,
-            }),
-            ToolDispatchPayload::LocalShell {
-                command,
-                workdir,
-                timeout_ms,
-                sandbox_permissions,
-                prefix_rule,
-                additional_permissions,
-                justification,
-            } => json!({
-                "type": "local_shell",
-                "command": command,
-                "workdir": workdir,
-                "timeout_ms": timeout_ms,
-                "sandbox_permissions": sandbox_permissions,
-                "prefix_rule": prefix_rule,
-                "additional_permissions": additional_permissions,
-                "justification": justification,
-            }),
+            ToolDispatchPayload::LocalShell { command, .. } => {
+                truncate_preview_chars(command.iter().enumerate().flat_map(|(index, argument)| {
+                    (index > 0)
+                        .then_some(' ')
+                        .into_iter()
+                        .chain(argument.chars())
+                }))
+            }
         }
     }
 }
 
 fn truncate_preview(value: &str) -> String {
+    truncate_preview_chars(value.chars())
+}
+
+fn truncate_preview_chars(mut chars: impl Iterator<Item = char>) -> String {
     const MAX_PREVIEW_CHARS: usize = 160;
-    let mut chars = value.chars();
     let mut preview = chars.by_ref().take(MAX_PREVIEW_CHARS).collect::<String>();
     if chars.next().is_some() {
         preview.push_str("...");
@@ -394,6 +385,107 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dispatch_records_full_tool_identity_and_typed_payload() -> anyhow::Result<()> {
+        for (namespace, name, expected_kind) in [
+            (
+                Some("mcp__external"),
+                "apply_patch",
+                ToolCallKind::Other {
+                    name: "mcp__external.apply_patch".into(),
+                },
+            ),
+            (
+                Some("mcp__external"),
+                "spawn_agent",
+                ToolCallKind::Other {
+                    name: "mcp__external.spawn_agent".into(),
+                },
+            ),
+            (
+                Some("multi_agent_v1"),
+                "spawn_agent",
+                ToolCallKind::SpawnAgent,
+            ),
+            (
+                Some("multi_agent_v1"),
+                "shell",
+                ToolCallKind::Other {
+                    name: "multi_agent_v1.shell".into(),
+                },
+            ),
+            (Some("image_gen"), "imagegen", ToolCallKind::ImageGeneration),
+            (Some("web"), "run", ToolCallKind::Web),
+            (None, "apply_patch", ToolCallKind::ApplyPatch),
+        ] {
+            let temp = tempfile::TempDir::new()?;
+            let writer = Arc::new(TraceWriter::create(
+                temp.path(),
+                "trace".into(),
+                "rollout".into(),
+                "thread-1".into(),
+            )?);
+            ToolDispatchTraceContext::start(
+                writer,
+                invocation(
+                    name,
+                    namespace.map(str::to_string),
+                    ToolDispatchRequester::Model {
+                        model_visible_call_id: "call-1".into(),
+                    },
+                    ToolDispatchPayload::Function {
+                        arguments: "{\"x\":1}".into(),
+                    },
+                ),
+            );
+            let event: crate::RawTraceEvent =
+                serde_json::from_str(&std::fs::read_to_string(temp.path().join("trace.jsonl"))?)?;
+            let RawTraceEventPayload::ToolCallStarted {
+                kind,
+                invocation_payload: Some(payload),
+                ..
+            } = event.payload
+            else {
+                panic!("dispatch start missing")
+            };
+            assert_eq!(kind, expected_kind);
+            let value: JsonValue =
+                serde_json::from_str(&std::fs::read_to_string(temp.path().join(payload.path))?)?;
+            assert_eq!(
+                value,
+                serde_json::json!({"tool_name": name, "tool_namespace": namespace, "payload": {"type":"function", "arguments":"{\"x\":1}"}})
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn local_shell_payload_preserves_nulls_and_bounded_unicode_preview() -> anyhow::Result<()> {
+        let payload = ToolDispatchPayload::LocalShell {
+            command: vec!["é".repeat(159), "z".repeat(1000)],
+            workdir: None,
+            timeout_ms: None,
+            sandbox_permissions: None,
+            prefix_rule: None,
+            additional_permissions: None,
+            justification: None,
+        };
+        assert_eq!(
+            payload.log_payload_preview(),
+            format!("{} ...", "é".repeat(159))
+        );
+        assert_eq!(
+            serde_json::to_value(&payload)?,
+            serde_json::json!({
+                "type":"local_shell", "command":["é".repeat(159), "z".repeat(1000)],
+                "workdir":null, "timeout_ms":null, "sandbox_permissions":null,
+                "prefix_rule":null, "additional_permissions":null, "justification":null
+            })
+        );
+        assert_eq!(truncate_preview(&"é".repeat(160)), "é".repeat(160));
+        Ok(())
+    }
+
+    #[test]
     fn suppresses_only_noncanonical_dispatch_boundaries() {
         assert!(suppresses_tool_dispatch_trace(&invocation(
             codex_code_mode::PUBLIC_TOOL_NAME,
@@ -430,12 +522,7 @@ mod tests {
     #[test]
     fn classifies_interrupt_agent_as_close_agent() {
         assert_eq!(
-            dispatched_tool_kind(
-                "interrupt_agent",
-                &ToolDispatchPayload::Function {
-                    arguments: r#"{"target":"/root/child"}"#.to_string(),
-                },
-            ),
+            dispatched_tool_kind("interrupt_agent", None),
             ToolCallKind::CloseAgent
         );
     }
@@ -443,12 +530,7 @@ mod tests {
     #[test]
     fn classifies_imagegen_as_image_generation() {
         assert_eq!(
-            dispatched_tool_kind(
-                "imagegen",
-                &ToolDispatchPayload::Function {
-                    arguments: String::new(),
-                },
-            ),
+            dispatched_tool_kind("imagegen", None),
             ToolCallKind::ImageGeneration
         );
     }

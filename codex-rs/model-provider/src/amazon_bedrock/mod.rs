@@ -23,11 +23,14 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
 use codex_protocol::openai_models::ModelsResponse;
 
+use crate::auth::ProviderAuthScope;
+use crate::auth::ResolvedProviderAuth;
 use crate::provider::ModelProvider;
 use crate::provider::ModelProviderFuture;
 use crate::provider::ProviderAccountResult;
 use crate::provider::ProviderAccountState;
 use crate::provider::ProviderCapabilities;
+use crate::provider::ResolvedModelProviderClientSetup;
 use auth::resolve_provider_auth;
 pub(crate) use catalog::static_model_catalog;
 use catalog::with_default_only_service_tier;
@@ -162,6 +165,23 @@ impl ModelProvider for AmazonBedrockModelProvider {
         Box::pin(AmazonBedrockModelProvider::api_auth(self))
     }
 
+    fn resolve_client_setup(
+        &self,
+        _scope: ProviderAuthScope,
+    ) -> ModelProviderFuture<'_, Result<ResolvedModelProviderClientSetup>> {
+        Box::pin(async move {
+            let managed_auth = self.managed_auth();
+            let method = auth::resolve_auth_method(managed_auth.as_ref(), &self.aws).await?;
+            let mut info = self.info.clone();
+            info.base_url = Some(mantle::base_url(method.region())?);
+            Ok(ResolvedModelProviderClientSetup {
+                auth: managed_auth.map(CodexAuth::BedrockApiKey),
+                api_provider: info.to_api_provider(None)?,
+                resolved_auth: ResolvedProviderAuth::new(method.into_provider()),
+            })
+        })
+    }
+
     fn models_manager(
         &self,
         _model_provider_id: &str,
@@ -185,22 +205,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
-
-    #[test]
-    fn api_provider_for_bedrock_bearer_token_uses_configured_region_endpoint() {
-        let region = "eu-central-1";
-        let mut api_provider_info =
-            ModelProviderInfo::create_amazon_bedrock_provider(/*aws*/ None);
-        api_provider_info.base_url = Some(mantle::base_url(region).expect("supported region"));
-        let api_provider = api_provider_info
-            .to_api_provider(/*auth_mode*/ None)
-            .expect("api provider should build");
-
-        assert_eq!(
-            api_provider.base_url,
-            "https://bedrock-mantle.eu-central-1.api.aws/openai/v1"
-        );
-    }
 
     #[tokio::test]
     async fn managed_auth_takes_precedence_over_aws_auth() {
@@ -226,7 +230,32 @@ mod tests {
         ));
         assert_eq!(
             provider.auth().await,
-            Some(CodexAuth::BedrockApiKey(managed_auth))
+            Some(CodexAuth::BedrockApiKey(managed_auth.clone()))
+        );
+        let setup = provider
+            .resolve_client_setup(ProviderAuthScope {
+                agent_identity_policy: codex_login::auth::AgentIdentityAuthPolicy::JwtOnly,
+                session_source: codex_protocol::protocol::SessionSource::Cli,
+                agent_identity_session_fallback: Default::default(),
+            })
+            .await
+            .expect("combined setup");
+        assert_eq!(setup.auth, Some(CodexAuth::BedrockApiKey(managed_auth)));
+        assert_eq!(
+            setup.api_provider.base_url,
+            "https://bedrock-mantle.us-east-1.api.aws/openai/v1"
+        );
+        assert_eq!(
+            provider.api_provider().await.unwrap().base_url,
+            setup.api_provider.base_url
+        );
+        assert_eq!(
+            setup
+                .resolved_auth
+                .auth
+                .to_auth_headers()
+                .get(http::header::AUTHORIZATION),
+            Some(&HeaderValue::from_static("Bearer managed-bedrock-api-key"))
         );
         assert_eq!(
             provider.account_state(),

@@ -187,24 +187,19 @@ impl InitializeRequestProcessor {
             .await;
 
         let receipt_codex_home = self.config.codex_home.clone();
-        // Hashing the running executable and atomically writing the receipt are
-        // blocking filesystem operations. Keep initialization ordered while
-        // leaving the async executor available for other connections.
-        let receipt_result = tokio::task::spawn_blocking(move || {
-            crate::runtime_provenance::write_desktop_runtime_receipt(
+        // Receipt publication is advisory and must not gate outbound readiness.
+        // The blocking task owns publication after initialization returns.
+        tokio::task::spawn_blocking(move || {
+            if let Err(err) = crate::runtime_provenance::write_desktop_runtime_receipt(
                 receipt_codex_home.as_path(),
                 &name,
-            )
-        })
-        .await
-        .map_err(std::io::Error::other)
-        .and_then(std::convert::identity);
-        if let Err(err) = receipt_result {
-            tracing::warn!(
-                error = %err,
-                "failed to publish app-server runtime receipt after initialization"
-            );
-        }
+            ) {
+                tracing::warn!(
+                    error = %err,
+                    "failed to publish app-server runtime receipt after initialization"
+                );
+            }
+        });
 
         if let Some(outbound_initialized) = outbound_initialized {
             outbound_initialized.store(true, Ordering::Release);

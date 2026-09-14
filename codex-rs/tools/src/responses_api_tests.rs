@@ -15,21 +15,22 @@ use std::collections::BTreeMap;
 
 #[test]
 fn tool_definition_to_responses_api_tool_omits_false_defer_loading() {
+    let tool = tool_definition_to_responses_api_tool(ToolDefinition {
+        name: "lookup_order".to_string(),
+        description: "Look up an order".to_string(),
+        input_schema: JsonSchema::object(
+            BTreeMap::from([(
+                "order_id".to_string(),
+                JsonSchema::string(/*description*/ None),
+            )]),
+            Some(vec!["order_id".to_string()]),
+            Some(false.into()),
+        ),
+        output_schema: Some(json!({"type": "object"})),
+        defer_loading: false,
+    });
     assert_eq!(
-        tool_definition_to_responses_api_tool(ToolDefinition {
-            name: "lookup_order".to_string(),
-            description: "Look up an order".to_string(),
-            input_schema: JsonSchema::object(
-                BTreeMap::from([(
-                    "order_id".to_string(),
-                    JsonSchema::string(/*description*/ None),
-                )]),
-                Some(vec!["order_id".to_string()]),
-                Some(false.into())
-            ),
-            output_schema: Some(json!({"type": "object"})),
-            defer_loading: false,
-        }),
+        tool,
         ResponsesApiTool {
             name: "lookup_order".to_string(),
             description: "Look up an order".to_string(),
@@ -45,6 +46,13 @@ fn tool_definition_to_responses_api_tool_omits_false_defer_loading() {
             ),
             output_schema: Some(json!({"type": "object"})),
         }
+    );
+    assert_eq!(
+        serde_json::to_value(tool).unwrap(),
+        json!({
+            "name":"lookup_order", "description":"Look up an order", "strict":false,
+            "parameters":{"type":"object", "properties":{"order_id":{"type":"string"}}, "required":["order_id"], "additionalProperties":false}
+        })
     );
 }
 
@@ -164,5 +172,43 @@ fn loadable_tool_spec_namespace_serializes_with_deferred_child_tools() {
                 }
             ]
         })
+    );
+}
+
+#[test]
+fn coalescing_preserves_first_occurrence_and_child_order() {
+    let tool = |name: &str| ResponsesApiTool {
+        name: name.to_string(),
+        description: name.to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::default(),
+        output_schema: None,
+    };
+    let namespace = |name: &str, description: &str, names: &[&str]| {
+        LoadableToolSpec::Namespace(ResponsesApiNamespace {
+            name: name.to_string(),
+            description: description.to_string(),
+            tools: names
+                .iter()
+                .map(|name| ResponsesApiNamespaceTool::Function(tool(name)))
+                .collect(),
+        })
+    };
+    assert_eq!(
+        super::coalesce_loadable_tool_specs([
+            LoadableToolSpec::Function(tool("plain1")),
+            namespace("a", "first", &["a1"]),
+            LoadableToolSpec::Function(tool("plain2")),
+            namespace("b", "second", &["b1"]),
+            namespace("a", "later", &["a2", "a3"]),
+            namespace("b", "later", &["b2"]),
+        ]),
+        vec![
+            LoadableToolSpec::Function(tool("plain1")),
+            namespace("a", "first", &["a1", "a2", "a3"]),
+            LoadableToolSpec::Function(tool("plain2")),
+            namespace("b", "second", &["b1", "b2"]),
+        ]
     );
 }

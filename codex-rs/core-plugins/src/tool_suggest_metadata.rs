@@ -32,6 +32,7 @@ type ToolSuggestMetadataEntry = Result<Arc<ToolSuggestMetadataFragment>, String>
 ///
 /// `PluginsManager` clears these entries alongside its loaded-plugin cache. Current skill config
 /// and auth routing are projected after each lookup and are not part of this cache.
+/// Each manager owns one cache and supplies its immutable restriction product on every load.
 pub(crate) struct ToolSuggestMetadataCache {
     state: RwLock<ToolSuggestMetadataCacheState>,
     load_semaphore: Semaphore,
@@ -170,7 +171,9 @@ impl ToolSuggestMetadataCache {
         if state.entries.len() >= MAX_TOOL_SUGGEST_METADATA_CACHE_ENTRIES
             && !state.entries.contains_key(&artifact)
         {
-            state.entries.clear();
+            // The result is current and may be returned even when it is not retained.
+            // Keep existing hits during scans slightly larger than the cache capacity.
+            return true;
         }
         state.entries.insert(artifact, entry);
         true
@@ -210,20 +213,18 @@ async fn load_plugin_metadata(
     })
     .await
     .map_err(|err| format!("failed to read plugin manifest: {err}"))??;
-    let skill_inventory = load_plugin_skill_inventory(
-        plugin_root,
-        &plugin_id,
-        &manifest,
-        restriction_product,
-        /*plugin_skill_snapshots*/ None,
-    )
-    .await;
-    let mcp_servers = load_plugin_mcp_servers(plugin_root.as_path(), /*auth_mode*/ None)
-        .await
-        .into_keys()
-        .map(|name| (name, ()))
-        .collect();
-    let app_declarations = load_plugin_apps(plugin_root.as_path()).await;
+    let (skill_inventory, mcp_servers, app_declarations) = tokio::join!(
+        load_plugin_skill_inventory(
+            plugin_root,
+            &plugin_id,
+            &manifest,
+            restriction_product,
+            /*plugin_skill_snapshots*/ None,
+        ),
+        load_plugin_mcp_servers(plugin_root.as_path(), /*auth_mode*/ None),
+        load_plugin_apps(plugin_root.as_path())
+    );
+    let mcp_servers = mcp_servers.into_keys().map(|name| (name, ())).collect();
 
     Ok(Arc::new(ToolSuggestMetadataFragment {
         config_name: plugin.id.clone(),
@@ -240,6 +241,63 @@ mod tests {
     use super::*;
     use codex_plugin::AppConnectorId;
     use pretty_assertions::assert_eq;
+
+    #[tokio::test]
+    async fn metadata_scan_past_capacity_preserves_existing_hits() {
+        let cache = ToolSuggestMetadataCache::new();
+        let mut plugin = ConfiguredMarketplacePlugin {
+            id: "sample@debug".to_string(),
+            name: "sample".to_string(),
+            local_version: None,
+            installed_version: None,
+            source: MarketplacePluginSource::Npm {
+                package: "sample".to_string(),
+                version: None,
+                registry: None,
+            },
+            policy: crate::marketplace::MarketplacePluginPolicy {
+                installation: Default::default(),
+                authentication: Default::default(),
+                products: None,
+            },
+            interface: None,
+            keywords: Vec::new(),
+            manifest_fallback: None,
+            installed: false,
+            enabled: false,
+        };
+        let first = cache
+            .metadata_for_plugin("debug", &plugin, None)
+            .await
+            .unwrap();
+        for index in 0..MAX_TOOL_SUGGEST_METADATA_CACHE_ENTRIES {
+            plugin.id = format!("sample{index}@debug");
+            let entry = cache
+                .metadata_for_plugin("debug", &plugin, None)
+                .await
+                .unwrap();
+            assert_eq!(entry.config_name, plugin.id);
+        }
+        plugin.id = "sample@debug".to_string();
+        let hit = cache
+            .metadata_for_plugin("debug", &plugin, None)
+            .await
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &hit),
+            "overflow must not discard existing hits"
+        );
+        cache.clear();
+        let refreshed = cache
+            .metadata_for_plugin("debug", &plugin, None)
+            .await
+            .unwrap();
+        assert!(
+            !Arc::ptr_eq(&hit, &refreshed),
+            "explicit invalidation must still reload"
+        );
+        assert_eq!(refreshed.config_name, plugin.id);
+    }
 
     #[test]
     fn projection_filters_cached_server_map_then_orders_names_once() {

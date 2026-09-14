@@ -256,6 +256,21 @@ pub async fn download_and_install_remote_plugin_bundle(
     bundle: ValidatedRemotePluginBundle,
     http_clients: &RouteAwareClientPool,
 ) -> Result<PluginInstallResult, RemotePluginBundleInstallError> {
+    let mutation = crate::remote::mark_remote_plugin_cache_mutation_in_flight(
+        &codex_home,
+        bundle.plugin_id.marketplace_name(),
+        bundle.plugin_id.plugin_name(),
+    );
+    download_and_install_remote_plugin_bundle_with_guard(codex_home, bundle, http_clients, mutation)
+        .await
+}
+
+pub(crate) async fn download_and_install_remote_plugin_bundle_with_guard(
+    codex_home: PathBuf,
+    bundle: ValidatedRemotePluginBundle,
+    http_clients: &RouteAwareClientPool,
+    mutation: crate::remote::RemotePluginCacheMutationGuard,
+) -> Result<PluginInstallResult, RemotePluginBundleInstallError> {
     let bundle_bytes = download_remote_plugin_bundle_with_limit(
         &bundle.bundle_download_url,
         /*max_bytes*/ REMOTE_PLUGIN_BUNDLE_MAX_DOWNLOAD_BYTES,
@@ -263,6 +278,7 @@ pub async fn download_and_install_remote_plugin_bundle(
     )
     .await?;
     tokio::task::spawn_blocking(move || {
+        let _mutation = mutation;
         install_remote_plugin_bundle(codex_home, bundle, bundle_bytes)
     })
     .await
@@ -408,6 +424,20 @@ fn install_remote_plugin_bundle(
     bundle: ValidatedRemotePluginBundle,
     bundle_bytes: Vec<u8>,
 ) -> Result<PluginInstallResult, RemotePluginBundleInstallError> {
+    install_remote_plugin_bundle_with_metadata_writer(
+        codex_home,
+        bundle,
+        bundle_bytes,
+        PluginStore::write_remote_plugin_id,
+    )
+}
+
+fn install_remote_plugin_bundle_with_metadata_writer(
+    codex_home: PathBuf,
+    bundle: ValidatedRemotePluginBundle,
+    bundle_bytes: Vec<u8>,
+    write_metadata: impl FnOnce(&PluginStore, &PluginId, &str) -> Result<(), PluginStoreError>,
+) -> Result<PluginInstallResult, RemotePluginBundleInstallError> {
     let staging_root = codex_home.join(REMOTE_PLUGIN_INSTALL_STAGING_DIR);
     fs::create_dir_all(&staging_root).map_err(|source| {
         RemotePluginBundleInstallError::io(
@@ -439,7 +469,11 @@ fn install_remote_plugin_bundle(
     let pending_install = store
         .begin_install_with_version(plugin_root, bundle.plugin_id, bundle.plugin_version)
         .map_err(RemotePluginBundleInstallError::from)?;
-    store.write_remote_plugin_id(&pending_install.result().plugin_id, &remote_plugin_id)?;
+    write_metadata(
+        &store,
+        &pending_install.result().plugin_id,
+        &remote_plugin_id,
+    )?;
     Ok(pending_install.commit())
 }
 
@@ -490,8 +524,8 @@ fn extract_remote_plugin_bundle_to_path(
         )));
     }
 
-    let staged_path = extract_dir.keep();
-    fs::rename(&staged_path, destination.as_path()).map_err(|source| {
+    let staged_path = extract_dir.path();
+    fs::rename(staged_path, destination.as_path()).map_err(|source| {
         RemotePluginBundleInstallError::io(
             "failed to activate checked out plugin directory",
             source,
@@ -897,23 +931,33 @@ mod tests {
             } else {
                 None
             };
-            // This accepted version creates a directory at the metadata-file
-            // destination, making the actual atomic metadata write fail.
+            // Obstruct the metadata destination after activation so the real
+            // metadata writer fails and the install transaction must roll back.
             let bundle = validate_remote_plugin_bundle(
                 "replacement-remote-id",
                 "openai-curated-remote",
                 "linear",
-                Some(".codex-remote-plugin-install.json"),
+                Some("2.0.0"),
                 Some(&format!("{}/linear.tar.gz", server.uri())),
                 None,
             )
-            .expect("valid bundle with metadata-path version");
-            let error = download_and_install_remote_plugin_bundle(
-                codex_home.path().to_path_buf(),
-                bundle.clone(),
+            .expect("valid replacement bundle");
+            let bytes = download_remote_plugin_bundle_with_limit(
+                &bundle.bundle_download_url,
+                REMOTE_PLUGIN_BUNDLE_MAX_DOWNLOAD_BYTES,
                 &http_clients,
             )
             .await
+            .unwrap();
+            let error = install_remote_plugin_bundle_with_metadata_writer(
+                codex_home.path().to_path_buf(),
+                bundle,
+                bytes,
+                |store, plugin_id, remote_id| {
+                    fs::create_dir_all(metadata_path.as_path()).unwrap();
+                    store.write_remote_plugin_id(plugin_id, remote_id)
+                },
+            )
             .expect_err("metadata destination is a directory");
             assert!(matches!(
                 error,

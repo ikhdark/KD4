@@ -4,14 +4,12 @@ use std::path::Path;
 
 use pretty_assertions::assert_eq;
 
-use crate::ProcessDriver;
 use crate::SpawnedProcess;
 use crate::TerminalSize;
 use crate::combine_output_receivers;
 use crate::configure_windows_command_args;
 use crate::windows_cmd_payload_index;
 
-use crate::spawn_from_driver;
 use crate::spawn_pipe_process;
 use crate::spawn_pipe_process_no_stdin;
 use crate::spawn_pty_process;
@@ -125,12 +123,15 @@ async fn collect_output_until_exit(
     let mut collected = Vec::new();
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
     tokio::pin!(exit_rx);
+    let mut output_open = true;
 
     loop {
         tokio::select! {
-            res = output_rx.recv() => {
-                if let Ok(chunk) = res {
-                    collected.extend_from_slice(&chunk);
+            res = output_rx.recv(), if output_open => {
+                match res {
+                    Ok(chunk) => collected.extend_from_slice(&chunk),
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => output_open = false,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
                 }
             }
             res = &mut exit_rx => {
@@ -429,12 +430,23 @@ async fn pipe_drains_stderr_without_stdout_activity() -> anyhow::Result<()> {
     let args = vec!["-c".to_string(), script.to_string()];
     let env_map: HashMap<String, String> = std::env::vars().collect();
     let spawned = spawn_pipe_process(&python, &args, Path::new("."), &env_map, &None).await?;
-    let (_session, output_rx, exit_rx) = combine_spawned_output(spawned);
-
-    let (output, code) = collect_output_until_exit(output_rx, exit_rx, /*timeout_ms*/ 10_000).await;
-
-    assert_eq!(code, 0, "expected python to exit cleanly");
-    assert!(!output.is_empty(), "expected stderr output to be drained");
+    let SpawnedProcess {
+        session: _session,
+        stdout_rx,
+        stderr_rx,
+        exit_rx,
+    } = spawned;
+    let (stdout, stderr, code) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(
+            collect_split_output(stdout_rx),
+            collect_split_output(stderr_rx),
+            exit_rx
+        )
+    })
+    .await?;
+    assert_eq!(code?, 0, "expected python to exit cleanly");
+    assert!(stdout.is_empty());
+    assert_eq!(stderr, vec![b'E'; 64 * 65_536]);
 
     Ok(())
 }
@@ -472,148 +484,6 @@ async fn pipe_process_can_expose_split_stdout_and_stderr() -> anyhow::Result<()>
 
     assert_eq!(stdout, expected_stdout);
     assert_eq!(stderr, expected_stderr);
-    assert_eq!(code, 0);
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn driver_backed_process_can_expose_split_stdout_and_stderr() -> anyhow::Result<()> {
-    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-    let (stdout_tx, stdout_driver_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
-    let (stderr_tx, stderr_driver_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
-    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
-
-    let spawned = spawn_from_driver(ProcessDriver {
-        writer_tx,
-        stdout_rx: stdout_driver_rx.into(),
-        stderr_rx: Some(stderr_driver_rx.into()),
-        exit_rx,
-        terminator: None,
-        writer_handle: None,
-        resizer: None,
-    });
-
-    let SpawnedProcess {
-        session: _session,
-        stdout_rx,
-        stderr_rx,
-        exit_rx,
-    } = spawned;
-    let stdout_task = tokio::spawn(async move { collect_split_output(stdout_rx).await });
-    let stderr_task = tokio::spawn(async move { collect_split_output(stderr_rx).await });
-
-    stdout_tx.send(b"driver-out".to_vec())?;
-    stderr_tx.send(b"driver-err".to_vec())?;
-    drop(stdout_tx);
-    drop(stderr_tx);
-    exit_tx.send(0).expect("send exit code");
-
-    let timeout = tokio::time::Duration::from_secs(2);
-    let code = tokio::time::timeout(timeout, exit_rx)
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting for driver exit"))?
-        .unwrap_or(-1);
-    let stdout = tokio::time::timeout(timeout, stdout_task)
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting to drain driver stdout"))??;
-    let stderr = tokio::time::timeout(timeout, stderr_task)
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting to drain driver stderr"))??;
-
-    assert_eq!(stdout, b"driver-out".to_vec());
-    assert_eq!(stderr, b"driver-err".to_vec());
-    assert_eq!(code, 0);
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn driver_backed_process_can_resize_via_resizer_hook() -> anyhow::Result<()> {
-    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-    let (_stdout_tx, stdout_driver_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
-    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
-    let (size_tx, size_rx) = tokio::sync::oneshot::channel::<TerminalSize>();
-
-    let size_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(size_tx)));
-    let spawned = spawn_from_driver(ProcessDriver {
-        writer_tx,
-        stdout_rx: stdout_driver_rx.into(),
-        stderr_rx: None,
-        exit_rx,
-        terminator: None,
-        writer_handle: None,
-        resizer: Some(Box::new(move |size| {
-            if let Ok(mut guard) = size_tx.lock()
-                && let Some(size_tx) = guard.take()
-            {
-                let _ = size_tx.send(size);
-            }
-            Ok(())
-        })),
-    });
-
-    spawned.session.resize(TerminalSize {
-        rows: 40,
-        cols: 120,
-    })?;
-    exit_tx.send(0).expect("send exit code");
-
-    let resized = tokio::time::timeout(tokio::time::Duration::from_secs(2), size_rx)
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting for resize"))?
-        .expect("receive resized terminal size");
-    assert_eq!(
-        resized,
-        TerminalSize {
-            rows: 40,
-            cols: 120
-        }
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn driver_backed_process_drains_output_that_arrives_after_exit_signal() -> anyhow::Result<()>
-{
-    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-    let (stdout_tx, stdout_driver_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
-    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
-
-    let spawned = spawn_from_driver(ProcessDriver {
-        writer_tx,
-        stdout_rx: stdout_driver_rx.into(),
-        stderr_rx: None,
-        exit_rx,
-        terminator: None,
-        writer_handle: None,
-        resizer: None,
-    });
-
-    let SpawnedProcess {
-        session: _session,
-        stdout_rx,
-        stderr_rx: _stderr_rx,
-        exit_rx,
-    } = spawned;
-    let stdout_task = tokio::spawn(async move { collect_split_output(stdout_rx).await });
-
-    exit_tx.send(0).expect("send exit code");
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    stdout_tx.send(b"tail".to_vec())?;
-    drop(stdout_tx);
-
-    let timeout = tokio::time::Duration::from_secs(2);
-    let code = tokio::time::timeout(timeout, exit_rx)
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting for driver exit"))?
-        .unwrap_or(-1);
-    let stdout = tokio::time::timeout(timeout, stdout_task)
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting to drain driver stdout"))??;
-
-    assert_eq!(stdout, b"tail".to_vec());
     assert_eq!(code, 0);
 
     Ok(())

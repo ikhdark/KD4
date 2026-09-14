@@ -642,6 +642,7 @@ impl TurnContext {
             .then_some(file_system_sandbox_policy)
     }
 
+    #[expect(clippy::expect_used, reason = "A failed permission projection must not publish an invented turn context")]
     pub(crate) async fn to_turn_context_item_async(self: &Arc<Self>) -> TurnContextItem {
         let turn = Arc::clone(self);
         tokio::task::spawn_blocking(move || turn.to_turn_context_item())

@@ -22,7 +22,7 @@ fn async_version_read_yields_while_file_io_is_queued() {
         .enable_all()
         .build()
         .expect("test runtime");
-    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let blocker = runtime.spawn_blocking(move || {
         started_tx
@@ -42,6 +42,13 @@ fn async_version_read_yields_while_file_io_is_queued() {
             read.as_mut().poll(&mut Context::from_waker(Waker::noop())),
             Poll::Pending
         ));
+        assert!(
+            matches!(
+                read.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Pending
+            ),
+            "yielding once must not hide synchronous file I/O on the next poll"
+        );
         drop(release_tx);
         let info = read
             .await
@@ -56,6 +63,86 @@ fn async_version_read_yields_while_file_io_is_queued() {
         assert_eq!(info.dismissed_version.as_deref(), Some("998.0.0"));
         blocker.await.expect("file I/O worker should finish");
     });
+}
+
+#[tokio::test]
+async fn dismissal_waits_for_refresh_transaction_and_preserves_new_metadata() {
+    let home = tempdir().unwrap();
+    let config = ConfigBuilder::default()
+        .codex_home(home.path().to_path_buf())
+        .build()
+        .await
+        .unwrap();
+    let path = version_filepath(&config);
+    cache_release(&path, "998.0.0".into(), false).await.unwrap();
+    let (read_tx, read_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let refresh = tokio::spawn(merge_version_info(
+        path.clone(),
+        "999.0.0".into(),
+        move |info| {
+            read_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+            info.latest_version = "999.0.0".into();
+            info.last_checked_at = DateTime::parse_from_rfc3339("2026-09-13T01:02:03Z")
+                .unwrap()
+                .with_timezone(&Utc);
+        },
+    ));
+    read_rx.await.unwrap();
+    let mut dismissal = Box::pin(dismiss_version(&config, "999.0.0"));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut dismissal)
+            .await
+            .is_err(),
+        "dismissal must wait until the refresh transaction releases its file lock"
+    );
+    drop(release_tx);
+    refresh.await.unwrap().unwrap();
+    dismissal.await.unwrap();
+    let info = read_version_info(&path).unwrap();
+    assert_eq!(info.latest_version, "999.0.0");
+    assert_eq!(info.dismissed_version.as_deref(), Some("999.0.0"));
+    assert_eq!(
+        info.last_checked_at.to_rfc3339(),
+        "2026-09-13T01:02:03+00:00"
+    );
+    // The reverse writer ordering must preserve dismissal too.
+    cache_release(&path, "1000.0.0".into(), true).await.unwrap();
+    let info = read_version_info(&path).unwrap();
+    assert_eq!(info.latest_version, "1000.0.0");
+    assert_eq!(info.dismissed_version.as_deref(), Some("999.0.0"));
+    assert_eq!(info.npm_ready, Some(true));
+    cache_release(&path, "1000.0.0".into(), false)
+        .await
+        .unwrap();
+    assert_eq!(read_version_info(&path).unwrap().npm_ready, Some(true));
+    cache_release(&path, "1001.0.0".into(), false)
+        .await
+        .unwrap();
+    assert_eq!(read_version_info(&path).unwrap().npm_ready, Some(false));
+}
+
+#[tokio::test]
+async fn dismissal_propagates_io_errors_without_replacing_the_cache() {
+    let home = tempdir().unwrap();
+    let config = ConfigBuilder::default()
+        .codex_home(home.path().to_path_buf())
+        .build()
+        .await
+        .unwrap();
+    let path = version_filepath(&config);
+    tokio::fs::create_dir(&path).await.unwrap();
+    tokio::fs::write(path.join("sentinel"), "keep")
+        .await
+        .unwrap();
+    assert!(dismiss_version(&config, "999.0.0").await.is_err());
+    assert_eq!(
+        tokio::fs::read_to_string(path.join("sentinel"))
+            .await
+            .unwrap(),
+        "keep"
+    );
 }
 
 #[tokio::test]

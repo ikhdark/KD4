@@ -40,6 +40,49 @@ use wiremock::MockServer;
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
 
+#[tokio::test]
+async fn test_constructors_preserve_injected_user_instructions_at_thread_start() {
+    struct SuppliedInstructions(codex_extension_api::UserInstructions);
+
+    impl codex_extension_api::UserInstructionsProvider for SuppliedInstructions {
+        fn load_user_instructions(&self) -> codex_extension_api::LoadUserInstructionsFuture<'_> {
+            Box::pin(async {
+                codex_extension_api::LoadedUserInstructions {
+                    instructions: Some(self.0.clone()),
+                    warnings: Vec::new(),
+                }
+            })
+        }
+    }
+
+    let temp_dir = tempdir().expect("temporary thread workspace");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.clone();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let expected = codex_extension_api::UserInstructions {
+        text: "Keep the explicitly supplied test instructions.".to_string(),
+        source: temp_dir.path().join("supplied-instructions.md").abs(),
+    };
+    // This constructor delegates through both home-aware constructors before
+    // normal root-thread startup loads the supplied provider.
+    let manager = ThreadManager::with_models_provider_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        Arc::new(SuppliedInstructions(expected.clone())),
+    );
+    let started = manager.start_thread(config).await.expect("start root thread");
+    assert_eq!(
+        started.thread.codex.session.user_instructions().await,
+        Some(expected)
+    );
+    started
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown root thread");
+}
+
 #[test]
 fn precomputed_thread_settings_bypass_a_second_history_reduction() {
     let mut reconstruction = ThreadSettingsReconstruction {
@@ -408,6 +451,7 @@ async fn shutdown_all_threads_bounded_submits_shutdown_to_every_thread() {
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let thread_1 = manager
         .start_thread(config.clone())
@@ -445,6 +489,7 @@ async fn thread_created_guard_only_blocks_replacement_of_the_guarded_thread() {
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let guarded = manager
         .start_thread(config.clone())
@@ -508,6 +553,7 @@ async fn code_mode_session_provider_is_shared_across_threads() {
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let first = manager
         .start_thread(config.clone())
@@ -565,6 +611,7 @@ async fn start_thread_discovers_a_usable_default_shell() {
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let started = manager.start_thread(config).await.expect("start thread");
     let shell = &started.thread.codex.session.services.user_shell;
@@ -605,6 +652,7 @@ async fn provider_override_builds_a_provider_specific_models_manager() {
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let startup = manager
         .start_thread(config.clone())
@@ -681,6 +729,7 @@ async fn start_thread_keeps_internal_threads_hidden_from_normal_lookups() {
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let thread = manager
         .start_thread_with_options(StartThreadOptions {
@@ -960,6 +1009,7 @@ async fn selected_capability_roots_round_trip_through_fork() {
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let selected_roots = vec![SelectedCapabilityRoot {
         id: "demo@1".to_string(),

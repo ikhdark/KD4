@@ -30,18 +30,21 @@ impl Client {
 
     pub(super) async fn get_rate_limit_status(&self) -> Result<RateLimitStatusWithResetCredits> {
         let url = self.rate_limit_status_url();
-        let req = self.request(Method::GET, &url).headers(self.headers());
+        let req = self.request(Method::GET, &url).headers(self.headers()?);
         let (body, ct) = self.exec_request(req, "GET", &url).await?;
         self.decode_json(&url, &ct, &body)
     }
 
     pub async fn list_rate_limit_reset_credits(&self) -> Result<RateLimitResetCreditsDetails> {
         let url = self.rate_limit_reset_credits_url();
-        let req = self.request(Method::GET, &url).headers(self.headers());
+        let req = self.request(Method::GET, &url).headers(self.headers()?);
         let (body, ct) = self.exec_request(req, "GET", &url).await?;
         self.decode_json(&url, &ct, &body)
     }
 
+    /// Reuse the same request ID and automatic credit target when retrying an
+    /// ambiguous failure in the same account/workspace. Use a new ID only for
+    /// a new redemption action.
     pub async fn consume_rate_limit_reset_credit(
         &self,
         redeem_request_id: &str,
@@ -50,6 +53,8 @@ impl Client {
             .await
     }
 
+    /// Reuse the same request ID and credit ID when retrying an ambiguous failure
+    /// in the same account/workspace. Use a new ID only for a new redemption action.
     pub async fn consume_rate_limit_reset_credit_by_id(
         &self,
         redeem_request_id: &str,
@@ -67,7 +72,7 @@ impl Client {
         let url = self.consume_rate_limit_reset_credit_url();
         let req = self
             .request(Method::POST, &url)
-            .headers(self.headers())
+            .headers(self.headers()?)
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
             .json(&ConsumeRateLimitResetCreditRequest {
                 redeem_request_id,
@@ -79,33 +84,22 @@ impl Client {
 
     fn rate_limit_status_url(&self) -> String {
         match self.path_style {
-            PathStyle::CodexApi => format!("{}/api/codex/usage", self.base_url),
-            PathStyle::ChatGptApi => format!("{}/wham/usage", self.base_url),
+            PathStyle::CodexApi => self.endpoint_url("/api/codex/usage"),
+            PathStyle::ChatGptApi => self.endpoint_url("/wham/usage"),
         }
     }
 
     fn rate_limit_reset_credits_url(&self) -> String {
         match self.path_style {
-            PathStyle::CodexApi => {
-                format!("{}/api/codex/rate-limit-reset-credits", self.base_url)
-            }
-            PathStyle::ChatGptApi => {
-                format!("{}/wham/rate-limit-reset-credits", self.base_url)
-            }
+            PathStyle::CodexApi => self.endpoint_url("/api/codex/rate-limit-reset-credits"),
+            PathStyle::ChatGptApi => self.endpoint_url("/wham/rate-limit-reset-credits"),
         }
     }
 
     fn consume_rate_limit_reset_credit_url(&self) -> String {
         match self.path_style {
-            PathStyle::CodexApi => {
-                format!(
-                    "{}/api/codex/rate-limit-reset-credits/consume",
-                    self.base_url
-                )
-            }
-            PathStyle::ChatGptApi => {
-                format!("{}/wham/rate-limit-reset-credits/consume", self.base_url)
-            }
+            PathStyle::CodexApi => self.endpoint_url("/api/codex/rate-limit-reset-credits/consume"),
+            PathStyle::ChatGptApi => self.endpoint_url("/wham/rate-limit-reset-credits/consume"),
         }
     }
 }

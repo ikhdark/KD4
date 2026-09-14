@@ -40,7 +40,7 @@ pub use process::ProcessSignal;
 pub use process::SpawnedProcess;
 /// Terminal size in character cells used for PTY spawn and resize operations.
 pub use process::TerminalSize;
-/// Combine stdout/stderr receivers into a single broadcast receiver.
+/// Combine stdout/stderr into lossy broadcast output; use split receivers for exact delivery.
 pub use process::combine_output_receivers;
 /// Adapt an externally-driven process into the standard spawned-process handle.
 pub use process::spawn_from_driver;
@@ -84,8 +84,10 @@ pub fn configure_windows_command_args<S>(
     };
 
     command.args(args[..payload_index].iter().map(AsRef::as_ref));
-    let payload = args[payload_index].as_ref().to_string_lossy();
-    command.raw_arg(format!(r#""{payload}""#));
+    let mut payload = std::ffi::OsString::from("\"");
+    payload.push(args[payload_index].as_ref());
+    payload.push("\"");
+    command.raw_arg(payload);
 }
 
 #[cfg(windows)]

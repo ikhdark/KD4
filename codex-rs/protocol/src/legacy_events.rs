@@ -471,6 +471,7 @@ impl McpToolCallItem {
     }
 
     pub fn as_legacy_end_event(&self) -> Option<EventMsg> {
+        let duration = self.duration?;
         let result = match (&self.result, &self.error) {
             (Some(result), _) => Ok(result.clone()),
             (None, Some(error)) => Err(error.message.clone()),
@@ -491,7 +492,7 @@ impl McpToolCallItem {
             template_id: self.template_id.clone(),
             action_name: self.action_name.clone(),
             plugin_id: self.plugin_id.clone(),
-            duration: self.duration?,
+            duration,
             result,
         }))
     }

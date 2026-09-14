@@ -52,7 +52,7 @@ pub async fn search_rollout_matches(
     archived: bool,
     search_term: &str,
 ) -> io::Result<RolloutSearchMatches> {
-    let root = codex_home.join(if archived {
+    let root = std::path::absolute(codex_home)?.join(if archived {
         ARCHIVED_SESSIONS_SUBDIR
     } else {
         SESSIONS_SUBDIR
@@ -188,6 +188,7 @@ fn parse_ripgrep_rollout_match(
     } else {
         root.join(path)
     };
+    let path = compression::RolloutFile::from_path(path)?.into_path();
     let snippet = data
         .get("lines")
         .and_then(|lines| lines.get("text"))
@@ -640,6 +641,36 @@ mod tests {
                 .await
                 .expect("scan rollout fallback"),
             Some("later needle".to_string())
+        );
+    }
+    #[tokio::test]
+    async fn relative_home_search_has_one_root_and_excludes_non_rollout_files() {
+        let temp = tempfile::tempdir_in(".").unwrap();
+        let absolute_home = std::path::absolute(temp.path()).unwrap();
+        let root = absolute_home.join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let name = "rollout-2026-01-01T00-00-00-00000000-0000-0000-0000-000000000001.jsonl";
+        let line = user_rollout_line("2026-01-01T00:00:00Z", "needle");
+        std::fs::write(root.join(name), &line).unwrap();
+        std::fs::write(root.join("notes.jsonl"), &line).unwrap();
+        let expected = HashMap::from([(root.join(name), Some("needle".to_string()))]);
+        let actual = search_rollout_matches(Path::new("rg"), temp.path(), false, "needle")
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+        let fallback = search_rollout_matches(
+            &absolute_home.join("missing-rg"),
+            temp.path(),
+            false,
+            "needle",
+        )
+        .await
+        .unwrap();
+        assert_eq!(fallback, expected);
+        let regex = case_insensitive_literal_regex("needle").unwrap();
+        assert_eq!(
+            parse_ripgrep_rollout_match(&ripgrep_match("notes.jsonl", &line), &root, &regex),
+            None
         );
     }
 }

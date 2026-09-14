@@ -116,7 +116,7 @@ pub(crate) fn create_tool_for_codex_tool_call_param() -> Tool {
 
     Tool::new(
         "codex",
-        "Run a Codex session. Accepts configuration parameters matching the Codex Config struct.",
+        "Run a Codex session with the listed options. Use config for additional configuration overrides.",
         input_schema,
     )
     .with_title("Codex")
@@ -221,13 +221,21 @@ impl CodexToolCallReplyParam {
 
 /// Builds a `Tool` definition for the `codex-reply` tool-call.
 pub(crate) fn create_tool_for_codex_tool_call_reply_param() -> Tool {
-    let schema = SchemaSettings::draft2019_09()
+    let mut schema = SchemaSettings::draft2019_09()
         .with(|s| {
             s.inline_subschemas = true;
             s.option_add_null_type = false;
         })
         .into_generator()
         .into_root_schema_for::<CodexToolCallReplyParam>();
+
+    schema.schema.extensions.insert(
+        "anyOf".to_string(),
+        serde_json::json!([
+            { "required": ["threadId"] },
+            { "required": ["conversationId"] }
+        ]),
+    );
 
     let input_schema = create_tool_input_schema(schema, "Codex reply tool schema should serialize");
 
@@ -262,6 +270,9 @@ fn create_tool_input_schema(
         "type",
         "$defs",
         "definitions",
+        "anyOf",
+        "oneOf",
+        "allOf",
     ] {
         if let Some(value) = schema_object.remove(key) {
             input_schema.insert(key.to_string(), value);
@@ -292,7 +303,7 @@ mod tests {
         let tool = create_tool_for_codex_tool_call_param();
         let tool_json = serde_json::to_value(&tool).expect("tool serializes");
         let expected_tool_json = serde_json::json!({
-          "description": "Run a Codex session. Accepts configuration parameters matching the Codex Config struct.",
+          "description": "Run a Codex session with the listed options. Use config for additional configuration overrides.",
           "inputSchema": {
             "additionalProperties": false,
             "properties": {
@@ -391,6 +402,10 @@ mod tests {
         let expected_tool_json = serde_json::json!({
           "description": "Continue a Codex conversation by providing the thread id and prompt.",
           "inputSchema": {
+            "anyOf": [
+              { "required": ["threadId"] },
+              { "required": ["conversationId"] }
+            ],
             "properties": {
               "conversationId": {
                 "description": "DEPRECATED: use threadId instead.",

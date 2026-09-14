@@ -161,13 +161,19 @@ impl ChatWidget {
     ///
     /// Results are dropped when they target an out-of-date cwd to avoid rendering stale branch
     /// names after directory changes.
-    pub(crate) fn set_status_line_branch(&mut self, cwd: PathBuf, branch: Option<String>) {
-        if self.status_line_branch_cwd.as_ref() != Some(&cwd) {
-            self.status_line_branch_pending = false;
+    pub(crate) fn set_status_line_branch(
+        &mut self,
+        request_id: uuid::Uuid,
+        cwd: PathBuf,
+        branch: Option<String>,
+    ) {
+        if self.status_line_branch_pending_request_id != Some(request_id)
+            || self.status_line_branch_cwd.as_ref() != Some(&cwd)
+        {
             return;
         }
         self.status_line_branch = branch;
-        self.status_line_branch_pending = false;
+        self.status_line_branch_pending_request_id = None;
         self.status_line_branch_lookup_complete = true;
         self.refresh_status_surfaces();
     }
@@ -175,15 +181,17 @@ impl ChatWidget {
     /// Stores async Git summary lookup results for the current status-line cwd.
     pub(crate) fn set_status_line_git_summary(
         &mut self,
+        request_id: uuid::Uuid,
         cwd: PathBuf,
         summary: StatusLineGitSummary,
     ) {
-        if self.status_line_git_summary_cwd.as_ref() != Some(&cwd) {
-            self.status_line_git_summary_pending = false;
+        if self.status_line_git_summary_pending_request_id != Some(request_id)
+            || self.status_line_git_summary_cwd.as_ref() != Some(&cwd)
+        {
             return;
         }
         self.status_line_git_summary = Some(summary);
-        self.status_line_git_summary_pending = false;
+        self.status_line_git_summary_pending_request_id = None;
         self.status_line_git_summary_lookup_complete = true;
         self.refresh_status_surfaces();
     }
@@ -250,7 +258,7 @@ impl ChatWidget {
     pub(crate) fn finish_status_rate_limit_refresh(
         &mut self,
         request_id: u64,
-        snapshots: Vec<RateLimitSnapshot>,
+        snapshots: Result<Vec<RateLimitSnapshot>, ()>,
     ) {
         if !self
             .refreshing_status_outputs
@@ -260,7 +268,8 @@ impl ChatWidget {
             return;
         }
 
-        for snapshot in snapshots {
+        let refresh_succeeded = snapshots.is_ok();
+        for snapshot in snapshots.unwrap_or_default() {
             self.on_rate_limit_snapshot(Some(snapshot));
         }
 
@@ -275,7 +284,11 @@ impl ChatWidget {
         for (pending_request_id, handle) in self.refreshing_status_outputs.drain(..) {
             if pending_request_id == request_id {
                 updated_any = true;
-                handle.finish_rate_limit_refresh(rate_limit_snapshots.as_slice(), now);
+                handle.finish_rate_limit_refresh(
+                    rate_limit_snapshots.as_slice(),
+                    now,
+                    refresh_succeeded,
+                );
             } else {
                 remaining.push((pending_request_id, handle));
             }
@@ -355,9 +368,7 @@ impl ChatWidget {
     }
 
     pub(super) fn status_line_context_remaining_percent(&self) -> Option<i64> {
-        let Some(context_window) = self.status_line_context_window_size() else {
-            return Some(100);
-        };
+        let context_window = self.status_line_context_window_size()?;
         let default_usage = TokenUsage::default();
         let usage = self
             .token_info
@@ -372,7 +383,7 @@ impl ChatWidget {
     }
 
     pub(super) fn status_line_context_used_percent(&self) -> Option<i64> {
-        let remaining = self.status_line_context_remaining_percent().unwrap_or(100);
+        let remaining = self.status_line_context_remaining_percent()?;
         Some((100 - remaining).clamp(0, 100))
     }
 

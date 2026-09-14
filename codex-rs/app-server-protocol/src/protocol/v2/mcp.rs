@@ -730,11 +730,16 @@ pub struct McpServerElicitationRequestResponse {
 }
 
 impl From<McpServerElicitationRequestResponse> for rmcp::model::CreateElicitationResult {
+    /// Preserves object metadata supported by RMCP. Non-object metadata is omitted;
+    /// the runtime's custom response serializer supports arbitrary JSON metadata.
     fn from(value: McpServerElicitationRequestResponse) -> Self {
         Self {
             action: value.action.into(),
             content: value.content,
-            meta: None,
+            meta: value.meta.and_then(|meta| match meta {
+                JsonValue::Object(meta) => Some(rmcp::model::Meta(meta)),
+                _ => None,
+            }),
         }
     }
 }
@@ -744,7 +749,7 @@ impl From<rmcp::model::CreateElicitationResult> for McpServerElicitationRequestR
         Self {
             action: value.action.into(),
             content: value.content,
-            meta: None,
+            meta: value.meta.map(|meta| JsonValue::Object(meta.0)),
         }
     }
 }

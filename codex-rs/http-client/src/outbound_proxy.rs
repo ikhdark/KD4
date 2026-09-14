@@ -244,6 +244,9 @@ impl HttpClientFactory {
                 .acquire()
                 .await
                 .map_err(io::Error::other)?;
+            if let Some(route) = self.cached_proxy_route(&request_url) {
+                return Ok(route);
+            }
             let factory = self.clone();
             tokio::task::spawn_blocking(move || {
                 // Keep the permit with the blocking task: cancelling the caller must not allow a
@@ -493,7 +496,7 @@ fn configure_concrete_proxy(
             return Err(BuildRouteAwareHttpClientError::InvalidProxyConfig { route_class });
         }
     };
-    Ok(builder.proxy(proxy.no_proxy(no_proxy)))
+    Ok(builder.no_proxy().proxy(proxy.no_proxy(no_proxy)))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -679,19 +682,32 @@ fn no_proxy_entry_matches_origin(entry: &str, origin: &RequestOrigin) -> bool {
         .strip_prefix("http://")
         .or_else(|| entry.strip_prefix("https://"))
         .unwrap_or(entry)
-        .trim_matches(['[', ']'])
         .to_ascii_lowercase();
     let mut port = None;
-    let parsed_host_port = entry.rsplit_once(':').and_then(|(host, candidate_port)| {
-        if host.contains(':') {
-            return None;
+    if let Some(bracketed) = entry.strip_prefix('[') {
+        let Some((host, suffix)) = bracketed.split_once(']') else {
+            return false;
+        };
+        if !suffix.is_empty() {
+            port = suffix
+                .strip_prefix(':')
+                .and_then(|port| port.parse::<u16>().ok());
+            if port.is_none() {
+                return false;
+            }
         }
-        candidate_port
-            .parse::<u16>()
-            .ok()
-            .map(|parsed_port| (host.to_string(), parsed_port))
-    });
-    if let Some((host, parsed_port)) = parsed_host_port {
+        entry = host.to_string();
+    } else if let Some((host, parsed_port)) =
+        entry.rsplit_once(':').and_then(|(host, candidate_port)| {
+            if host.contains(':') {
+                return None;
+            }
+            candidate_port
+                .parse::<u16>()
+                .ok()
+                .map(|parsed_port| (host.to_string(), parsed_port))
+        })
+    {
         entry = host;
         port = Some(parsed_port);
     }
@@ -713,7 +729,8 @@ fn no_proxy_entry_matches_origin(entry: &str, origin: &RequestOrigin) -> bool {
 fn wildcard_host_match(pattern: &str, host: &str) -> bool {
     let mut remaining = host;
     let mut first = true;
-    for part in pattern.split('*') {
+    let mut parts = pattern.split('*').peekable();
+    while let Some(part) = parts.next() {
         if part.is_empty() {
             continue;
         }
@@ -722,6 +739,8 @@ fn wildcard_host_match(pattern: &str, host: &str) -> bool {
                 return false;
             };
             remaining = stripped;
+        } else if parts.peek().is_none() {
+            return remaining.ends_with(part);
         } else {
             let Some(index) = remaining.find(part) else {
                 return false;

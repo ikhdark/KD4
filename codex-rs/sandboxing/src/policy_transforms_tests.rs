@@ -842,6 +842,9 @@ fn merge_file_system_policy_with_additional_permissions_preserves_unreadable_roo
         ),
     );
 
+    assert!(!merged_policy.can_read_path_with_cwd(denied_path.as_path(), cwd.as_path()));
+    assert!(merged_policy.can_read_path_with_cwd(allowed_path.as_path(), cwd.as_path()));
+    assert!(!merged_policy.can_write_path_with_cwd(allowed_path.as_path(), cwd.as_path()));
     assert_eq!(
         merged_policy.entries.contains(&FileSystemSandboxEntry {
             path: FileSystemPath::Path { path: denied_path },
@@ -955,6 +958,8 @@ fn effective_file_system_sandbox_policy_merges_additional_write_roots() {
     let effective_policy =
         effective_file_system_sandbox_policy(&base_policy, Some(&additional_permissions));
 
+    assert!(!effective_policy.can_read_path_with_cwd(denied_path.as_path(), cwd.as_path()));
+    assert!(effective_policy.can_write_path_with_cwd(allowed_path.as_path(), cwd.as_path()));
     assert_eq!(
         effective_policy.entries.contains(&FileSystemSandboxEntry {
             path: FileSystemPath::Path { path: denied_path },
@@ -968,5 +973,220 @@ fn effective_file_system_sandbox_policy_merges_additional_write_roots() {
             access: FileSystemAccessMode::Write,
         }),
         true
+    );
+}
+
+#[test]
+fn intersections_preserve_read_carveouts_and_reject_writes_inside_them() {
+    let dir = TempDir::new().unwrap();
+    let cwd = AbsolutePathBuf::from_absolute_path(canonicalize(dir.path()).unwrap()).unwrap();
+    let protected = cwd.join("protected");
+    let requested = PermissionProfile {
+        file_system: Some(FileSystemPermissions {
+            entries: vec![
+                FileSystemSandboxEntry {
+                    path: FileSystemPath::Path { path: cwd.clone() },
+                    access: FileSystemAccessMode::Write,
+                },
+                FileSystemSandboxEntry {
+                    path: FileSystemPath::Path {
+                        path: protected.clone(),
+                    },
+                    access: FileSystemAccessMode::Read,
+                },
+            ],
+            glob_scan_max_depth: None,
+        }),
+        network: None,
+    };
+    for grant_path in [cwd.clone(), protected.join("child")] {
+        let grant = PermissionProfile {
+            file_system: Some(FileSystemPermissions::from_read_write_roots(
+                None,
+                Some(vec![grant_path.clone()]),
+            )),
+            network: None,
+        };
+        let native = intersect_permission_profiles(requested.clone(), grant.clone(), cwd.as_path());
+        let uri = intersect_uri_permission_profiles(
+            requested.clone().into(),
+            grant.into(),
+            &PathUri::from_abs_path(&cwd),
+        );
+        let uri_native: PermissionProfile = uri.try_into().expect("native URI result");
+        for result in [native, uri_native] {
+            let policy =
+                FileSystemSandboxPolicy::restricted(result.file_system.unwrap_or_default().entries);
+            assert_eq!(
+                policy.can_write_path_with_cwd(cwd.join("allowed").as_path(), cwd.as_path()),
+                grant_path == cwd
+            );
+            assert!(
+                !policy.can_write_path_with_cwd(protected.join("child").as_path(), cwd.as_path())
+            );
+            assert_eq!(
+                policy.can_read_path_with_cwd(protected.join("child").as_path(), cwd.as_path()),
+                grant_path == cwd
+            );
+        }
+    }
+}
+
+#[test]
+fn uri_intersection_accepts_symbolic_grant_for_concrete_request() {
+    for (cwd, requested_root) in [
+        ("file:///project", "file:///project"),
+        ("file:///C:/project", "file:///C:/project"),
+        ("file:///project", "file:///project/"),
+        ("file:///C:/project", "file:///C:/project/"),
+        ("file:///project", "file:///pro%6Aect"),
+    ] {
+        let cwd = PathUri::parse(cwd).unwrap();
+        let requested = UriAdditionalPermissionProfile {
+            file_system: Some(FileSystemPermissions::from_read_write_roots(
+                None,
+                Some(vec![PathUri::parse(requested_root).unwrap()]),
+            )),
+            network: None,
+        };
+        let granted = UriAdditionalPermissionProfile {
+            file_system: Some(FileSystemPermissions {
+                entries: vec![FileSystemSandboxEntry {
+                    path: FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(None),
+                    },
+                    access: FileSystemAccessMode::Write,
+                }],
+                glob_scan_max_depth: None,
+            }),
+            network: None,
+        };
+        assert_eq!(
+            intersect_uri_permission_profiles(requested, granted, &cwd),
+            UriAdditionalPermissionProfile {
+                file_system: Some(FileSystemPermissions::from_read_write_roots(
+                    None,
+                    Some(vec![cwd.clone()]),
+                )),
+                network: None,
+            }
+        );
+    }
+}
+
+#[test]
+fn uri_intersection_rejects_grant_when_deny_glob_cannot_be_bound() {
+    let cwd = PathUri::parse("file:///C:/project").unwrap();
+    let requested = UriAdditionalPermissionProfile {
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            None,
+            Some(vec![cwd.clone()]),
+        )),
+        network: None,
+    };
+    let mut granted = requested.clone();
+    granted
+        .file_system
+        .as_mut()
+        .unwrap()
+        .entries
+        .push(FileSystemSandboxEntry {
+            path: FileSystemPath::GlobPattern {
+                // Drive-relative patterns have no stable meaning without per-drive cwd state.
+                pattern: "D:*.env".into(),
+            },
+            access: FileSystemAccessMode::Deny,
+        });
+    assert_eq!(
+        intersect_uri_permission_profiles(requested, granted, &cwd).file_system,
+        None
+    );
+}
+
+#[test]
+fn uri_intersection_binds_granted_deny_globs_using_target_convention() {
+    for (cwd, expected) in [
+        ("file:///project-a", "/project-a/**/*.env"),
+        ("file:///C:/project-a", r"C:\project-a\**\*.env"),
+    ] {
+        let cwd = PathUri::parse(cwd).unwrap();
+        let requested = UriAdditionalPermissionProfile {
+            file_system: Some(FileSystemPermissions::from_read_write_roots(
+                None,
+                Some(vec![cwd.clone()]),
+            )),
+            network: None,
+        };
+        let mut grant = requested.clone();
+        grant
+            .file_system
+            .as_mut()
+            .unwrap()
+            .entries
+            .push(FileSystemSandboxEntry {
+                path: FileSystemPath::GlobPattern {
+                    pattern: "**/*.env".into(),
+                },
+                access: FileSystemAccessMode::Deny,
+            });
+        let stored = intersect_uri_permission_profiles(requested.clone(), grant, &cwd);
+        let fs = stored.file_system.as_ref().unwrap();
+        assert_eq!(
+            fs.entries[0],
+            requested.file_system.as_ref().unwrap().entries[0]
+        );
+        assert_eq!(
+            fs.entries[1],
+            FileSystemSandboxEntry {
+                path: FileSystemPath::GlobPattern {
+                    pattern: expected.into()
+                },
+                access: FileSystemAccessMode::Deny,
+            }
+        );
+        let later = cwd.join("../project-b").unwrap();
+        assert_eq!(
+            intersect_uri_permission_profiles(requested, stored.clone(), &later),
+            stored
+        );
+    }
+}
+
+#[test]
+fn unresolved_grants_keep_deny_constraints() {
+    let dir = TempDir::new().unwrap();
+    let cwd = AbsolutePathBuf::from_absolute_path(dir.path()).unwrap();
+    let allow = FileSystemSandboxEntry {
+        path: FileSystemPath::Special {
+            value: FileSystemSpecialPath::Minimal,
+        },
+        access: FileSystemAccessMode::Read,
+    };
+    let deny = FileSystemSandboxEntry {
+        path: FileSystemPath::Path {
+            path: cwd.join("blocked"),
+        },
+        access: FileSystemAccessMode::Deny,
+    };
+    let requested = PermissionProfile {
+        file_system: Some(FileSystemPermissions {
+            entries: vec![allow.clone(), deny.clone()],
+            glob_scan_max_depth: None,
+        }),
+        network: None,
+    };
+    let granted = PermissionProfile {
+        file_system: Some(FileSystemPermissions {
+            entries: vec![allow.clone()],
+            glob_scan_max_depth: None,
+        }),
+        network: None,
+    };
+    assert_eq!(
+        intersect_permission_profiles(requested, granted, cwd.as_path())
+            .file_system
+            .unwrap()
+            .entries,
+        vec![allow, deny]
     );
 }

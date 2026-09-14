@@ -1,6 +1,7 @@
 use crate::config::OtelExporter;
 use crate::config::OtelHttpProtocol;
 use crate::config::OtelSettings;
+use crate::config::OtelTlsConfig;
 use crate::config::StatsigMetricsSettings;
 use crate::metrics::MetricsClient;
 use crate::metrics::MetricsConfig;
@@ -63,7 +64,6 @@ pub struct OtelProvider {
 impl OtelProvider {
     pub fn shutdown(&self) {
         if let Some(tracer_provider) = &self.tracer_provider {
-            let _ = tracer_provider.force_flush();
             let _ = tracer_provider.shutdown();
         }
         if let Some(metrics) = &self.metrics {
@@ -75,6 +75,15 @@ impl OtelProvider {
     }
 
     pub fn from(settings: &OtelSettings) -> Result<Option<Self>, Box<dyn Error>> {
+        if matches!(settings.exporter, OtelExporter::Statsig)
+            || matches!(settings.trace_exporter, OtelExporter::Statsig)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Statsig is supported only for metrics",
+            )
+            .into());
+        }
         let log_enabled = !matches!(settings.exporter, OtelExporter::None);
         let trace_enabled = !matches!(settings.trace_exporter, OtelExporter::None);
         let metric_exporter = crate::config::resolve_exporter(&settings.metrics_exporter);
@@ -196,16 +205,7 @@ impl OtelProvider {
 
 impl Drop for OtelProvider {
     fn drop(&mut self) {
-        if let Some(tracer_provider) = &self.tracer_provider {
-            let _ = tracer_provider.force_flush();
-            let _ = tracer_provider.shutdown();
-        }
-        if let Some(metrics) = &self.metrics {
-            let _ = metrics.shutdown();
-        }
-        if let Some(logger) = &self.logger {
-            let _ = logger.shutdown();
-        }
+        self.shutdown();
     }
 }
 
@@ -250,16 +250,18 @@ fn normalize_host_name(host_name: &str) -> Option<String> {
     (!host_name.is_empty()).then(|| host_name.to_owned())
 }
 
-fn tracer_provider_builder(
+fn tracer_provider_builder<P: SpanProcessor + 'static>(
     resource: &Resource,
     span_attributes: BTreeMap<String, String>,
+    processor: P,
 ) -> TracerProviderBuilder {
     let builder = SdkTracerProvider::builder().with_resource(resource.clone());
     if span_attributes.is_empty() {
-        builder
+        builder.with_span_processor(processor)
     } else {
         builder.with_span_processor(SpanAttributesProcessor {
             attributes: span_attributes,
+            inner: processor,
         })
     }
 }
@@ -268,26 +270,36 @@ fn tracer_provider_builder(
 ///
 /// Resource attributes describe the provider process. These attributes are
 /// per-span metadata, so they need to be attached before each span is exported.
+/// Wrap the exporter processor so the SDK can move completed span data into one
+/// processor instead of cloning it for a separate attribute-only processor.
 #[derive(Debug)]
-struct SpanAttributesProcessor {
+struct SpanAttributesProcessor<P> {
+    inner: P,
     attributes: BTreeMap<String, String>,
 }
 
-impl SpanProcessor for SpanAttributesProcessor {
-    fn on_start(&self, span: &mut Span, _cx: &Context) {
+impl<P: SpanProcessor> SpanProcessor for SpanAttributesProcessor<P> {
+    fn on_start(&self, span: &mut Span, cx: &Context) {
         for (key, value) in self.attributes.iter() {
             span.set_attribute(KeyValue::new(key.clone(), value.clone()));
         }
+        self.inner.on_start(span, cx);
     }
 
-    fn on_end(&self, _span: SpanData) {}
+    fn on_end(&self, span: SpanData) {
+        self.inner.on_end(span);
+    }
 
     fn force_flush(&self) -> OTelSdkResult {
-        Ok(())
+        self.inner.force_flush()
     }
 
-    fn shutdown_with_timeout(&self, _timeout: Duration) -> OTelSdkResult {
-        Ok(())
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        self.inner.shutdown_with_timeout(timeout)
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        self.inner.set_resource(resource);
     }
 }
 
@@ -307,7 +319,7 @@ fn build_logger(
         } => {
             debug!("Using OTLP Grpc exporter: {endpoint}");
 
-            let header_map = crate::otlp::build_header_map(&headers);
+            let header_map = crate::otlp::build_header_map(&headers)?;
 
             let base_tls_config = ClientTlsConfig::new()
                 .with_enabled_roots()
@@ -334,6 +346,7 @@ fn build_logger(
             tls,
         } => {
             debug!("Using OTLP Http exporter: {endpoint}");
+            crate::otlp::build_header_map(&headers)?;
 
             let protocol = match protocol {
                 OtelHttpProtocol::Binary => Protocol::HttpBinary,
@@ -346,10 +359,11 @@ fn build_logger(
                 .with_protocol(protocol)
                 .with_headers(headers);
 
-            if let Some(tls) = tls.as_ref() {
-                let client = crate::otlp::build_http_client(tls, OTEL_EXPORTER_OTLP_LOGS_TIMEOUT)?;
-                exporter_builder = exporter_builder.with_http_client(client);
-            }
+            let client = crate::otlp::build_http_client(
+                tls.as_ref().unwrap_or(&OtelTlsConfig::default()),
+                OTEL_EXPORTER_OTLP_LOGS_TIMEOUT,
+            )?;
+            exporter_builder = exporter_builder.with_http_client(client);
 
             let exporter = exporter_builder.build()?;
 
@@ -366,7 +380,11 @@ fn build_tracer_provider(
     span_attributes: BTreeMap<String, String>,
 ) -> Result<SdkTracerProvider, Box<dyn Error>> {
     let span_exporter = match crate::config::resolve_exporter(exporter) {
-        OtelExporter::None => return Ok(tracer_provider_builder(resource, span_attributes).build()),
+        OtelExporter::None => {
+            return Ok(SdkTracerProvider::builder()
+                .with_resource(resource.clone())
+                .build());
+        }
         OtelExporter::Statsig => unreachable!("statsig exporter should be resolved"),
         OtelExporter::OtlpGrpc {
             endpoint,
@@ -375,7 +393,7 @@ fn build_tracer_provider(
         } => {
             debug!("Using OTLP Grpc exporter for traces: {endpoint}");
 
-            let header_map = crate::otlp::build_header_map(&headers);
+            let header_map = crate::otlp::build_header_map(&headers)?;
 
             let base_tls_config = ClientTlsConfig::new()
                 .with_enabled_roots()
@@ -400,6 +418,7 @@ fn build_tracer_provider(
             tls,
         } => {
             debug!("Using OTLP Http exporter for traces: {endpoint}");
+            crate::otlp::build_header_map(&headers)?;
 
             if crate::otlp::current_tokio_runtime_is_multi_thread() {
                 let protocol = match protocol {
@@ -423,9 +442,7 @@ fn build_tracer_provider(
                     TokioBatchSpanProcessor::builder(exporter_builder.build()?, runtime::Tokio)
                         .build();
 
-                return Ok(tracer_provider_builder(resource, span_attributes)
-                    .with_span_processor(processor)
-                    .build());
+                return Ok(tracer_provider_builder(resource, span_attributes, processor).build());
             }
 
             let protocol = match protocol {
@@ -439,11 +456,11 @@ fn build_tracer_provider(
                 .with_protocol(protocol)
                 .with_headers(headers);
 
-            if let Some(tls) = tls.as_ref() {
-                let client =
-                    crate::otlp::build_http_client(tls, OTEL_EXPORTER_OTLP_TRACES_TIMEOUT)?;
-                exporter_builder = exporter_builder.with_http_client(client);
-            }
+            let client = crate::otlp::build_http_client(
+                tls.as_ref().unwrap_or(&OtelTlsConfig::default()),
+                OTEL_EXPORTER_OTLP_TRACES_TIMEOUT,
+            )?;
+            exporter_builder = exporter_builder.with_http_client(client);
 
             exporter_builder.build()?
         }
@@ -451,9 +468,7 @@ fn build_tracer_provider(
 
     let processor = BatchSpanProcessor::builder(span_exporter).build();
 
-    Ok(tracer_provider_builder(resource, span_attributes)
-        .with_span_processor(processor)
-        .build())
+    Ok(tracer_provider_builder(resource, span_attributes, processor).build())
 }
 
 #[cfg(test)]
@@ -511,8 +526,13 @@ mod tests {
 
     #[test]
     fn log_export_target_excludes_trace_safe_events() {
+        assert!(is_log_export_target("codex_otel"));
+        assert!(is_log_export_target("codex_otel::module"));
+        assert!(!is_log_export_target("codex_otel_extra"));
+        assert!(is_log_export_target("codex_otel.trace_safe_private"));
         assert!(is_log_export_target("codex_otel.log_only"));
         assert!(is_log_export_target("codex_otel.network_proxy"));
+        assert!(!is_log_export_target("codex_otel_unrelated"));
         assert!(!is_log_export_target("codex_otel.trace_safe"));
         assert!(!is_log_export_target("codex_otel.trace_safe.debug"));
     }
@@ -521,8 +541,74 @@ mod tests {
     fn trace_export_target_only_includes_trace_safe_prefix() {
         assert!(is_trace_safe_target("codex_otel.trace_safe"));
         assert!(is_trace_safe_target("codex_otel.trace_safe.summary"));
+        assert!(!is_trace_safe_target("codex_otel.trace_safe_private"));
         assert!(!is_trace_safe_target("codex_otel.log_only"));
         assert!(!is_trace_safe_target("codex_otel.network_proxy"));
+        assert!(!is_trace_safe_target("codex_otel.trace_safe_extra"));
+        assert!(!is_trace_safe_target("codex_otel.trace_safeextra"));
+    }
+
+    #[test]
+    fn provider_rejects_statsig_for_logs_and_traces() {
+        for logs in [true, false] {
+            let mut settings = test_otel_settings();
+            if logs {
+                settings.exporter = OtelExporter::Statsig;
+            } else {
+                settings.trace_exporter = OtelExporter::Statsig;
+            }
+            let error = OtelProvider::from(&settings)
+                .err()
+                .expect("invalid signal rejected");
+            assert_eq!(error.to_string(), "Statsig is supported only for metrics");
+        }
+    }
+
+    #[test]
+    fn provider_rejects_invalid_headers_for_every_signal_and_transport() {
+        for http in [false, true] {
+            for signal in ["logs", "traces", "metrics"] {
+                for entries in [
+                    vec![("bad name", "secret")],
+                    vec![("authorization", "secret\nvalue")],
+                    vec![("X-Token", "secret"), ("x-token", "different-secret")],
+                ] {
+                    let headers = entries
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect();
+                    let exporter = if http {
+                        OtelExporter::OtlpHttp {
+                            endpoint: "http://localhost:4318".to_string(),
+                            headers,
+                            protocol: OtelHttpProtocol::Binary,
+                            tls: None,
+                        }
+                    } else {
+                        OtelExporter::OtlpGrpc {
+                            endpoint: "http://localhost:4317".to_string(),
+                            headers,
+                            tls: None,
+                        }
+                    };
+                    let mut settings = test_otel_settings();
+                    match signal {
+                        "logs" => settings.exporter = exporter,
+                        "traces" => settings.trace_exporter = exporter,
+                        _ => settings.metrics_exporter = exporter,
+                    }
+                    let error = OtelProvider::from(&settings)
+                        .err()
+                        .expect("invalid headers rejected");
+                    let message = error.to_string();
+                    assert!(message.contains("header"), "{signal}: {message}");
+                    assert!(
+                        !message.contains("secret"),
+                        "header value leaked: {message}"
+                    );
+                }
+            }
+        }
     }
 
     fn test_otel_settings() -> OtelSettings {

@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use codex_analytics::AnalyticsEventsClient;
@@ -48,6 +50,228 @@ use codex_protocol::protocol::TruncationPolicy;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::TempDir;
+
+#[tokio::test]
+async fn disabling_goals_preserves_recorded_usage_until_turn_cleanup() -> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+    harness.start_turn("turn-1", &TokenUsage::default()).await;
+    let tools = harness.tools();
+    tool_by_name(&tools, "create_goal")
+        .handle(tool_call(
+            "create_goal",
+            "create",
+            json!({"objective": "retain recorded usage when disabled"}),
+        ))
+        .await?;
+    harness
+        .record_token_usage("turn-1", &token_usage(20, 5, 8, 0, 28))
+        .await;
+    harness.enabled.store(false, Ordering::Relaxed);
+    for contributor in harness.registry.config_contributors() {
+        contributor.on_config_changed(&harness.session_store, &harness.thread_store, &(), &());
+    }
+    assert!(harness.tools().is_empty());
+    harness
+        .record_token_usage("turn-1", &token_usage(100, 5, 80, 0, 180))
+        .await;
+    harness.stop_turn("turn-1").await;
+    harness.stop_turn("turn-1").await;
+    let goal = runtime
+        .thread_goals()
+        .get_thread_goal(thread_id)
+        .await?
+        .unwrap();
+    assert_eq!(goal.tokens_used, 23);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_goal_flushes_usage_once_and_rejects_stale_turn_updates() -> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+    harness.start_turn("turn-1", &TokenUsage::default()).await;
+    let tools = harness.tools();
+    tool_by_name(&tools, "create_goal")
+        .handle(tool_call(
+            "create_goal",
+            "create",
+            json!({"objective": "report current usage"}),
+        ))
+        .await?;
+    harness
+        .record_token_usage("turn-1", &token_usage(20, 5, 8, 0, 28))
+        .await;
+    for call_id in ["get-first", "get-second"] {
+        let call = tool_call("get_goal", call_id, json!({}));
+        let payload = call.payload.clone();
+        let output = tool_by_name(&tools, "get_goal").handle(call).await?;
+        let value = output.code_mode_result(&payload);
+        assert_eq!(value["goal"]["tokensUsed"], 23);
+    }
+    harness
+        .start_turn("turn-2", &token_usage(20, 5, 8, 0, 28))
+        .await;
+    let result = tool_by_name(&tools, "update_goal")
+        .handle(tool_call(
+            "update_goal",
+            "stale-update",
+            json!({"status": "complete"}),
+        ))
+        .await;
+    assert!(
+        matches!(result, Err(FunctionCallError::RespondToModel(message)) if message == "goal tool call belongs to an inactive turn")
+    );
+    let goal = runtime
+        .thread_goals()
+        .get_thread_goal(thread_id)
+        .await?
+        .unwrap();
+    assert_eq!(goal.tokens_used, 23);
+    assert_eq!(goal.status, codex_state::ThreadGoalStatus::Active);
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_usage_flush_does_not_prevent_stopping_and_is_retried() -> anyhow::Result<()> {
+    for external_pause in [false, true] {
+        let runtime = test_runtime().await?;
+        let thread_id = test_thread_id()?;
+        seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+        let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+        harness.start_turn("turn-1", &TokenUsage::default()).await;
+        let tools = harness.tools();
+        tool_by_name(&tools, "create_goal")
+            .handle(tool_call(
+                "create_goal",
+                "create",
+                json!({"objective": "stop despite failed accounting"}),
+            ))
+            .await?;
+        harness
+            .record_token_usage("turn-1", &token_usage(20, 5, 8, 0, 28))
+            .await;
+        let fault_db = sqlx::SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(codex_state::goals_db_path(runtime.codex_home())),
+        )
+        .await?;
+        sqlx::query("CREATE TRIGGER fail_usage BEFORE UPDATE OF tokens_used ON thread_goals BEGIN SELECT RAISE(ABORT, 'usage unavailable'); END")
+            .execute(&fault_db).await?;
+        let expected_status = if external_pause {
+            // Active mutations must fail without resetting unflushed usage.
+            let result = harness
+                .goal_service
+                .set_thread_goal(
+                    runtime.as_ref(),
+                    GoalSetRequest {
+                        thread_id,
+                        objective: GoalObjectiveUpdate::Keep,
+                        status: Some(ThreadGoalStatus::Active),
+                        token_budget: GoalTokenBudgetUpdate::Keep,
+                    },
+                )
+                .await;
+            assert!(result.is_err());
+            harness
+                .goal_service
+                .set_thread_goal(
+                    runtime.as_ref(),
+                    GoalSetRequest {
+                        thread_id,
+                        objective: GoalObjectiveUpdate::Keep,
+                        status: Some(ThreadGoalStatus::Paused),
+                        token_budget: GoalTokenBudgetUpdate::Keep,
+                    },
+                )
+                .await?;
+            codex_state::ThreadGoalStatus::Paused
+        } else {
+            harness
+                .notify_turn_error("turn-1", CodexErrorInfo::Other)
+                .await;
+            codex_state::ThreadGoalStatus::Blocked
+        };
+        let goal = runtime
+            .thread_goals()
+            .get_thread_goal(thread_id)
+            .await?
+            .unwrap();
+        assert_eq!(goal.status, expected_status);
+        assert_eq!(goal.tokens_used, 0);
+        sqlx::query("DROP TRIGGER fail_usage")
+            .execute(&fault_db)
+            .await?;
+        harness
+            .runtime_handle()
+            .prepare_external_goal_mutation()
+            .await
+            .map_err(anyhow::Error::msg)?;
+        harness
+            .runtime_handle()
+            .prepare_external_goal_mutation()
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let goal = runtime
+            .thread_goals()
+            .get_thread_goal(thread_id)
+            .await?
+            .unwrap();
+        assert_eq!(goal.status, expected_status);
+        assert_eq!(goal.tokens_used, 23);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn delayed_set_effects_do_not_reactivate_a_paused_goal() -> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+    harness.start_turn("turn-1", &TokenUsage::default()).await;
+    let active = harness
+        .goal_service
+        .set_thread_goal(
+            runtime.as_ref(),
+            GoalSetRequest {
+                thread_id,
+                objective: GoalObjectiveUpdate::Set("stay paused"),
+                status: Some(ThreadGoalStatus::Active),
+                token_budget: GoalTokenBudgetUpdate::Keep,
+            },
+        )
+        .await?;
+    harness
+        .goal_service
+        .set_thread_goal(
+            runtime.as_ref(),
+            GoalSetRequest {
+                thread_id,
+                objective: GoalObjectiveUpdate::Keep,
+                status: Some(ThreadGoalStatus::Paused),
+                token_budget: GoalTokenBudgetUpdate::Keep,
+            },
+        )
+        .await?;
+    active.apply_runtime_effects(&harness.goal_service).await;
+    let tools = harness.tools();
+    assert_eq!(
+        tool_by_name(&tools, "get_goal").exposure(),
+        ToolExposure::Deferred
+    );
+    let goal = runtime
+        .thread_goals()
+        .get_thread_goal(thread_id)
+        .await?
+        .unwrap();
+    assert_eq!(goal.status, codex_state::ThreadGoalStatus::Paused);
+    Ok(())
+}
 
 #[tokio::test]
 async fn terminal_goal_accounting_failure_preserves_and_retries_progress() -> anyhow::Result<()> {
@@ -294,7 +518,7 @@ async fn installed_goal_tools_only_replace_complete_goal() -> anyhow::Result<()>
     assert_eq!(
         err,
         FunctionCallError::RespondToModel(
-            "cannot create a new goal because this thread has an unfinished goal; complete the existing goal first"
+            "cannot create a new goal because this thread has an unfinished goal; continue it or ask the user to clear or replace it. Do not mark it complete merely to replace it"
                 .to_string()
         )
     );
@@ -983,6 +1207,15 @@ async fn update_goal_can_block_and_accounts_final_progress() -> anyhow::Result<(
         .await;
     let tools = harness.tools();
     let update_tool = tool_by_name(&tools, "update_goal");
+    let codex_extension_api::ToolSpec::Function(spec) = update_tool.spec() else {
+        anyhow::bail!("update_goal must expose a function tool");
+    };
+    assert!(spec.description.contains("authoritative evidence establishes that user input, external change, or unavailable authorization is required and no permitted independent work remains"));
+    assert!(
+        spec.description
+            .contains("Do not repeat an unchanged failing action merely to satisfy a turn count.")
+    );
+    assert!(!spec.description.contains("three consecutive"));
     let invocation = tool_call(
         "update_goal",
         "call-update-goal",
@@ -1283,6 +1516,67 @@ async fn goal_service_sets_gets_and_clears_thread_goal() -> anyhow::Result<()> {
     assert_eq!(Some(123), get.token_budget);
     assert_eq!(Some("ship goal API ownership"), metadata.preview.as_deref());
 
+    let fault_db = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(codex_state::goals_db_path(runtime.codex_home())),
+    )
+    .await?;
+    sqlx::query("UPDATE thread_goals SET tokens_used = 23, time_used_seconds = 7")
+        .execute(&fault_db)
+        .await?;
+    let before_replace = api
+        .get_thread_goal(runtime.as_ref(), thread_id)
+        .await?
+        .unwrap();
+    let previous_id = runtime
+        .thread_goals()
+        .get_thread_goal(thread_id)
+        .await?
+        .unwrap()
+        .goal_id;
+    sqlx::query("CREATE TRIGGER fail_replacement BEFORE INSERT ON thread_goals BEGIN SELECT RAISE(ABORT, 'replacement unavailable'); END")
+        .execute(&fault_db).await?;
+    let replacement = GoalSetRequest {
+        thread_id,
+        objective: GoalObjectiveUpdate::Replace("replacement objective"),
+        status: Some(ThreadGoalStatus::Paused),
+        token_budget: GoalTokenBudgetUpdate::Set(None),
+    };
+    assert!(
+        api.set_thread_goal(runtime.as_ref(), replacement)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        Some(before_replace.clone()),
+        api.get_thread_goal(runtime.as_ref(), thread_id).await?
+    );
+    sqlx::query("DROP TRIGGER fail_replacement")
+        .execute(&fault_db)
+        .await?;
+    let replaced = api
+        .set_thread_goal(runtime.as_ref(), replacement)
+        .await?
+        .goal;
+    assert_ne!(
+        runtime
+            .thread_goals()
+            .get_thread_goal(thread_id)
+            .await?
+            .unwrap()
+            .goal_id,
+        previous_id
+    );
+    assert_eq!(replaced.objective, "replacement objective");
+    assert_eq!(replaced.status, ThreadGoalStatus::Paused);
+    assert_eq!(replaced.token_budget, None);
+    assert_eq!(replaced.tokens_used, 0);
+    assert_eq!(replaced.time_used_seconds, 0);
+    assert_eq!(
+        Some(replaced),
+        api.get_thread_goal(runtime.as_ref(), thread_id).await?
+    );
+
     assert!(api.clear_thread_goal(runtime.as_ref(), thread_id).await?);
     assert_eq!(
         None,
@@ -1355,6 +1649,7 @@ struct GoalExtensionHarness {
     thread_store: ExtensionData,
     goal_service: Arc<GoalService>,
     sink: Arc<RecordingEventSink>,
+    enabled: Arc<AtomicBool>,
 }
 
 impl GoalExtensionHarness {
@@ -1365,6 +1660,8 @@ impl GoalExtensionHarness {
         let sink = Arc::new(RecordingEventSink::default());
         let mut builder = ExtensionRegistryBuilder::<()>::with_event_sink(sink.clone());
         let goal_service = Arc::new(GoalService::new());
+        let enabled = Arc::new(AtomicBool::new(true));
+        let resolve_enabled = Arc::clone(&enabled);
         install_with_backend(
             &mut builder,
             runtime,
@@ -1372,7 +1669,7 @@ impl GoalExtensionHarness {
             /*metrics_client*/ None,
             Weak::new(),
             Arc::clone(&goal_service),
-            |_| true,
+            move |_| resolve_enabled.load(Ordering::Relaxed),
         );
         let registry = builder.build();
         let session_store = ExtensionData::new("session-1");
@@ -1396,6 +1693,7 @@ impl GoalExtensionHarness {
             thread_store,
             goal_service,
             sink,
+            enabled,
         })
     }
 

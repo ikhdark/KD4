@@ -2,6 +2,7 @@
 """Stage one or more Codex npm packages for release."""
 
 import argparse
+import errno
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -763,7 +764,7 @@ def artifact_is_complete(artifact_dir: Path, artifact: WorkflowArtifact) -> bool
         return False
     try:
         marker = marker_path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeError):
         return False
     expected_digest = next(
         (
@@ -773,24 +774,27 @@ def artifact_is_complete(artifact_dir: Path, artifact: WorkflowArtifact) -> bool
         ),
         None,
     )
-    if expected_digest is None:
+    if expected_digest is None or not all(
+        field in marker.splitlines()
+        for field in (
+            "version=3",
+            f"name={artifact.name}",
+            f"size_in_bytes={artifact.size_in_bytes}",
+            f"artifact_id={artifact.artifact_id}",
+            f"archive_sha256={artifact.archive_sha256}",
+        )
+    ):
         return False
     try:
         actual_digest = artifact_tree_digest(artifact_dir)
     except (OSError, RuntimeError):
         return False
-    return (
-        "version=2\n" in marker
-        and f"name={artifact.name}\n" in marker
-        and f"size_in_bytes={artifact.size_in_bytes}\n" in marker
-        and f"artifact_id={artifact.artifact_id}\n" in marker
-        and f"archive_sha256={artifact.archive_sha256}\n" in marker
-        and actual_digest == expected_digest
-    )
+    return actual_digest == expected_digest
 
 
 def artifact_tree_digest(artifact_dir: Path) -> str:
     digest = hashlib.sha256()
+    digest.update(b"codex-artifact-tree-v3\0")
     for path in sorted(
         artifact_dir.rglob("*"),
         key=lambda item: item.relative_to(artifact_dir).as_posix(),
@@ -807,16 +811,14 @@ def artifact_tree_digest(artifact_dir: Path) -> str:
         digest.update(len(relative).to_bytes(8, "big"))
         digest.update(relative)
         if kind == b"f":
-            with path.open("rb") as handle:
-                while chunk := handle.read(1024 * 1024):
-                    digest.update(chunk)
+            digest.update(bytes.fromhex(file_sha256(path)))
     return digest.hexdigest()
 
 
 def write_complete_marker(artifact_dir: Path, artifact: WorkflowArtifact) -> None:
     marker_path = artifact_dir / COMPLETE_MARKER
     payload = (
-        "version=2\n"
+        "version=3\n"
         f"name={artifact.name}\n"
         f"size_in_bytes={artifact.size_in_bytes}\n"
         f"artifact_id={artifact.artifact_id}\n"
@@ -847,18 +849,31 @@ def file_sha256(path: Path) -> str:
 
 def extract_artifact_zip(archive_path: Path, dest_dir: Path) -> None:
     seen: set[str] = set()
+    root = dest_dir.resolve()
     with zipfile.ZipFile(archive_path) as archive:
         for member in archive.infolist():
             normalized_name = member.filename.replace("\\", "/")
+            raw_parts = normalized_name.removesuffix("/").split("/")
             candidate = PurePosixPath(normalized_name)
+            identity = candidate.as_posix().casefold()
             if (
                 not normalized_name
                 or candidate.is_absolute()
-                or any(part in {"", ".", ".."} for part in candidate.parts)
-                or normalized_name in seen
+                or any(
+                    part in {"", ".", ".."}
+                    or part.endswith((".", " "))
+                    or any(char in '<>:"|?*' or ord(char) < 32 for char in part)
+                    or re.fullmatch(
+                        r"(?:CON|PRN|AUX|NUL|COM[1-9\u00b9\u00b2\u00b3]|LPT[1-9\u00b9\u00b2\u00b3])(?:\..*)?",
+                        part,
+                        re.IGNORECASE,
+                    )
+                    for part in raw_parts
+                )
+                or identity in seen
             ):
                 raise RuntimeError(f"unsafe workflow artifact path: {member.filename}")
-            seen.add(normalized_name)
+            seen.add(identity)
             mode = member.external_attr >> 16
             file_type = stat.S_IFMT(mode)
             if file_type not in {0, stat.S_IFREG, stat.S_IFDIR}:
@@ -866,6 +881,8 @@ def extract_artifact_zip(archive_path: Path, dest_dir: Path) -> None:
                     f"workflow artifact contains a link or special file: {member.filename}"
                 )
             destination = dest_dir.joinpath(*candidate.parts)
+            if not destination.resolve().is_relative_to(root):
+                raise RuntimeError(f"unsafe workflow artifact path: {member.filename}")
             if member.is_dir():
                 destination.mkdir(parents=True, exist_ok=True)
                 continue
@@ -911,18 +928,21 @@ def run_command(cmd: list[str]) -> None:
 
 
 def run_command_capture(cmd: list[str]) -> str:
-    result = subprocess.run(
-        cmd,
-        cwd=REPO_ROOT,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        # node/npm emit UTF-8 unconditionally; Windows would otherwise decode
-        # as cp1252 and can hard-crash on undecodable bytes.
-        encoding="utf-8",
-        errors="replace",
-    )
-    log = format_command(cmd) + "\n" + bounded_log(result.stdout or "")
+    with tempfile.TemporaryFile() as output:
+        result = subprocess.run(
+            cmd, cwd=REPO_ROOT, stdout=output, stderr=subprocess.STDOUT
+        )
+        size = output.tell()
+        output.seek(0)
+        if size <= MAX_CAPTURED_LOG_CHARS:
+            captured = output.read().decode("utf-8", errors="replace")
+        else:
+            half = MAX_CAPTURED_LOG_CHARS // 2
+            prefix = output.read(half).decode("utf-8", errors="replace")
+            output.seek(-half, os.SEEK_END)
+            tail = output.read(half).decode("utf-8", errors="replace")
+            captured = f"{prefix}\n...[truncated {size - 2 * half} bytes]...\n{tail}"
+    log = format_command(cmd) + "\n" + captured
     if result.returncode != 0:
         raise RuntimeError(
             f"Command failed with exit code {result.returncode}:\n{log.rstrip()}"
@@ -1067,6 +1087,25 @@ def stage_packages(
     return [results_by_package[package] for package in packages]
 
 
+def replace_package_file(source: Path, destination: Path) -> None:
+    try:
+        source.replace(destination)
+    except OSError as error:
+        if error.errno != errno.EXDEV:
+            raise
+        descriptor, name = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+        )
+        os.close(descriptor)
+        temporary = Path(name)
+        try:
+            shutil.copy2(source, temporary)
+            temporary.replace(destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+        # The staging directory's owner removes this source after activation.
+
+
 def commit_staged_packages(
     results: Sequence[StagePackageResult], output_dir: Path
 ) -> list[StagePackageResult]:
@@ -1082,7 +1121,7 @@ def commit_staged_packages(
                 destination.replace(backup)
                 existing_backup = backup
             try:
-                source.replace(destination)
+                replace_package_file(source, destination)
             except Exception:
                 if existing_backup is not None and not destination.exists():
                     existing_backup.replace(destination)
@@ -1091,7 +1130,8 @@ def commit_staged_packages(
     except Exception:
         for destination, backup, source in reversed(committed):
             if destination.exists():
-                destination.replace(source)
+                replace_package_file(destination, source)
+                destination.unlink(missing_ok=True)
             if backup is not None and backup.exists():
                 backup.replace(destination)
         raise

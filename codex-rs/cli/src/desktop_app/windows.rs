@@ -34,16 +34,23 @@ pub async fn run_windows_app_open_or_install(
 }
 
 async fn codex_app_is_installed() -> anyhow::Result<bool> {
-    let output = Command::new("powershell.exe")
+    let mut command = Command::new("powershell.exe");
+    command
+        .kill_on_drop(true)
         .arg("-NoProfile")
+        .arg("-NonInteractive")
         .arg("-Command")
-        .arg("Get-StartApps -Name 'Codex' | Select-Object -First 1 -ExpandProperty AppID")
-        .output()
+        .arg("$ErrorActionPreference = 'Stop'; Get-StartApps -Name 'Codex' | Select-Object -First 1 -ExpandProperty AppID");
+    let output = tokio::time::timeout(std::time::Duration::from_secs(10), command.output())
         .await
+        .context("timed out checking whether Codex Desktop is installed")?
         .context("failed to invoke `powershell.exe`")?;
 
     if !output.status.success() {
-        return Ok(false);
+        anyhow::bail!(
+            "failed to check Codex Desktop installation: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
 
     Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
@@ -52,9 +59,10 @@ async fn codex_app_is_installed() -> anyhow::Result<bool> {
 async fn open_url(url: &str) -> anyhow::Result<()> {
     let status = Command::new("powershell.exe")
         .arg("-NoProfile")
+        .arg("-NonInteractive")
         .arg("-Command")
-        .arg("& { param($target) try { Start-Process -FilePath $target -ErrorAction Stop } catch { Write-Error $_; exit 1 } }")
-        .arg(url)
+        .arg("try { Start-Process -FilePath $env:CODEX_DESKTOP_OPEN_TARGET -ErrorAction Stop } catch { Write-Error $_; exit 1 }")
+        .env("CODEX_DESKTOP_OPEN_TARGET", url)
         .status()
         .await
         .with_context(|| format!("failed to open {url}"))?;
@@ -100,6 +108,23 @@ mod tests {
             .await
             .expect_err("a nonexistent installer must not be reported as opened");
         assert!(error.to_string().contains("failed to open"));
+    }
+
+    #[tokio::test]
+    async fn open_url_treats_powershell_metacharacters_as_data() {
+        let temp = tempfile::tempdir().expect("temp directory");
+        let marker = temp.path().join("injected.txt");
+        let target = format!(
+            "missing-installer.exe; New-Item -ItemType File -Path '{}'; #",
+            marker.display()
+        );
+        open_url(&target)
+            .await
+            .expect_err("literal target must fail to open");
+        assert!(
+            !marker.exists(),
+            "URL contents must not execute as PowerShell"
+        );
     }
 
     #[test]

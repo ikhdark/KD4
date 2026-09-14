@@ -387,7 +387,7 @@ impl From<MemoriesToml> for MemoriesConfig {
 }
 
 /// Default settings that apply to all apps.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct AppsDefaultConfig {
     /// When `false`, apps are disabled unless overridden by per-app settings.
@@ -417,6 +417,18 @@ pub struct AppsDefaultConfig {
     pub default_tools_approval_mode: Option<AppToolApproval>,
 }
 
+impl Default for AppsDefaultConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_enabled(),
+            approvals_reviewer: None,
+            destructive_enabled: default_enabled(),
+            open_world_enabled: default_enabled(),
+            default_tools_approval_mode: None,
+        }
+    }
+}
+
 /// Per-tool settings for a single app tool.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
@@ -440,7 +452,7 @@ pub struct AppToolsConfig {
 }
 
 /// Config values for a single app/connector.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct AppConfig {
     /// When `false`, Codex does not surface this app.
@@ -470,6 +482,20 @@ pub struct AppConfig {
     /// Per-tool settings for this app.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<AppToolsConfig>,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_enabled(),
+            approvals_reviewer: None,
+            destructive_enabled: None,
+            open_world_enabled: None,
+            default_tools_approval_mode: None,
+            default_tools_enabled: None,
+            tools: None,
+        }
+    }
 }
 
 /// App/connector settings loaded from `config.toml`.
@@ -655,7 +681,7 @@ pub struct ModelAvailabilityNuxConfig {
 pub const DEFAULT_TERMINAL_RESIZE_REFLOW_FALLBACK_MAX_ROWS: usize = 1_000;
 
 /// Collection of settings that are specific to the TUI.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct Tui {
     #[serde(default, flatten)]
@@ -750,6 +776,29 @@ pub struct Tui {
     #[serde(default)]
     #[schemars(range(min = 0))]
     pub terminal_resize_reflow_max_rows: Option<usize>,
+}
+
+impl Default for Tui {
+    fn default() -> Self {
+        Self {
+            notification_settings: TuiNotificationSettings::default(),
+            animations: default_true(),
+            show_tooltips: default_true(),
+            vim_mode_default: false,
+            raw_output_mode: false,
+            alternate_screen: AltScreenMode::default(),
+            status_line: None,
+            status_line_use_colors: default_true(),
+            terminal_title: None,
+            theme: None,
+            pet: None,
+            pet_anchor: TuiPetAnchor::default(),
+            session_picker_view: None,
+            keymap: TuiKeymap::default(),
+            model_availability_nux: ModelAvailabilityNuxConfig::default(),
+            terminal_resize_reflow_max_rows: None,
+        }
+    }
 }
 
 const fn default_true() -> bool {

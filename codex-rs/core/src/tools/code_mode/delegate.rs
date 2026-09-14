@@ -664,6 +664,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Hold live history to verify durable notification acceptance survives cancellation before live publication"
+    )]
     async fn broker_notify_cancellation_preserves_physical_live_and_model_history()
     -> anyhow::Result<()> {
         use codex_protocol::protocol::{EventMsg, RolloutItem};
@@ -823,7 +827,10 @@ mod tests {
         let ResponseItem::CustomToolCallOutput { output, .. } = &saved[0] else {
             unreachable!()
         };
-        assert_eq!(output, &FunctionCallOutputPayload::from_text(TEXT.to_string()));
+        assert_eq!(
+            output,
+            &FunctionCallOutputPayload::from_text(TEXT.to_string())
+        );
 
         // A new emission with identical text is not a retry of the cancelled wait.
         broker

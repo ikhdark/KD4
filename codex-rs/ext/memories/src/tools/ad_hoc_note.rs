@@ -31,7 +31,7 @@ impl ToolExecutor<ToolCall> for AddAdHocNoteTool {
     fn spec(&self) -> ToolSpec {
         memory_function_tool::<AddAdHocMemoryNoteRequest, AddAdHocMemoryNoteResponse>(
             ADD_AD_HOC_NOTE_TOOL_NAME,
-            "Create one append-only ad-hoc memory note after the user explicitly asks Codex to remember, forget, or update something.",
+            "Create one new memory note only after an explicit user request to remember, correct, or forget information. This records the instruction; it does not edit or delete existing files.",
         )
     }
 

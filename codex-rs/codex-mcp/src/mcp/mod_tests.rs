@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use super::*;
 use crate::McpPluginAttribution;
 use crate::McpServerRegistration;
@@ -477,4 +478,55 @@ async fn effective_mcp_servers_preserve_runtime_servers() {
         }
         other => panic!("expected streamable http transport, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn status_snapshot_distinguishes_failed_resources_from_empty_results() {
+    let home = tempfile::tempdir().expect("home");
+    let mut config = test_mcp_config(home.path().to_path_buf());
+    let server = serde_json::from_value::<McpServerConfig>(
+        serde_json::json!({"command": "missing-codex-mcp-test-command"}),
+    )
+    .expect("server config");
+    let mut catalog = ResolvedMcpCatalog::builder();
+    catalog.register(McpServerRegistration::from_config(
+        "unavailable".to_string(),
+        server,
+    ));
+    config.mcp_server_catalog = catalog.build();
+    let runtime = McpRuntimeContext::new(
+        Arc::new(codex_exec_server::EnvironmentManager::without_environments()),
+        home.path().to_path_buf(),
+    );
+    let failed = collect_mcp_server_status_snapshot_with_detail(
+        &config,
+        None,
+        "test".into(),
+        runtime.clone(),
+        CodexAppsToolsCache::default(),
+        McpSnapshotDetail::Full,
+    )
+    .await;
+    assert!(failed.resources.is_empty());
+    assert!(failed.resource_templates.is_empty());
+    assert_eq!(failed.resource_errors.len(), 2);
+    assert!(
+        failed
+            .resource_errors
+            .iter()
+            .all(|error| error.server == "unavailable"
+                && error.message.contains("server unavailable"))
+    );
+    config.mcp_server_catalog = ResolvedMcpCatalog::default();
+    let empty = collect_mcp_server_status_snapshot_with_detail(
+        &config,
+        None,
+        "test".into(),
+        runtime,
+        CodexAppsToolsCache::default(),
+        McpSnapshotDetail::Full,
+    )
+    .await;
+    assert!(empty.resources.is_empty());
+    assert!(empty.resource_errors.is_empty());
 }

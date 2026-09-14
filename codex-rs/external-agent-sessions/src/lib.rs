@@ -48,11 +48,14 @@ pub fn prepare_validated_session_import(
     codex_home: &Path,
     session: ExternalAgentSessionMigration,
 ) -> io::Result<Option<PendingSessionImport>> {
-    let has_been_imported = has_current_session_been_imported(codex_home, &session.path)?;
-    if has_been_imported {
+    let Some(pending) = load_importable_session(&session.path)? else {
         return Ok(None);
-    }
-    load_importable_session(&session.path)
+    };
+    let ledger = ledger::load_import_ledger(codex_home)?;
+    Ok(
+        (!ledger.contains_fingerprint(&pending.source_path, &pending.source_content_sha256))
+            .then_some(pending),
+    )
 }
 
 fn load_importable_session(path: &Path) -> io::Result<Option<PendingSessionImport>> {
@@ -92,7 +95,7 @@ fn summarize_for_label(text: &str) -> String {
 }
 
 fn truncate(text: &str, max_len: usize) -> String {
-    if text.chars().count() <= max_len {
+    if text.chars().take(max_len.saturating_add(1)).count() <= max_len {
         return text.to_string();
     }
     let prefix = text
@@ -122,7 +125,20 @@ mod tests {
         let root = TempDir::new().expect("tempdir");
         let codex_home = root.path().join("codex-home");
         let source_path = root.path().join("session.jsonl");
-        std::fs::write(&source_path, "{}\n").expect("session");
+        let contents = serde_json::json!({
+            "type": "user", "cwd": root.path(),
+            "message": {"content": "first request"},
+        })
+        .to_string();
+        std::fs::write(&source_path, &contents).expect("session");
+        let pending =
+            prepare_validated_session_import(&codex_home, session_migration(&source_path))
+                .expect("prepare")
+                .expect("importable before recording");
+        assert_eq!(
+            pending.source_content_sha256,
+            format!("{:x}", Sha256::digest(&contents))
+        );
         ledger::record_imported_session(&codex_home, &source_path, ThreadId::new())
             .expect("record import");
 
@@ -131,6 +147,23 @@ mod tests {
                 .expect("already imported session should be skipped");
 
         assert!(pending.is_none());
+        std::fs::write(
+            &source_path,
+            contents.replace("first request", "other request"),
+        )
+        .expect("change session");
+        assert!(
+            prepare_validated_session_import(&codex_home, session_migration(&source_path))
+                .unwrap()
+                .is_some()
+        );
+        ledger::record_imported_session(&codex_home, &source_path, ThreadId::new()).unwrap();
+        std::fs::write(&source_path, contents).expect("restore historical version");
+        assert!(
+            prepare_validated_session_import(&codex_home, session_migration(&source_path))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

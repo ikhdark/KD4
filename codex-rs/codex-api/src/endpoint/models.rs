@@ -44,7 +44,10 @@ impl<T: HttpTransport> ModelsClient<T> {
 
     fn append_client_version_query(req: &mut codex_client::Request, client_version: &str) {
         let separator = if req.url.contains('?') { '&' } else { '?' };
-        req.url = format!("{}{}client_version={client_version}", req.url, separator);
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("client_version", client_version)
+            .finish();
+        req.url = format!("{}{separator}{query}", req.url);
     }
 
     pub fn request_url(provider: &Provider, client_version: &str) -> String {
@@ -100,8 +103,12 @@ impl<T: HttpTransport> ModelsClient<T> {
         let ModelsResponse { models } = serde_json::from_slice::<ModelsResponse>(&resp.body)
             .map_err(|e| {
                 ApiError::Stream(format!(
-                    "failed to decode models response: {e}; body: {}",
-                    String::from_utf8_lossy(&resp.body)
+                    "failed to decode models response: {:?} at line {} column {}; status: {}; body length: {}",
+                    e.classify(),
+                    e.line(),
+                    e.column(),
+                    resp.status,
+                    resp.body.len()
                 ))
             })?;
 
@@ -132,7 +139,7 @@ mod tests {
     #[derive(Clone)]
     struct CapturingTransport {
         last_request: Arc<Mutex<Option<Request>>>,
-        body: Arc<ModelsResponse>,
+        body: Arc<Vec<u8>>,
         etag: Option<String>,
         status: StatusCode,
     }
@@ -141,7 +148,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 last_request: Arc::new(Mutex::new(None)),
-                body: Arc::new(ModelsResponse { models: Vec::new() }),
+                body: Arc::new(br#"{"models":[]}"#.to_vec()),
                 etag: None,
                 status: StatusCode::OK,
             }
@@ -151,7 +158,11 @@ mod tests {
     impl HttpTransport for CapturingTransport {
         async fn execute(&self, req: Request) -> Result<Response, TransportError> {
             *self.last_request.lock().unwrap() = Some(req);
-            let body = serde_json::to_vec(&*self.body).unwrap();
+            let body = if self.status == StatusCode::NOT_MODIFIED {
+                Vec::new()
+            } else {
+                self.body.as_ref().clone()
+            };
             let mut headers = HeaderMap::new();
             if let Some(etag) = &self.etag {
                 headers.insert(ETAG, etag.parse().unwrap());
@@ -198,7 +209,7 @@ mod tests {
 
         let transport = CapturingTransport {
             last_request: Arc::new(Mutex::new(None)),
-            body: Arc::new(response),
+            body: Arc::new(serde_json::to_vec(&response).unwrap()),
             etag: None,
             status: StatusCode::OK,
         };
@@ -261,7 +272,7 @@ mod tests {
 
         let transport = CapturingTransport {
             last_request: Arc::new(Mutex::new(None)),
-            body: Arc::new(response),
+            body: Arc::new(serde_json::to_vec(&response).unwrap()),
             etag: None,
             status: StatusCode::OK,
         };
@@ -287,7 +298,7 @@ mod tests {
 
         let transport = CapturingTransport {
             last_request: Arc::new(Mutex::new(None)),
-            body: Arc::new(response),
+            body: Arc::new(serde_json::to_vec(&response).unwrap()),
             etag: Some("\"abc\"".to_string()),
             status: StatusCode::OK,
         };
@@ -303,6 +314,57 @@ mod tests {
 
         assert_eq!(models.len(), 0);
         assert_eq!(etag, Some("\"abc\"".to_string()));
+    }
+
+    #[tokio::test]
+    async fn encodes_client_version_without_changing_existing_query() {
+        let transport = CapturingTransport::default();
+        let mut provider = provider("https://example.com/api/codex");
+        provider.query_params = Some(std::collections::HashMap::from([(
+            "api-version".to_string(),
+            "test".to_string(),
+        )]));
+        let version = "1.0+dev&extra=value #/?";
+        let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, version);
+        let client = ModelsClient::new(transport.clone(), provider, Arc::new(DummyAuth));
+        client
+            .list_models(request_url, HeaderMap::new())
+            .await
+            .unwrap();
+        let request = transport.last_request.lock().unwrap();
+        let url = url::Url::parse(&request.as_ref().unwrap().url).unwrap();
+        assert_eq!(
+            url.query_pairs().collect::<Vec<_>>(),
+            vec![
+                ("api-version".into(), "test".into()),
+                ("client_version".into(), version.into())
+            ]
+        );
+        assert_eq!(url.fragment(), None);
+    }
+
+    #[tokio::test]
+    async fn malformed_models_response_does_not_include_body_in_error() {
+        let transport = CapturingTransport {
+            // A valid JSON value of the wrong type makes Serde's Display include
+            // the string itself; diagnostics must not copy it into the error.
+            body: Arc::new(serde_json::to_vec(&"private-proxy-content".repeat(10_000)).unwrap()),
+            ..Default::default()
+        };
+        let body_length = transport.body.len();
+        let provider = provider("https://example.com/api/codex");
+        let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, "1.0");
+        let client = ModelsClient::new(transport, provider, Arc::new(DummyAuth));
+        let error = client
+            .list_models(request_url, HeaderMap::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("failed to decode models response"));
+        assert!(error.contains("status: 200 OK"));
+        assert!(error.contains(&format!("body length: {body_length}")));
+        assert!(!error.contains("private-proxy-content"));
+        assert!(error.len() < 300);
     }
 
     #[tokio::test]

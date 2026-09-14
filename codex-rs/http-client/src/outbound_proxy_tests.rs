@@ -346,7 +346,9 @@ async fn enabled_environment_proxy_routes_request_through_proxy() {
     let request_url = "http://enabled-proxy.test/proxy-check";
     let builder = configure_proxy_for_route(
         &env,
-        reqwest::Client::builder().timeout(Duration::from_secs(2)),
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:1").unwrap()),
         request_url,
         ClientRouteClass::Auth,
         OutboundProxyPolicy::RespectSystemProxy,
@@ -553,27 +555,45 @@ fn system_proxy_resolution_is_single_flight() {
     let worker = std::thread::spawn(move || {
         resolve_system_proxy_with(&worker_cache, request_url, &worker_origin, |_, _| {
             started_tx.send(()).expect("test should still be running");
-            release_rx.recv().expect("test should release resolver");
+            release_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("test should release resolver");
             SystemProxyDecision::Direct
         })
     });
 
-    started_rx.recv().expect("resolver should start");
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("resolver should start");
     assert!(matches!(
         cache.try_lock(),
         Err(std::sync::TryLockError::WouldBlock)
     ));
-    release_tx
-        .send(())
-        .expect("resolver should still be running");
+    let waiter_cache = Arc::clone(&cache);
+    let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        waiting_tx.send(()).expect("signal waiter");
+        let decision = resolve_system_proxy_with(&waiter_cache, request_url, &origin, |_, _| {
+            panic!("competing caller must reuse the first result")
+        });
+        finished_tx.send(()).expect("signal completion");
+        decision
+    });
+    waiting_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("waiter started");
     assert_eq!(
-        worker.join().expect("resolver should finish"),
+        finished_rx.recv_timeout(Duration::from_millis(30)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    );
+    release_tx.send(()).expect("release resolver");
+    assert_eq!(
+        worker.join().expect("resolver finishes"),
         SystemProxyDecision::Direct
     );
     assert_eq!(
-        resolve_system_proxy_with(&cache, request_url, &origin, |_, _| {
-            panic!("cached waiter should not resolve the platform proxy again")
-        }),
+        waiter.join().expect("waiter finishes"),
         SystemProxyDecision::Direct
     );
 }
@@ -653,7 +673,27 @@ fn system_proxy_cache_key_preserves_url_specific_pac_decisions() {
 
     assert_ne!(
         cache_key,
-        system_proxy_cache_key("https://auth.openai.com/oauth/revoke")
+        system_proxy_cache_key("https://auth.openai.com/oauth/token?access_token=different")
     );
     assert!(!cache_key.contains(request_url));
+}
+
+#[test]
+fn no_proxy_matches_repeated_suffix_and_bracketed_ipv6_ports() {
+    let origin = RequestOrigin {
+        scheme: "https".into(),
+        host: "a.example.com.example.com".into(),
+        port: 443,
+    };
+    assert!(no_proxy_matches_origin("*.example.com", &origin));
+    assert!(!no_proxy_matches_origin("*.example.org", &origin));
+    let ipv6 = RequestOrigin {
+        scheme: "https".into(),
+        host: "::1".into(),
+        port: 443,
+    };
+    assert!(no_proxy_matches_origin("[::1]:443", &ipv6));
+    assert!(no_proxy_matches_origin("[::1]", &ipv6));
+    assert!(!no_proxy_matches_origin("[::1]:8443", &ipv6));
+    assert!(!no_proxy_matches_origin("[::1]:invalid", &ipv6));
 }

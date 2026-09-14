@@ -19,17 +19,15 @@ use crate::markdown;
 
 /// Newline-gated accumulator that buffers raw markdown source and commits only completed lines.
 ///
-/// The buffer tracks how many source bytes have already been committed via
-/// `committed_source_len`, so each `commit_complete_source()` call returns only the newly
-/// completed portion. This design lets the stream controller re-render the entire accumulated
-/// source while only appending new content.
+/// Completed source is transferred to the stream controller; only the incomplete suffix remains.
 ///
 /// The collector does not parse markdown in production. It only defines stable source boundaries;
 /// rendering lives in the stream controllers so width changes can re-render from one accumulated
 /// source string.
 pub(crate) struct MarkdownStreamCollector {
     buffer: String,
-    committed_source_len: usize,
+    #[cfg(test)]
+    rendered_source: String,
     #[cfg(test)]
     committed_line_count: usize,
     width: Option<usize>,
@@ -49,7 +47,8 @@ impl MarkdownStreamCollector {
 
         Self {
             buffer: String::new(),
-            committed_source_len: 0,
+            #[cfg(test)]
+            rendered_source: String::new(),
             #[cfg(test)]
             committed_line_count: 0,
             width,
@@ -66,10 +65,10 @@ impl MarkdownStreamCollector {
     /// Reset all buffered source and commit bookkeeping.
     pub fn clear(&mut self) {
         self.buffer.clear();
-        self.committed_source_len = 0;
         #[cfg(test)]
         {
             self.committed_line_count = 0;
+            self.rendered_source.clear();
         }
     }
 
@@ -86,12 +85,8 @@ impl MarkdownStreamCollector {
     /// incomplete markdown blocks that may change meaning when the rest of the line arrives.
     pub fn commit_complete_source(&mut self) -> Option<String> {
         let commit_end = self.buffer.rfind('\n').map(|idx| idx + 1)?;
-        if commit_end <= self.committed_source_len {
-            return None;
-        }
-
-        let out = self.buffer[self.committed_source_len..commit_end].to_string();
-        self.committed_source_len = commit_end;
+        let remainder = self.buffer.split_off(commit_end);
+        let out = std::mem::replace(&mut self.buffer, remainder);
         Some(out)
     }
 
@@ -102,12 +97,12 @@ impl MarkdownStreamCollector {
     /// callers should not invoke it until the stream is truly complete or interrupted output is
     /// being intentionally consolidated.
     pub fn finalize_and_drain_source(&mut self) -> String {
-        if self.committed_source_len >= self.buffer.len() {
+        if self.buffer.is_empty() {
             self.clear();
             return String::new();
         }
 
-        let mut out = self.buffer[self.committed_source_len..].to_string();
+        let mut out = std::mem::take(&mut self.buffer);
         if !out.ends_with('\n') {
             out.push('\n');
         }
@@ -124,15 +119,13 @@ impl MarkdownStreamCollector {
     /// behavior without stream-controller holdback semantics.
     #[cfg(test)]
     pub fn commit_complete_lines(&mut self) -> Vec<Line<'static>> {
-        let Some(commit_end) = self.buffer.rfind('\n').map(|idx| idx + 1) else {
+        let Some(source) = self.commit_complete_source() else {
             return Vec::new();
         };
-        if commit_end <= self.committed_source_len {
-            return Vec::new();
-        }
-        let source = self.buffer[..commit_end].to_string();
+        self.rendered_source.push_str(&source);
+        let source = &self.rendered_source;
         let mut rendered: Vec<Line<'static>> = Vec::new();
-        markdown::append_markdown(&source, self.width, Some(self.cwd.as_path()), &mut rendered);
+        markdown::append_markdown(source, self.width, Some(self.cwd.as_path()), &mut rendered);
         let mut complete_line_count = rendered.len();
         if complete_line_count > 0
             && crate::render::line_utils::is_blank_line_spaces_only(
@@ -149,7 +142,6 @@ impl MarkdownStreamCollector {
         let out_slice = &rendered[self.committed_line_count..complete_line_count];
 
         let out = out_slice.to_vec();
-        self.committed_source_len = commit_end;
         self.committed_line_count = complete_line_count;
         out
     }
@@ -159,7 +151,9 @@ impl MarkdownStreamCollector {
     /// for rendering.
     #[cfg(test)]
     pub fn finalize_and_drain(&mut self) -> Vec<Line<'static>> {
-        let mut source = self.buffer.clone();
+        let mut source = std::mem::take(&mut self.rendered_source);
+        let committed_line_count = self.committed_line_count;
+        source.push_str(&self.finalize_and_drain_source());
         if source.is_empty() {
             self.clear();
             return Vec::new();
@@ -179,10 +173,10 @@ impl MarkdownStreamCollector {
         let mut rendered: Vec<Line<'static>> = Vec::new();
         markdown::append_markdown(&source, self.width, Some(self.cwd.as_path()), &mut rendered);
 
-        let out = if self.committed_line_count >= rendered.len() {
+        let out = if committed_line_count >= rendered.len() {
             Vec::new()
         } else {
-            rendered[self.committed_line_count..].to_vec()
+            rendered[committed_line_count..].to_vec()
         };
 
         // Reset collector state for next stream.
@@ -905,5 +899,24 @@ mod tests {
             !rendered_strs.iter().any(|line| line.trim() == "| A | B |"),
             "did not expect raw table header after markdown-fence unwrapping: {rendered_strs:?}"
         );
+    }
+    #[test]
+    fn commits_transfer_source_and_retain_only_incomplete_suffix() {
+        let mut collector = MarkdownStreamCollector::new(None, &test_cwd());
+        collector.push_delta("first\nsec");
+        assert_eq!(
+            collector.commit_complete_source(),
+            Some("first\n".to_string())
+        );
+        assert_eq!(collector.buffer, "sec");
+        assert_eq!(collector.commit_complete_source(), None);
+        collector.push_delta("ond\nlast");
+        assert_eq!(
+            collector.commit_complete_source(),
+            Some("second\n".to_string())
+        );
+        assert_eq!(collector.buffer, "last");
+        assert_eq!(collector.finalize_and_drain_source(), "last\n");
+        assert_eq!(collector.buffer, "");
     }
 }

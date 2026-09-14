@@ -101,9 +101,11 @@ fn pack_npm_package(
     }
     command.arg("--").arg(package_spec);
 
-    let output = command
-        .output()
-        .map_err(|err| format!("failed to run npm pack: {err}"))?;
+    let output = crate::startup_sync::run_git_command_with_timeout(
+        &mut command,
+        "npm pack",
+        std::time::Duration::from_secs(60),
+    )?;
     if output.status.success() {
         return Ok(());
     }
@@ -204,7 +206,7 @@ fn validate_npm_package_metadata(plugin_root: &Path, package: &str) -> Result<()
 }
 
 fn npm_command() -> &'static str {
-    "npm.cmd"
+    if cfg!(windows) { "npm.cmd" } else { "npm" }
 }
 
 #[cfg(test)]
@@ -260,7 +262,7 @@ mod tests {
         fs::write(
             &command,
             format!(
-                "@echo off\r\ncopy /y \"{}\" package.tgz >nul\r\n{extra}exit /b 0\r\n",
+                "@echo off\r\nif not \"%~1\"==\"pack\" exit /b 31\r\nif not \"%~2\"==\"--ignore-scripts\" exit /b 32\r\nif not \"%~3\"==\"--pack-destination\" exit /b 33\r\necho %* > args.txt\r\ncopy /y \"{}\" package.tgz >nul\r\n{extra}exit /b 0\r\n",
                 archive_path.display()
             ),
         )
@@ -277,7 +279,7 @@ mod tests {
             directory.path(),
             "@test/plugin",
             Some("1.0.0"),
-            None,
+            Some("https://registry.example.com"),
             command.as_os_str(),
         )
         .unwrap();
@@ -286,6 +288,11 @@ mod tests {
             r#"{"name":"@test/plugin"}"#
         );
         assert!(plugin.as_path().starts_with(staging.path()));
+        let args = fs::read_to_string(staging.path().join("args.txt")).unwrap();
+        assert!(
+            args.contains("--registry https://registry.example.com -- @test/plugin@1.0.0"),
+            "{args}"
+        );
         drop(staging);
         assert!(!plugin.as_path().exists());
     }

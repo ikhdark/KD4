@@ -186,38 +186,10 @@ impl ImageGenerationTool {
                     .map(|data| data.b64_json)
                     .ok_or_else(|| "image generation returned no image data".to_string())
             })?;
-            let saved_path = match self.save_root.as_ref() {
-                Some(save_root) => match save_image_generation_result(
-                    LOCAL_FS.as_ref(),
-                    save_root,
-                    &self.thread_id,
-                    &call.call_id,
-                    &result,
-                )
-                .await
-                {
-                    Ok(path) => Some(path),
-                    Err(error) => {
-                        let output_path = image_generation_artifact_path(
-                            save_root,
-                            &self.thread_id,
-                            &call.call_id,
-                        );
-                        let output_dir = output_path.parent().unwrap_or_else(|| save_root.clone());
-                        tracing::warn!(
-                            call_id = %call.call_id,
-                            output_dir = %output_dir.display(),
-                            "failed to save generated image: {error}"
-                        );
-                        None
-                    }
-                },
-                None => None,
-            };
-            Ok::<_, String>((result, saved_path))
+            Ok::<_, String>(result)
         };
         let operation_result = call.cancellation_token.run_until_cancelled(operation).await;
-        let (result, saved_path) = match operation_result {
+        let result = match operation_result {
             None => {
                 emit_failed_item(&call, &args.prompt).await;
                 return Err(cancelled_error());
@@ -227,6 +199,33 @@ impl ImageGenerationTool {
                 return Err(FunctionCallError::RespondToModel(message));
             }
             Some(Ok(result)) => result,
+        };
+        // Once the provider returned image bytes, cancellation must not discard them.
+        // Finish any local write we start so cancellation cannot leave a partial artifact.
+        let saved_path = match self.save_root.as_ref() {
+            Some(save_root) => match save_image_generation_result(
+                LOCAL_FS.as_ref(),
+                save_root,
+                &self.thread_id,
+                &call.call_id,
+                &result,
+            )
+            .await
+            {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    let output_path =
+                        image_generation_artifact_path(save_root, &self.thread_id, &call.call_id);
+                    let output_dir = output_path.parent().unwrap_or_else(|| save_root.clone());
+                    tracing::warn!(
+                        call_id = %call.call_id,
+                        output_dir = %output_dir.display(),
+                        "failed to save generated image: {error}"
+                    );
+                    None
+                }
+            },
+            None => None,
         };
         let item = ImageGenerationItem {
             id: call.call_id.clone(),
@@ -256,13 +255,22 @@ fn cancelled_error() -> FunctionCallError {
 
 fn image_history_requirement(payload: &ToolPayload) -> ConversationHistoryRequirement {
     let ToolPayload::Function { arguments } = payload else {
-        return ConversationHistoryRequirement::Full;
+        return ConversationHistoryRequirement::None;
     };
     match serde_json::from_str::<ImagegenArgs>(arguments) {
-        Ok(args) if args.num_last_images_to_include.is_none() => {
-            ConversationHistoryRequirement::None
+        Ok(args)
+            if args
+                .referenced_image_paths
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+                && args
+                    .num_last_images_to_include
+                    .is_some_and(|count| (1..=MAX_EDIT_IMAGES).contains(&count)) =>
+        {
+            ConversationHistoryRequirement::Full
         }
-        Ok(_) | Err(_) => ConversationHistoryRequirement::Full,
+        Ok(_) | Err(_) => ConversationHistoryRequirement::None,
     }
 }
 
@@ -422,23 +430,31 @@ fn recent_images(history: &[ResponseItem], count: usize) -> Vec<ImageUrl> {
 
     let mut images = Vec::with_capacity(count);
     'history: for item in history.iter().rev() {
+        let remaining = count - images.len();
         let mut image_urls = Vec::new();
         match item {
             ResponseItem::Message { content, .. } => {
-                image_urls.extend(content.iter().rev().filter_map(|item| match item {
-                    ContentItem::InputImage { image_url, .. } => Some(image_url.clone()),
-                    ContentItem::InputText { .. } | ContentItem::OutputText { .. } => None,
-                }));
+                image_urls.extend(
+                    content
+                        .iter()
+                        .rev()
+                        .filter_map(|item| match item {
+                            ContentItem::InputImage { image_url, .. } => Some(image_url),
+                            ContentItem::InputText { .. } | ContentItem::OutputText { .. } => None,
+                        })
+                        .take(remaining)
+                        .cloned(),
+                );
             }
             ResponseItem::FunctionCallOutput {
                 call_id, output, ..
             } if function_call_ids.contains(call_id.as_str()) => {
-                image_urls.extend(output_image_urls(output));
+                image_urls.extend(output_image_urls(output).take(remaining).cloned());
             }
             ResponseItem::CustomToolCallOutput {
                 call_id, output, ..
             } if custom_tool_call_ids.contains(call_id.as_str()) => {
-                image_urls.extend(output_image_urls(output));
+                image_urls.extend(output_image_urls(output).take(remaining).cloned());
             }
             ResponseItem::ImageGenerationCall { result, .. } if !result.is_empty() => {
                 image_urls.push(format!("data:image/png;base64,{result}"));
@@ -472,14 +488,14 @@ fn recent_images(history: &[ResponseItem], count: usize) -> Vec<ImageUrl> {
 }
 
 /// Extracts image URLs from a tool output in newest-first order.
-fn output_image_urls(output: &FunctionCallOutputPayload) -> impl Iterator<Item = String> + '_ {
+fn output_image_urls(output: &FunctionCallOutputPayload) -> impl Iterator<Item = &String> + '_ {
     output
         .content_items()
         .into_iter()
         .flatten()
         .rev()
         .filter_map(|item| match item {
-            FunctionCallOutputContentItem::InputImage { image_url, .. } => Some(image_url.clone()),
+            FunctionCallOutputContentItem::InputImage { image_url, .. } => Some(image_url),
             FunctionCallOutputContentItem::InputText { .. }
             | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
         })

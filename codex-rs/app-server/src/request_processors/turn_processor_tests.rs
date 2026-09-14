@@ -55,11 +55,20 @@ fn in_flight_task_coalescing_fingerprint_preserves_text_and_normalizes_identity_
         ..Default::default()
     };
     let first = params("thread-1", "fix   the\n bug", None);
-    let same_task = params("thread-2", "fix   the\n bug", Some(true));
-    let whitespace_changed_task = params("thread-2", "fix the bug", Some(true));
+    let mut same_task = params("thread-1", "fix   the\n bug", Some(true));
+    same_task.client_user_message_id = Some("another-client-message".to_string());
+    let whitespace_changed_task = params("thread-1", "fix the bug", Some(true));
 
     let first_fingerprint = normalized_task_fingerprint(&first, "C:/repo", "model=o3");
     assert!(first_fingerprint.is_some());
+    assert_ne!(
+        first_fingerprint,
+        normalized_task_fingerprint(
+            &params("thread-2", "fix   the\n bug", None),
+            "C:/repo",
+            "model=o3"
+        )
+    );
     assert_eq!(
         first_fingerprint,
         normalized_task_fingerprint(&same_task, "C:/repo", "model=o3")
@@ -80,8 +89,9 @@ fn in_flight_task_coalescing_fingerprint_preserves_text_and_normalizes_identity_
 
 #[test]
 fn task_workspace_identity_uses_one_snapshot_projection_for_defaults_and_overrides() {
-    let fallback_cwd =
-        AbsolutePathBuf::from_absolute_path(r"C:\repo").expect("absolute fallback cwd");
+    let workspace = tempfile::TempDir::new().expect("workspace");
+    let fallback_cwd = AbsolutePathBuf::from_absolute_path(workspace.path().join("repo"))
+        .expect("absolute fallback cwd");
     let fallback_roots = vec![fallback_cwd.clone()];
     let params = TurnStartParams::default();
 
@@ -90,8 +100,8 @@ fn task_workspace_identity_uses_one_snapshot_projection_for_defaults_and_overrid
         format!("cwd={fallback_cwd:?};roots={fallback_roots:?}")
     );
 
-    let override_cwd =
-        AbsolutePathBuf::from_absolute_path(r"D:\other").expect("absolute override cwd");
+    let override_cwd = AbsolutePathBuf::from_absolute_path(workspace.path().join("other"))
+        .expect("absolute override cwd");
     let override_roots = vec![override_cwd.clone()];
     let params = TurnStartParams {
         cwd: Some(override_cwd.to_path_buf()),
@@ -176,32 +186,49 @@ async fn missing_error_path_rejected_task_does_not_apply_connection_updates() {
 }
 
 #[tokio::test]
-async fn concurrent_turn_start_on_one_thread_is_rejected_before_connection_updates() {
+async fn reserved_turn_start_on_one_thread_is_rejected_before_connection_updates() {
     let manager = ThreadStateManager::new();
     let thread_id = ThreadId::new();
-    claim_turn_start_before_connection_updates(
+    let (admitted_tx, admitted_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let first = claim_turn_start_before_connection_updates(
         &manager,
         Some("first-task"),
         thread_id,
         "turn-first",
-        || async { Ok(()) },
-    )
-    .await
-    .expect("first turn should reserve the thread");
-    let updates_applied = std::cell::Cell::new(false);
-
-    let error = claim_turn_start_before_connection_updates(
-        &manager,
-        Some("second-task"),
-        thread_id,
-        "turn-second",
         || async {
-            updates_applied.set(true);
+            admitted_tx.send(()).expect("signal admitted request");
+            release_rx
+                .await
+                .expect("second request must release the first");
             Ok(())
         },
-    )
-    .await
-    .expect_err("a second turn/start must not become steering input");
+    );
+    let updates_applied = std::cell::Cell::new(false);
+
+    let second = async {
+        admitted_rx
+            .await
+            .expect("first request reached connection update");
+        let result = claim_turn_start_before_connection_updates(
+            &manager,
+            Some("second-task"),
+            thread_id,
+            "turn-second",
+            || async {
+                updates_applied.set(true);
+                Ok(())
+            },
+        )
+        .await;
+        release_tx
+            .send(())
+            .expect("release pending connection update");
+        result
+    };
+    let (first, second) = tokio::join!(first, second);
+    first.expect("first turn should reserve the thread");
+    let error = second.expect_err("a second turn/start must not become steering input");
 
     assert!(!updates_applied.get());
     assert_eq!(
@@ -357,6 +384,24 @@ fn map_additional_context_preserves_client_order() {
 }
 
 #[test]
+fn additional_context_estimate_caps_escaped_utf8_values() {
+    for (value, expected_value_bytes) in [
+        ("<&é>".to_string(), 15),
+        ("&".repeat(4_000), 16_384),
+        ("é".repeat(10_000), 16_384),
+    ] {
+        let entry = additional_context_entry(value.clone());
+        assert_eq!(
+            estimated_additional_context_rendered_bytes("source", &entry),
+            6 + expected_value_bytes + ESTIMATED_ADDITIONAL_CONTEXT_WRAPPER_BYTES
+        );
+        let mapped = map_additional_context(Some(IndexMap::from([("source".to_string(), entry)])))
+            .expect("one capped value is within the aggregate budget");
+        assert_eq!(mapped["source"].value, value);
+    }
+}
+
+#[test]
 fn bug_classifier_accepts_exact_multibyte_evidence_offsets() {
     let raw = "Crash in caf\u{e9}";
     let output = r#"{
@@ -372,6 +417,73 @@ fn bug_classifier_accepts_exact_multibyte_evidence_offsets() {
 
     assert_eq!(result.failure_mechanism.as_deref(), Some("Crash"));
     assert_eq!(result.affected_components_json, r#"["café"]"#);
+}
+
+#[tokio::test]
+async fn bug_classifier_stream_accepts_reasoning_and_rejects_extra_answers_or_tools() {
+    let answer = ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: serde_json::json!({
+                "summary": "A crash was reported.",
+                "severity": null,
+                "failureMechanism": null,
+                "affectedComponents": [],
+                "statedCause": null,
+                "requiredRepair": null
+            })
+            .to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let reasoning: ResponseItem = serde_json::from_value(serde_json::json!({
+        "type": "reasoning", "id": "reasoning-1", "summary": []
+    }))
+    .expect("reasoning output item");
+    let completed = || ResponseEvent::Completed {
+        response_id: "classification-1".to_string(),
+        token_usage: None,
+        end_turn: Some(true),
+    };
+    let shutdown = CancellationToken::new();
+    let mut stream = futures::stream::iter([
+        Ok(ResponseEvent::OutputItemDone(reasoning.clone())),
+        Ok(ResponseEvent::OutputItemDone(answer.clone())),
+        Ok(completed()),
+    ]);
+    let result = consume_bug_classification_stream(&mut stream, &shutdown, "Crash")
+        .await
+        .expect("one assistant answer is valid even when reasoning is emitted");
+    assert_eq!(result.summary, "A crash was reported.");
+
+    let tool: ResponseItem = serde_json::from_value(serde_json::json!({
+        "type": "function_call", "call_id": "call-1", "name": "exec", "arguments": "{}"
+    }))
+    .expect("tool output item");
+    for extra in [answer.clone(), tool] {
+        let mut stream = futures::stream::iter([
+            Ok(ResponseEvent::OutputItemDone(answer.clone())),
+            Ok(ResponseEvent::OutputItemDone(extra)),
+            Ok(completed()),
+        ]);
+        assert!(matches!(
+            consume_bug_classification_stream(&mut stream, &shutdown, "Crash").await,
+            Err(BugClassificationFailure::MalformedOutput)
+        ));
+    }
+    for items in [vec![reasoning], vec![answer]] {
+        let mut stream = futures::stream::iter(
+            items
+                .into_iter()
+                .map(|item| Ok(ResponseEvent::OutputItemDone(item))),
+        );
+        assert!(matches!(
+            consume_bug_classification_stream(&mut stream, &shutdown, "Crash").await,
+            Err(BugClassificationFailure::MalformedOutput)
+        ));
+    }
 }
 
 #[test]

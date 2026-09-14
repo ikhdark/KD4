@@ -36,7 +36,10 @@ pub fn json_response<T: Serialize>(value: &T) -> Response {
         Ok(body) => body,
         Err(err) => {
             error!("failed to serialize JSON response: {err}");
-            "{}".to_string()
+            return text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "JSON serialization failed",
+            );
         }
     };
     Response::builder()
@@ -103,6 +106,21 @@ mod tests {
     use super::*;
     use crate::reasons::REASON_NOT_ALLOWED;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn json_serialization_failure_returns_server_error() {
+        struct Unserializable;
+        impl serde::Serialize for Unserializable {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom(
+                    "intentional serialization failure",
+                ))
+            }
+        }
+        let response = json_response(&Unserializable);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.headers()["content-type"], "text/plain");
+    }
 
     #[test]
     fn blocked_message_with_policy_returns_human_message() {

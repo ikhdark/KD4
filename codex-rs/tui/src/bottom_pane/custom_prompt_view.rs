@@ -211,7 +211,7 @@ impl Renderable for CustomPromptView {
             return;
         }
 
-        let input_height = self.input_height(area.width);
+        let input_area = self.input_area(area);
 
         // Title line
         let title_area = Rect {
@@ -224,26 +224,19 @@ impl Renderable for CustomPromptView {
         Paragraph::new(Line::from(title_spans)).render(title_area, buf);
 
         // Optional context line
-        let mut input_y = area.y.saturating_add(1);
+        let input_y = area.y.saturating_add(1);
         if let Some(context_label) = &self.context_label {
             let context_area = Rect {
                 x: area.x,
                 y: input_y,
                 width: area.width,
-                height: 1,
+                height: u16::from(input_y < area.bottom()),
             };
             let spans: Vec<Span<'static>> = vec![gutter(), context_label.clone().cyan()];
             Paragraph::new(Line::from(spans)).render(context_area, buf);
-            input_y = input_y.saturating_add(1);
         }
 
         // Input line
-        let input_area = Rect {
-            x: area.x,
-            y: input_y,
-            width: area.width,
-            height: input_height,
-        };
         if input_area.width >= 2 {
             for row in 0..input_area.height {
                 Paragraph::new(Line::from(vec![gutter()])).render(
@@ -283,7 +276,7 @@ impl Renderable for CustomPromptView {
             }
         }
 
-        let hint_blank_y = input_area.y.saturating_add(input_height);
+        let hint_blank_y = input_area.bottom();
         if hint_blank_y < area.y.saturating_add(area.height) {
             let blank_area = Rect {
                 x: area.x,
@@ -309,20 +302,15 @@ impl Renderable for CustomPromptView {
     }
 
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
-        if area.height < 2 || area.width <= 2 {
+        let input_area = self.input_area(area);
+        if input_area.height <= 1 || input_area.width <= 2 {
             return None;
         }
-        let text_area_height = self.input_height(area.width).saturating_sub(1);
-        if text_area_height == 0 {
-            return None;
-        }
-        let extra_offset: u16 = if self.context_label.is_some() { 1 } else { 0 };
-        let top_line_count = 1u16 + extra_offset;
         let textarea_rect = Rect {
-            x: area.x.saturating_add(2),
-            y: area.y.saturating_add(top_line_count).saturating_add(1),
-            width: area.width.saturating_sub(2),
-            height: text_area_height,
+            x: input_area.x.saturating_add(2),
+            y: input_area.y.saturating_add(1),
+            width: input_area.width.saturating_sub(2),
+            height: input_area.height.saturating_sub(1),
         };
         let state = *self.textarea_state.borrow();
         self.textarea.cursor_pos_with_state(textarea_rect, state)
@@ -330,6 +318,18 @@ impl Renderable for CustomPromptView {
 }
 
 impl CustomPromptView {
+    fn input_area(&self, area: Rect) -> Rect {
+        let top = (1 + u16::from(self.context_label.is_some())).min(area.height);
+        Rect {
+            x: area.x,
+            y: area.y.saturating_add(top),
+            width: area.width,
+            height: self
+                .input_height(area.width)
+                .min(area.height.saturating_sub(top)),
+        }
+    }
+
     fn input_height(&self, width: u16) -> u16 {
         let usable_width = width.saturating_sub(2);
         let text_height = self.textarea.desired_height(usable_width).clamp(1, 8);

@@ -347,56 +347,41 @@ impl App {
         self.backtrack.primed = true;
         self.backtrack.base_id = self.chat_widget.thread_id();
         self.backtrack.overlay_preview_active = true;
-        let count = user_count(&self.transcript_cells);
-        if let Some(last) = count.checked_sub(1) {
-            self.apply_backtrack_selection_internal(last);
-        }
+        self.apply_clamped_backtrack_selection(usize::MAX);
         tui.frame_requester().schedule_frame();
         Ok(())
     }
 
     /// Step selection to the next older user message and update overlay.
     fn step_backtrack_and_highlight(&mut self, tui: &mut tui::Tui) {
-        let count = user_count(&self.transcript_cells);
-        if count == 0 {
-            return;
-        }
-
-        let last_index = count.saturating_sub(1);
         let next_selection = if self.backtrack.nth_user_message == usize::MAX {
-            last_index
-        } else if self.backtrack.nth_user_message == 0 {
-            0
+            usize::MAX
         } else {
-            self.backtrack
-                .nth_user_message
-                .saturating_sub(1)
-                .min(last_index)
+            self.backtrack.nth_user_message.saturating_sub(1)
         };
 
-        self.apply_backtrack_selection_internal(next_selection);
+        self.apply_clamped_backtrack_selection(next_selection);
         tui.frame_requester().schedule_frame();
     }
 
     /// Step selection to the next newer user message and update overlay.
     fn step_forward_backtrack_and_highlight(&mut self, tui: &mut tui::Tui) {
-        let count = user_count(&self.transcript_cells);
-        if count == 0 {
-            return;
-        }
-
-        let last_index = count.saturating_sub(1);
-        let next_selection = if self.backtrack.nth_user_message == usize::MAX {
-            last_index
-        } else {
-            self.backtrack
-                .nth_user_message
-                .saturating_add(1)
-                .min(last_index)
-        };
-
-        self.apply_backtrack_selection_internal(next_selection);
+        let next_selection = self.backtrack.nth_user_message.saturating_add(1);
+        self.apply_clamped_backtrack_selection(next_selection);
         tui.frame_requester().schedule_frame();
+    }
+
+    fn apply_clamped_backtrack_selection(&mut self, requested: usize) {
+        let selected = user_positions_iter(&self.transcript_cells)
+            .enumerate()
+            .take_while(|(nth, _)| *nth <= requested)
+            .last();
+        if let Some((nth, cell_idx)) = selected {
+            self.backtrack.nth_user_message = nth;
+            if let Some(Overlay::Transcript(t)) = &mut self.overlay {
+                t.set_highlight_cell(Some(cell_idx));
+            }
+        }
     }
 
     /// Apply a computed backtrack selection to the overlay and internal counter.
@@ -663,16 +648,17 @@ pub(crate) fn trim_transcript_cells_drop_last_n_user_turns(
         return false;
     }
 
-    let user_positions: Vec<usize> = user_positions_iter(transcript_cells).collect();
-    let Some(&first_user_idx) = user_positions.first() else {
-        return false;
-    };
-
     let turns_from_end = usize::try_from(num_turns).unwrap_or(usize::MAX);
-    let cut_idx = if turns_from_end >= user_positions.len() {
-        first_user_idx
-    } else {
-        user_positions[user_positions.len() - turns_from_end]
+    let cut_idx = transcript_cells
+        .iter()
+        .enumerate()
+        .rev()
+        .take_while(|(_, cell)| !cell.as_any().is::<SessionInfoCell>())
+        .filter_map(|(idx, cell)| cell.as_any().is::<UserHistoryCell>().then_some(idx))
+        .take(turns_from_end)
+        .last();
+    let Some(cut_idx) = cut_idx else {
+        return false;
     };
     let original_len = transcript_cells.len();
     transcript_cells.truncate(cut_idx);
@@ -684,7 +670,7 @@ pub(crate) fn user_count(cells: &[Arc<dyn crate::history_cell::HistoryCell>]) ->
 }
 
 fn has_backtrack_target(cells: &[Arc<dyn crate::history_cell::HistoryCell>]) -> bool {
-    user_count(cells) > 0
+    user_positions_iter(cells).next().is_some()
 }
 
 fn nth_user_position(

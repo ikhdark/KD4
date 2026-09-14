@@ -2,10 +2,11 @@ use crate::color::blend;
 use crate::color::is_light;
 use crate::terminal_palette::StdoutColorLevel;
 use crate::terminal_palette::best_color;
+use crate::terminal_palette::best_color_for_level;
 use crate::terminal_palette::default_bg;
 use crate::terminal_palette::default_fg;
+use crate::terminal_palette::effective_stdout_color_level;
 use crate::terminal_palette::rgb_color;
-use crate::terminal_palette::stdout_color_level;
 use ratatui::style::Color;
 use ratatui::style::Style;
 use ratatui::style::Stylize;
@@ -24,7 +25,7 @@ pub fn proposed_plan_style() -> Style {
 
 /// Returns a low-contrast rule style for separators within markdown tables.
 pub(crate) fn table_separator_style() -> Style {
-    table_separator_style_for(default_fg(), default_bg(), stdout_color_level())
+    table_separator_style_for(default_fg(), default_bg(), effective_stdout_color_level())
 }
 
 /// Returns the shared accent style for active or selected TUI controls.
@@ -67,7 +68,9 @@ fn table_separator_style_for(
     let separator_rgb = blend(fg, bg, TABLE_SEPARATOR_FG_ALPHA);
     match color_level {
         StdoutColorLevel::TrueColor => Style::default().fg(rgb_color(separator_rgb)),
-        StdoutColorLevel::Ansi256 => Style::default().fg(best_color(separator_rgb)),
+        StdoutColorLevel::Ansi256 => {
+            Style::default().fg(best_color_for_level(separator_rgb, color_level))
+        }
         StdoutColorLevel::Ansi16 | StdoutColorLevel::Unknown => Style::default().dim(),
     }
 }
@@ -95,9 +98,12 @@ mod tests {
 
     #[test]
     fn accent_style_uses_darker_cyan_on_light_backgrounds() {
-        let style = accent_style_for(Some((255, 255, 255)));
-
-        assert_eq!(style.fg, Some(best_color(LIGHT_BG_ACCENT_RGB)));
+        let style = crate::terminal_palette::with_test_terminal_colors(
+            (255, 255, 255),
+            StdoutColorLevel::TrueColor,
+            || accent_style_for(Some((255, 255, 255))),
+        );
+        assert_eq!(style.fg, Some(rgb_color((0, 95, 135))));
         assert!(style.add_modifier.contains(Modifier::BOLD));
     }
 
@@ -107,6 +113,22 @@ mod tests {
 
         assert_eq!(accent_style_for(Some((0, 0, 0))), expected);
         assert_eq!(accent_style_for(/*terminal_bg*/ None), expected);
+    }
+
+    #[test]
+    fn explicit_ansi256_level_overrides_global_truecolor() {
+        let style = crate::terminal_palette::with_test_terminal_colors(
+            (0, 0, 0),
+            StdoutColorLevel::TrueColor,
+            || {
+                table_separator_style_for(
+                    Some((255, 255, 255)),
+                    Some((0, 0, 0)),
+                    StdoutColorLevel::Ansi256,
+                )
+            },
+        );
+        assert_eq!(style.fg, Some(crate::terminal_palette::indexed_color(236)));
     }
 
     #[test]

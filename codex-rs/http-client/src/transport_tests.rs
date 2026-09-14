@@ -102,6 +102,7 @@ async fn invalid_json_body_is_rejected_before_network_dispatch() {
 fn test_reqwest_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
+        .timeout(Duration::from_secs(2))
         .build()
         .expect("HTTP client should build")
 }
@@ -160,4 +161,75 @@ impl Write for TestLogWriter {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn non_connection_errors_redact_request_urls() {
+    let client = reqwest::Client::builder().https_only(true).build().unwrap();
+    let transport = ReqwestTransport::from_http_client(HttpClient::new(client));
+    let error = transport
+        .execute(Request::new(
+            Method::GET,
+            "http://user:password@private.example/secret-path?sig=secret-query".to_string(),
+        ))
+        .await
+        .expect_err("HTTP prohibited");
+    let TransportError::Network(message) = error else {
+        panic!("expected network error: {error}");
+    };
+    for secret in ["password", "private.example", "secret-path", "secret-query"] {
+        assert!(!message.contains(secret), "leaked URL: {message}");
+    }
+}
+
+#[tokio::test]
+async fn interrupted_error_body_retains_http_status_and_headers() {
+    use std::io::Read;
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < deadline, "request must arrive");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        stream.write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 100\r\nRetry-After: 7\r\nConnection: close\r\n\r\npartial").unwrap();
+    });
+    let transport = ReqwestTransport::from_http_client(HttpClient::new(test_reqwest_client()));
+    let error = transport
+        .execute(Request::new(Method::GET, format!("http://{address}/")))
+        .await
+        .expect_err("HTTP failure");
+    server.join().unwrap();
+    let TransportError::Http {
+        status,
+        headers,
+        body,
+        ..
+    } = error
+    else {
+        panic!("lost HTTP metadata: {error}");
+    };
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers.expect("HTTP headers retained")["retry-after"], "7");
+    assert_eq!(body, None);
 }

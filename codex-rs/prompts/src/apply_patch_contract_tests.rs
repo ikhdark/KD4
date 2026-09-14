@@ -16,9 +16,13 @@ fn apply_patch_instructions_stay_compact_and_complete() {
         "*** Update File:",
         "*** Move to:",
         "@@",
-        "Paths must be relative",
-        "unified-diff headers",
-        "re-read the relevant current section",
+        "Paths must be relative; never use absolute paths.",
+        "Do not include unified-diff headers such as `diff --git`, `---`, or `+++`.",
+        "After stale context, a concurrent edit, a context mismatch, or a failure that may have modified files, re-read only the affected current sections before retrying.",
+        "For errors known to occur before file mutation, correct the error without re-reading unchanged contents.",
+        "rename it without hunks",
+        "( MoveTo { Hunk } | Hunk { Hunk } )",
+        "single multiline argument, preserving actual line breaks",
     ] {
         assert!(
             APPLY_PATCH_TOOL_INSTRUCTIONS.contains(required),

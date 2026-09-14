@@ -9,7 +9,8 @@ use super::*;
 
 #[tokio::test]
 async fn sandboxed_file_system_rejects_non_native_uri_as_invalid_input() {
-    let runtime_paths = ExecServerRuntimePaths::new(std::env::current_exe().expect("current exe"))
+    let directory = tempfile::tempdir().expect("temp directory");
+    let runtime_paths = ExecServerRuntimePaths::new(directory.path().join("missing-helper.exe"))
         .expect("runtime paths");
     let file_system = SandboxedFileSystem::new(runtime_paths);
     let sandbox = FileSystemSandboxContext::from_permission_profile(
@@ -19,12 +20,16 @@ async fn sandboxed_file_system_rejects_non_native_uri_as_invalid_input() {
         ),
     );
 
+    assert!(sandbox.should_run_in_sandbox());
+    let path = non_native_uri();
+    let expected_error = path.to_abs_path().expect_err("fixture must be non-native");
     let error = file_system
-        .read_file(&non_native_uri(), Some(&sandbox))
+        .read_file(&path, Some(&sandbox))
         .await
         .expect_err("non-native URI should be rejected");
 
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(error.to_string(), expected_error.to_string());
 }
 
 fn non_native_uri() -> PathUri {
@@ -33,6 +38,28 @@ fn non_native_uri() -> PathUri {
     match PathUri::parse(uri) {
         Ok(uri) => uri,
         Err(err) => panic!("valid non-native URI should parse: {err}"),
+    }
+}
+
+#[test]
+fn sandbox_errors_preserve_protocol_categories() {
+    for (code, expected_kind) in [
+        (-32600, io::ErrorKind::InvalidInput),
+        (-32602, io::ErrorKind::InvalidInput),
+        (-32004, io::ErrorKind::NotFound),
+        (
+            FS_PERMISSION_DENIED_ERROR_CODE,
+            io::ErrorKind::PermissionDenied,
+        ),
+        (-32603, io::ErrorKind::Other),
+    ] {
+        let error = map_sandbox_error(JSONRPCErrorError {
+            code,
+            message: "helper rejection".to_string(),
+            data: None,
+        });
+        assert_eq!(error.kind(), expected_kind, "helper code {code}");
+        assert_eq!(error.to_string(), "helper rejection");
     }
 }
 

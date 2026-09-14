@@ -866,7 +866,6 @@ pub(crate) struct TimingCounters {
     pub(crate) suppressed_validation_output_count: u32,
     pub(crate) ready_startup_prewarm_count: u32,
     pub(crate) same_purpose_continuation_count: u32,
-    pub(crate) exact_repeated_wait_count: u32,
     pub(crate) planning_generation_count: u32,
     pub(crate) plan_revision_generation_count: u32,
     pub(crate) planning_fixed_point_iteration_count: u32,
@@ -2532,6 +2531,29 @@ impl TurnTimingState {
             .counters
             .projection_source_dependencies_fallback_count
             .saturating_add(1);
+    }
+
+    /// Keep contended source-dependency bookkeeping off the tool-dispatch worker.
+    pub(crate) async fn record_projection_source_dependencies_reuse_async(self: &Arc<Self>) {
+        let timing = Arc::clone(self);
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            timing.record_projection_source_dependencies_reuse();
+        })
+        .await
+        {
+            tracing::error!(%error, "failed to record projection source dependency reuse");
+        }
+    }
+
+    pub(crate) async fn record_projection_source_dependencies_fallback_async(self: &Arc<Self>) {
+        let timing = Arc::clone(self);
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            timing.record_projection_source_dependencies_fallback();
+        })
+        .await
+        {
+            tracing::error!(%error, "failed to record projection source dependency fallback");
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

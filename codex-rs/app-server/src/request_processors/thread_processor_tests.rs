@@ -1,16 +1,15 @@
 #[test]
 fn forked_resume_moves_history_into_core_without_cloning_its_buffer() {
-    let items = vec![codex_protocol::protocol::RolloutItem::EventMsg(
-        codex_protocol::protocol::EventMsg::UserMessage(
-            codex_protocol::protocol::UserMessageEvent {
-                client_id: None,
-                message: "forked history".to_string(),
-                images: None,
-                local_images: Vec::new(),
-                text_elements: Vec::new(),
-                ..Default::default()
-            },
-        ),
+    let items = vec![codex_protocol::protocol::RolloutItem::ResponseItem(
+        codex_protocol::models::ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![codex_protocol::models::ContentItem::InputText {
+                text: "forked history".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
     )];
     let original_buffer = items.as_ptr();
 
@@ -32,6 +31,42 @@ fn forked_resume_moves_history_into_core_without_cloning_its_buffer() {
             assert!(turns.is_none());
         }
         super::ResumeResponseHistory::Resumed(_) => panic!("expected forked response history"),
+    }
+}
+
+#[test]
+fn forked_resume_preview_preserves_first_user_message_across_rollout_representations() {
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ResponseItem;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::InitialHistory;
+    use codex_protocol::protocol::RolloutItem;
+    use codex_protocol::protocol::UserMessageEvent;
+
+    let event = RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+        message: "event history".to_string(),
+        ..Default::default()
+    }));
+    let response = RolloutItem::ResponseItem(ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "response history".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    });
+    for (items, expected) in [
+        (vec![event.clone(), response.clone()], "event history"),
+        (vec![response, event], "response history"),
+    ] {
+        let (_, response, _) =
+            super::prepare_resume_response_history(InitialHistory::Forked(items), false, None)
+                .expect("prepare forked resume");
+        let super::ResumeResponseHistory::Forked { preview, .. } = response else {
+            panic!("expected forked response");
+        };
+        assert_eq!(preview, expected);
     }
 }
 
@@ -120,7 +155,10 @@ mod thread_list_cwd_filter_tests {
 
     #[test]
     fn normalize_thread_list_cwd_filter_preserves_absolute_paths() {
-        let cwd = String::from(r"C:\srv\repo-b");
+        let cwd = std::env::temp_dir()
+            .join("repo-b")
+            .to_string_lossy()
+            .into_owned();
 
         assert_eq!(
             normalize_thread_list_cwd_filters(Some(ThreadListCwdFilter::One(cwd.clone())))
@@ -154,14 +192,14 @@ mod background_terminal_pagination_tests {
     use pretty_assertions::assert_eq;
 
     fn terminal(process_id: &str) -> ThreadBackgroundTerminal {
-        let cwd = r"C:\tmp";
+        let cwd = AbsolutePathBuf::from_absolute_path(std::env::temp_dir()).expect("absolute cwd");
 
         ThreadBackgroundTerminal {
             item_id: format!("item-{process_id}"),
             process_id: process_id.to_string(),
             command: format!("command-{process_id}"),
-            cwd: Some(AbsolutePathBuf::from_absolute_path(cwd).expect("absolute cwd")),
-            cwd_uri: PathUri::parse("file:///C:/tmp").expect("valid cwd URI"),
+            cwd: Some(cwd.clone()),
+            cwd_uri: PathUri::from_abs_path(&cwd),
             os_pid: None,
             cpu_percent: None,
             rss_kb: None,
@@ -224,14 +262,20 @@ mod background_terminal_pagination_tests {
 
     #[test]
     fn terminal_adapter_preserves_mixed_native_and_foreign_cwds() {
-        let native_cwd = AbsolutePathBuf::from_absolute_path(r"C:\tmp").expect("absolute cwd");
+        let native_cwd =
+            AbsolutePathBuf::from_absolute_path(std::env::temp_dir()).expect("absolute cwd");
         let native = thread_background_terminal_from_core(codex_core::BackgroundTerminalInfo {
             item_id: "native".to_string(),
             process_id: "1".to_string(),
             command: "native-command".to_string(),
             cwd: PathUri::from_abs_path(&native_cwd),
         });
-        let foreign_uri = PathUri::parse("file:///home/remote/project").expect("foreign cwd URI");
+        let foreign_path = if cfg!(windows) {
+            "file:///home/remote/project"
+        } else {
+            "file:///C:/remote/project"
+        };
+        let foreign_uri = PathUri::parse(foreign_path).expect("foreign cwd URI");
         let foreign = thread_background_terminal_from_core(codex_core::BackgroundTerminalInfo {
             item_id: "foreign".to_string(),
             process_id: "2".to_string(),
@@ -264,86 +308,125 @@ mod failed_fork_cleanup_tests {
 }
 
 mod reconstructed_thread_item_pagination_tests {
-    use super::super::ReconstructedThreadItem;
-    use super::super::paginate_reconstructed_thread_items;
+    use super::super::parse_reconstructed_thread_items_cursor;
+    use super::super::serialize_reconstructed_thread_items_cursor;
+    use crate::thread_state::ThreadState;
     use codex_app_server_protocol::SortDirection;
-    use codex_app_server_protocol::ThreadItem;
-    use codex_app_server_protocol::UserInput;
-    use pretty_assertions::assert_eq;
-
-    fn item(turn_id: &str, item_id: &str) -> ReconstructedThreadItem {
-        ReconstructedThreadItem {
-            turn_id: turn_id.to_string(),
-            item: ThreadItem::UserMessage {
-                id: item_id.to_string(),
-                client_id: None,
-                content: vec![UserInput::Text {
-                    text: item_id.to_string(),
-                    text_elements: Vec::new(),
-                }],
-            },
-        }
-    }
-
-    fn items() -> Vec<ReconstructedThreadItem> {
-        vec![
-            item("turn-1", "item-1"),
-            item("turn-1", "item-2"),
-            item("turn-2", "item-3"),
-        ]
-    }
-
-    fn item_ids(items: &[ThreadItem]) -> Vec<&str> {
-        items.iter().map(ThreadItem::id).collect()
-    }
+    use codex_protocol::config_types::ModeKind;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::RolloutItem;
+    use codex_protocol::protocol::TurnStartedEvent;
+    use codex_protocol::protocol::UserMessageEvent;
 
     #[test]
     fn paginates_forward_backward_and_rejects_removed_anchor() {
-        let first_page = paginate_reconstructed_thread_items(items(), None, 2, SortDirection::Asc)
-            .expect("first page");
-        assert_eq!(item_ids(&first_page.data), vec!["item-1", "item-2"]);
-        assert!(first_page.backwards_cursor.is_some());
-        let next_cursor = first_page.next_cursor.expect("next cursor");
-
-        let second_page =
-            paginate_reconstructed_thread_items(items(), Some(&next_cursor), 2, SortDirection::Asc)
-                .expect("second page");
-        assert_eq!(item_ids(&second_page.data), vec!["item-3"]);
-        assert!(second_page.next_cursor.is_none());
-        let backwards_cursor = second_page.backwards_cursor.expect("backwards cursor");
-
-        let backwards_page = paginate_reconstructed_thread_items(
-            items(),
-            Some(&backwards_cursor),
-            2,
-            SortDirection::Desc,
-        )
-        .expect("backwards page");
-        assert_eq!(item_ids(&backwards_page.data), vec!["item-3", "item-2"]);
-
-        let removed_anchor_items = vec![item("turn-1", "item-1"), item("turn-1", "item-2")];
-        assert!(
-            paginate_reconstructed_thread_items(
-                removed_anchor_items,
-                Some(&backwards_cursor),
+        let mut history: Vec<_> = ["turn-1", "turn-2", "turn-3"]
+            .into_iter()
+            .flat_map(|id| {
+                [
+                    RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                        turn_id: id.to_string(),
+                        trace_id: None,
+                        started_at: None,
+                        model_context_window: None,
+                        collaboration_mode_kind: ModeKind::Default,
+                    })),
+                    RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                        message: id.to_string(),
+                        ..Default::default()
+                    })),
+                    RolloutItem::EventMsg(EventMsg::TurnComplete(
+                        codex_protocol::protocol::TurnCompleteEvent {
+                            turn_id: id.to_string(),
+                            last_agent_message: None,
+                            surfaced_result: None,
+                            error: None,
+                            completed_at: None,
+                            duration_ms: None,
+                            time_to_first_token_ms: None,
+                            timing: None,
+                        },
+                    )),
+                ]
+            })
+            .collect();
+        let mut state = ThreadState::default();
+        state.seed_turn_index_from_history(&history);
+        let first = state
+            .indexed_items_page(None, None, 2, SortDirection::Asc)
+            .expect("valid page")
+            .expect("seeded index");
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|entry| entry.turn_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["turn-1", "turn-2"]
+        );
+        assert!(first.more_items_available);
+        let last = first.items.last().expect("anchor");
+        let cursor =
+            serialize_reconstructed_thread_items_cursor(&last.turn_id, last.item.id(), false)
+                .expect("serialize cursor");
+        let anchor = parse_reconstructed_thread_items_cursor(&cursor).expect("parse cursor");
+        let second = state
+            .indexed_items_page(
+                None,
+                Some((&anchor.turn_id, &anchor.item_id, anchor.include_anchor)),
+                2,
+                SortDirection::Asc,
+            )
+            .expect("valid page")
+            .expect("seeded index");
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].turn_id, "turn-3");
+        assert!(!second.more_items_available);
+        let last = &second.items[0];
+        let cursor =
+            serialize_reconstructed_thread_items_cursor(&last.turn_id, last.item.id(), true)
+                .expect("serialize backwards cursor");
+        let anchor = parse_reconstructed_thread_items_cursor(&cursor).expect("parse cursor");
+        let backwards = state
+            .indexed_items_page(
+                None,
+                Some((&anchor.turn_id, &anchor.item_id, anchor.include_anchor)),
                 2,
                 SortDirection::Desc,
             )
-            .is_err()
+            .expect("valid backwards page")
+            .expect("seeded index");
+        assert_eq!(
+            backwards
+                .items
+                .iter()
+                .map(|entry| entry.turn_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["turn-3", "turn-2"]
+        );
+        history.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+            codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+        )));
+        let mut state = ThreadState::default();
+        state.seed_turn_index_from_history(&history);
+        assert!(
+            state
+                .indexed_items_page(
+                    None,
+                    Some((&anchor.turn_id, &anchor.item_id, anchor.include_anchor)),
+                    2,
+                    SortDirection::Desc
+                )
+                .is_err()
         );
     }
 
     #[test]
-    fn rejects_malformed_cursor_when_items_are_empty() {
-        assert!(
-            paginate_reconstructed_thread_items(
-                Vec::new(),
-                Some("not-a-cursor"),
-                2,
-                SortDirection::Asc,
-            )
-            .is_err()
-        );
+    fn rejects_malformed_cursor_before_index_lookup() {
+        let error = parse_reconstructed_thread_items_cursor("not-a-cursor")
+            .err()
+            .expect("malformed cursor must be rejected");
+        assert_eq!(error.code, crate::error_code::INVALID_REQUEST_ERROR_CODE);
     }
 }
 
@@ -393,7 +476,6 @@ mod thread_processor_behavior_tests {
     use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
     use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
     use codex_protocol::models::PermissionProfile;
-    use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::permissions::FileSystemAccessMode;
     use codex_protocol::permissions::FileSystemPath;
     use codex_protocol::permissions::FileSystemSandboxEntry;
@@ -402,7 +484,6 @@ mod thread_processor_behavior_tests {
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::SubAgentSource;
     use codex_protocol::protocol::TurnEnvironmentSelections;
-    use codex_state::ThreadMetadataBuilder;
     use codex_thread_store::StoredThread;
     use codex_utils_absolute_path::test_support::PathBufExt;
     use codex_utils_absolute_path::test_support::test_path_buf;
@@ -804,18 +885,17 @@ mod thread_processor_behavior_tests {
         assert!(err.contains("Responses API"), "unexpected error: {err}");
     }
 
-    #[test]
-    fn summary_from_stored_thread_preserves_millisecond_precision() {
+    fn summary_test_stored_thread() -> StoredThread {
         let created_at =
             DateTime::parse_from_rfc3339("2025-01-02T03:04:05.678Z").expect("valid timestamp");
         let updated_at =
             DateTime::parse_from_rfc3339("2025-01-02T03:04:06.789Z").expect("valid timestamp");
         let thread_id =
             ThreadId::from_string("00000000-0000-0000-0000-000000000123").expect("valid thread");
-        let stored_thread = StoredThread {
+        StoredThread {
             thread_id,
             extra_config: None,
-            rollout_path: Some(PathBuf::from("/tmp/thread.jsonl")),
+            rollout_path: Some(test_path_buf("/tmp/thread.jsonl")),
             forked_from_id: None,
             parent_thread_id: None,
             preview: "preview".to_string(),
@@ -827,7 +907,7 @@ mod thread_processor_behavior_tests {
             updated_at: updated_at.with_timezone(&Utc),
             recency_at: updated_at.with_timezone(&Utc),
             archived_at: None,
-            cwd: PathBuf::from(r"\\?\C:\"),
+            cwd: test_path_buf("/tmp/project"),
             cli_version: "0.0.0".to_string(),
             source: SessionSource::Cli,
             history_mode: Default::default(),
@@ -841,8 +921,29 @@ mod thread_processor_behavior_tests {
             token_usage: None,
             first_user_message: Some("first user message".to_string()),
             history: None,
-        };
+        }
+    }
 
+    #[test]
+    fn stored_thread_response_normalizes_existing_title_without_another_read() {
+        for (name, expected) in [
+            ("  custom title  ", "custom title"),
+            ("  preview  ", "  preview  "),
+            ("   ", "   "),
+        ] {
+            let mut stored = summary_test_stored_thread();
+            stored.name = Some(name.to_string());
+            let cwd = AbsolutePathBuf::from_absolute_path(test_path_buf("/tmp/project"))
+                .expect("absolute cwd");
+            let (thread, _) = thread_from_stored_thread(stored, "fallback", &cwd);
+            assert_eq!(thread.name.as_deref(), Some(expected));
+            assert_eq!(thread.preview, "preview");
+        }
+    }
+
+    #[test]
+    fn summary_from_stored_thread_preserves_millisecond_precision() {
+        let stored_thread = summary_test_stored_thread();
         let summary = summary_from_stored_thread(stored_thread, "fallback");
 
         assert_eq!(
@@ -853,6 +954,17 @@ mod thread_processor_behavior_tests {
             summary.updated_at.as_deref(),
             Some("2025-01-02T03:04:06.789Z")
         );
+        assert_eq!(summary.cwd, test_path_buf("/tmp/project"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn summary_from_stored_thread_normalizes_verbatim_cwd() {
+        let mut stored_thread = summary_test_stored_thread();
+        stored_thread.cwd = PathBuf::from(r"\\?\C:\");
+
+        let summary = summary_from_stored_thread(stored_thread, "fallback");
+
         assert_eq!(summary.cwd, PathBuf::from(r"C:\"));
     }
 
@@ -1143,40 +1255,6 @@ mod thread_processor_behavior_tests {
         );
     }
 
-    fn test_thread_metadata(
-        model: Option<&str>,
-        reasoning_effort: Option<ReasoningEffort>,
-    ) -> Result<ThreadMetadata> {
-        let thread_id = ThreadId::from_string("3f941c35-29b3-493b-b0a4-e25800d9aeb0")?;
-        let mut builder = ThreadMetadataBuilder::new(
-            thread_id,
-            PathBuf::from("/tmp/rollout.jsonl"),
-            Utc::now(),
-            codex_protocol::protocol::SessionSource::default(),
-        );
-        builder.model_provider = Some("mock_provider".to_string());
-        let mut metadata = builder.build("mock_provider");
-        metadata.model = model.map(ToString::to_string);
-        metadata.reasoning_effort = reasoning_effort;
-        Ok(metadata)
-    }
-
-    #[test]
-    fn summary_from_thread_metadata_formats_protocol_timestamps_as_seconds() -> Result<()> {
-        let mut metadata =
-            test_thread_metadata(/*model*/ None, /*reasoning_effort*/ None)?;
-        metadata.created_at =
-            DateTime::parse_from_rfc3339("2025-09-05T16:53:11.123Z")?.with_timezone(&Utc);
-        metadata.updated_at =
-            DateTime::parse_from_rfc3339("2025-09-05T16:53:12.456Z")?.with_timezone(&Utc);
-
-        let summary = summary_from_thread_metadata(&metadata);
-
-        assert_eq!(summary.timestamp, Some("2025-09-05T16:53:11Z".to_string()));
-        assert_eq!(summary.updated_at, Some("2025-09-05T16:53:12Z".to_string()));
-        Ok(())
-    }
-
     #[test]
     fn persisted_settings_override_mask_is_fieldwise() {
         let request_overrides = HashMap::from([(
@@ -1406,6 +1484,7 @@ mod thread_processor_behavior_tests {
                 },
             ))
             .await;
+        let request_id = request_id.expect("request admitted");
         thread_outgoing.abort_pending_server_requests().await;
 
         let request_message = outgoing_rx.recv().await.expect("request should be sent");
@@ -1444,41 +1523,22 @@ mod thread_processor_behavior_tests {
     }
 
     #[test]
-    fn summary_from_state_db_metadata_preserves_agent_nickname() -> Result<()> {
-        let conversation_id = ThreadId::from_string("bfd12a78-5900-467b-9bc5-d3d35df08191")?;
-        let source =
-            serde_json::to_string(&SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                parent_thread_id: ThreadId::from_string("ad7f0408-99b8-4f6e-a46f-bd0eec433370")?,
-                depth: 1,
-                agent_path: None,
-                agent_nickname: None,
-                agent_role: None,
-            }))?;
-
-        let summary = summary_from_state_db_metadata(
-            conversation_id,
-            PathBuf::from("/tmp/rollout.jsonl"),
-            Some("hi".to_string()),
-            /*preview*/ None,
-            "2025-09-05T16:53:11Z".to_string(),
-            "2025-09-05T16:53:12Z".to_string(),
-            "test-provider".to_string(),
-            PathBuf::from("/"),
-            "0.0.0".to_string(),
-            source,
-            Some(codex_protocol::protocol::ThreadSource::Subagent),
-            Some("atlas".to_string()),
-            Some("explorer".to_string()),
-            /*git_sha*/ None,
-            /*git_branch*/ None,
-            /*git_origin_url*/ None,
-        );
-
-        let fallback_cwd = AbsolutePathBuf::from_absolute_path("/")?;
+    fn summary_from_stored_thread_preserves_agent_nickname() -> Result<()> {
+        let mut stored = summary_test_stored_thread();
+        stored.source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: ThreadId::new(),
+            depth: 1,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+        });
+        stored.agent_nickname = Some("atlas".to_string());
+        stored.agent_role = Some("explorer".to_string());
+        let summary = summary_from_stored_thread(stored, "fallback");
+        let fallback_cwd = test_path_buf("/tmp").abs();
         let thread = summary_to_thread(summary, &fallback_cwd);
-
-        assert_eq!(thread.agent_nickname, Some("atlas".to_string()));
-        assert_eq!(thread.agent_role, Some("explorer".to_string()));
+        assert_eq!(thread.agent_nickname.as_deref(), Some("atlas"));
+        assert_eq!(thread.agent_role.as_deref(), Some("explorer"));
         Ok(())
     }
 

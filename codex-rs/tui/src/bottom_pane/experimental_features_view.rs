@@ -66,7 +66,7 @@ impl ExperimentalFeaturesView {
             complete: false,
             app_event_tx,
             header: Box::new(header),
-            footer_hint: experimental_popup_hint_line(),
+            footer_hint: experimental_popup_hint_line(&keymap),
             keymap,
         };
         view.initialize_selection();
@@ -282,12 +282,11 @@ impl Renderable for ExperimentalFeaturesView {
     }
 }
 
-fn experimental_popup_hint_line() -> Line<'static> {
-    Line::from(vec![
-        "Press ".into(),
-        key_hint::plain(KeyCode::Char(' ')).into(),
-        " to select or ".into(),
-        key_hint::plain(KeyCode::Enter).into(),
-        " to save for next conversation".into(),
-    ])
+fn experimental_popup_hint_line(keymap: &ListKeymap) -> Line<'static> {
+    super::popup_consts::accept_cancel_hint_line(
+        Some(key_hint::plain(KeyCode::Char(' '))),
+        "to select",
+        crate::keymap::primary_binding(&keymap.accept),
+        "to save for next conversation",
+    )
 }

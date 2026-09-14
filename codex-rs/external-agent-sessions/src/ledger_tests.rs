@@ -76,8 +76,8 @@ fn completed_import_refreshes_existing_record_metadata() {
         &codex_home,
         vec![CompletedExternalAgentSessionImport {
             source_path: source_path.clone(),
-            source_content_sha256: content_sha256,
-            source_modified_at: Some(1),
+            source_content_sha256: content_sha256.clone(),
+            source_modified_at: Some(2),
             imported_thread_id: second_thread_id,
         }],
     )
@@ -87,7 +87,8 @@ fn completed_import_refreshes_existing_record_metadata() {
     assert_eq!(ledger.records.len(), 1);
     assert_eq!(ledger.records[0].source_path, source_path);
     assert_eq!(ledger.records[0].imported_thread_id, second_thread_id);
-    assert_eq!(ledger.records[0].source_modified_at, Some(1));
+    assert_eq!(ledger.records[0].source_modified_at, Some(2));
+    assert_eq!(ledger.records[0].content_sha256, content_sha256);
 }
 
 #[test]
@@ -98,6 +99,8 @@ fn concurrent_completed_imports_preserve_every_ledger_update() {
     let codex_home = Arc::new(root.path().join("codex-home"));
     let barrier = Arc::new(Barrier::new(IMPORT_COUNT + 1));
     let mut workers = Vec::new();
+    let mut expected = Vec::new();
+    let before = super::now_unix_seconds();
     for index in 0..IMPORT_COUNT {
         let source_path = root.path().join(format!("session-{index}.jsonl"));
         let contents = format!("session contents {index}");
@@ -109,6 +112,7 @@ fn concurrent_completed_imports_preserve_every_ledger_update() {
             source_modified_at: Some(index as i64),
             imported_thread_id: ThreadId::new(),
         };
+        expected.push(completed_import.clone());
         let codex_home = Arc::clone(&codex_home);
         let barrier = Arc::clone(&barrier);
         workers.push(std::thread::spawn(move || {
@@ -124,6 +128,18 @@ fn concurrent_completed_imports_preserve_every_ledger_update() {
 
     let ledger = super::load_import_ledger(codex_home.as_path()).expect("ledger");
     assert_eq!(ledger.records.len(), IMPORT_COUNT);
+    let after = super::now_unix_seconds();
+    for expected in expected {
+        let actual = ledger
+            .records
+            .iter()
+            .find(|record| record.source_path == expected.source_path)
+            .expect("every identity survives");
+        assert_eq!(actual.content_sha256, expected.source_content_sha256);
+        assert_eq!(actual.imported_thread_id, expected.imported_thread_id);
+        assert_eq!(actual.source_modified_at, expected.source_modified_at);
+        assert!((before..=after).contains(&actual.imported_at));
+    }
 }
 
 #[test]
@@ -175,10 +191,24 @@ fn stale_source_refresh_does_not_reorder_a_newer_completed_import() {
         }],
     )
     .expect("record version c");
+    let before = super::load_import_ledger(&codex_home).expect("before refresh");
+    let ledger_path = super::import_ledger_path(&codex_home);
+    let sentinel = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+    std::fs::File::options()
+        .write(true)
+        .open(&ledger_path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(sentinel))
+        .unwrap();
     record_current_source_refreshes(&codex_home, vec![stale_refresh])
         .expect("record stale refresh");
 
     let ledger = super::load_import_ledger(&codex_home).expect("ledger");
+    assert_eq!(ledger, before);
+    assert_eq!(
+        std::fs::metadata(ledger_path).unwrap().modified().unwrap(),
+        sentinel
+    );
     assert_eq!(
         ledger.records.last().map(|record| &record.content_sha256),
         Some(&version_c_hash)

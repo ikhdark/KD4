@@ -134,6 +134,7 @@ pub(crate) async fn extract_metadata_from_rollout_with_cache_status(
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ExtractionCacheKey {
     path: PathBuf,
+    physical_path: PathBuf,
     len: u64,
     modified: Option<SystemTime>,
     default_provider: String,
@@ -154,9 +155,11 @@ async fn extraction_cache_key(
     rollout_path: &Path,
     default_provider: &str,
 ) -> Option<ExtractionCacheKey> {
-    let metadata = tokio::fs::metadata(rollout_path).await.ok()?;
+    let physical_path = compression::existing_rollout_path(rollout_path).await?;
+    let metadata = tokio::fs::metadata(&physical_path).await.ok()?;
     Some(ExtractionCacheKey {
         path: rollout_path.to_path_buf(),
+        physical_path,
         len: metadata.len(),
         modified: metadata.modified().ok(),
         default_provider: default_provider.to_string(),
@@ -634,35 +637,10 @@ async fn collect_rollout_paths(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut stack = vec![root.to_path_buf()];
     let mut paths = Vec::new();
     while let Some(dir) = stack.pop() {
-        let mut read_dir = match tokio::fs::read_dir(&dir).await {
-            Ok(read_dir) => read_dir,
-            Err(err) => {
-                warn!("failed to read directory {}: {err}", dir.display());
-                continue;
-            }
-        };
-        loop {
-            let next_entry = match read_dir.next_entry().await {
-                Ok(next_entry) => next_entry,
-                Err(err) => {
-                    warn!(
-                        "failed to read directory entry under {}: {err}",
-                        dir.display()
-                    );
-                    continue;
-                }
-            };
-            let Some(entry) = next_entry else {
-                break;
-            };
+        let mut read_dir = tokio::fs::read_dir(&dir).await?;
+        while let Some(entry) = read_dir.next_entry().await? {
             let path = entry.path();
-            let file_type = match entry.file_type().await {
-                Ok(file_type) => file_type,
-                Err(err) => {
-                    warn!("failed to read file type for {}: {err}", path.display());
-                    continue;
-                }
-            };
+            let file_type = entry.file_type().await?;
             if file_type.is_dir() {
                 stack.push(path);
                 continue;

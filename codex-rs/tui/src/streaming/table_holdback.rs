@@ -96,7 +96,7 @@ impl TableHoldbackScanner {
     /// scanner never treats an unfinished table row as a stable structural
     /// signal.
     pub(super) fn push_source_chunk(&mut self, source_chunk: &str) {
-        if source_chunk.is_empty() {
+        if source_chunk.is_empty() || self.confirmed_table_start.is_some() {
             return;
         }
 
@@ -105,6 +105,9 @@ impl TableHoldbackScanner {
         for source_line in source_chunk.split_inclusive('\n') {
             lines += 1;
             self.push_line(source_line);
+            if self.confirmed_table_start.is_some() {
+                break;
+            }
         }
         tracing::trace!(
             bytes = source_chunk.len(),

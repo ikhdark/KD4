@@ -86,49 +86,34 @@ WHERE thread_id = ?
         Ok(updated_rows)
     }
 
-    async fn stage1_source_needs_update(
+    async fn stage1_sources_needing_update(
         &self,
-        thread_id: ThreadId,
-        source_updated_at: i64,
-    ) -> anyhow::Result<bool> {
-        let thread_id = thread_id.to_string();
-        let existing_output = sqlx::query(
+        threads: &[ThreadMetadata],
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        let sources = threads
+            .iter()
+            .map(|thread| (thread.id.to_string(), thread.updated_at.timestamp()))
+            .collect::<Vec<_>>();
+        let rows = sqlx::query_scalar::<_, String>(
             r#"
-SELECT source_updated_at
-FROM stage1_outputs
-WHERE thread_id = ?
+WITH sources AS (
+    SELECT json_extract(value, '$[0]') AS thread_id,
+           CAST(json_extract(value, '$[1]') AS INTEGER) AS updated_at
+    FROM json_each(?)
+)
+SELECT sources.thread_id
+FROM sources
+LEFT JOIN stage1_outputs AS outputs ON outputs.thread_id = sources.thread_id
+LEFT JOIN jobs ON jobs.kind = ? AND jobs.job_key = sources.thread_id
+WHERE (outputs.source_updated_at IS NULL OR outputs.source_updated_at < sources.updated_at)
+  AND (jobs.last_success_watermark IS NULL OR jobs.last_success_watermark < sources.updated_at)
             "#,
         )
-        .bind(thread_id.as_str())
-        .fetch_optional(self.pool.as_ref())
-        .await?;
-        if let Some(existing_output) = existing_output {
-            let existing_source_updated_at: i64 = existing_output.try_get("source_updated_at")?;
-            if existing_source_updated_at >= source_updated_at {
-                return Ok(false);
-            }
-        }
-
-        let existing_job = sqlx::query(
-            r#"
-SELECT last_success_watermark
-FROM jobs
-WHERE kind = ? AND job_key = ?
-            "#,
-        )
+        .bind(serde_json::to_string(&sources)?)
         .bind(JOB_KIND_MEMORY_STAGE1)
-        .bind(thread_id.as_str())
-        .fetch_optional(self.pool.as_ref())
+        .fetch_all(self.pool.as_ref())
         .await?;
-        if let Some(existing_job) = existing_job {
-            let last_success_watermark =
-                existing_job.try_get::<Option<i64>, _>("last_success_watermark")?;
-            if last_success_watermark.is_some_and(|watermark| watermark >= source_updated_at) {
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
+        Ok(rows.into_iter().collect())
     }
 
     /// Selects and claims stage-1 startup jobs for stale threads.
@@ -243,15 +228,13 @@ FROM threads
             .map(|row| ThreadRow::try_from_row(&row).and_then(ThreadMetadata::try_from))
             .collect::<Result<Vec<_>, _>>()?;
 
+        let stale_sources = self.stage1_sources_needing_update(&items).await?;
         let mut claimed = Vec::new();
         for item in items {
             if claimed.len() >= max_claimed {
                 break;
             }
-            if !self
-                .stage1_source_needs_update(item.id, item.updated_at.timestamp())
-                .await?
-            {
+            if !stale_sources.contains(&item.id.to_string()) {
                 continue;
             }
 
@@ -275,52 +258,27 @@ FROM threads
         Ok(claimed)
     }
 
-    pub(super) async fn delete_thread_memory(&self, thread_id: ThreadId) -> anyhow::Result<()> {
+    pub(super) async fn delete_threads_memory(&self, thread_ids_json: &str) -> anyhow::Result<()> {
         let now = Utc::now().timestamp();
-        let thread_id = thread_id.to_string();
         let mut tx = self.pool.begin().await?;
-
-        let existing_output = sqlx::query(
-            r#"
-SELECT selected_for_phase2
-FROM stage1_outputs
-WHERE thread_id = ?
-            "#,
+        // The first operation reserves the writer and returns the forgetting
+        // decision without a deferred read-to-write upgrade.
+        let selected = sqlx::query_scalar::<_, i64>(
+            "DELETE FROM stage1_outputs WHERE thread_id IN (SELECT value FROM json_each(?)) RETURNING selected_for_phase2",
         )
-        .bind(thread_id.as_str())
-        .fetch_optional(&mut *tx)
+        .bind(thread_ids_json)
+        .fetch_all(&mut *tx)
         .await?;
-        let was_selected_for_phase2 = existing_output
-            .map(|row| row.try_get::<i64, _>("selected_for_phase2"))
-            .transpose()?
-            .is_some_and(|selected| selected != 0);
-
-        let deleted_rows = sqlx::query(
-            r#"
-DELETE FROM stage1_outputs
-WHERE thread_id = ?
-            "#,
-        )
-        .bind(thread_id.as_str())
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-
         sqlx::query(
-            r#"
-DELETE FROM jobs
-WHERE kind = ? AND job_key = ?
-            "#,
+            "DELETE FROM jobs WHERE kind = ? AND job_key IN (SELECT value FROM json_each(?))",
         )
         .bind(JOB_KIND_MEMORY_STAGE1)
-        .bind(thread_id.as_str())
+        .bind(thread_ids_json)
         .execute(&mut *tx)
         .await?;
-
-        if deleted_rows > 0 && was_selected_for_phase2 {
+        if selected.into_iter().any(|selected| selected != 0) {
             enqueue_global_consolidation_with_executor(&mut *tx, now).await?;
         }
-
         tx.commit().await?;
         Ok(())
     }
@@ -341,33 +299,40 @@ WHERE kind = ? AND job_key = ?
             return Ok(Vec::new());
         }
 
-        let rows = sqlx::query(
-            r#"
-SELECT
-    so.thread_id,
-    so.source_updated_at,
-    so.raw_memory,
-    so.rollout_summary,
-    so.rollout_slug,
-    so.generated_at
-FROM stage1_outputs AS so
-WHERE length(trim(so.raw_memory)) > 0 OR length(trim(so.rollout_summary)) > 0
-ORDER BY so.source_updated_at DESC, so.thread_id DESC
-            "#,
-        )
-        .fetch_all(self.pool.as_ref())
-        .await?;
-
-        let mut outputs = Vec::new();
-        for row in rows {
-            if let Some(output) = self.stage1_output_from_row_if_thread_enabled(&row).await? {
-                outputs.push(output);
-                if outputs.len() >= n {
-                    break;
+        let mut snapshot = self.pool.begin().await?;
+        let mut offset = 0_i64;
+        let mut selected_keys = Vec::new();
+        let page_size = n.clamp(1, PHASE2_INPUT_SELECTION_PAGE_SIZE) as i64;
+        while selected_keys.len() < n {
+            let rows = sqlx::query_as::<_, (String, i64)>(
+                "SELECT thread_id, source_updated_at FROM stage1_outputs WHERE length(trim(raw_memory)) > 0 OR length(trim(rollout_summary)) > 0 ORDER BY source_updated_at DESC, thread_id DESC LIMIT ? OFFSET ?",
+            )
+            .bind(page_size)
+            .bind(offset)
+            .fetch_all(&mut *snapshot)
+            .await?;
+            if rows.is_empty() {
+                break;
+            }
+            offset += rows.len() as i64;
+            let ids = rows.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+            let enabled = self.enabled_thread_metadata_for_ids(&ids).await?;
+            for key in rows {
+                if enabled.contains_key(&key.0) {
+                    selected_keys.push(key);
+                    if selected_keys.len() == n {
+                        break;
+                    }
                 }
             }
         }
-
+        snapshot.commit().await?;
+        let mut outputs = self.hydrate_selected_keys(&selected_keys).await?;
+        outputs.sort_by(|a, b| {
+            b.source_updated_at
+                .cmp(&a.source_updated_at)
+                .then_with(|| b.thread_id.to_string().cmp(&a.thread_id.to_string()))
+        });
         Ok(outputs)
     }
 
@@ -445,6 +410,21 @@ WHERE thread_id IN (
         n: usize,
         max_unused_days: i64,
     ) -> anyhow::Result<(Vec<Stage1Output>, usize)> {
+        self.get_phase2_input_selection_inner(
+            n,
+            max_unused_days,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    async fn get_phase2_input_selection_inner(
+        &self,
+        n: usize,
+        max_unused_days: i64,
+        #[cfg(test)] between_pages: Option<&tokio::sync::Barrier>,
+    ) -> anyhow::Result<(Vec<Stage1Output>, usize)> {
         if n == 0 {
             return Ok((Vec::new(), 0));
         }
@@ -456,6 +436,7 @@ WHERE thread_id IN (
         let mut selected_keys = Vec::with_capacity(n);
         let mut query_count = 0;
 
+        let mut snapshot = self.pool.begin().await?;
         while selected_keys.len() < n {
             let candidate_rows = sqlx::query(
                 r#"
@@ -480,7 +461,7 @@ LIMIT ? OFFSET ?
             .bind(cutoff)
             .bind(page_size_i64)
             .bind(offset)
-            .fetch_all(self.pool.as_ref())
+            .fetch_all(&mut *snapshot)
             .await?;
             query_count += 1;
 
@@ -508,13 +489,35 @@ LIMIT ? OFFSET ?
                 }
             }
 
+            #[cfg(test)]
+            if offset == 0
+                && let Some(barrier) = between_pages
+            {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
             offset = offset.saturating_add(candidate_count);
         }
+
+        snapshot.commit().await?;
 
         if selected_keys.is_empty() {
             return Ok((Vec::new(), query_count));
         }
 
+        let mut selected = self.hydrate_selected_keys(&selected_keys).await?;
+        query_count += 2;
+        selected.sort_by_key(|entry| entry.thread_id.to_string());
+        Ok((selected, query_count))
+    }
+
+    async fn hydrate_selected_keys(
+        &self,
+        selected_keys: &[(String, i64)],
+    ) -> anyhow::Result<Vec<Stage1Output>> {
+        if selected_keys.is_empty() {
+            return Ok(Vec::new());
+        }
         let selected_keys_json = serde_json::to_string(&selected_keys)?;
         let rows = sqlx::query(
             r#"
@@ -540,7 +543,6 @@ JOIN selected_keys AS selected
         .bind(selected_keys_json)
         .fetch_all(self.pool.as_ref())
         .await?;
-        query_count += 1;
 
         let selected_thread_ids = rows
             .iter()
@@ -549,7 +551,6 @@ JOIN selected_keys AS selected
         let mut enabled_threads = self
             .enabled_thread_metadata_for_ids(&selected_thread_ids)
             .await?;
-        query_count += 1;
         let mut selected = Vec::with_capacity(selected_keys.len());
         for row in rows {
             let thread_id: String = row.try_get("thread_id")?;
@@ -559,68 +560,7 @@ JOIN selected_keys AS selected
             selected.push(stage1_output_from_row_and_thread(&row, thread)?);
         }
 
-        selected.sort_by_key(|entry| entry.thread_id.to_string());
-
-        Ok((selected, query_count))
-    }
-
-    async fn stage1_output_from_row_if_thread_enabled(
-        &self,
-        row: &sqlx::sqlite::SqliteRow,
-    ) -> anyhow::Result<Option<Stage1Output>> {
-        let thread_id: String = row.try_get("thread_id")?;
-        let Some(thread) = self
-            .enabled_thread_metadata(ThreadId::try_from(thread_id.as_str())?)
-            .await?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(stage1_output_from_row_and_thread(row, thread)?))
-    }
-
-    async fn enabled_thread_metadata(
-        &self,
-        thread_id: ThreadId,
-    ) -> anyhow::Result<Option<ThreadMetadata>> {
-        let row = sqlx::query(
-            r#"
-SELECT
-    threads.id,
-    threads.rollout_path,
-    threads.created_at_ms AS created_at,
-    threads.updated_at_ms AS updated_at,
-    threads.recency_at_ms AS recency_at,
-    threads.source,
-    threads.history_mode,
-    threads.thread_source,
-    threads.agent_nickname,
-    threads.agent_role,
-    threads.agent_path,
-    threads.model_provider,
-    threads.model,
-    threads.reasoning_effort,
-    threads.cwd,
-    threads.cli_version,
-    threads.title,
-    threads.preview,
-    threads.sandbox_policy,
-    threads.approval_mode,
-    threads.tokens_used,
-    threads.first_user_message,
-    threads.archived_at,
-    threads.git_sha,
-    threads.git_branch,
-    threads.git_origin_url
-FROM threads
-WHERE threads.id = ? AND threads.memory_mode = 'enabled' AND threads.history_mode = 'legacy'
-            "#,
-        )
-        .bind(thread_id.to_string())
-        .fetch_optional(self.state_pool.as_ref())
-        .await?;
-
-        row.map(|row| ThreadRow::try_from_row(&row).and_then(ThreadMetadata::try_from))
-            .transpose()
+        Ok(selected)
     }
 
     async fn enabled_thread_metadata_for_ids(
@@ -1793,6 +1733,63 @@ mod tests {
             .execute(memory_pool(runtime))
             .await
             .expect("age phase2 success beyond cooldown");
+    }
+
+    #[tokio::test]
+    async fn phase2_pagination_keeps_snapshot_when_usage_changes_between_pages() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = StateRuntime::init(temp.path().to_path_buf(), "test-provider".to_string())
+            .await
+            .expect("runtime");
+        let ids = [
+            stable_thread_id("00000000-0000-4000-8000-000000000001"),
+            stable_thread_id("00000000-0000-4000-8000-000000000002"),
+            stable_thread_id("00000000-0000-4000-8000-000000000003"),
+        ];
+        for id in ids {
+            runtime
+                .upsert_thread(&test_thread_metadata(
+                    temp.path(),
+                    id,
+                    temp.path().to_path_buf(),
+                ))
+                .await
+                .expect("thread");
+            sqlx::query("INSERT INTO stage1_outputs (thread_id, source_updated_at, raw_memory, rollout_summary, generated_at) VALUES (?, ?, 'memory', 'summary', ?)")
+                .bind(id.to_string()).bind(Utc::now().timestamp()).bind(Utc::now().timestamp()).execute(memory_pool(&runtime)).await.expect("memory output");
+        }
+        runtime
+            .set_thread_memory_mode(ids[2], "polluted")
+            .await
+            .expect("exclude first candidate");
+        let barrier = tokio::sync::Barrier::new(2);
+        let (selection, ()) = tokio::join!(
+            runtime
+                .memories
+                .get_phase2_input_selection_inner(2, 30, Some(&barrier)),
+            async {
+                barrier.wait().await;
+                assert_eq!(
+                    runtime
+                        .memories
+                        .record_stage1_output_usage(&[ids[0]])
+                        .await
+                        .expect("rerank between pages"),
+                    1
+                );
+                barrier.wait().await;
+            },
+        );
+        assert_eq!(
+            selection
+                .expect("selection")
+                .0
+                .into_iter()
+                .map(|output| output.thread_id)
+                .collect::<Vec<_>>(),
+            vec![ids[0], ids[1]]
+        );
+        runtime.close().await;
     }
 
     #[tokio::test]

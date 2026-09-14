@@ -231,14 +231,12 @@ impl ChatComposer {
     }
 
     fn history_search_in_direction(&mut self, direction: HistorySearchDirection) -> InputResult {
-        let Some((query, original_draft)) = self
-            .history_search
-            .as_ref()
-            .map(|search| (search.query.clone(), search.original_draft.clone()))
-        else {
+        let Some(search) = self.history_search.as_ref() else {
             return InputResult::None;
         };
+        let query = search.query.clone();
         if query.is_empty() {
+            let original_draft = search.original_draft.clone();
             self.history.reset_search();
             if let Some(search) = self.history_search.as_mut() {
                 search.status = HistorySearchStatus::Idle;
@@ -257,23 +255,19 @@ impl ChatComposer {
     }
 
     fn update_history_search_query(&mut self, query: String) {
-        let Some(original_draft) = self
-            .history_search
-            .as_ref()
-            .map(|search| search.original_draft.clone())
-        else {
+        let Some(search) = self.history_search.as_mut() else {
             return;
         };
-        if let Some(search) = self.history_search.as_mut() {
-            search.query = query.clone();
-            search.status = HistorySearchStatus::Searching;
+        if search.query == query {
+            return;
         }
-        self.restore_draft(original_draft);
+        search.query = query.clone();
+        search.status = HistorySearchStatus::Searching;
         if query.is_empty() {
+            let original_draft = search.original_draft.clone();
+            search.status = HistorySearchStatus::Idle;
             self.history.reset_search();
-            if let Some(search) = self.history_search.as_mut() {
-                search.status = HistorySearchStatus::Idle;
-            }
+            self.restore_draft(original_draft);
             return;
         }
         let result = self.history.search(
@@ -282,6 +276,12 @@ impl ChatComposer {
             /*restart*/ true,
             &self.app_event_tx,
         );
+        if matches!(result, HistorySearchResult::Pending)
+            && let Some(search) = self.history_search.as_ref()
+        {
+            let original_draft = search.original_draft.clone();
+            self.restore_draft(original_draft);
+        }
         self.apply_history_search_result(result);
     }
 
@@ -414,24 +414,20 @@ impl ChatComposer {
 
         let mut ranges = Vec::new();
         let mut search_from = 0;
+        let mut span_index = 0;
         while search_from <= folded.len()
             && let Some(relative_start) = folded[search_from..].find(&query_lower)
         {
             let folded_start = search_from + relative_start;
             let folded_end = folded_start + query_lower.len();
-            if let Some((_, first_original)) = folded_spans.iter().find(|(folded_range, _)| {
-                folded_range.end > folded_start && folded_range.start < folded_end
-            }) {
-                let original_end = folded_spans
-                    .iter()
-                    .rev()
-                    .find(|(folded_range, _)| {
-                        folded_range.end > folded_start && folded_range.start < folded_end
-                    })
-                    .map(|(_, original_range)| original_range.end)
-                    .unwrap_or(first_original.end);
-                ranges.push(first_original.start..original_end);
+            while folded_spans[span_index].0.end <= folded_start {
+                span_index += 1;
             }
+            let original_start = folded_spans[span_index].1.start;
+            while folded_spans[span_index].0.end < folded_end {
+                span_index += 1;
+            }
+            ranges.push(original_start..folded_spans[span_index].1.end);
             search_from = folded_end;
         }
         ranges
@@ -573,6 +569,50 @@ mod tests {
             vec![1..3, 4..5]
         );
         assert!(ChatComposer::case_insensitive_match_ranges("git", "").is_empty());
+    }
+
+    #[test]
+    fn history_search_maps_repetitive_unicode_preview_ranges() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let mut composer =
+            ChatComposer::new(true, AppEventSender::new(tx), true, String::new(), true);
+        let text = "aİ".repeat(10_000);
+        composer
+            .history
+            .record_local_submission(HistoryEntry::new(text.clone()));
+        composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        composer.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert_eq!(composer.draft.textarea.text(), text);
+        assert_eq!(
+            composer.history_search_highlight_ranges(),
+            (0..10_000)
+                .map(|index| index * 3 + 1..index * 3 + 3)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn history_search_changed_query_restores_draft_while_pending_and_ignores_cancelled_response() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let mut composer =
+            ChatComposer::new(true, AppEventSender::new(tx), true, String::new(), true);
+        composer.set_text_content("draft".to_string(), Vec::new(), Vec::new());
+        composer.set_history_metadata(codex_protocol::ThreadId::new(), 7, 1);
+        composer
+            .history
+            .record_local_submission(HistoryEntry::new("alpha".to_string()));
+        composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        composer.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(composer.draft.textarea.text(), "alpha");
+        composer.handle_key_event(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert_eq!(composer.draft.textarea.text(), "draft");
+        assert!(matches!(
+            composer.history_search.as_ref().unwrap().status,
+            HistorySearchStatus::Searching
+        ));
+        composer.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!composer.on_history_entry_response(7, 0, Some("az result".to_string())));
+        assert_eq!(composer.draft.textarea.text(), "draft");
     }
 
     #[test]

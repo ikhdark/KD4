@@ -49,43 +49,30 @@ impl DetectedShell {
 }
 
 pub fn powershell_host_kind(path: impl AsRef<std::path::Path>) -> Option<PowerShellHostKind> {
-    match path
-        .as_ref()
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("pwsh") => Some(PowerShellHostKind::Pwsh),
-        Some("powershell") => Some(PowerShellHostKind::WindowsPowerShell),
+    match shell_basename(path.as_ref())?.as_str() {
+        "pwsh" => Some(PowerShellHostKind::Pwsh),
+        "powershell" => Some(PowerShellHostKind::WindowsPowerShell),
         _ => None,
     }
 }
 
+fn shell_basename(path: &std::path::Path) -> Option<String> {
+    let name = path
+        .to_str()?
+        .rsplit(['/', '\\'])
+        .next()?
+        .to_ascii_lowercase();
+    Some(name.strip_suffix(".exe").unwrap_or(&name).to_string())
+}
+
 pub fn detect_shell_type(shell_path: impl AsRef<std::path::Path>) -> Option<ShellType> {
-    let shell_path = shell_path.as_ref();
-    match shell_path
-        .as_os_str()
-        .to_str()
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("zsh") => Some(ShellType::Zsh),
-        Some("bash") => Some(ShellType::Bash),
-        Some("sh") => Some(ShellType::Sh),
-        Some("cmd") => Some(ShellType::Cmd),
-        Some("pwsh") => Some(ShellType::PowerShell),
-        Some("powershell") => Some(ShellType::PowerShell),
-        _ => {
-            let shell_name = shell_path.file_stem();
-            if let Some(shell_name) = shell_name {
-                let shell_name_path = std::path::Path::new(shell_name);
-                if shell_name_path != shell_path {
-                    return detect_shell_type(shell_name_path);
-                }
-            }
-            None
-        }
+    match shell_basename(shell_path.as_ref())?.as_str() {
+        "zsh" => Some(ShellType::Zsh),
+        "bash" => Some(ShellType::Bash),
+        "sh" => Some(ShellType::Sh),
+        "cmd" => Some(ShellType::Cmd),
+        "pwsh" | "powershell" => Some(ShellType::PowerShell),
+        _ => None,
     }
 }
 
@@ -223,6 +210,23 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use std::cell::Cell;
+
+    #[test]
+    fn review_regression_shell_suffix_is_explicit_and_shared() {
+        for name in [
+            "pwsh.backup",
+            "pwsh.exe.old",
+            "bash.backup.exe",
+            "pwsh.exe.exe",
+        ] {
+            assert_eq!(detect_shell_type(name), None);
+            assert_eq!(powershell_host_kind(name), None);
+        }
+        for name in ["pwsh", "PWSH.EXE", r"C:\Tools\pwsh.exe"] {
+            assert_eq!(detect_shell_type(name), Some(ShellType::PowerShell));
+            assert_eq!(powershell_host_kind(name), Some(PowerShellHostKind::Pwsh));
+        }
+    }
 
     #[test]
     fn test_detect_shell_type() {

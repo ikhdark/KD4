@@ -195,7 +195,7 @@ mod tests {
                 assert!(tokio::time::timeout(Duration::from_millis(20), &mut handoff).await.is_err());
                 assert_eq!(input_mode() & VT_INPUT, 0, "TUI input mode restored before events resume");
                 drop(broker_guard);
-                assert_eq!(tokio::time::timeout(Duration::from_secs(2), &mut handoff).await.expect("handoff resumes"), "completed");
+                assert_eq!(tokio::time::timeout(Duration::from_secs(2), &mut handoff).await.expect("handoff resumes").expect("terminal modes restored"), "completed");
                 // The same consumer must receive a real native input record after resume.
                 let record = INPUT_RECORD {
                     EventType: KEY_EVENT as u16,
@@ -379,7 +379,10 @@ pub fn set_modes() -> Result<()> {
 
     execute!(stdout(), EnableBracketedPaste)?;
 
-    enable_raw_mode()?;
+    if let Err(err) = enable_raw_mode() {
+        let _ = execute!(stdout(), DisableBracketedPaste);
+        return Err(err);
+    }
 
     if let Err(err) = windows_console::set_input_record_mode() {
         let _ = disable_raw_mode();
@@ -548,7 +551,11 @@ pub(crate) fn init() -> Result<InitializedTerminal> {
 
     probe_windows_default_colors();
 
-    let tui = CustomTerminal::with_options_and_cursor_position(backend, cursor_pos)?;
+    let tui = CustomTerminal::with_options_and_cursor_position(backend, cursor_pos).inspect_err(
+        |_| {
+            let _ = restore_after_exit();
+        },
+    )?;
     Ok(InitializedTerminal {
         terminal: tui,
         enhanced_keys_supported,
@@ -725,7 +732,7 @@ impl Tui {
     /// This pauses crossterm's stdin polling by dropping the underlying event stream, restores
     /// terminal modes while keeping raw mode enabled, then re-applies Codex TUI modes before
     /// resuming events.
-    pub async fn with_restored<R, F, Fut>(&mut self, f: F) -> R
+    pub async fn with_restored<R, F, Fut>(&mut self, f: F) -> Result<R>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = R>,
@@ -734,14 +741,12 @@ impl Tui {
         let broker = Arc::clone(&self.event_broker);
         tokio::task::spawn_blocking(move || broker.pause_events())
             .await
-            .expect("terminal input pause worker panicked");
+            .map_err(std::io::Error::other)?;
 
         // Leave alt screen if active to avoid conflicts with external program `f`.
         let was_alt_screen = self.is_alt_screen_active();
-        if was_alt_screen {
-            if let Err(err) = self.leave_alt_screen() {
-                tracing::warn!("failed to leave alternate screen before external program: {err}");
-            }
+        if was_alt_screen && let Err(err) = self.leave_alt_screen() {
+            tracing::warn!("failed to leave alternate screen before external program: {err}");
         }
 
         if let Err(err) = tokio::task::spawn_blocking(restore_keep_raw)
@@ -752,27 +757,24 @@ impl Tui {
         }
         let output = f().await;
 
-        tokio::task::spawn_blocking(|| {
-            if let Err(err) = set_modes() {
-                tracing::warn!("failed to re-enable terminal modes after external program: {err}");
-            }
+        tokio::task::spawn_blocking(|| -> Result<()> {
+            set_modes()?;
             // Clear keys buffered while the external program owned the terminal.
             flush_terminal_input_buffer();
+            Ok(())
         })
         .await
-        .expect("terminal mode resume worker panicked");
+        .map_err(std::io::Error::other)??;
 
         if was_alt_screen {
-            if let Err(err) = self.enter_alt_screen() {
-                tracing::warn!("failed to restore alternate screen after external program: {err}");
-            }
+            self.enter_alt_screen()?;
         }
 
         let broker = Arc::clone(&self.event_broker);
         tokio::task::spawn_blocking(move || broker.resume_events())
             .await
-            .expect("terminal input resume worker panicked");
-        output
+            .map_err(std::io::Error::other)?;
+        Ok(output)
     }
 
     /// Emit a desktop notification now if the terminal is unfocused.
@@ -815,7 +817,7 @@ impl Tui {
     /// Enter alternate screen and expand the viewport to full terminal size, saving the current
     /// inline viewport for restoration when leaving.
     pub fn enter_alt_screen(&mut self) -> Result<()> {
-        if !self.alt_screen_enabled {
+        if !self.alt_screen_enabled || self.is_alt_screen_active() {
             return Ok(());
         }
         let size = self.terminal.size()?;
@@ -845,7 +847,7 @@ impl Tui {
 
     /// Leave alternate screen and restore the previously saved inline viewport, if any.
     pub fn leave_alt_screen(&mut self) -> Result<()> {
-        if !self.alt_screen_enabled {
+        if !self.is_alt_screen_active() {
             return Ok(());
         }
         // Disable alternate scroll when leaving alt-screen

@@ -4,6 +4,7 @@
 //! context (for example, the unified-exec background-process summary). Keeping
 //! these pieces on one line avoids vertical layout churn in the bottom pane.
 
+use std::cell::RefCell;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -48,6 +49,7 @@ pub(crate) struct StatusIndicatorWidget {
     header: String,
     details: Option<String>,
     details_max_lines: usize,
+    details_layout: RefCell<Option<(u16, Vec<Line<'static>>)>>,
     /// Optional suffix rendered after the elapsed/interrupt segment.
     inline_message: Option<String>,
     show_interrupt_hint: bool,
@@ -88,6 +90,7 @@ impl StatusIndicatorWidget {
             header: String::from("Working"),
             details: None,
             details_max_lines: STATUS_DETAILS_DEFAULT_MAX_LINES,
+            details_layout: RefCell::new(None),
             inline_message: None,
             show_interrupt_hint: true,
             interrupt_binding: Some(key_hint::plain(KeyCode::Esc)),
@@ -118,6 +121,7 @@ impl StatusIndicatorWidget {
         capitalization: StatusDetailsCapitalization,
         max_lines: usize,
     ) {
+        self.details_layout.get_mut().take();
         self.details_max_lines = max_lines.max(1);
         self.details = details
             .filter(|details| !details.is_empty())
@@ -202,6 +206,17 @@ impl StatusIndicatorWidget {
 
     /// Wrap the details text into a fixed width and return the lines, truncating if necessary.
     fn wrapped_details_lines(&self, width: u16) -> Vec<Line<'static>> {
+        if let Some((cached_width, lines)) = self.details_layout.borrow().as_ref()
+            && *cached_width == width
+        {
+            return lines.clone();
+        }
+        let lines = self.compute_details_lines(width);
+        self.details_layout.replace(Some((width, lines.clone())));
+        lines
+    }
+
+    fn compute_details_lines(&self, width: u16) -> Vec<Line<'static>> {
         let Some(details) = self.details.as_deref() else {
             return Vec::new();
         };
@@ -215,7 +230,26 @@ impl StatusIndicatorWidget {
             .subsequent_indent(Line::from(Span::from(" ".repeat(prefix_width)).dim()))
             .break_words(/*break_words*/ true);
 
-        let mut out = word_wrap_lines(details.lines().map(|line| vec![line.dim()]), opts);
+        let mut out = Vec::new();
+        for (index, line) in details.lines().enumerate() {
+            let options = if index == 0 {
+                opts.clone()
+            } else {
+                opts.clone().initial_indent(opts.subsequent_indent.clone())
+            };
+            out.extend(
+                word_wrap_lines([vec![line.dim()]], options)
+                    .into_iter()
+                    .take(
+                        self.details_max_lines
+                            .saturating_add(1)
+                            .saturating_sub(out.len()),
+                    ),
+            );
+            if out.len() > self.details_max_lines {
+                break;
+            }
+        }
 
         if out.len() > self.details_max_lines {
             out.truncate(self.details_max_lines);
@@ -242,13 +276,18 @@ impl Renderable for StatusIndicatorWidget {
             return;
         }
 
+        let now = Instant::now();
+        let elapsed_duration = self.elapsed_duration_at(now);
         if self.animations_enabled {
             // Schedule next animation frame.
             self.frame_requester
                 .schedule_frame_in(Duration::from_millis(32));
+        } else if !self.is_paused {
+            self.frame_requester.schedule_frame_in(
+                Duration::from_secs(1)
+                    - Duration::from_nanos(u64::from(elapsed_duration.subsec_nanos())),
+            );
         }
-        let now = Instant::now();
-        let elapsed_duration = self.elapsed_duration_at(now);
         let pretty_elapsed = fmt_elapsed_compact(elapsed_duration.as_secs());
         let motion_mode = MotionMode::from_animations_enabled(self.animations_enabled);
 
@@ -311,6 +350,42 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn details_layout_updates_after_width_text_and_line_limit_changes() {
+        let (tx, _rx) = unbounded_channel();
+        let mut widget = StatusIndicatorWidget::new(
+            AppEventSender::new(tx),
+            FrameRequester::test_dummy(),
+            false,
+        );
+        widget.update_details(
+            Some("one two three four".to_string()),
+            StatusDetailsCapitalization::Preserve,
+            3,
+        );
+        let wide = widget.wrapped_details_lines(40);
+        assert_eq!(
+            wide.iter().map(Line::to_string).collect::<Vec<_>>(),
+            vec!["  └ one two three four"]
+        );
+        assert!(widget.wrapped_details_lines(12).len() > 1);
+        widget.update_details(
+            Some("changed\nsecond\nthird".to_string()),
+            StatusDetailsCapitalization::Preserve,
+            1,
+        );
+        assert_eq!(
+            widget
+                .wrapped_details_lines(40)
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>(),
+            vec!["  └ changed…"]
+        );
+        widget.update_details(None, StatusDetailsCapitalization::Preserve, 3);
+        assert!(widget.wrapped_details_lines(40).is_empty());
+    }
 
     #[test]
     fn fmt_elapsed_compact_formats_seconds_minutes_hours() {

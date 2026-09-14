@@ -349,7 +349,9 @@ impl SandboxMode {
         }
     }
 
-    /// Projects the canonical permission profile onto the legacy app-server sandbox field.
+    /// Produces a lossy classification for the legacy app-server sandbox field.
+    /// The canonical permission profile remains authoritative for authorization;
+    /// this label does not capture all filesystem grants, denials, or network restrictions.
     ///
     /// `None` means the profile cannot be represented by the legacy field. Callers should send
     /// the richer permissions selection when one is available.

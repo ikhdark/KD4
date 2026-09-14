@@ -181,7 +181,7 @@ fn managed_job_terminates_root() -> anyhow::Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut child = command.spawn()?;
+    let mut child = KillOnDrop(command.spawn()?);
     managed.attach(child.id())?;
     let process =
         unsafe { BorrowedHandle::borrow_raw(child.as_raw_handle()) }.try_clone_to_owned()?;
@@ -192,6 +192,10 @@ fn managed_job_terminates_root() -> anyhow::Result<()> {
 
     terminator.kill()?;
 
+    assert_eq!(
+        unsafe { WaitForSingleObject(child.as_raw_handle() as _, 5_000) },
+        WAIT_OBJECT_0
+    );
     assert!(!child.wait()?.success());
     Ok(())
 }
@@ -216,9 +220,21 @@ async fn managed_job_terminates_child_and_grandchild() -> anyhow::Result<()> {
         ..
     } = spawned;
 
-    let output = tokio::time::timeout(Duration::from_secs(10), stdout_rx.recv())
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("managed root closed stdout before reporting child pid"))?;
+    let output = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut line = Vec::new();
+        loop {
+            let chunk = stdout_rx
+                .recv()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("root closed stdout before reporting child pid"))?;
+            line.extend(chunk);
+            if let Some(newline) = line.iter().position(|byte| *byte == b'\n') {
+                line.truncate(newline);
+                return Ok::<_, anyhow::Error>(line);
+            }
+        }
+    })
+    .await??;
     let grandchild_pid = std::str::from_utf8(&output)?.trim().parse::<u32>()?;
 
     let raw = unsafe {
@@ -276,7 +292,7 @@ async fn suspended_root_waits_for_job_assignment_before_running() -> anyhow::Res
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .creation_flags(WINDOWS_CREATE_SUSPENDED);
-    let mut child = command.spawn()?;
+    let mut child = KillOnDrop(command.spawn()?);
 
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(
@@ -285,6 +301,11 @@ async fn suspended_root_waits_for_job_assignment_before_running() -> anyhow::Res
     );
 
     managed.attach_and_resume(child.id())?;
+    assert_eq!(
+        unsafe { WaitForSingleObject(child.as_raw_handle() as _, 10_000) },
+        WAIT_OBJECT_0,
+        "resumed root did not exit within ten seconds"
+    );
     let status = child.wait()?;
     assert!(status.success());
     assert!(marker.exists(), "child did not run after it was resumed");
@@ -302,4 +323,83 @@ async fn windows_process_spawn_timeout_does_not_block_async_runtime() {
     .expect_err("the blocking spawn operation should time out");
 
     assert_eq!(error.kind(), ErrorKind::TimedOut);
+}
+
+struct KillOnDrop(std::process::Child);
+impl std::ops::Deref for KillOnDrop {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for KillOnDrop {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        // Bound cleanup even when a native failure caused the test to unwind.
+        unsafe {
+            WaitForSingleObject(self.0.as_raw_handle() as _, 5_000);
+        }
+        let _ = self.0.try_wait();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn canceled_public_setup_retains_admission_until_native_child_is_reaped() -> anyhow::Result<()>
+{
+    let held = (0..511)
+        .map(|_| ManagedRootProcess::reserve())
+        .collect::<io::Result<Vec<_>>>()?;
+    let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    TEST_DUPLICATE_PROCESS_HANDLE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |raw| {
+            let process = unsafe { BorrowedHandle::borrow_raw(raw) }.try_clone_to_owned()?;
+            let observer = process.try_clone()?;
+            let _ = observed_tx.send(observer);
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(io::Error::other)?;
+            Ok(process)
+        }));
+    });
+    let env = std::env::vars().collect();
+    let cwd = std::env::current_dir()?;
+    let args = ["/D".into(), "/Q".into(), "/K".into()];
+    let mut pending = Box::pin(spawn_process("cmd.exe", &args, &cwd, &env, &None));
+    let process = tokio::select! {
+        result = &mut pending => panic!("setup returned before native work was released: {result:?}"),
+        process = observed_rx => process?,
+    };
+    drop(pending);
+    assert_eq!(
+        unsafe { WaitForSingleObject(process.as_raw_handle() as _, 0) },
+        WAIT_TIMEOUT
+    );
+    assert!(
+        ManagedRootProcess::reserve().is_err(),
+        "cancellation released live admission"
+    );
+    release_tx.send(())?;
+    let admitted = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(root) = ManagedRootProcess::reserve() {
+                break root;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    assert_eq!(
+        unsafe { WaitForSingleObject(process.as_raw_handle() as _, 0) },
+        WAIT_OBJECT_0,
+        "admission was released before the native child exited"
+    );
+    drop(admitted);
+    drop(held);
+    Ok(())
 }

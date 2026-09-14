@@ -926,40 +926,37 @@ def verify_fixture(
         agent's own `--timeout-seconds` has already been enforced, so nothing
         else would ever recover it.
         """
-        process = spawn_owned_process(
-            command,
-            cwd=root,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=env,
-        )
-        try:
-            stdout, stderr = process.communicate(timeout=VERIFIER_TIMEOUT_SECONDS)
-            return subprocess.CompletedProcess(
+        with (
+            tempfile.TemporaryFile() as stdout_file,
+            tempfile.TemporaryFile() as stderr_file,
+        ):
+            process = spawn_owned_process(
                 command,
-                process.returncode,
-                stdout,
-                stderr,
+                cwd=root,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                env=env,
             )
-        except subprocess.TimeoutExpired:
-            failures.append(
-                f"{label} did not finish within {VERIFIER_TIMEOUT_SECONDS}s"
-            )
-            return None
-        finally:
-            # `communicate()` kills only its direct child on timeout. A verifier
-            # can import agent-authored code that spawns a descendant holding the
-            # captured pipes, so sweep the entire isolated process tree on every
-            # exit path.
-            terminate_process(process)
             try:
-                process.communicate(timeout=READER_JOIN_TIMEOUT_SECONDS)
+                process.wait(timeout=VERIFIER_TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:
-                pass
+                failures.append(
+                    f"{label} did not finish within {VERIFIER_TIMEOUT_SECONDS}s"
+                )
+                return None
+            finally:
+                terminate_process(process)
+            tails = []
+            for capture in (stdout_file, stderr_file):
+                capture.seek(0, os.SEEK_END)
+                capture.seek(max(0, capture.tell() - MAX_COMMAND_TEXT_CHARS))
+                tails.append(
+                    capture.read(MAX_COMMAND_TEXT_CHARS).decode(
+                        "utf-8", errors="replace"
+                    )
+                )
+            return subprocess.CompletedProcess(command, process.returncode, *tails)
 
     hidden = _verifier_run("external verifier", ["python", "-I", "-B", "-c", verifier])
     if hidden is not None and hidden.returncode != 0:
@@ -1091,12 +1088,14 @@ def prepare_home(root: Path, auth_source: Path) -> None:
     shutil.copy2(auth_source, root / "auth.json")
 
 
-def bounded_text_lines(stream: Any, max_chars: int):
+def bounded_text_lines(stream: Any, max_chars: int, *, sink: Any = None):
     """Yield logical text lines without ever buffering more than one bounded chunk."""
     while True:
         fragment = stream.readline(max_chars + 1)
         if fragment == "":
             return
+        if sink is not None:
+            sink.write(fragment)
         terminated = fragment.endswith("\n")
         truncated = not terminated and len(fragment) > max_chars
         if truncated:
@@ -1105,6 +1104,8 @@ def bounded_text_lines(stream: Any, max_chars: int):
             # queue row limit and manufacture thousands of invalid JSONL events.
             while True:
                 remainder = stream.readline(max_chars + 1)
+                if sink is not None:
+                    sink.write(remainder)
                 if remainder == "" or remainder.endswith("\n"):
                     break
         yield fragment[:max_chars].rstrip(), truncated
@@ -3324,7 +3325,7 @@ def _run_agent_impl(
             task=task,
             config_overrides=config_overrides,
         )
-        env = os.environ.copy()
+        env = without_git_environment()
         env["CODEX_HOME"] = str(home)
         if artifact_dir is not None:
             artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -3363,11 +3364,11 @@ def _run_agent_impl(
             assert process.stdout
             capture = (artifact_dir / "cli.stdout.jsonl").open("w", encoding="utf-8") if artifact_dir else nullcontext(None)
             with capture as sink:
-                for line in process.stdout:
+                for line, truncated in bounded_text_lines(
+                    process.stdout, MAX_STREAM_LINE_CHARS, sink=sink
+                ):
                     observed_ns = time.perf_counter_ns()
-                    if sink is not None:
-                        sink.write(line)
-                    if len(line.rstrip()) > MAX_STREAM_LINE_CHARS:
+                    if truncated:
                         stdout_truncated_lines += 1
                     stdout_queue.put((observed_ns, line[:MAX_STREAM_LINE_CHARS].rstrip()))
             stdout_queue.put(None)
@@ -3377,10 +3378,10 @@ def _run_agent_impl(
             assert process.stderr
             capture = (artifact_dir / "cli.stderr.log").open("w", encoding="utf-8") if artifact_dir else nullcontext(None)
             with capture as sink:
-                for line in process.stderr:
-                    if sink is not None:
-                        sink.write(line)
-                    if len(line.rstrip()) > MAX_COMMAND_TEXT_CHARS:
+                for line, truncated in bounded_text_lines(
+                    process.stderr, MAX_COMMAND_TEXT_CHARS, sink=sink
+                ):
+                    if truncated:
                         stderr_line_overflow += 1
                     if len(stderr_lines) == MAX_STDERR_LINES:
                         # Preserve the true tail in the bounded report view.
@@ -4790,11 +4791,11 @@ def comparison_latency_explanation(
         upstream_command_ms.get("medianMs")
     ):
         findings.append(
-            "Median harness-observed command execution was only "
+            "Median harness-observed command execution was "
             f"{float(fork_command_ms['medianMs']) / 1000:.3f}s for {fork_label} "
             f"and {float(upstream_command_ms['medianMs']) / 1000:.3f}s for "
-            f"{upstream_label}; command processes themselves do not explain the "
-            "end-to-end gap."
+            f"{upstream_label}. These observations alone do not establish the cause "
+            "of the completion-time difference."
         )
     if fork_internal.get("available") is True:
         ownership = fork_internal.get("exclusiveOwnershipTotalMs", {})
@@ -5358,13 +5359,14 @@ def _gate_for_pairs(
             usable.append((float(candidate_value), float(control_value)))
         candidate_values = [candidate for candidate, _ in usable]
         control_values = [control for _, control in usable]
-        if not usable:
+        if len(usable) < MIN_GATE_REPETITIONS_PER_TASK:
             metric_rows[metric] = {
                 "status": "not_evaluable",
                 "passed": False,
-                "usablePairs": 0,
+                "usablePairs": len(usable),
+                "requiredPairs": MIN_GATE_REPETITIONS_PER_TASK,
                 "maxCandidateToControlRatio": max_ratio,
-                "reason": "no jointly correct, compliant pair reported both values",
+                "reason": "insufficient jointly correct, compliant pairs reported both values",
             }
             continue
         candidate_median = float(statistics.median(candidate_values))
@@ -6091,6 +6093,11 @@ def parse_args() -> argparse.Namespace:
         "--auth-source", type=Path, default=Path.home() / ".codex" / "auth.json"
     )
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--full-json",
+        action="store_true",
+        help="Print complete results as well as writing the report artifact",
+    )
     for role in ("fork", "upstream"):
         parser.add_argument(
             f"--{role}-config",
@@ -6188,7 +6195,13 @@ def main() -> None:
     report = make_report(args)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(report["results"], indent=2), flush=True)
+    results = report["results"]
+    summary = {
+        "report": str(args.output.resolve()),
+        "gatePassed": results["regressionGate"].get("passed"),
+        "gateMode": results["regressionGate"].get("mode"),
+    }
+    print(json.dumps(results if args.full_json else summary, indent=2), flush=True)
     gate = report["results"]["regressionGate"]
     if gate.get("mode") == "enforce" and gate.get("passed") is not True:
         raise SystemExit(1)

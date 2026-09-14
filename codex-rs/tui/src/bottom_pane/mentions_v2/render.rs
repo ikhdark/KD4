@@ -7,6 +7,7 @@ use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Widget;
+use unicode_width::UnicodeWidthStr;
 
 use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
 use crate::style::accent_style;
@@ -95,7 +96,8 @@ fn render_rows(
         .take(visible_items)
         .map(primary_text_width)
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .min(usize::from(area.width));
     for (idx, row) in rows.iter().enumerate().skip(start_idx).take(visible_items) {
         if cur_y >= area.y + area.height {
             break;
@@ -131,7 +133,13 @@ fn build_line(
     let content_width =
         width.saturating_sub(gutter_width.saturating_add(tag_width).saturating_add(2));
     let content = truncate_line_with_ellipsis_if_overflow(
-        content_line(row, base_style, dim_style, primary_column_width),
+        content_line(
+            row,
+            base_style,
+            dim_style,
+            primary_column_width.min(content_width),
+            content_width,
+        ),
         content_width,
     );
     let rendered_content_width = content.width();
@@ -159,13 +167,15 @@ fn content_line(
     base_style: Style,
     dim_style: Style,
     primary_column_width: usize,
+    content_width: usize,
 ) -> Line<'static> {
     let mut spans = Vec::new();
     spans.extend(primary_spans(row, base_style));
     if let Some(secondary) = secondary_line(row, base_style, dim_style) {
         let padding = primary_column_width
             .saturating_sub(primary_text_width(row))
-            .saturating_add(2);
+            .saturating_add(2)
+            .min(content_width);
         spans.push(" ".repeat(padding).set_style(dim_style));
         spans.extend(secondary.spans);
     }
@@ -180,10 +190,31 @@ fn primary_spans(row: &SearchResult, base_style: Style) -> Vec<Span<'static>> {
         } else {
             base_style
         };
+        if let Some(indices) = row.match_indices.as_ref() {
+            let start = file_name_start(row);
+            let mut indices = indices
+                .iter()
+                .copied()
+                .filter(|index| *index >= start)
+                .peekable();
+            return file_name
+                .chars()
+                .enumerate()
+                .map(|(index, ch)| {
+                    let style = if indices.peek() == Some(&(start + index)) {
+                        indices.next();
+                        style.bold()
+                    } else {
+                        style
+                    };
+                    ch.to_string().set_style(style)
+                })
+                .collect();
+        }
         return vec![file_name.to_string().set_style(style)];
     }
 
-    let mut spans = Vec::with_capacity(row.display_name.len());
+    let mut spans = Vec::new();
     let name_style = match row.mention_type {
         MentionType::Plugin => base_style.magenta(),
         MentionType::Skill => base_style.dim(),
@@ -231,7 +262,7 @@ fn secondary_line(
 }
 
 fn path_spans(row: &SearchResult, base_style: Style) -> Vec<Span<'static>> {
-    let mut spans = Vec::with_capacity(row.display_name.len());
+    let mut spans = Vec::new();
     let file_name_start = file_name_start(row);
     let path_style = base_style.dim();
     if file_name_start == 0 {
@@ -265,9 +296,7 @@ fn path_spans(row: &SearchResult, base_style: Style) -> Vec<Span<'static>> {
 }
 
 fn primary_text_width(row: &SearchResult) -> usize {
-    file_name(row)
-        .map(|file_name| file_name.chars().count())
-        .unwrap_or_else(|| row.display_name.chars().count())
+    file_name(row).unwrap_or(&row.display_name).width()
 }
 
 fn file_name(row: &SearchResult) -> Option<&str> {
@@ -296,5 +325,82 @@ fn file_name_start(row: &SearchResult) -> usize {
             .map(|idx| row.display_name[..idx + 1].chars().count())
             .unwrap_or(0),
         Selection::File(_) | Selection::Tool { .. } => usize::MAX,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use ratatui::style::Modifier;
+    use std::path::PathBuf;
+
+    fn row(name: &str) -> SearchResult {
+        SearchResult {
+            display_name: name.to_string(),
+            description: Some("description".to_string()),
+            mention_type: MentionType::Plugin,
+            selection: Selection::Tool {
+                insert_text: name.to_string(),
+                path: None,
+            },
+            match_indices: None,
+            score: 0,
+        }
+    }
+
+    #[test]
+    fn popup_aligns_descriptions_using_terminal_columns() {
+        let area = Rect::new(0, 0, 40, 2);
+        let mut buf = Buffer::empty(area);
+        render_popup(
+            area,
+            &mut buf,
+            &[row("界"), row("abcd")],
+            &ScrollState::new(),
+            "no matches",
+            SearchMode::Results,
+        );
+        assert_eq!(buf[(8, 0)].symbol(), "d");
+        assert_eq!(buf[(8, 1)].symbol(), "d");
+    }
+
+    #[test]
+    fn popup_keeps_description_gap_for_short_names() {
+        let area = Rect::new(0, 0, 40, 1);
+        let mut buf = Buffer::empty(area);
+        render_popup(
+            area,
+            &mut buf,
+            &[row("x")],
+            &ScrollState::new(),
+            "no matches",
+            SearchMode::Results,
+        );
+        assert_eq!(buf[(3, 0)].symbol(), " ");
+        assert_eq!(buf[(4, 0)].symbol(), " ");
+        assert_eq!(buf[(5, 0)].symbol(), "d");
+    }
+
+    #[test]
+    fn popup_highlights_filename_matches_after_unicode_directory() {
+        let mut file = row("目录/main.rs");
+        file.mention_type = MentionType::File;
+        file.selection = Selection::File(PathBuf::from("目录/main.rs"));
+        file.match_indices = Some(vec![0, 3, 4]);
+        let area = Rect::new(0, 0, 40, 1);
+        let mut buf = Buffer::empty(area);
+        render_popup(
+            area,
+            &mut buf,
+            &[file],
+            &ScrollState::new(),
+            "no matches",
+            SearchMode::Results,
+        );
+        assert_eq!(buf[(2, 0)].symbol(), "m");
+        assert!(buf[(2, 0)].style().add_modifier.contains(Modifier::BOLD));
+        assert!(buf[(3, 0)].style().add_modifier.contains(Modifier::BOLD));
+        assert!(!buf[(4, 0)].style().add_modifier.contains(Modifier::BOLD));
     }
 }

@@ -12,15 +12,18 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use toml::Value;
 
 pub(crate) const TEST_CURATED_PLUGIN_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
-pub(crate) const TEST_CURATED_PLUGIN_CACHE_VERSION: &str = "01234567";
+pub(crate) const TEST_CURATED_PLUGIN_CACHE_VERSION: &str =
+    "0123456789abcdef0123456789abcdef01234567";
 
 /// Denies metadata access within one test-owned directory, restoring its ACL even
 /// when a behavior assertion unwinds. Never apply this guard outside a fixture.
+#[cfg(windows)]
 pub(crate) struct DeniedMetadata {
     path: std::path::PathBuf,
     active: bool,
 }
 
+#[cfg(windows)]
 impl DeniedMetadata {
     pub(crate) fn new(fixture: &tempfile::TempDir, path: &Path) -> Self {
         let target = path.canonicalize().expect("canonical fixture directory");
@@ -65,6 +68,7 @@ impl DeniedMetadata {
     }
 }
 
+#[cfg(windows)]
 impl Drop for DeniedMetadata {
     fn drop(&mut self) {
         if self.active

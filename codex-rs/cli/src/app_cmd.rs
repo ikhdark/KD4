@@ -13,6 +13,7 @@ pub struct AppCommand {
 }
 
 pub async fn run_app(cmd: AppCommand) -> anyhow::Result<()> {
-    let workspace = std::fs::canonicalize(&cmd.path).unwrap_or(cmd.path);
+    let path = std::path::absolute(&cmd.path)?;
+    let workspace = std::fs::canonicalize(&path).unwrap_or(path);
     crate::desktop_app::run_app_open_or_install(workspace, cmd.download_url_override).await
 }

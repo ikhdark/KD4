@@ -38,7 +38,7 @@ impl SessionLogger {
         }
     }
 
-    async fn open(&self, path: PathBuf) -> std::io::Result<()> {
+    async fn open(&self, path: PathBuf, create_new: bool) -> std::io::Result<()> {
         if self.is_enabled() {
             return Ok(());
         }
@@ -48,7 +48,8 @@ impl SessionLogger {
             }
             let file = OpenOptions::new()
                 .create(true)
-                .truncate(true)
+                .create_new(create_new)
+                .truncate(!create_new)
                 .write(true)
                 .open(path)?;
             let (sender, receiver) = mpsc::sync_channel(SESSION_LOG_QUEUE_CAPACITY);
@@ -131,19 +132,20 @@ pub(crate) async fn maybe_init(config: &Config) {
         return;
     }
 
-    let path = if let Ok(path) = std::env::var("CODEX_TUI_SESSION_LOG_PATH") {
-        PathBuf::from(path)
+    let (path, create_new) = if let Ok(path) = std::env::var("CODEX_TUI_SESSION_LOG_PATH") {
+        (PathBuf::from(path), false)
     } else {
         let mut p = config.log_dir.clone();
         let filename = format!(
-            "session-{}.jsonl",
-            chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+            "session-{}-{}.jsonl",
+            chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
+            uuid::Uuid::new_v4()
         );
         p.push(filename);
-        p
+        (p, true)
     };
 
-    if let Err(e) = LOGGER.open(path.clone()).await {
+    if let Err(e) = LOGGER.open(path.clone(), create_new).await {
         tracing::error!("failed to open session log {:?}: {}", path, e);
         return;
     }
@@ -167,68 +169,65 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
         return;
     }
 
+    LOGGER.write_json_line(inbound_app_event_record(event));
+}
+
+fn inbound_app_event_record(event: &AppEvent) -> serde_json::Value {
     match event {
         AppEvent::NewSession => {
-            let value = json!({
+            json!({
                 "ts": now_ts(),
                 "dir": "to_tui",
                 "kind": "new_session",
-            });
-            LOGGER.write_json_line(value);
+            })
         }
         AppEvent::ClearUi => {
-            let value = json!({
+            json!({
                 "ts": now_ts(),
                 "dir": "to_tui",
                 "kind": "clear_ui",
-            });
-            LOGGER.write_json_line(value);
+            })
         }
-        AppEvent::InsertHistoryCell(cell) => {
-            let value = json!({
+        AppEvent::InsertHistoryCell(_) => {
+            json!({
                 "ts": now_ts(),
                 "dir": "to_tui",
                 "kind": "insert_history_cell",
-                "lines": cell.transcript_lines(u16::MAX).len(),
-            });
-            LOGGER.write_json_line(value);
+            })
         }
         AppEvent::StartFileSearch(query) => {
-            let value = json!({
+            json!({
                 "ts": now_ts(),
                 "dir": "to_tui",
                 "kind": "file_search_start",
                 "query": query,
-            });
-            LOGGER.write_json_line(value);
+            })
         }
         AppEvent::FileSearchResult { query, matches } => {
-            let value = json!({
+            json!({
                 "ts": now_ts(),
                 "dir": "to_tui",
                 "kind": "file_search_result",
                 "query": query,
                 "matches": matches.len(),
-            });
-            LOGGER.write_json_line(value);
+            })
         }
         AppEvent::PetPreviewLoaded { request_id, result } => {
-            let value = json!({
+            json!({
                 "ts": now_ts(),
                 "dir": "to_tui",
                 "kind": "app_event",
                 "variant": "PetPreviewLoaded",
                 "request_id": request_id,
                 "ok": result.is_ok(),
-            });
-            LOGGER.write_json_line(value);
+            })
         }
         AppEvent::PetSelectionLoaded {
             request_id,
             pet_id,
             result,
         } => {
-            let value = json!({
+            json!({
                 "ts": now_ts(),
                 "dir": "to_tui",
                 "kind": "app_event",
@@ -236,27 +235,24 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
                 "request_id": request_id,
                 "pet_id": pet_id,
                 "ok": result.is_ok(),
-            });
-            LOGGER.write_json_line(value);
+            })
         }
         AppEvent::CodexOp(AppCommand::BugCreate { .. }) => {
-            let value = json!({
+            json!({
                 "ts": now_ts(),
                 "dir": "to_tui",
                 "kind": "app_event",
                 "variant": "BugCreate",
-            });
-            LOGGER.write_json_line(value);
+            })
         }
         // Noise or control flow – record variant only
         other => {
-            let value = json!({
+            json!({
                 "ts": now_ts(),
                 "dir": "to_tui",
                 "kind": "app_event",
-                "variant": format!("{other:?}").split('(').next().unwrap_or("app_event"),
-            });
-            LOGGER.write_json_line(value);
+                "variant": <&'static str>::from(other),
+            })
         }
     }
 }
@@ -310,12 +306,53 @@ where
 mod tests {
     use super::*;
 
+    #[test]
+    fn fallback_event_logs_only_the_variant() {
+        let record = inbound_app_event_record(&AppEvent::ClearUiAndSubmitUserMessage {
+            text: "private prompt".to_string(),
+        });
+        assert_eq!(record["variant"], "ClearUiAndSubmitUserMessage");
+        assert_eq!(record.as_object().unwrap().len(), 4);
+        assert!(!record.to_string().contains("private prompt"));
+    }
+
+    #[test]
+    fn history_cell_logging_does_not_render_the_transcript() {
+        #[derive(Debug)]
+        struct UnrenderableCell;
+        impl crate::history_cell::HistoryCell for UnrenderableCell {
+            fn raw_lines(&self) -> Vec<ratatui::text::Line<'static>> {
+                panic!("logging must not render raw history");
+            }
+
+            fn display_lines(&self, _width: u16) -> Vec<ratatui::text::Line<'static>> {
+                panic!("logging must not render history");
+            }
+        }
+        let record =
+            inbound_app_event_record(&AppEvent::InsertHistoryCell(Box::new(UnrenderableCell)));
+        assert_eq!(record["kind"], "insert_history_cell");
+        assert_eq!(record.as_object().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn automatically_named_logs_never_truncate_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, b"existing session").unwrap();
+        let logger = SessionLogger::new();
+        let error = logger.open(path.clone(), true).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(!logger.is_enabled());
+        assert_eq!(std::fs::read(path).unwrap(), b"existing session");
+    }
+
     #[tokio::test]
     async fn session_logger_shutdown_drains_records_in_order() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("nested/session.jsonl");
         let logger = SessionLogger::new();
-        logger.open(path.clone()).await.unwrap();
+        logger.open(path.clone(), false).await.unwrap();
         // Exceed the queue capacity to cover lossless backpressure as well as
         // escaping and the final records still queued when shutdown starts.
         for sequence in 0..(SESSION_LOG_QUEUE_CAPACITY * 2 + 1) {
@@ -343,7 +380,12 @@ mod tests {
         let occupied = directory.path().join("occupied");
         std::fs::write(&occupied, "keep existing file").unwrap();
         let logger = SessionLogger::new();
-        assert!(logger.open(occupied.join("session.jsonl")).await.is_err());
+        assert!(
+            logger
+                .open(occupied.join("session.jsonl"), false)
+                .await
+                .is_err()
+        );
         assert!(!logger.is_enabled());
         logger.write_json_line(json!({"not_recorded": true}));
         logger.shutdown().await.unwrap();

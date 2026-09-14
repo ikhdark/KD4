@@ -50,6 +50,13 @@ async fn run_probe() -> Result<(), String> {
     let proxy_url = env::var(PROBE_PROXY_ENV).ok();
     let target_url = env::var(PROBE_URL_ENV).ok();
     if let Ok(explicit_ca_path) = env::var(PROBE_EXCLUSIVE_CA_ENV) {
+        for unsupported in [PROBE_PROXY_ENV, PROBE_TLS13_ENV] {
+            if env::var_os(unsupported).is_some() {
+                return Err(format!(
+                    "{PROBE_EXCLUSIVE_CA_ENV} cannot be combined with {unsupported}"
+                ));
+            }
+        }
         let explicit_ca = fs::read(&explicit_ca_path).map_err(|error| {
             format!("failed to read explicit CA file {explicit_ca_path}: {error}")
         })?;

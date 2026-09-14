@@ -85,7 +85,7 @@ impl ChatWidget {
         );
         match session.collaboration_mode.as_deref() {
             Some(collaboration_mode) => {
-                self.set_effective_collaboration_mode(collaboration_mode.clone());
+                self.apply_effective_collaboration_mode(collaboration_mode.clone());
             }
             None => {
                 self.active_collaboration_mask = Self::initial_collaboration_mask(
@@ -100,9 +100,7 @@ impl ChatWidget {
                 self.refresh_plan_mode_nudge();
             }
         }
-        self.refresh_model_display();
-        self.refresh_status_surfaces();
-        self.sync_service_tier_commands();
+        self.refresh_model_dependent_surfaces();
         self.sync_personality_command_enabled();
         self.sync_plugins_command_enabled();
         self.sync_goal_command_enabled();
@@ -225,6 +223,10 @@ impl ChatWidget {
     }
 
     pub(super) fn set_skills(&mut self, skills: Option<Vec<SkillMetadata>>) {
+        if skills.is_none() {
+            self.skills_all.clear();
+            self.skills_initial_state = None;
+        }
         self.bottom_pane.set_skills(skills);
     }
 }

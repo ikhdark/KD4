@@ -54,6 +54,24 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
             } => {
                 let body_text = body.unwrap_or_default();
 
+                if let Ok(parsed) = serde_json::from_str::<Value>(&body_text) {
+                    match (
+                        status,
+                        parsed
+                            .get("error")
+                            .and_then(|error| error.get("code"))
+                            .and_then(Value::as_str),
+                    ) {
+                        (http::StatusCode::BAD_REQUEST, Some("context_length_exceeded")) => {
+                            return CodexErr::ContextWindowExceeded;
+                        }
+                        (http::StatusCode::TOO_MANY_REQUESTS, Some("insufficient_quota")) => {
+                            return CodexErr::QuotaExceeded;
+                        }
+                        _ => {}
+                    }
+                }
+
                 if status == http::StatusCode::SERVICE_UNAVAILABLE
                     && let Ok(value) = serde_json::from_str::<serde_json::Value>(&body_text)
                     && matches!(
@@ -169,8 +187,7 @@ const X_ERROR_JSON_HEADER: &str = "x-error-json";
 const CYBER_POLICY_ERROR_CODE: &str = "cyber_policy";
 const CYBER_POLICY_FALLBACK_MESSAGE: &str =
     "This request has been flagged for possible cybersecurity risk.";
-const CLOUDFLARE_BLOCKED_MESSAGE: &str =
-    "Access blocked by Cloudflare. This usually happens when connecting from a restricted region";
+const CLOUDFLARE_BLOCKED_MESSAGE: &str = "Access blocked by Cloudflare";
 
 #[cfg(test)]
 #[path = "api_bridge_tests.rs"]
@@ -181,7 +198,7 @@ fn extract_request_tracking_id(headers: Option<&HeaderMap>) -> Option<String> {
 }
 
 fn api_error_user_message(status: http::StatusCode, body: &str) -> Option<String> {
-    if is_cloudflare_region_block(status, body) {
+    if is_cloudflare_access_block(status, body) {
         Some(format!("{CLOUDFLARE_BLOCKED_MESSAGE} (status {status})"))
     } else {
         None
@@ -189,14 +206,10 @@ fn api_error_user_message(status: http::StatusCode, body: &str) -> Option<String
 }
 
 fn map_unexpected_response(error: UnexpectedResponseError) -> CodexErr {
-    if is_cloudflare_region_block(error.status, &error.body) {
-        CodexErr::RegionRestricted(error)
-    } else {
-        CodexErr::UnexpectedStatus(error)
-    }
+    CodexErr::UnexpectedStatus(error)
 }
 
-fn is_cloudflare_region_block(status: http::StatusCode, body: &str) -> bool {
+fn is_cloudflare_access_block(status: http::StatusCode, body: &str) -> bool {
     status == http::StatusCode::FORBIDDEN && body.contains("Cloudflare") && body.contains("blocked")
 }
 

@@ -72,7 +72,6 @@ mod tests {
     use crate::common::RawMemoryMetadata;
     use crate::provider::RetryConfig;
     use codex_client::Request;
-    use codex_client::RequestBody;
     use codex_client::Response;
     use codex_client::StreamResponse;
     use codex_client::TransportError;
@@ -186,7 +185,9 @@ mod tests {
                 metadata: RawMemoryMetadata {
                     source_path: "/tmp/trace.json".to_string(),
                 },
-                items: vec![json!({"type": "message", "role": "user", "content": []})],
+                items: vec![json!({"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "Remember the user's project preferences."}
+                ]})],
             }],
             reasoning: None,
         };
@@ -210,13 +211,19 @@ mod tests {
             request.url,
             "https://example.com/api/codex/memories/trace_summarize"
         );
-        let body = request
-            .body
-            .as_ref()
-            .and_then(RequestBody::json)
-            .expect("request body should be JSON");
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.prepare_body_for_send().unwrap().body_bytes())
+                .expect("request body should be JSON");
         assert_eq!(body["model"], "gpt-test");
         assert_eq!(body["traces"][0]["id"], "trace-1");
+        assert_eq!(
+            body["traces"][0]["items"],
+            json!([
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "Remember the user's project preferences."}
+                ]}
+            ])
+        );
         assert_eq!(
             body["traces"][0]["metadata"]["source_path"],
             "/tmp/trace.json"

@@ -62,7 +62,8 @@ impl SkillsThreadState {
 
     /// Returns catalogs for stable selected roots.
     ///
-    /// The first catalog returned for a root remains cached until this thread state is dropped.
+    /// The first successful catalog for a root remains cached until this thread state is dropped.
+    /// Failures are retained for the current turn, then retried on the next real observation.
     /// Environment availability only controls whether the root is projected into the current
     /// step; it never invalidates the cache. There is intentionally no filesystem watcher or
     /// content-based invalidation because selected environment roots are treated as stable.
@@ -101,10 +102,12 @@ impl SkillsThreadState {
         let mut catalog = SkillCatalog::default();
         for root in roots {
             query.executor_roots = vec![root.clone()];
-            if let Some(cached) = self.cached_executor_catalog(&root) {
+            if let Some(cached) = self.cached_executor_catalog(&root, &query.turn_id) {
                 catalog.extend(cached);
             } else {
-                catalog.extend(providers.list_executor_for_turn(query.clone()).await);
+                catalog.extend(catalog_or_warning(
+                    providers.list_executor_for_turn(query.clone()).await,
+                ));
             }
         }
         catalog
@@ -115,16 +118,27 @@ impl SkillsThreadState {
         mcp_resources: Option<&McpResourceClient>,
         initialize: impl Future<Output = Result<SkillCatalog, SkillProviderError>> + Send,
     ) -> SkillCatalog {
-        self.orchestrator_cache(mcp_resources)
-            .catalog
-            .get_or_init(|| async {
-                initialize.await.unwrap_or_else(|err| SkillCatalog {
-                    warnings: vec![err.message],
-                    ..Default::default()
-                })
-            })
-            .await
-            .clone()
+        catalog_or_warning(
+            self.orchestrator_cache(mcp_resources)
+                .catalog
+                .get_or_init(|| initialize)
+                .await
+                .clone(),
+        )
+    }
+
+    /// Explicit discovery can retry an outage without making every projection retry it.
+    pub(crate) fn retry_failed_orchestrator_catalog(&self) {
+        let mut cache = self
+            .orchestrator_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache
+            .as_ref()
+            .is_some_and(|cache| matches!(cache.catalog.get(), Some(Err(_))))
+        {
+            *cache = None;
+        }
     }
 
     pub(crate) async fn estimate_orchestrator_catalog_snapshot(
@@ -141,7 +155,7 @@ impl SkillsThreadState {
             .filter(|cache| cache.mcp_cache_key == cache_key)
             .and_then(|cache| cache.catalog.get().cloned());
         if let Some(catalog) = cached_catalog {
-            return catalog;
+            return catalog_or_warning(catalog);
         }
 
         initialize.await.unwrap_or_else(|err| SkillCatalog {
@@ -171,9 +185,6 @@ impl SkillsThreadState {
         }
 
         let result = providers.read(request).await?;
-        if result.resource != cache_key.resource {
-            return Ok(result);
-        }
 
         Ok(cache
             .resources
@@ -214,44 +225,63 @@ impl SkillsThreadState {
         root: SelectedCapabilityRoot,
         query: SkillListQuery,
     ) -> SkillCatalog {
-        if let Some(cached) = self.cached_executor_catalog(&root) {
+        if let Some(cached) = self.cached_executor_catalog(&root, &query.turn_id) {
             return cached;
         }
 
+        let turn_id = query.turn_id.clone();
         let discovered = providers.list_executor_for_turn(query).await;
         let mut cache = self
             .executor_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(cached) = cache.iter().find(|cached| cached.root == root) {
-            return cached.catalog.clone();
+        if let Some(cached) = cache.iter().find(|cached| {
+            cached.root == root && (cached.catalog.is_ok() || cached.turn_id == turn_id)
+        }) {
+            return catalog_or_warning(cached.catalog.clone());
         }
+        cache.retain(|cached| cached.root != root);
         cache.push(CachedExecutorCatalog {
             root,
+            turn_id,
             catalog: discovered.clone(),
         });
-        discovered
+        catalog_or_warning(discovered)
     }
 
-    fn cached_executor_catalog(&self, root: &SelectedCapabilityRoot) -> Option<SkillCatalog> {
+    fn cached_executor_catalog(
+        &self,
+        root: &SelectedCapabilityRoot,
+        turn_id: &str,
+    ) -> Option<SkillCatalog> {
         self.executor_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
-            .find(|cached| &cached.root == root)
-            .map(|cached| cached.catalog.clone())
+            .find(|cached| {
+                &cached.root == root && (cached.catalog.is_ok() || cached.turn_id == turn_id)
+            })
+            .map(|cached| catalog_or_warning(cached.catalog.clone()))
     }
 }
 
 struct CachedExecutorCatalog {
     root: SelectedCapabilityRoot,
-    catalog: SkillCatalog,
+    turn_id: String,
+    catalog: SkillProviderResult<SkillCatalog>,
 }
 
 struct OrchestratorGenerationCache {
     mcp_cache_key: Option<McpResourceClientCacheKey>,
-    catalog: OnceCell<SkillCatalog>,
+    catalog: OnceCell<SkillProviderResult<SkillCatalog>>,
     resources: Mutex<OrchestratorResourceCache>,
+}
+
+fn catalog_or_warning(result: SkillProviderResult<SkillCatalog>) -> SkillCatalog {
+    result.unwrap_or_else(|err| SkillCatalog {
+        warnings: vec![err.message],
+        ..Default::default()
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

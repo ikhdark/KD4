@@ -13,6 +13,84 @@ from scripts import kd4_model_attempt_analysis
 
 
 class Kd4PerfSnapshotTest(unittest.TestCase):
+    def test_default_installed_scenario_matches_publisher_bin_directory(self) -> None:
+        with (
+            mock.patch.dict(kd4_perf_snapshot.os.environ, {}, clear=True),
+            mock.patch.object(Path, "home", return_value=Path("C:/fixture")),
+        ):
+            catalog = kd4_perf_snapshot.scenario_catalog()
+        self.assertEqual(
+            Path(catalog["installed-codex-version"].command[0]),
+            Path("C:/fixture/Desktop/LOCAL-KD/bin/codex.exe"),
+        )
+
+    def test_elapsed_time_excludes_capture_setup_and_report_preparation(self) -> None:
+        clock_ns = 0
+        original_capture = tempfile.TemporaryFile
+        original_tail = kd4_perf_snapshot._output_size_and_tail
+
+        def capture():
+            nonlocal clock_ns
+            clock_ns += 1_000_000_000
+            return original_capture()
+
+        def run(command, **kwargs):
+            nonlocal clock_ns
+            clock_ns += 25_000_000
+            return subprocess.CompletedProcess(command, 0)
+
+        def tail(handle):
+            nonlocal clock_ns
+            clock_ns += 500_000_000
+            return original_tail(handle)
+
+        scenario = kd4_perf_snapshot.Scenario(
+            "fixture", (sys.executable,), Path.cwd(), 1, "test"
+        )
+        with (
+            mock.patch.object(tempfile, "TemporaryFile", side_effect=capture),
+            mock.patch.object(subprocess, "run", side_effect=run),
+            mock.patch.object(
+                kd4_perf_snapshot, "_output_size_and_tail", side_effect=tail
+            ),
+            mock.patch.object(
+                kd4_perf_snapshot.time, "perf_counter_ns", side_effect=lambda: clock_ns
+            ),
+        ):
+            result = kd4_perf_snapshot.measure_scenario(scenario)
+        self.assertEqual(result.status, "passed")
+        self.assertEqual(result.samples[0].elapsed_ms, 25)
+
+    def test_conflicting_attempts_are_quarantined_and_missing_context_is_not_zero(self):
+        attempt = {
+            "event.name": "codex.model_attempt",
+            "sampling_request_id": "request",
+            "attempt_id": "failed",
+            "retry_index": 0,
+            "duration_ms": 10,
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "attempts.jsonl"
+            path.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in [
+                        attempt,
+                        {**attempt, "duration_ms": 20},
+                        {**attempt, "attempt_id": "success", "retry_index": 1},
+                    ]
+                )
+            )
+            records, exclusions = kd4_model_attempt_analysis.load_jsonl([path])
+            self.assertEqual(records, [])
+            self.assertEqual(exclusions["conflicted_logical_request_attempts"], 3)
+        summary = kd4_model_attempt_analysis._stable_context_summary(
+            [{}, {"logical_context_tokens": 0}, {"logical_context_tokens": 100}]
+        )
+        self.assertEqual(summary["averageActiveContextTokens"], 50)
+        self.assertEqual(summary["measuredContextAttempts"], 2)
+        self.assertEqual(summary["missingContextAttempts"], 1)
+
     def test_rollout_analysis_is_owned_by_turn_latency_audit(self) -> None:
         help_text = kd4_perf_snapshot.build_parser().format_help()
 
@@ -162,6 +240,7 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
     def test_atomic_json_writer_replaces_target(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             target = Path(tempdir) / "snapshot.json"
+            target.write_bytes(b'{"old": true}\n')
             kd4_perf_snapshot.write_json_atomic(target, {"ok": True})
 
             self.assertEqual(
@@ -173,12 +252,20 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             target = Path(tempdir) / "snapshot.json"
+            target.write_bytes(b'{"old": true}\n')
 
             with self.assertRaises(TypeError):
                 kd4_perf_snapshot.write_json_atomic(target, {"bad": object()})
 
             self.assertEqual(list(Path(tempdir).glob("*.tmp")), [])
-            self.assertFalse(target.exists())
+            self.assertEqual(target.read_bytes(), b'{"old": true}\n')
+            with mock.patch.object(
+                kd4_perf_snapshot.os, "replace", side_effect=OSError("publish failed")
+            ):
+                with self.assertRaisesRegex(OSError, "publish failed"):
+                    kd4_perf_snapshot.write_json_atomic(target, {"new": True})
+            self.assertEqual(target.read_bytes(), b'{"old": true}\n')
+            self.assertEqual(list(Path(tempdir).glob("*.tmp")), [])
 
     def test_environment_metadata_distinguishes_git_failure_from_clean_tree(
         self,
@@ -394,7 +481,8 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
                 [first, second]
             )
 
-        self.assertEqual(records, [attempt, conflicting])
+        self.assertEqual(records, [])
+        self.assertEqual(diagnostics["conflicted_logical_request_attempts"], 2)
         self.assertEqual(diagnostics["duplicate_physical_attempt_collapsed"], 1)
         self.assertEqual(diagnostics["conflicting_physical_attempt_duplicate"], 1)
 

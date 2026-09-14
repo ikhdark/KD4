@@ -17,13 +17,13 @@ pub(crate) fn compute_source_filters(
     let requires_post_filter = source_kinds.iter().any(|kind| {
         matches!(
             kind,
-            ThreadSourceKind::Exec
-                | ThreadSourceKind::AppServer
-                | ThreadSourceKind::SubAgent
+            ThreadSourceKind::SubAgent
                 | ThreadSourceKind::SubAgentReview
                 | ThreadSourceKind::SubAgentCompact
                 | ThreadSourceKind::SubAgentThreadSpawn
                 | ThreadSourceKind::SubAgentOther
+                // Legacy rollouts can omit the source field. Storage filtering
+                // would exclude them before they can be classified as Unknown.
                 | ThreadSourceKind::Unknown
         )
     });
@@ -31,14 +31,14 @@ pub(crate) fn compute_source_filters(
     if requires_post_filter {
         (Vec::new(), Some(source_kinds))
     } else {
-        let interactive_sources = source_kinds
+        let allowed_sources = source_kinds
             .iter()
             .filter_map(|kind| match kind {
                 ThreadSourceKind::Cli => Some(CoreSessionSource::Cli),
                 ThreadSourceKind::VsCode => Some(CoreSessionSource::VSCode),
-                ThreadSourceKind::Exec
-                | ThreadSourceKind::AppServer
-                | ThreadSourceKind::SubAgent
+                ThreadSourceKind::Exec => Some(CoreSessionSource::Exec),
+                ThreadSourceKind::AppServer => Some(CoreSessionSource::Mcp),
+                ThreadSourceKind::SubAgent
                 | ThreadSourceKind::SubAgentReview
                 | ThreadSourceKind::SubAgentCompact
                 | ThreadSourceKind::SubAgentThreadSpawn
@@ -46,7 +46,7 @@ pub(crate) fn compute_source_filters(
                 | ThreadSourceKind::Unknown => None,
             })
             .collect::<Vec<_>>();
-        (interactive_sources, None)
+        (allowed_sources, None)
     }
 }
 
@@ -105,13 +105,23 @@ mod tests {
     }
 
     #[test]
-    fn compute_source_filters_interactive_only_skips_post_filtering() {
-        let source_kinds = vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode];
+    fn compute_source_filters_direct_sources_skip_post_filtering() {
+        let source_kinds = vec![
+            ThreadSourceKind::Cli,
+            ThreadSourceKind::VsCode,
+            ThreadSourceKind::Exec,
+            ThreadSourceKind::AppServer,
+        ];
         let (allowed_sources, filter) = compute_source_filters(Some(source_kinds));
 
         assert_eq!(
             allowed_sources,
-            vec![CoreSessionSource::Cli, CoreSessionSource::VSCode]
+            vec![
+                CoreSessionSource::Cli,
+                CoreSessionSource::VSCode,
+                CoreSessionSource::Exec,
+                CoreSessionSource::Mcp
+            ]
         );
         assert_eq!(filter, None);
     }

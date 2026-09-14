@@ -33,6 +33,8 @@ pub fn unified_exec_feature_mode_for_features(features: &Features) -> UnifiedExe
     }
 }
 
+/// ShellTool is the availability gate. UnifiedExec, when enabled, overrides the
+/// model's preferred shell type (including Disabled), subject to platform support.
 pub fn shell_type_for_model_and_features(
     model_info: &ModelInfo,
     features: &Features,

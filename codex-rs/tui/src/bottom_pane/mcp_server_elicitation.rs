@@ -1517,7 +1517,16 @@ impl BottomPaneView for McpServerElicitationOverlay {
             return;
         }
 
-        if matches!(key_event.code, KeyCode::Esc) {
+        // Repeats may navigate, but must never decide a newly advanced request.
+        if key_event.kind != KeyEventKind::Press
+            && (self.list_keymap.cancel.is_pressed(key_event)
+                || self.list_keymap.accept.is_pressed(key_event)
+                || key_event.code == KeyCode::Enter
+                || matches!(key_event.code, KeyCode::Char(ch) if ch.is_ascii_digit()))
+        {
+            return;
+        }
+        if self.list_keymap.cancel.is_pressed(key_event) {
             self.dispatch_cancel();
             self.advance_queue_or_complete();
             return;
@@ -1594,28 +1603,40 @@ impl BottomPaneView for McpServerElicitationOverlay {
         if self.current_field_is_select() {
             self.validation_error = None;
             let options_len = self.options_len();
-            match key_event.code {
-                KeyCode::Up | KeyCode::Char('k') => {
+            match key_event {
+                _ if self.list_keymap.move_up.is_pressed(key_event) => {
                     if let Some(answer) = self.current_answer_mut() {
                         answer.selection.move_up_wrap(options_len);
                         answer.answer_committed = false;
                     }
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                _ if self.list_keymap.move_down.is_pressed(key_event) => {
                     if let Some(answer) = self.current_answer_mut() {
                         answer.selection.move_down_wrap(options_len);
                         answer.answer_committed = false;
                     }
                 }
-                KeyCode::Backspace | KeyCode::Delete => self.clear_selection(),
-                KeyCode::Char(' ') => self.select_current_option(/*committed*/ true),
-                KeyCode::Enter => {
+                KeyEvent {
+                    code: KeyCode::Backspace | KeyCode::Delete,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                } => self.clear_selection(),
+                KeyEvent {
+                    code: KeyCode::Char(' '),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                } => self.select_current_option(/*committed*/ true),
+                _ if self.list_keymap.accept.is_pressed(key_event) => {
                     if self.selected_option_index().is_some() {
                         self.select_current_option(/*committed*/ true);
                     }
                     self.go_next_or_submit();
                 }
-                KeyCode::Char(ch) => {
+                KeyEvent {
+                    code: KeyCode::Char(ch),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                } => {
                     if let Some(option_idx) = self.option_index_for_digit(ch) {
                         if let Some(answer) = self.current_answer_mut() {
                             answer.selection.selected_idx = Some(option_idx);
@@ -1629,14 +1650,17 @@ impl BottomPaneView for McpServerElicitationOverlay {
             return;
         }
 
-        let before = self.capture_composer_draft();
+        let needs_invalidation = self.validation_error.is_some()
+            || self
+                .current_answer()
+                .is_some_and(|answer| answer.answer_committed);
+        let before = needs_invalidation.then(|| self.capture_composer_draft());
         let (result, _) = self.composer.handle_key_event(key_event);
         let submitted = self.handle_composer_input_result(result);
         if submitted {
             return;
         }
-        let after = self.capture_composer_draft();
-        if before != after {
+        if before.is_some_and(|before| before != self.capture_composer_draft()) {
             self.validation_error = None;
             if let Some(answer) = self.current_answer_mut() {
                 answer.answer_committed = false;
@@ -1686,6 +1710,12 @@ impl BottomPaneView for McpServerElicitationOverlay {
         &mut self,
         request: McpServerElicitationFormRequest,
     ) -> Option<McpServerElicitationFormRequest> {
+        if request
+            .tool_suggestion()
+            .is_some_and(|suggestion| suggestion.install_url.is_some())
+        {
+            return Some(request);
+        }
         self.queue.push_back(request);
         None
     }
@@ -2496,6 +2526,96 @@ mod tests {
                 "last resolution must close the overlay"
             );
         }
+    }
+
+    fn pane_for_elicitation(tx: AppEventSender) -> crate::bottom_pane::BottomPane {
+        crate::bottom_pane::BottomPane::new(crate::bottom_pane::BottomPaneParams {
+            app_event_tx: tx,
+            frame_requester: crate::tui::FrameRequester::test_dummy(),
+            has_input_focus: true,
+            enhanced_keys_supported: false,
+            placeholder_text: "Ask Codex".to_string(),
+            disable_paste_burst: true,
+            animations_enabled: false,
+            skills: Some(Vec::new()),
+        })
+    }
+
+    #[test]
+    fn queued_decisions_require_a_fresh_key_press() {
+        for code in [KeyCode::Enter, KeyCode::Esc, KeyCode::Char('1')] {
+            let (tx, mut rx) = test_sender();
+            let mut pane = pane_for_elicitation(tx);
+            for id in ["first", "second"] {
+                pane.push_mcp_server_elicitation_request(
+                    McpServerElicitationFormRequest::from_app_server_request(
+                        ThreadId::default(),
+                        request_id(id),
+                        form_request(id, empty_object_schema(), None),
+                    )
+                    .expect("supported request"),
+                );
+            }
+            pane.handle_key_event(KeyEvent::from(code));
+            assert!(matches!(rx.try_recv(), Ok(AppEvent::SubmitThreadOp {
+                op: Op::ResolveElicitation { request_id: id, .. }, ..
+            }) if id == request_id("first")));
+            pane.handle_key_event(KeyEvent::new_with_kind(
+                code,
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            ));
+            assert!(
+                rx.try_recv().is_err(),
+                "repeat must not resolve the second request"
+            );
+            assert!(pane.has_active_view());
+            pane.handle_key_event(KeyEvent::from(code));
+            assert!(matches!(rx.try_recv(), Ok(AppEvent::SubmitThreadOp {
+                op: Op::ResolveElicitation { request_id: id, .. }, ..
+            }) if id == request_id("second")));
+            assert!(!pane.has_active_view());
+        }
+    }
+
+    #[test]
+    fn installation_link_opens_above_an_existing_form() {
+        let (tx, mut rx) = test_sender();
+        let mut pane = pane_for_elicitation(tx);
+        pane.push_mcp_server_elicitation_request(
+            from_form_request(
+                ThreadId::default(),
+                form_request("First form", empty_object_schema(), None),
+            )
+            .unwrap(),
+        );
+        pane.push_mcp_server_elicitation_request(
+            McpServerElicitationFormRequest::from_app_server_request(
+                ThreadId::default(),
+                request_id("install"),
+                form_request(
+                    "Install Calendar",
+                    empty_object_schema(),
+                    Some(serde_json::json!({
+                        "codex_approval_kind": "tool_suggestion", "tool_type": "connector",
+                        "suggest_type": "install", "suggest_reason": "Read the calendar",
+                        "tool_id": "connector_calendar", "tool_name": "Calendar",
+                        "install_url": "https://example.test/calendar"
+                    })),
+                ),
+            )
+            .unwrap(),
+        );
+        assert_eq!(pane.view_stack.len(), 2, "the link must use its own view");
+        pane.handle_key_event(KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(rx.try_recv(), Ok(AppEvent::SubmitThreadOp {
+            op: Op::ResolveElicitation { request_id: id, decision: McpServerElicitationAction::Decline, .. }, ..
+        }) if id == request_id("install")));
+        assert_eq!(
+            pane.view_stack.len(),
+            1,
+            "the original form must remain actionable"
+        );
     }
 
     #[test]

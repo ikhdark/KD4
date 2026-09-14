@@ -79,11 +79,11 @@ impl PluginsManager {
         let use_remote_global_catalog =
             input.plugins.remote_plugin_enabled && auth.is_some_and(CodexAuth::uses_codex_backend);
         let marketplaces = self
-            .list_marketplaces_for_config(
+            .list_marketplaces_for_config_async(
                 &input.plugins,
-                &[],
                 /*include_openai_curated*/ !use_remote_global_catalog,
             )
+            .await
             .context("failed to list plugin marketplaces for tool suggestions")?
             .marketplaces;
         let remote_installed_marketplaces = if use_remote_global_catalog {

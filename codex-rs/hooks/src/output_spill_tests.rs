@@ -36,6 +36,7 @@ async fn small_hook_output_remains_inline() -> Result<()> {
     let thread_id = ThreadId::new();
     let spiller = HookOutputSpiller {
         output_dir: output_dir.clone(),
+        last_prune: Arc::default(),
     };
 
     let output = spiller
@@ -52,18 +53,77 @@ async fn large_hook_output_spills_to_file() -> Result<()> {
     let dir = tempdir()?;
     let text = "hook output ".repeat(1_000);
     let output_dir = AbsolutePathBuf::from_absolute_path(dir.path())?.join(HOOK_OUTPUTS_DIR);
-    let spiller = HookOutputSpiller { output_dir };
+    let spiller = HookOutputSpiller {
+        output_dir,
+        last_prune: Arc::default(),
+    };
 
     let output = spiller
         .maybe_spill_text(ThreadId::new(), text.clone())
         .await;
 
     assert!(output.contains("tokens truncated"));
+    assert!(approx_token_count(&output) <= HOOK_OUTPUT_TOKEN_LIMIT);
     let path = output
         .lines()
         .find_map(|line| line.strip_prefix("Full hook output saved to: "))
         .context("spill path")?;
     assert_eq!(fs::read_to_string(path).await?, text);
+    Ok(())
+}
+
+#[tokio::test]
+async fn spill_batches_throttle_cleanup_and_keep_writer_directories() -> Result<()> {
+    let dir = tempdir()?;
+    let output_dir = AbsolutePathBuf::from_absolute_path(dir.path())?.join(HOOK_OUTPUTS_DIR);
+    let spiller = HookOutputSpiller {
+        output_dir: output_dir.clone(),
+        last_prune: Arc::default(),
+    };
+    let thread_id = ThreadId::new();
+    let expired = output_dir.join(thread_id.to_string()).join("expired.txt");
+    write_spill(expired.as_ref(), "old", SystemTime::UNIX_EPOCH)?;
+    let text = "output ".repeat(2000);
+    let outputs = spiller
+        .maybe_spill_texts(thread_id, vec![text.clone(), text.clone()])
+        .await;
+    assert!(!expired.exists());
+    assert!(expired.parent().context("parent")?.exists());
+    for output in outputs {
+        let path = output
+            .lines()
+            .find_map(|line| line.strip_prefix("Full hook output saved to: "))
+            .context("spill path")?;
+        assert_eq!(fs::read_to_string(path).await?, text);
+        assert!(approx_token_count(&output) <= HOOK_OUTPUT_TOKEN_LIMIT);
+    }
+    write_spill(expired.as_ref(), "old", SystemTime::UNIX_EPOCH)?;
+    let output = spiller.clone().maybe_spill_text(thread_id, text).await;
+    assert!(output.contains("Full hook output saved to:"));
+    assert!(
+        expired.exists(),
+        "a second sweep ran inside the throttle interval"
+    );
+    *spiller.last_prune.lock().await = Some(Instant::now() - Duration::from_secs(61));
+    spiller.prune_crash_leftovers(None).await;
+    assert!(
+        !expired.exists(),
+        "cleanup did not resume after the throttle interval"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cleanup_keeps_empty_directories_available_to_writers() -> Result<()> {
+    let dir = tempdir()?;
+    let thread_dir = dir.path().join("thread");
+    let expired = thread_dir.join("expired.txt");
+    write_spill(&expired, "old", SystemTime::UNIX_EPOCH)?;
+    prune_crash_leftovers_at(dir.path(), None, SPILL_RETENTION_POLICY, SystemTime::now()).await?;
+    assert!(!expired.exists());
+    let pending_write = thread_dir.join("new.txt");
+    fs::write(&pending_write, "full output").await?;
+    assert_eq!(fs::read_to_string(pending_write).await?, "full output");
     Ok(())
 }
 

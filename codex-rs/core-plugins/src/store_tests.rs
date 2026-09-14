@@ -675,3 +675,97 @@ fn install_rejects_manifest_names_that_do_not_match_marketplace_plugin_name() {
         "plugin.json name `manifest-name` does not match marketplace plugin name `different-name`"
     );
 }
+
+#[test]
+fn install_rejects_source_containing_staging_and_reserved_versions() {
+    let tmp = tempdir().unwrap();
+    write_plugin(tmp.path(), ".", "sample-plugin");
+    let store = PluginStore::new(tmp.path().to_path_buf());
+    let id = PluginId::new("sample-plugin".to_string(), "debug".to_string()).unwrap();
+    let source = AbsolutePathBuf::try_from(tmp.path()).unwrap();
+    let error = store.install(source.clone(), id.clone()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("contains its installation staging directory")
+    );
+    assert!(!store.is_installed(&id));
+    assert_eq!(
+        fs::read_dir(tmp.path().join("plugins/cache/debug"))
+            .unwrap()
+            .count(),
+        0
+    );
+    for version in [
+        ".codex-remote-plugin-install.json",
+        ".CODEX-REMOTE-PLUGIN-INSTALL.JSON",
+    ] {
+        let error = store
+            .install_with_version(source.clone(), id.clone(), version.to_string())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reserved remote install metadata filename")
+        );
+        assert!(!store.is_installed(&id));
+    }
+}
+
+#[test]
+fn install_replaces_plugin_named_like_internal_backup_directory() {
+    let tmp = tempdir().unwrap();
+    write_plugin(tmp.path(), "source", "previous-plugin-root");
+    let store = PluginStore::new(tmp.path().to_path_buf());
+    let id = PluginId::new("previous-plugin-root".to_string(), "debug".to_string()).unwrap();
+    let source = AbsolutePathBuf::try_from(tmp.path().join("source")).unwrap();
+    store
+        .install_with_version(source.clone(), id.clone(), "1.0.0".to_string())
+        .unwrap();
+    fs::write(source.join("payload").as_path(), "replacement").unwrap();
+    let result = store
+        .install_with_version(source, id.clone(), "2.0.0".to_string())
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(result.installed_path.join("payload").as_path()).unwrap(),
+        "replacement"
+    );
+    assert_eq!(store.active_plugin_version(&id).as_deref(), Some("2.0.0"));
+    assert!(!store.plugin_root(&id, "1.0.0").as_path().exists());
+}
+
+#[test]
+fn active_plugin_version_orders_mixed_versions_consistently() {
+    let tmp = tempdir().unwrap();
+    let store = PluginStore::new(tmp.path().to_path_buf());
+    let id = PluginId::new("sample-plugin".to_string(), "debug".to_string()).unwrap();
+    for version in ["9.0.0", "10.0.0", "8opaque", "zzz"] {
+        fs::create_dir_all(store.plugin_root(&id, version).as_path()).unwrap();
+    }
+    assert_eq!(store.active_plugin_version(&id).as_deref(), Some("10.0.0"));
+    for a in ["9.0.0", "10.0.0", "8opaque", "zzz"] {
+        for b in ["9.0.0", "10.0.0", "8opaque", "zzz"] {
+            for c in ["9.0.0", "10.0.0", "8opaque", "zzz"] {
+                if compare_plugin_versions(a, b).is_le() && compare_plugin_versions(b, c).is_le() {
+                    assert!(compare_plugin_versions(a, c).is_le(), "{a}, {b}, {c}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn install_rejects_unsupported_socket_entries() {
+    let tmp = tempdir().unwrap();
+    write_plugin(tmp.path(), "source", "sample-plugin");
+    let source = tmp.path().join("source");
+    let _socket = std::os::unix::net::UnixListener::bind(source.join("socket")).unwrap();
+    let store = PluginStore::new(tmp.path().to_path_buf());
+    let id = PluginId::new("sample-plugin".to_string(), "debug".to_string()).unwrap();
+    let error = store
+        .install(AbsolutePathBuf::try_from(source).unwrap(), id.clone())
+        .unwrap_err();
+    assert!(error.to_string().contains("unsupported"));
+    assert!(!store.is_installed(&id));
+}

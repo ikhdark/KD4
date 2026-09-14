@@ -63,18 +63,12 @@ pub fn detect_recent_sessions(
             let Ok(source_path) = fs::canonicalize(&path) else {
                 continue;
             };
-            if let Some(state) = source_states.get(source_path.as_path())
-                && state.source_modified_at == Some(modified_at_nanos)
-            {
-                continue;
-            }
-            file_candidates.push((modified_at_nanos, path));
+            file_candidates.push((modified_at_nanos, path, source_path));
         }
     }
 
-    drop(source_states);
     file_candidates.sort_unstable_by(
-        |(left_modified_at, left_path), (right_modified_at, right_path)| {
+        |(left_modified_at, left_path, _), (right_modified_at, right_path, _)| {
             right_modified_at
                 .cmp(left_modified_at)
                 .then_with(|| left_path.cmp(right_path))
@@ -82,8 +76,11 @@ pub fn detect_recent_sessions(
     );
     let mut migrations = Vec::new();
     let mut source_refreshes = Vec::new();
-    for (_modified_at, path) in file_candidates {
-        match ledger.current_source_refresh(&path) {
+    for (_modified_at, path, source_path) in file_candidates {
+        match source_states
+            .get(source_path.as_path())
+            .map_or(Ok(None), super::ledger::ImportedSourceState::current_source_refresh)
+        {
             Ok(None) => {}
             Ok(Some(refresh)) => {
                 source_refreshes.push(refresh);
@@ -379,7 +376,12 @@ mod tests {
         let projects_dir = valid_session.parent().expect("projects dir");
         for index in 0..SESSION_IMPORT_MAX_COUNT {
             let invalid_session = projects_dir.join(format!("invalid-{index}.jsonl"));
-            std::fs::write(&invalid_session, "not json").expect("invalid session");
+            let contents = if index % 2 == 0 {
+                "not json".to_string()
+            } else {
+                jsonl(&[record("assistant", "no user message", &project_root)])
+            };
+            std::fs::write(&invalid_session, contents).expect("invalid session");
             set_modified_at(
                 &invalid_session,
                 modified_at - Duration::from_secs(/*secs*/ index as u64),
@@ -450,6 +452,37 @@ mod tests {
                 path: session_path,
                 cwd: project_root,
                 title: Some("hello there".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn redetects_same_length_changes_with_preserved_modification_time() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join(".external");
+        let project = root.path().join("repo");
+        let path = write_session(
+            &source,
+            &project,
+            "session.jsonl",
+            &[record("user", "version-a", &project)],
+        );
+        let timestamp = std::fs::metadata(&path).unwrap().modified().unwrap();
+        record_imported_session(root.path(), &path, ThreadId::new()).unwrap();
+        assert!(
+            detect_recent_sessions(&source, root.path())
+                .unwrap()
+                .is_empty()
+        );
+        let original = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, original.replace("version-a", "version-b")).unwrap();
+        set_modified_at(&path, timestamp);
+        assert_eq!(
+            detect_recent_sessions(&source, root.path()).unwrap(),
+            vec![ExternalAgentSessionMigration {
+                path,
+                cwd: project,
+                title: Some("version-b".to_string()),
             }]
         );
     }

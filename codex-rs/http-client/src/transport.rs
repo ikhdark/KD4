@@ -84,7 +84,7 @@ impl ReqwestTransport {
         } else if err.is_timeout() {
             TransportError::Timeout
         } else {
-            TransportError::Network(err.to_string())
+            TransportError::Network(err.without_url().to_string())
         }
     }
 
@@ -122,9 +122,12 @@ impl HttpTransport for ReqwestTransport {
         let resp = builder.send().await.map_err(Self::map_error)?;
         let status = resp.status();
         let headers = resp.headers().clone();
-        let bytes = resp.bytes().await.map_err(Self::map_error)?;
         if !(status.is_success() || status == StatusCode::NOT_MODIFIED && accepts_not_modified) {
-            let body = String::from_utf8(bytes.to_vec()).ok();
+            let body = resp
+                .bytes()
+                .await
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes.to_vec()).ok());
             return Err(TransportError::Http {
                 status,
                 url: Some(url),
@@ -132,6 +135,7 @@ impl HttpTransport for ReqwestTransport {
                 body,
             });
         }
+        let bytes = resp.bytes().await.map_err(Self::map_error)?;
         Ok(Response {
             status,
             headers,

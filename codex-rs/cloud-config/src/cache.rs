@@ -1,7 +1,7 @@
-//! Signed on-disk cache for cloud config bundles.
+//! Non-authoritative diagnostic snapshot of cloud config bundles.
 //!
-//! The cache is scoped to the authenticated ChatGPT user and account, has a
-//! short TTL, and is HMAC-signed so malformed or edited files fail closed.
+//! The embedded-key MAC detects changes that have not been re-signed; it does
+//! not prove backend origin. Never use this file to authorize managed config.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -18,6 +18,7 @@ use sha2::Sha256;
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
+#[cfg(test)]
 use tokio::fs;
 
 const CLOUD_CONFIG_BUNDLE_CACHE_VERSION: u32 = 1;
@@ -118,9 +119,9 @@ impl CloudConfigBundleCache {
         let expires_at = now
             .checked_add_signed(
                 ChronoDuration::from_std(CLOUD_CONFIG_BUNDLE_CACHE_TTL)
-                    .map_err(|_| CloudConfigBundleCacheError)?,
+                    .map_err(|_| CloudConfigBundleCacheError::Expiration)?,
             )
-            .ok_or(CloudConfigBundleCacheError)?;
+            .ok_or(CloudConfigBundleCacheError::Expiration)?;
         let signed_payload = CloudConfigBundleCacheSignedPayload {
             version: CLOUD_CONFIG_BUNDLE_CACHE_VERSION,
             cached_at: now,
@@ -130,22 +131,21 @@ impl CloudConfigBundleCache {
             bundle,
         };
         let payload_bytes =
-            cache_payload_bytes(&signed_payload).ok_or(CloudConfigBundleCacheError)?;
+            serde_json::to_vec(&signed_payload).map_err(CloudConfigBundleCacheError::Serialize)?;
         let serialized = serde_json::to_vec_pretty(&CloudConfigBundleCacheFile {
-            signature: sign_cache_payload(&payload_bytes).ok_or(CloudConfigBundleCacheError)?,
+            signature: sign_cache_payload(&payload_bytes)
+                .ok_or(CloudConfigBundleCacheError::Signature)?,
             signed_payload,
         })
-        .map_err(|_| CloudConfigBundleCacheError)?;
+        .map_err(CloudConfigBundleCacheError::Serialize)?;
 
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|_| CloudConfigBundleCacheError)?;
-        }
-
-        fs::write(&self.path, serialized)
-            .await
-            .map_err(|_| CloudConfigBundleCacheError)?;
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            codex_file_system::write_bytes_atomically(&path, &serialized)
+        })
+        .await
+        .map_err(CloudConfigBundleCacheError::Join)?
+        .map_err(CloudConfigBundleCacheError::Replace)?;
         Ok(())
     }
 }
@@ -174,8 +174,18 @@ pub(super) enum CacheLoadStatus {
 }
 
 #[derive(Debug, Error)]
-#[error("failed to write cloud config bundle cache")]
-pub(super) struct CloudConfigBundleCacheError;
+pub(super) enum CloudConfigBundleCacheError {
+    #[error("failed to calculate cache expiration")]
+    Expiration,
+    #[error("failed to sign cache payload")]
+    Signature,
+    #[error("failed to serialize cache: {0}")]
+    Serialize(#[source] serde_json::Error),
+    #[error("failed to replace cache: {0}")]
+    Replace(#[source] std::io::Error),
+    #[error("cache writer task failed: {0}")]
+    Join(#[source] tokio::task::JoinError),
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct CloudConfigBundleCacheFile {
@@ -193,6 +203,7 @@ pub(super) struct CloudConfigBundleCacheSignedPayload {
     pub(super) bundle: CloudConfigBundle,
 }
 
+#[cfg(test)]
 pub(super) fn cache_payload_bytes(
     payload: &CloudConfigBundleCacheSignedPayload,
 ) -> Option<Vec<u8>> {

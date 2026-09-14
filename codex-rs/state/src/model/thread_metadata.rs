@@ -231,7 +231,9 @@ impl ThreadMetadataBuilder {
             approval_mode,
             tokens_used: 0,
             first_user_message: None,
-            archived_at: self.archived_at.map(canonicalize_datetime),
+            archived_at: self
+                .archived_at
+                .map(|dt| epoch_seconds_to_datetime(datetime_to_epoch_seconds(dt)).unwrap_or(dt)),
             git_sha: self.git_sha.clone(),
             git_branch: self.git_branch.clone(),
             git_origin_url: self.git_origin_url.clone(),
@@ -253,7 +255,8 @@ impl ThreadMetadata {
         }
     }
 
-    /// Preserve an existing user-facing title when reconciling rollout-derived metadata.
+    /// Best-effort preservation of an existing title that differs from its fallback message.
+    /// Text equality does not establish whether the title was explicitly chosen.
     pub fn prefer_existing_explicit_title(&mut self, existing: &Self) {
         let existing_title = existing.title.trim();
         if existing_title.is_empty()
@@ -510,15 +513,7 @@ pub(crate) fn datetime_to_epoch_seconds(dt: DateTime<Utc>) -> i64 {
 }
 
 pub(crate) fn epoch_millis_to_datetime(value: i64) -> Result<DateTime<Utc>> {
-    // Values older than 2020 if interpreted as milliseconds are legacy second-precision rows.
-    // Convert them in memory so old state DBs keep ordering correctly after new writes use ms.
-    const MIN_EPOCH_MILLIS: i64 = 1_577_836_800_000;
-    let millis = if value < MIN_EPOCH_MILLIS {
-        value.saturating_mul(1000)
-    } else {
-        value
-    };
-    DateTime::<Utc>::from_timestamp_millis(millis)
+    DateTime::<Utc>::from_timestamp_millis(value)
         .ok_or_else(|| anyhow::anyhow!("invalid unix timestamp millis: {value}"))
 }
 
@@ -554,9 +549,9 @@ mod tests {
         ThreadRow {
             id: "00000000-0000-0000-0000-000000000123".to_string(),
             rollout_path: "/tmp/rollout-123.jsonl".to_string(),
-            created_at: 1_700_000_000,
-            updated_at: 1_700_000_100,
-            recency_at: 1_700_000_100,
+            created_at: 1_700_000_000_000,
+            updated_at: 1_700_000_100_000,
+            recency_at: 1_700_000_100_000,
             source: "cli".to_string(),
             history_mode: "legacy".to_string(),
             thread_source: None,

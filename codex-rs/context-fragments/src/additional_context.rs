@@ -39,8 +39,12 @@ impl ContextualUserFragment for AdditionalContextUserFragment {
 
     fn matches_text(text: &str) -> bool {
         let trimmed = text.trim();
-        matches_explicit_context(trimmed, EXTERNAL_CONTEXT_TAG, EXTERNAL_CONTEXT_KIND)
-            || matches_legacy_external_context(trimmed)
+        matches_explicit_context(
+            trimmed,
+            "<external_context source=\"",
+            "\" kind=\"untrusted\">\n",
+            "\n</external_context>",
+        ) || matches_legacy_external_context(trimmed)
     }
 
     fn body(&self) -> String {
@@ -81,8 +85,9 @@ impl ContextualUserFragment for AdditionalContextDeveloperFragment {
     fn matches_text(text: &str) -> bool {
         matches_explicit_context(
             text.trim(),
-            APPLICATION_CONTEXT_TAG,
-            APPLICATION_CONTEXT_KIND,
+            "<application_context source=\"",
+            "\" kind=\"application\">\n",
+            "\n</application_context>",
         )
     }
 
@@ -96,12 +101,20 @@ impl ContextualUserFragment for AdditionalContextDeveloperFragment {
     }
 }
 
-fn matches_explicit_context(trimmed: &str, tag: &str, kind: &str) -> bool {
-    let opening_prefix = format!("<{tag} source=\"");
-    let Some(after_prefix) = trimmed.strip_prefix(&opening_prefix) else {
+fn matches_explicit_context(
+    trimmed: &str,
+    opening_prefix: &str,
+    opening_suffix: &str,
+    closing_tag: &str,
+) -> bool {
+    let Some(after_prefix) = trimmed.strip_prefix(opening_prefix) else {
         return false;
     };
-    let Some(source_end) = after_prefix.find('"') else {
+    let Some(source_end) = after_prefix
+        .bytes()
+        .take(MAX_ADDITIONAL_CONTEXT_SOURCE_LABEL_BYTES + 1)
+        .position(|byte| byte == b'"')
+    else {
         return false;
     };
     let source = &after_prefix[..source_end];
@@ -110,14 +123,12 @@ fn matches_explicit_context(trimmed: &str, tag: &str, kind: &str) -> bool {
     }
 
     let after_source = &after_prefix[source_end..];
-    let opening_suffix = format!("\" kind=\"{kind}\">\n");
-    let Some(body_and_close) = after_source.strip_prefix(&opening_suffix) else {
+    let Some(body_and_close) = after_source.strip_prefix(opening_suffix) else {
         return false;
     };
 
-    let closing_tag = format!("\n</{tag}>");
     body_and_close
-        .strip_suffix(&closing_tag)
+        .strip_suffix(closing_tag)
         .is_some_and(matches_rendered_text_value)
 }
 
@@ -196,9 +207,13 @@ fn additional_context_body(tag: &str, kind: &str, key: &str, value: &str) -> Str
 }
 
 fn escape_attr_value_with_byte_budget(value: &str) -> String {
-    let escaped_bytes = value.chars().fold(0usize, |total, ch| {
-        total.saturating_add(escaped_attr_char_len(ch))
-    });
+    let mut escaped_bytes = 0;
+    for ch in value.chars() {
+        escaped_bytes += escaped_attr_char_len(ch);
+        if escaped_bytes > MAX_ADDITIONAL_CONTEXT_SOURCE_LABEL_BYTES {
+            break;
+        }
+    }
     if escaped_bytes <= MAX_ADDITIONAL_CONTEXT_SOURCE_LABEL_BYTES {
         let mut escaped = String::with_capacity(escaped_bytes);
         push_escaped_attr_value(&mut escaped, value);

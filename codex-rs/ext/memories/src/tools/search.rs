@@ -55,7 +55,7 @@ impl ToolExecutor<ToolCall> for SearchTool {
     fn spec(&self) -> ToolSpec {
         memory_function_tool::<SearchArgs, SearchMemoriesResponse>(
             SEARCH_TOOL_NAME,
-            "Search Codex memory files for substring matches, optionally normalizing separators or requiring all query substrings on the same line or within a line window.",
+            "Search memory text, using path to restrict a known file or subtree. Defaults to any-query, case-sensitive matching with zero context and no normalization. Normalization removes all non-alphanumeric characters. Other modes require all queries on one line or within a line window. Excerpts are size-limited; content_truncated marks shortened excerpts, while truncated and next_cursor indicate more matches.",
         )
     }
 

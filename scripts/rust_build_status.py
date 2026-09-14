@@ -589,6 +589,7 @@ def _safe_lane_name(value: str) -> str:
         not value
         or re.fullmatch(r"[A-Za-z0-9_.-]+", value) is None
         or re.fullmatch(r"\.+", value) is not None
+        or re.search(r"\.trash-\d{17}$", value, re.IGNORECASE) is not None
     ):
         raise ValueError(f"invalid Cargo lane name {value!r}")
     return value
@@ -738,13 +739,13 @@ def reserve_cargo_lane(
     lane_root: Path | None = None,
     lock_timeout_seconds: float = 30.0,
 ) -> Iterator[tuple[str, Path]]:
-    root = initialize_cargo_lanes_root(
-        repo_root,
-        lane_root or default_cargo_lanes_root(repo_root),
-    )
     explicit = requested_lane != "auto"
     base_lane = _safe_lane_name(
         requested_lane if explicit else _auto_lane_base(command)
+    )
+    root = initialize_cargo_lanes_root(
+        repo_root,
+        lane_root if lane_root is not None else cargo_lanes_root(repo_root),
     )
     active_handle: BinaryIO | None = None
     target_dir: Path | None = None
@@ -808,7 +809,8 @@ def _require_reserved_target_dir(candidate: str, target_dir: Path) -> None:
 
 
 def _cargo_watch_exec_with_target_dir(command: str, target_dir: Path) -> str:
-    separator_index = command.find(" -- ")
+    separator = re.search(r"\s--(?=\s|$)", command)
+    separator_index = separator.start() if separator else -1
     cargo_command = command if separator_index < 0 else command[:separator_index]
     target_pattern = re.compile(
         r'(?:^|\s)--target-dir(?:=(?:"(?P<double>[^\"]*)"|'
@@ -830,6 +832,16 @@ def _cargo_watch_exec_with_target_dir(command: str, target_dir: Path) -> str:
     if target_matches:
         return command
     build_commands = {
+        "b",
+        "c",
+        "t",
+        "r",
+        "d",
+        "clean",
+        "rustdoc",
+        "package",
+        "install",
+        "publish",
         "bench",
         "build",
         "check",
@@ -843,7 +855,7 @@ def _cargo_watch_exec_with_target_dir(command: str, target_dir: Path) -> str:
     }
     stripped = command.strip()
     if not stripped or stripped.split(maxsplit=1)[0] not in build_commands:
-        return command
+        raise ValueError("Unsupported Cargo watch exec command in a reserved lane")
     target_arg = str(target_dir)
     escaped_target = target_arg.replace('"', '\\"')
     quoted_target = (
@@ -928,7 +940,7 @@ def _cargo_command_with_target_dir(
     target_arg = str(target_dir)
     tail = result[subcommand_index + 1 :]
     if subcommand == "nextest":
-        if not tail or tail[0] not in {"archive", "run"}:
+        if not tail or tail[0] not in {"archive", "run", "list"}:
             return result
         if _cargo_target_dir_is_present(
             result,
@@ -943,30 +955,51 @@ def _cargo_command_with_target_dir(
             *result[subcommand_index + 2 :],
         ]
     if subcommand == "watch":
-        for index in range(subcommand_index + 1, len(result)):
-            if result[index] == "--":
+        index = subcommand_index + 1
+        has_exec = False
+        while index < len(result):
+            argument = result[index]
+            if argument == "--":
+                if index + 1 < len(result):
+                    raise ValueError(
+                        "Cargo watch positional commands cannot enforce a reserved target; use --exec/-x"
+                    )
                 break
-            if result[index] in {"-s", "--shell"} or result[index].startswith(
-                "--shell="
-            ):
+            if argument in {"-s", "--shell"} or argument.startswith("--shell="):
                 raise ValueError(
-                    "Cargo watch --shell/-s is not allowed inside a reserved "
-                    "lane; use --exec/-x so --target-dir can be enforced"
+                    "Cargo watch --shell/-s is not allowed inside a reserved lane; use --exec/-x so --target-dir can be enforced"
                 )
-            if result[index] in {"-x", "--exec"} and index + 1 < len(result):
-                result[index + 1] = _cargo_watch_exec_with_target_dir(
-                    result[index + 1],
-                    target_dir,
+            if argument in {"-x", "--exec"}:
+                if index + 1 >= len(result):
+                    raise ValueError("Cargo watch --exec/-x requires a command")
+                index += 1
+                result[index] = _cargo_watch_exec_with_target_dir(
+                    result[index], target_dir
                 )
-                return result
-            if result[index].startswith("--exec="):
+                has_exec = True
+            elif argument.startswith("--exec="):
                 result[index] = "--exec=" + _cargo_watch_exec_with_target_dir(
-                    result[index].removeprefix("--exec="),
-                    target_dir,
+                    argument.removeprefix("--exec="), target_dir
                 )
-                return result
+                has_exec = True
+            index += 1
+        if not has_exec:
+            result[index:index] = [
+                "-x",
+                _cargo_watch_exec_with_target_dir("check", target_dir),
+            ]
         return result
     if subcommand not in {
+        "b",
+        "c",
+        "t",
+        "r",
+        "d",
+        "clean",
+        "rustdoc",
+        "package",
+        "install",
+        "publish",
         "bench",
         "build",
         "check",
@@ -978,7 +1011,36 @@ def _cargo_command_with_target_dir(
         "rustc",
         "test",
     }:
-        return result
+        if subcommand in {
+            "add",
+            "remove",
+            "rm",
+            "fetch",
+            "fmt",
+            "generate-lockfile",
+            "locate-project",
+            "login",
+            "logout",
+            "metadata",
+            "new",
+            "init",
+            "owner",
+            "search",
+            "tree",
+            "update",
+            "vendor",
+            "verify-project",
+            "version",
+            "help",
+            "report",
+            "read-manifest",
+            "uninstall",
+            "info",
+        }:
+            return result
+        raise ValueError(
+            f"Unsupported Cargo command {subcommand!r} in a reserved lane; use an explicit build command"
+        )
     if _cargo_target_dir_is_present(
         result,
         start_index=subcommand_index + 1,

@@ -154,7 +154,13 @@ pub(crate) fn command_actions_for_path_uri(
     // TODO(anp): Carry PathUri into CommandAction so foreign Read actions retain resolved paths.
     // Until then, omit those actions rather than project a foreign cwd onto the host.
     let native_cwd = if cwd.infer_path_convention() == Some(PathConvention::native()) {
-        cwd.to_abs_path().ok()
+        match cwd.to_abs_path() {
+            Ok(path) => Some(path),
+            Err(error) => {
+                warn!(%cwd, %error, "cannot resolve native command cwd");
+                None
+            }
+        }
     } else {
         None
     };
@@ -163,21 +169,11 @@ pub(crate) fn command_actions_for_path_uri(
         .iter()
         .cloned()
         .filter_map(|parsed| match parsed {
-            ParsedCommand::Read { cmd, name, path } => match native_cwd.as_ref() {
-                Some(native_cwd) => Some(CommandAction::Read {
+            ParsedCommand::Read { cmd, name, path } => native_cwd.as_ref().map(|native_cwd| CommandAction::Read {
                     command: cmd,
                     name,
                     path: native_cwd.join(path),
                 }),
-                None => {
-                    warn!(
-                        command = cmd,
-                        %cwd,
-                        "omitting read command action whose path cannot be resolved against a foreign cwd"
-                    );
-                    None
-                }
-            },
             ParsedCommand::ListFiles { cmd, path } => {
                 Some(CommandAction::ListFiles { command: cmd, path })
             }

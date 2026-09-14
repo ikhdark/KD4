@@ -113,3 +113,96 @@ fn agent_status_uses_reasoning_summaries_only() {
     assert!(!rendered.contains("hidden raw reasoning"));
     assert!(!rendered.contains("raw-only reasoning"));
 }
+
+#[test]
+fn agent_status_bounds_items_unicode_and_lines_and_keeps_latest_item() {
+    use codex_app_server_protocol::ItemStartedNotification;
+
+    let mut store = ThreadEventStore::new(/*capacity*/ 16);
+    for index in 0..8 {
+        store.push_notification(ServerNotification::ItemCompleted(
+            ItemCompletedNotification {
+                item: ThreadItem::AgentMessage {
+                    id: format!("message-{index}"),
+                    text: format!("activity {index}"),
+                    phase: None,
+                    memory_citation: None,
+                },
+                thread_id: "thread-child".to_string(),
+                turn_id: "turn-1".to_string(),
+                completed_at_ms: index,
+            },
+        ));
+    }
+    store.push_notification(ServerNotification::ItemStarted(ItemStartedNotification {
+        item: ThreadItem::AgentMessage {
+            id: "latest".to_string(),
+            text: "obsolete draft".to_string(),
+            phase: None,
+            memory_citation: None,
+        },
+        thread_id: "thread-child".to_string(),
+        turn_id: "turn-1".to_string(),
+        started_at_ms: 9,
+    }));
+    store.push_notification(ServerNotification::ItemCompleted(
+        ItemCompletedNotification {
+            item: ThreadItem::AgentMessage {
+                id: "latest".to_string(),
+                text: "e\u{301}".repeat(300),
+                phase: None,
+                memory_citation: None,
+            },
+            thread_id: "thread-child".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 10,
+        },
+    ));
+
+    let preview = AgentStatusThreadPreview::from_store("/root/reviewer".to_string(), &store);
+    assert_eq!(
+        preview.activity,
+        vec![
+            "activity 3".to_string(),
+            "activity 4".to_string(),
+            "activity 5".to_string(),
+            "activity 6".to_string(),
+            "activity 7".to_string(),
+            format!("{}...", "e\u{301}".repeat(237)),
+        ]
+    );
+    let rendered = AgentStatusHistoryCell::new(vec![preview]).display_lines(20);
+    assert_eq!(
+        rendered.len(),
+        7,
+        "heading, agent title, and three preview lines"
+    );
+    assert!(
+        rendered
+            .last()
+            .expect("last line")
+            .to_string()
+            .ends_with("...")
+    );
+    assert!(rendered[4..].iter().all(|line| line.width() <= 20));
+}
+
+#[test]
+fn agent_status_does_not_claim_started_file_changes_are_complete() {
+    use codex_app_server_protocol::ItemStartedNotification;
+    use codex_app_server_protocol::PatchApplyStatus;
+
+    let mut store = ThreadEventStore::new(/*capacity*/ 4);
+    store.push_notification(ServerNotification::ItemStarted(ItemStartedNotification {
+        item: ThreadItem::FileChange {
+            id: "patch".to_string(),
+            changes: Vec::new(),
+            status: PatchApplyStatus::InProgress,
+        },
+        thread_id: "thread-child".to_string(),
+        turn_id: "turn-1".to_string(),
+        started_at_ms: 0,
+    }));
+    let preview = AgentStatusThreadPreview::from_store("/root/reviewer".to_string(), &store);
+    assert_eq!(preview.activity, vec!["File changes: 0"]);
+}

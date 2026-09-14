@@ -72,6 +72,8 @@ impl RuntimeMetricsSummary {
             && self.turn_ttfm_ms == 0
     }
 
+    /// Accumulate activity totals while retaining the latest nonzero collection
+    /// window for server and first-response timings displayed by the TUI.
     pub fn merge(&mut self, other: Self) {
         self.tool_calls.merge(other.tool_calls);
         self.api_calls.merge(other.api_calls);
@@ -117,65 +119,66 @@ impl RuntimeMetricsSummary {
     }
 
     pub(crate) fn from_snapshot(snapshot: &ResourceMetrics) -> Self {
-        let tool_calls = RuntimeMetricTotals {
-            count: sum_counter(snapshot, TOOL_CALL_COUNT_METRIC),
-            duration_ms: sum_histogram_ms(snapshot, TOOL_CALL_DURATION_METRIC),
-        };
-        let api_calls = RuntimeMetricTotals {
-            count: sum_counter(snapshot, API_CALL_COUNT_METRIC),
-            duration_ms: sum_histogram_ms(snapshot, API_CALL_DURATION_METRIC),
-        };
-        let streaming_events = RuntimeMetricTotals {
-            count: sum_counter(snapshot, SSE_EVENT_COUNT_METRIC),
-            duration_ms: sum_histogram_ms(snapshot, SSE_EVENT_DURATION_METRIC),
-        };
-        let websocket_calls = RuntimeMetricTotals {
-            count: sum_counter(snapshot, WEBSOCKET_REQUEST_COUNT_METRIC),
-            duration_ms: sum_histogram_ms(snapshot, WEBSOCKET_REQUEST_DURATION_METRIC),
-        };
-        let websocket_events = RuntimeMetricTotals {
-            count: sum_counter(snapshot, WEBSOCKET_EVENT_COUNT_METRIC),
-            duration_ms: sum_histogram_ms(snapshot, WEBSOCKET_EVENT_DURATION_METRIC),
-        };
-        let responses_api_overhead_ms =
-            sum_histogram_ms(snapshot, RESPONSES_API_OVERHEAD_DURATION_METRIC);
-        let responses_api_inference_time_ms =
-            sum_histogram_ms(snapshot, RESPONSES_API_INFERENCE_TIME_DURATION_METRIC);
-        let responses_api_engine_iapi_ttft_ms =
-            sum_histogram_ms(snapshot, RESPONSES_API_ENGINE_IAPI_TTFT_DURATION_METRIC);
-        let responses_api_engine_service_ttft_ms =
-            sum_histogram_ms(snapshot, RESPONSES_API_ENGINE_SERVICE_TTFT_DURATION_METRIC);
-        let responses_api_engine_iapi_tbt_ms =
-            sum_histogram_ms(snapshot, RESPONSES_API_ENGINE_IAPI_TBT_DURATION_METRIC);
-        let responses_api_engine_service_tbt_ms =
-            sum_histogram_ms(snapshot, RESPONSES_API_ENGINE_SERVICE_TBT_DURATION_METRIC);
-        let turn_ttft_ms = sum_histogram_ms(snapshot, TURN_TTFT_DURATION_METRIC);
-        let turn_ttfm_ms = sum_histogram_ms(snapshot, TURN_TTFM_DURATION_METRIC);
-        Self {
-            tool_calls,
-            api_calls,
-            streaming_events,
-            websocket_calls,
-            websocket_events,
-            responses_api_overhead_ms,
-            responses_api_inference_time_ms,
-            responses_api_engine_iapi_ttft_ms,
-            responses_api_engine_service_ttft_ms,
-            responses_api_engine_iapi_tbt_ms,
-            responses_api_engine_service_tbt_ms,
-            turn_ttft_ms,
-            turn_ttfm_ms,
+        let mut summary = Self::default();
+        // Accumulate fractional milliseconds across all attribute points and scopes
+        // before rounding at the public integer-summary boundary.
+        let mut durations = [0.0; 13];
+        for metric in snapshot
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        {
+            let counter = match metric.name() {
+                TOOL_CALL_COUNT_METRIC => Some(&mut summary.tool_calls.count),
+                API_CALL_COUNT_METRIC => Some(&mut summary.api_calls.count),
+                SSE_EVENT_COUNT_METRIC => Some(&mut summary.streaming_events.count),
+                WEBSOCKET_REQUEST_COUNT_METRIC => Some(&mut summary.websocket_calls.count),
+                WEBSOCKET_EVENT_COUNT_METRIC => Some(&mut summary.websocket_events.count),
+                _ => None,
+            };
+            if let Some(counter) = counter {
+                *counter = counter.saturating_add(sum_counter_metric(metric));
+                continue;
+            }
+            let duration = match metric.name() {
+                TOOL_CALL_DURATION_METRIC => &mut durations[0],
+                API_CALL_DURATION_METRIC => &mut durations[1],
+                SSE_EVENT_DURATION_METRIC => &mut durations[2],
+                WEBSOCKET_REQUEST_DURATION_METRIC => &mut durations[3],
+                WEBSOCKET_EVENT_DURATION_METRIC => &mut durations[4],
+                RESPONSES_API_OVERHEAD_DURATION_METRIC => &mut durations[5],
+                RESPONSES_API_INFERENCE_TIME_DURATION_METRIC => &mut durations[6],
+                RESPONSES_API_ENGINE_IAPI_TTFT_DURATION_METRIC => &mut durations[7],
+                RESPONSES_API_ENGINE_SERVICE_TTFT_DURATION_METRIC => &mut durations[8],
+                RESPONSES_API_ENGINE_IAPI_TBT_DURATION_METRIC => &mut durations[9],
+                RESPONSES_API_ENGINE_SERVICE_TBT_DURATION_METRIC => &mut durations[10],
+                TURN_TTFT_DURATION_METRIC => &mut durations[11],
+                TURN_TTFM_DURATION_METRIC => &mut durations[12],
+                _ => continue,
+            };
+            if let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() {
+                for point in histogram.data_points() {
+                    let value = point.sum();
+                    if value.is_finite() && value > 0.0 {
+                        *duration = (*duration + value).min(u64::MAX as f64);
+                    }
+                }
+            }
         }
+        summary.tool_calls.duration_ms = f64_to_u64(durations[0]);
+        summary.api_calls.duration_ms = f64_to_u64(durations[1]);
+        summary.streaming_events.duration_ms = f64_to_u64(durations[2]);
+        summary.websocket_calls.duration_ms = f64_to_u64(durations[3]);
+        summary.websocket_events.duration_ms = f64_to_u64(durations[4]);
+        summary.responses_api_overhead_ms = f64_to_u64(durations[5]);
+        summary.responses_api_inference_time_ms = f64_to_u64(durations[6]);
+        summary.responses_api_engine_iapi_ttft_ms = f64_to_u64(durations[7]);
+        summary.responses_api_engine_service_ttft_ms = f64_to_u64(durations[8]);
+        summary.responses_api_engine_iapi_tbt_ms = f64_to_u64(durations[9]);
+        summary.responses_api_engine_service_tbt_ms = f64_to_u64(durations[10]);
+        summary.turn_ttft_ms = f64_to_u64(durations[11]);
+        summary.turn_ttfm_ms = f64_to_u64(durations[12]);
+        summary
     }
-}
-
-fn sum_counter(snapshot: &ResourceMetrics, name: &str) -> u64 {
-    snapshot
-        .scope_metrics()
-        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
-        .filter(|metric| metric.name() == name)
-        .map(sum_counter_metric)
-        .sum()
 }
 
 fn sum_counter_metric(metric: &Metric) -> u64 {
@@ -183,26 +186,7 @@ fn sum_counter_metric(metric: &Metric) -> u64 {
         AggregatedMetrics::U64(MetricData::Sum(sum)) => sum
             .data_points()
             .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
-            .sum(),
-        _ => 0,
-    }
-}
-
-fn sum_histogram_ms(snapshot: &ResourceMetrics, name: &str) -> u64 {
-    snapshot
-        .scope_metrics()
-        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
-        .filter(|metric| metric.name() == name)
-        .map(sum_histogram_metric_ms)
-        .sum()
-}
-
-fn sum_histogram_metric_ms(metric: &Metric) -> u64 {
-    match metric.data() {
-        AggregatedMetrics::F64(MetricData::Histogram(histogram)) => histogram
-            .data_points()
-            .map(|point| f64_to_u64(point.sum()))
-            .sum(),
+            .fold(0, u64::saturating_add),
         _ => 0,
     }
 }
@@ -213,4 +197,46 @@ fn f64_to_u64(value: f64) -> u64 {
     }
     let clamped = value.min(u64::MAX as f64);
     clamped.round() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{MetricsClient, MetricsConfig};
+    use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+    use std::time::Duration;
+
+    #[test]
+    fn snapshot_sums_fractional_attribute_points_before_rounding_and_saturates_counts() {
+        let metrics = MetricsClient::new(
+            MetricsConfig::in_memory("test", "test", "1", InMemoryMetricExporter::default())
+                .with_runtime_reader(),
+        )
+        .unwrap();
+        for tag in ["one", "two", "three"] {
+            metrics
+                .record_count_and_duration(
+                    TOOL_CALL_COUNT_METRIC,
+                    TOOL_CALL_DURATION_METRIC,
+                    i64::MAX,
+                    Duration::from_micros(400),
+                    &[("part", tag)],
+                )
+                .unwrap();
+        }
+        let summary = RuntimeMetricsSummary::from_snapshot(&metrics.snapshot().unwrap());
+        assert_eq!(
+            summary.tool_calls,
+            RuntimeMetricTotals {
+                count: u64::MAX,
+                duration_ms: 1
+            }
+        );
+        assert_eq!(summary.api_calls, RuntimeMetricTotals::default());
+        assert_eq!(
+            RuntimeMetricsSummary::from_snapshot(&metrics.snapshot().unwrap()),
+            RuntimeMetricsSummary::default()
+        );
+        metrics.shutdown().unwrap();
+    }
 }

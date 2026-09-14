@@ -18,10 +18,12 @@ use rama_tls_rustls::dep::tokio_rustls::TlsAcceptor;
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
+use std::time::Duration;
 use tempfile::tempdir;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
+use tokio::time::timeout;
 
 #[test]
 fn proxy_env_uses_first_present_casing_even_when_unusable() {
@@ -53,11 +55,7 @@ fn proxy_env_uses_first_present_casing_even_when_unusable() {
         None
     );
 
-    let non_unicode = {
-        use std::os::windows::ffi::OsStringExt;
-
-        std::ffi::OsString::from_wide(&[0xd800])
-    };
+    let non_unicode = std::ffi::OsString::from("synthetic non-Unicode environment error");
     assert_eq!(
         read_proxy_env_with(&["HTTPS_PROXY", "https_proxy"], |key| {
             if key == "HTTPS_PROXY" {
@@ -67,6 +65,29 @@ fn proxy_env_uses_first_present_casing_even_when_unusable() {
             }
         }),
         None
+    );
+}
+
+#[tokio::test]
+async fn direct_client_rejects_an_inherited_proxy_route() {
+    let client = UpstreamClient::direct_with_allow_local_binding(
+        true,
+        Arc::new(rustls::RootCertStore::empty()),
+    );
+    let mut request = Request::builder()
+        .uri("http://127.0.0.1:1/")
+        .body(Body::empty())
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(ProxyAddress::try_from("http://127.0.0.1:2").unwrap());
+    let error = client
+        .serve(request)
+        .await
+        .expect_err("direct routing must reject proxy overrides");
+    assert_eq!(
+        error.to_string(),
+        "direct upstream request contains a proxy route"
     );
 }
 
@@ -126,33 +147,99 @@ async fn mitm_upstream_client_trusts_startup_custom_ca() {
             .unwrap();
     assert_eq!(roots.len(), baseline_roots.len() + 1);
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut stream = acceptor.accept(stream).await.unwrap();
-        let mut request = [0; 4096];
-        let bytes_read = stream.read(&mut request).await.unwrap();
-        assert!(bytes_read > 0);
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
-    });
+    timeout(Duration::from_secs(10), async {
+        for (roots, trusted) in [(baseline_roots, false), (roots, true)] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = async {
+                let (stream, _) = listener.accept().await.unwrap();
+                let handshake = acceptor.accept(stream).await;
+                if !trusted {
+                    assert!(
+                        handshake.is_err(),
+                        "untrusted certificate should abort the handshake"
+                    );
+                    return;
+                }
+                let mut stream = handshake.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                assert!(request.starts_with(b"GET / HTTP/1.1\r\n"));
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            };
+            let client = async {
+                let client = UpstreamClient::direct_with_allow_local_binding(
+                    /*allow_local_binding*/ true, roots,
+                );
+                let mut request = Request::builder()
+                    .uri(format!("https://localhost:{}/", address.port()))
+                    .body(Body::empty())
+                    .unwrap();
+                // Direct configuration must override stale routing metadata.
+                request
+                    .extensions_mut()
+                    .insert(ProxyAddress::try_from("http://127.0.0.1:1").unwrap());
+                let result = client.serve(request).await;
+                if trusted {
+                    assert_eq!(result.unwrap().status(), StatusCode::OK);
+                } else {
+                    let err = result.expect_err("baseline roots must reject startup CA");
+                    assert!(
+                        format!("{err:?}").contains("UnknownIssuer"),
+                        "unexpected TLS error: {err:?}"
+                    );
+                }
+            };
+            tokio::join!(server, client);
+        }
+    })
+    .await
+    .expect("TLS exchanges should finish");
+}
 
-    let client =
-        UpstreamClient::direct_with_allow_local_binding(/*allow_local_binding*/ true, roots);
-    let response = client
-        .serve(
-            Request::builder()
-                .uri(format!("https://localhost:{}/", address.port()))
+#[tokio::test]
+async fn request_failure_does_not_include_uri_secrets() {
+    timeout(Duration::from_secs(10), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+            }
+            assert!(request.starts_with(b"GET /private-path?token=query-secret HTTP/1.1\r\n"));
+            stream
+                .write_all(b"invalid HTTP response\r\n\r\n")
+                .await
+                .unwrap();
+        };
+        let client = async {
+            let client = UpstreamClient::direct_with_allow_local_binding(
+                /*allow_local_binding*/ true,
+                Arc::new(rustls::RootCertStore::empty()),
+            );
+            let request = Request::builder()
+                .uri(format!("http://{address}/private-path?token=query-secret"))
                 .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    server.await.unwrap();
+                .unwrap();
+            let err = client
+                .serve(request)
+                .await
+                .expect_err("malformed response must fail");
+            let diagnostic = format!("{err:?}");
+            assert!(diagnostic.contains(&format!("http request failure for upstream: {address}")));
+            assert!(!diagnostic.contains("private-path"));
+            assert!(!diagnostic.contains("query-secret"));
+        };
+        tokio::join!(server, client);
+    })
+    .await
+    .expect("HTTP exchange should finish");
 }

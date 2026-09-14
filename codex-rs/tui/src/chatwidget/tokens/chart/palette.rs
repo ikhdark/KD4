@@ -52,7 +52,13 @@ impl TokenActivityPalette {
         color_level: StdoutColorLevel,
         active_style: Style,
     ) -> Self {
-        let fallback_palette = || Self::fallback(active_style);
+        let fallback_palette = || {
+            let mut style = active_style;
+            if let Some(Color::Rgb(r, g, b)) = style.fg {
+                style.fg = Some(best_color_for_level((r, g, b), color_level));
+            }
+            Self::fallback(style)
+        };
         let (Some(fg), Some(bg), Some(anchor)) =
             (default_fg, default_bg, activity_anchor_rgb(active_style))
         else {

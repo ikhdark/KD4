@@ -63,6 +63,9 @@ impl CommandOutput {
     }
 
     pub(super) fn is_success(&self) -> bool {
+        if self.live_output.is_some() {
+            return false;
+        }
         match self.status_without_exit_code.as_ref() {
             Some(CommandExecutionStatus::Completed) => true,
             Some(_) => false,
@@ -155,8 +158,11 @@ impl ExecCell {
             duration: None,
         };
         if self.is_exploring_cell() && Self::is_exploring_call(&call) {
+            let mut calls = Vec::with_capacity(self.calls.len() + 1);
+            calls.extend_from_slice(&self.calls);
+            calls.push(call);
             Some(Self {
-                calls: [self.calls.clone(), vec![call]].concat(),
+                calls,
                 animations_enabled: self.animations_enabled,
             })
         } else {
@@ -185,19 +191,22 @@ impl ExecCell {
     }
 
     pub(crate) fn should_flush(&self) -> bool {
-        !self.is_exploring_cell() && self.calls.iter().all(|c| c.output.is_some())
+        !self.is_exploring_cell() && self.calls.iter().all(ExecCall::is_complete)
     }
 
     pub(crate) fn mark_failed(&mut self) {
         for call in self.calls.iter_mut() {
-            if call.output.is_none() {
+            if !call.is_complete() {
                 let elapsed = call
                     .start_time
                     .map(|st| st.elapsed())
                     .unwrap_or_else(|| Duration::from_millis(0));
                 call.start_time = None;
                 call.duration = Some(elapsed);
-                call.output = Some(CommandOutput::new(1, String::new(), String::new()));
+                let text = call.output.as_ref().map_or_else(String::new, |output| {
+                    output.transcript_lines().collect::<Vec<_>>().join("\n")
+                });
+                call.output = Some(CommandOutput::from_shared_output(1, text));
             }
         }
     }
@@ -207,13 +216,13 @@ impl ExecCell {
     }
 
     pub(crate) fn is_active(&self) -> bool {
-        self.calls.iter().any(|c| c.output.is_none())
+        self.calls.iter().any(|c| !c.is_complete())
     }
 
     pub(crate) fn active_start_time(&self) -> Option<Instant> {
         self.calls
             .iter()
-            .find(|c| c.output.is_none())
+            .find(|c| !c.is_complete())
             .and_then(|c| c.start_time)
     }
 
@@ -232,6 +241,9 @@ impl ExecCell {
         let Some(call) = self.calls.iter_mut().rev().find(|c| c.call_id == call_id) else {
             return false;
         };
+        if call.is_complete() {
+            return false;
+        }
         let output = call.output.get_or_insert_with(CommandOutput::default);
         output
             .live_output
@@ -255,6 +267,12 @@ impl ExecCell {
 }
 
 impl ExecCall {
+    pub(super) fn is_complete(&self) -> bool {
+        self.output
+            .as_ref()
+            .is_some_and(|output| output.live_output.is_none())
+    }
+
     pub(crate) fn is_user_shell_command(&self) -> bool {
         matches!(self.source, ExecCommandSource::UserShell)
     }

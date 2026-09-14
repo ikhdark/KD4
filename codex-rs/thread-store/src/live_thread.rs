@@ -140,7 +140,8 @@ fn terminal_event_turn_id(event: &EventMsg) -> Option<&str> {
 
 /// Owns a live thread while session initialization is still fallible.
 ///
-/// If initialization returns early after persistence has been opened, dropping this guard discards
+/// If initialization returns early after persistence has been opened, dropping this guard schedules
+/// best-effort cleanup on the current Tokio runtime to discard
 /// the live writer without forcing lazy in-memory state to become durable. Call [`commit`] once the
 /// session owns the live thread for normal operation.
 pub struct LiveThreadInitGuard {
@@ -161,12 +162,13 @@ impl LiveThreadInitGuard {
     }
 
     pub async fn discard(&mut self) {
-        let Some(live_thread) = self.live_thread.take() else {
+        let Some(live_thread) = self.live_thread.as_ref() else {
             return;
         };
         if let Err(err) = live_thread.discard().await {
             warn!("failed to discard thread persistence for failed session init: {err}");
         }
+        self.commit();
     }
 }
 
@@ -221,35 +223,13 @@ impl LiveThread {
         let thread_id = params.thread_id;
         let should_load_history = params.history.is_none();
         let include_archived = params.include_archived;
-        let mut terminal_events = params
+        let terminal_events = params
             .history
             .as_deref()
             .map(|history| TerminalEventIndex::from_items(history));
-        let mut metadata_sync = ThreadMetadataSync::for_resume(&params);
+        let metadata_sync = ThreadMetadataSync::for_resume(&params);
         thread_store.resume_thread(params).await?;
-        if should_load_history {
-            match thread_store
-                .load_history(LoadThreadHistoryParams {
-                    thread_id,
-                    include_archived,
-                })
-                .await
-            {
-                Ok(history) => {
-                    metadata_sync.record_resume_history(&history.items);
-                    terminal_events = Some(TerminalEventIndex::from_items(&history.items));
-                }
-                Err(err) => {
-                    if let Err(discard_err) = thread_store.discard_thread(thread_id).await {
-                        warn!(
-                            "failed to discard thread persistence after resume history load failed: {discard_err}"
-                        );
-                    }
-                    return Err(err);
-                }
-            }
-        }
-        Ok(Self {
+        let live_thread = Self {
             thread_id,
             history_mode,
             thread_store,
@@ -258,7 +238,37 @@ impl LiveThread {
                 terminal_events.unwrap_or_else(TerminalEventIndex::trusted_empty),
             )),
             persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
-        })
+        };
+        let mut init_guard = LiveThreadInitGuard::new(Some(live_thread.clone()));
+        if should_load_history {
+            match live_thread
+                .thread_store
+                .load_history(LoadThreadHistoryParams {
+                    thread_id,
+                    include_archived,
+                })
+                .await
+            {
+                Ok(history) => {
+                    live_thread
+                        .metadata_sync
+                        .lock()
+                        .await
+                        .record_resume_history(&history.items);
+                    *live_thread
+                        .terminal_events
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        TerminalEventIndex::from_items(&history.items);
+                }
+                Err(err) => {
+                    init_guard.discard().await;
+                    return Err(err);
+                }
+            }
+        }
+        init_guard.commit();
+        Ok(live_thread)
     }
 
     #[tracing::instrument(
@@ -266,6 +276,8 @@ impl LiveThread {
         skip_all,
         fields(item_count = raw_items.len())
     )]
+    /// Append history and apply its metadata. A metadata failure can occur after history
+    /// was accepted; retry pending metadata with a barrier instead of replaying the batch.
     pub async fn append_items(&self, raw_items: &[RolloutItem]) -> ThreadStoreResult<()> {
         self.append_items_with_durability(raw_items, true).await
     }
@@ -280,6 +292,7 @@ impl LiveThread {
         should_persist_event_msg(event, self.history_mode)
     }
 
+    #[expect(clippy::await_holding_invalid_type, reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations")]
     async fn append_items_with_durability(
         &self,
         raw_items: &[RolloutItem],
@@ -303,6 +316,9 @@ impl LiveThread {
         if items.is_empty() {
             return Ok(());
         }
+        // Keep canonical submission, observation and metadata acknowledgement in one
+        // per-thread critical section, shared with explicit updates and barriers.
+        let mut metadata_sync = self.metadata_sync.lock().await;
         let terminal_append =
             TerminalAppendGuard::new(Arc::clone(&self.terminal_events), items.as_slice());
         if durable {
@@ -315,11 +331,7 @@ impl LiveThread {
                 .await?;
         }
         terminal_append.commit(items.as_slice());
-        let update = self
-            .metadata_sync
-            .lock()
-            .await
-            .observe_appended_items(items.as_slice());
+        let update = metadata_sync.observe_appended_items(items.as_slice());
         if durable && let Some(update) = update {
             self.thread_store
                 .update_thread_metadata(UpdateThreadMetadataParams {
@@ -328,32 +340,41 @@ impl LiveThread {
                     include_archived: true,
                 })
                 .await?;
-            self.metadata_sync
-                .lock()
-                .await
-                .mark_pending_update_applied(&update);
+            metadata_sync.mark_pending_update_applied(&update);
         }
         Ok(())
     }
 
+    #[expect(clippy::await_holding_invalid_type, reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations")]
     pub async fn persist(&self) -> ThreadStoreResult<()> {
+        let mut metadata_sync = self.metadata_sync.lock().await;
         self.thread_store.persist_thread(self.thread_id).await?;
-        self.flush_pending_metadata_update().await
+        let update = metadata_sync.take_pending_update();
+        self.apply_pending_metadata_update(&mut metadata_sync, update)
+            .await
     }
 
+    #[expect(clippy::await_holding_invalid_type, reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations")]
     pub async fn flush(&self) -> ThreadStoreResult<()> {
+        let mut metadata_sync = self.metadata_sync.lock().await;
         self.thread_store.flush_thread(self.thread_id).await?;
-        self.flush_pending_metadata_update_for_existing_history()
+        let update = metadata_sync.take_pending_update_for_existing_history();
+        self.apply_pending_metadata_update(&mut metadata_sync, update)
             .await
     }
 
+    #[expect(clippy::await_holding_invalid_type, reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations")]
     pub async fn shutdown(&self) -> ThreadStoreResult<()> {
+        let mut metadata_sync = self.metadata_sync.lock().await;
         self.thread_store.shutdown_thread(self.thread_id).await?;
-        self.flush_pending_metadata_update_for_existing_history()
+        let update = metadata_sync.take_pending_update_for_existing_history();
+        self.apply_pending_metadata_update(&mut metadata_sync, update)
             .await
     }
 
+    #[expect(clippy::await_holding_invalid_type, reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations")]
     pub async fn discard(&self) -> ThreadStoreResult<()> {
+        let _metadata_sync = self.metadata_sync.lock().await;
         self.thread_store.discard_thread(self.thread_id).await
     }
 
@@ -369,16 +390,18 @@ impl LiveThread {
             .await
     }
 
-    /// Returns the first terminal event persisted for `turn_id`.
+    /// Returns the first terminal event accepted into the canonical stream for `turn_id`.
+    /// An indexed result does not itself establish durability.
     ///
     /// Successful live appends and resume history keep this lookup process-local. A full history
     /// read is reserved for an ambiguous append whose future was cancelled or returned an error.
+    #[expect(clippy::await_holding_invalid_type, reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations")]
     pub async fn terminal_event(
         &self,
         turn_id: &str,
         include_archived: bool,
     ) -> ThreadStoreResult<Option<EventMsg>> {
-        let revision = {
+        {
             let terminal_events = self
                 .terminal_events
                 .lock()
@@ -386,27 +409,37 @@ impl LiveThread {
             if terminal_events.trusted && terminal_events.pending_terminal_appends == 0 {
                 return Ok(terminal_events.by_turn_id.get(turn_id).cloned());
             }
+        }
+
+        let _metadata_sync = self.metadata_sync.lock().await;
+        let revision = {
+            let terminal_events = self
+                .terminal_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // An append or another recovery may have repaired the index while we waited.
+            if terminal_events.trusted && terminal_events.pending_terminal_appends == 0 {
+                return Ok(terminal_events.by_turn_id.get(turn_id).cloned());
+            }
             terminal_events.revision
         };
-
+        // Recovery reads must include accepted ordered appends, even in a lazy writer.
+        // The normal trusted lookup above never forces persistence.
+        self.thread_store.persist_thread(self.thread_id).await?;
         let history = self.load_history(include_archived).await?;
-        let loaded_event = history.items.iter().find_map(|item| {
-            let RolloutItem::EventMsg(event) = item else {
-                return None;
-            };
-            (terminal_event_turn_id(event) == Some(turn_id)).then(|| event.clone())
-        });
+        let mut replacement = TerminalEventIndex::from_items(&history.items);
+        let loaded_event = replacement.by_turn_id.get(turn_id).cloned();
         let mut terminal_events = self
             .terminal_events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if terminal_events.revision == revision && terminal_events.pending_terminal_appends == 0 {
-            let next_revision = terminal_events.revision;
-            *terminal_events = TerminalEventIndex::from_items(&history.items);
-            terminal_events.revision = next_revision;
+            replacement.revision = terminal_events.revision;
+            std::mem::swap(&mut *terminal_events, &mut replacement);
         } else if terminal_events.trusted && terminal_events.pending_terminal_appends == 0 {
             return Ok(terminal_events.by_turn_id.get(turn_id).cloned());
         }
+        drop(terminal_events);
         Ok(loaded_event)
     }
 
@@ -424,12 +457,16 @@ impl LiveThread {
             .await
     }
 
+    #[expect(clippy::await_holding_invalid_type, reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations")]
     pub async fn update_memory_mode(
         &self,
         mode: ThreadMemoryMode,
         include_archived: bool,
     ) -> ThreadStoreResult<()> {
-        self.flush_pending_metadata_update().await?;
+        let mut metadata_sync = self.metadata_sync.lock().await;
+        let update = metadata_sync.take_pending_update();
+        self.apply_pending_metadata_update(&mut metadata_sync, update)
+            .await?;
         self.thread_store
             .update_thread_metadata(UpdateThreadMetadataParams {
                 thread_id: self.thread_id,
@@ -443,12 +480,16 @@ impl LiveThread {
         Ok(())
     }
 
+    #[expect(clippy::await_holding_invalid_type, reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations")]
     pub async fn update_metadata(
         &self,
         patch: ThreadMetadataPatch,
         include_archived: bool,
     ) -> ThreadStoreResult<StoredThread> {
-        self.flush_pending_metadata_update().await?;
+        let mut metadata_sync = self.metadata_sync.lock().await;
+        let update = metadata_sync.take_pending_update();
+        self.apply_pending_metadata_update(&mut metadata_sync, update)
+            .await?;
         self.thread_store
             .update_thread_metadata(UpdateThreadMetadataParams {
                 thread_id: self.thread_id,
@@ -475,22 +516,9 @@ impl LiveThread {
             .map(Some)
     }
 
-    async fn flush_pending_metadata_update(&self) -> ThreadStoreResult<()> {
-        let update = self.metadata_sync.lock().await.take_pending_update();
-        self.apply_pending_metadata_update(update).await
-    }
-
-    async fn flush_pending_metadata_update_for_existing_history(&self) -> ThreadStoreResult<()> {
-        let update = self
-            .metadata_sync
-            .lock()
-            .await
-            .take_pending_update_for_existing_history();
-        self.apply_pending_metadata_update(update).await
-    }
-
     async fn apply_pending_metadata_update(
         &self,
+        metadata_sync: &mut ThreadMetadataSync,
         update: Option<crate::thread_metadata_sync::PendingThreadMetadataPatch>,
     ) -> ThreadStoreResult<()> {
         let Some(update) = update else {
@@ -503,10 +531,151 @@ impl LiveThread {
                 include_archived: true,
             })
             .await?;
-        self.metadata_sync
-            .lock()
-            .await
-            .mark_pending_update_applied(&update);
+        metadata_sync.mark_pending_update_applied(&update);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::InMemoryThreadStore;
+    use crate::LocalThreadStoreConfig;
+    use crate::ThreadPersistenceMetadata;
+    use codex_protocol::models::BaseInstructions;
+    use codex_protocol::protocol::SessionSource;
+    use codex_protocol::protocol::TurnCompleteEvent;
+
+    fn create_params(thread_id: ThreadId, cwd: PathBuf) -> CreateThreadParams {
+        CreateThreadParams {
+            session_id: thread_id.into(),
+            thread_id,
+            extra_config: None,
+            forked_from_id: None,
+            parent_thread_id: None,
+            source: SessionSource::Exec,
+            thread_source: None,
+            originator: "test".to_string(),
+            base_instructions: BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: ThreadHistoryMode::Legacy,
+            initial_window_id: uuid::Uuid::now_v7().to_string(),
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(cwd),
+                model_provider: "test-provider".to_string(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        }
+    }
+
+    fn terminal(turn: &str) -> RolloutItem {
+        RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+            surfaced_result: None,
+            turn_id: turn.to_string(),
+            last_agent_message: None,
+            error: None,
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
+            timing: None,
+        }))
+    }
+
+    #[tokio::test]
+    async fn terminal_recovery_includes_queued_local_appends() {
+        let home = tempfile::TempDir::new().expect("temp dir");
+        let store = Arc::new(LocalThreadStore::new(
+            LocalThreadStoreConfig {
+                codex_home: home.path().to_path_buf(),
+                sqlite_home: home.path().to_path_buf(),
+                default_model_provider_id: "test-provider".to_string(),
+            },
+            None,
+        ));
+        let thread_id = ThreadId::new();
+        let live = LiveThread::create(
+            store.clone(),
+            create_params(thread_id, home.path().to_path_buf()),
+        )
+        .await
+        .expect("create live thread");
+        let path = store
+            .live_rollout_path(thread_id)
+            .await
+            .expect("rollout path");
+        live.append_items_ordered(&[terminal("first")])
+            .await
+            .expect("queue terminal");
+        assert!(!path.exists(), "ordered append remains lazy");
+        // Dropping an uncommitted append guard models the ambiguous cancellation path.
+        drop(TerminalAppendGuard::new(
+            live.terminal_events.clone(),
+            &[terminal("cancelled")],
+        ));
+        assert!(
+            matches!(live.terminal_event("first", true).await.expect("recovery"),
+            Some(EventMsg::TurnComplete(event)) if event.turn_id == "first")
+        );
+        assert!(
+            live.terminal_event("cancelled", true)
+                .await
+                .expect("absent event")
+                .is_none()
+        );
+        assert!(live.terminal_events.lock().expect("index").trusted);
+        let history = live
+            .load_history(true)
+            .await
+            .expect("persisted recovery history");
+        assert_eq!(
+            history
+                .items
+                .iter()
+                .filter(|item| matches!(item,
+            RolloutItem::EventMsg(EventMsg::TurnComplete(event)) if event.turn_id == "first"))
+                .count(),
+            1
+        );
+        live.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    #[expect(clippy::await_holding_invalid_type, reason = "Holds the metadata owner to assert that history submission waits for its release")]
+    async fn append_waits_for_metadata_owner_before_submitting_history() {
+        let store = Arc::new(InMemoryThreadStore::default());
+        let live = LiveThread::create(
+            store.clone(),
+            create_params(ThreadId::new(), PathBuf::new()),
+        )
+        .await
+        .expect("create live thread");
+        let owner = live.metadata_sync.lock().await;
+        let items = [terminal("ordered")];
+        let append = live.append_items_ordered(&items);
+        tokio::pin!(append);
+        assert!(matches!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                append.as_mut(),
+                cx
+            )))
+            .await,
+            std::task::Poll::Pending
+        ));
+        assert_eq!(
+            store.calls().await.append_items,
+            0,
+            "history must wait for the same owner as metadata"
+        );
+        drop(owner);
+        append.await.expect("append after owner releases");
+        assert_eq!(store.calls().await.append_items, 1);
+        assert!(
+            live.terminal_event("ordered", true)
+                .await
+                .expect("lookup")
+                .is_some()
+        );
     }
 }

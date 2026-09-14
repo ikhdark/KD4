@@ -203,6 +203,8 @@ pub(super) struct ProcessTerminationOwner {
     pub(super) runtime: tokio::runtime::Handle,
 }
 
+type TerminalCompletionReceiver = watch::Receiver<Option<Result<(), String>>>;
+
 /// Unified wrapper over directly spawned PTY sessions and exec-server-backed
 /// processes.
 pub(crate) struct UnifiedExecProcess {
@@ -225,8 +227,7 @@ pub(crate) struct UnifiedExecProcess {
     interaction_lock: Arc<Mutex<()>>,
     state_tx: watch::Sender<ProcessState>,
     state_rx: watch::Receiver<ProcessState>,
-    terminal_completion: StdMutex<Option<watch::Receiver<Option<Result<(), String>>>>>,
-    output_task: Option<JoinHandle<()>>,
+    terminal_completion: StdMutex<Option<TerminalCompletionReceiver>>,
     output_shutdown: CancellationToken,
     raw_output_artifact: Option<Arc<Mutex<RawOutputArtifact>>>,
     sandbox_type: SandboxType,
@@ -309,7 +310,6 @@ impl UnifiedExecProcess {
             state_tx,
             state_rx,
             terminal_completion: StdMutex::new(None),
-            output_task: None,
             output_shutdown: CancellationToken::new(),
             raw_output_artifact: raw_output_artifact.map(|artifact| Arc::new(Mutex::new(artifact))),
             sandbox_type,
@@ -704,14 +704,15 @@ impl UnifiedExecProcess {
             stderr_rx,
             mut exit_rx,
         } = spawned;
-        let mut managed = Self::new(
+        let managed = Self::new(
             ProcessHandle::Local(Arc::new(process_handle)),
             sandbox_type,
             Some(spawn_lifecycle),
             raw_output_artifact,
         );
         let output_handles = managed.output_handles();
-        managed.output_task = Some(Self::spawn_local_output_task(
+        // Output completion is tracked by closure/drain signals; detach the task.
+        drop(Self::spawn_local_output_task(
             stdout_rx,
             stderr_rx,
             output_handles,
@@ -799,14 +800,15 @@ impl UnifiedExecProcess {
         pending_spawns: &PendingSpawnRegistration,
     ) -> Result<Arc<Self>, UnifiedExecError> {
         let process_handle = ProcessHandle::ExecServer(Arc::clone(&started.process));
-        let mut managed = Self::new(
+        let managed = Self::new(
             process_handle,
             SandboxType::None,
             /*spawn_lifecycle*/ None,
             raw_output_artifact,
         );
         let output_handles = managed.output_handles();
-        managed.output_task = Some(Self::spawn_exec_server_output_task(
+        // Shutdown and output closure remain owned by their existing signals.
+        drop(Self::spawn_exec_server_output_task(
             started,
             output_handles,
             managed.output_tx.clone(),

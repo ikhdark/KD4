@@ -512,12 +512,12 @@ pub async fn reconcile_rollout(
     items: &[RolloutItem],
     archived_only: Option<bool>,
     new_thread_memory_mode: Option<&str>,
-) {
+) -> bool {
     let Some(ctx) = context else {
-        return;
+        return false;
     };
     if builder.is_some() || !items.is_empty() {
-        apply_rollout_items(
+        return apply_rollout_items(
             Some(ctx),
             rollout_path,
             default_provider,
@@ -528,7 +528,6 @@ pub async fn reconcile_rollout(
             /*updated_at_override*/ None,
         )
         .await;
-        return;
     }
     let outcome =
         match metadata::extract_metadata_from_rollout(rollout_path, default_provider).await {
@@ -538,7 +537,7 @@ pub async fn reconcile_rollout(
                     "state db reconcile_rollout extraction failed {}: {err}",
                     rollout_path.display()
                 );
-                return;
+                return false;
             }
         };
     let parent_thread_id = outcome.parent_thread_id;
@@ -563,7 +562,7 @@ pub async fn reconcile_rollout(
             "state db reconcile_rollout upsert failed {}: {err}",
             rollout_path.display()
         );
-        return;
+        return false;
     }
     if let Some(parent_thread_id) = parent_thread_id
         && let Err(err) = ctx
@@ -574,7 +573,7 @@ pub async fn reconcile_rollout(
             "state db reconcile_rollout parent edge update failed {}: {err}",
             rollout_path.display()
         );
-        return;
+        return false;
     }
     if let Err(err) = ctx
         .set_thread_memory_mode(metadata.id, memory_mode.as_str())
@@ -584,7 +583,9 @@ pub async fn reconcile_rollout(
             "state db reconcile_rollout memory_mode update failed {}: {err}",
             rollout_path.display()
         );
+        return false;
     }
+    true
 }
 
 /// Repair a thread's rollout path after filesystem fallback succeeds.
@@ -661,9 +662,9 @@ pub async fn apply_rollout_items(
     stage: &str,
     new_thread_memory_mode: Option<&str>,
     updated_at_override: Option<DateTime<Utc>>,
-) {
+) -> bool {
     let Some(ctx) = context else {
-        return;
+        return false;
     };
     let mut builder = match builder {
         Some(builder) => builder.clone(),
@@ -675,7 +676,7 @@ pub async fn apply_rollout_items(
                     rollout_path.display()
                 );
                 warn!("state db discrepancy during apply_rollout_items: {stage}, missing_builder");
-                return;
+                return false;
             }
         },
     };
@@ -692,7 +693,9 @@ pub async fn apply_rollout_items(
             "state db apply_rollout_items failed during {stage} for {}: {err}",
             rollout_path.display()
         );
+        return false;
     }
+    true
 }
 
 pub async fn touch_thread_updated_at(

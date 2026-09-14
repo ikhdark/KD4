@@ -232,46 +232,49 @@ impl StateRuntime {
             &transaction_result,
         );
         let mut tx = transaction_result?;
-        let mut builder = QueryBuilder::<Sqlite>::new(
-            "INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, thread_id, process_uuid, module_path, file, line, estimated_bytes) ",
-        );
-        builder.push_values(entries, |mut row, entry| {
-            let feedback_log_body = entry.feedback_log_body.as_ref().or(entry.message.as_ref());
-            // Keep about 10 MiB of reader-visible log content per partition.
-            // Both `query_logs` and `/feedback` read the persisted
-            // `feedback_log_body`, while `LogEntry.message` is only a write-time
-            // fallback for callers that still populate the old field.
-            let estimated_bytes = feedback_log_body.map_or(0, String::len) as i64
-                + entry.level.len() as i64
-                + entry.target.len() as i64
-                + entry.module_path.as_ref().map_or(0, String::len) as i64
-                + entry.file.as_ref().map_or(0, String::len) as i64;
-            row.push_bind(entry.ts)
-                .push_bind(entry.ts_nanos)
-                .push_bind(&entry.level)
-                .push_bind(&entry.target)
-                .push_bind(feedback_log_body)
-                .push_bind(&entry.thread_id)
-                .push_bind(&entry.process_uuid)
-                .push_bind(&entry.module_path)
-                .push_bind(&entry.file)
-                .push_bind(entry.line)
-                .push_bind(estimated_bytes);
-        });
-        let started = Instant::now();
-        let insert_result = builder
-            .build()
-            .execute(&mut *tx)
-            .await
-            .map_err(anyhow::Error::from);
-        crate::telemetry::record_log_phase(
-            self.db_telemetry.as_deref(),
-            "insert",
-            "execute",
-            started.elapsed(),
-            &insert_result,
-        );
-        insert_result?;
+        // Eleven binds per row; cap each statement below SQLite's 32,766 limit.
+        for entries in entries.chunks(2_978) {
+            let mut builder = QueryBuilder::<Sqlite>::new(
+                "INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, thread_id, process_uuid, module_path, file, line, estimated_bytes) ",
+            );
+            builder.push_values(entries, |mut row, entry| {
+                let feedback_log_body = entry.feedback_log_body.as_ref().or(entry.message.as_ref());
+                // Keep about 10 MiB of reader-visible log content per partition.
+                // Both `query_logs` and `/feedback` read the persisted
+                // `feedback_log_body`, while `LogEntry.message` is only a write-time
+                // fallback for callers that still populate the old field.
+                let estimated_bytes = feedback_log_body.map_or(0, String::len) as i64
+                    + entry.level.len() as i64
+                    + entry.target.len() as i64
+                    + entry.module_path.as_ref().map_or(0, String::len) as i64
+                    + entry.file.as_ref().map_or(0, String::len) as i64;
+                row.push_bind(entry.ts)
+                    .push_bind(entry.ts_nanos)
+                    .push_bind(&entry.level)
+                    .push_bind(&entry.target)
+                    .push_bind(feedback_log_body)
+                    .push_bind(&entry.thread_id)
+                    .push_bind(&entry.process_uuid)
+                    .push_bind(&entry.module_path)
+                    .push_bind(&entry.file)
+                    .push_bind(entry.line)
+                    .push_bind(estimated_bytes);
+            });
+            let started = Instant::now();
+            let insert_result = builder
+                .build()
+                .execute(&mut *tx)
+                .await
+                .map_err(anyhow::Error::from);
+            crate::telemetry::record_log_phase(
+                self.db_telemetry.as_deref(),
+                "insert",
+                "execute",
+                started.elapsed(),
+                &insert_result,
+            );
+            insert_result?;
+        }
         let started = Instant::now();
         let commit_result = tx.commit().await.map_err(anyhow::Error::from);
         crate::telemetry::record_log_phase(
@@ -621,22 +624,11 @@ WHERE id IN (
         Ok(())
     }
 
-    pub(crate) async fn delete_logs_before(&self, cutoff_ts: i64) -> anyhow::Result<u64> {
-        let result = sqlx::query("DELETE FROM logs WHERE ts < ?")
-            .bind(cutoff_ts)
-            .execute(self.logs_pool.as_ref())
+    /// Explicit retention reconciliation for runtimes without a log inserter.
+    /// The log inserter schedules this retention work in its maintenance task.
+    pub async fn run_logs_startup_maintenance(&self) -> anyhow::Result<()> {
+        self.prune_log_retention(LogRetentionScope::for_reconciliation())
             .await?;
-        Ok(result.rows_affected())
-    }
-
-    pub(crate) async fn run_logs_startup_maintenance(&self) -> anyhow::Result<()> {
-        let Some(cutoff) =
-            Utc::now().checked_sub_signed(chrono::Duration::days(LOG_RETENTION_DAYS))
-        else {
-            return Ok(());
-        };
-        self.delete_logs_before(cutoff.timestamp()).await?;
-        // Startup cleanup should not wait behind or block foreground work.
         // PASSIVE checkpoints copy whatever is immediately available and skip
         // frames that would require waiting on active readers or writers.
         sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
@@ -647,24 +639,7 @@ WHERE id IN (
 
     /// Query logs with optional filters.
     pub async fn query_logs(&self, query: &LogQuery) -> anyhow::Result<Vec<LogRow>> {
-        let mut builder = QueryBuilder::<Sqlite>::new(
-            "SELECT id, ts, ts_nanos, level, target, feedback_log_body AS message, thread_id, process_uuid, file, line FROM logs WHERE 1 = 1",
-        );
-        push_log_filters(&mut builder, query);
-        if query.descending {
-            builder.push(" ORDER BY id DESC");
-        } else {
-            builder.push(" ORDER BY id ASC");
-        }
-        if let Some(limit) = query.limit {
-            builder.push(" LIMIT ").push_bind(limit as i64);
-        }
-
-        let rows = builder
-            .build_query_as::<LogRow>()
-            .fetch_all(self.logs_pool.as_ref())
-            .await?;
-        Ok(rows)
+        query_logs(self.logs_pool.as_ref(), query).await
     }
 
     /// Query feedback logs for a set of threads, capped to the SQLite retention budget.
@@ -773,13 +748,61 @@ WHERE cumulative_estimated_bytes <=
 
     /// Return the max log id matching optional filters.
     pub async fn max_log_id(&self, query: &LogQuery) -> anyhow::Result<i64> {
-        let mut builder =
-            QueryBuilder::<Sqlite>::new("SELECT MAX(id) AS max_id FROM logs WHERE 1 = 1");
-        push_log_filters(&mut builder, query);
-        let row = builder.build().fetch_one(self.logs_pool.as_ref()).await?;
-        let max_id: Option<i64> = row.try_get("max_id")?;
-        Ok(max_id.unwrap_or(0))
+        max_log_id(self.logs_pool.as_ref(), query).await
     }
+}
+
+/// Read-only access to an existing logs database, without initializing other stores.
+pub struct LogReader {
+    pool: SqlitePool,
+}
+
+impl LogReader {
+    pub async fn open(path: &Path) -> anyhow::Result<Self> {
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .read_only(true)
+            .disable_statement_logging();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
+        Ok(Self { pool })
+    }
+
+    pub async fn query_logs(&self, query: &LogQuery) -> anyhow::Result<Vec<LogRow>> {
+        query_logs(&self.pool, query).await
+    }
+
+    pub async fn max_log_id(&self, query: &LogQuery) -> anyhow::Result<i64> {
+        max_log_id(&self.pool, query).await
+    }
+}
+
+async fn query_logs(pool: &SqlitePool, query: &LogQuery) -> anyhow::Result<Vec<LogRow>> {
+    let mut builder = QueryBuilder::<Sqlite>::new(
+        "SELECT id, ts, ts_nanos, level, target, feedback_log_body AS message, thread_id, process_uuid, file, line FROM logs WHERE 1 = 1",
+    );
+    push_log_filters(&mut builder, query);
+    if query.descending {
+        builder.push(" ORDER BY id DESC");
+    } else {
+        builder.push(" ORDER BY id ASC");
+    }
+    if let Some(limit) = query.limit {
+        builder.push(" LIMIT ").push_bind(limit as i64);
+    }
+
+    let rows = builder.build_query_as::<LogRow>().fetch_all(pool).await?;
+    Ok(rows)
+}
+
+async fn max_log_id(pool: &SqlitePool, query: &LogQuery) -> anyhow::Result<i64> {
+    let mut builder = QueryBuilder::<Sqlite>::new("SELECT MAX(id) AS max_id FROM logs WHERE 1 = 1");
+    push_log_filters(&mut builder, query);
+    let row = builder.build().fetch_one(pool).await?;
+    let max_id: Option<i64> = row.try_get("max_id")?;
+    Ok(max_id.unwrap_or(0))
 }
 
 #[derive(sqlx::FromRow)]
@@ -976,6 +999,84 @@ mod tests {
             .expect("count log rows");
         pool.close().await;
         count
+    }
+
+    #[tokio::test]
+    async fn runtime_init_defers_log_retention_until_explicit_maintenance() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = StateRuntime::init(temp.path().to_path_buf(), "test-provider".to_string())
+            .await
+            .expect("runtime");
+        let mut expired = test_log("expired", "thread");
+        expired.ts = (Utc::now() - chrono::Duration::days(11)).timestamp();
+        runtime
+            .insert_logs_deferred_retention(&[expired])
+            .await
+            .expect("seed expired log");
+        runtime.close().await;
+        let runtime = StateRuntime::init(temp.path().to_path_buf(), "test-provider".to_string())
+            .await
+            .expect("reopen runtime");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM logs")
+                .fetch_one(runtime.logs_pool.as_ref())
+                .await
+                .expect("before maintenance"),
+            1
+        );
+        runtime
+            .run_logs_startup_maintenance()
+            .await
+            .expect("explicit maintenance");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM logs")
+                .fetch_one(runtime.logs_pool.as_ref())
+                .await
+                .expect("after maintenance"),
+            0
+        );
+        runtime.close().await;
+    }
+
+    #[tokio::test]
+    async fn large_log_batches_are_atomic_across_parameter_chunks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = StateRuntime::init(temp.path().to_path_buf(), "test-provider".to_string())
+            .await
+            .expect("runtime");
+        let entries = (0..3_000)
+            .map(|i| test_log(&format!("entry-{i}"), "batch-thread"))
+            .collect::<Vec<_>>();
+        runtime
+            .insert_logs_deferred_retention(&entries)
+            .await
+            .expect("large batch");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM logs")
+                .fetch_one(runtime.logs_pool.as_ref())
+                .await
+                .expect("count logs"),
+            3_000
+        );
+        sqlx::query("DELETE FROM logs")
+            .execute(runtime.logs_pool.as_ref())
+            .await
+            .expect("clear logs");
+        sqlx::query("CREATE TRIGGER reject_last_log BEFORE INSERT ON logs WHEN NEW.feedback_log_body = 'entry-2999' BEGIN SELECT RAISE(ABORT, 'injected late failure'); END")
+            .execute(runtime.logs_pool.as_ref()).await.expect("failure trigger");
+        let err = runtime
+            .insert_logs_deferred_retention(&entries)
+            .await
+            .expect_err("late insert failure");
+        assert!(err.to_string().contains("injected late failure"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM logs")
+                .fetch_one(runtime.logs_pool.as_ref())
+                .await
+                .expect("count rolled back logs"),
+            0
+        );
+        runtime.close().await;
     }
 
     #[tokio::test]

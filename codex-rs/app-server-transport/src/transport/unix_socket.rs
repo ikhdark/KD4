@@ -19,6 +19,9 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 
+// Local clients must finish setup promptly; idle partial HTTP requests retain a socket/task.
+pub(super) const CONTROL_SOCKET_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub async fn start_control_socket_acceptor(
     socket_path: AbsolutePathBuf,
     transport_event_tx: mpsc::Sender<TransportEvent>,
@@ -75,12 +78,11 @@ async fn run_control_socket_acceptor(
 
         let transport_event_tx = transport_event_tx.clone();
         let connection_shutdown = shutdown_token.clone();
-        connection_tasks.spawn(async move {
-            tokio::select! {
-                _ = connection_shutdown.cancelled() => {}
-                _ = run_control_socket_connection(stream, transport_event_tx) => {}
-            }
-        });
+        connection_tasks.spawn(run_control_socket_connection(
+            stream,
+            transport_event_tx,
+            connection_shutdown,
+        ));
     }
     connection_tasks.close();
     connection_tasks.wait().await;
@@ -90,16 +92,32 @@ async fn run_control_socket_acceptor(
 async fn run_control_socket_connection(
     stream: UnixStream,
     transport_event_tx: mpsc::Sender<TransportEvent>,
+    shutdown_token: CancellationToken,
 ) {
-    let websocket_stream = match accept_async(stream).await {
-        Ok(websocket_stream) => websocket_stream,
-        Err(err) => {
+    let handshake = tokio::select! {
+        biased;
+        _ = shutdown_token.cancelled() => return,
+        result = tokio::time::timeout(CONTROL_SOCKET_HANDSHAKE_TIMEOUT, accept_async(stream)) => result,
+    };
+    let websocket_stream = match handshake {
+        Ok(Ok(websocket_stream)) => websocket_stream,
+        Ok(Err(err)) => {
             warn!("failed to upgrade control socket websocket connection: {err}");
+            return;
+        }
+        Err(_) => {
+            warn!("control socket websocket handshake timed out");
             return;
         }
     };
     let (websocket_writer, websocket_reader) = websocket_stream.split();
-    run_websocket_connection(websocket_writer, websocket_reader, transport_event_tx).await;
+    run_websocket_connection(
+        websocket_writer,
+        websocket_reader,
+        transport_event_tx,
+        shutdown_token,
+    )
+    .await;
 }
 
 pub async fn prepare_control_socket_path(socket_path: &Path) -> IoResult<()> {
@@ -153,18 +171,25 @@ pub async fn acquire_app_server_startup_lock(
     if let Some(parent) = startup_lock_path.as_path().parent() {
         codex_uds::prepare_private_socket_directory(parent).await?;
     }
-    tokio::task::spawn_blocking(move || {
-        let file = OpenOptions::new()
+    let file = tokio::task::spawn_blocking(move || {
+        OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(startup_lock_path.as_path())?;
-        file.lock()?;
-        Ok(AppServerStartupLock { _file: file })
+            .open(startup_lock_path.as_path())
     })
     .await
-    .map_err(|err| std::io::Error::other(format!("startup lock task failed: {err}")))?
+    .map_err(|err| std::io::Error::other(format!("startup lock task failed: {err}")))??;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(AppServerStartupLock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(std::fs::TryLockError::Error(err)) => return Err(err),
+        }
+    }
 }
 
 async fn set_control_socket_permissions(_socket_path: &Path) -> IoResult<()> {

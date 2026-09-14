@@ -15,6 +15,23 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+/// A local destination explicitly authorized by the request's host policy.
+/// The socket check still restricts the actual resolved address to this destination.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum LocalTarget {
+    Ip(std::net::IpAddr),
+    Loopback,
+}
+
+impl LocalTarget {
+    fn permits(self, ip: std::net::IpAddr) -> bool {
+        match self {
+            Self::Ip(expected) => ip == expected,
+            Self::Loopback => ip.is_loopback(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct TargetCheckedTcpConnector {
     policy: TargetPolicy,
@@ -52,6 +69,7 @@ where
         TcpConnector::new()
             .with_connector(TargetCheckedStreamConnector {
                 policy: self.policy.clone(),
+                local_target: input.extensions().get::<LocalTarget>().copied(),
             })
             .serve(input)
             .await
@@ -61,13 +79,19 @@ where
 #[derive(Clone)]
 struct TargetCheckedStreamConnector {
     policy: TargetPolicy,
+    local_target: Option<LocalTarget>,
 }
 
 impl TcpStreamConnector for TargetCheckedStreamConnector {
     type Error = BoxError;
 
     async fn connect(&self, addr: SocketAddr) -> Result<TcpStream, Self::Error> {
-        if !self.policy.allow_local_binding().await? && is_non_public_ip(addr.ip()) {
+        if !self.policy.allow_local_binding().await?
+            && is_non_public_ip(addr.ip())
+            && !self
+                .local_target
+                .is_some_and(|target| target.permits(addr.ip()))
+        {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "network target rejected by policy",
@@ -112,6 +136,29 @@ mod tests {
     use rama_net::address::HostWithPort;
     use std::net::Ipv4Addr;
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn explicit_local_target_only_authorizes_the_selected_address() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let connector = TargetCheckedTcpConnector::from_allow_local_binding(false);
+        let mut wrong = rama_tcp::client::Request::new(HostWithPort::from(target));
+        wrong
+            .extensions_mut()
+            .insert(LocalTarget::Ip("127.0.0.2".parse().unwrap()));
+        let error = connector.serve(wrong).await.unwrap_err();
+        assert!(format!("{error:?}").contains("network target rejected by policy"));
+
+        let mut allowed = rama_tcp::client::Request::new(HostWithPort::from(target));
+        allowed
+            .extensions_mut()
+            .insert(LocalTarget::Ip(target.ip()));
+        let connected = connector.serve(allowed).await.unwrap();
+        let (_, peer) = listener.accept().await.unwrap();
+        assert!(peer.ip().is_loopback());
+        drop(connected);
+        assert!(!LocalTarget::Loopback.permits("10.0.0.1".parse().unwrap()));
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn direct_connector_rejects_non_public_target_when_local_binding_disabled() {

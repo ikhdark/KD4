@@ -100,12 +100,15 @@ where
     K: Eq + Hash,
 {
     let runtime = tokio::runtime::Handle::try_current().ok()?;
+    if let Ok(guard) = m.try_lock() {
+        return Some(guard);
+    }
     if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
         Some(tokio::task::block_in_place(|| m.blocking_lock()))
     } else {
         // Blocking here can prevent the task holding the mutex from progressing,
         // and block_in_place panics on a current-thread runtime.
-        m.try_lock().ok()
+        None
     }
 }
 

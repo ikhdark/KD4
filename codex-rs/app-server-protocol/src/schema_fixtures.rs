@@ -16,7 +16,6 @@ use anyhow::Result;
 use serde_json::Map;
 use serde_json::Value;
 use std::any::TypeId;
-use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::path::Path;
@@ -76,11 +75,12 @@ pub fn write_schema_fixtures_with_options(
     prettier: Option<&Path>,
     options: SchemaFixtureOptions,
 ) -> Result<()> {
-    let typescript_out_dir = schema_root.join("typescript");
-    let json_out_dir = schema_root.join("json");
-
-    ensure_empty_dir(&typescript_out_dir)?;
-    ensure_empty_dir(&json_out_dir)?;
+    std::fs::create_dir_all(schema_root)?;
+    let staging = tempfile::Builder::new()
+        .prefix(".schema-staging-")
+        .tempdir_in(schema_root)?;
+    let typescript_out_dir = staging.path().join("typescript");
+    let json_out_dir = staging.path().join("json");
 
     crate::generate_ts_with_options(
         &typescript_out_dir,
@@ -92,15 +92,17 @@ pub fn write_schema_fixtures_with_options(
     )?;
     crate::generate_json_with_experimental(&json_out_dir, options.experimental_api)?;
 
-    Ok(())
-}
-
-fn ensure_empty_dir(dir: &Path) -> Result<()> {
-    if dir.exists() {
-        std::fs::remove_dir_all(dir)
-            .with_context(|| format!("failed to remove {}", dir.display()))?;
+    // Publish only after both generators (including the formatter) succeed.
+    // Replacement of the two owned subtrees is not a two-directory transaction.
+    for label in ["typescript", "json"] {
+        let destination = schema_root.join(label);
+        if destination.exists() {
+            std::fs::remove_dir_all(&destination)
+                .with_context(|| format!("failed to remove {}", destination.display()))?;
+        }
+        std::fs::rename(staging.path().join(label), &destination)
+            .with_context(|| format!("failed to publish {}", destination.display()))?;
     }
-    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     Ok(())
 }
 
@@ -132,80 +134,91 @@ fn read_file_bytes(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+// Only schema keywords define unordered arrays. Literal data and tuple positions
+// preserve their order even when their contents resemble schema keywords.
 fn canonicalize_json(value: &Value) -> Value {
-    match value {
-        Value::Array(items) => {
-            // NOTE: We sort some JSON arrays to make schema fixture comparisons stable across
-            // platforms.
-            //
-            // In general, JSON array ordering is significant. However, this code path is used
-            // only by `schema_fixtures_match_generated` to compare our *vendored* JSON schema
-            // files against freshly generated output. Some parts of schema generation end up
-            // with non-deterministic ordering across platforms (often due to map iteration order
-            // upstream), which can cause Windows CI failures even when the generated schema is
-            // semantically equivalent.
-            //
-            // JSON Schema itself also contains a number of array-valued keywords whose ordering
-            // does not affect validation semantics (e.g. `required`, `type`, `enum`, `anyOf`,
-            // `oneOf`, `allOf`). That makes it reasonable to treat many schema-emitted arrays as
-            // order-insensitive for the purpose of fixture diffs.
-            //
-            // To avoid accidentally changing the meaning of arrays where order *could* matter
-            // (e.g. tuple validation / `prefixItems`-style arrays), we only sort arrays when we
-            // can derive a stable sort key for *every* element. If we cannot, we preserve the
-            // original ordering.
-            let items = items.iter().map(canonicalize_json).collect::<Vec<_>>();
-            let mut sortable = Vec::with_capacity(items.len());
-            for item in &items {
-                let Some(key) = schema_array_item_sort_key(item) else {
-                    return Value::Array(items);
-                };
-                let stable = serde_json::to_string(item).unwrap_or_default();
-                sortable.push((key, stable));
+    let Value::Object(map) = value else {
+        return canonicalize_literal(value);
+    };
+    let mut sorted = Map::new();
+    for (key, child) in map {
+        let normalized = match key.as_str() {
+            "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas" => {
+                if let Value::Object(entries) = child {
+                    Value::Object(
+                        entries
+                            .iter()
+                            .map(|(name, schema)| {
+                                // Mixed app-server bundles group definitions under v1/v2.
+                                let schema = if key == "definitions"
+                                    && matches!(name.as_str(), "v1" | "v2")
+                                {
+                                    match schema.as_object() {
+                                        Some(namespace) => Value::Object(
+                                            namespace
+                                                .iter()
+                                                .map(|(name, schema)| {
+                                                    (name.clone(), canonicalize_json(schema))
+                                                })
+                                                .collect(),
+                                        ),
+                                        None => canonicalize_literal(schema),
+                                    }
+                                } else {
+                                    canonicalize_json(schema)
+                                };
+                                (name.clone(), schema)
+                            })
+                            .collect(),
+                    )
+                } else {
+                    canonicalize_literal(child)
+                }
             }
-
-            let mut items = items.into_iter().zip(sortable).collect::<Vec<_>>();
-
-            items.sort_by(
-                |(_, (key_left, stable_left)), (_, (key_right, stable_right))| match key_left
-                    .cmp(key_right)
-                {
-                    Ordering::Equal => stable_left.cmp(stable_right),
-                    other => other,
-                },
-            );
-
-            Value::Array(items.into_iter().map(|(item, _)| item).collect())
-        }
-        Value::Object(map) => {
-            let mut entries: Vec<_> = map.iter().collect();
-            entries.sort_by_key(|(key, _)| *key);
-            let mut sorted = Map::with_capacity(map.len());
-            for (key, child) in entries {
-                sorted.insert(key.clone(), canonicalize_json(child));
+            "anyOf" | "oneOf" | "allOf" | "items" | "prefixItems" => {
+                if let Value::Array(items) = child {
+                    let mut items: Vec<_> = items.iter().map(canonicalize_json).collect();
+                    if matches!(key.as_str(), "anyOf" | "oneOf" | "allOf") {
+                        items.sort_by_cached_key(Value::to_string);
+                    }
+                    Value::Array(items)
+                } else {
+                    canonicalize_json(child)
+                }
             }
-            Value::Object(sorted)
-        }
-        _ => value.clone(),
+            "required" | "type" | "enum" => {
+                let mut child = canonicalize_literal(child);
+                if let Value::Array(items) = &mut child {
+                    items.sort_by_cached_key(Value::to_string);
+                }
+                child
+            }
+            "additionalProperties"
+            | "additionalItems"
+            | "contains"
+            | "not"
+            | "if"
+            | "then"
+            | "else"
+            | "propertyNames"
+            | "unevaluatedProperties"
+            | "unevaluatedItems" => canonicalize_json(child),
+            _ => canonicalize_literal(child),
+        };
+        sorted.insert(key.clone(), normalized);
     }
+    Value::Object(sorted)
 }
 
-fn schema_array_item_sort_key(item: &Value) -> Option<String> {
-    match item {
-        Value::Null => Some("null".to_string()),
-        Value::Bool(b) => Some(format!("b:{b}")),
-        Value::Number(n) => Some(format!("n:{n}")),
-        Value::String(s) => Some(format!("s:{s}")),
-        Value::Object(map) => {
-            if let Some(Value::String(reference)) = map.get("$ref") {
-                Some(format!("ref:{reference}"))
-            } else if let Some(Value::String(title)) = map.get("title") {
-                Some(format!("title:{title}"))
-            } else {
-                None
-            }
-        }
-        Value::Array(_) => None,
+fn canonicalize_literal(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, child)| (key.clone(), canonicalize_literal(child)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(canonicalize_literal).collect()),
+        _ => value.clone(),
     }
 }
 
@@ -263,10 +276,17 @@ fn collect_typescript_fixture_file<T: TS + 'static + ?Sized>(
 
     let contents = T::export_to_string().context("export TypeScript fixture content")?;
     let output_path = normalize_relative_fixture_path(&output_path);
-    files.insert(
-        output_path,
-        contents.replace("\r\n", "\n").replace('\r', "\n"),
-    );
+    let contents = contents.replace("\r\n", "\n").replace('\r', "\n");
+    if let Some(existing) = files.get(&output_path) {
+        anyhow::ensure!(
+            existing == &contents,
+            "conflicting TypeScript fixture {} for {}",
+            output_path.display(),
+            std::any::type_name::<T>()
+        );
+    } else {
+        files.insert(output_path, contents);
+    }
 
     let mut visitor = TypeScriptFixtureCollector {
         files,
@@ -322,23 +342,110 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
 
-    #[test]
-    fn canonicalize_json_sorts_string_arrays() {
-        let value = serde_json::json!(["b", "a"]);
-        let expected = serde_json::json!(["a", "b"]);
-        assert_eq!(canonicalize_json(&value), expected);
+    fn read_normalized(value: Value) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("json")).unwrap();
+        std::fs::write(dir.path().join("json/schema.json"), value.to_string()).unwrap();
+        read_schema_fixture_subtree(dir.path(), "json")
+            .unwrap()
+            .remove(Path::new("schema.json"))
+            .unwrap()
     }
 
     #[test]
-    fn canonicalize_json_sorts_schema_ref_arrays() {
-        let value = serde_json::json!([
-            {"$ref": "#/definitions/B"},
-            {"$ref": "#/definitions/A"}
-        ]);
-        let expected = serde_json::json!([
-            {"$ref": "#/definitions/A"},
-            {"$ref": "#/definitions/B"}
-        ]);
-        assert_eq!(canonicalize_json(&value), expected);
+    fn fixture_reader_preserves_ordered_data_and_tuple_positions() {
+        for (left, right) in [
+            (
+                serde_json::json!({"const":[1,2]}),
+                serde_json::json!({"const":[2,1]}),
+            ),
+            (
+                serde_json::json!({"enum":[[1,2]]}),
+                serde_json::json!({"enum":[[2,1]]}),
+            ),
+            (
+                serde_json::json!({"default":{"required":["a","b"]}}),
+                serde_json::json!({"default":{"required":["b","a"]}}),
+            ),
+            (
+                serde_json::json!({"const":{"anyOf":[{"title":"A"},{"title":"B"}]}}),
+                serde_json::json!({"const":{"anyOf":[{"title":"B"},{"title":"A"}]}}),
+            ),
+            (
+                serde_json::json!({"items":[{"$ref":"#/A"},{"$ref":"#/B"}]}),
+                serde_json::json!({"items":[{"$ref":"#/B"},{"$ref":"#/A"}]}),
+            ),
+            (
+                serde_json::json!({"prefixItems":[{"title":"A"},{"title":"B"}]}),
+                serde_json::json!({"prefixItems":[{"title":"B"},{"title":"A"}]}),
+            ),
+        ] {
+            assert_ne!(read_normalized(left), read_normalized(right));
+        }
+    }
+
+    #[test]
+    fn fixture_reader_normalizes_unordered_schema_keywords() {
+        assert_eq!(
+            read_normalized(
+                serde_json::json!({"properties":{"required":{"required":["b","a"],"anyOf":[{"$ref":"#/B"},{"$ref":"#/A"}]}}})
+            ),
+            read_normalized(
+                serde_json::json!({"properties":{"required":{"required":["a","b"],"anyOf":[{"$ref":"#/A"},{"$ref":"#/B"}]}}})
+            ),
+        );
+    }
+
+    #[test]
+    fn fixture_generation_failure_preserves_existing_outputs() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        for label in ["typescript", "json"] {
+            std::fs::create_dir(dir.path().join(label))?;
+            std::fs::write(dir.path().join(label).join("previous"), "keep me")?;
+        }
+        let result = write_schema_fixtures_with_options(
+            dir.path(),
+            Some(&dir.path().join("missing-prettier")),
+            SchemaFixtureOptions::default(),
+        );
+        assert!(result.is_err());
+        for label in ["typescript", "json"] {
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(label).join("previous"))?,
+                "keep me"
+            );
+        }
+        assert_eq!(std::fs::read_dir(dir.path())?.count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn typescript_collector_rejects_conflicting_output_paths() -> Result<()> {
+        #[derive(TS)]
+        #[ts(rename = "Collision", export_to = "Collision.ts")]
+        #[expect(dead_code, reason = "Only the derived TypeScript shape is exercised")]
+        struct First {
+            value: String,
+        }
+        #[derive(TS)]
+        #[ts(rename = "Collision", export_to = "Collision.ts")]
+        #[expect(dead_code, reason = "Only the derived TypeScript shape is exercised")]
+        struct Second {
+            value: bool,
+        }
+        #[derive(TS)]
+        #[ts(rename = "Collision", export_to = "Collision.ts")]
+        #[expect(dead_code, reason = "Only the derived TypeScript shape is exercised")]
+        struct Identical {
+            value: String,
+        }
+        let mut files = BTreeMap::new();
+        let mut seen = HashSet::new();
+        collect_typescript_fixture_file::<First>(&mut files, &mut seen)?;
+        collect_typescript_fixture_file::<Identical>(&mut files, &mut seen)?;
+        let error = collect_typescript_fixture_file::<Second>(&mut files, &mut seen).unwrap_err();
+        assert!(error.to_string().contains("Collision.ts"));
+        assert!(files[Path::new("Collision.ts")].contains("value: string"));
+        Ok(())
     }
 }

@@ -148,12 +148,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print("Forcing config schema regeneration.")
                 generated_changed = regenerate_schema(root, args.owner)
             else:
-                changed = schema_inputs_changed(root, args.baseline)
-                state = "changed" if changed else "unchanged"
-                print(
-                    f"Config schema inputs are {state} relative to {args.baseline}; "
-                    "running a check-only freshness proof."
-                )
+                print("Running a check-only config schema freshness proof.")
             check_code = run_protocol_check(root)
     except GenerationLockError as error:
         print(str(error), file=sys.stderr)

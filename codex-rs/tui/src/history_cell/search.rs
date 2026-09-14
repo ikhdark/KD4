@@ -51,6 +51,24 @@ fn web_search_header(completed: bool) -> &'static str {
     }
 }
 
+#[cfg(test)]
+mod animation_tests {
+    use super::*;
+
+    #[test]
+    fn transcript_tick_advances_only_for_live_animated_search() {
+        let mut cell = WebSearchCell::new("search".into(), "query".into(), None, true);
+        let first = cell.transcript_animation_tick().expect("live search tick");
+        cell.start_time -= Duration::from_millis(100);
+        assert!(cell.transcript_animation_tick().unwrap() >= first + 2);
+        cell.completed = true;
+        assert_eq!(cell.transcript_animation_tick(), None);
+        cell.completed = false;
+        cell.animations_enabled = false;
+        assert_eq!(cell.transcript_animation_tick(), None);
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct WebSearchCell {
     call_id: String,
@@ -93,6 +111,13 @@ impl WebSearchCell {
 }
 
 impl HistoryCell for WebSearchCell {
+    fn transcript_animation_tick(&self) -> Option<u64> {
+        if self.completed || !self.animations_enabled {
+            return None;
+        }
+        Some((self.start_time.elapsed().as_millis() / 50) as u64)
+    }
+
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let bullet = if self.completed {
             "•".dim()

@@ -324,29 +324,30 @@ impl PendingAppServerRequests {
 
     pub(super) fn contains_server_request(&self, request: &ServerRequest) -> bool {
         match request {
-            ServerRequest::CommandExecutionRequestApproval { request_id, .. } => self
-                .exec_approvals
-                .values()
-                .any(|pending_request_id| pending_request_id == request_id),
-            ServerRequest::FileChangeRequestApproval { request_id, .. } => self
-                .file_change_approvals
-                .values()
-                .any(|pending_request_id| pending_request_id == request_id),
-            ServerRequest::PermissionsRequestApproval { request_id, .. } => self
-                .permissions_approvals
-                .values()
-                .any(|pending_request_id| pending_request_id == request_id),
-            ServerRequest::ToolRequestUserInput { request_id, .. } => {
-                self.user_inputs.values().any(|queue| {
-                    queue
-                        .iter()
-                        .any(|pending| &pending.request_id == request_id)
+            ServerRequest::CommandExecutionRequestApproval { request_id, params } => {
+                self.exec_approvals
+                    .get(params.approval_id.as_ref().unwrap_or(&params.item_id))
+                    == Some(request_id)
+            }
+            ServerRequest::FileChangeRequestApproval { request_id, params } => {
+                self.file_change_approvals.get(&params.item_id) == Some(request_id)
+            }
+            ServerRequest::PermissionsRequestApproval { request_id, params } => {
+                self.permissions_approvals.get(&params.item_id) == Some(request_id)
+            }
+            ServerRequest::ToolRequestUserInput { request_id, params } => {
+                self.user_inputs.get(&params.turn_id).is_some_and(|queue| {
+                    queue.iter().any(|pending| {
+                        &pending.request_id == request_id && pending.item_id == params.item_id
+                    })
                 })
             }
-            ServerRequest::McpServerElicitationRequest { request_id, .. } => self
-                .mcp_requests
-                .values()
-                .any(|pending_request_id| pending_request_id == request_id),
+            ServerRequest::McpServerElicitationRequest { request_id, params } => {
+                self.mcp_requests.get(&McpRequestKey {
+                    server_name: params.server_name.clone(),
+                    request_id: request_id.clone(),
+                }) == Some(request_id)
+            }
             ServerRequest::DynamicToolCall { .. }
             | ServerRequest::ChatgptAuthTokensRefresh { .. }
             | ServerRequest::AttestationGenerate { .. }
@@ -465,6 +466,18 @@ mod tests {
         };
 
         assert_eq!(pending.note_server_request(&request), None);
+
+        assert!(pending.contains_server_request(&request));
+        let mut wrong_key = request.clone();
+        if let ServerRequest::CommandExecutionRequestApproval { params, .. } = &mut wrong_key {
+            params.approval_id = Some("different-approval".to_string());
+        }
+        assert!(!pending.contains_server_request(&wrong_key));
+        let mut wrong_id = request.clone();
+        if let ServerRequest::CommandExecutionRequestApproval { request_id, .. } = &mut wrong_id {
+            *request_id = AppServerRequestId::Integer(42);
+        }
+        assert!(!pending.contains_server_request(&wrong_id));
 
         let resolution = pending
             .take_resolution(&Op::ExecApproval {

@@ -103,33 +103,59 @@ mod tests {
     use codex_home::CodexHomeUserInstructionsProvider;
     use codex_login::AuthManager;
     use codex_login::CodexAuth;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::Op;
+    use codex_protocol::protocol::ReviewRequest;
+    use codex_protocol::protocol::ReviewTarget;
     use codex_protocol::protocol::SessionSource;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use tempfile::TempDir;
 
     #[tokio::test]
     async fn strict_refresh_reports_thread_planning_failures() -> anyhow::Result<()> {
-        let (_temp_dir, thread_manager, config_manager, _loader) = refresh_test_state().await?;
+        let (temp_dir, thread_manager, config_manager, loader) = refresh_test_state().await?;
+        enable_secret_auth_storage(&temp_dir)?;
+        // Fail after one plan has been built regardless of thread iteration order.
+        loader.fail_on_second.store(true, Ordering::Relaxed);
 
         let err = queue_strict_refresh(&thread_manager, &config_manager)
             .await
             .expect_err("strict refresh should fail");
 
         assert_eq!(err.to_string(), "failed to load refresh config");
+        assert_eq!(loader.thread_loads.load(Ordering::Relaxed), 2);
+        for thread_id in thread_manager.list_thread_ids().await {
+            let thread = thread_manager.get_thread(thread_id).await?;
+            assert_eq!(
+                consume_refresh(&thread).await?,
+                AuthKeyringBackendKind::Direct
+            );
+        }
         Ok(())
     }
 
     #[tokio::test]
     async fn best_effort_refresh_attempts_every_loaded_thread() -> anyhow::Result<()> {
-        let (_temp_dir, thread_manager, config_manager, loader) = refresh_test_state().await?;
+        let (temp_dir, thread_manager, config_manager, loader) = refresh_test_state().await?;
+        enable_secret_auth_storage(&temp_dir)?;
 
         queue_best_effort_refresh(&thread_manager, &config_manager).await;
 
         assert_eq!(loader.good_loads.load(Ordering::Relaxed), 1);
         assert_eq!(loader.bad_loads.load(Ordering::Relaxed), 1);
+        for thread_id in thread_manager.list_thread_ids().await {
+            let thread = thread_manager.get_thread(thread_id).await?;
+            let expected = if thread.config().await.cwd.ends_with("good") {
+                AuthKeyringBackendKind::Secrets
+            } else {
+                AuthKeyringBackendKind::Direct
+            };
+            assert_eq!(consume_refresh(&thread).await?, expected);
+        }
         Ok(())
     }
 
@@ -142,10 +168,55 @@ mod tests {
         assert_eq!(thread_ids.len(), 2);
         let terminated_thread = thread_manager.get_thread(thread_ids[1]).await?;
         terminated_thread.shutdown_and_wait().await?;
+        enable_secret_auth_storage(&temp_dir)?;
 
         queue_strict_refresh(&thread_manager, &config_manager).await?;
 
+        let live_thread = thread_manager.get_thread(thread_ids[0]).await?;
+        assert_eq!(
+            consume_refresh(&live_thread).await?,
+            AuthKeyringBackendKind::Secrets
+        );
         Ok(())
+    }
+
+    fn enable_secret_auth_storage(temp_dir: &TempDir) -> io::Result<()> {
+        std::fs::write(
+            temp_dir.path().join(codex_config::CONFIG_TOML_FILE),
+            "[features]\nsecret_auth_storage = true\n",
+        )
+    }
+
+    async fn consume_refresh(thread: &CodexThread) -> anyhow::Result<AuthKeyringBackendKind> {
+        // Review consumes pending refreshes before validating its prompt. An empty
+        // prompt completes locally, letting us inspect the runtime without a model call.
+        let id = thread
+            .submit(Op::Review {
+                review_request: ReviewRequest {
+                    target: ReviewTarget::Custom {
+                        instructions: String::new(),
+                    },
+                    user_facing_hint: None,
+                },
+            })
+            .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let event = thread.next_event().await?;
+                if event.id == id
+                    && let EventMsg::Error(error) = event.msg
+                {
+                    assert_eq!(error.message, "Review prompt cannot be empty");
+                    return anyhow::Ok(());
+                }
+            }
+        })
+        .await??;
+        Ok(thread
+            .current_mcp_runtime()
+            .await
+            .config()
+            .auth_keyring_backend_kind)
     }
 
     #[tokio::test]
@@ -256,6 +327,8 @@ mod tests {
             bad_cwd: AbsolutePathBuf::try_from(bad_cwd)?,
             good_loads: AtomicUsize::new(0),
             bad_loads: AtomicUsize::new(0),
+            fail_on_second: AtomicBool::new(false),
+            thread_loads: AtomicUsize::new(0),
         });
         let config_manager = ConfigManager::new(
             temp_dir.path().to_path_buf(),
@@ -275,6 +348,8 @@ mod tests {
         bad_cwd: AbsolutePathBuf,
         good_loads: AtomicUsize,
         bad_loads: AtomicUsize,
+        fail_on_second: AtomicBool,
+        thread_loads: AtomicUsize,
     }
 
     impl CountingThreadConfigLoader {
@@ -287,6 +362,20 @@ mod tests {
             }
             if context.cwd.as_ref() == Some(&self.bad_cwd) {
                 self.bad_loads.fetch_add(1, Ordering::Relaxed);
+            }
+            let is_thread = context.cwd.as_ref() == Some(&self.good_cwd)
+                || context.cwd.as_ref() == Some(&self.bad_cwd);
+            let should_fail = if is_thread {
+                let load = self.thread_loads.fetch_add(1, Ordering::Relaxed);
+                if self.fail_on_second.load(Ordering::Relaxed) {
+                    load == 1
+                } else {
+                    context.cwd.as_ref() == Some(&self.bad_cwd)
+                }
+            } else {
+                false
+            };
+            if should_fail {
                 return Err(ThreadConfigLoadError::new(
                     ThreadConfigLoadErrorCode::Internal,
                     /*status_code*/ None,

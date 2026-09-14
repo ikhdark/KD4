@@ -188,9 +188,14 @@ impl Service<Request<Body>> for UpstreamClient {
         }
         if let Some(proxy) = proxy {
             req.extensions_mut().insert(proxy);
+        } else if req.extensions().contains::<ProxyAddress>() {
+            // Rama's extension store is append-only. Reject an inherited proxy route
+            // rather than letting it override the client's direct-routing policy.
+            return Err(OpaqueError::from_display(
+                "direct upstream request contains a proxy route",
+            ));
         }
 
-        let uri = req.uri().clone();
         let connect_started_at = Instant::now();
         let EstablishedClientConnection {
             input: mut req,
@@ -230,7 +235,7 @@ impl Service<Request<Body>> for UpstreamClient {
                     request_started_at.elapsed().as_millis()
                 );
                 Err(OpaqueError::from_boxed(err)
-                    .context(format!("http request failure for uri: {uri}")))
+                    .context(format!("http request failure for upstream: {authority}")))
             }
         }
     }

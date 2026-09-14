@@ -17,6 +17,16 @@ pub fn install(registry: &mut ExtensionRegistryBuilder<()>) {
 struct StyleContributor;
 
 impl ContextContributor for StyleContributor {
+    fn estimate_thread_context<'a>(
+        &'a self,
+        _session_store: &'a ExtensionData,
+        _thread_store: &'a ExtensionData,
+    ) -> codex_extension_api::ExtensionFuture<'a, Vec<PromptFragment>> {
+        Box::pin(std::future::ready(vec![PromptFragment::developer_policy(
+            "Prefer short answers unless the user asks for detail.",
+        )]))
+    }
+
     fn contribute_thread_context<'a>(
         &'a self,
         session_store: &'a ExtensionData,
@@ -26,9 +36,8 @@ impl ContextContributor for StyleContributor {
             contribution_counts(session_store).record_style();
             contribution_counts(thread_store).record_style();
 
-            vec![PromptFragment::developer_policy(
-                "Prefer short answers unless the user asks for detail.",
-            )]
+            self.estimate_thread_context(session_store, thread_store)
+                .await
         })
     }
 }
@@ -37,6 +46,18 @@ impl ContextContributor for StyleContributor {
 struct UsageContributor;
 
 impl ContextContributor for UsageContributor {
+    fn estimate_thread_context<'a>(
+        &'a self,
+        _session_store: &'a ExtensionData,
+        _thread_store: &'a ExtensionData,
+    ) -> codex_extension_api::ExtensionFuture<'a, Vec<PromptFragment>> {
+        Box::pin(std::future::ready(vec![
+            PromptFragment::developer_capability(
+                "This extension can contribute more than one prompt fragment.",
+            ),
+        ]))
+    }
+
     fn contribute_thread_context<'a>(
         &'a self,
         session_store: &'a ExtensionData,
@@ -46,9 +67,8 @@ impl ContextContributor for UsageContributor {
             contribution_counts(session_store).record_usage();
             contribution_counts(thread_store).record_usage();
 
-            vec![PromptFragment::developer_capability(
-                "This extension can contribute more than one prompt fragment.",
-            )]
+            self.estimate_thread_context(session_store, thread_store)
+                .await
         })
     }
 }

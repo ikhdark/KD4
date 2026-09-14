@@ -97,8 +97,16 @@ def build_source_binaries(
         build_codex_command_runner=codex_command_runner_bin is None,
         build_codex_windows_sandbox_setup=codex_windows_sandbox_setup_bin is None,
     )
+    build_env = (
+        cargo_build_env(
+            spec, profile, target_dir=target_dir, release_version=release_version
+        )
+        if requested_binaries
+        else None
+    )
     binaries = binaries_missing_for_reuse(
         requested_binaries,
+        build_env=build_env,
         outputs=outputs,
         variant=variant,
         target_dir=target_dir,
@@ -121,6 +129,7 @@ def build_source_binaries(
             spec,
             profile,
             binaries,
+            build_env=build_env,
             target_dir=target_dir,
             release_version=release_version,
         )
@@ -133,6 +142,8 @@ def build_source_binaries(
             profile=profile,
             variant=variant,
             outputs=outputs,
+            proven_binaries=requested_binaries,
+            build_env=build_env,
             cargo=cargo,
             release_version=release_version,
         )
@@ -147,6 +158,7 @@ def run_cargo_build(
     *,
     target_dir: Path,
     release_version: str | None = None,
+    build_env: dict[str, str] | None = None,
 ) -> None:
     cmd = [
         cargo,
@@ -162,8 +174,12 @@ def run_cargo_build(
     for binary in binaries:
         cmd.extend(["--bin", binary])
 
-    cargo_env = cargo_build_env(
-        spec, profile, target_dir=target_dir, release_version=release_version
+    cargo_env = (
+        build_env
+        if build_env is not None
+        else cargo_build_env(
+            spec, profile, target_dir=target_dir, release_version=release_version
+        )
     )
     print("+", " ".join(cmd))
     start = time.perf_counter()
@@ -237,7 +253,9 @@ def validate_prebuilt_executable_targets(
         if path is None or not path.is_file():
             continue
         machine = pe_machine(path)
-        if machine is not None and machine != expected_machine:
+        if machine is None:
+            raise RuntimeError(f"Invalid PE executable for prebuilt {role}: {path}")
+        if machine != expected_machine:
             raise RuntimeError(
                 f"prebuilt {role} target mismatch: {path} has PE machine "
                 f"0x{machine:04x}, expected 0x{expected_machine:04x}"
@@ -409,6 +427,7 @@ def binaries_missing_for_reuse(
     force_rebuild: bool,
     cargo: str = "cargo",
     release_version: str | None = None,
+    build_env: dict[str, str] | None = None,
 ) -> list[str]:
     if force_rebuild or not reuse_existing:
         return binaries
@@ -421,6 +440,7 @@ def binaries_missing_for_reuse(
         variant=variant,
         cargo=cargo,
         release_version=release_version,
+        build_env=build_env,
     ):
         return binaries
 
@@ -520,6 +540,8 @@ def write_source_build_stamp(
     outputs: SourceBuildOutputs,
     cargo: str = "cargo",
     release_version: str | None = None,
+    build_env: dict[str, str] | None = None,
+    proven_binaries: list[str] | None = None,
 ) -> None:
     stamp = {
         "target": spec.target,
@@ -530,9 +552,21 @@ def write_source_build_stamp(
             profile=profile,
             cargo=cargo,
             release_version=release_version,
+            build_env=build_env,
         ),
         "source": source_tree_fingerprint(),
-        "outputs": source_output_fingerprints(outputs),
+        "outputs": (
+            source_output_fingerprints(outputs)
+            if proven_binaries is None
+            else {
+                source_output_key_for_binary(
+                    binary, variant=variant
+                ): source_output_fingerprint(
+                    expected_output_for_binary(binary, outputs=outputs, variant=variant)
+                )
+                for binary in proven_binaries
+            }
+        ),
     }
     path = source_build_stamp_path(target_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -592,18 +626,24 @@ def source_build_stamp_metadata_matches(
     variant: PackageVariant,
     cargo: str = "cargo",
     release_version: str | None = None,
+    build_env: dict[str, str] | None = None,
 ) -> bool:
+    if (
+        stamp.get("target") != spec.target
+        or stamp.get("profile") != profile
+        or stamp.get("variant") != variant.name
+    ):
+        return False
+    recipe = build_recipe_fingerprint(
+        spec=spec,
+        profile=profile,
+        cargo=cargo,
+        release_version=release_version,
+        build_env=build_env,
+    )
     return (
-        stamp.get("target") == spec.target
-        and stamp.get("profile") == profile
-        and stamp.get("variant") == variant.name
-        and stamp.get("build_recipe")
-        == build_recipe_fingerprint(
-            spec=spec,
-            profile=profile,
-            cargo=cargo,
-            release_version=release_version,
-        )
+        all(recipe[tool].get("status") != "unavailable" for tool in ("cargo", "rustc"))
+        and stamp.get("build_recipe") == recipe
     )
 
 
@@ -613,12 +653,21 @@ def build_recipe_fingerprint(
     profile: str,
     cargo: str = "cargo",
     release_version: str | None = None,
+    build_env: dict[str, str] | None = None,
 ) -> dict[str, object]:
     """Capture toolchain and environment inputs that can change Cargo output."""
-    rustc = os.environ.get("RUSTC", "rustc")
+    target_dir = cargo_package_target_dir(spec, profile)
+    effective_env = (
+        build_env
+        if build_env is not None
+        else cargo_build_env(
+            spec, profile, target_dir=target_dir, release_version=release_version
+        )
+    )
+    rustc = effective_env.get("RUSTC", "rustc")
     environment_names = {
         name
-        for name in os.environ
+        for name in effective_env
         if name.startswith("CARGO_PROFILE_")
         or name.startswith("CARGO_TARGET_")
         or "V8" in name
@@ -627,6 +676,9 @@ def build_recipe_fingerprint(
         {
             "AR",
             "CARGO",
+            "CARGO_HOME",
+            "RUSTUP_TOOLCHAIN",
+            "CODEX_RELEASE_VERSION",
             "CARGO_ENCODED_RUSTFLAGS",
             "CC",
             "CXX",
@@ -638,18 +690,12 @@ def build_recipe_fingerprint(
     )
     environment: dict[str, object] = {}
     for name in sorted(environment_names):
-        value = os.environ.get(name)
+        value = effective_env.get(name)
         if value is None:
             continue
         environment[name] = {
             "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest()
         }
-    if release_version is not None:
-        environment["CODEX_RELEASE_VERSION"] = {
-            "sha256": hashlib.sha256(release_version.encode("utf-8")).hexdigest()
-        }
-
-    target_dir = cargo_package_target_dir(spec, profile)
     effective_command = [
         cargo,
         "build",
@@ -663,11 +709,11 @@ def build_recipe_fingerprint(
     ]
 
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "target": spec.target,
         "profile": profile,
-        "cargo": command_identity(cargo, "--version", "--verbose"),
-        "rustc": command_identity(rustc, "-Vv"),
+        "cargo": command_identity(cargo, "--version", "--verbose", env=effective_env),
+        "rustc": command_identity(rustc, "-Vv", env=effective_env),
         "environment": environment,
         "effective_command_sha256": hashlib.sha256(
             "\0".join(effective_command).encode("utf-8")
@@ -693,13 +739,16 @@ def build_recipe_fingerprint(
     }
 
 
-def command_identity(command: str, *args: str) -> dict[str, object]:
+def command_identity(
+    command: str, *args: str, env: dict[str, str] | None = None
+) -> dict[str, object]:
     executable = shutil.which(command) or command
     try:
         completed = subprocess.run(
             [executable, *args],
             check=True,
-            cwd=REPO_ROOT,
+            cwd=CODEX_RS_ROOT,
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -753,9 +802,11 @@ def source_tree_fingerprint() -> dict[str, str]:
             untracked_contents.update(b"\0")
             file_path = CODEX_RS_ROOT / name.decode("utf-8", "surrogateescape")
             try:
-                untracked_contents.update(file_path.read_bytes())
+                with file_path.open("rb") as source:
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        untracked_contents.update(chunk)
             except OSError:
-                untracked_contents.update(b"<unreadable>")
+                return {"status": "unavailable", "reason": "unreadable-source"}
             untracked_contents.update(b"\0")
     except (OSError, subprocess.CalledProcessError):
         return {"status": "unavailable", "reason": "git-unavailable"}
@@ -832,5 +883,15 @@ def source_output_matches_fingerprint(path: Path | None, fingerprint: object) ->
     if path is None:
         return fingerprint is None
     if not isinstance(fingerprint, dict) or not path.is_file():
+        return False
+    stat = path.stat()
+    if any(
+        fingerprint.get(key) != value
+        for key, value in {
+            "path": str(path),
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }.items()
+    ):
         return False
     return fingerprint == source_output_fingerprint(path)

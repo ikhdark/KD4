@@ -153,6 +153,10 @@ impl BoundedJsonWriter {
         }
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "Bytes are validated and truncated to the valid UTF-8 prefix immediately before conversion"
+    )]
     fn finish(self) -> (String, bool, usize) {
         let mut bytes = self.bytes;
         let mut truncated = self.total_bytes > bytes.len();
@@ -331,6 +335,10 @@ impl CodeModeService {
         Some(ordinal)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep the per-call accounting and terminal evidence explicit"
+    )]
     fn complete_packet_call(
         &self,
         cell_id: &CellId,
@@ -734,6 +742,10 @@ fn nested_result_content_items(
         .collect()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Rendering consumes output budgets, timing, feedback, and terminal evidence together"
+)]
 fn format_runtime_response(
     response: RuntimeResponse,
     max_output_tokens: Option<usize>,
@@ -1601,7 +1613,7 @@ mod tests {
         let lt = '<';
         let heredoc = format!("apply_patch {lt}{lt}'EOF'\n{envelope}\nEOF");
         let native = ToolPayload::Function {
-            arguments: json!({ "cmd": heredoc.clone() }).to_string(),
+            arguments: json!({ "cmd": heredoc }).to_string(),
         };
         assert_eq!(wrapped_patch_rejection(&exec_command, &native, true), None);
         let native_argv = ToolPayload::Function {

@@ -235,11 +235,8 @@ impl ContentFragment {
 }
 
 impl TurnItem {
-    fn text_values(&self) -> Vec<String> {
-        self.content
-            .iter()
-            .filter_map(|fragment| fragment.text().map(str::to_string))
-            .collect()
+    fn text_values(&self) -> impl Iterator<Item = &str> {
+        self.content.iter().filter_map(ContentFragment::text)
     }
 
     fn diff_text(&self) -> Option<String> {
@@ -265,27 +262,28 @@ impl Turn {
         self.output_items.iter().find_map(TurnItem::diff_text)
     }
 
-    fn message_texts(&self) -> Vec<String> {
-        let mut out: Vec<String> = self
+    fn message_texts(&self) -> impl Iterator<Item = &str> {
+        let output = self
             .output_items
             .iter()
             .filter(|item| item.kind == "message")
-            .flat_map(TurnItem::text_values)
-            .collect();
-
-        if let Some(log) = &self.worklog {
-            for message in &log.messages {
-                if message.is_assistant() {
-                    out.extend(message.text_values());
-                }
-            }
-        }
-
-        out
+            .filter(|item| {
+                item.role
+                    .as_deref()
+                    .is_none_or(|role| role.eq_ignore_ascii_case("assistant"))
+            })
+            .flat_map(TurnItem::text_values);
+        let worklog = self
+            .worklog
+            .iter()
+            .flat_map(|log| &log.messages)
+            .filter(|message| message.is_assistant())
+            .flat_map(WorklogMessage::text_values);
+        output.chain(worklog)
     }
 
     fn user_prompt(&self) -> Option<String> {
-        let parts: Vec<String> = self
+        let parts: Vec<&str> = self
             .input_items
             .iter()
             .filter(|item| item.kind == "message")
@@ -323,17 +321,11 @@ impl WorklogMessage {
             .unwrap_or(false)
     }
 
-    fn text_values(&self) -> Vec<String> {
+    fn text_values(&self) -> impl Iterator<Item = &str> {
         self.content
-            .as_ref()
-            .map(|content| {
-                content
-                    .parts
-                    .iter()
-                    .filter_map(|fragment| fragment.text().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default()
+            .iter()
+            .flat_map(|content| &content.parts)
+            .filter_map(ContentFragment::text)
     }
 }
 
@@ -364,17 +356,15 @@ impl CodeTaskDetailsResponse {
 
     /// Extract assistant text output messages (no diff) from current turns.
     pub fn assistant_text_messages(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for turn in [
+        [
             self.current_diff_task_turn.as_ref(),
             self.current_assistant_turn.as_ref(),
         ]
         .into_iter()
         .flatten()
-        {
-            out.extend(turn.message_texts());
-        }
-        out
+        .flat_map(Turn::message_texts)
+        .map(str::to_owned)
+        .collect()
     }
 
     /// Extract the user's prompt text from the current user turn, when present.
@@ -464,6 +454,33 @@ mod tests {
         let details = fixture("diff");
         let messages = details.assistant_text_messages();
         assert_eq!(messages, vec!["Assistant response".to_string()]);
+    }
+
+    #[test]
+    fn assistant_text_messages_respects_roles_and_keeps_missing_roles() {
+        let details: CodeTaskDetailsResponse = serde_json::from_value(serde_json::json!({
+            "current_assistant_turn": {
+                "output_items": [
+                    {"type":"message", "role":"user", "content":["user text"]},
+                    {"type":"message", "role":"tool", "content":["tool text"]},
+                    {"type":"message", "role":"Assistant", "content":["assistant text", {"content_type":"text", "text":"structured"}]},
+                    {"type":"message", "content":["legacy text"]}
+                ],
+                "worklog": {"messages": [
+                    {"author":{"role":"assistant"}, "content":{"parts":["worklog text"]}},
+                    {"author":{"role":"user"}, "content":{"parts":["user worklog"]}}
+                ]}
+            }
+        })).unwrap();
+        assert_eq!(
+            details.assistant_text_messages(),
+            [
+                "assistant text",
+                "structured",
+                "legacy text",
+                "worklog text"
+            ]
+        );
     }
 
     #[test]

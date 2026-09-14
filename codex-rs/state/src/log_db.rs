@@ -128,13 +128,18 @@ impl LogDbLayer {
         }
     }
 
-    pub async fn flush(&self) {
+    /// Wait for queued inserts and report any insertion failure since the last flush.
+    pub async fn flush(&self) -> anyhow::Result<()> {
         let (tx, rx) = oneshot::channel();
-        if self.sender.send(LogDbCommand::Flush(tx)).await.is_ok() {
-            let _ = rx.await;
-        }
+        self.sender
+            .send(LogDbCommand::Flush(tx))
+            .await
+            .map_err(|_| anyhow::anyhow!("log inserter is closed"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("log inserter stopped before acknowledging flush"))?
     }
 
+    #[cfg(test)]
     fn try_send(&self, entry: LogEntry) {
         let _ = self.sender.try_send(LogDbCommand::Entry(Box::new(entry)));
     }
@@ -208,7 +213,10 @@ where
             return;
         }
 
-        let mut visitor = MessageVisitor::default();
+        let Ok(permit) = self.sender.try_reserve() else {
+            return;
+        };
+        let mut visitor = SpanFieldVisitor::default();
         event.record(&mut visitor);
         let thread_id = visitor
             .thread_id
@@ -224,7 +232,7 @@ where
             ts_nanos: now.subsec_nanos() as i64,
             level: metadata.level().as_str().to_string(),
             target: metadata.target().to_string(),
-            message: visitor.message,
+            message: None,
             feedback_log_body: Some(feedback_log_body),
             thread_id,
             process_uuid: Some(self.process_uuid.clone()),
@@ -233,13 +241,13 @@ where
             line: metadata.line().map(|line| line as i64),
         };
 
-        self.try_send(entry);
+        permit.send(LogDbCommand::Entry(Box::new(entry)));
     }
 }
 
 enum LogDbCommand {
     Entry(Box<LogEntry>),
-    Flush(oneshot::Sender<()>),
+    Flush(oneshot::Sender<anyhow::Result<()>>),
 }
 
 #[derive(Debug)]
@@ -255,40 +263,40 @@ struct SpanFieldVisitor {
 }
 
 impl SpanFieldVisitor {
-    fn record_field(&mut self, field: &Field, value: String) {
+    fn record_field(&mut self, field: &Field, value: impl FnOnce() -> String) {
         if field.name() == "thread_id" && self.thread_id.is_none() {
-            self.thread_id = Some(value);
+            self.thread_id = Some(value());
         }
     }
 }
 
 impl Visit for SpanFieldVisitor {
     fn record_i64(&mut self, field: &Field, value: i64) {
-        self.record_field(field, value.to_string());
+        self.record_field(field, || value.to_string());
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
-        self.record_field(field, value.to_string());
+        self.record_field(field, || value.to_string());
     }
 
     fn record_bool(&mut self, field: &Field, value: bool) {
-        self.record_field(field, value.to_string());
+        self.record_field(field, || value.to_string());
     }
 
     fn record_f64(&mut self, field: &Field, value: f64) {
-        self.record_field(field, value.to_string());
+        self.record_field(field, || value.to_string());
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
-        self.record_field(field, value.to_string());
+        self.record_field(field, || value.to_string());
     }
 
     fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
-        self.record_field(field, value.to_string());
+        self.record_field(field, || value.to_string());
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        self.record_field(field, format!("{value:?}"));
+        self.record_field(field, || format!("{value:?}"));
     }
 }
 
@@ -376,6 +384,7 @@ async fn run_inserter(
     config: LogSinkQueueConfig,
 ) {
     let mut buffer = Vec::with_capacity(config.batch_size);
+    let mut insert_error = None;
     let mut ticker = tokio::time::interval(config.flush_interval);
     let mut pending_retention = Some(LogRetentionScope::for_reconciliation());
     let mut maintenance = None;
@@ -393,7 +402,7 @@ async fn run_inserter(
                             merge_pending_retention(
                                 &state_db,
                                 &mut pending_retention,
-                                flush(&state_db, &mut buffer).await,
+                                flush(&state_db, &mut buffer, &mut insert_error).await,
                             );
                         }
                     }
@@ -401,15 +410,15 @@ async fn run_inserter(
                         merge_pending_retention(
                             &state_db,
                             &mut pending_retention,
-                            flush(&state_db, &mut buffer).await,
+                            flush(&state_db, &mut buffer, &mut insert_error).await,
                         );
-                        let _ = reply.send(());
+                        let _ = reply.send(insert_error.take().map_or(Ok(()), Err));
                     }
                     None => {
                         merge_pending_retention(
                             &state_db,
                             &mut pending_retention,
-                            flush(&state_db, &mut buffer).await,
+                            flush(&state_db, &mut buffer, &mut insert_error).await,
                         );
                         break;
                     }
@@ -420,7 +429,7 @@ async fn run_inserter(
                 merge_pending_retention(
                     &state_db,
                     &mut pending_retention,
-                    flush(&state_db, &mut buffer).await,
+                    flush(&state_db, &mut buffer, &mut insert_error).await,
                 );
             }
             maintenance_result = async {
@@ -517,61 +526,28 @@ fn start_retention_maintenance(
     }));
 }
 
-async fn flush(state_db: &StateRuntime, buffer: &mut Vec<LogEntry>) -> Option<LogRetentionScope> {
+async fn flush(
+    state_db: &StateRuntime,
+    buffer: &mut Vec<LogEntry>,
+    insert_error: &mut Option<anyhow::Error>,
+) -> Option<LogRetentionScope> {
     if buffer.is_empty() {
         return None;
     }
-    let entries = buffer.split_off(0);
-    state_db
-        .insert_logs_deferred_retention(entries.as_slice())
-        .await
-        .ok()
-}
-
-#[derive(Default)]
-struct MessageVisitor {
-    message: Option<String>,
-    thread_id: Option<String>,
-}
-
-impl MessageVisitor {
-    fn record_field(&mut self, field: &Field, value: String) {
-        if field.name() == "message" && self.message.is_none() {
-            self.message = Some(value.clone());
+    let result = state_db
+        .insert_logs_deferred_retention(buffer.as_slice())
+        .await;
+    // Logging remains best-effort; replay after an ambiguous commit could
+    // duplicate entries. Retain capacity and surface failure to explicit flush.
+    buffer.clear();
+    match result {
+        Ok(scope) => Some(scope),
+        Err(error) => {
+            if insert_error.is_none() {
+                *insert_error = Some(error);
+            }
+            None
         }
-        if field.name() == "thread_id" && self.thread_id.is_none() {
-            self.thread_id = Some(value);
-        }
-    }
-}
-
-impl Visit for MessageVisitor {
-    fn record_i64(&mut self, field: &Field, value: i64) {
-        self.record_field(field, value.to_string());
-    }
-
-    fn record_u64(&mut self, field: &Field, value: u64) {
-        self.record_field(field, value.to_string());
-    }
-
-    fn record_bool(&mut self, field: &Field, value: bool) {
-        self.record_field(field, value.to_string());
-    }
-
-    fn record_f64(&mut self, field: &Field, value: f64) {
-        self.record_field(field, value.to_string());
-    }
-
-    fn record_str(&mut self, field: &Field, value: &str) {
-        self.record_field(field, value.to_string());
-    }
-
-    fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
-        self.record_field(field, value.to_string());
-    }
-
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        self.record_field(field, format!("{value:?}"));
     }
 }
 
@@ -708,7 +684,10 @@ mod tests {
             .send(LogDbCommand::Flush(flush_sender))
             .await
             .expect("queue flush");
-        flush_receiver.await.expect("flush inserted burst");
+        flush_receiver
+            .await
+            .expect("flush acknowledged")
+            .expect("flush inserted burst");
 
         control.fail_next_deletion();
         control.release_blocked_deletion();
@@ -851,7 +830,7 @@ mod tests {
         });
         tracing::debug!("threadless-after");
 
-        layer.flush().await;
+        layer.flush().await.expect("flush logs");
         drop(guard);
 
         let feedback_logs = writer.snapshot();
@@ -897,7 +876,7 @@ mod tests {
 
         tracing::info!("buffered-log");
 
-        layer.flush().await;
+        layer.flush().await.expect("flush logs");
         drop(guard);
 
         let after_flush = runtime
@@ -908,6 +887,53 @@ mod tests {
         assert_eq!(after_flush[0].message.as_deref(), Some("buffered-log"));
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn flush_reports_failed_automatic_batch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = StateRuntime::init(temp.path().to_path_buf(), "test-provider".to_string())
+            .await
+            .expect("runtime");
+        runtime.close().await;
+        let layer = LogDbLayer::start_with_config(
+            runtime,
+            LogSinkQueueConfig {
+                queue_capacity: 8,
+                batch_size: 1,
+                flush_interval: std::time::Duration::from_secs(60),
+            },
+        );
+        layer.try_send(test_entry("failed automatic batch"));
+        assert!(
+            layer.flush().await.is_err(),
+            "flush must report the earlier batch failure"
+        );
+        layer.flush().await.expect("reported failure is consumed");
+    }
+
+    #[tokio::test]
+    async fn full_queue_does_not_format_event_fields() {
+        struct MustNotFormat;
+        impl std::fmt::Debug for MustNotFormat {
+            fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                panic!("full queue must reject before formatting");
+            }
+        }
+        let (sender, mut receiver) = mpsc::channel(1);
+        let layer = LogDbLayer {
+            sender,
+            process_uuid: "process-1".to_string(),
+        };
+        layer.try_send(test_entry("retained"));
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            tracing::info!(field = ?MustNotFormat, "dropped");
+        });
+        let LogDbCommand::Entry(entry) = receiver.try_recv().expect("original entry") else {
+            panic!("entry expected")
+        };
+        assert_eq!(entry.message.as_deref(), Some("retained"));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1024,7 +1050,7 @@ mod tests {
         let mut flush_task = tokio::spawn({
             let layer = layer.clone();
             async move {
-                layer.flush().await;
+                layer.flush().await.expect("flush logs");
             }
         });
 
@@ -1041,7 +1067,7 @@ mod tests {
         match receiver.recv().await.expect("flush command") {
             LogDbCommand::Flush(reply) => {
                 assert!(!flush_task.is_finished());
-                let _ = reply.send(());
+                let _ = reply.send(Ok(()));
             }
             LogDbCommand::Entry(_) => panic!("expected flush command"),
         }

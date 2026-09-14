@@ -602,7 +602,7 @@ impl ThreadMetadataPatch {
     ///
     /// Omitted fields in `next` leave the current patch unchanged. Present fields replace the
     /// current value, including clear requests like `Some(None)`. Nested patches use the same
-    /// semantics.
+    /// semantics. Recency advances compose by maximum so coalescing cannot lose an advance.
     pub fn merge(&mut self, next: Self) {
         if next.name.is_some() {
             self.name = next.name;
@@ -631,8 +631,11 @@ impl ThreadMetadataPatch {
         if next.updated_at.is_some() {
             self.updated_at = next.updated_at;
         }
-        if next.advance_recency_at.is_some() {
-            self.advance_recency_at = next.advance_recency_at;
+        if let Some(next_recency) = next.advance_recency_at {
+            self.advance_recency_at = Some(
+                self.advance_recency_at
+                    .map_or(next_recency, |current| current.max(next_recency)),
+            );
         }
         if next.source.is_some() {
             self.source = next.source;
@@ -735,6 +738,24 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn recency_advances_merge_by_maximum() {
+        let later = DateTime::<Utc>::from_timestamp(600, 0).expect("later timestamp");
+        let earlier = DateTime::<Utc>::from_timestamp(300, 0).expect("earlier timestamp");
+        let mut patch = ThreadMetadataPatch {
+            advance_recency_at: Some(later),
+            updated_at: Some(later),
+            ..Default::default()
+        };
+        patch.merge(ThreadMetadataPatch {
+            advance_recency_at: Some(earlier),
+            updated_at: Some(earlier),
+            ..Default::default()
+        });
+        assert_eq!(patch.advance_recency_at, Some(later));
+        assert_eq!(patch.updated_at, Some(earlier));
+    }
 
     #[test]
     fn thread_metadata_patch_round_trips_optional_clears() {

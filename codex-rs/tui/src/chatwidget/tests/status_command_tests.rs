@@ -46,7 +46,7 @@ async fn status_command_refresh_updates_cached_limits_for_future_status_outputs(
         other => panic!("expected rate-limit refresh request, got {other:?}"),
     };
 
-    chat.finish_status_rate_limit_refresh(first_request_id, vec![snapshot(/*percent*/ 92.0)]);
+    chat.finish_status_rate_limit_refresh(first_request_id, Ok(vec![snapshot(/*percent*/ 92.0)]));
     drain_insert_history(&mut rx);
 
     chat.dispatch_command(SlashCommand::Status);
@@ -131,10 +131,10 @@ async fn status_command_overlapping_refreshes_update_matching_cells_only() {
     set_chatgpt_auth(&mut chat);
 
     chat.dispatch_command(SlashCommand::Status);
-    match rx.try_recv() {
-        Ok(AppEvent::InsertHistoryCell(_)) => {}
+    let first_cell = match rx.try_recv() {
+        Ok(AppEvent::InsertHistoryCell(cell)) => cell,
         other => panic!("expected first status output, got {other:?}"),
-    }
+    };
     let first_request_id = match rx.try_recv() {
         Ok(AppEvent::RefreshRateLimits {
             origin: RateLimitRefreshOrigin::StatusCommand { request_id },
@@ -143,12 +143,11 @@ async fn status_command_overlapping_refreshes_update_matching_cells_only() {
     };
 
     chat.dispatch_command(SlashCommand::Status);
-    let second_rendered = match rx.try_recv() {
-        Ok(AppEvent::InsertHistoryCell(cell)) => {
-            lines_to_single_string(&cell.display_lines(/*width*/ 80))
-        }
+    let second_cell = match rx.try_recv() {
+        Ok(AppEvent::InsertHistoryCell(cell)) => cell,
         other => panic!("expected second status output, got {other:?}"),
     };
+    let second_rendered = lines_to_single_string(&second_cell.display_lines(80));
     let second_request_id = match rx.try_recv() {
         Ok(AppEvent::RefreshRateLimits {
             origin: RateLimitRefreshOrigin::StatusCommand { request_id },
@@ -162,11 +161,24 @@ async fn status_command_overlapping_refreshes_update_matching_cells_only() {
         "expected /status to avoid transient refresh text in terminal history, got: {second_rendered}"
     );
 
-    chat.finish_status_rate_limit_refresh(first_request_id, Vec::new());
+    chat.finish_status_rate_limit_refresh(first_request_id, Ok(Vec::new()));
     pretty_assertions::assert_eq!(chat.refreshing_status_outputs.len(), 1);
+    assert!(
+        lines_to_single_string(&first_cell.display_lines(80))
+            .contains("not available for this account")
+    );
+    assert_eq!(
+        lines_to_single_string(&second_cell.display_lines(80)),
+        second_rendered
+    );
 
-    chat.finish_status_rate_limit_refresh(second_request_id, vec![snapshot(/*percent*/ 92.0)]);
+    chat.finish_status_rate_limit_refresh(second_request_id, Ok(vec![snapshot(/*percent*/ 92.0)]));
     assert!(chat.refreshing_status_outputs.is_empty());
+    assert!(lines_to_single_string(&second_cell.display_lines(80)).contains("8% left"));
+    assert!(
+        lines_to_single_string(&first_cell.display_lines(80))
+            .contains("not available for this account")
+    );
 }
 
 #[tokio::test]
@@ -186,7 +198,36 @@ async fn account_update_rejects_stale_status_rate_limit_snapshots() {
         /*status_account_display*/ None, /*plan_type*/ None,
         /*has_chatgpt_account*/ true, /*has_codex_backend_auth*/ true,
     );
-    chat.finish_status_rate_limit_refresh(request_id, vec![snapshot(/*percent*/ 92.0)]);
+    chat.finish_status_rate_limit_refresh(request_id, Ok(vec![snapshot(/*percent*/ 92.0)]));
 
     assert!(chat.rate_limit_snapshots_by_limit_id.is_empty());
+}
+
+#[tokio::test]
+async fn status_command_distinguishes_empty_success_from_refresh_failure() {
+    for (result, expected) in [
+        (Ok(Vec::new()), "not available for this account"),
+        (Err(()), "data not available yet"),
+    ] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+        set_chatgpt_auth(&mut chat);
+        chat.dispatch_command(SlashCommand::Status);
+        let cell = match rx.try_recv() {
+            Ok(AppEvent::InsertHistoryCell(cell)) => cell,
+            other => panic!("expected status cell, got {other:?}"),
+        };
+        let request_id = match rx.try_recv() {
+            Ok(AppEvent::RefreshRateLimits {
+                origin: RateLimitRefreshOrigin::StatusCommand { request_id },
+            }) => request_id,
+            other => panic!("expected refresh request, got {other:?}"),
+        };
+        chat.finish_status_rate_limit_refresh(request_id, result);
+        let rendered = lines_to_single_string(&cell.display_lines(80));
+        assert!(
+            rendered.contains(expected),
+            "expected {expected}: {rendered}"
+        );
+        assert!(chat.refreshing_status_outputs.is_empty());
+    }
 }

@@ -49,6 +49,7 @@ use codex_protocol::user_input::UserInput;
 use eventsource_stream::Event as StreamEvent;
 use eventsource_stream::EventStreamError as StreamError;
 use opentelemetry_sdk::metrics::data::ResourceMetrics;
+use std::borrow::Cow;
 use std::future::Future;
 use std::time::Duration;
 use std::time::Instant;
@@ -373,6 +374,10 @@ fn normalized_context_component_hash(value: &str) -> Option<&str> {
 }
 
 fn normalized_context_component_semantic_id(value: &str) -> Option<&str> {
+    // kind (96), separators (2), v + u16 (6), and hash (24).
+    if value.len() > 128 {
+        return None;
+    }
     let mut parts = value.split(':');
     let (Some(kind), Some(version), Some(hash), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
@@ -381,7 +386,10 @@ fn normalized_context_component_semantic_id(value: &str) -> Option<&str> {
     };
     (normalized_model_attempt_label(kind).is_some()
         && version.strip_prefix('v').is_some_and(|digits| {
-            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+            !digits.is_empty()
+                && digits.len() <= 5
+                && digits.bytes().all(|byte| byte.is_ascii_digit())
+                && digits.parse::<u16>().is_ok()
         })
         && normalized_context_component_hash(hash).is_some())
     .then_some(value)
@@ -714,7 +722,10 @@ impl SessionTelemetry {
     }
 
     pub fn record_responses(&self, handle_responses_span: &Span, event: &ResponseEvent) {
-        handle_responses_span.record("otel.name", SessionTelemetry::responses_type(event));
+        handle_responses_span.record(
+            "otel.name",
+            SessionTelemetry::responses_type(event).as_ref(),
+        );
 
         match event {
             ResponseEvent::OutputItemDone(item) => {
@@ -860,14 +871,12 @@ impl SessionTelemetry {
                 event.name = "codex.api_request",
                 duration_ms = %duration.as_millis(),
                 http.response.status_code = status,
-                error.message = error,
                 attempt = attempt,
                 auth.header_attached = auth_header_attached,
                 auth.header_name = auth_header_name,
                 auth.retry_after_unauthorized = retry_after_unauthorized,
                 auth.recovery_mode = recovery_mode,
                 auth.recovery_phase = recovery_phase,
-                endpoint = endpoint,
                 auth.env_openai_api_key_present = self.metadata.auth_env.openai_api_key_env_present,
                 auth.env_codex_api_key_present = self.metadata.auth_env.codex_api_key_env_present,
                 auth.env_codex_api_key_enabled = self.metadata.auth_env.codex_api_key_env_enabled,
@@ -876,13 +885,19 @@ impl SessionTelemetry {
                 auth.env_refresh_token_url_override_present = self.metadata.auth_env.refresh_token_url_override_present,
                 auth.request_id = request_id,
                 auth.cf_ray = cf_ray,
-                auth.error = auth_error,
-                auth.error_code = auth_error_code,
                 auth.agent_id = agent_identity_telemetry.map(|metadata| metadata.agent_id.as_str()),
                 auth.task_id = agent_identity_telemetry.map(|metadata| metadata.task_id.as_str()),
             },
-            log: {},
-            trace: {},
+            log: {
+                error.message = error,
+                endpoint = endpoint,
+                auth.error = auth_error,
+                auth.error_code = auth_error_code,
+            },
+            trace: {
+                error.present = error.is_some(),
+                auth.error_present = auth_error.is_some() || auth_error_code.is_some(),
+            },
         );
     }
 
@@ -983,7 +998,7 @@ impl SessionTelemetry {
     ) {
         let success = error.is_none()
             && status
-                .map(|code| (200..=299).contains(&code))
+                .map(|code| code == 101 || (200..=299).contains(&code))
                 .unwrap_or(true);
         let success_str = if success { "true" } else { "false" };
         log_and_trace_event!(
@@ -993,13 +1008,11 @@ impl SessionTelemetry {
                 duration_ms = %duration.as_millis(),
                 http.response.status_code = status,
                 success = success_str,
-                error.message = error,
                 auth.header_attached = auth_header_attached,
                 auth.header_name = auth_header_name,
                 auth.retry_after_unauthorized = retry_after_unauthorized,
                 auth.recovery_mode = recovery_mode,
                 auth.recovery_phase = recovery_phase,
-                endpoint = endpoint,
                 auth.env_openai_api_key_present = self.metadata.auth_env.openai_api_key_env_present,
                 auth.env_codex_api_key_present = self.metadata.auth_env.codex_api_key_env_present,
                 auth.env_codex_api_key_enabled = self.metadata.auth_env.codex_api_key_env_enabled,
@@ -1009,13 +1022,19 @@ impl SessionTelemetry {
                 auth.connection_reused = connection_reused,
                 auth.request_id = request_id,
                 auth.cf_ray = cf_ray,
-                auth.error = auth_error,
-                auth.error_code = auth_error_code,
                 auth.agent_id = agent_identity_telemetry.map(|metadata| metadata.agent_id.as_str()),
                 auth.task_id = agent_identity_telemetry.map(|metadata| metadata.task_id.as_str()),
             },
-            log: {},
-            trace: {},
+            log: {
+                error.message = error,
+                endpoint = endpoint,
+                auth.error = auth_error,
+                auth.error_code = auth_error_code,
+            },
+            trace: {
+                error.present = error.is_some(),
+                auth.error_present = auth_error.is_some() || auth_error_code.is_some(),
+            },
         );
     }
 
@@ -1040,7 +1059,6 @@ impl SessionTelemetry {
                 event.name = "codex.websocket_request",
                 duration_ms = %duration.as_millis(),
                 success = success_str,
-                error.message = error,
                 auth.env_openai_api_key_present = self.metadata.auth_env.openai_api_key_env_present,
                 auth.env_codex_api_key_present = self.metadata.auth_env.codex_api_key_env_present,
                 auth.env_codex_api_key_enabled = self.metadata.auth_env.codex_api_key_env_enabled,
@@ -1051,8 +1069,12 @@ impl SessionTelemetry {
                 auth.agent_id = agent_identity_telemetry.map(|metadata| metadata.agent_id.as_str()),
                 auth.task_id = agent_identity_telemetry.map(|metadata| metadata.task_id.as_str()),
             },
-            log: {},
-            trace: {},
+            log: {
+                error.message = error,
+            },
+            trace: {
+                error.present = error.is_some(),
+            },
         );
     }
 
@@ -1078,13 +1100,16 @@ impl SessionTelemetry {
                 auth.outcome = outcome,
                 auth.request_id = request_id,
                 auth.cf_ray = cf_ray,
-                auth.error = auth_error,
-                auth.error_code = auth_error_code,
                 auth.recovery_reason = recovery_reason,
                 auth.state_changed = auth_state_changed,
             },
-            log: {},
-            trace: {},
+            log: {
+                auth.error = auth_error,
+                auth.error_code = auth_error_code,
+            },
+            trace: {
+                auth.error_present = auth_error.is_some() || auth_error_code.is_some(),
+            },
         );
     }
 
@@ -1101,6 +1126,9 @@ impl SessionTelemetry {
         >,
         duration: Duration,
     ) {
+        if self.metrics.is_none() {
+            return;
+        }
         let mut kind = None;
         let mut success = true;
 
@@ -1236,7 +1264,7 @@ impl SessionTelemetry {
             event.name = "codex.sse_event",
             event.kind = %kind_str,
             duration_ms = %duration.as_millis(),
-            error.message = %error,
+            error.present = true,
         );
     }
 
@@ -1249,10 +1277,13 @@ impl SessionTelemetry {
             common: {
                 event.name = "codex.sse_event",
                 event.kind = %"response.completed",
+            },
+            log: {
                 error.message = %error,
             },
-            log: {},
-            trace: {},
+            trace: {
+                error.present = true,
+            },
         );
     }
 
@@ -1294,6 +1325,9 @@ impl SessionTelemetry {
 
     /// Emits only the explicit allowlist in [`ModelAttemptTelemetry`].
     pub fn model_attempt_completed(&self, record: &ModelAttemptTelemetry) {
+        if !self.model_attempt_logging_enabled() {
+            return;
+        }
         let prompt_context_categories = serde_json::to_string(&record.prompt_context_categories)
             .unwrap_or_else(|_| "[]".to_string());
         let tool_schema_breakdown = serde_json::to_string(&record.tool_schema_breakdown)
@@ -1428,7 +1462,16 @@ impl SessionTelemetry {
     }
 
     pub fn user_prompt(&self, items: &[UserInput]) {
-        let summary = summarize_user_prompt(items, self.metadata.log_user_prompts);
+        let log_enabled = self.model_attempt_logging_enabled();
+        if !log_enabled
+            && !tracing::enabled!(
+                target: crate::targets::OTEL_TRACE_SAFE_TARGET,
+                tracing::Level::INFO
+            )
+        {
+            return;
+        }
+        let summary = summarize_user_prompt(items, self.metadata.log_user_prompts && log_enabled);
         let prompt_to_log = summary.prompt.as_deref().unwrap_or("[REDACTED]");
 
         log_event!(
@@ -1545,6 +1588,10 @@ impl SessionTelemetry {
     }
 
     pub fn log_tool_failed(&self, tool_name: &str, error: &str) {
+        if !tool_result_events_enabled() {
+            return;
+        }
+        let output_line_count = error.lines().count() as i64;
         log_event!(
             self,
             event.name = "codex.tool_result",
@@ -1552,7 +1599,7 @@ impl SessionTelemetry {
             duration_ms = %Duration::ZERO.as_millis(),
             success = %false,
             output_length = error.len() as i64,
-            output_line_count = error.lines().count() as i64,
+            output_line_count = output_line_count,
             mcp_server = "",
             mcp_server_origin = "",
         );
@@ -1563,7 +1610,7 @@ impl SessionTelemetry {
             duration_ms = %Duration::ZERO.as_millis(),
             success = %false,
             output_length = error.len() as i64,
-            output_line_count = error.lines().count() as i64,
+            output_line_count = output_line_count,
             tool_origin = %"builtin",
         );
     }
@@ -1581,6 +1628,10 @@ impl SessionTelemetry {
         extra_trace_fields: &[(&str, &str)],
     ) {
         self.record_tool_result_metrics(tool_name, duration, success, extra_tags);
+        if !tool_result_events_enabled() {
+            return;
+        }
+        let output_line_count = output.lines().count() as i64;
         let success_str = if success { "true" } else { "false" };
         let mcp_server = trace_field_value(extra_trace_fields, "mcp_server").unwrap_or("");
         let mcp_server_origin =
@@ -1594,7 +1645,7 @@ impl SessionTelemetry {
             success = %success_str,
             arguments_length = arguments.len() as i64,
             output_length = output.len() as i64,
-            output_line_count = output.lines().count() as i64,
+            output_line_count = output_line_count,
             mcp_server = %mcp_server,
             mcp_server_origin = %mcp_server_origin,
         );
@@ -1607,7 +1658,7 @@ impl SessionTelemetry {
             success = %success_str,
             arguments_length = arguments.len() as i64,
             output_length = output.len() as i64,
-            output_line_count = output.lines().count() as i64,
+            output_line_count = output_line_count,
             tool_origin = if mcp_server.is_empty() { "builtin" } else { "mcp" },
             mcp_tool = !mcp_server.is_empty(),
         );
@@ -1686,7 +1737,7 @@ impl SessionTelemetry {
         }
     }
 
-    fn responses_type(event: &ResponseEvent) -> String {
+    fn responses_type(event: &ResponseEvent) -> Cow<'static, str> {
         match event {
             ResponseEvent::Created => "created".into(),
             ResponseEvent::OutputItemDone(item) | ResponseEvent::OutputItemAdded(item) => {
@@ -1711,10 +1762,10 @@ impl SessionTelemetry {
         }
     }
 
-    fn responses_item_type(item: &ResponseItem) -> String {
+    fn responses_item_type(item: &ResponseItem) -> Cow<'static, str> {
         match item {
             ResponseItem::AdditionalTools { .. } => "additional_tools".into(),
-            ResponseItem::Message { role, .. } => format!("message_from_{role}"),
+            ResponseItem::Message { role, .. } => format!("message_from_{role}").into(),
             ResponseItem::AgentMessage { .. } => "agent_message".into(),
             ResponseItem::Reasoning { .. } => "reasoning".into(),
             ResponseItem::LocalShellCall { .. } => "local_shell_call".into(),
@@ -1771,6 +1822,15 @@ mod model_attempt_privacy_tests {
 
     #[test]
     fn context_component_ids_accept_only_bounded_opaque_hashes() {
+        let longest = format!("{}:v65535:0123456789abcdef01234567", "x".repeat(96));
+        assert_eq!(
+            normalized_context_component_semantic_id(&longest),
+            Some(longest.as_str())
+        );
+        for version in ["", "65536", "000001", "１２", "99999999999999999999"] {
+            let id = format!("repository:v{version}:0123456789abcdef01234567");
+            assert_eq!(normalized_context_component_semantic_id(&id), None, "{id}");
+        }
         assert_eq!(
             normalized_context_component_semantic_id("repository:v1:0123456789abcdef01234567"),
             Some("repository:v1:0123456789abcdef01234567")

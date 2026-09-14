@@ -103,13 +103,14 @@ pub(super) async fn list_remote_control_clients_with_client(
         headers,
         body,
     } = response;
-    let body_preview = preview_remote_control_response_body(&body);
-    ensure_success_response(status, &headers, &url, &body_preview, "client list")?;
+    ensure_success_response(status, &headers, &url, &body, "client list")?;
     let response = serde_json::from_slice::<ListRemoteControlClientsResponse>(&body).map_err(
         |err| {
+            let err = super::enroll::format_remote_control_decode_error(&err);
             io::Error::other(format!(
-                "failed to parse remote control client list response from `{url}`: HTTP {status}, {}, body: {body_preview}, decode error: {err}",
-                format_headers(&headers)
+                "failed to parse remote control client list response from `{url}`: HTTP {status}, {}, body: {}, decode error: {err}",
+                format_headers(&headers),
+                preview_remote_control_response_body(&body)
             ))
         },
     )?;
@@ -197,8 +198,7 @@ pub(super) async fn revoke_remote_control_client_with_client(
         headers,
         body,
     } = response;
-    let body_preview = preview_remote_control_response_body(&body);
-    ensure_success_response(status, &headers, &url, &body_preview, "client revoke")?;
+    ensure_success_response(status, &headers, &url, &body, "client revoke")?;
     Ok(RemoteControlClientsRevokeResponse {})
 }
 
@@ -299,11 +299,9 @@ async fn send_client_management_request_once(
         .map_err(|err| io::Error::other(format!("failed to {action}: {err}")))?;
     let headers = response.headers().clone();
     let status = response.status();
-    let body = response
-        .bytes()
+    let body = super::enroll::read_remote_control_response_body(response)
         .await
-        .map_err(|err| io::Error::other(format!("failed to read {action} response: {err}")))?
-        .to_vec();
+        .map_err(|err| io::Error::other(format!("failed to read {action} response: {err}")))?;
     Ok(ClientManagementResponse {
         status,
         headers,
@@ -315,7 +313,7 @@ fn ensure_success_response(
     status: axum::http::StatusCode,
     headers: &HeaderMap,
     url: &Url,
-    body_preview: &str,
+    body: &[u8],
     response_kind: &str,
 ) -> io::Result<()> {
     if status.is_success() {
@@ -330,8 +328,9 @@ fn ensure_success_response(
     Err(io::Error::new(
         error_kind,
         format!(
-            "remote control {response_kind} failed at `{url}`: HTTP {status}, {}, body: {body_preview}",
-            format_headers(headers)
+            "remote control {response_kind} failed at `{url}`: HTTP {status}, {}, body: {}",
+            format_headers(headers),
+            preview_remote_control_response_body(body)
         ),
     ))
 }

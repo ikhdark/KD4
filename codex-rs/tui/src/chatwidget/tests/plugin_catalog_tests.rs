@@ -286,3 +286,98 @@ async fn plugin_detail_not_installable_plugin_disables_install_action() {
         "expected navigation to skip the disabled install row"
     );
 }
+
+#[tokio::test]
+async fn plugin_list_refresh_preserves_open_detail() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.set_feature_enabled(Feature::Plugins, true);
+    let summary = plugins_test_summary(
+        "plugin-test",
+        "test",
+        Some("Test plugin"),
+        Some("Details stay open."),
+        false,
+        true,
+        PluginInstallPolicy::Available,
+    );
+    let response = plugins_test_response(vec![plugins_test_curated_marketplace(vec![
+        summary.clone(),
+    ])]);
+    render_loaded_plugins_popup(&mut chat, response.clone());
+    let cwd = chat.config.cwd.to_path_buf();
+    chat.on_plugin_detail_loaded(
+        cwd.clone(),
+        Ok(PluginReadResponse {
+            plugin: plugins_test_detail(summary, Some("Details stay open."), &[], &[], &[], &[]),
+        }),
+    );
+    let detail = render_bottom_popup(&chat, 100);
+    assert!(detail.contains("Install plugin"));
+    chat.on_plugins_loaded(cwd.clone(), Ok(response));
+    assert_eq!(render_bottom_popup(&chat, 100), detail);
+    chat.on_plugin_remote_sections_loaded(cwd, Vec::new(), Vec::new());
+    assert_eq!(render_bottom_popup(&chat, 100), detail);
+}
+
+#[tokio::test]
+async fn plugin_prefetch_remains_in_flight_until_remote_sections_finish() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.set_feature_enabled(Feature::Plugins, true);
+    chat.add_plugins_output();
+    let cwd = chat.config.cwd.to_path_buf();
+    chat.on_plugins_loaded(cwd.clone(), Ok(plugins_test_response(Vec::new())));
+    chat.add_plugins_output();
+    let mut fetches = 0;
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event, AppEvent::FetchPluginsList { .. }) {
+            fetches += 1;
+        }
+    }
+    assert_eq!(fetches, 1);
+    chat.on_plugin_remote_sections_loaded(cwd, Vec::new(), Vec::new());
+    chat.add_plugins_output();
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|event| matches!(event, AppEvent::FetchPluginsList { .. }))
+    );
+}
+
+#[tokio::test]
+async fn marketplace_errors_show_actionable_backend_reason() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let add = chat.marketplace_add_error_popup_params("Authentication required for this source");
+    assert_eq!(
+        add.items[0].description.as_deref(),
+        Some("Authentication required for this source")
+    );
+    chat.on_marketplace_remove_loaded(
+        chat.config.cwd.to_path_buf(),
+        "example".to_string(),
+        "Example".to_string(),
+        Err("Cannot remove a managed marketplace".to_string()),
+    );
+    assert!(render_bottom_popup(&chat, 120).contains("Cannot remove a managed marketplace"));
+}
+
+#[tokio::test]
+async fn plugin_uninstall_completion_returns_to_list_after_refresh() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.set_feature_enabled(Feature::Plugins, true);
+    let response = plugins_test_response(Vec::new());
+    render_loaded_plugins_popup(&mut chat, response.clone());
+    chat.open_plugin_uninstall_loading_popup("Test plugin");
+    assert!(render_bottom_popup(&chat, 100).contains("Uninstalling Test plugin"));
+    let cwd = chat.config.cwd.to_path_buf();
+    chat.on_plugin_uninstall_loaded(
+        cwd.clone(),
+        "Test plugin".to_string(),
+        Ok(codex_app_server_protocol::PluginUninstallResponse {}),
+    );
+    chat.on_plugins_loaded(cwd, Ok(response));
+    assert!(
+        chat.bottom_pane
+            .active_tab_id_for_active_view(super::super::plugins::PLUGINS_SELECTION_VIEW_ID)
+            .is_some()
+    );
+    assert!(!render_bottom_popup(&chat, 100).contains("Uninstalling"));
+}

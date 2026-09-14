@@ -5,10 +5,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
-use std::time::Instant;
 
 use anyhow::Result;
 use anyhow::anyhow;
@@ -66,6 +63,7 @@ use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::sync::watch;
 use tokio::time;
+use tokio::time::Instant;
 use tracing::instrument;
 use tracing::warn;
 
@@ -141,30 +139,51 @@ struct InitializeContext {
 
 #[derive(Clone)]
 pub(crate) struct ElicitationPauseState {
-    active_count: Arc<AtomicUsize>,
-    paused: watch::Sender<bool>,
+    timing: watch::Sender<ElicitationTiming>,
+}
+
+#[derive(Clone, Copy)]
+struct ElicitationTiming {
+    active_count: usize,
+    active_elapsed: Duration,
+    active_since: Instant,
+}
+
+impl ElicitationTiming {
+    fn active_time(&self) -> Duration {
+        self.active_elapsed
+            + if self.active_count == 0 {
+                self.active_since.elapsed()
+            } else {
+                Duration::ZERO
+            }
+    }
 }
 
 impl ElicitationPauseState {
     fn new() -> Self {
-        let (paused, _rx) = watch::channel(false);
-        Self {
-            active_count: Arc::new(AtomicUsize::new(0)),
-            paused,
-        }
+        let (timing, _rx) = watch::channel(ElicitationTiming {
+            active_count: 0,
+            active_elapsed: Duration::ZERO,
+            active_since: Instant::now(),
+        });
+        Self { timing }
     }
 
     pub(crate) fn enter(&self) -> ElicitationPauseGuard {
-        if self.active_count.fetch_add(1, Ordering::AcqRel) == 0 {
-            self.paused.send_replace(true);
-        }
+        self.timing.send_modify(|timing| {
+            if timing.active_count == 0 {
+                timing.active_elapsed = timing.active_time();
+            }
+            timing.active_count += 1;
+        });
         ElicitationPauseGuard {
             pause_state: self.clone(),
         }
     }
 
-    fn subscribe(&self) -> watch::Receiver<bool> {
-        self.paused.subscribe()
+    fn subscribe(&self) -> watch::Receiver<ElicitationTiming> {
+        self.timing.subscribe()
     }
 }
 
@@ -174,52 +193,43 @@ pub(crate) struct ElicitationPauseGuard {
 
 impl Drop for ElicitationPauseGuard {
     fn drop(&mut self) {
-        if self.pause_state.active_count.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.pause_state.paused.send_replace(false);
-        }
+        self.pause_state.timing.send_modify(|timing| {
+            timing.active_count -= 1;
+            if timing.active_count == 0 {
+                timing.active_since = Instant::now();
+            }
+        });
     }
 }
 
 async fn active_time_timeout<T, Fut>(
     duration: Duration,
-    mut pause_state: watch::Receiver<bool>,
+    mut pause_state: watch::Receiver<ElicitationTiming>,
     operation: Fut,
 ) -> std::result::Result<T, ()>
 where
     Fut: Future<Output = T>,
 {
-    let mut remaining = duration;
+    let started = pause_state.borrow_and_update().active_time();
     tokio::pin!(operation);
-
     loop {
-        if *pause_state.borrow_and_update() {
-            tokio::select! {
-                result = &mut operation => return Ok(result),
-                changed = pause_state.changed() => {
-                    if changed.is_err() {
-                        return time::timeout(remaining, operation).await.map_err(|_| ());
-                    }
-                    let _paused = *pause_state.borrow_and_update();
-                }
-            }
-            continue;
+        let (active_count, active_time) = {
+            let timing = pause_state.borrow_and_update();
+            (timing.active_count, timing.active_time())
+        };
+        let remaining = duration.saturating_sub(active_time.saturating_sub(started));
+        if remaining.is_zero() {
+            return Err(());
         }
-
-        let active_start = Instant::now();
         tokio::select! {
             result = &mut operation => return Ok(result),
-            _ = time::sleep(remaining) => {
-                return Err(());
-            }
+            _ = time::sleep(remaining), if active_count == 0 => {},
             changed = pause_state.changed() => {
                 if changed.is_err() {
+                    let remaining = duration.saturating_sub(
+                        pause_state.borrow().active_time().saturating_sub(started)
+                    );
                     return time::timeout(remaining, operation).await.map_err(|_| ());
-                }
-                if *pause_state.borrow_and_update() {
-                    remaining = remaining.saturating_sub(active_start.elapsed());
-                    if remaining.is_zero() {
-                        return Err(());
-                    }
                 }
             }
         }
@@ -308,12 +318,14 @@ impl OperationRequestTracker {
 
 struct OperationCancellationGuard {
     tracker: Option<OperationRequestTracker>,
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl OperationCancellationGuard {
     fn new(tracker: OperationRequestTracker) -> Self {
         Self {
             tracker: Some(tracker),
+            runtime: tokio::runtime::Handle::try_current().ok(),
         }
     }
 
@@ -327,7 +339,11 @@ impl Drop for OperationCancellationGuard {
         let Some(tracker) = self.tracker.take() else {
             return;
         };
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        let Some(runtime) = self
+            .runtime
+            .take()
+            .or_else(|| tokio::runtime::Handle::try_current().ok())
+        else {
             return;
         };
         runtime.spawn(async move {
@@ -386,17 +402,22 @@ impl From<CreateElicitationResult> for ElicitationResponse {
         Self {
             action: value.action,
             content: value.content,
-            meta: None,
+            meta: value.meta.map(|meta| serde_json::Value::Object(meta.0)),
         }
     }
 }
 
 impl From<ElicitationResponse> for CreateElicitationResult {
+    /// Preserves object metadata supported by RMCP. Non-object metadata is omitted;
+    /// the runtime's custom response serializer supports arbitrary JSON metadata.
     fn from(value: ElicitationResponse) -> Self {
         Self {
             action: value.action,
             content: value.content,
-            meta: None,
+            meta: value.meta.and_then(|meta| match meta {
+                serde_json::Value::Object(meta) => Some(rmcp::model::Meta(meta)),
+                _ => None,
+            }),
         }
     }
 }
@@ -634,9 +655,9 @@ impl RmcpClient {
                 }
                 .boxed()
             })
-            .await?;
+            .await;
         self.persist_oauth_tokens().await;
-        Ok(result)
+        result
     }
 
     #[instrument(level = "trace", skip_all)]
@@ -709,9 +730,9 @@ impl RmcpClient {
                 }
                 .boxed()
             })
-            .await?;
+            .await;
         self.persist_oauth_tokens().await;
-        Ok(result)
+        result
     }
 
     pub async fn list_resource_templates(
@@ -745,9 +766,9 @@ impl RmcpClient {
                     .boxed()
                 },
             )
-            .await?;
+            .await;
         self.persist_oauth_tokens().await;
-        Ok(result)
+        result
     }
 
     pub async fn read_resource(
@@ -774,9 +795,9 @@ impl RmcpClient {
                 }
                 .boxed()
             })
-            .await?;
+            .await;
         self.persist_oauth_tokens().await;
-        Ok(result)
+        result
     }
 
     pub async fn call_tool(
@@ -830,9 +851,9 @@ impl RmcpClient {
                 }
                 .boxed()
             })
-            .await?;
+            .await;
         self.persist_oauth_tokens().await;
-        Ok(result)
+        result
     }
 
     pub async fn send_custom_notification(
@@ -841,28 +862,29 @@ impl RmcpClient {
         params: Option<serde_json::Value>,
     ) -> Result<()> {
         self.refresh_oauth_if_needed().await;
-        self.run_service_operation(
-            "notifications/custom",
-            /*timeout*/ None,
-            move |service, _tracker| {
-                let params = params.clone();
-                async move {
-                    service
-                        .send_notification(ClientNotification::CustomNotification(
-                            CustomNotification {
-                                method: method.to_string(),
-                                params,
-                                extensions: Extensions::new(),
-                            },
-                        ))
-                        .await
-                }
-                .boxed()
-            },
-        )
-        .await?;
+        let result = self
+            .run_service_operation(
+                "notifications/custom",
+                /*timeout*/ None,
+                move |service, _tracker| {
+                    let params = params.clone();
+                    async move {
+                        service
+                            .send_notification(ClientNotification::CustomNotification(
+                                CustomNotification {
+                                    method: method.to_string(),
+                                    params,
+                                    extensions: Extensions::new(),
+                                },
+                            ))
+                            .await
+                    }
+                    .boxed()
+                },
+            )
+            .await;
         self.persist_oauth_tokens().await;
-        Ok(())
+        result
     }
 
     pub async fn send_custom_request(
@@ -889,9 +911,9 @@ impl RmcpClient {
                     .boxed()
                 },
             )
-            .await?;
+            .await;
         self.persist_oauth_tokens().await;
-        Ok(response)
+        response
     }
 
     async fn service(&self) -> Result<Arc<RunningService<RoleClient, ElicitationClientService>>> {
@@ -931,7 +953,7 @@ impl RmcpClient {
                 Err(service) => {
                     service.cancellation_token().cancel();
                     while !service.is_transport_closed() {
-                        tokio::task::yield_now().await;
+                        time::sleep(Duration::from_millis(10)).await;
                     }
                 }
             }
@@ -1103,6 +1125,7 @@ impl RmcpClient {
         Arc<RunningService<RoleClient, ElicitationClientService>>,
         Option<OAuthPersistor>,
     )> {
+        let deadline = timeout.map(|duration| Instant::now() + duration);
         let (transport, oauth_persistor) = match pending_transport {
             PendingTransport::Stdio { transport } => (
                 service::serve_client(client_service, transport).boxed(),
@@ -1135,12 +1158,22 @@ impl RmcpClient {
         let service = match service_result {
             Ok(service) => service,
             Err(error) => {
-                if let Some(runtime) = oauth_persistor.as_ref()
-                    && let Err(persist_error) = runtime.persist_if_needed().await
-                {
-                    warn!(
-                        "failed to persist OAuth tokens after failed initialize: {persist_error}"
-                    );
+                if let Some(runtime) = oauth_persistor {
+                    let persistence = tokio::spawn(async move {
+                        if let Err(persist_error) = runtime.persist_if_needed().await {
+                            warn!(
+                                "failed to persist OAuth tokens after failed initialize: {persist_error}"
+                            );
+                        }
+                    });
+                    // Let a retry observe refreshed credentials, but keep storage I/O
+                    // within the caller's remaining startup budget. Dropping the join
+                    // handle leaves the owned write running to completion.
+                    if let Some(deadline) = deadline {
+                        let _ = time::timeout_at(deadline, persistence).await;
+                    } else {
+                        let _ = persistence.await;
+                    }
                 }
                 return Err(error);
             }
@@ -1173,7 +1206,9 @@ impl RmcpClient {
             {
                 Ok(result) => result,
                 Err(()) => {
-                    tracker.cancel_current("request timeout").await;
+                    tokio::spawn(async move {
+                        tracker.cancel_current("request timeout").await;
+                    });
                     Err(ClientOperationError::Timeout {
                         label: label.to_string(),
                         duration,
@@ -1571,6 +1606,34 @@ mod tests {
             .await;
 
         assert_eq!(Ok("done"), result);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_time_budget_survives_coalesced_pause_notifications() {
+        let state = ElicitationPauseState::new();
+        let future = active_time_timeout(
+            Duration::from_secs(10),
+            state.subscribe(),
+            std::future::pending::<()>(),
+        );
+        tokio::pin!(future);
+        assert!(futures::poll!(&mut future).is_pending());
+        time::advance(Duration::from_secs(6)).await;
+        let first = state.enter();
+        let second = state.enter();
+        time::advance(Duration::from_secs(100)).await;
+        drop(first);
+        assert!(futures::poll!(&mut future).is_pending());
+        time::advance(Duration::from_secs(100)).await;
+        drop(second);
+        // Coalesce resume, pause, and resume without polling the timeout.
+        time::advance(Duration::from_secs(3)).await;
+        let third = state.enter();
+        time::advance(Duration::from_secs(100)).await;
+        drop(third);
+        assert!(futures::poll!(&mut future).is_pending());
+        time::advance(Duration::from_secs(1)).await;
+        assert_eq!(futures::poll!(&mut future), std::task::Poll::Ready(Err(())));
     }
 
     #[tokio::test]

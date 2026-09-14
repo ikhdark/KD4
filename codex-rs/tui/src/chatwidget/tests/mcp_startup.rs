@@ -682,3 +682,34 @@ async fn app_server_mcp_startup_next_round_after_lag_can_settle_without_starting
     assert!(summary_text.contains("MCP startup incomplete (failed: alpha)"));
     assert!(!chat.bottom_pane.is_task_running());
 }
+
+#[tokio::test]
+async fn mcp_completion_does_not_repeat_locally_settled_failures() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.show_welcome_banner = false;
+    chat.set_mcp_startup_expected_servers(["alpha".to_string()]);
+    notify_mcp_status(&mut chat, "alpha", McpServerStartupState::Starting);
+    notify_mcp_status_error(&mut chat, "alpha", "alpha authentication failed");
+    assert!(chat.mcp_startup_status.is_none());
+    let text = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<String>();
+    assert_eq!(text.matches("alpha authentication failed").count(), 1);
+    assert_eq!(text.matches("MCP startup incomplete").count(), 1);
+    notify_mcp_completed(
+        &mut chat,
+        &[],
+        &[("alpha", "alpha authentication failed")],
+        &[],
+    );
+    assert!(drain_insert_history(&mut rx).is_empty());
+    notify_mcp_status(&mut chat, "alpha", McpServerStartupState::Starting);
+    notify_mcp_status_error(&mut chat, "alpha", "alpha authentication failed");
+    let text = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<String>();
+    assert_eq!(text.matches("alpha authentication failed").count(), 1);
+    assert_eq!(text.matches("MCP startup incomplete").count(), 1);
+}

@@ -36,6 +36,7 @@ fn environment_descriptor_binds_every_manifest_resource() {
     let hooks = root.join("hooks/hooks.json");
     let composer_icon = root.join("assets/composer.svg");
     let logo = root.join("assets/logo.svg");
+    let logo_dark = root.join("assets/logo-dark.svg");
     let screenshot = root.join("assets/screenshot.png");
     let manifest = PluginManifest {
         name: "demo".to_string(),
@@ -51,6 +52,7 @@ fn environment_descriptor_binds_every_manifest_resource() {
         interface: Some(PluginManifestInterface {
             composer_icon: Some(path_uri(&composer_icon)),
             logo: Some(path_uri(&logo)),
+            logo_dark: Some(path_uri(&logo_dark)),
             screenshots: vec![path_uri(&screenshot)],
             ..PluginManifestInterface::default()
         }),
@@ -92,6 +94,7 @@ fn environment_descriptor_binds_every_manifest_resource() {
             interface: Some(PluginManifestInterface {
                 composer_icon: Some(resource("executor-1", &composer_icon)),
                 logo: Some(resource("executor-1", &logo)),
+                logo_dark: Some(resource("executor-1", &logo_dark)),
                 screenshots: vec![resource("executor-1", &screenshot)],
                 ..PluginManifestInterface::default()
             }),
@@ -104,7 +107,7 @@ fn environment_descriptor_binds_every_manifest_resource() {
 fn environment_descriptor_rejects_resources_outside_package_root() {
     let cwd = std::env::current_dir().expect("cwd");
     let root = absolute(cwd.join("plugin-root"));
-    let outside = absolute(cwd.join("outside/.mcp.json"));
+    let outside = absolute(cwd.join("plugin-root-other/.mcp.json"));
     let manifest = PluginManifest {
         name: "demo".to_string(),
         version: None,
@@ -128,6 +131,44 @@ fn environment_descriptor_rejects_resources_outside_package_root() {
         manifest,
     )
     .expect_err("outside resource should fail");
+
+    assert_eq!(
+        err,
+        ResolvedPluginError::ResourceOutsideRoot {
+            root: path_uri(&root),
+            path: path_uri(&outside),
+        }
+    );
+}
+
+#[test]
+fn environment_descriptor_rejects_manifest_outside_package_root() {
+    let cwd = std::env::current_dir().expect("cwd");
+    let root = absolute(cwd.join("plugin-root"));
+    let outside = absolute(cwd.join("plugin-root-other/.codex-plugin/plugin.json"));
+    let manifest = PluginManifest {
+        name: "demo".to_string(),
+        version: None,
+        description: None,
+        keywords: Vec::new(),
+        paths: PluginManifestPaths {
+            skills: vec![path_uri(&root.join("skills"))],
+            mcp_servers: None,
+            apps: None,
+            hooks: None,
+        },
+        interface: None,
+        tool_exposure: None,
+    };
+
+    let err = ResolvedPlugin::from_environment(
+        "selected-demo".to_string(),
+        "executor-1".to_string(),
+        path_uri(&root),
+        path_uri(&outside),
+        manifest,
+    )
+    .expect_err("outside manifest should fail even when its resources are inside");
 
     assert_eq!(
         err,

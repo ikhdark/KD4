@@ -110,7 +110,7 @@ pub(crate) struct ChatComposerHistory {
     /// Local entries retain full draft state (text elements, image paths, pending pastes, remote image URLs).
     local_history: Vec<HistoryEntry>,
     /// Local entries seeded from resumed transcript replay.
-    replay_seeded_history: Vec<HistoryEntry>,
+    replay_seeded_history: Vec<usize>,
 
     /// Cache of persistent history entries fetched on-demand (text-only).
     fetched_history: HashMap<usize, HistoryEntry>,
@@ -254,8 +254,9 @@ impl ChatComposerHistory {
     }
 
     pub fn record_replayed_submission(&mut self, entry: HistoryEntry) {
-        if self.record_local_submission_inner(entry.clone()) {
-            self.replay_seeded_history.push(entry);
+        if self.record_local_submission_inner(entry) {
+            self.replay_seeded_history
+                .push(self.local_history.len() - 1);
         }
     }
 
@@ -281,6 +282,15 @@ impl ChatComposerHistory {
 
         self.local_history.push(entry);
         true
+    }
+
+    /// Stops an outstanding recall from replacing a draft edited while the lookup was pending.
+    pub fn invalidate_pending_navigation(&mut self) {
+        if self.pending_navigation_direction.is_some() {
+            self.history_cursor = None;
+            self.pending_navigation_direction = None;
+            self.last_history_text = None;
+        }
     }
 
     /// Resets normal history navigation so the next Up key resumes from the newest entry.
@@ -616,7 +626,8 @@ impl ChatComposerHistory {
         let total_entries = self.total_entries();
         while offset < total_entries {
             if let Some(entry) = self.entry_at_cached_offset(offset) {
-                if self.search_matches(&entry) && self.search_result_is_unique(&entry) {
+                if self.search_matches(entry) && self.search_result_is_unique(entry) {
+                    let entry = entry.clone();
                     return self.search_match(offset, entry);
                 }
             } else if offset < self.persistent_entry_count
@@ -652,13 +663,11 @@ impl ChatComposerHistory {
         HistorySearchResult::NotFound
     }
 
-    fn entry_at_cached_offset(&self, offset: usize) -> Option<HistoryEntry> {
+    fn entry_at_cached_offset(&self, offset: usize) -> Option<&HistoryEntry> {
         if offset >= self.persistent_entry_count {
-            self.local_history
-                .get(offset - self.persistent_entry_count)
-                .cloned()
+            self.local_history.get(offset - self.persistent_entry_count)
         } else {
-            self.fetched_history.get(&offset).cloned()
+            self.fetched_history.get(&offset)
         }
     }
 
@@ -742,7 +751,7 @@ impl ChatComposerHistory {
         loop {
             if let Some(entry) = self.entry_at_cached_offset(global_idx) {
                 if global_idx < self.persistent_entry_count
-                    && self.persistent_entry_duplicates_local(&entry)
+                    && self.persistent_entry_duplicates_local(entry)
                 {
                     let Some(next_idx) = self.next_history_offset(global_idx, direction) else {
                         self.pending_navigation_direction = None;
@@ -752,6 +761,7 @@ impl ChatComposerHistory {
                     global_idx = next_idx;
                     continue;
                 }
+                let entry = entry.clone();
                 self.pending_navigation_direction = None;
                 self.last_history_text = Some(entry.text.clone());
                 return Some(entry);
@@ -787,7 +797,8 @@ impl ChatComposerHistory {
     }
 
     fn persistent_entry_duplicates_local(&self, entry: &HistoryEntry) -> bool {
-        self.replay_seeded_history.iter().any(|local_entry| {
+        self.replay_seeded_history.iter().any(|&index| {
+            let local_entry = &self.local_history[index];
             local_entry.text == entry.text && local_entry.mention_bindings == entry.mention_bindings
         })
     }
@@ -823,19 +834,18 @@ impl HistorySearchState {
     }
 
     fn record_match(&mut self, offset: usize, entry: &HistoryEntry) {
-        if let Some(index) = self
-            .unique_matches
-            .iter()
-            .position(|history_match| history_match.offset == offset)
-        {
-            self.select_match(index);
-            return;
-        }
-
-        self.seen_texts.insert(entry.text.clone());
         let insert_index = self
             .unique_matches
             .partition_point(|history_match| history_match.offset > offset);
+        if self
+            .unique_matches
+            .get(insert_index)
+            .is_some_and(|history_match| history_match.offset == offset)
+        {
+            self.select_match(insert_index);
+            return;
+        }
+        self.seen_texts.insert(entry.text.clone());
         self.unique_matches.insert(
             insert_index,
             UniqueHistoryMatch {
@@ -853,8 +863,6 @@ impl HistorySearchState {
         self.selected_offset = Some(history_match.offset);
         self.selected_match_index = Some(index);
         self.awaiting = None;
-        self.exhausted_older = false;
-        self.exhausted_newer = false;
     }
 }
 
@@ -1171,6 +1179,55 @@ mod tests {
                 &tx
             )
         );
+    }
+
+    #[test]
+    fn cached_match_navigation_preserves_an_exhausted_boundary() {
+        let (tx, mut rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx);
+        let mut history = ChatComposerHistory::new();
+        history.set_metadata(test_thread_id(), 1, 3);
+        for (offset, text) in [(2, "needle newest"), (1, "needle older")] {
+            assert_eq!(
+                history.search("needle", HistorySearchDirection::Older, offset == 2, &tx),
+                HistorySearchResult::Pending
+            );
+            assert!(
+                matches!(rx.try_recv(), Ok(AppEvent::LookupMessageHistoryEntry { offset: requested, .. }) if requested == offset)
+            );
+            assert_eq!(
+                history.on_entry_response(1, offset, Some(text.into()), &tx),
+                HistoryEntryResponse::Search(HistorySearchResult::Found(HistoryEntry::new(
+                    text.into()
+                )))
+            );
+        }
+        assert_eq!(
+            history.search("needle", HistorySearchDirection::Older, false, &tx),
+            HistorySearchResult::Pending
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppEvent::LookupMessageHistoryEntry { offset: 0, .. })
+        ));
+        assert_eq!(
+            history.on_entry_response(1, 0, None, &tx),
+            HistoryEntryResponse::Search(HistorySearchResult::AtBoundary)
+        );
+        for (direction, text) in [
+            (HistorySearchDirection::Newer, "needle newest"),
+            (HistorySearchDirection::Older, "needle older"),
+        ] {
+            assert_eq!(
+                history.search("needle", direction, false, &tx),
+                HistorySearchResult::Found(HistoryEntry::new(text.into()))
+            );
+        }
+        assert_eq!(
+            history.search("needle", HistorySearchDirection::Older, false, &tx),
+            HistorySearchResult::AtBoundary
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

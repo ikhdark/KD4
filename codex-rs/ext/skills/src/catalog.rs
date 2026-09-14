@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use codex_core_skills::model::SkillDependencies;
 use codex_protocol::protocol::SkillScope;
 use codex_utils_path_uri::PathUri;
@@ -190,10 +192,22 @@ pub struct SkillCatalog {
 
 impl SkillCatalog {
     pub fn extend(&mut self, other: SkillCatalog) {
-        for entry in other.entries {
-            self.push_entry(entry);
-        }
+        self.extend_entries(other.entries);
         self.warnings.extend(other.warnings);
+    }
+
+    /// Append a batch in order, retaining the first entry for each authority/package.
+    pub fn extend_entries(&mut self, entries: impl IntoIterator<Item = SkillCatalogEntry>) {
+        let mut seen: HashSet<_> = self
+            .entries
+            .iter()
+            .map(|entry| (entry.authority.clone(), entry.id.clone()))
+            .collect();
+        self.entries.extend(
+            entries
+                .into_iter()
+                .filter(|entry| seen.insert((entry.authority.clone(), entry.id.clone()))),
+        );
     }
 
     pub fn push_entry(&mut self, entry: SkillCatalogEntry) {

@@ -132,7 +132,7 @@ fn empty_and_tiny_chunks_have_bounded_metadata() {
 
     for byte in b"0123456789ab" {
         buf.push_chunk(&[]);
-        buf.push_chunk(&vec![*byte]);
+        buf.push_chunk(&[*byte]);
     }
 
     assert_eq!(

@@ -12,6 +12,8 @@ pub enum CargoBinError {
     },
     #[error("CARGO_BIN_EXE env var {key} resolved to {path:?}, but it does not exist")]
     ResolvedPathDoesNotExist { key: String, path: PathBuf },
+    #[error("CARGO_BIN_EXE env var {key} resolved to {path:?}, but an absolute path is required")]
+    ResolvedPathIsRelative { key: String, path: PathBuf },
     #[error("could not locate binary {name:?}; tried env vars {env_keys:?}; {fallback}")]
     NotFound {
         name: String,
@@ -58,7 +60,7 @@ fn cargo_bin_env_keys(name: &str) -> Vec<String> {
     let mut keys = Vec::with_capacity(2);
     keys.push(format!("CARGO_BIN_EXE_{name}"));
 
-    // Cargo replaces dashes in target names when exporting env vars.
+    // The repository's rust_test_runner exports both spellings for helper binaries.
     let underscore_name = name.replace('-', "_");
     if underscore_name != name {
         keys.push(format!("CARGO_BIN_EXE_{underscore_name}"));
@@ -69,7 +71,13 @@ fn cargo_bin_env_keys(name: &str) -> Vec<String> {
 
 fn resolve_bin_from_env(key: &str, value: OsString) -> Result<PathBuf, CargoBinError> {
     let path = PathBuf::from(value);
-    if path.is_absolute() && path.exists() {
+    if !path.is_absolute() {
+        return Err(CargoBinError::ResolvedPathIsRelative {
+            key: key.to_owned(),
+            path,
+        });
+    }
+    if path.exists() {
         return Ok(path);
     }
 
@@ -109,3 +117,19 @@ pub fn repo_root() -> io::Result<PathBuf> {
     }
     Ok(root)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_environment_path_reports_the_absolute_path_requirement() {
+        let error = resolve_bin_from_env("CARGO_BIN_EXE_example", OsString::from("Cargo.toml"))
+            .expect_err("relative environment path");
+        assert!(
+            matches!(&error, CargoBinError::ResolvedPathIsRelative { path, .. } if path == Path::new("Cargo.toml"))
+        );
+        assert!(error.to_string().contains("an absolute path is required"));
+    }
+}
+

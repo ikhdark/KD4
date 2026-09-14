@@ -100,6 +100,10 @@ fn sanitize_original_falls_back_to_high_without_support() {
         },
     ];
 
+    let original = items.clone();
+    sanitize_original_image_detail(/*can_request_original_image_detail*/ true, &mut items);
+    assert_eq!(items, original);
+
     sanitize_original_image_detail(/*can_request_original_image_detail*/ false, &mut items);
 
     assert_eq!(

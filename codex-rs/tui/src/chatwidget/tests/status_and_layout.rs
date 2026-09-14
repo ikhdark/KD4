@@ -248,9 +248,10 @@ async fn status_line_branch_changes_render_no_changes() {
 async fn stale_status_line_git_summary_update_is_ignored() {
     let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.status_line_git_summary_cwd = Some(PathBuf::from("/expected"));
-    chat.status_line_git_summary_pending = true;
+    chat.status_line_git_summary_pending_request_id = Some(uuid::Uuid::new_v4());
 
     chat.set_status_line_git_summary(
+        chat.status_line_git_summary_pending_request_id.unwrap(),
         PathBuf::from("/other"),
         StatusLineGitSummary {
             pull_request: Some(crate::branch_summary::StatusLinePullRequest {
@@ -265,7 +266,68 @@ async fn stale_status_line_git_summary_update_is_ignored() {
     );
 
     assert!(chat.status_line_git_summary.is_none());
-    assert!(!chat.status_line_git_summary_pending);
+    assert!(chat.status_line_git_summary_pending_request_id.is_some());
+}
+
+#[tokio::test]
+async fn stale_status_line_branch_update_preserves_pending_lookup() {
+    let (mut chat, _rx, _ops) = make_chatwidget_manual(None).await;
+    chat.status_line_branch_cwd = Some(PathBuf::from("/expected"));
+    chat.status_line_branch_pending_request_id = Some(uuid::Uuid::new_v4());
+    chat.set_status_line_branch(
+        chat.status_line_branch_pending_request_id.unwrap(),
+        PathBuf::from("/other"),
+        Some("stale".to_string()),
+    );
+    assert!(chat.status_line_branch.is_none());
+    assert!(chat.status_line_branch_pending_request_id.is_some());
+}
+
+#[tokio::test]
+async fn status_line_omits_unknown_context_window_and_usage() {
+    let (mut chat, _rx, _ops) = make_chatwidget_manual(None).await;
+    chat.token_info = None;
+    chat.config.model_context_window = None;
+    for item in [
+        crate::bottom_pane::StatusLineItem::ContextWindowSize,
+        crate::bottom_pane::StatusLineItem::ContextUsed,
+    ] {
+        assert_eq!(chat.status_line_value_for_item(item), None);
+    }
+}
+
+#[tokio::test]
+async fn stale_git_request_for_same_cwd_preserves_newer_request() {
+    let (mut chat, _rx, _ops) = make_chatwidget_manual(None).await;
+    let cwd = PathBuf::from("/expected");
+    let current_request = uuid::Uuid::new_v4();
+    let stale_request = uuid::Uuid::new_v4();
+    chat.status_line_branch_cwd = Some(cwd.clone());
+    chat.status_line_git_summary_cwd = Some(cwd.clone());
+    chat.status_line_branch_pending_request_id = Some(current_request);
+    chat.status_line_git_summary_pending_request_id = Some(current_request);
+    chat.set_status_line_branch(stale_request, cwd.clone(), Some("old-branch".to_string()));
+    chat.set_status_line_git_summary(
+        stale_request,
+        cwd,
+        StatusLineGitSummary {
+            pull_request: None,
+            branch_change_stats: Some(crate::branch_summary::GitBranchDiffStats {
+                additions: 99,
+                deletions: 3,
+            }),
+        },
+    );
+    assert!(chat.status_line_branch.is_none());
+    assert!(chat.status_line_git_summary.is_none());
+    assert_eq!(
+        chat.status_line_branch_pending_request_id,
+        Some(current_request)
+    );
+    assert_eq!(
+        chat.status_line_git_summary_pending_request_id,
+        Some(current_request)
+    );
 }
 
 #[tokio::test]
@@ -2639,14 +2701,14 @@ async fn account_update_discards_stale_workspace_headline_results() {
 async fn status_line_branch_state_resets_when_git_branch_disabled() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.status_line_branch = Some("main".to_string());
-    chat.status_line_branch_pending = true;
+    chat.status_line_branch_pending_request_id = Some(uuid::Uuid::new_v4());
     chat.status_line_branch_lookup_complete = true;
     chat.config.tui_status_line = Some(vec!["model_name".to_string()]);
 
     chat.refresh_status_line();
 
     assert_eq!(chat.status_line_branch, None);
-    assert!(!chat.status_line_branch_pending);
+    assert!(chat.status_line_branch_pending_request_id.is_none());
     assert!(!chat.status_line_branch_lookup_complete);
 }
 
@@ -2656,11 +2718,11 @@ async fn status_line_branch_refreshes_after_turn_complete() {
     install_noop_workspace_command_runner(&mut chat);
     chat.config.tui_status_line = Some(vec!["git-branch".to_string()]);
     chat.status_line_branch_lookup_complete = true;
-    chat.status_line_branch_pending = false;
+    chat.status_line_branch_pending_request_id = None;
 
     handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
 
-    assert!(chat.status_line_branch_pending);
+    assert!(chat.status_line_branch_pending_request_id.is_some());
 }
 
 #[tokio::test]
@@ -2669,11 +2731,11 @@ async fn status_line_branch_refreshes_after_interrupt() {
     install_noop_workspace_command_runner(&mut chat);
     chat.config.tui_status_line = Some(vec!["git-branch".to_string()]);
     chat.status_line_branch_lookup_complete = true;
-    chat.status_line_branch_pending = false;
+    chat.status_line_branch_pending_request_id = None;
 
     handle_turn_interrupted(&mut chat, "turn-1");
 
-    assert!(chat.status_line_branch_pending);
+    assert!(chat.status_line_branch_pending_request_id.is_some());
 }
 
 fn install_noop_workspace_command_runner(chat: &mut ChatWidget) {
@@ -4427,4 +4489,56 @@ async fn rate_limit_usage_warnings_preserve_and_clear_spend_control_state() {
         chat.codex_rate_limit_reached_type,
         Some(RateLimitReachedType::WorkspaceMemberUsageLimitReached)
     );
+}
+
+#[tokio::test]
+async fn refreshed_usage_cancels_deferred_rate_limit_prompt() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.has_chatgpt_account = true;
+    chat.bottom_pane.set_task_running(true);
+    chat.on_rate_limit_snapshot(Some(snapshot(95.0)));
+    assert!(matches!(
+        chat.rate_limit_switch_prompt,
+        RateLimitSwitchPromptState::Pending
+    ));
+    chat.on_rate_limit_snapshot(Some(snapshot(10.0)));
+    chat.bottom_pane.set_task_running(false);
+    chat.maybe_show_pending_rate_limit_prompt();
+    assert!(matches!(
+        chat.rate_limit_switch_prompt,
+        RateLimitSwitchPromptState::Idle
+    ));
+    assert!(chat.bottom_pane.no_modal_or_popup_active());
+}
+
+#[tokio::test]
+async fn other_limit_does_not_replace_codex_reached_reason() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let mut codex = snapshot(100.0);
+    codex.rate_limit_reached_type = Some(RateLimitReachedType::WorkspaceMemberCreditsDepleted);
+    chat.on_rate_limit_snapshot(Some(codex));
+    let mut other = snapshot(100.0);
+    other.limit_id = Some("other".to_string());
+    other.rate_limit_reached_type = Some(RateLimitReachedType::WorkspaceOwnerCreditsDepleted);
+    chat.on_rate_limit_snapshot(Some(other));
+    assert_eq!(
+        chat.codex_rate_limit_reached_type,
+        Some(RateLimitReachedType::WorkspaceMemberCreditsDepleted)
+    );
+}
+
+#[test]
+fn notification_preview_preserves_unicode_and_whitespace_at_limit() {
+    for response in [
+        "  alpha\t beta\n gamma ".to_string(),
+        format!("{} tail", "👩‍💻e\u{301} ".repeat(150)),
+        format!("{}\nend", "a".repeat(1_000_000)),
+        format!("{}{}", "a".repeat(199), " ".repeat(100_000)),
+        "\n\t ".to_string(),
+    ] {
+        let normalized = response.split_whitespace().collect::<Vec<_>>().join(" ");
+        let expected = (!normalized.is_empty())
+            .then(|| truncate_text(&normalized, 200));
+        assert_eq!(Notification::agent_turn_preview(&response), expected);
+    }
 }

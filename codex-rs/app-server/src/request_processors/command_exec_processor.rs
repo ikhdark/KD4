@@ -202,6 +202,11 @@ impl CommandExecRequestProcessor {
         if size.is_some() && !tty {
             return Err(invalid_params("command/exec size requires tty: true"));
         }
+        let size = size
+            .map(|size| {
+                crate::command_exec::terminal_size_from_protocol(size.into_inner(), "command/exec")
+            })
+            .transpose()?;
 
         if disable_output_cap && output_bytes_cap.is_some() {
             return Err(invalid_params(
@@ -222,6 +227,8 @@ impl CommandExecRequestProcessor {
         );
         if let Some(env_overrides) = env_overrides {
             for (key, value) in env_overrides {
+                #[cfg(windows)]
+                env.retain(|inherited_key, _| !inherited_key.eq_ignore_ascii_case(&key));
                 match value {
                     Some(value) => {
                         env.insert(key, value);
@@ -366,13 +373,6 @@ impl CommandExecRequestProcessor {
         let outgoing = self.outgoing.clone();
         let request_for_task = request.clone();
         let started_network_proxy_for_task = started_network_proxy;
-        let size = match size.map(|size| {
-            crate::command_exec::terminal_size_from_protocol(size.into_inner(), "command/exec")
-        }) {
-            Some(Ok(size)) => Some(size),
-            Some(Err(error)) => return Err(error),
-            None => None,
-        };
 
         let exec_request = codex_core::exec::build_exec_request_async(
             exec_params,

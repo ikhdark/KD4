@@ -14,7 +14,6 @@ use codex_file_search as file_search;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
 
 use crate::outgoing_message::OutgoingMessageSender;
 
@@ -25,9 +24,9 @@ pub(crate) async fn run_fuzzy_file_search(
     query: String,
     roots: Vec<String>,
     cancellation_flag: Arc<AtomicBool>,
-) -> Vec<FuzzyFileSearchResult> {
+) -> anyhow::Result<Vec<FuzzyFileSearchResult>> {
     if roots.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     #[expect(clippy::expect_used)]
@@ -41,7 +40,7 @@ pub(crate) async fn run_fuzzy_file_search(
     let threads = NonZero::new(threads.max(1)).expect("threads should be non-zero");
     let search_dirs: Vec<PathBuf> = roots.iter().map(PathBuf::from).collect();
 
-    let mut files = match tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         file_search::run(
             query.as_str(),
             search_dirs,
@@ -54,35 +53,25 @@ pub(crate) async fn run_fuzzy_file_search(
             Some(cancellation_flag),
         )
     })
-    .await
-    {
-        Ok(Ok(res)) => res
-            .matches
-            .into_iter()
-            .map(|m| {
-                let file_name = m.path.file_name().unwrap_or_default();
-                FuzzyFileSearchResult {
-                    root: m.root.to_string_lossy().to_string(),
-                    path: m.path.to_string_lossy().to_string(),
-                    match_type: match m.match_type {
-                        file_search::MatchType::File => FuzzyFileSearchMatchType::File,
-                        file_search::MatchType::Directory => FuzzyFileSearchMatchType::Directory,
-                    },
-                    file_name: file_name.to_string_lossy().to_string(),
-                    score: m.score,
-                    indices: m.indices,
-                }
-            })
-            .collect::<Vec<_>>(),
-        Ok(Err(err)) => {
-            warn!("fuzzy-file-search failed: {err}");
-            Vec::new()
-        }
-        Err(err) => {
-            warn!("fuzzy-file-search join failed: {err}");
-            Vec::new()
-        }
-    };
+    .await??;
+    let mut files = result
+        .matches
+        .into_iter()
+        .map(|m| {
+            let file_name = m.path.file_name().unwrap_or_default();
+            FuzzyFileSearchResult {
+                root: m.root.to_string_lossy().to_string(),
+                path: m.path.to_string_lossy().to_string(),
+                match_type: match m.match_type {
+                    file_search::MatchType::File => FuzzyFileSearchMatchType::File,
+                    file_search::MatchType::Directory => FuzzyFileSearchMatchType::Directory,
+                },
+                file_name: file_name.to_string_lossy().to_string(),
+                score: m.score,
+                indices: m.indices,
+            }
+        })
+        .collect::<Vec<_>>();
 
     files.sort_by(file_search::cmp_by_score_desc_then_path_asc::<
         FuzzyFileSearchResult,
@@ -90,7 +79,7 @@ pub(crate) async fn run_fuzzy_file_search(
         _,
     >(|f| f.score, |f| f.path.as_str()));
 
-    files
+    Ok(files)
 }
 
 pub(crate) struct FuzzyFileSearchSession {
@@ -108,6 +97,7 @@ impl FuzzyFileSearchSession {
             #[expect(clippy::unwrap_used)]
             let mut latest_query = self.shared.latest_query.lock().unwrap();
             *latest_query = query.clone();
+            self.shared.query_changed.notify_waiters();
         }
         self.session.update_query(&query);
     }
@@ -142,6 +132,7 @@ pub(crate) fn start_fuzzy_file_search_session(
         outgoing,
         pending_deliveries: Mutex::new(PendingDeliveries::default()),
         delivery_ready: Notify::new(),
+        query_changed: Notify::new(),
         delivery_cancellation: CancellationToken::new(),
         canceled: canceled.clone(),
     });
@@ -175,6 +166,7 @@ struct SessionShared {
     outgoing: Arc<OutgoingMessageSender>,
     pending_deliveries: Mutex<PendingDeliveries>,
     delivery_ready: Notify,
+    query_changed: Notify,
     delivery_cancellation: CancellationToken,
     canceled: Arc<AtomicBool>,
 }
@@ -275,12 +267,16 @@ async fn run_delivery_relay(shared: Arc<SessionShared>) {
                 _ = notified => continue,
             }
         };
+        let query_changed = shared.query_changed.notified();
+        tokio::pin!(query_changed);
+        query_changed.as_mut().enable();
         if shared.canceled.load(Ordering::Relaxed) || !shared.query_is_current(&delivery.query) {
             continue;
         }
         tokio::select! {
             biased;
             _ = shared.delivery_cancellation.cancelled() => return,
+            _ = query_changed => continue,
             _ = shared.outgoing.send_server_notification(delivery.notification) => {}
         }
     }
@@ -413,6 +409,7 @@ mod tests {
             outgoing,
             pending_deliveries: Mutex::new(PendingDeliveries::default()),
             delivery_ready: Notify::new(),
+            query_changed: Notify::new(),
             delivery_cancellation: CancellationToken::new(),
             canceled: Arc::new(AtomicBool::new(false)),
         });
@@ -454,5 +451,66 @@ mod tests {
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn query_update_invalidates_a_saturated_delivery() {
+        use crate::outgoing_message::OutgoingEnvelope;
+        use crate::outgoing_message::OutgoingMessage;
+        let (tx, mut rx) = mpsc::channel(1);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        assert!(outgoing.try_send_server_notification(completion_notification("blocker")));
+        let root = tempfile::tempdir().unwrap();
+        let mut session = start_fuzzy_file_search_session(
+            "session".to_string(),
+            vec![root.path().to_string_lossy().into_owned()],
+            outgoing,
+        )
+        .unwrap();
+        session.delivery_relay.task.abort();
+        assert!(
+            (&mut session.delivery_relay.task)
+                .await
+                .unwrap_err()
+                .is_cancelled()
+        );
+        let mut relay = Box::pin(run_delivery_relay(Arc::clone(&session.shared)));
+        session.update_query("old".to_string());
+        session.shared.enqueue_delivery(
+            DeliveryKind::Completion,
+            "old".to_string(),
+            completion_notification("old"),
+        );
+        assert!(futures::poll!(&mut relay).is_pending());
+
+        session.update_query("new".to_string());
+        session.shared.enqueue_delivery(
+            DeliveryKind::Completion,
+            "new".to_string(),
+            completion_notification("new"),
+        );
+        rx.recv().await.expect("blocker");
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::select! {
+                _ = &mut relay => panic!("relay must remain active"),
+                delivery = rx.recv() => delivery.expect("latest query delivery"),
+            }
+        })
+        .await
+        .expect("latest query delivered after capacity returns");
+        let query = match delivered {
+            OutgoingEnvelope::Broadcast {
+                message: OutgoingMessage::AppServerNotification(notification),
+            } => match notification {
+                ServerNotification::FuzzyFileSearchSessionCompleted(value) => value.query,
+                ServerNotification::FuzzyFileSearchSessionUpdated(value) => value.query,
+                other => panic!("unexpected notification: {other:?}"),
+            },
+            other => panic!("unexpected delivery: {other:?}"),
+        };
+        assert_eq!(query, "new");
     }
 }

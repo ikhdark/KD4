@@ -83,6 +83,10 @@ impl ProcThreadAttributeList {
     }
 
     pub fn set_job(&mut self, job: HANDLE) -> Result<(), Error> {
+        ensure!(
+            self.job_list.is_empty(),
+            "job attribute has already been set"
+        );
         // Atomic job attachment is intentionally required for native ConPTY
         // spawns. If Windows cannot honor the job list (for example, because a
         // parent job forbids nesting), fail the spawn rather than briefly run
@@ -128,5 +132,23 @@ impl Drop for ProcThreadAttributeList {
         // SAFETY: Self is constructed only after successful initialization, and its backing
         // storage and job-list values remain alive during deletion.
         unsafe { DeleteProcThreadAttributeList(self.as_mut_ptr()) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::windows::io::AsRawHandle;
+
+    #[test]
+    fn setting_job_twice_preserves_registered_storage() -> anyhow::Result<()> {
+        let job = crate::win::job::JobObject::create()?;
+        let mut attributes = ProcThreadAttributeList::with_capacity(1)?;
+        attributes.set_job(job.as_raw_handle().cast())?;
+        let address = attributes.job_list.as_ptr();
+        assert!(attributes.set_job(job.as_raw_handle().cast()).is_err());
+        assert_eq!(attributes.job_list.as_ptr(), address);
+        assert_eq!(attributes.job_list, vec![job.as_raw_handle().cast()]);
+        Ok(())
     }
 }

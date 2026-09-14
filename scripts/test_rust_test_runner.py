@@ -294,6 +294,20 @@ class RunnerTestCase(unittest.TestCase):
 
 
 class ManifestSchemaTest(RunnerTestCase):
+    def test_list_targets_does_not_load_cargo_metadata(self):
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                rust_test_runner,
+                "load_metadata",
+                side_effect=AssertionError("metadata discovery"),
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(rust_test_runner.main(["list-targets"]), 0)
+        self.assertIn("target\t", output.getvalue())
+        self.assertIn("gate\t", output.getvalue())
+
     def test_unknown_top_level_key_is_rejected(self) -> None:
         with self.assertRaisesRegex(RunnerError, "unknown keys: profiles"):
             self.manifest(profiles={})
@@ -467,6 +481,11 @@ class GenericRecipeGuardTest(unittest.TestCase):
             ["--package", "codex-core"],
             ["--package=codex-core"],
             ["-pcodex-core"],
+            ["--workspace"],
+            ["--all"],
+            ["-p", "codex-*"],
+            ["--package=codex-c?re"],
+            ["-p", "codex-core@0.0.0"],
             ["--no-fail-fast", "-p", "codex-core", "-E", "test(x)"],
         ):
             with (
@@ -575,7 +594,10 @@ class RunTargetTest(RunnerTestCase):
 
     def test_run_forces_no_tests_fail(self) -> None:
         runner, executor = self.runner(executor=self.build_executor())
-        runner.run_target("core_all", [])
+        runner.run_target("core_all", ["-E", "test(=tests::alpha)"])
+        for command in executor.commands(["cargo", "nextest"]):
+            self.assertEqual(command[command.index("-E") + 1], "test(=tests::alpha)")
+        self.assertEqual(len(executor.commands(["cargo", "nextest", "list"])), 1)
         run_commands = executor.commands(["cargo", "nextest", "run"])
         self.assertEqual(len(run_commands), 1)
         self.assertIn("--no-tests=fail", run_commands[0])
@@ -1291,8 +1313,12 @@ class JustfileContractTest(unittest.TestCase):
         for argv in self.invocations():
             parsed = parser.parse_args(argv)
             with self.subTest(argv=argv):
-                if parsed.command in {"run-target", "plan"}:
+                if parsed.command == "run-target":
                     self.assertIn(parsed.name, manifest.targets)
+                elif parsed.command == "plan":
+                    self.assertIn(
+                        parsed.name, manifest.targets.keys() | manifest.gates.keys()
+                    )
                 elif parsed.command == "run-gate":
                     self.assertIn(parsed.name, manifest.gates)
                 elif parsed.command == "parity":

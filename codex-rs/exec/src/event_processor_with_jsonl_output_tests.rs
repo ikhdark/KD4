@@ -3,6 +3,102 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::tempdir;
 
+fn agent_completion(id: &str, text: &str) -> ServerNotification {
+    ServerNotification::ItemCompleted(codex_app_server_protocol::ItemCompletedNotification {
+        thread_id: "thread-1".into(),
+        turn_id: "turn-1".into(),
+        completed_at_ms: 0,
+        item: ThreadItem::AgentMessage {
+            id: id.into(),
+            text: text.into(),
+            phase: None,
+            memory_citation: None,
+        },
+    })
+}
+
+#[test]
+fn recovered_message_is_deduplicated_by_identity_not_text() {
+    for (recovered_id, expected_count) in [("streamed", 0), ("recovered", 1)] {
+        let mut processor = EventProcessorWithJsonOutput::new(None);
+        let streamed = processor.collect_thread_events(agent_completion("streamed", "same answer"));
+        assert_eq!(streamed.events.len(), 1);
+        let notification = crate::tests::recovery_completion();
+        let ServerNotification::TurnCompleted(mut payload) = notification else {
+            panic!("completion")
+        };
+        payload.turn.items = vec![ThreadItem::AgentMessage {
+            id: recovered_id.into(),
+            text: "same answer".into(),
+            phase: None,
+            memory_citation: None,
+        }];
+        let collected = processor.collect_thread_events(ServerNotification::TurnCompleted(payload));
+        assert_eq!(collected.events.len(), expected_count + 1);
+        assert!(matches!(
+            collected.events.last(),
+            Some(ThreadEvent::TurnCompleted(_))
+        ));
+        if expected_count == 1 {
+            assert!(
+                matches!(&collected.events[0], ThreadEvent::ItemCompleted(ItemCompletedEvent { item: ExecThreadItem { details: ThreadItemDetails::AgentMessage(AgentMessageItem { text }), .. } }) if text == "same answer")
+            );
+        }
+        assert_eq!(processor.final_message(), Some("same answer"));
+    }
+}
+
+#[test]
+fn stdout_failure_is_returned_without_overwriting_last_message() {
+    struct BrokenPipe;
+    impl std::io::Write for BrokenPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "reader closed",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("answer.txt");
+    std::fs::write(&path, "previous answer").expect("seed artifact");
+    let mut processor = EventProcessorWithJsonOutput::new(Some(path.clone()));
+    processor.output = Box::new(BrokenPipe);
+    processor.process_server_notification(agent_completion("final", "new answer"));
+    let error = processor
+        .print_final_output()
+        .expect_err("write error must propagate");
+    assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    assert_eq!(processor.final_message(), None);
+    assert_eq!(
+        std::fs::read_to_string(path).expect("read artifact"),
+        "previous answer"
+    );
+}
+
+#[test]
+fn declined_patch_retains_its_wire_status() {
+    let mut processor = EventProcessorWithJsonOutput::new(None);
+    let events = processor.collect_thread_events(ServerNotification::ItemCompleted(
+        codex_app_server_protocol::ItemCompletedNotification {
+            thread_id: "thread-1".into(),
+            turn_id: "turn-1".into(),
+            completed_at_ms: 0,
+            item: ThreadItem::FileChange {
+                id: "patch".into(),
+                changes: vec![],
+                status: PatchApplyStatus::Declined,
+            },
+        },
+    ));
+    assert_eq!(events.events.len(), 1);
+    let value = serde_json::to_value(&events.events[0]).expect("serialize patch");
+    assert_eq!(value["item"]["status"], "declined");
+}
+
 #[test]
 fn failed_turn_does_not_overwrite_output_last_message_file() {
     let tempdir = tempdir().expect("create tempdir");
@@ -108,6 +204,14 @@ fn output_last_message_write_failure_is_returned() {
 #[test]
 fn event_stream_error_emits_fatal_and_turn_terminal_events() {
     let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
+    processor.collect_thread_events(agent_completion("early", "partial"));
+    processor.running_todo_list = Some(RunningTodoList {
+        item_id: "todo".into(),
+        items: vec![TodoItem {
+            text: "unfinished".into(),
+            completed: false,
+        }],
+    });
 
     let events = processor.collect_event_stream_error("worker exited early".to_string());
 
@@ -117,10 +221,24 @@ fn event_stream_error_emits_fatal_and_turn_terminal_events() {
     assert_eq!(
         events,
         vec![
+            ThreadEvent::ItemCompleted(ItemCompletedEvent {
+                item: ExecThreadItem {
+                    id: "todo".into(),
+                    details: ThreadItemDetails::TodoList(TodoListItem {
+                        items: vec![TodoItem {
+                            text: "unfinished".into(),
+                            completed: false
+                        }],
+                    }),
+                }
+            }),
             ThreadEvent::Error(error.clone()),
             ThreadEvent::TurnFailed(TurnFailedEvent { error }),
         ]
     );
+    assert_eq!(processor.final_message(), None);
+    assert!(!processor.emit_final_message_on_shutdown);
+    assert!(processor.running_todo_list.is_none());
 }
 
 #[test]

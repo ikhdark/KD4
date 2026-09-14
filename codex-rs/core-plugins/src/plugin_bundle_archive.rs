@@ -10,6 +10,9 @@ use std::path::Path;
 use std::path::PathBuf;
 use tar::Archive;
 
+const MAX_PLUGIN_ARCHIVE_ENTRIES: usize = 20_000;
+const MAX_PLUGIN_ARCHIVE_PAYLOAD_BYTES: u64 = 250 * 1024 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PluginBundlePackError {
     #[error("invalid plugin path `{path}`: {reason}")]
@@ -68,7 +71,8 @@ pub(crate) fn pack_plugin_bundle_tar_gz(
 
     let encoder = GzEncoder::new(SizeLimitedBuffer::new(max_bytes), Compression::default());
     let mut archive = tar::Builder::new(encoder);
-    append_plugin_tree(&mut archive, plugin_path, plugin_path).map_err(archive_io_error)?;
+    append_plugin_tree(&mut archive, plugin_path, plugin_path, &mut 0, &mut 0)
+        .map_err(archive_io_error)?;
     let encoder = archive.into_inner().map_err(archive_io_error)?;
     encoder
         .finish()
@@ -80,10 +84,21 @@ fn append_plugin_tree<W: Write>(
     archive: &mut tar::Builder<W>,
     plugin_root: &Path,
     current: &Path,
+    entry_count: &mut usize,
+    payload_bytes: &mut u64,
 ) -> io::Result<()> {
-    let mut entries = fs::read_dir(current)?.collect::<Result<Vec<_>, io::Error>>()?;
+    let mut entries = fs::read_dir(current)?
+        .take(MAX_PLUGIN_ARCHIVE_ENTRIES - *entry_count + 1)
+        .collect::<Result<Vec<_>, io::Error>>()?;
+    if entries.len() > MAX_PLUGIN_ARCHIVE_ENTRIES - *entry_count {
+        return Err(io::Error::other("plugin archive exceeds entry limit"));
+    }
     entries.sort_by_key(fs::DirEntry::file_name);
     for entry in entries {
+        *entry_count += 1;
+        if *entry_count > MAX_PLUGIN_ARCHIVE_ENTRIES {
+            return Err(io::Error::other("plugin archive exceeds entry limit"));
+        }
         let path = entry.path();
         let file_type = entry.file_type()?;
         let relative_path = path.strip_prefix(plugin_root).map_err(|err| {
@@ -94,9 +109,15 @@ fn append_plugin_tree<W: Write>(
         })?;
         if file_type.is_dir() {
             archive.append_dir(relative_path, &path)?;
-            append_plugin_tree(archive, plugin_root, &path)?;
+            append_plugin_tree(archive, plugin_root, &path, entry_count, payload_bytes)?;
         } else if file_type.is_file() {
-            archive.append_path_with_name(&path, relative_path)?;
+            let mut file = fs::File::open(&path)?;
+            let metadata = file.metadata()?;
+            if metadata.len() > MAX_PLUGIN_ARCHIVE_PAYLOAD_BYTES - *payload_bytes {
+                return Err(io::Error::other("plugin archive exceeds raw payload limit"));
+            }
+            *payload_bytes += metadata.len();
+            archive.append_file(relative_path, &mut file)?;
         } else {
             return Err(io::Error::other(format!(
                 "unsupported plugin archive entry type: {}",
@@ -134,8 +155,17 @@ pub(crate) fn unpack_plugin_bundle_tar_gz(
     })?;
 
     let archive = GzDecoder::new(std::io::Cursor::new(bytes));
-    let mut archive = Archive::new(archive);
-    unpack_plugin_bundle_tar(&mut archive, destination, max_total_bytes)
+    // Include bounded header/padding overhead. This also bounds tar extension
+    // records consumed internally before the entry iterator yields a file.
+    let max_stream_bytes = max_total_bytes.saturating_add(MAX_PLUGIN_ARCHIVE_ENTRIES as u64 * 4096);
+    let mut archive = Archive::new(archive.take(max_stream_bytes));
+    unpack_plugin_bundle_tar(&mut archive, destination, max_total_bytes)?;
+    if archive.into_inner().limit() == 0 {
+        return Err(PluginBundleUnpackError::InvalidBundle(
+            "plugin tar stream exceeds decompressed limit".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn unpack_plugin_bundle_tar<R: Read>(
@@ -147,7 +177,12 @@ fn unpack_plugin_bundle_tar<R: Read>(
     let entries = archive.entries().map_err(|source| {
         PluginBundleUnpackError::io("failed to read plugin bundle tar", source)
     })?;
-    for entry in entries {
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_PLUGIN_ARCHIVE_ENTRIES {
+            return Err(PluginBundleUnpackError::InvalidBundle(
+                "plugin archive exceeds entry limit".to_string(),
+            ));
+        }
         let mut entry = entry.map_err(|source| {
             PluginBundleUnpackError::io("failed to read plugin bundle tar entry", source)
         })?;
@@ -313,3 +348,45 @@ impl fmt::Display for ArchiveSizeLimitExceeded {
 }
 
 impl std::error::Error for ArchiveSizeLimitExceeded {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pack_rejects_oversized_uncompressed_payload() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(".codex-plugin")).unwrap();
+        fs::write(
+            root.path().join(".codex-plugin/plugin.json"),
+            br#"{"name":"sample"}"#,
+        )
+        .unwrap();
+        fs::File::create(root.path().join("large"))
+            .unwrap()
+            .set_len(MAX_PLUGIN_ARCHIVE_PAYLOAD_BYTES + 1)
+            .unwrap();
+        let error = pack_plugin_bundle_tar_gz(root.path(), 1024 * 1024).unwrap_err();
+        assert!(error.to_string().contains("payload limit"), "{error}");
+    }
+
+    #[test]
+    fn unpack_rejects_excessive_zero_byte_entries() {
+        let encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        let mut archive = tar::Builder::new(encoder);
+        for _ in 0..=MAX_PLUGIN_ARCHIVE_ENTRIES {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_size(0);
+            header.set_mode(0o755);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, "empty", io::empty())
+                .unwrap();
+        }
+        let bytes = archive.into_inner().unwrap().finish().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let error = unpack_plugin_bundle_tar_gz(&bytes, destination.path(), 1024).unwrap_err();
+        assert!(error.to_string().contains("entry limit"), "{error}");
+    }
+}

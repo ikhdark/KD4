@@ -29,7 +29,6 @@ impl ChatWidget {
         else {
             return;
         };
-        let (_command, parsed_cmd) = command_execution_command_and_parsed(command, command_actions);
         self.flush_answer_stream_with_separator();
         if is_unified_exec_source(*source) {
             if *source == ExecCommandSource::UnifiedExecStartup {
@@ -40,14 +39,14 @@ impl ChatWidget {
             }
             // Unified exec may be parsed as Unknown; keep the working indicator visible regardless.
             self.bottom_pane.ensure_status_indicator();
-            if !is_standard_tool_call(&parsed_cmd) {
+            if !is_standard_tool_call(command_actions) {
                 return;
             }
         }
-        let item2 = item.clone();
-        self.defer_or_handle(
-            |q| q.push_item_started(item),
-            |s| s.handle_command_execution_started_now(item2),
+        self.defer_or_handle_owned(
+            item,
+            super::interrupts::InterruptManager::push_item_started,
+            super::ChatWidget::handle_command_execution_started_now,
         );
     }
 
@@ -90,6 +89,13 @@ impl ChatWidget {
             // Empty stdin means we are polling for background output.
             // Surface this in the status indicator (single "waiting" surface) instead of
             // the transcript. Keep the header short so the interrupt hint remains visible.
+            if self
+                .unified_exec_wait_streak
+                .as_ref()
+                .is_some_and(|wait| wait.process_id != process_id)
+            {
+                self.flush_unified_exec_wait_streak();
+            }
             self.bottom_pane.ensure_status_indicator();
             self.bottom_pane
                 .set_interrupt_hint_visible(/*visible*/ true);
@@ -105,12 +111,7 @@ impl ChatWidget {
                 Some(wait) if wait.process_id == process_id => {
                     wait.update_command_display(command_display);
                 }
-                Some(_) => {
-                    self.flush_unified_exec_wait_streak();
-                    self.unified_exec_wait_streak =
-                        Some(UnifiedExecWaitStreak::new(process_id, command_display));
-                }
-                None => {
+                Some(_) | None => {
                     self.unified_exec_wait_streak =
                         Some(UnifiedExecWaitStreak::new(process_id, command_display));
                 }
@@ -155,10 +156,10 @@ impl ChatWidget {
                 return;
             }
         }
-        let item2 = item.clone();
-        self.defer_or_handle(
-            |q| q.push_item_completed(item),
-            |s| s.handle_command_execution_completed_now(item2),
+        self.defer_or_handle_owned(
+            item,
+            super::interrupts::InterruptManager::push_item_completed,
+            super::ChatWidget::handle_command_execution_completed_now,
         );
     }
 
@@ -205,12 +206,8 @@ impl ChatWidget {
     }
 
     pub(super) fn sync_unified_exec_footer(&mut self) {
-        let processes = self
-            .unified_exec_processes
-            .iter()
-            .map(|process| process.command_display.clone())
-            .collect();
-        self.bottom_pane.set_unified_exec_processes(processes);
+        self.bottom_pane
+            .set_unified_exec_process_count(self.unified_exec_processes.len());
     }
 
     /// Record recent stdout/stderr lines for the unified exec footer.
@@ -223,20 +220,34 @@ impl ChatWidget {
             return;
         };
 
-        let text = String::from_utf8_lossy(chunk);
-        for line in text
-            .lines()
-            .map(str::trim_end)
-            .filter(|line| !line.is_empty())
-        {
-            process.recent_chunks.push(line.to_string());
-        }
-
         const MAX_RECENT_CHUNKS: usize = 3;
-        if process.recent_chunks.len() > MAX_RECENT_CHUNKS {
-            let drop_count = process.recent_chunks.len() - MAX_RECENT_CHUNKS;
-            process.recent_chunks.drain(0..drop_count);
-        }
+        const MAX_PREVIEW_LINE_BYTES: usize = 1024;
+        // Select from the borrowed tail before decoding or allocating preview strings.
+        let mut tail: Vec<String> = chunk
+            .rsplit(|byte| *byte == b'\n')
+            .filter_map(|line| {
+                // Keep a valid final scalar intact when the byte budget cuts through it.
+                let mut prefix = &line[..line.len().min(MAX_PREVIEW_LINE_BYTES)];
+                if let Err(error) = std::str::from_utf8(prefix)
+                    && error.error_len().is_none()
+                {
+                    prefix = &prefix[..error.valid_up_to()];
+                }
+                let text = String::from_utf8_lossy(prefix);
+                let text = text.trim_end();
+                if text.is_empty() {
+                    return None;
+                }
+                let end = text.floor_char_boundary(MAX_PREVIEW_LINE_BYTES.min(text.len()));
+                Some(text[..end].to_string())
+            })
+            .take(MAX_RECENT_CHUNKS)
+            .collect();
+        tail.reverse();
+        let keep = MAX_RECENT_CHUNKS - tail.len();
+        let drop_count = process.recent_chunks.len().saturating_sub(keep);
+        process.recent_chunks.drain(..drop_count);
+        process.recent_chunks.extend(tail);
     }
 
     pub(crate) fn handle_command_execution_started_now(&mut self, item: ThreadItem) {
@@ -340,11 +351,6 @@ impl ChatWidget {
         else {
             return;
         };
-        let event_command = split_command_string(&command);
-        let event_parsed = command_actions
-            .into_iter()
-            .map(codex_app_server_protocol::CommandAction::into_core)
-            .collect();
         let duration = Duration::from_millis(duration_ms.unwrap_or_default().max(0) as u64);
         let aggregated_output = aggregated_output.unwrap_or_default();
 
@@ -354,7 +360,14 @@ impl ChatWidget {
         }
         let (command, parsed, source) = match running {
             Some(rc) => (rc.command, rc.parsed_cmd, rc.source),
-            None => (event_command, event_parsed, source),
+            None => (
+                split_command_string(&command),
+                command_actions
+                    .into_iter()
+                    .map(codex_app_server_protocol::CommandAction::into_core)
+                    .collect(),
+                source,
+            ),
         };
         let parsed = self.annotate_skill_reads_in_parsed_cmd(parsed);
         let is_unified_exec_interaction =

@@ -1,5 +1,3 @@
-#![allow(warnings, clippy::all)]
-
 use codex_utils_absolute_path as path_utils;
 use std::cmp::Reverse;
 use std::ffi::OsStr;
@@ -33,7 +31,6 @@ pub use codex_protocol::protocol::SortDirection;
 use codex_protocol::protocol::ThreadHistoryMode;
 pub use codex_protocol::protocol::ThreadSortKey;
 use codex_protocol::protocol::user_message_preview;
-use serde_json::Value;
 
 /// Returned page of thread (thread) summaries.
 #[derive(Debug, Default, PartialEq)]
@@ -110,7 +107,6 @@ struct HeadTailSummary {
     model_provider: Option<String>,
     cli_version: Option<String>,
     created_at: Option<String>,
-    updated_at: Option<String>,
     recency_at: Option<String>,
 }
 
@@ -331,6 +327,10 @@ impl From<codex_state::Anchor> for Cursor {
 /// can be supplied on the next call to resume after the last returned item, resilient to
 /// concurrent new sessions being appended. Ordering is stable by the requested sort key
 /// (timestamp desc).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Preserve the existing pagination and filter API used by rollout callers"
+)]
 pub async fn get_threads(
     codex_home: &Path,
     page_size: usize,
@@ -361,6 +361,10 @@ pub async fn get_threads(
 /// Retrieve a filesystem-backed page in ascending order with one bounded
 /// traversal. Unlike reversing paginated descending results, this does not
 /// revisit the same rollout files for every intermediate page.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Preserve the existing pagination and filter API used by rollout callers"
+)]
 pub async fn get_threads_ascending(
     codex_home: &Path,
     page_size: usize,
@@ -401,6 +405,11 @@ pub async fn get_threads_in_root(
             num_scanned_files: 0,
             reached_scan_cap: false,
         });
+    }
+
+    if sort_key == ThreadSortKey::RecencyAt {
+        return get_threads_in_root_by_summary(root, page_size, cursor, sort_key, config, false)
+            .await;
     }
 
     let anchor = cursor.cloned();
@@ -447,6 +456,17 @@ pub async fn get_threads_in_root_ascending(
     sort_key: ThreadSortKey,
     config: ThreadListConfig<'_>,
 ) -> io::Result<ThreadsPage> {
+    get_threads_in_root_by_summary(root, page_size, cursor, sort_key, config, true).await
+}
+
+async fn get_threads_in_root_by_summary(
+    root: PathBuf,
+    page_size: usize,
+    cursor: Option<&Cursor>,
+    sort_key: ThreadSortKey,
+    config: ThreadListConfig<'_>,
+    ascending: bool,
+) -> io::Result<ThreadsPage> {
     if !root.exists() {
         return Ok(ThreadsPage::default());
     }
@@ -454,6 +474,36 @@ pub async fn get_threads_in_root_ascending(
     let provider_matcher = config
         .model_providers
         .and_then(|filters| ProviderMatcher::new(filters, config.default_provider));
+    if sort_key == ThreadSortKey::CreatedAt {
+        return match config.layout {
+            ThreadListLayout::NestedByDate => {
+                traverse_directories_for_paths_created(
+                    root,
+                    page_size,
+                    cursor.cloned(),
+                    config.allowed_sources,
+                    provider_matcher.as_ref(),
+                    config.cwd_filters,
+                    config.default_provider,
+                    ascending,
+                )
+                .await
+            }
+            ThreadListLayout::Flat => {
+                traverse_flat_paths_created(
+                    root,
+                    page_size,
+                    cursor.cloned(),
+                    config.allowed_sources,
+                    provider_matcher.as_ref(),
+                    config.cwd_filters,
+                    config.default_provider,
+                    ascending,
+                )
+                .await
+            }
+        };
+    }
     let mut scanned_files = 0usize;
     let candidates = match config.layout {
         ThreadListLayout::NestedByDate => {
@@ -491,14 +541,29 @@ pub async fn get_threads_in_root_ascending(
             continue;
         };
         if anchor.is_some_and(|(anchor_ts, anchor_id)| match anchor_id {
-            Some(anchor_id) => key <= (anchor_ts, anchor_id),
-            None => key.0 <= anchor_ts,
+            Some(anchor_id) => {
+                if ascending {
+                    key <= (anchor_ts, anchor_id)
+                } else {
+                    key >= (anchor_ts, anchor_id)
+                }
+            }
+            None => {
+                if ascending {
+                    key.0 <= anchor_ts
+                } else {
+                    key.0 >= anchor_ts
+                }
+            }
         }) {
             continue;
         }
         keyed_items.push((key, item));
     }
     keyed_items.sort_by_key(|(key, _)| *key);
+    if !ascending {
+        keyed_items.reverse();
+    }
 
     let more_matches_available = keyed_items.len() > page_size || reached_scan_cap;
     keyed_items.truncate(page_size);
@@ -522,6 +587,10 @@ pub async fn get_threads_in_root_ascending(
 ///
 /// Directory layout: `~/.codex/sessions/YYYY/MM/DD/rollout-YYYY-MM-DDThh-mm-ss-<uuid>.jsonl`
 /// Returned newest (based on sort key) first.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep the traversal arguments aligned with the existing pagination and filter inputs"
+)]
 async fn traverse_directories_for_paths(
     root: PathBuf,
     page_size: usize,
@@ -542,6 +611,7 @@ async fn traverse_directories_for_paths(
                 provider_matcher,
                 cwd_filters,
                 default_provider,
+                false,
             )
             .await
         }
@@ -560,6 +630,10 @@ async fn traverse_directories_for_paths(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep the traversal arguments aligned with the existing pagination and filter inputs"
+)]
 async fn traverse_flat_paths(
     root: PathBuf,
     page_size: usize,
@@ -580,6 +654,7 @@ async fn traverse_flat_paths(
                 provider_matcher,
                 cwd_filters,
                 default_provider,
+                false,
             )
             .await
         }
@@ -604,6 +679,10 @@ async fn traverse_flat_paths(
 /// Ordering comes from directory/filename sorting, so created_at is derived
 /// from the filename timestamp. Pagination is handled by the anchor cursor
 /// so we resume strictly after the last returned `(ts, id)` pair.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep the traversal arguments aligned with the existing pagination and filter inputs"
+)]
 async fn traverse_directories_for_paths_created(
     root: PathBuf,
     page_size: usize,
@@ -612,6 +691,7 @@ async fn traverse_directories_for_paths_created(
     provider_matcher: Option<&ProviderMatcher<'_>>,
     cwd_filters: Option<&[PathBuf]>,
     default_provider: &str,
+    ascending: bool,
 ) -> io::Result<ThreadsPage> {
     let mut items: Vec<ThreadItem> = Vec::with_capacity(page_size);
     let mut scanned_files = 0usize;
@@ -619,14 +699,21 @@ async fn traverse_directories_for_paths_created(
     let mut visitor = FilesByCreatedAtVisitor {
         items: &mut items,
         page_size,
-        anchor_state: AnchorState::new(anchor),
+        anchor_state: AnchorState::new(None),
         more_matches_available,
         allowed_sources,
         provider_matcher,
         cwd_filters,
         default_provider,
     };
-    walk_rollout_files(&root, &mut scanned_files, &mut visitor).await?;
+    walk_rollout_files(
+        &root,
+        &mut scanned_files,
+        &mut visitor,
+        ascending,
+        anchor.as_ref(),
+    )
+    .await?;
     more_matches_available = visitor.more_matches_available;
 
     let reached_scan_cap = scanned_files >= MAX_SCAN_FILES;
@@ -718,6 +805,10 @@ async fn traverse_directories_for_paths_updated(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep the traversal arguments aligned with the existing pagination and filter inputs"
+)]
 async fn traverse_flat_paths_created(
     root: PathBuf,
     page_size: usize,
@@ -726,15 +817,18 @@ async fn traverse_flat_paths_created(
     provider_matcher: Option<&ProviderMatcher<'_>>,
     cwd_filters: Option<&[PathBuf]>,
     default_provider: &str,
+    ascending: bool,
 ) -> io::Result<ThreadsPage> {
     let mut items: Vec<ThreadItem> = Vec::with_capacity(page_size);
     let mut scanned_files = 0usize;
-    let mut anchor_state = AnchorState::new(anchor);
     let mut more_matches_available = false;
 
-    let files = collect_flat_rollout_files(&root, &mut scanned_files).await?;
+    let mut files = collect_flat_rollout_files(&root, &mut scanned_files).await?;
+    if ascending {
+        files.reverse();
+    }
     for (ts, id, path) in files.into_iter() {
-        if anchor_state.should_skip(ts, id) {
+        if skip_created_candidate(ts, id, anchor.as_ref(), ascending) {
             continue;
         }
         if items.len() == page_size {
@@ -959,12 +1053,9 @@ async fn build_thread_item(
             model_provider,
             cli_version,
             created_at,
-            updated_at: mut summary_updated_at,
             recency_at,
         } = summary;
-        if summary_updated_at.is_none() {
-            summary_updated_at = updated_at.or_else(|| created_at.clone());
-        }
+        let summary_updated_at = updated_at.or_else(|| created_at.clone());
         return Some(ThreadItem {
             path,
             thread_id,
@@ -1135,7 +1226,7 @@ async fn collect_files_by_updated_at(
     let mut visitor = FilesByUpdatedAtVisitor {
         candidates: &mut candidates,
     };
-    walk_rollout_files(root, scanned_files, &mut visitor).await?;
+    walk_rollout_files(root, scanned_files, &mut visitor, false, None).await?;
 
     Ok(candidates)
 }
@@ -1182,29 +1273,72 @@ async fn collect_flat_files_by_updated_at(
     Ok(candidates)
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "ThreadId serializes its validated UUID, so parsing that representation cannot fail"
+)]
+fn skip_created_candidate(
+    ts: OffsetDateTime,
+    id: Uuid,
+    anchor: Option<&Cursor>,
+    ascending: bool,
+) -> bool {
+    anchor.is_some_and(|anchor| {
+        let ordering = match anchor.id {
+            Some(anchor_id) => (ts, id).cmp(&(
+                anchor.ts,
+                Uuid::parse_str(&anchor_id.to_string()).expect("thread UUID"),
+            )),
+            None => ts.cmp(&anchor.ts),
+        };
+        if ascending {
+            !ordering.is_gt()
+        } else {
+            !ordering.is_lt()
+        }
+    })
+}
+
 async fn walk_rollout_files(
     root: &Path,
     scanned_files: &mut usize,
     visitor: &mut impl RolloutFileVisitor,
+    ascending: bool,
+    anchor: Option<&Cursor>,
 ) -> io::Result<()> {
-    let year_dirs = collect_dirs_desc(root, |s| s.parse::<u16>().ok()).await?;
+    let mut year_dirs = collect_dirs_desc(root, |s| s.parse::<u16>().ok()).await?;
+    if ascending {
+        year_dirs.reverse();
+    }
 
     'outer: for (_year, year_path) in year_dirs.iter() {
         if *scanned_files >= MAX_SCAN_FILES {
             break;
         }
-        let month_dirs = collect_dirs_desc(year_path, |s| s.parse::<u8>().ok()).await?;
+        let mut month_dirs = collect_dirs_desc(year_path, |s| s.parse::<u8>().ok()).await?;
+        if ascending {
+            month_dirs.reverse();
+        }
         for (_month, month_path) in month_dirs.iter() {
             if *scanned_files >= MAX_SCAN_FILES {
                 break 'outer;
             }
-            let day_dirs = collect_dirs_desc(month_path, |s| s.parse::<u8>().ok()).await?;
+            let mut day_dirs = collect_dirs_desc(month_path, |s| s.parse::<u8>().ok()).await?;
+            if ascending {
+                day_dirs.reverse();
+            }
             for (_day, day_path) in day_dirs.iter() {
                 if *scanned_files >= MAX_SCAN_FILES {
                     break 'outer;
                 }
-                let day_files = collect_rollout_day_files(day_path).await?;
+                let mut day_files = collect_rollout_day_files(day_path).await?;
+                if ascending {
+                    day_files.reverse();
+                }
                 for (ts, id, path) in day_files.into_iter() {
+                    if skip_created_candidate(ts, id, anchor, ascending) {
+                        continue;
+                    }
                     *scanned_files += 1;
                     if *scanned_files > MAX_SCAN_FILES {
                         break 'outer;
@@ -1366,7 +1500,7 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
     let mut lines = compression::open_rollout_line_reader(path).await?;
     let mut head = Vec::new();
 
-    while head.len() < HEAD_RECORD_LIMIT {
+    for _ in 0..HEAD_RECORD_LIMIT {
         let Some(line) = lines.next_line().await? else {
             break;
         };
@@ -1425,19 +1559,32 @@ fn event_msg_preview(event: &EventMsg) -> Option<String> {
 /// Read the SessionMetaLine from the head of a rollout file for reuse by
 /// callers that need the session metadata (e.g. to derive a cwd for config).
 pub async fn read_session_meta_line(path: &Path) -> io::Result<SessionMetaLine> {
-    let head = read_head_for_summary(path).await?;
-    let Some(first) = head.first() else {
-        return Err(io::Error::other(format!(
-            "rollout at {} is empty",
-            path.display()
-        )));
-    };
-    serde_json::from_value::<SessionMetaLine>(first.clone()).map_err(|_| {
-        io::Error::other(format!(
-            "rollout at {} does not start with session metadata",
-            path.display()
-        ))
-    })
+    let mut lines = compression::open_rollout_line_reader(path).await?;
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        crate::recorder::reject_unknown_thread_history_mode(&value)?;
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("session_meta") {
+            return match serde_json::from_value::<RolloutLine>(value) {
+                Ok(RolloutLine {
+                    item: RolloutItem::SessionMeta(meta),
+                    ..
+                }) => Ok(meta),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid canonical session metadata",
+                )),
+            };
+        }
+    }
+    Err(io::Error::other(format!(
+        "rollout at {} has no session metadata",
+        path.display()
+    )))
 }
 
 async fn file_modified_time(path: &Path) -> io::Result<Option<OffsetDateTime>> {

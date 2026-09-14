@@ -344,6 +344,13 @@ pub enum RemotePluginCatalogError {
         source: RouteAwareRequestError,
     },
 
+    #[error("failed to read remote plugin catalog response from {url}: {source}")]
+    Body {
+        url: String,
+        #[source]
+        source: codex_http_client::HttpError,
+    },
+
     #[error("remote plugin catalog request to {url} failed with status {status}: {body}")]
     UnexpectedStatus {
         url: String,
@@ -428,6 +435,7 @@ impl RemotePluginCatalogError {
             Self::UnsupportedAuthMode => "remote_catalog_unsupported_auth_mode",
             Self::AuthToken(_) => "remote_catalog_auth_token",
             Self::Request { .. } => "remote_catalog_request",
+            Self::Body { .. } => "remote_catalog_body",
             Self::UnexpectedStatus { .. } => "remote_catalog_unexpected_status",
             Self::Decode { .. } => "remote_catalog_decode",
             Self::InvalidBaseUrl(_) => "remote_catalog_invalid_base_url",
@@ -463,7 +471,7 @@ impl RemotePluginCatalogError {
             Self::UnexpectedStatus { status, .. } if *status == http::StatusCode::NOT_FOUND => {
                 PluginRemoteErrorReason::NotFound
             }
-            Self::Request { .. } => PluginRemoteErrorReason::Transient,
+            Self::Request { .. } | Self::Body { .. } => PluginRemoteErrorReason::Transient,
             Self::UnexpectedStatus { status, .. }
                 if *status == http::StatusCode::REQUEST_TIMEOUT
                     || *status == http::StatusCode::TOO_MANY_REQUESTS
@@ -982,7 +990,7 @@ pub async fn fetch_recommended_plugins(
     auth: Option<&CodexAuth>,
 ) -> Result<RecommendedPluginsMode, RemotePluginCatalogError> {
     let auth = ensure_chatgpt_auth(auth)?;
-    let url = format!("{}/ps/plugins/suggested", config.chatgpt_base_url);
+    let url = remote_plugin_service_url(config, &["ps", "plugins", "suggested"])?;
     let client = &config.http_clients;
     let request = authenticated_request(client.get(&url), auth)?
         .timeout(RECOMMENDED_PLUGINS_TIMEOUT)
@@ -2023,7 +2031,7 @@ async fn get_remote_plugin_list_page(
     page_token: Option<&str>,
     collection: Option<&str>,
 ) -> Result<RemotePluginListResponse, RemotePluginCatalogError> {
-    let url = format!("{}/ps/plugins/list", config.chatgpt_base_url);
+    let url = remote_plugin_service_url(config, &["ps", "plugins", "list"])?;
     let mut request = authenticated_request(client.get(&url), auth)?;
     request = request.query(&[("scope", scope.api_value())]);
     request = request.query(&[("limit", REMOTE_PLUGIN_LIST_PAGE_LIMIT)]);
@@ -2042,7 +2050,7 @@ async fn get_remote_shared_workspace_plugins_page(
     auth: &CodexAuth,
     page_token: Option<&str>,
 ) -> Result<RemotePluginListResponse, RemotePluginCatalogError> {
-    let url = format!("{}/ps/plugins/workspace/shared", config.chatgpt_base_url);
+    let url = remote_plugin_service_url(config, &["ps", "plugins", "workspace", "shared"])?;
     let mut request = authenticated_request(client.get(&url), auth)?;
     request = request.query(&[("limit", REMOTE_PLUGIN_LIST_PAGE_LIMIT)]);
     if let Some(page_token) = page_token {
@@ -2059,7 +2067,7 @@ async fn get_remote_plugin_installed_page(
     page_token: Option<&str>,
     include_download_urls: bool,
 ) -> Result<RemotePluginInstalledResponse, RemotePluginCatalogError> {
-    let url = format!("{}/ps/plugins/installed", config.chatgpt_base_url);
+    let url = remote_plugin_service_url(config, &["ps", "plugins", "installed"])?;
     let mut request = authenticated_request(client.get(&url), auth)?;
     request = request.query(&[("scope", scope.api_value())]);
     if include_download_urls {
@@ -2149,18 +2157,83 @@ async fn send_and_decode<T: for<'de> Deserialize<'de>>(
             url: url.to_string(),
             source,
         })?;
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(RemotePluginCatalogError::UnexpectedStatus {
-            url: url.to_string(),
-            status,
-            body,
-        });
-    }
+    let body = read_plugin_http_response(response, MAX_PLUGIN_JSON_BYTES)
+        .await
+        .map_err(|error| match error {
+            PluginHttpResponseError::Status { status, body } => {
+                RemotePluginCatalogError::UnexpectedStatus {
+                    url: url.to_string(),
+                    status,
+                    body,
+                }
+            }
+            PluginHttpResponseError::Body(source) => RemotePluginCatalogError::Body {
+                url: url.to_string(),
+                source,
+            },
+            PluginHttpResponseError::TooLarge { max_bytes } => {
+                RemotePluginCatalogError::UnexpectedResponse(format!(
+                    "remote plugin response exceeds {max_bytes} bytes"
+                ))
+            }
+        })?;
 
-    serde_json::from_str(&body).map_err(|source| RemotePluginCatalogError::Decode {
+    serde_json::from_slice(&body).map_err(|source| RemotePluginCatalogError::Decode {
         url: url.to_string(),
         source,
     })
+}
+
+pub(crate) const MAX_PLUGIN_JSON_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PluginHttpResponseError {
+    #[error("HTTP status {status}: {body}")]
+    Status {
+        status: http::StatusCode,
+        body: String,
+    },
+    #[error("failed to read response body: {0}")]
+    Body(#[source] codex_http_client::HttpError),
+    #[error("response exceeds {max_bytes} bytes")]
+    TooLarge { max_bytes: usize },
+}
+
+pub(crate) async fn read_plugin_http_response(
+    mut response: codex_http_client::HttpResponse,
+    max_bytes: usize,
+) -> Result<Vec<u8>, PluginHttpResponseError> {
+    let status = response.status();
+    let success = status.is_success();
+    let limit = if success { max_bytes } else { 8 * 1024 };
+    let mut body = Vec::new();
+    let mut diagnostic = String::new();
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(source) if success => return Err(PluginHttpResponseError::Body(source)),
+            Err(source) => {
+                diagnostic = format!("\n[failed to read response body: {source}]");
+                break;
+            }
+        };
+        let remaining = limit - body.len();
+        if chunk.len() > remaining {
+            if success {
+                return Err(PluginHttpResponseError::TooLarge { max_bytes });
+            }
+            body.extend_from_slice(&chunk[..remaining]);
+            diagnostic = format!("\n[response body truncated after {limit} bytes]");
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    if !success {
+        return Err(PluginHttpResponseError::Status {
+            status,
+            body: format!("{}{diagnostic}", String::from_utf8_lossy(&body)),
+        });
+    }
+    Ok(body)
 }

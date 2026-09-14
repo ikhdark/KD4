@@ -1,6 +1,8 @@
 use std::fs;
 use std::io;
+use std::io::BufWriter;
 use std::io::Read;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -15,20 +17,17 @@ use tiny_http::Method;
 
 const AUTHORIZATION_HEADER_NAME: &str = "authorization";
 const REDACTED_HEADER_VALUE: &str = "[REDACTED]";
+static NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) struct ExchangeDumper {
     dump_dir: PathBuf,
-    next_sequence: AtomicU64,
 }
 
 impl ExchangeDumper {
     pub(crate) fn new(dump_dir: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(&dump_dir)?;
 
-        Ok(Self {
-            dump_dir,
-            next_sequence: AtomicU64::new(1),
-        })
+        Ok(Self { dump_dir })
     }
 
     pub(crate) fn dump_request(
@@ -38,11 +37,12 @@ impl ExchangeDumper {
         headers: &[Header],
         body: &[u8],
     ) -> io::Result<ExchangeDump> {
-        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
-        let timestamp_ms = SystemTime::now()
+        let sequence = NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let timestamp_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_millis());
-        let prefix = format!("{sequence:06}-{timestamp_ms}");
+            .map_or(0, |duration| duration.as_nanos());
+        let pid = std::process::id();
+        let prefix = format!("{sequence:06}-{pid}-{timestamp_ns}");
 
         let request_path = self.dump_dir.join(format!("{prefix}-request.json"));
         let response_path = self.dump_dir.join(format!("{prefix}-response.json"));
@@ -92,7 +92,7 @@ pub(crate) struct ResponseBodyDump<R> {
 }
 
 impl<R> ResponseBodyDump<R> {
-    fn write_dump_if_needed(&mut self) {
+    fn write_dump_if_needed(&mut self, termination: CaptureTermination) {
         if self.dump_written {
             return;
         }
@@ -103,6 +103,7 @@ impl<R> ResponseBodyDump<R> {
             status: self.status,
             headers: std::mem::take(&mut self.headers),
             body: dump_body(&self.body),
+            termination,
         };
 
         if let Err(err) = write_json_dump(&self.response_path, &response_dump) {
@@ -116,9 +117,20 @@ impl<R> ResponseBodyDump<R> {
 
 impl<R: Read> Read for ResponseBodyDump<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let bytes_read = self.response_body.read(buf)?;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let bytes_read = match self.response_body.read(buf) {
+            Ok(bytes_read) => bytes_read,
+            Err(err) => {
+                if err.kind() != io::ErrorKind::Interrupted {
+                    self.write_dump_if_needed(CaptureTermination::ReadError);
+                }
+                return Err(err);
+            }
+        };
         if bytes_read == 0 {
-            self.write_dump_if_needed();
+            self.write_dump_if_needed(CaptureTermination::Eof);
             return Ok(0);
         }
 
@@ -129,7 +141,7 @@ impl<R: Read> Read for ResponseBodyDump<R> {
 
 impl<R> Drop for ResponseBodyDump<R> {
     fn drop(&mut self) {
-        self.write_dump_if_needed();
+        self.write_dump_if_needed(CaptureTermination::Unknown);
     }
 }
 
@@ -146,6 +158,16 @@ struct ResponseDump {
     status: u16,
     headers: Vec<HeaderDump>,
     body: Value,
+    termination: CaptureTermination,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CaptureTermination {
+    Eof,
+    ReadError,
+    // Dropping without an observed EOF does not establish whether the body ended.
+    Unknown,
 }
 
 #[derive(Debug, Serialize)]
@@ -194,10 +216,14 @@ fn dump_body(body: &[u8]) -> Value {
 }
 
 fn write_json_dump(path: &PathBuf, dump: &impl Serialize) -> io::Result<()> {
-    let mut bytes = serde_json::to_vec_pretty(dump)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    bytes.push(b'\n');
-    fs::write(path, bytes)
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, dump)?;
+    writer.write_all(b"\n")?;
+    writer.flush()
 }
 
 #[cfg(test)]
@@ -347,11 +373,83 @@ mod tests {
                         "value": "[REDACTED]"
                     }
                 ],
-                "body": "data: hello\n\n"
+                "body": "data: hello\n\n",
+                "termination": "eof"
             })
         );
 
         fs::remove_dir_all(dump_dir).expect("remove test dump dir");
+    }
+
+    #[test]
+    fn empty_read_does_not_finalize_capture() {
+        let dump_dir = test_dump_dir();
+        let dumper = ExchangeDumper::new(dump_dir.clone()).unwrap();
+        let exchange = dumper
+            .dump_request(&Method::Post, "/v1/responses", &[], b"{}")
+            .unwrap();
+        let path = exchange.response_path.clone();
+        let mut body = exchange.tee_response_body(200, &HeaderMap::new(), Cursor::new(b"hello"));
+        assert_eq!(body.read(&mut []).unwrap(), 0);
+        assert!(!path.exists());
+        let mut output = String::new();
+        body.read_to_string(&mut output).unwrap();
+        assert_eq!(output, "hello");
+        let dump: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(dump["body"], "hello");
+        assert_eq!(dump["termination"], "eof");
+        fs::remove_dir_all(dump_dir).unwrap();
+    }
+
+    #[test]
+    fn partial_capture_distinguishes_read_error_from_unknown_completion() {
+        for fail in [false, true] {
+            let dump_dir = test_dump_dir();
+            let dumper = ExchangeDumper::new(dump_dir.clone()).unwrap();
+            let exchange = dumper
+                .dump_request(&Method::Post, "/v1/responses", &[], b"{}")
+                .unwrap();
+            let path = exchange.response_path.clone();
+            struct FailingReader;
+            impl Read for FailingReader {
+                fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                    Err(std::io::ErrorKind::ConnectionReset.into())
+                }
+            }
+            let mut body = exchange.tee_response_body(
+                200,
+                &HeaderMap::new(),
+                Cursor::new(b"hello").chain(FailingReader),
+            );
+            let mut output = [0; 5];
+            body.read_exact(&mut output).unwrap();
+            assert_eq!(&output, b"hello");
+            if fail {
+                assert_eq!(
+                    body.read(&mut output).unwrap_err().kind(),
+                    std::io::ErrorKind::ConnectionReset
+                );
+            }
+            drop(body);
+            let dump: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            assert_eq!(dump["body"], "hello");
+            assert_eq!(
+                dump["termination"],
+                if fail { "read_error" } else { "unknown" }
+            );
+            fs::remove_dir_all(dump_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn dump_writes_never_overwrite_existing_evidence() {
+        let dump_dir = test_dump_dir();
+        let path = dump_dir.join("existing.json");
+        fs::write(&path, b"original").unwrap();
+        let err = super::write_json_dump(&path, &json!({"replacement": true})).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+        fs::remove_dir_all(dump_dir).unwrap();
     }
 
     fn test_dump_dir() -> std::path::PathBuf {

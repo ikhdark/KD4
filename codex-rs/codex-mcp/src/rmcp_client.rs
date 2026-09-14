@@ -162,6 +162,13 @@ pub(crate) struct ManagedClient {
 
 impl ManagedClient {
     fn listed_tools(&self) -> Vec<ToolInfo> {
+        if let Some(tools) = self
+            .codex_apps_tools_cache_context
+            .as_ref()
+            .and_then(CodexAppsToolsCacheContext::current_tools)
+        {
+            return filter_tools(tools, &self.tool_filter);
+        }
         self.tools.load_full().as_ref().clone()
     }
 }
@@ -383,7 +390,9 @@ impl ManagedClientStartup {
             let refresh_start = is_codex_apps_mcp_server.then(Instant::now);
             let outcome = match async {
                 if let Err(error) = validate_mcp_server_name(&server_name) {
-                    return Err(error.into());
+                    return Err(StartupOutcomeError::InvalidConfiguration {
+                        error: error.to_string(),
+                    });
                 }
 
                 let client = Arc::new(
@@ -507,7 +516,10 @@ impl AsyncManagedClient {
                     load_startup_cached_codex_apps_server_info(&context)
                 })
                 .await
-                .expect("Codex Apps startup server-info cache worker failed")
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, "Codex Apps startup server-info cache worker failed");
+                    None
+                })
             } else {
                 None
             }
@@ -581,7 +593,7 @@ impl AsyncManagedClient {
     fn release_manager(&self) -> bool {
         self.manager_owners
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |owners| {
-                (owners > 0).then_some(owners - 1)
+                owners.checked_sub(1)
             })
             .is_ok_and(|previous| previous == 1)
     }
@@ -659,9 +671,7 @@ impl AsyncManagedClient {
 
     pub(crate) async fn listed_tools(&self) -> Option<Vec<ToolInfo>> {
         // Keep cache payloads raw; plugin provenance is resolved per-session at read time.
-        let tools = if !self.startup_complete.load(Ordering::Acquire)
-            && let Some(startup_tools) = self.cached_tools()
-        {
+        let tools = if let Some(startup_tools) = self.cached_tools() {
             Some(startup_tools)
         } else {
             match self.client().await {
@@ -675,12 +685,44 @@ impl AsyncManagedClient {
             prepare_regular_mcp_tools_for_model(tools, &self.tool_plugin_provenance)
         })
     }
+
+    pub(crate) async fn tool_info(&self, tool_name: &str) -> Option<ToolInfo> {
+        let tool = if let Some(snapshot) = self
+            .codex_apps_tools_cache_context
+            .as_ref()
+            .and_then(CodexAppsToolsCacheContext::current_snapshot)
+        {
+            snapshot
+                .tools()
+                .iter()
+                .find(|tool| tool.tool.name == tool_name)
+                .cloned()
+        } else {
+            self.client()
+                .await
+                .ok()?
+                .tools
+                .load_full()
+                .iter()
+                .find(|tool| tool.tool.name == tool_name)
+                .cloned()
+        }?;
+        let tools = filter_tools(vec![tool], &self.tool_filter);
+        let tools = if self.is_codex_apps_mcp_server {
+            prepare_codex_apps_tools_for_model(tools, &self.tool_plugin_provenance)
+        } else {
+            prepare_regular_mcp_tools_for_model(tools, &self.tool_plugin_provenance)
+        };
+        tools.into_iter().next()
+    }
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub(crate) enum StartupOutcomeError {
     #[error("MCP startup cancelled")]
     Cancelled,
+    #[error("MCP startup failed: {error}")]
+    InvalidConfiguration { error: String },
     // We can't store the original error here because anyhow::Error doesn't implement
     // `Clone`.
     #[error("MCP startup failed: {error}")]
@@ -694,7 +736,7 @@ pub(crate) enum StartupOutcomeError {
 impl StartupOutcomeError {
     pub(crate) fn is_authentication_required(&self) -> bool {
         match self {
-            Self::Cancelled => false,
+            Self::Cancelled | Self::InvalidConfiguration { .. } => false,
             Self::Failed {
                 is_authentication_required,
                 ..
@@ -704,7 +746,7 @@ impl StartupOutcomeError {
 
     pub(crate) fn is_timeout(&self) -> bool {
         match self {
-            Self::Cancelled => false,
+            Self::Cancelled | Self::InvalidConfiguration { .. } => false,
             Self::Failed { is_timeout, .. } => *is_timeout,
         }
     }
@@ -1070,8 +1112,12 @@ fn spawn_tool_catalog_refresh_worker(
                     &[("cache", "miss")],
                 );
             }
-            if let Err(error) = commit_tool_catalog_refresh(&tools, &tool_catalog_revision, refresh)
-            {
+            let commit = if codex_apps_tools_cache_context.is_some() {
+                refresh.map(|_| ())
+            } else {
+                commit_tool_catalog_refresh(&tools, &tool_catalog_revision, refresh)
+            };
+            if let Err(error) = commit {
                 warn!(
                     "failed to refresh tools after list-changed notification for MCP server \
                      '{server_name}': {error:#}"
@@ -1081,7 +1127,7 @@ fn spawn_tool_catalog_refresh_worker(
     });
 }
 
-fn commit_tool_catalog_refresh(
+pub(crate) fn commit_tool_catalog_refresh(
     tools: &Arc<ArcSwap<Vec<ToolInfo>>>,
     tool_catalog_revision: &AtomicU64,
     refresh: Result<Vec<ToolInfo>>,

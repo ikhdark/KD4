@@ -132,38 +132,26 @@ INSERT INTO agent_jobs (
         .execute(&mut *tx)
         .await?;
 
-        for item in items {
-            let row_json = serde_json::to_string(&item.row_json)?;
-            sqlx::query(
-                r#"
-INSERT INTO agent_job_items (
-    job_id,
-    item_id,
-    row_index,
-    source_id,
-    row_json,
-    status,
-    assigned_thread_id,
-    attempt_count,
-    result_json,
-    last_error,
-    created_at,
-    updated_at,
-    completed_at,
-    reported_at
-) VALUES (?, ?, ?, ?, ?, ?, NULL, 0, NULL, NULL, ?, ?, NULL, NULL)
-                "#,
-            )
-            .bind(params.id.as_str())
-            .bind(item.item_id.as_str())
-            .bind(item.row_index)
-            .bind(item.source_id.as_deref())
-            .bind(row_json)
-            .bind(AgentJobItemStatus::Pending.as_str())
-            .bind(now)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
+        // Eight bound columns per item, below SQLite's supported variable limit.
+        for chunk in items.chunks(4_000) {
+            let rows = chunk
+                .iter()
+                .map(|item| serde_json::to_string(&item.row_json))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut builder = QueryBuilder::<Sqlite>::new(
+                "INSERT INTO agent_job_items (job_id, item_id, row_index, source_id, row_json, status, created_at, updated_at) ",
+            );
+            builder.push_values(chunk.iter().zip(&rows), |mut row, (item, row_json)| {
+                row.push_bind(params.id.as_str())
+                    .push_bind(item.item_id.as_str())
+                    .push_bind(item.row_index)
+                    .push_bind(item.source_id.as_deref())
+                    .push_bind(row_json)
+                    .push_bind(AgentJobItemStatus::Pending.as_str())
+                    .push_bind(now)
+                    .push_bind(now);
+            });
+            builder.build().execute(&mut *tx).await?;
         }
 
         tx.commit().await?;
@@ -179,7 +167,7 @@ INSERT INTO agent_job_items (
     ) -> anyhow::Result<Vec<AgentJob>> {
         let now = Utc::now().timestamp();
         let stale_before = now.saturating_sub(AGENT_JOB_RUNNER_LEASE_TIMEOUT_SECONDS);
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let rows = sqlx::query(
             r#"
 SELECT jobs.id, jobs.runner_instance_id
@@ -908,6 +896,75 @@ mod tests {
             .await?;
         assert!(marked_running);
         Ok((job_id, item_id, thread_id))
+    }
+
+    #[tokio::test]
+    async fn large_agent_job_batches_preserve_rows_and_rollback_late_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = StateRuntime::init(temp.path().to_path_buf(), "test-provider".to_string())
+            .await
+            .expect("runtime");
+        let mut params = AgentJobCreateParams {
+            id: "large-job".to_string(),
+            name: "batch".to_string(),
+            instruction: "work".to_string(),
+            auto_export: false,
+            max_runtime_seconds: None,
+            output_schema_json: None,
+            input_headers: vec!["value".to_string()],
+            input_csv_path: "in.csv".to_string(),
+            output_csv_path: "out.csv".to_string(),
+        };
+        let mut items = (0..4_100)
+            .map(|i| AgentJobItemCreateParams {
+                item_id: format!("item-{i}"),
+                row_index: i,
+                source_id: Some(format!("source-{i}")),
+                row_json: json!({"value":i}),
+            })
+            .collect::<Vec<_>>();
+        runtime
+            .create_agent_job(&params, &items)
+            .await
+            .expect("large job");
+        let progress = runtime
+            .get_agent_job_progress(&params.id)
+            .await
+            .expect("progress");
+        assert_eq!(
+            (progress.total_items, progress.pending_items),
+            (4_100, 4_100)
+        );
+        let last: (i64, String, String, i64) = sqlx::query_as("SELECT row_index, source_id, row_json, attempt_count FROM agent_job_items WHERE job_id = ? AND item_id = 'item-4099'")
+            .bind(&params.id).fetch_one(runtime.pool.as_ref()).await.expect("last row");
+        assert_eq!(
+            last,
+            (
+                4_099,
+                "source-4099".to_string(),
+                json!({"value":4099}).to_string(),
+                0
+            )
+        );
+        params.id = "rolled-back-job".to_string();
+        items[4_099].item_id = items[0].item_id.clone();
+        assert!(runtime.create_agent_job(&params, &items).await.is_err());
+        assert!(
+            runtime
+                .get_agent_job(&params.id)
+                .await
+                .expect("job lookup")
+                .is_none()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_job_items WHERE job_id = ?")
+                .bind(&params.id)
+                .fetch_one(runtime.pool.as_ref())
+                .await
+                .expect("rolled back items"),
+            0
+        );
+        runtime.close().await;
     }
 
     #[tokio::test]

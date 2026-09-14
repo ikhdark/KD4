@@ -65,16 +65,35 @@ async fn audit_mutation_recovery_f060_page_reports_completeness_and_rejects_zero
             .await
             .expect("mutation begins");
     }
-    let (page, query_count) = fixture
+    let page = fixture
         .store
-        .list_mutation_evidence_page_with_query_count(attempt.attempt_id, Some(1))
+        .list_mutation_evidence_page(attempt.attempt_id, Some(1), None)
         .await
         .expect("page reads");
-    assert_eq!(query_count, 2);
     assert_eq!(page.evidence.len(), 1);
     assert_eq!(page.total_count, 2);
     assert!(page.truncated);
     assert_eq!(page.next_cursor, Some(1));
+    let second = fixture
+        .store
+        .list_mutation_evidence_page(attempt.attempt_id, Some(1), page.next_cursor)
+        .await
+        .expect("next page reads");
+    assert_eq!(second.total_count, 2);
+    assert!(!second.truncated);
+    assert_eq!(second.next_cursor, None);
+    assert_eq!(page.evidence[0].path, "src/b.rs");
+    assert_eq!(second.evidence.len(), 1);
+    assert_eq!(second.evidence[0].path, "src/a.rs");
+    assert_eq!(second.evidence[0].mutation_event_ids.len(), 1);
+    let empty = fixture
+        .store
+        .list_mutation_evidence_page(attempt.attempt_id, Some(1), Some(999))
+        .await
+        .expect("past-end page reads");
+    assert_eq!(empty.total_count, 2);
+    assert!(empty.evidence.is_empty());
+    assert_eq!(empty.next_cursor, None);
     assert!(matches!(
         fixture
             .store
@@ -446,6 +465,117 @@ async fn audit_mutation_recovery_f070_capsule_publication_reconciles_committed_s
     restarted.close().await;
 }
 
+#[tokio::test]
+async fn audit_capsule_cancelled_publication_serializes_competing_attach_and_recovery() {
+    let fixture = Fixture::new().await;
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("capsule-race", "src"))
+        .await
+        .expect("assignment");
+    let canonical = serde_json::to_string(&audit_capsule(&assignment, &attempt)).expect("capsule");
+    let pause = Arc::new(TestSnapshotCapturePause::new());
+    let writer_store = fixture.store.clone();
+    let writer_pause = pause.clone();
+    let payload = canonical.clone();
+    let writer = tokio::spawn(async move {
+        with_test_snapshot_capture_pause(
+            writer_pause,
+            writer_store.attach_task_capsule(assignment.assignment_id, attempt.attempt_id, payload),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), pause.started.acquire())
+        .await
+        .expect("publication starts")
+        .expect("pause open")
+        .forget();
+    writer.abort();
+    assert!(
+        writer
+            .await
+            .expect_err("caller is cancelled")
+            .is_cancelled()
+    );
+    let competing_store = fixture.store.clone();
+    let payload = canonical.clone();
+    let competitor = tokio::spawn(async move {
+        competing_store
+            .attach_task_capsule(assignment.assignment_id, attempt.attempt_id, payload)
+            .await
+    });
+    let recovery = LocalAgentTaskStore::initialize(&fixture.state);
+    tokio::pin!(recovery);
+    let while_paused =
+        tokio::time::timeout(std::time::Duration::from_millis(200), &mut recovery).await;
+    pause.release.add_permits(1);
+    assert!(
+        while_paused.is_err(),
+        "recovery must wait for capsule publication"
+    );
+    assert!(
+        matches!(competitor.await.expect("competitor joins"), Err(StoreError::TaskCapsuleAlreadyAttached(id)) if id == assignment.assignment_id)
+    );
+    let recovered = recovery.await.expect("recovery succeeds");
+    let task = recovered
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await
+        .expect("capsule reloads");
+    assert_eq!(
+        task.assignment.task_capsule.as_deref(),
+        Some(canonical.as_str())
+    );
+    recovered.close().await;
+}
+
+#[tokio::test]
+async fn audit_workspace_root_capture_records_deleted_descendants() {
+    let fixture = Fixture::new().await;
+    std::fs::create_dir_all(fixture.repo.path().join("src")).expect("source directory");
+    let path = fixture.repo.path().join("src/deleted.rs");
+    std::fs::write(&path, "before").expect("source writes");
+    let before = fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec![".".into()])
+        .await
+        .expect("baseline");
+    std::fs::remove_file(path).expect("source deletes");
+    let after = fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec![".".into()])
+        .await
+        .expect("deletion capture");
+    assert_eq!(after.epoch, before.epoch + 1);
+    let deleted = after
+        .files
+        .iter()
+        .find(|entry| entry.path == "src/deleted.rs")
+        .expect("deleted descendant remains represented");
+    assert!(!deleted.existed);
+    assert_eq!(deleted.content_hash, None);
+}
+
+#[tokio::test]
+async fn wake_wait_ends_when_store_closes() {
+    let fixture = Fixture::new().await;
+    let waiter = fixture
+        .store
+        .wait_for_wake_events("empty-root".into(), None);
+    tokio::pin!(waiter);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut waiter)
+            .await
+            .is_err()
+    );
+    fixture.store.close().await;
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("shutdown wakes the waiter"),
+        Err(StoreError::Sql(sqlx::Error::PoolClosed))
+    ));
+}
+
 fn run_git(repo: &std::path::Path, args: &[&str]) {
     let output = Command::new("git")
         .arg("-C")
@@ -676,6 +806,8 @@ async fn audit_workspace_git_capture_includes_tracked_generated_named_paths() {
 async fn audit_workspace_fallback_is_incomplete_and_rejected_for_validation() {
     let fixture = Fixture::new().await;
     std::fs::write(fixture.repo.path().join("input.txt"), "input").expect("fallback input");
+    run_git(fixture.repo.path(), &["init", "--quiet"]);
+    // An unborn HEAD makes overlay discovery fail despite a real Git repository.
     let revision = fixture
         .store
         .capture_workspace_revision(fixture.repo.path(), vec![REPOSITORY_WIDE_PATH.to_string()])
@@ -727,6 +859,9 @@ async fn audit_workspace_symlink_target_identity_affects_manifest() {
         .capture_workspace_revision(fixture.repo.path(), vec!["link.txt".to_string()])
         .await
         .expect("right link captures");
+    assert_eq!(left.files[0].path, "link.txt");
+    assert_eq!(right.files[0].path, "link.txt");
+    assert_ne!(left.files[0].content_hash, right.files[0].content_hash);
     assert_ne!(left.files, right.files);
     assert_ne!(left.manifest_hash, right.manifest_hash);
 }
@@ -1153,10 +1288,17 @@ async fn assert_writer_blocked_while_snapshot_capture_is_paused(
             .expect("independent writer lock is released");
     }
     pause.release.add_permits(1);
-    assert!(
-        !writer_acquired,
-        "snapshot capture must retain the SQLite writer transaction"
-    );
+    match writer_result {
+        Err(_) => {} // The writer stayed blocked until the timeout.
+        Ok(Err(sqlx::Error::Database(error))) => assert!(
+            matches!(
+                error.code().as_deref(),
+                Some("5" | "6" | "261" | "262" | "517")
+            ),
+            "expected SQLite contention, got {error}",
+        ),
+        other => panic!("snapshot capture must retain the writer lock: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -2008,6 +2150,14 @@ fn relation_draft(root_session_id: &str, role: AgentRole, target: AssignmentId) 
 fn ids_and_scope_validation_are_strict() {
     assert_eq!(AssignmentId::new().as_uuid().get_version_num(), 7);
     assert!(AssignmentId::try_from(Uuid::new_v4()).is_err());
+    let mut bytes = *Uuid::now_v7().as_bytes();
+    bytes[8] &= 0x3f;
+    let non_rfc = Uuid::from_bytes(bytes);
+    assert_eq!(non_rfc.get_version_num(), 7);
+    assert!(AssignmentId::try_from(non_rfc).is_err());
+    assert!(
+        serde_json::from_value::<AssignmentId>(serde_json::json!(non_rfc.to_string())).is_err()
+    );
     let repo = TempDir::new().expect("repository tempdir");
     assert!(
         normalize_repo_scopes(
@@ -2243,6 +2393,9 @@ async fn explorer_identity_rejects_only_the_same_primary_question() {
         .submit_agent_receipt(first.attempt.attempt_id, completed_receipt(Vec::new()))
         .await
         .expect("the first investigation result seals");
+    std::fs::create_dir_all(fixture.repo.path().join("src")).expect("source directory");
+    std::fs::write(fixture.repo.path().join("src/shared.rs"), "changed parser")
+        .expect("workspace changes");
     let completed_duplicate = fixture
         .store
         .create_admitted_assignment(
@@ -2255,15 +2408,11 @@ async fn explorer_identity_rejects_only_the_same_primary_question() {
             true,
         )
         .await
-        .expect_err("the sealed result is reused instead of spawning duplicate work");
-    assert!(matches!(
-        completed_duplicate,
-        StoreError::AdmissionRejected {
-            reason: AdmissionRejectionReason::DuplicateExplorerInvestigation,
-            reusable_assignment_id: Some(assignment_id),
-        }
-        if assignment_id == first.assignment.assignment_id
-    ));
+        .expect("a sealed investigation cannot prove freshness for new work");
+    assert_ne!(
+        completed_duplicate.assignment.assignment_id,
+        first.assignment.assignment_id
+    );
 }
 
 #[tokio::test]
@@ -3043,6 +3192,17 @@ async fn validation_calls_allow_only_running_to_terminal_transitions() {
             .len(),
         5
     );
+    for mut call in task.validation_calls {
+        if call.status == ValidationCallStatus::Running {
+            call.status = ValidationCallStatus::Cancelled;
+            call.recorded_at = started_at + Duration::seconds(5);
+            fixture
+                .store
+                .record_validation_call(call)
+                .await
+                .expect("remaining calls cancel");
+        }
+    }
     fixture
         .store
         .submit_agent_receipt(
@@ -5104,6 +5264,21 @@ async fn failed_snapshot_deletion_is_queued_and_retried_without_failing_receipt(
         .await
         .expect("directory forces remove_file failure");
 
+    let later_name = "snapshots/zz-later.bin";
+    let later_path = fixture
+        .state
+        .codex_home()
+        .join("agent-task-coordination")
+        .join(later_name);
+    std::fs::write(&later_path, "collect me").expect("later snapshot");
+    let pool = coordination_pool(&fixture).await;
+    sqlx::query("INSERT INTO snapshot_gc_queue (snapshot_name, queued_at) VALUES (?, ?)")
+        .bind(later_name)
+        .bind(serde_json::to_string(&Utc::now()).expect("timestamp"))
+        .execute(&pool)
+        .await
+        .expect("later deletion queues");
+    pool.close().await;
     fixture
         .store
         .submit_agent_receipt(
@@ -5113,6 +5288,10 @@ async fn failed_snapshot_deletion_is_queued_and_retried_without_failing_receipt(
         .await
         .expect("receipt remains successful when deletion fails");
     assert!(!snapshot_is_retained(&fixture.store, attempt.attempt_id).await);
+    assert!(
+        !later_path.exists(),
+        "one failed deletion must not starve later entries"
+    );
     let pool = coordination_pool(&fixture).await;
     assert!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM snapshot_gc_queue")
@@ -5546,7 +5725,10 @@ async fn repository_wide_capture_detects_an_external_revert_missing_from_git_ove
         vec![REPOSITORY_WIDE_PATH, "src/lib.rs"]
     );
     assert_eq!(
-        modified.files.iter().find(|entry| entry.path == "src/lib.rs"),
+        modified
+            .files
+            .iter()
+            .find(|entry| entry.path == "src/lib.rs"),
         Some(&WorkspaceManifestEntry {
             path: "src/lib.rs".to_string(),
             content_hash: Some(
@@ -5572,7 +5754,10 @@ async fn repository_wide_capture_detects_an_external_revert_missing_from_git_ove
         vec![REPOSITORY_WIDE_PATH, "src/lib.rs"]
     );
     assert_eq!(
-        reverted.files.iter().find(|entry| entry.path == "src/lib.rs"),
+        reverted
+            .files
+            .iter()
+            .find(|entry| entry.path == "src/lib.rs"),
         Some(&WorkspaceManifestEntry {
             path: "src/lib.rs".to_string(),
             content_hash: Some(

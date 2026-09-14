@@ -18,7 +18,7 @@ use codex_rollout::open_rollout_line_reader;
 use codex_state::StateRuntime;
 use codex_utils_absolute_path as path_utils;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::value::RawValue;
 
 #[derive(Default)]
 struct RolloutResumeState {
@@ -40,10 +40,11 @@ struct TurnContextResumeState {
 }
 
 #[derive(Deserialize)]
-struct RawRecord {
+struct RawRecord<'a> {
     #[serde(rename = "type")]
     item_type: String,
-    payload: Option<Value>,
+    #[serde(borrow)]
+    payload: Option<&'a RawValue>,
 }
 
 pub(crate) enum ResolveCwdOutcome {
@@ -57,7 +58,7 @@ pub(crate) async fn resolve_session_thread_id(
 ) -> Option<ThreadId> {
     match id_str_if_uuid {
         Some(id_str) => ThreadId::from_string(id_str).ok(),
-        None => read_rollout_resume_state(path)
+        None => scan_rollout_resume_state(path, true)
             .await
             .ok()
             .and_then(|state| state.thread_id),
@@ -142,6 +143,10 @@ pub(crate) fn cwds_differ(current_cwd: &Path, session_cwd: &Path) -> bool {
 }
 
 async fn read_rollout_resume_state(path: &Path) -> io::Result<RolloutResumeState> {
+    scan_rollout_resume_state(path, false).await
+}
+
+async fn scan_rollout_resume_state(path: &Path, id_only: bool) -> io::Result<RolloutResumeState> {
     let mut reader = open_rollout_line_reader(path).await?;
     let mut state = RolloutResumeState::default();
     let mut saw_record = false;
@@ -161,13 +166,17 @@ async fn read_rollout_resume_state(path: &Path) -> io::Result<RolloutResumeState
 
         match record.item_type.as_str() {
             "session_meta" if state.thread_id.is_none() => {
-                if let Ok(metadata) = serde_json::from_value::<SessionMetadata>(payload) {
+                if let Ok(metadata) = serde_json::from_str::<SessionMetadata>(payload.get()) {
                     state.thread_id = Some(metadata.id);
                     state.cwd.get_or_insert(metadata.cwd);
+                    if id_only {
+                        return Ok(state);
+                    }
                 }
             }
             "turn_context" => {
-                if let Ok(turn_context) = serde_json::from_value::<TurnContextResumeState>(payload)
+                if let Ok(turn_context) =
+                    serde_json::from_str::<TurnContextResumeState>(payload.get())
                 {
                     state.cwd = Some(turn_context.cwd);
                     state.model = Some(turn_context.model);
@@ -212,6 +221,21 @@ mod tests {
             text.push('\n');
         }
         std::fs::write(path, text)
+    }
+
+    #[tokio::test]
+    async fn thread_id_lookup_stops_before_unreadable_transcript() -> std::io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("rollout.jsonl");
+        let id = ThreadId::new();
+        let mut bytes = serde_json::to_vec(&serde_json::json!({
+            "type": "session_meta", "payload": {"id": id, "cwd": temp_dir.path()}
+        }))?;
+        bytes.extend_from_slice(b"\n\xff\n");
+        std::fs::write(&path, bytes)?;
+        assert_eq!(resolve_session_thread_id(&path, None).await, Some(id));
+        assert!(read_rollout_resume_state(&path).await.is_err());
+        Ok(())
     }
 
     #[tokio::test]

@@ -1,4 +1,43 @@
 use super::*;
+
+#[tokio::test]
+async fn queued_inline_side_command_is_rejected_during_review() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.review.is_review_mode = true;
+    chat.bottom_pane
+        .set_composer_text("unfinished draft".to_string(), Vec::new(), Vec::new());
+    let queued = QueuedUserMessage::new(
+        UserMessage {
+            text: "/side explore".to_string(),
+            local_images: Vec::new(),
+            remote_image_urls: Vec::new(),
+            text_elements: Vec::new(),
+            mention_bindings: Vec::new(),
+        },
+        QueuedInputAction::ParseSlash,
+    );
+    assert_eq!(
+        chat.submit_queued_slash_prompt(queued),
+        QueueDrain::Continue
+    );
+    let mut errors = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            AppEvent::InsertHistoryCell(cell) => {
+                errors.push(lines_to_single_string(&cell.display_lines(80)))
+            }
+            event => assert!(!matches!(
+                event,
+                AppEvent::StartSide { .. } | AppEvent::SubmitThreadOp { .. }
+            )),
+        }
+    }
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("'/side' is unavailable while code review is running."));
+    assert_eq!(chat.bottom_pane.composer_text(), "unfinished draft");
+    assert!(op_rx.try_recv().is_err());
+}
 use pretty_assertions::assert_eq;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;

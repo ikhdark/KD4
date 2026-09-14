@@ -13,7 +13,7 @@ use super::helpers::distinct_thread_metadata_title;
 use super::helpers::set_thread_name_from_title;
 use super::helpers::stored_thread_from_rollout_item;
 use super::helpers::thread_item_titles;
-use super::read_thread::stored_thread_from_sqlite_metadata;
+use super::read_thread::stored_thread_from_sqlite_metadata_with_name;
 use crate::ListThreadsParams;
 use crate::SortDirection;
 use crate::StoredThread;
@@ -87,7 +87,7 @@ async fn list_threads_with_state_db_read_count(
         .as_ref()
         .map(|cursor| encode_rollout_cursor(storage_path, cursor))
         .transpose()?;
-    let (mut names, resolved_title_ids) = thread_item_titles(&page.items);
+    let (mut names, mut resolved_title_ids) = thread_item_titles(&page.items);
     let mut items = Vec::with_capacity(page.items.len());
     for item in page.items {
         let Some(mut thread) = stored_thread_from_rollout_item(
@@ -110,13 +110,21 @@ async fn list_threads_with_state_db_read_count(
         } else {
             None
         };
-        if let Some(metadata) = metadata
-            && let Ok(authoritative_thread) =
-                stored_thread_from_sqlite_metadata(store, metadata).await
-        {
-            thread = authoritative_thread;
-            if params.relation_filter.is_some() {
-                thread.parent_thread_id = relation_parent_thread_id;
+        if let Some(metadata) = metadata {
+            let name = distinct_thread_metadata_title(&metadata);
+            if let Some(title) = name.as_ref() {
+                resolved_title_ids.insert(thread.thread_id);
+                names
+                    .entry(thread.thread_id)
+                    .or_insert_with(|| title.clone());
+            }
+            if let Ok(authoritative_thread) =
+                stored_thread_from_sqlite_metadata_with_name(store, metadata, name).await
+            {
+                thread = authoritative_thread;
+                if params.relation_filter.is_some() {
+                    thread.parent_thread_id = relation_parent_thread_id;
+                }
             }
         }
         items.push(thread);
@@ -126,32 +134,10 @@ async fn list_threads_with_state_db_read_count(
         .iter()
         .map(|thread| thread.thread_id)
         .collect::<HashSet<_>>();
-    let mut unresolved_thread_ids = thread_ids
+    let unresolved_thread_ids = thread_ids
         .difference(&resolved_title_ids)
         .copied()
         .collect::<HashSet<_>>();
-    if storage_path == ThreadListStoragePath::StateDb {
-        for thread_id in unresolved_thread_ids.clone() {
-            let Some(metadata) = state_metadata.get(&thread_id) else {
-                continue;
-            };
-            if let Some(title) = distinct_thread_metadata_title(metadata) {
-                unresolved_thread_ids.remove(&thread_id);
-                names.insert(thread_id, title);
-            }
-        }
-    } else if let Some(state_db_ctx) = hydration_db.as_deref() {
-        for thread_id in unresolved_thread_ids.clone() {
-            state_db_reads += 1;
-            let Ok(Some(metadata)) = state_db_ctx.get_thread(thread_id).await else {
-                continue;
-            };
-            if let Some(title) = distinct_thread_metadata_title(&metadata) {
-                unresolved_thread_ids.remove(&thread_id);
-                names.insert(thread_id, title);
-            }
-        }
-    }
     if !unresolved_thread_ids.is_empty()
         && let Ok(legacy_names) =
             find_thread_names_by_ids(store.config.codex_home.as_path(), &unresolved_thread_ids)

@@ -57,8 +57,9 @@ impl EncodedImage {
 
 /// Wraps image bytes in a data URL without decoding or validating them.
 pub fn data_url_from_bytes(mime: &str, bytes: &[u8]) -> String {
-    let encoded = BASE64_STANDARD.encode(bytes);
-    format!("data:{mime};base64,{encoded}")
+    let mut url = format!("data:{mime};base64,");
+    BASE64_STANDARD.encode_string(bytes, &mut url);
+    url
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -95,6 +96,11 @@ pub fn load_for_prompt_bytes(
     file_bytes: Vec<u8>,
     mode: PromptImageMode,
 ) -> Result<EncodedImage, ImageProcessingError> {
+    if let PromptImageMode::ResizeWithLimits(limits) = mode
+        && (limits.max_dimension == 0 || limits.max_patches == 0)
+    {
+        return Err(ImageProcessingError::InvalidResizeLimits);
+    }
     let path_buf = path.to_path_buf();
 
     let key = ImageCacheKey {
@@ -119,6 +125,13 @@ pub fn load_for_prompt_bytes(
 
         let mut decoder = ImageReader::with_format(Cursor::new(&file_bytes), guessed_format)
             .into_decoder()
+            .map_err(|source| ImageProcessingError::decode_error(&path_buf, source))?;
+        // Match ImageReader::decode: into_decoder alone does not reserve the
+        // decoded pixel buffer against the allocation limit.
+        let mut decode_limits = image::Limits::default();
+        decode_limits
+            .reserve(decoder.total_bytes())
+            .and_then(|()| decoder.set_limits(decode_limits))
             .map_err(|source| ImageProcessingError::decode_error(&path_buf, source))?;
         // Preserve the metadata most important for rendering prompt images faithfully: the color
         // profile and EXIF data, including orientation. Other format-specific metadata is
@@ -295,6 +308,29 @@ fn prompt_image_output_dimensions_for_limits(
     // patch grid down so integer output dimensions remain within the budget.
     let scaled_patches_wide = width_f64 * scale / patch_size;
     let scaled_patches_high = height_f64 * scale / patch_size;
+    if scaled_patches_wide < 1.0 || scaled_patches_high < 1.0 {
+        // A sub-patch axis still costs one patch. Fit the longest axis with
+        // integer search instead of flooring that axis to zero and collapsing
+        // both dimensions. The search never enlarges either dimension.
+        let longest = width.max(height);
+        let dimensions = |length: u32| {
+            (
+                (u64::from(width) * u64::from(length) / u64::from(longest)).max(1) as u32,
+                (u64::from(height) * u64::from(length) / u64::from(longest)).max(1) as u32,
+            )
+        };
+        let (mut low, mut high) = (1, longest);
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            let (w, h) = dimensions(middle);
+            if prompt_image_dimensions_fit(w, h, limits) {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        return dimensions(low);
+    }
     scale *= (scaled_patches_wide.floor() / scaled_patches_wide)
         .min(scaled_patches_high.floor() / scaled_patches_high);
 

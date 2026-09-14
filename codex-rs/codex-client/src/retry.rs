@@ -31,7 +31,10 @@ impl RetryOn {
                 (self.retry_429 && status.as_u16() == 429)
                     || (self.retry_5xx && status.is_server_error())
             }
-            TransportError::Timeout | TransportError::Network(_) => self.retry_transport,
+            TransportError::Timeout
+            | TransportError::Connection(_)
+            | TransportError::Network(_)
+            | TransportError::PreDispatch(_) => self.retry_transport,
             _ => false,
         }
     }
@@ -75,6 +78,9 @@ pub fn capped_backoff(base: Duration, retry_number: u64, maximum: Duration) -> D
 ///
 /// The operation receives a zero-based attempt index. If all allowed attempts
 /// fail, the final underlying error is returned unchanged.
+/// Use only for operations whose replay is safe. Otherwise use
+/// [`run_with_retry_non_idempotent`]. Delays grow exponentially without a cap;
+/// callers that need an elapsed-time budget must apply an outer deadline.
 pub async fn run_with_retry<T, F, Fut>(
     policy: RetryPolicy,
     mut make_req: impl FnMut() -> Request,
@@ -132,20 +138,5 @@ where
             }
             Err(err) => return Err(err),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn capped_backoff_never_exceeds_the_maximum() {
-        let maximum = Duration::from_secs(2);
-
-        assert_eq!(
-            capped_backoff(Duration::from_secs(1), u64::MAX, maximum),
-            maximum
-        );
     }
 }

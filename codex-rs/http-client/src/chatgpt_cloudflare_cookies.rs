@@ -136,6 +136,7 @@ fn set_cookie_name(header: &str) -> Option<&str> {
 }
 
 fn only_cloudflare_cookies(header: HeaderValue) -> Option<HeaderValue> {
+    let sensitive = header.is_sensitive();
     let header = header.to_str().ok()?;
     let cookies = header
         .split(';')
@@ -150,7 +151,9 @@ fn only_cloudflare_cookies(header: HeaderValue) -> Option<HeaderValue> {
     if cookies.is_empty() {
         None
     } else {
-        HeaderValue::from_str(&cookies).ok()
+        let mut header = HeaderValue::from_str(&cookies).ok()?;
+        header.set_sensitive(sensitive);
+        Some(header)
     }
 }
 
@@ -371,5 +374,14 @@ mod tests {
         ] {
             assert!(!is_allowed_cloudflare_cookie_name(name));
         }
+    }
+    #[test]
+    fn filtered_cookie_preserves_sensitivity() {
+        let mut cookie = HeaderValue::from_static("_cfuvid=secret; session=removed");
+        cookie.set_sensitive(true);
+        let filtered = super::only_cloudflare_cookies(cookie).expect("allowed cookie");
+        assert_eq!(filtered.to_str().unwrap(), "_cfuvid=secret");
+        assert!(filtered.is_sensitive());
+        assert!(!format!("{filtered:?}").contains("secret"));
     }
 }

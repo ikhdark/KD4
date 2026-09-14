@@ -1,6 +1,7 @@
 //! Desktop notification coalescing for `ChatWidget`.
 
 use super::*;
+use unicode_segmentation::UnicodeSegmentation;
 
 impl ChatWidget {
     pub(super) fn notify(&mut self, notification: Notification) {
@@ -94,11 +95,30 @@ impl Notification {
 
     pub(super) fn agent_turn_preview(response: &str) -> Option<String> {
         let mut normalized = String::new();
-        for part in response.split_whitespace() {
-            if !normalized.is_empty() {
-                normalized.push(' ');
+        let mut pending_space = false;
+        // Stop after enough graphemes for the preview and its truncation marker.
+        // Normalize incrementally so a long response or unbroken word is never copied.
+        for grapheme in response.graphemes(true) {
+            let previous_len = normalized.len();
+            for ch in grapheme.chars() {
+                if ch.is_whitespace() {
+                    pending_space = !normalized.is_empty();
+                } else {
+                    if pending_space {
+                        normalized.push(' ');
+                        pending_space = false;
+                    }
+                    normalized.push(ch);
+                }
             }
-            normalized.push_str(part);
+            if normalized.len() != previous_len
+                && normalized
+                    .graphemes(true)
+                    .nth(AGENT_NOTIFICATION_PREVIEW_GRAPHEMES)
+                    .is_some()
+            {
+                break;
+            }
         }
         let trimmed = normalized.trim();
         if trimmed.is_empty() {

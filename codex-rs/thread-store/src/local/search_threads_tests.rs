@@ -16,6 +16,29 @@ use crate::local::LocalThreadStore;
 use crate::local::test_support::test_config;
 use crate::local::test_support::write_session_file;
 
+#[tokio::test]
+async fn search_threads_rejects_zero_page_size_before_scanning() {
+    let home = TempDir::new().expect("temp dir");
+    let store = LocalThreadStore::new(test_config(&home.path().join("missing")), None);
+    let error = store
+        .search_threads(SearchThreadsParams {
+            page_size: 0,
+            cursor: None,
+            sort_key: ThreadSortKey::CreatedAt,
+            sort_direction: SortDirection::Desc,
+            allowed_sources: Vec::new(),
+            archived: false,
+            search_term: "hello".to_string(),
+        })
+        .await
+        .expect_err("zero page size");
+    assert!(matches!(
+        error,
+        crate::ThreadStoreError::InvalidRequest { .. }
+    ));
+    assert!(error.to_string().contains("page size"));
+}
+
 #[test]
 fn recency_cursor_includes_thread_id_tie_breaker() {
     let thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000123")

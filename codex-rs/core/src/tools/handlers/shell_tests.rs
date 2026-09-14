@@ -80,7 +80,8 @@ async fn late_validation_denial_finishes_the_started_shell_event() {
             call_id,
             Some(&tracker),
         ))
-        .await;
+        .await
+        .expect("begin event should publish");
 
     let result = super::finish_validation_skip_after_begin(
         &emitter,

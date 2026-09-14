@@ -3,7 +3,7 @@
 
 const APPROX_BYTES_PER_TOKEN: usize = 4;
 
-/// Truncate a string to `max_bytes` using a character-count marker.
+/// Retain at most `max_bytes` bytes of source content, plus a character-count marker.
 pub fn truncate_middle_chars(s: &str, max_bytes: usize) -> String {
     truncate_with_byte_estimate(s, max_bytes, /*use_tokens*/ false)
 }
@@ -35,17 +35,19 @@ pub fn truncate_middle_with_token_budget(s: &str, max_tokens: usize) -> (String,
             .unwrap_or(0)
     };
     let mut content_bytes = proportional_bytes.min(approx_bytes_for_tokens(max_tokens));
-    let mut truncated = truncate_with_byte_estimate(s, content_bytes, /*use_tokens*/ true);
-    while content_bytes > 0 && approx_token_count(&truncated) > max_tokens {
-        content_bytes = content_bytes.saturating_sub(1);
-        truncated = truncate_with_byte_estimate(s, content_bytes, /*use_tokens*/ true);
-    }
     let total_tokens = u64::try_from(total_token_count).unwrap_or(u64::MAX);
-
-    if truncated == s {
-        (truncated, None)
-    } else {
-        (truncated, Some(total_tokens))
+    loop {
+        let truncated = truncate_with_byte_estimate(s, content_bytes, /*use_tokens*/ true);
+        if approx_token_count(&truncated) <= max_tokens {
+            return (truncated, Some(total_tokens));
+        }
+        if content_bytes == 0 {
+            return (String::new(), Some(total_tokens));
+        }
+        // Geometric reduction bounds retries even when the retained ends are
+        // much denser than the middle. Verify each candidate: the estimate is
+        // not necessarily monotonic as UTF-8 boundaries and marker digits change.
+        content_bytes -= content_bytes.div_ceil(4);
     }
 }
 
@@ -54,12 +56,14 @@ fn truncate_with_byte_estimate(s: &str, max_bytes: usize, use_tokens: bool) -> S
         return String::new();
     }
 
-    let total_chars = s.chars().count();
-
     if max_bytes == 0 {
         return format_truncation_marker(
             use_tokens,
-            removed_units(use_tokens, s.len(), total_chars),
+            removed_units(
+                use_tokens,
+                s.len(),
+                if use_tokens { 0 } else { s.chars().count() },
+            ),
         );
     }
 
@@ -69,12 +73,17 @@ fn truncate_with_byte_estimate(s: &str, max_bytes: usize, use_tokens: bool) -> S
 
     let total_bytes = s.len();
     let (left_budget, right_budget) = split_budget(max_bytes);
-    let (removed_chars, left, right) = split_string(s, left_budget, right_budget);
+    let (left, right) = split_boundaries(s, left_budget, right_budget);
+    let removed_chars = if use_tokens {
+        0
+    } else {
+        s[left.len()..s.len() - right.len()].chars().count()
+    };
     let marker = format_truncation_marker(
         use_tokens,
         removed_units(
             use_tokens,
-            total_bytes.saturating_sub(max_bytes),
+            total_bytes - left.len() - right.len(),
             removed_chars,
         ),
     );
@@ -122,44 +131,23 @@ pub fn approx_tokens_from_byte_count(bytes: usize) -> u64 {
         / (APPROX_BYTES_PER_TOKEN as u64)
 }
 
-fn split_string(s: &str, beginning_bytes: usize, end_bytes: usize) -> (usize, &str, &str) {
-    if s.is_empty() {
-        return (0, "", "");
-    }
-
+fn split_boundaries(s: &str, beginning_bytes: usize, end_bytes: usize) -> (&str, &str) {
     let len = s.len();
-    let tail_start_target = len.saturating_sub(end_bytes);
-    let mut prefix_end = 0usize;
-    let mut suffix_start = len;
-    let mut removed_chars = 0usize;
-    let mut suffix_started = false;
+    let prefix_end = s.floor_char_boundary(beginning_bytes.min(len));
+    let suffix_start = s
+        .ceil_char_boundary(len.saturating_sub(end_bytes))
+        .max(prefix_end);
+    (&s[..prefix_end], &s[suffix_start..])
+}
 
-    for (idx, ch) in s.char_indices() {
-        let char_end = idx + ch.len_utf8();
-        if char_end <= beginning_bytes {
-            prefix_end = char_end;
-            continue;
-        }
-
-        if idx >= tail_start_target {
-            if !suffix_started {
-                suffix_start = idx;
-                suffix_started = true;
-            }
-            continue;
-        }
-
-        removed_chars = removed_chars.saturating_add(1);
-    }
-
-    if suffix_start < prefix_end {
-        suffix_start = prefix_end;
-    }
-
-    let before = &s[..prefix_end];
-    let after = &s[suffix_start..];
-
-    (removed_chars, before, after)
+#[cfg(test)]
+fn split_string(s: &str, beginning_bytes: usize, end_bytes: usize) -> (usize, &str, &str) {
+    let (before, after) = split_boundaries(s, beginning_bytes, end_bytes);
+    (
+        s[before.len()..s.len() - after.len()].chars().count(),
+        before,
+        after,
+    )
 }
 
 fn split_budget(budget: usize) -> (usize, usize) {

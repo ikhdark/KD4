@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import os
 import subprocess
 import sys
 import unittest
@@ -16,6 +17,7 @@ class RustToolEnvTest(unittest.TestCase):
             completed = subprocess.run(
                 [
                     sys.executable,
+                    "-I",
                     "-c",
                     "import runpy, sys; runpy.run_path(sys.argv[1], run_name='loaded')",
                     str(just_shell),
@@ -24,6 +26,12 @@ class RustToolEnvTest(unittest.TestCase):
                 check=False,
                 capture_output=True,
                 text=True,
+                env={
+                    key: value
+                    for key, value in os.environ.items()
+                    if key != "PYTHONPATH"
+                },
+                timeout=30,
             )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -46,11 +54,36 @@ class RustToolEnvTest(unittest.TestCase):
             expected = scoop / "apps" / "llvm" / "current" / "bin" / "lld-link.exe"
             expected.parent.mkdir(parents=True)
             expected.write_text("", encoding="utf-8")
+            user_linker = (
+                user / "scoop" / "apps" / "llvm" / "current" / "bin" / "lld-link.exe"
+            )
+            for candidate in (user_linker, default):
+                candidate.parent.mkdir(parents=True)
+                candidate.write_text("", encoding="utf-8")
 
             result = rust_tool_env.find_windows_lld_link(
                 {"SCOOP": str(scoop), "USERPROFILE": str(user)},
                 which=lambda _program: None,
                 default_path=default,
+            )
+            self.assertEqual(result, str(expected))
+            expected.unlink()
+            self.assertEqual(
+                rust_tool_env.find_windows_lld_link(
+                    {"SCOOP": str(scoop), "USERPROFILE": str(user)},
+                    which=lambda _program: None,
+                    default_path=default,
+                ),
+                str(user_linker),
+            )
+            user_linker.unlink()
+            self.assertEqual(
+                rust_tool_env.find_windows_lld_link(
+                    {"SCOOP": str(scoop), "USERPROFILE": str(user)},
+                    which=lambda _program: None,
+                    default_path=default,
+                ),
+                str(default),
             )
 
         self.assertEqual(result, str(expected))

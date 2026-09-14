@@ -49,9 +49,10 @@ pub(super) fn build_serve_command(
 fn build_direct_codex_command(codex_bin: &Path, config_overrides: &[String]) -> Result<Command> {
     let mut command = Command::new(codex_bin);
     add_codex_parent_to_path(&mut command, codex_bin)?;
-    command
-        .env("RUST_BACKTRACE", "full")
-        .env("RUST_LOG", "warn,codex_=trace");
+    command.env("RUST_BACKTRACE", "full");
+    if env::var_os("RUST_LOG").is_none() {
+        command.env("RUST_LOG", "warn");
+    }
     for override_kv in config_overrides {
         command.arg("--config").arg(override_kv);
     }
@@ -113,7 +114,11 @@ pub(super) fn listener_pids_on_port(port: u16) -> Result<Vec<u32>> {
         .output()
         .with_context(|| format!("failed to run netstat for port {port}"))?;
     if !output.status.success() {
-        return Ok(Vec::new());
+        bail!(
+            "netstat failed for port {port}: {}; {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     Ok(parse_windows_listener_pids(

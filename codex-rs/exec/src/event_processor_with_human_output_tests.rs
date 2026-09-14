@@ -494,3 +494,57 @@ fn turn_interrupted_clears_stale_final_message() {
     assert!(!processor.final_message_rendered);
     assert!(!processor.emit_final_message_on_shutdown);
 }
+
+#[test]
+fn canonical_message_retains_rendered_state_only_when_unchanged() {
+    for (canonical, expected_rendered) in [("streamed answer", true), ("updated answer", false)] {
+        let mut processor = EventProcessorWithHumanOutput {
+            bold: Style::new(),
+            cyan: Style::new(),
+            dimmed: Style::new(),
+            green: Style::new(),
+            italic: Style::new(),
+            magenta: Style::new(),
+            red: Style::new(),
+            yellow: Style::new(),
+            show_agent_reasoning: true,
+            show_raw_agent_reasoning: false,
+            last_message_path: None,
+            final_message: None,
+            final_message_rendered: false,
+            emit_final_message_on_shutdown: false,
+            last_total_token_usage: None,
+        };
+        processor.process_server_notification(ServerNotification::ItemCompleted(
+            codex_app_server_protocol::ItemCompletedNotification {
+                thread_id: "thread-1".into(),
+                turn_id: "turn-1".into(),
+                completed_at_ms: 0,
+                item: ThreadItem::AgentMessage {
+                    id: "message".into(),
+                    text: "streamed answer".into(),
+                    phase: None,
+                    memory_citation: None,
+                },
+            },
+        ));
+        assert!(processor.final_message_rendered);
+        let ServerNotification::TurnCompleted(mut payload) = crate::tests::recovery_completion()
+        else {
+            panic!("completion")
+        };
+        payload.surfaced_result = Some(codex_protocol::protocol::SurfacedToolResult {
+            adapter: "owner".into(),
+            value: serde_json::json!({}),
+            canonical_message: Some(canonical.into()),
+        });
+        processor.process_server_notification(ServerNotification::TurnCompleted(payload));
+        assert_eq!(processor.final_message.as_deref(), Some(canonical));
+        assert_eq!(processor.final_message_rendered, expected_rendered);
+        assert!(processor.emit_final_message_on_shutdown);
+        processor.process_event_stream_error("lost stream".into());
+        assert_eq!(processor.final_message, None);
+        assert!(!processor.final_message_rendered);
+        assert!(!processor.emit_final_message_on_shutdown);
+    }
+}

@@ -21,7 +21,6 @@ use anyhow::Result;
 use anyhow::bail;
 use codex_http_client::BlockingHttpClientBuilder;
 use url::Url;
-use uuid::Uuid;
 
 use super::catalog;
 
@@ -45,7 +44,7 @@ pub(crate) fn builtin_spritesheet_path(codex_home: &Path, file: &str) -> PathBuf
 /// install they can safely ignore.
 pub(crate) fn ensure_builtin_pet(codex_home: &Path, pet: catalog::BuiltinPet) -> Result<()> {
     let destination = builtin_spritesheet_path(codex_home, pet.spritesheet_file);
-    if validate_cached_spritesheet(&destination).is_ok() {
+    if validate_builtin_cache(codex_home, pet, &destination).is_ok() {
         return Ok(());
     }
 
@@ -56,31 +55,7 @@ pub(crate) fn ensure_builtin_pet(codex_home: &Path, pet: catalog::BuiltinPet) ->
         .context("pet spritesheet path should include an assets directory")?;
     fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
 
-    let staging = destination.with_file_name(format!(
-        ".{}.download-{}.webp",
-        pet.spritesheet_file,
-        Uuid::new_v4()
-    ));
-    fs::write(&staging, &bytes).with_context(|| format!("write {}", staging.display()))?;
-    if let Err(err) = validate_cached_spritesheet(&staging) {
-        let _ = fs::remove_file(&staging);
-        return Err(err);
-    }
-
-    if install_downloaded_spritesheet(&staging, &destination).is_ok() {
-        return Ok(());
-    }
-
-    if validate_cached_spritesheet(&destination).is_ok() {
-        let _ = fs::remove_file(&staging);
-        return Ok(());
-    }
-
-    if destination.exists() {
-        fs::remove_file(&destination)
-            .with_context(|| format!("remove {}", destination.display()))?;
-    }
-    install_downloaded_spritesheet(&staging, &destination)
+    install_downloaded_spritesheet(&bytes, &destination)
 }
 
 fn builtin_pet_url(pet: catalog::BuiltinPet) -> Result<String> {
@@ -122,8 +97,44 @@ fn download_bytes_with_limit(url: &str, max_bytes: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn install_downloaded_spritesheet(staging: &Path, destination: &Path) -> Result<()> {
-    fs::rename(staging, destination).with_context(|| format!("install {}", destination.display()))
+fn install_downloaded_spritesheet(bytes: &[u8], destination: &Path) -> Result<()> {
+    let dimensions = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()?
+        .into_dimensions()?;
+    if dimensions != (catalog::SPRITESHEET_WIDTH, catalog::SPRITESHEET_HEIGHT) {
+        bail!("invalid downloaded pet spritesheet dimensions");
+    }
+    image::load_from_memory(bytes).context("decode downloaded pet spritesheet")?;
+    let staging =
+        tempfile::NamedTempFile::new_in(destination.parent().context("missing assets directory")?)?;
+    fs::write(staging.path(), bytes).context("write downloaded pet spritesheet")?;
+    staging
+        .persist(destination)
+        .with_context(|| format!("install {}", destination.display()))?;
+    Ok(())
+}
+
+fn validate_builtin_cache(
+    codex_home: &Path,
+    builtin: catalog::BuiltinPet,
+    path: &Path,
+) -> Result<()> {
+    validate_cached_spritesheet(path)?;
+    let pet = super::model::Pet::load_with_codex_home(builtin.id, Some(codex_home))?;
+    let bytes = pet.spritesheet_bytes()?;
+    let dimensions = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()?
+        .into_dimensions()?;
+    if dimensions != (catalog::SPRITESHEET_WIDTH, catalog::SPRITESHEET_HEIGHT) {
+        bail!("invalid cached pet spritesheet dimensions");
+    }
+    // A complete cache in this content namespace proves that this exact source
+    // has already decoded successfully. Cold or corrupt sources must decode.
+    let frames = pet.frame_cache_dir(codex_home, &bytes).join("frames");
+    if super::frames::cached_png_frames(&pet, &frames).is_none() {
+        image::load_from_memory(&bytes).context("decode cached pet spritesheet")?;
+    }
+    Ok(())
 }
 
 fn validate_download_url(value: &str) -> Result<()> {
@@ -164,6 +175,30 @@ pub(crate) fn write_test_pack(codex_home: &Path) {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn downloaded_spritesheet_replacement_is_validated_and_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("pet.webp");
+        catalog::write_test_spritesheet(&destination);
+        let original = fs::read(&destination).unwrap();
+        assert!(install_downloaded_spritesheet(b"corrupt image", &destination).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), original);
+
+        let replacement = image::RgbaImage::from_pixel(
+            catalog::SPRITESHEET_WIDTH,
+            catalog::SPRITESHEET_HEIGHT,
+            image::Rgba([10, 20, 30, 255]),
+        );
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        replacement
+            .write_to(&mut bytes, image::ImageFormat::WebP)
+            .unwrap();
+        install_downloaded_spritesheet(bytes.get_ref(), &destination).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), *bytes.get_ref());
+        assert_eq!(image::open(&destination).unwrap().to_rgba8(), replacement);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn builtin_pet_url_uses_public_cdn_path() {

@@ -2,7 +2,6 @@ use codex_state::Stage1Output;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::Path;
-use tracing::warn;
 use uuid::Uuid;
 
 use crate::ensure_layout;
@@ -100,10 +99,13 @@ async fn prune_rollout_summaries(root: &Path, keep: &HashSet<String>) -> std::io
             && let Err(err) = tokio::fs::remove_file(&path).await
             && err.kind() != std::io::ErrorKind::NotFound
         {
-            warn!(
-                "failed pruning outdated rollout summary {}: {err}",
-                path.display()
-            );
+            return Err(std::io::Error::new(
+                err.kind(),
+                format!(
+                    "failed pruning outdated rollout summary {}: {err}",
+                    path.display()
+                ),
+            ));
         }
     }
 
@@ -167,50 +169,16 @@ fn rollout_summary_file_stem_from_parts(
     rollout_slug: Option<&str>,
 ) -> String {
     const ROLLOUT_SLUG_MAX_LEN: usize = 60;
-    const SHORT_HASH_ALPHABET: &[u8; 62] =
-        b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    const SHORT_HASH_SPACE: u32 = 14_776_336;
-
     let thread_id = thread_id.to_string();
-    let (timestamp_fragment, short_hash_seed) = match Uuid::parse_str(&thread_id) {
-        Ok(thread_uuid) => {
-            let timestamp = thread_uuid
-                .get_timestamp()
-                .and_then(|uuid_timestamp| {
-                    let (seconds, nanos) = uuid_timestamp.to_unix();
-                    i64::try_from(seconds).ok().and_then(|secs| {
-                        chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nanos)
-                    })
-                })
-                .unwrap_or(source_updated_at);
-            let short_hash_seed = (thread_uuid.as_u128() & 0xFFFF_FFFF) as u32;
-            (
-                timestamp.format("%Y-%m-%dT%H-%M-%S").to_string(),
-                short_hash_seed,
-            )
-        }
-        Err(_) => {
-            let mut short_hash_seed = 0u32;
-            for byte in thread_id.bytes() {
-                short_hash_seed = short_hash_seed
-                    .wrapping_mul(31)
-                    .wrapping_add(u32::from(byte));
-            }
-            (
-                source_updated_at.format("%Y-%m-%dT%H-%M-%S").to_string(),
-                short_hash_seed,
-            )
-        }
-    };
-    let mut short_hash_value = short_hash_seed % SHORT_HASH_SPACE;
-    let mut short_hash_chars = ['0'; 4];
-    for idx in (0..short_hash_chars.len()).rev() {
-        let alphabet_idx = (short_hash_value % SHORT_HASH_ALPHABET.len() as u32) as usize;
-        short_hash_chars[idx] = SHORT_HASH_ALPHABET[alphabet_idx] as char;
-        short_hash_value /= SHORT_HASH_ALPHABET.len() as u32;
-    }
-    let short_hash: String = short_hash_chars.iter().collect();
-    let file_prefix = format!("{timestamp_fragment}-{short_hash}");
+    let timestamp = Uuid::parse_str(&thread_id)
+        .ok()
+        .and_then(|uuid| uuid.get_timestamp())
+        .and_then(|timestamp| {
+            let (seconds, nanos) = timestamp.to_unix();
+            chrono::DateTime::<chrono::Utc>::from_timestamp(i64::try_from(seconds).ok()?, nanos)
+        })
+        .unwrap_or(source_updated_at);
+    let file_prefix = format!("{}-{thread_id}", timestamp.format("%Y-%m-%dT%H-%M-%S"));
 
     let Some(raw_slug) = rollout_slug else {
         return file_prefix;

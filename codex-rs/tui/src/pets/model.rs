@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -28,6 +29,9 @@ use super::catalog;
 
 const MAX_PET_FRAMES: usize = 256;
 const MAX_ANIMATION_FPS: f64 = 60.0;
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_ANIMATION_ENTRIES: usize = 16_384;
+const MAX_SPRITESHEET_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct AnimationFrame {
@@ -59,7 +63,6 @@ impl Animation {
 /// means the final frame eventually hands off to `fallback`.
 #[derive(Debug, Clone)]
 pub struct Pet {
-    pub id: String,
     pub display_name: String,
     pub description: String,
     pub spritesheet_path: PathBuf,
@@ -80,12 +83,12 @@ impl Pet {
     /// asset-fetch step, they will get a missing-spritesheet error here on
     /// first use.
     pub(super) fn load_with_codex_home(value: &str, codex_home: Option<&Path>) -> Result<Self> {
-        if path_like(value) {
-            return load_pet_path(value);
-        }
-
         if let Some(custom_id) = value.strip_prefix(CUSTOM_PET_PREFIX) {
             return load_custom_pet(custom_id, codex_home);
+        }
+
+        if path_like(value) {
+            return load_pet_path(value);
         }
 
         if let Some(builtin) = catalog::builtin_pet(value) {
@@ -99,18 +102,42 @@ impl Pet {
         self.frame_count
     }
 
-    pub(super) fn frame_cache_key(&self) -> Result<String> {
-        let bytes = fs::read(&self.spritesheet_path)
-            .with_context(|| format!("read {}", self.spritesheet_path.display()))?;
-        let digest = Sha256::digest(&bytes);
-        Ok(format!(
-            "sha256-{digest:x}-{}x{}-{}x{}",
+    pub(super) fn spritesheet_bytes(&self) -> Result<Vec<u8>> {
+        read_bounded(&self.spritesheet_path, MAX_SPRITESHEET_BYTES)
+    }
+
+    pub(super) fn frame_cache_key(&self, bytes: &[u8]) -> String {
+        let digest = Sha256::digest(bytes);
+        format!(
+            "v2-sha256-{digest:x}-{}x{}-{}x{}",
             self.frame_width, self.frame_height, self.columns, self.rows
-        ))
+        )
+    }
+
+    pub(super) fn frame_cache_dir(&self, codex_home: &Path, bytes: &[u8]) -> PathBuf {
+        // Manifest identities are display data, never filesystem components.
+        codex_home
+            .join("cache")
+            .join("tui-pets")
+            .join("frame-cache")
+            .join(self.frame_cache_key(bytes))
     }
 }
 
 pub(super) const CUSTOM_PET_PREFIX: &str = "custom:";
+
+fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .with_context(|| format!("read {}", path.display()))?
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", path.display()))?;
+    if bytes.len() as u64 > limit {
+        bail!("{} exceeds maximum {limit} bytes", path.display());
+    }
+    Ok(bytes)
+}
 
 #[derive(Debug, Deserialize)]
 struct PetFile {
@@ -169,7 +196,6 @@ fn load_builtin_pet(pet: catalog::BuiltinPet, codex_home: Option<&Path>) -> Resu
     }
 
     Ok(Pet {
-        id: pet.id.to_string(),
         display_name: pet.display_name.to_string(),
         description: pet.description.to_string(),
         spritesheet_path,
@@ -183,20 +209,22 @@ fn load_builtin_pet(pet: catalog::BuiltinPet, codex_home: Option<&Path>) -> Resu
 }
 
 fn load_custom_pet(value: &str, codex_home: Option<&Path>) -> Result<Pet> {
+    let mut components = Path::new(value).components();
+    if !matches!(components.next(), Some(Component::Normal(_)))
+        || components.next().is_some()
+        || value.contains(['/', '\\', ':'])
+    {
+        bail!("custom pet id must be a single normal path component");
+    }
     let codex_home = codex_home.context("CODEX_HOME is not available")?;
     let pet_dir = codex_home.join("pets").join(value);
     if pet_dir.join("pet.json").is_file() {
-        return load_pet_manifest(&pet_dir, "pet.json", value, &custom_pet_cache_id(value));
+        return load_pet_manifest(&pet_dir, "pet.json", value);
     }
 
     let avatar_dir = codex_home.join("avatars").join(value);
     if avatar_dir.join("avatar.json").is_file() {
-        return load_pet_manifest(
-            &avatar_dir,
-            "avatar.json",
-            value,
-            &custom_pet_cache_id(value),
-        );
+        return load_pet_manifest(&avatar_dir, "avatar.json", value);
     }
 
     bail!("unknown pet {value}")
@@ -226,20 +254,18 @@ fn load_pet_path(value: &str) -> Result<Pet> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("pet");
-    load_pet_manifest(&pet_dir, manifest_file, fallback_id, fallback_id)
+    load_pet_manifest(&pet_dir, manifest_file, fallback_id)
 }
 
 fn load_pet_manifest(
     pet_dir: &Path,
     manifest_file: &str,
     fallback_id: &str,
-    cache_id: &str,
 ) -> Result<Pet> {
     let config_path = pet_dir.join(manifest_file);
-    let raw = fs::read_to_string(&config_path)
-        .with_context(|| format!("read {}", config_path.display()))?;
+    let raw = read_bounded(&config_path, MAX_MANIFEST_BYTES)?;
     let file: PetFile =
-        serde_json::from_str(&raw).with_context(|| format!("parse {}", config_path.display()))?;
+        serde_json::from_slice(&raw).with_context(|| format!("parse {}", config_path.display()))?;
 
     let manifest_id = file
         .id
@@ -254,11 +280,6 @@ fn load_pet_manifest(
         .or(manifest_id)
         .unwrap_or(fallback_id)
         .to_string();
-    let pet_id = if cache_id == fallback_id {
-        manifest_id.unwrap_or(fallback_id).to_string()
-    } else {
-        cache_id.to_string()
-    };
     let description = file
         .description
         .map(|description| description.trim().to_string())
@@ -280,7 +301,6 @@ fn load_pet_manifest(
     let frame = file.frame.unwrap_or_default();
     let frame_count = validate_frame_spec(&frame, spritesheet_width, spritesheet_height)?;
     Ok(Pet {
-        id: pet_id,
         display_name,
         description,
         spritesheet_path,
@@ -302,9 +322,12 @@ fn load_pet_manifest(
 fn resolve_spritesheet_path(pet_dir: &Path, spritesheet_path: &str) -> Result<PathBuf> {
     let path = Path::new(spritesheet_path);
     if path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
     {
         bail!("spritesheet path must stay inside {}", pet_dir.display());
     }
@@ -358,10 +381,6 @@ fn validate_frame_spec(
     Ok(frame_count)
 }
 
-fn custom_pet_cache_id(id: &str) -> String {
-    format!("custom-{id}")
-}
-
 fn path_like(value: &str) -> bool {
     value == "."
         || value == ".."
@@ -389,6 +408,12 @@ fn load_animations(
     specs: HashMap<String, AnimationSpec>,
     frame_count: usize,
 ) -> Result<HashMap<String, Animation>> {
+    let entries = specs.values().try_fold(0usize, |total, spec| {
+        total.checked_add(spec.frames.len().max(1))
+    });
+    if entries.is_none_or(|total| total > MAX_ANIMATION_ENTRIES) {
+        bail!("pet animation entries exceed maximum {MAX_ANIMATION_ENTRIES}");
+    }
     let mut animations = default_animations();
     if specs.is_empty() {
         validate_animation_indices(&animations, frame_count)?;
@@ -416,7 +441,11 @@ fn load_animations(
             }
             None => 8.0,
         };
-        let duration = Duration::from_secs_f64(1.0 / fps);
+        let duration = Duration::try_from_secs_f64(1.0 / fps)
+            .with_context(|| format!("animation {name} frame duration is out of range"))?;
+        duration
+            .checked_mul(spec.frames.len() as u32)
+            .with_context(|| format!("animation {name} total duration is out of range"))?;
         let fallback = if spec.fallback.is_empty() {
             "idle".to_string()
         } else {
@@ -657,6 +686,82 @@ mod tests {
     }
 
     #[test]
+    fn custom_selectors_reject_path_components() {
+        let home = tempfile::tempdir().unwrap();
+        for selector in [
+            "custom:",
+            "custom:..",
+            "custom:../outside",
+            "custom:foo/bar",
+            "custom:foo\\bar",
+            "custom:C:outside",
+            "custom:/outside",
+        ] {
+            let error = Pet::load_with_codex_home(selector, Some(home.path())).unwrap_err();
+            assert!(
+                error.to_string().contains("single normal path component"),
+                "{selector}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_identity_cannot_escape_frame_cache() {
+        let dir =
+            write_pet_manifest(r#"{"id":"../../outside", "spritesheetPath":"spritesheet.webp"}"#);
+        let pet = load_pet_from_dir(&dir);
+        let home = tempfile::tempdir().unwrap();
+        let cache = pet.frame_cache_dir(home.path(), &pet.spritesheet_bytes().unwrap());
+        let relative = cache
+            .strip_prefix(home.path().join("cache/tui-pets/frame-cache"))
+            .unwrap();
+        assert_eq!(relative.components().count(), 1);
+        assert!(matches!(
+            relative.components().next(),
+            Some(Component::Normal(_))
+        ));
+        assert!(!cache.to_string_lossy().contains("outside"));
+    }
+
+    #[test]
+    fn rejects_unrepresentable_animation_durations_and_entry_budgets() {
+        let dir = write_minimal_pet();
+        for (spec, expected) in [
+            (
+                serde_json::json!({"frames":[0],"fps":1e-300}),
+                "frame duration is out of range",
+            ),
+            (
+                serde_json::json!({"frames":[0,0],"fps":1e-19}),
+                "total duration is out of range",
+            ),
+            (
+                serde_json::json!({"frames":vec![0; MAX_ANIMATION_ENTRIES + 1]}),
+                "animation entries exceed maximum",
+            ),
+        ] {
+            fs::write(dir.path().join("pet.json"), serde_json::json!({"spritesheetPath":"spritesheet.webp","animations":{"idle":spec}}).to_string()).unwrap();
+            let error = load_pet_error_from_dir(&dir);
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_manifest_before_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("pet.json"),
+            vec![b' '; MAX_MANIFEST_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(
+            load_pet_error_from_dir(&dir)
+                .to_string()
+                .contains("exceeds maximum")
+        );
+    }
+
+    #[test]
     fn load_builtin_pet_uses_app_catalog_storage() {
         let codex_home = tempfile::tempdir().unwrap();
         super::super::asset_pack::write_test_pack(codex_home.path());
@@ -664,7 +769,6 @@ mod tests {
         let pet =
             Pet::load_with_codex_home("dewey", /*codex_home*/ Some(codex_home.path())).unwrap();
 
-        assert_eq!(pet.id, "dewey");
         assert_eq!(pet.display_name, "Dewey");
         assert_eq!(pet.description, "A tidy duck for calm workspace days");
         assert_eq!(
@@ -754,7 +858,6 @@ mod tests {
 
         let pet = load_pet_from_dir(&dir);
 
-        assert_eq!(pet.id, "chefito");
         assert_eq!(pet.display_name, "Chefito");
         assert_eq!(pet.frame_width, 192);
         assert_eq!(pet.frame_height, 208);
@@ -769,7 +872,7 @@ mod tests {
         let dir = write_minimal_pet();
         let spritesheet_path = dir.path().join("spritesheet.webp");
         let pet = load_pet_from_dir(&dir);
-        let first_key = pet.frame_cache_key().unwrap();
+        let first_key = pet.frame_cache_key(&pet.spritesheet_bytes().unwrap());
 
         let image = image::RgbaImage::from_pixel(
             catalog::SPRITESHEET_WIDTH,
@@ -779,7 +882,10 @@ mod tests {
         image.save(&spritesheet_path).unwrap();
         let pet = load_pet_from_dir(&dir);
 
-        assert_ne!(pet.frame_cache_key().unwrap(), first_key);
+        assert_ne!(
+            pet.frame_cache_key(&pet.spritesheet_bytes().unwrap()),
+            first_key
+        );
     }
 
     #[test]
@@ -796,8 +902,8 @@ mod tests {
         let custom_pet = load_pet_from_dir(&custom_dir);
 
         assert_ne!(
-            custom_pet.frame_cache_key().unwrap(),
-            default_pet.frame_cache_key().unwrap()
+            custom_pet.frame_cache_key(&custom_pet.spritesheet_bytes().unwrap()),
+            default_pet.frame_cache_key(&default_pet.spritesheet_bytes().unwrap())
         );
     }
 
@@ -834,7 +940,6 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(pet.id, "custom-chefito");
         assert_eq!(pet.spritesheet_path, pet_dir.join("spritesheet.webp"),);
     }
 
@@ -857,8 +962,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(pet.id, "custom-legacy");
         assert_eq!(pet.display_name, "Chefito");
+        assert_eq!(pet.spritesheet_path, avatar_dir.join("spritesheet.webp"));
     }
 
     #[test]

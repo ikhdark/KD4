@@ -13,7 +13,6 @@ use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::default_namespace_description;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::Value;
 
 use crate::MEMORY_TOOLS_NAMESPACE;
 use crate::backend::MemoriesBackendError;
@@ -76,13 +75,13 @@ pub(super) fn memory_function_tool<I: JsonSchema, O: JsonSchema>(
 
 fn parse_args<T: for<'de> Deserialize<'de>>(call: &ToolCall) -> Result<T, FunctionCallError> {
     let arguments = call.function_arguments()?;
-    let value = if arguments.trim().is_empty() {
-        Value::Object(serde_json::Map::new())
+    let input = if arguments.trim().is_empty() {
+        "{}"
     } else {
-        serde_json::from_str(arguments)
-            .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?
+        arguments
     };
-    serde_json::from_value(value).map_err(|err| FunctionCallError::RespondToModel(err.to_string()))
+    // Typed deserialization rejects ambiguous duplicate fields as malformed input.
+    serde_json::from_str(input).map_err(|err| FunctionCallError::RespondToModel(err.to_string()))
 }
 
 fn clamp_max_results(requested: Option<usize>, default: usize, max: usize) -> usize {

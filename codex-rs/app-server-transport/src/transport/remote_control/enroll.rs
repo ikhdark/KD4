@@ -20,6 +20,7 @@ use tracing::warn;
 
 const REMOTE_CONTROL_PAIRING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const REMOTE_CONTROL_RESPONSE_BODY_MAX_BYTES: usize = 4096;
+const REMOTE_CONTROL_RESPONSE_READ_MAX_BYTES: usize = 1024 * 1024;
 const REMOTE_CONTROL_SERVER_TOKEN_REFRESH_SKEW_SECS: i64 = 5 * 60;
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -46,6 +47,22 @@ pub(super) enum RemoteControlServerTokenRefreshRequirement {
 }
 
 impl RemoteControlEnrollment {
+    pub(super) fn from_persisted(
+        target: &RemoteControlTarget,
+        record: RemoteControlEnrollmentRecord,
+    ) -> Self {
+        Self {
+            remote_control_target: target.clone(),
+            account_id: record.account_id,
+            environment_id: record.environment_id,
+            server_id: record.server_id,
+            server_name: record.server_name,
+            remote_control_token: None,
+            expires_at: None,
+            next_refresh_at: None,
+        }
+    }
+
     #[cfg(test)]
     pub(super) async fn start_pairing(
         &self,
@@ -85,13 +102,15 @@ impl RemoteControlEnrollment {
             })?;
         let headers = response.headers().clone();
         let status = response.status();
-        let body = response.bytes().await.map_err(|err| {
-            io::Error::other(format!(
-                "failed to read remote control pairing response from `{}`: {err}",
-                self.remote_control_target.pair_url
-            ))
-        })?;
-        let body_preview = preview_remote_control_response_body(&body);
+        let body = read_remote_control_response_body(response)
+            .await
+            .map_err(|err| {
+                io::Error::other(format!(
+                    "failed to read remote control pairing response from `{}`: {err}",
+                    self.remote_control_target.pair_url
+                ))
+            })?;
+        let body_preview = || preview_remote_control_response_body(&body);
         if !status.is_success() {
             let error_kind = match status.as_u16() {
                 401 | 403 => ErrorKind::PermissionDenied,
@@ -101,19 +120,22 @@ impl RemoteControlEnrollment {
             return Err(io::Error::new(
                 error_kind,
                 format!(
-                    "remote control pairing failed at `{}`: HTTP {status}, {}, body: {body_preview}",
+                    "remote control pairing failed at `{}`: HTTP {status}, {}, body: {}",
                     self.remote_control_target.pair_url,
-                    format_headers(&headers)
+                    format_headers(&headers),
+                    body_preview()
                 ),
             ));
         }
 
         let pairing = serde_json::from_slice::<StartRemoteControlPairingResponse>(&body).map_err(
             |err| {
+                let err = format_remote_control_decode_error(&err);
                 io::Error::other(format!(
-                    "failed to parse remote control pairing response from `{}`: HTTP {status}, {}, body: {body_preview}, decode error: {err}",
+                    "failed to parse remote control pairing response from `{}`: HTTP {status}, {}, body: {}, decode error: {err}",
                     self.remote_control_target.pair_url,
-                    format_headers(&headers)
+                    format_headers(&headers),
+                    body_preview()
                 ))
             },
         )?;
@@ -135,9 +157,10 @@ impl RemoteControlEnrollment {
                 io::Error::new(
                     ErrorKind::InvalidData,
                     format!(
-                        "failed to parse remote control pairing response from `{}`: HTTP {status}, {}, body: {body_preview}, expires_at parse error: {err}",
+                        "failed to parse remote control pairing response from `{}`: HTTP {status}, {}, body: {}, expires_at parse error: {err}",
                         self.remote_control_target.pair_url,
-                        format_headers(&headers)
+                        format_headers(&headers),
+                        body_preview()
                     ),
                 )
             })?
@@ -190,13 +213,15 @@ impl RemoteControlEnrollment {
             })?;
         let headers = response.headers().clone();
         let status = response.status();
-        let body = response.bytes().await.map_err(|err| {
-            io::Error::other(format!(
-                "failed to read remote control pairing status response from `{}`: {err}",
-                self.remote_control_target.pair_status_url
-            ))
-        })?;
-        let body_preview = preview_remote_control_response_body(&body);
+        let body = read_remote_control_response_body(response)
+            .await
+            .map_err(|err| {
+                io::Error::other(format!(
+                    "failed to read remote control pairing status response from `{}`: {err}",
+                    self.remote_control_target.pair_status_url
+                ))
+            })?;
+        let body_preview = || preview_remote_control_response_body(&body);
         if !status.is_success() {
             let error_kind = match status.as_u16() {
                 401 | 403 => ErrorKind::PermissionDenied,
@@ -206,19 +231,22 @@ impl RemoteControlEnrollment {
             return Err(io::Error::new(
                 error_kind,
                 format!(
-                    "remote control pairing status failed at `{}`: HTTP {status}, {}, body: {body_preview}",
+                    "remote control pairing status failed at `{}`: HTTP {status}, {}, body: {}",
                     self.remote_control_target.pair_status_url,
-                    format_headers(&headers)
+                    format_headers(&headers),
+                    body_preview()
                 ),
             ));
         }
 
         let response = serde_json::from_slice::<RemoteControlPairingStatusResponse>(&body)
             .map_err(|err| {
+                let err = format_remote_control_decode_error(&err);
                 io::Error::other(format!(
-                    "failed to parse remote control pairing status response from `{}`: HTTP {status}, {}, body: {body_preview}, decode error: {err}",
+                    "failed to parse remote control pairing status response from `{}`: HTTP {status}, {}, body: {}, decode error: {err}",
                     self.remote_control_target.pair_status_url,
-                    format_headers(&headers)
+                    format_headers(&headers),
+                    body_preview()
                 ))
             })?;
         Ok(response)
@@ -304,16 +332,10 @@ pub(super) async fn load_persisted_remote_control_enrollment(
                 enrollment.server_id,
                 enrollment.environment_id
             );
-            Ok(Some(RemoteControlEnrollment {
-                remote_control_target: remote_control_target.clone(),
-                account_id: enrollment.account_id,
-                environment_id: enrollment.environment_id,
-                server_id: enrollment.server_id,
-                server_name: enrollment.server_name,
-                remote_control_token: None,
-                expires_at: None,
-                next_refresh_at: None,
-            }))
+            Ok(Some(RemoteControlEnrollment::from_persisted(
+                remote_control_target,
+                enrollment,
+            )))
         }
         None => {
             info!(
@@ -392,6 +414,41 @@ pub(super) async fn update_persisted_remote_control_enrollment(
     }
 }
 
+pub(super) async fn read_remote_control_response_body(
+    mut response: codex_http_client::HttpResponse,
+) -> io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|err| {
+        io::Error::new(
+            if err.is_timeout() {
+                ErrorKind::TimedOut
+            } else {
+                ErrorKind::Other
+            },
+            err,
+        )
+    })? {
+        if chunk.len() > REMOTE_CONTROL_RESPONSE_READ_MAX_BYTES - body.len() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "remote control response exceeds 1 MiB limit",
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+pub(super) fn format_remote_control_decode_error(err: &serde_json::Error) -> String {
+    // Serde's display text can echo a credential supplied as an unexpected value.
+    format!(
+        "{:?} at line {} column {}",
+        err.classify(),
+        err.line(),
+        err.column()
+    )
+}
+
 pub(crate) fn preview_remote_control_response_body(body: &[u8]) -> String {
     let body = String::from_utf8_lossy(body);
     let trimmed = body.trim();
@@ -414,20 +471,34 @@ pub(crate) fn preview_remote_control_response_body(body: &[u8]) -> String {
 
 fn redact_remote_control_response_body(body: &str) -> String {
     let Ok(mut body_json) = serde_json::from_str::<serde_json::Value>(body) else {
-        return body.to_string();
+        return "<omitted non-JSON response body>".to_string();
     };
-    let Some(body_object) = body_json.as_object_mut() else {
-        return body.to_string();
-    };
-    for sensitive_field in [
-        "remote_control_token",
-        "pairing_code",
-        "manual_pairing_code",
-    ] {
-        if let Some(value) = body_object.get_mut(sensitive_field) {
-            *value = serde_json::Value::String("<redacted>".to_string());
+    fn redact(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, value) in object {
+                    if matches!(
+                        key.as_str(),
+                        "remote_control_token" | "pairing_code" | "manual_pairing_code"
+                    ) {
+                        *value = serde_json::Value::String("<redacted>".to_string());
+                    } else {
+                        redact(value);
+                    }
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    redact(value);
+                }
+            }
+            _ => {}
         }
     }
+    if !body_json.is_object() && !body_json.is_array() {
+        return "<omitted scalar response body>".to_string();
+    }
+    redact(&mut body_json);
     body_json.to_string()
 }
 
@@ -489,6 +560,32 @@ mod tests {
                 "remote_control_token": "<redacted>",
                 "pairing_code": "<redacted>",
                 "manual_pairing_code": "<redacted>",
+            })
+        );
+    }
+
+    #[test]
+    fn response_preview_omits_malformed_and_scalar_credentials() {
+        for body in [
+            br#"{"remote_control_token":"secret","#.as_slice(),
+            br#""secret""#,
+            b"secret",
+        ] {
+            let preview = preview_remote_control_response_body(body);
+            assert!(preview.starts_with("<omitted"));
+            assert!(!preview.contains("secret"));
+        }
+    }
+
+    #[test]
+    fn response_preview_redacts_nested_credentials() {
+        let preview = preview_remote_control_response_body(br#"{"error":{"remote_control_token":"secret"},"items":[{"pairing_code":"secret","manual_pairing_code":"secret"}],"detail":"failed"}"#);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&preview).expect("valid JSON"),
+            json!({
+                "error": {"remote_control_token": "<redacted>"},
+                "items": [{"pairing_code": "<redacted>", "manual_pairing_code": "<redacted>"}],
+                "detail": "failed"
             })
         );
     }
@@ -706,36 +803,48 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "failed to parse remote control server enrollment response from `{enroll_url}`: HTTP 200 OK, request-id: <none>, cf-ray: <none>, body: {expected_body}, decode error: missing field `remote_control_token` at line 1 column {}",
+                "failed to parse remote control server enrollment response from `{enroll_url}`: HTTP 200 OK, request-id: <none>, cf-ray: <none>, body: {expected_body}, decode error: Data at line 1 column {}",
                 expected_body.len()
             )
         );
     }
 
     async fn accept_http_request(listener: &TcpListener) -> TcpStream {
-        let (stream, _) = timeout(Duration::from_secs(5), listener.accept())
-            .await
-            .expect("HTTP request should arrive in time")
-            .expect("listener accept should succeed");
-        let mut reader = BufReader::new(stream);
-
-        let mut request_line = String::new();
-        reader
-            .read_line(&mut request_line)
-            .await
-            .expect("request line should read");
-        loop {
-            let mut line = String::new();
-            reader
-                .read_line(&mut line)
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (stream, _) = timeout(Duration::from_secs(5), listener.accept())
                 .await
-                .expect("header line should read");
-            if line == "\r\n" {
-                break;
-            }
-        }
+                .expect("HTTP request should arrive in time")
+                .expect("listener accept should succeed");
+            let mut reader = BufReader::new(stream);
 
-        reader.into_inner()
+            let mut request_line = String::new();
+            assert_ne!(
+                reader
+                    .read_line(&mut request_line)
+                    .await
+                    .expect("request line should read"),
+                0,
+                "unexpected EOF reading HTTP request"
+            );
+            loop {
+                let mut line = String::new();
+                assert_ne!(
+                    reader
+                        .read_line(&mut line)
+                        .await
+                        .expect("header line should read"),
+                    0,
+                    "unexpected EOF reading HTTP request"
+                );
+                if line == "\r\n" {
+                    break;
+                }
+            }
+
+            reader.into_inner()
+        })
+        .await
+        .expect("test exchange should finish in time")
     }
 
     async fn respond_with_json(mut stream: TcpStream, body: serde_json::Value) {

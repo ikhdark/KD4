@@ -60,6 +60,24 @@ impl FileSystemSandboxRunner {
         sandbox: &FileSystemSandboxContext,
         request: FsHelperRequest,
     ) -> Result<FsHelperPayload, JSONRPCErrorError> {
+        let runner = self.clone();
+        let sandbox = sandbox.clone();
+        let (command, request_json) = tokio::task::spawn_blocking(move || {
+            let command = runner.prepare_command(&sandbox)?;
+            let request_json = serde_json::to_vec(&request).map_err(json_error)?;
+            Ok::<_, JSONRPCErrorError>((command, request_json))
+        })
+        .await
+        .map_err(|error| {
+            internal_error(format!("fs sandbox preparation task failed: {error}"))
+        })??;
+        run_command(command, request_json).await
+    }
+
+    fn prepare_command(
+        &self,
+        sandbox: &FileSystemSandboxContext,
+    ) -> Result<SandboxExecRequest, JSONRPCErrorError> {
         let cwd = sandbox_cwd(sandbox)?;
         let native_permissions: PermissionProfile =
             sandbox.permissions.clone().try_into().map_err(|err| {
@@ -79,9 +97,7 @@ impl FileSystemSandboxRunner {
             &file_system_policy,
             network_policy,
         );
-        let command = self.sandbox_exec_request(&permission_profile, &cwd, sandbox)?;
-        let request_json = serde_json::to_vec(&request).map_err(json_error)?;
-        run_command(command, request_json).await
+        self.sandbox_exec_request(&permission_profile, &cwd, sandbox)
     }
 
     fn sandbox_exec_request(
@@ -281,6 +297,7 @@ async fn run_command(
         .take()
         .ok_or_else(|| internal_error("failed to open fs sandbox helper stdin".to_string()))?;
     stdin.write_all(&request_json).await.map_err(io_error)?;
+    drop(request_json);
     stdin.shutdown().await.map_err(io_error)?;
     drop(stdin);
 
@@ -360,7 +377,6 @@ mod tests {
     use super::add_helper_runtime_permissions;
     use super::helper_env;
     use super::helper_env_from_vars;
-    use super::helper_env_key_is_allowed;
     use super::helper_read_roots;
     use super::sandbox_cwd;
 
@@ -425,7 +441,7 @@ mod tests {
         let expected = std::env::vars_os()
             .filter_map(|(key, value)| {
                 let key = key.to_string_lossy();
-                helper_env_key_is_allowed(&key)
+                (key.eq_ignore_ascii_case("PATH") || key == "TMP" || key == "TEMP")
                     .then(|| (key.into_owned(), value.to_string_lossy().into_owned()))
             })
             .collect::<HashMap<_, _>>();
@@ -476,17 +492,12 @@ mod tests {
 
     #[test]
     fn sandbox_exec_request_carries_helper_env() {
-        let Some((path_key, path)) = std::env::vars_os().find(|(key, _)| {
-            let key = key.to_string_lossy();
-            key.eq_ignore_ascii_case("PATH")
-        }) else {
-            return;
-        };
-        let path_key = path_key.to_string_lossy().into_owned();
-        let path = path.to_string_lossy().into_owned();
+        let path_key = "Path".to_string();
+        let path = r"C:\Windows\System32".to_string();
         let codex_self_exe = std::env::current_exe().expect("current exe");
         let runtime_paths = ExecServerRuntimePaths::new(codex_self_exe).expect("runtime paths");
-        let runner = FileSystemSandboxRunner::new(runtime_paths);
+        let mut runner = FileSystemSandboxRunner::new(runtime_paths);
+        runner.helper_env = HashMap::from([(path_key.clone(), path.clone())]);
         let native_cwd = AbsolutePathBuf::current_dir().expect("cwd");
         let cwd = PathUri::from_abs_path(&native_cwd);
         let file_system_policy = restricted_policy(vec![path_entry(
@@ -567,6 +578,32 @@ mod tests {
             err.message,
             "file system sandbox context with dynamic permissions requires cwd"
         );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (occupied_tx, occupied_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                occupied_tx.send(()).expect("blocking worker occupied");
+                release_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("release worker");
+            });
+            occupied_rx.await.expect("worker started");
+            let runtime_paths = ExecServerRuntimePaths::new(std::env::current_exe().expect("exe")).expect("runtime paths");
+            let runner = FileSystemSandboxRunner::new(runtime_paths);
+            let request = serde_json::from_value(serde_json::json!({
+                "operation": "fs/getMetadata",
+                "params": { "path": PathUri::from_abs_path(&AbsolutePathBuf::current_dir().expect("cwd")) }
+            })).expect("helper request");
+            let mut run = Box::pin(runner.run(&sandbox_context, request));
+            assert!(futures::poll!(run.as_mut()).is_pending(), "preparation must yield to the blocking pool");
+            release_tx.send(()).expect("release preparation");
+            assert_eq!(run.await.expect_err("missing cwd"), err);
+            blocker.await.expect("worker finished");
+        });
     }
 
     #[test]

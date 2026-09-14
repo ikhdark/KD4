@@ -24,14 +24,17 @@ fn main() -> Result<()> {
         bail!("expected payload as final argument");
     }
 
-    let payload = payload.to_string_lossy();
-    let temp_path = PathBuf::from(format!("{}.tmp", output_path.display()));
+    let payload = payload
+        .into_string()
+        .map_err(|_| anyhow!("payload must be valid UTF-8"))?;
+    let mut temp_name = output_path.as_os_str().to_os_string();
+    temp_name.push(".tmp");
+    let temp_path = PathBuf::from(temp_name);
     let mut file = File::create(&temp_path)
         .with_context(|| format!("failed to create {}", temp_path.display()))?;
     file.write_all(payload.as_bytes())
         .with_context(|| format!("failed to write {}", temp_path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to sync {}", temp_path.display()))?;
+    drop(file);
     fs::rename(&temp_path, &output_path).with_context(|| {
         format!(
             "failed to move {} into {}",

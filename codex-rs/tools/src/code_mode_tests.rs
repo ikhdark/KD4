@@ -147,26 +147,22 @@ fn collect_code_mode_tool_definitions_disambiguates_flattened_name_collisions() 
 
     let definitions = collect_code_mode_tool_definitions(&specs);
 
-    assert_eq!(definitions.len(), 2);
-    assert_ne!(
-        codex_code_mode::normalize_code_mode_identifier(&definitions[0].name),
-        codex_code_mode::normalize_code_mode_identifier(&definitions[1].name)
-    );
-    assert!(definitions.iter().any(|tool| tool.name == "acme__lookup"));
-    assert!(
+    assert_eq!(
         definitions
             .iter()
-            .any(|tool| tool.name.starts_with("acme__lookup__"))
+            .map(|tool| (tool.name.as_str(), tool.tool_name.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("acme__lookup", ToolName::plain("acme__lookup")),
+            (
+                "acme__lookup__namespaced",
+                ToolName::namespaced("acme", "lookup")
+            ),
+        ]
     );
-    assert!(
-        definitions
-            .iter()
-            .any(|tool| tool.tool_name == ToolName::plain("acme__lookup"))
-    );
-    assert!(
-        definitions
-            .iter()
-            .any(|tool| tool.tool_name == ToolName::namespaced("acme", "lookup"))
+    assert_eq!(
+        definitions,
+        collect_code_mode_tool_definitions(specs.iter().rev())
     );
     assert!(
         definitions
@@ -234,5 +230,67 @@ fn tool_spec_to_code_mode_tool_definition_still_skips_web_search() {
             search_content_types: None,
         }),
         None,
+    );
+}
+
+#[test]
+fn singular_code_mode_conversion_rejects_multiple_namespace_children() {
+    let spec = ToolSpec::Namespace(ResponsesApiNamespace {
+        name: "acme".to_string(),
+        description: "Acme tools".to_string(),
+        tools: ["first", "second"]
+            .into_iter()
+            .map(|name| {
+                ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+                    name: name.to_string(),
+                    description: name.to_string(),
+                    strict: false,
+                    defer_loading: None,
+                    parameters: JsonSchema::default(),
+                    output_schema: None,
+                })
+            })
+            .collect(),
+    });
+    assert_eq!(tool_spec_to_code_mode_tool_definition(&spec), None);
+    let definitions = collect_code_mode_tool_definitions([&spec]);
+    assert_eq!(
+        definitions
+            .iter()
+            .map(|tool| tool.tool_name.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            ToolName::namespaced("acme", "first"),
+            ToolName::namespaced("acme", "second")
+        ]
+    );
+}
+
+#[test]
+fn code_mode_aliases_disambiguate_identifier_normalization_collisions() {
+    let specs = ["read-file", "read_file"].map(|name| {
+        ToolSpec::Function(ResponsesApiTool {
+            name: name.to_string(),
+            description: name.to_string(),
+            strict: false,
+            defer_loading: None,
+            parameters: JsonSchema::default(),
+            output_schema: None,
+        })
+    });
+    let definitions = collect_code_mode_tool_definitions(&specs);
+    assert_eq!(
+        definitions
+            .iter()
+            .map(|tool| (tool.name.as_str(), tool.tool_name.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("read-file", ToolName::plain("read-file")),
+            ("read_file__plain", ToolName::plain("read_file")),
+        ]
+    );
+    assert_eq!(
+        definitions,
+        collect_code_mode_tool_definitions(specs.iter().rev())
     );
 }

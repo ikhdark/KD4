@@ -9,8 +9,10 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use tempfile::NamedTempFile;
 use toml::Value as TomlValue;
 
 const SOURCE_EXTERNAL_AGENT_NAME: &str = "claude";
@@ -117,15 +119,22 @@ pub fn import_hooks(source_external_agent_dir: &Path, target_hooks: &Path) -> io
 
     fs::create_dir_all(parent)?;
 
+    let _lock = codex_file_system::acquire_atomic_write_lock(target_hooks)?;
     let mut wrote_active_hooks = false;
     if is_missing_or_empty_text_file(target_hooks)? {
+        let target_was_missing = !target_hooks.exists();
         copy_hook_scripts(source_external_agent_dir, parent)?;
         let mut payload = serde_json::Map::new();
         payload.insert("hooks".to_string(), JsonValue::Object(migration));
         let rendered = serde_json::to_string_pretty(&JsonValue::Object(payload))
             .map_err(|err| invalid_data_error(format!("failed to serialize hooks.json: {err}")))?;
-        fs::write(target_hooks, format!("{rendered}\n"))?;
-        wrote_active_hooks = true;
+        let rendered = format!("{rendered}\n");
+        wrote_active_hooks = if target_was_missing {
+            publish_new_file(target_hooks, rendered.as_bytes(), None)?
+        } else {
+            codex_file_system::write_atomically(target_hooks, &rendered)?;
+            true
+        };
     }
 
     Ok(wrote_active_hooks)
@@ -173,8 +182,13 @@ pub fn import_subagents(source_agents: &Path, target_agents: &Path) -> io::Resul
         let Some(metadata) = agent_metadata(&document) else {
             continue;
         };
-        fs::write(&target, render_agent_toml(&document.body, &metadata)?)?;
-        imported.push(metadata.name);
+        if publish_new_file(
+            &target,
+            render_agent_toml(&document.body, &metadata)?.as_bytes(),
+            None,
+        )? {
+            imported.push(metadata.name);
+        }
     }
 
     Ok(imported)
@@ -190,8 +204,8 @@ pub fn missing_command_names(
 ) -> io::Result<Vec<String>> {
     Ok(unique_supported_command_sources(source_commands)?
         .into_iter()
-        .filter(|(_source_file, name)| !target_skills.join(name).exists())
-        .map(|(_source_file, name)| name)
+        .filter(|(_, name, _)| !target_skills.join(name).join("SKILL.md").exists())
+        .map(|(_, name, _)| name)
         .collect())
 }
 
@@ -202,22 +216,20 @@ pub fn import_commands(source_commands: &Path, target_skills: &Path) -> io::Resu
 
     fs::create_dir_all(target_skills)?;
     let mut imported = Vec::new();
-    for (source_file, name) in unique_supported_command_sources(source_commands)? {
-        let document = parse_document(&source_file)?;
+    for (source_file, name, document) in unique_supported_command_sources(source_commands)? {
         let target_dir = target_skills.join(&name);
-        if target_dir.exists() {
+        if target_dir.join("SKILL.md").exists() {
             continue;
         }
-        fs::create_dir_all(&target_dir)?;
         let source_name = command_source_name(source_commands, &source_file);
         let Some(description) = command_skill_description(&document, &source_name) else {
             continue;
         };
-        fs::write(
-            target_dir.join("SKILL.md"),
-            render_command_skill(&document.body, &name, &description, &source_name),
-        )?;
-        imported.push(name);
+        let rendered = render_command_skill(&document.body, &name, &description, &source_name);
+        fs::create_dir_all(&target_dir)?;
+        if publish_new_file(&target_dir.join("SKILL.md"), rendered.as_bytes(), None)? {
+            imported.push(name);
+        }
     }
 
     Ok(imported)
@@ -483,10 +495,7 @@ fn append_env_config(
 }
 
 fn parse_env_placeholder(value: &str) -> Option<String> {
-    let inner = value.strip_prefix("${")?.strip_suffix('}')?;
-    let name = inner
-        .split_once(":-")
-        .map_or(inner, |(name, _default)| name);
+    let name = value.strip_prefix("${")?.strip_suffix('}')?;
     let mut chars = name.chars();
     let first = chars.next()?;
     if !(first == '_' || first.is_ascii_alphabetic()) {
@@ -528,7 +537,12 @@ fn hook_migration(
 
     let mut migration = serde_json::Map::new();
     for settings in settings_files {
-        append_convertible_hook_groups(&settings, &mut migration, target_config_dir);
+        append_convertible_hook_groups(
+            &settings,
+            &mut migration,
+            target_config_dir,
+            source_external_agent_dir,
+        );
     }
 
     Ok(migration)
@@ -538,6 +552,7 @@ fn append_convertible_hook_groups(
     settings: &JsonValue,
     hooks_payload: &mut serde_json::Map<String, JsonValue>,
     target_config_dir: Option<&Path>,
+    source_external_agent_dir: &Path,
 ) {
     let Some(hooks_config) = settings.get("hooks").and_then(JsonValue::as_object) else {
         return;
@@ -606,13 +621,15 @@ fn append_convertible_hook_groups(
                         continue;
                     };
 
+                    let Some(command) =
+                        rewrite_hook_command(command, target_config_dir, source_external_agent_dir)
+                    else {
+                        continue;
+                    };
                     let mut command_payload = serde_json::Map::new();
                     command_payload
                         .insert("type".to_string(), JsonValue::String("command".to_string()));
-                    command_payload.insert(
-                        "command".to_string(),
-                        JsonValue::String(rewrite_hook_command(command, target_config_dir)),
-                    );
+                    command_payload.insert("command".to_string(), JsonValue::String(command));
                     if let Some(timeout) = hook_object
                         .get("timeout")
                         .or_else(|| hook_object.get("timeoutSec"))
@@ -659,190 +676,105 @@ fn append_convertible_hook_groups(
     }
 }
 
-fn rewrite_hook_command(command: &str, target_config_dir: Option<&Path>) -> String {
+// Relocate only complete static path tokens. Ambiguous source references cannot
+// safely be activated against a different hook tree.
+fn rewrite_hook_command(
+    command: &str,
+    target_config_dir: Option<&Path>,
+    source_external_agent_dir: &Path,
+) -> Option<String> {
     let Some(target_config_dir) = target_config_dir else {
-        return command.to_string();
+        return Some(command.to_string());
     };
     if looks_like_windows_hook_command(command) {
-        return command.to_string();
+        return None;
     }
-    let target_hooks_dir = target_config_dir.join(EXTERNAL_AGENT_MIGRATED_HOOKS_SUBDIR);
-    let source_hooks_path = format!(
+    let relative_root = format!(
         "{}/{EXTERNAL_AGENT_HOOKS_SUBDIR}/",
         external_agent_config_dir()
     );
-    let command = replace_quoted_hook_paths(command, '\'', &source_hooks_path, &target_hooks_dir);
-    let command = replace_quoted_hook_paths(&command, '"', &source_hooks_path, &target_hooks_dir);
-    replace_unquoted_hook_paths(&command, &source_hooks_path, &target_hooks_dir)
-}
-
-fn replace_quoted_hook_paths(
-    command: &str,
-    quote: char,
-    source_hooks_path: &str,
-    target_hooks_dir: &Path,
-) -> String {
-    let mut rewritten = command.to_string();
-    let mut search_start = 0usize;
-    while let Some(relative_start) = rewritten[search_start..].find(quote) {
-        let start = search_start + relative_start;
-        let content_start = start + quote.len_utf8();
-        let Some(relative_end) = rewritten[content_start..].find(quote) else {
-            break;
-        };
-        let end = content_start + relative_end;
-        let content = &rewritten[content_start..end];
-        if let Some(source_hooks_start) = content.find(source_hooks_path) {
-            let suffix_start = source_hooks_start + source_hooks_path.len();
-            let suffix = &content[suffix_start..];
-            let Some(replacement) =
-                target_hook_path_replacement(target_hooks_dir, content, source_hooks_start, suffix)
-            else {
-                search_start = end + quote.len_utf8();
-                continue;
-            };
-            rewritten.replace_range(start..end + quote.len_utf8(), &replacement);
-            search_start = start + replacement.len();
-        } else {
-            search_start = end + quote.len_utf8();
-        }
-    }
-    rewritten
-}
-
-fn replace_unquoted_hook_paths(
-    command: &str,
-    source_hooks_path: &str,
-    target_hooks_dir: &Path,
-) -> String {
-    let mut rewritten = command.to_string();
-    let mut search_start = 0usize;
-    while let Some(source_hooks_start) =
-        find_unquoted_source_hook_path(&rewritten, source_hooks_path, search_start)
-    {
-        let path_start = shell_path_start(&rewritten, source_hooks_start);
-        let path_end = shell_path_end(&rewritten, source_hooks_start + source_hooks_path.len());
-        if is_assignment_value_start(&rewritten, path_start) {
-            search_start = source_hooks_start + source_hooks_path.len();
-            continue;
-        }
-        let path = rewritten[path_start..path_end].to_string();
-        let suffix = rewritten[source_hooks_start + source_hooks_path.len()..path_end].to_string();
-        if let Some(replacement) = target_hook_path_replacement(
-            target_hooks_dir,
-            &path,
-            source_hooks_start - path_start,
-            &suffix,
-        ) {
-            rewritten.replace_range(path_start..path_end, &replacement);
-            search_start = path_start + replacement.len();
-        } else {
-            search_start = source_hooks_start + source_hooks_path.len();
-        }
-    }
-    rewritten
-}
-
-fn find_unquoted_source_hook_path(
-    command: &str,
-    source_hooks_path: &str,
-    start: usize,
-) -> Option<usize> {
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
+    let absolute_root = format!(
+        "{}/",
+        source_external_agent_dir
+            .join(EXTERNAL_AGENT_HOOKS_SUBDIR)
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
+    let target_root = target_config_dir.join(EXTERNAL_AGENT_MIGRATED_HOOKS_SUBDIR);
+    let mut output = String::new();
+    let mut start = 0;
+    let mut quote = None;
     let mut escaped = false;
-    for (offset, ch) in command[start..].char_indices() {
-        let index = start + offset;
+    let mut ranges = Vec::new();
+    for (index, ch) in command.char_indices() {
         if escaped {
             escaped = false;
             continue;
         }
-        if !in_single_quote && ch == '\\' {
+        if ch == '\\' && quote != Some('\'') {
             escaped = true;
             continue;
         }
-        match ch {
-            '\'' if !in_double_quote => {
-                in_single_quote = !in_single_quote;
+        if matches!(ch, '\'' | '"') {
+            if quote == Some(ch) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(ch);
             }
-            '"' if !in_single_quote => {
-                in_double_quote = !in_double_quote;
+        } else if quote.is_none()
+            && (ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '<' | '>' | '(' | ')'))
+        {
+            if start < index {
+                ranges.push((start, index));
             }
-            _ if !in_single_quote
-                && !in_double_quote
-                && command[index..].starts_with(source_hooks_path) =>
-            {
-                return Some(index);
-            }
-            _ => {}
+            start = index + ch.len_utf8();
         }
     }
-    None
-}
-
-fn is_pure_shell_path_content(content: &str, source_hooks_start: usize) -> bool {
-    let prefix = &content[..source_hooks_start];
-    (prefix.is_empty() || prefix == "./" || prefix.ends_with('/'))
-        && !prefix.chars().any(is_shell_path_boundary)
-}
-
-fn shell_path_start(command: &str, end: usize) -> usize {
-    command[..end]
-        .char_indices()
-        .filter_map(|(index, ch)| is_shell_path_boundary(ch).then_some(index + ch.len_utf8()))
-        .next_back()
-        .unwrap_or(0)
-}
-
-fn shell_path_end(command: &str, start: usize) -> usize {
-    let mut escaped = false;
-    for (offset, ch) in command[start..].char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' {
-            escaped = true;
-            continue;
-        }
-        if is_shell_path_boundary(ch) {
-            return start + offset;
-        }
-    }
-    command.len()
-}
-
-fn is_shell_path_boundary(ch: char) -> bool {
-    ch.is_whitespace() || matches!(ch, '=' | ';' | '|' | '&' | '<' | '>' | '(' | ')')
-}
-
-fn is_assignment_value_start(command: &str, path_start: usize) -> bool {
-    command[..path_start]
-        .chars()
-        .next_back()
-        .is_some_and(|ch| ch == '=')
-}
-
-fn target_hook_path_replacement(
-    target_hooks_dir: &Path,
-    path: &str,
-    source_hooks_start: usize,
-    suffix: &str,
-) -> Option<String> {
-    if !is_pure_shell_path_content(path, source_hooks_start) || !is_static_hook_path_suffix(suffix)
-    {
+    if quote.is_some() || escaped {
         return None;
     }
-    Some(shell_single_quote(
-        target_hooks_dir.join(suffix).to_string_lossy().as_ref(),
-    ))
-}
-
-fn is_static_hook_path_suffix(suffix: &str) -> bool {
-    !suffix.is_empty()
-        && !suffix
-            .chars()
-            .any(|ch| matches!(ch, '\\' | '$' | '`' | '*' | '?' | '[' | '{' | '}'))
+    if start < command.len() {
+        ranges.push((start, command.len()));
+    }
+    let mut copied = 0;
+    for (start, end) in ranges {
+        let token = &command[start..end];
+        if !token.contains(&relative_root) && !token.contains(&absolute_root) {
+            continue;
+        }
+        let path = token
+            .strip_prefix('\'')
+            .and_then(|s| s.strip_suffix('\''))
+            .or_else(|| token.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+            .unwrap_or(token);
+        let suffix = path
+            .strip_prefix(&absolute_root)
+            .or_else(|| path.strip_prefix(&relative_root))
+            .or_else(|| {
+                path.strip_prefix("./")
+                    .and_then(|s| s.strip_prefix(&relative_root))
+            })?;
+        if suffix.is_empty()
+            || suffix.chars().any(|ch| {
+                matches!(
+                    ch,
+                    '\\' | '\'' | '"' | '$' | '`' | '*' | '?' | '[' | '{' | '}' | ':'
+                )
+            })
+            || suffix
+                .split('/')
+                .any(|part| part.is_empty() || matches!(part, "." | ".."))
+        {
+            return None;
+        }
+        output.push_str(&command[copied..start]);
+        output.push_str(&shell_single_quote(
+            &target_root.join(suffix).to_string_lossy(),
+        ));
+        copied = end;
+    }
+    output.push_str(&command[copied..]);
+    Some(output)
 }
 
 fn looks_like_windows_hook_command(command: &str) -> bool {
@@ -878,11 +810,43 @@ fn copy_dir_recursive_skip_existing(source: &Path, target: &Path) -> io::Result<
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
             copy_dir_recursive_skip_existing(&source_path, &target_path)?;
-        } else if file_type.is_file() && !target_path.exists() {
-            fs::copy(source_path, target_path)?;
+        } else if file_type.is_file() {
+            let contents = fs::read(&source_path)?;
+            if !publish_new_file(
+                &target_path,
+                &contents,
+                Some(fs::metadata(&source_path)?.permissions()),
+            )? && fs::read(&target_path)? != contents
+            {
+                return Err(invalid_data_error(format!(
+                    "conflicting hook script: {}",
+                    target_path.display()
+                )));
+            }
         }
     }
     Ok(())
+}
+
+fn publish_new_file(
+    path: &Path,
+    contents: &[u8],
+    permissions: Option<fs::Permissions>,
+) -> io::Result<bool> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid_data_error("target has no parent"))?;
+    let mut temporary = NamedTempFile::new_in(parent)?;
+    temporary.write_all(contents)?;
+    if let Some(permissions) = permissions {
+        temporary.as_file().set_permissions(permissions)?;
+    }
+    temporary.as_file().sync_all()?;
+    match temporary.persist_noclobber(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error.error),
+    }
 }
 
 fn agent_source_files(source_agents: &Path) -> io::Result<Vec<PathBuf>> {
@@ -919,24 +883,30 @@ fn command_source_files(source_commands: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn unique_supported_command_sources(source_commands: &Path) -> io::Result<Vec<(PathBuf, String)>> {
-    let mut by_name = BTreeMap::<String, Vec<PathBuf>>::new();
+fn unique_supported_command_sources(
+    source_commands: &Path,
+) -> io::Result<Vec<(PathBuf, String, ParsedDocument)>> {
+    let mut by_name = BTreeMap::<String, Vec<(PathBuf, ParsedDocument)>>::new();
     for source_file in command_source_files(source_commands)? {
         let document = parse_document(&source_file)?;
         let Some(name) = command_skill_name_if_supported(source_commands, &source_file, &document)
         else {
             continue;
         };
-        by_name.entry(name).or_default().push(source_file);
+        by_name
+            .entry(name)
+            .or_default()
+            .push((source_file, document));
     }
 
     Ok(by_name
         .into_iter()
-        .filter_map(|(name, source_files)| {
-            let [source_file] = source_files.as_slice() else {
+        .filter_map(|(name, mut source_files)| {
+            if source_files.len() != 1 {
                 return None;
-            };
-            Some((source_file.clone(), name))
+            }
+            let (source_file, document) = source_files.pop()?;
+            Some((source_file, name, document))
         })
         .collect())
 }
@@ -995,17 +965,14 @@ fn parse_document_content(content: &str) -> ParsedDocument {
 }
 
 fn frontmatter_end(rest: &str) -> Option<(usize, usize)> {
-    [
-        "\r\n---\r\n",
-        "\r\n---\n",
-        "\n---\r\n",
-        "\n---\n",
-        "\r\n---",
-        "\n---",
-    ]
-    .into_iter()
-    .filter_map(|delimiter| rest.find(delimiter).map(|end| (end, end + delimiter.len())))
-    .min_by_key(|(end, _body_start)| *end)
+    let mut offset = 0;
+    for line in rest.split_inclusive('\n') {
+        if line.trim_end_matches(['\r', '\n']) == "---" {
+            return Some((offset, offset + line.len()));
+        }
+        offset += line.len();
+    }
+    None
 }
 
 fn parse_frontmatter(
@@ -1046,7 +1013,21 @@ fn frontmatter_value_from_yaml(value: &YamlValue) -> FrontmatterValue {
 }
 
 fn agent_metadata(document: &ParsedDocument) -> Option<AgentMetadata> {
-    if document.frontmatter_error.is_some() || document.body.trim().is_empty() {
+    if document.frontmatter_error.is_some()
+        || document.body.trim().is_empty()
+        || ["tools", "disallowedTools"]
+            .iter()
+            .any(|key| document.frontmatter.contains_key(*key))
+        || document
+            .frontmatter
+            .get("permissionMode")
+            .is_some_and(|value| {
+                value
+                    .as_scalar()
+                    .and_then(map_agent_permission_mode)
+                    .is_none()
+            })
+    {
         return None;
     }
     let name = document
@@ -1107,7 +1088,7 @@ fn render_agent_toml(body: &str, metadata: &AgentMetadata) -> io::Result<String>
 }
 
 fn render_agent_body(body: &str) -> String {
-    let body = rewrite_external_agent_terms(body.trim());
+    let body = body.trim().to_string();
     if body.is_empty() {
         "No subagent instructions were found.".to_string()
     } else {
@@ -1163,7 +1144,7 @@ fn command_source_name(source_commands: &Path, source_file: &Path) -> String {
 }
 
 fn render_command_skill(body: &str, name: &str, description: &str, source_name: &str) -> String {
-    let body = rewrite_external_agent_terms(body.trim());
+    let body = body.trim().to_string();
     let template_body = if body.is_empty() {
         "No command template body was found.".to_string()
     } else {
@@ -1248,8 +1229,10 @@ fn json_u64(value: &JsonValue) -> Option<u64> {
     value.as_u64().or_else(|| value.as_str()?.parse().ok())
 }
 
+#[expect(clippy::expect_used, reason = "A string serialized into an in-memory JSON buffer has no fallible values or writer")]
 fn yaml_string(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    // JSON quoted scalars are valid YAML and preserve line breaks and control characters.
+    serde_json::to_string(value).expect("string serializes")
 }
 
 fn slugify_name(value: &str) -> String {
@@ -1409,21 +1392,6 @@ mod tests {
         assert_eq!(rewrite_external_agent_terms(""), "");
     }
 
-    fn source_hook_command(script_name: &str) -> String {
-        format!(
-            "python3 {}/{EXTERNAL_AGENT_HOOKS_SUBDIR}/{script_name}",
-            external_agent_config_dir()
-        )
-    }
-
-    fn source_hook_command_with_project_dir(script_name: &str) -> String {
-        format!(
-            "python3 \"${}\"/{}/{EXTERNAL_AGENT_HOOKS_SUBDIR}/{script_name}",
-            external_agent_project_dir_env_var(),
-            external_agent_config_dir()
-        )
-    }
-
     fn migrated_hook_command(script_name: &str) -> String {
         migrated_quoted_hook_command(script_name)
     }
@@ -1439,11 +1407,8 @@ mod tests {
     }
 
     #[test]
-    fn env_placeholder_accepts_defaults() {
-        assert_eq!(
-            parse_env_placeholder("${TOKEN:-fallback}"),
-            Some("TOKEN".to_string())
-        );
+    fn env_placeholder_rejects_unrepresentable_defaults() {
+        assert_eq!(parse_env_placeholder("${TOKEN:-fallback}"), None);
     }
 
     #[test]
@@ -1780,7 +1745,7 @@ command = "enabled-server"
     #[test]
     fn commands_without_description_are_skipped() {
         let root = source_path("commands");
-        let file = source_path("commands/README.md");
+        let file = source_path("commands/review.md");
         let document = parse_document_content("# Notes\n\nThis documents commands.\n");
 
         assert!(command_skill_name_if_supported(&root, &file, &document).is_none());
@@ -1802,21 +1767,39 @@ command = "enabled-server"
         )
         .expect("write second command");
 
-        assert_eq!(
-            unique_supported_command_sources(&commands).unwrap(),
-            Vec::<(PathBuf, String)>::new()
+        assert!(
+            unique_supported_command_sources(&commands)
+                .unwrap()
+                .is_empty()
         );
     }
 
     #[test]
-    fn subagent_accepts_yaml_block_lists_by_ignoring_unsupported_fields() {
-        let document = parse_document_content(
-            "---\nname: cloud-incident\ndescription: Debug incidents\nskills:\n  - runbook-reader\ntools:\n  - Read\n  - Bash\ndisallowedTools:\n  - Write\n---\nInvestigate carefully.\n",
+    fn subagents_with_unmappable_restrictions_are_not_offered_or_imported() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let source = root.path().join("agents");
+        let target = root.path().join("target");
+        fs::create_dir_all(&source).unwrap();
+        for (index, restriction) in [
+            "tools: [Read]",
+            "disallowedTools: [Write]",
+            "permissionMode: plan",
+            "permissionMode: [readOnly]",
+        ]
+        .iter()
+        .enumerate()
+        {
+            fs::write(source.join(format!("agent-{index}.md")), format!("---\nname: reviewer\ndescription: Review\n{restriction}\n---\nReview carefully.\n")).unwrap();
+        }
+        assert_eq!(
+            missing_subagent_names(&source, &target).unwrap(),
+            Vec::<String>::new()
         );
-
-        let metadata = agent_metadata(&document).expect("valid subagent metadata");
-        assert_eq!(metadata.name, "cloud-incident");
-        assert_eq!(metadata.description, "Debug incidents");
+        assert_eq!(
+            import_subagents(&source, &target).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
     }
 
     #[test]
@@ -1899,7 +1882,7 @@ Review carefully."""
                     "if": "tool_input.command contains 'rm'",
                     "hooks": [{
                         "type": "command",
-                        "command": source_hook_command("policy_gate.py")
+                        "command": "python3 .claude/hooks/policy_gate.py"
                     }]
                 }, {
                     "matcher": "Edit",
@@ -1907,7 +1890,7 @@ Review carefully."""
                         {
                             "type": "command",
                             "if": "Bash(rm *)",
-                            "command": source_hook_command("policy_gate.py")
+                            "command": "python3 .claude/hooks/policy_gate.py"
                         },
                         {
                             "type": "http",
@@ -1919,7 +1902,7 @@ Review carefully."""
                     "matcher": "Bash",
                     "hooks": [{
                         "type": "command",
-                        "command": source_hook_command("approve.py")
+                        "command": "python3 .claude/hooks/approve.py"
                     }]
                 }],
                 "SubagentStart": [{
@@ -1929,7 +1912,12 @@ Review carefully."""
             }
         });
         let mut migration = serde_json::Map::new();
-        append_convertible_hook_groups(&settings, &mut migration, Some(Path::new("/repo/.codex")));
+        append_convertible_hook_groups(
+            &settings,
+            &mut migration,
+            Some(Path::new("/repo/.codex")),
+            Path::new("/repo/.claude"),
+        );
 
         assert_eq!(
             migration,
@@ -2025,152 +2013,46 @@ Review carefully."""
     }
 
     #[test]
-    fn hook_command_paths_rewrite_to_target_hook_dir() {
-        let project_dir_env_var = external_agent_project_dir_env_var();
-        let plugin_root_env_var = format!(
-            "{}_PLUGIN_ROOT",
-            SOURCE_EXTERNAL_AGENT_NAME.to_ascii_uppercase()
-        );
-        let source_hooks_path = format!(
-            "{}/{EXTERNAL_AGENT_HOOKS_SUBDIR}",
-            external_agent_config_dir()
-        );
+    fn hook_command_paths_rewrite_only_supported_whole_tokens() {
+        let source = Path::new("/repo/.claude");
+        let target = Some(Path::new("/repo/.codex"));
+        for command in [
+            "python3 .claude/hooks/check.py",
+            "python3 ./.claude/hooks/check.py",
+            "python3 /repo/.claude/hooks/check.py",
+            "python3 '.claude/hooks/check.py'",
+        ] {
+            assert_eq!(
+                rewrite_hook_command(command, target, source),
+                Some(migrated_hook_command("check.py"))
+            );
+        }
         assert_eq!(
-            rewrite_hook_command(
-                &source_hook_command_with_project_dir("check.py"),
-                Some(Path::new("/repo/.codex")),
-            ),
-            migrated_hook_command("check.py")
+            rewrite_hook_command("python3 \".claude/hooks/my script.py\"", target, source),
+            Some(migrated_hook_command("my script.py"))
         );
+        for command in [
+            "python3 .claude/hooks/\"my script.py\"",
+            "python3 .claude/hooks//check.py",
+            "python3 .claude/hooks/../check.py",
+            "python3 /other/.claude/hooks/check.py",
+            "python3 .claude/hooks/${SCRIPT}.py",
+            "python3 .claude/hooks/my\\ script.py",
+            "bash -lc \"python3 .claude/hooks/check.py\"",
+            "HOOK=.claude/hooks/check.py python3 $HOOK",
+            "python3 '.claude/hooks/check.py'junk",
+            "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/check.py",
+            "python3 .claude\\hooks\\check.py",
+        ] {
+            assert_eq!(
+                rewrite_hook_command(command, target, source),
+                None,
+                "{command}"
+            );
+        }
         assert_eq!(
-            rewrite_hook_command(
-                &format!("\"${project_dir_env_var}\"/{source_hooks_path}/check-style.sh"),
-                Some(Path::new("/repo/.codex")),
-            ),
-            shell_single_quote(
-                Path::new("/repo/.codex")
-                    .join(EXTERNAL_AGENT_MIGRATED_HOOKS_SUBDIR)
-                    .join("check-style.sh")
-                    .to_string_lossy()
-                    .as_ref()
-            )
-        );
-        assert_eq!(
-            rewrite_hook_command(
-                &source_hook_command("check.py"),
-                Some(Path::new("/repo/.codex")),
-            ),
-            migrated_hook_command("check.py")
-        );
-        assert_eq!(
-            rewrite_hook_command(
-                &format!("python3 ./{source_hooks_path}/check.py"),
-                Some(Path::new("/repo/.codex")),
-            ),
-            migrated_hook_command("check.py")
-        );
-        assert_eq!(
-            rewrite_hook_command(
-                &format!("python3 '${{{project_dir_env_var}}}/{source_hooks_path}/check.py'"),
-                Some(Path::new("/repo/.codex")),
-            ),
-            migrated_quoted_hook_command("check.py")
-        );
-        assert_eq!(
-            rewrite_hook_command(
-                &format!("python3 \"${{{project_dir_env_var}}}/{source_hooks_path}/check.py\""),
-                Some(Path::new("/repo/.codex")),
-            ),
-            migrated_quoted_hook_command("check.py")
-        );
-        assert_eq!(
-            rewrite_hook_command(
-                &format!("bash -lc \"python3 {source_hooks_path}/check.py\""),
-                Some(Path::new("/repo/.codex")),
-            ),
-            format!("bash -lc \"python3 {source_hooks_path}/check.py\"")
-        );
-        assert_eq!(
-            rewrite_hook_command(
-                &format!(
-                    "HOOK=${{{project_dir_env_var}}}/{source_hooks_path}/check.py python3 \"$HOOK\""
-                ),
-                Some(Path::new("/repo/.codex")),
-            ),
-            format!(
-                "HOOK=${{{project_dir_env_var}}}/{source_hooks_path}/check.py python3 \"$HOOK\""
-            )
-        );
-        assert_eq!(
-            rewrite_hook_command(
-                &format!("python3 {source_hooks_path}/${{SCRIPT}}.py"),
-                Some(Path::new("/repo/.codex")),
-            ),
-            format!("python3 {source_hooks_path}/${{SCRIPT}}.py")
-        );
-        assert_eq!(
-            rewrite_hook_command(
-                &format!("python3 {source_hooks_path}/{{lint,fmt}}.sh"),
-                Some(Path::new("/repo/.codex")),
-            ),
-            format!("python3 {source_hooks_path}/{{lint,fmt}}.sh")
-        );
-        assert_eq!(
-            rewrite_hook_command(
-                &format!("python3 {source_hooks_path}/my\\ script.py"),
-                Some(Path::new("/repo/.codex")),
-            ),
-            format!("python3 {source_hooks_path}/my\\ script.py")
-        );
-        assert_eq!(
-            rewrite_hook_command(
-                &format!("python3 .{SOURCE_EXTERNAL_AGENT_NAME}\\hooks\\check.py"),
-                Some(Path::new("/repo/.codex")),
-            ),
-            format!("python3 .{}\\hooks\\check.py", SOURCE_EXTERNAL_AGENT_NAME)
-        );
-        assert_eq!(
-            rewrite_hook_command(
-                &format!(
-                    "python3 \"%{}%\\{}\\hooks\\check.py\"",
-                    project_dir_env_var,
-                    external_agent_config_dir()
-                ),
-                Some(Path::new("/repo/.codex")),
-            ),
-            format!(
-                "python3 \"%{}%\\{}\\hooks\\check.py\"",
-                project_dir_env_var,
-                external_agent_config_dir()
-            )
-        );
-        assert_eq!(
-            rewrite_hook_command(
-                &format!("python3 '${{{project_dir_env_var}}}/{source_hooks_path}/my script.py'"),
-                Some(Path::new("/repo/.codex")),
-            ),
-            migrated_quoted_hook_command("my script.py")
-        );
-        assert_eq!(
-            rewrite_hook_command(
-                &format!("/repo/{source_hooks_path}/check.py 2>/dev/null || true"),
-                Some(Path::new("/repo/.codex")),
-            ),
-            format!(
-                "{} 2>/dev/null || true",
-                shell_single_quote(
-                    Path::new("/repo/.codex")
-                        .join(EXTERNAL_AGENT_MIGRATED_HOOKS_SUBDIR)
-                        .join("check.py")
-                        .to_string_lossy()
-                        .as_ref()
-                )
-            )
-        );
-        let plugin_script_command = format!("${{{plugin_root_env_var}}}/scripts/format.sh");
-        assert_eq!(
-            rewrite_hook_command(&plugin_script_command, Some(Path::new("/repo/.codex")),),
-            plugin_script_command
+            rewrite_hook_command("echo ready", target, source),
+            Some("echo ready".to_string())
         );
     }
 
@@ -2193,6 +2075,16 @@ Review carefully."""
         .expect("write source settings");
 
         let target_config = target_config_dir.join("hooks.json");
+        let error = import_hooks(&source_external_agent_dir, &target_config)
+            .expect_err("conflicting script");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!target_config.exists());
+        assert_eq!(
+            fs::read_to_string(target_hooks.join("check.py")).unwrap(),
+            "existing script"
+        );
+        // Reusing identical scripts is safe and a failed attempt remains retryable.
+        fs::write(source_hooks.join("check.py"), "existing script").unwrap();
         assert!(import_hooks(&source_external_agent_dir, &target_config).expect("import hooks"));
 
         assert_eq!(
@@ -2240,7 +2132,12 @@ Review carefully."""
             }
         });
         let mut migration = serde_json::Map::new();
-        append_convertible_hook_groups(&settings, &mut migration, /*target_config_dir*/ None);
+        append_convertible_hook_groups(
+            &settings,
+            &mut migration,
+            /*target_config_dir*/ None,
+            Path::new("/repo/.claude"),
+        );
 
         assert_eq!(
             migration,
@@ -2257,5 +2154,110 @@ Review carefully."""
             .cloned()
             .expect("object")
         );
+    }
+    #[test]
+    fn generated_imports_preserve_bodies_and_recover_missing_skill_files() {
+        let root = tempfile::TempDir::new().unwrap();
+        let source = root.path().join("source");
+        let target = root.path().join("target");
+        fs::create_dir_all(&source).unwrap();
+        let body = "Run `claude --version`; inspect `.claude/settings.json`.";
+        fs::write(
+            source.join("review.md"),
+            format!("---\nname: reviewer\ndescription: Review code\n---\n{body}\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            import_subagents(&source, &target).unwrap(),
+            vec!["reviewer"]
+        );
+        let agent: TomlValue =
+            toml::from_str(&fs::read_to_string(target.join("review.toml")).unwrap()).unwrap();
+        assert_eq!(agent["developer_instructions"].as_str(), Some(body));
+        fs::write(target.join("review.toml"), "user content").unwrap();
+        assert!(import_subagents(&source, &target).unwrap().is_empty());
+        assert_eq!(
+            fs::read_to_string(target.join("review.toml")).unwrap(),
+            "user content"
+        );
+
+        fs::create_dir_all(target.join("source-command-review")).unwrap();
+        assert_eq!(
+            missing_command_names(&source, &target).unwrap(),
+            vec!["source-command-review"]
+        );
+        assert_eq!(
+            import_commands(&source, &target).unwrap(),
+            vec!["source-command-review"]
+        );
+        let skill_path = target.join("source-command-review/SKILL.md");
+        let skill = fs::read_to_string(&skill_path).unwrap();
+        assert!(skill.ends_with(&format!("{body}\n")));
+        assert!(missing_command_names(&source, &target).unwrap().is_empty());
+        assert!(import_commands(&source, &target).unwrap().is_empty());
+        assert_eq!(fs::read_to_string(skill_path).unwrap(), skill);
+    }
+
+    #[test]
+    fn frontmatter_requires_a_complete_delimiter_and_roundtrips_scalar_content() {
+        let parsed = parse_document_content("---\ndescription: Review\n---extra: keep\n---\nBody");
+        assert_eq!(
+            frontmatter_string(&parsed.frontmatter, "---extra").as_deref(),
+            Some("keep")
+        );
+        assert_eq!(parsed.body, "Body");
+        for description in [
+            "line one\nline two",
+            "tab\tand\u{1}control",
+            "quoted \"text\" \\ path",
+        ] {
+            let rendered = render_command_skill("Body", "review", description, "review");
+            let parsed = parse_document_content(&rendered);
+            assert_eq!(parsed.frontmatter_error, None);
+            assert_eq!(
+                frontmatter_string(&parsed.frontmatter, "description").as_deref(),
+                Some(description)
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_migration_declines_environment_defaults_without_losing_other_servers() {
+        let root = tempfile::TempDir::new().unwrap();
+        fs::write(root.path().join(".mcp.json"), r#"{"mcpServers":{
+            "defaulted":{"url":"https://example.com","headers":{"Authorization":"Bearer ${TOKEN:-fallback}"}},
+            "defaulted_env":{"command":"server","env":{"TOKEN":"${TOKEN:-fallback}"}},
+            "supported":{"url":"https://example.com","headers":{"Authorization":"Bearer ${TOKEN}"}}
+        }}"#).unwrap();
+        let config = build_mcp_config_from_external(root.path(), None, None).unwrap();
+        let servers = config["mcp_servers"].as_table().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(
+            servers["supported"]["bearer_token_env_var"].as_str(),
+            Some("TOKEN")
+        );
+    }
+    #[test]
+    fn unsupported_hook_paths_are_not_offered_or_activated() {
+        let root = tempfile::TempDir::new().unwrap();
+        let source = root.path().join(".claude");
+        fs::create_dir_all(source.join("hooks")).unwrap();
+        fs::write(source.join("hooks/check.py"), "print('check')").unwrap();
+        let target = root.path().join(".codex/hooks.json");
+        for command in [
+            "python3 /other/.claude/hooks/check.py",
+            "python3 .claude/hooks/${SCRIPT}.py",
+            "python3 .claude/hooks/../check.py",
+            "python3 .claude/hooks/\"check.py\"",
+        ] {
+            let settings = serde_json::json!({"hooks":{"SessionStart":[{"hooks":[{"type":"command", "command":command}]}]}});
+            fs::write(source.join("settings.json"), settings.to_string()).unwrap();
+            assert_eq!(
+                hook_migration_event_names(&source, &target).unwrap(),
+                Vec::<String>::new()
+            );
+            assert!(!import_hooks(&source, &target).unwrap());
+            assert!(!target.exists());
+        }
     }
 }

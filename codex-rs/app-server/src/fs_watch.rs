@@ -320,9 +320,7 @@ impl FsWatchManager {
             .extract_if(|key, _| key.connection_id == connection_id)
             .map(|(_, entry)| entry)
             .collect::<Vec<_>>();
-        for entry in entries {
-            entry.stop().await;
-        }
+        futures::future::join_all(entries.into_iter().map(WatchEntry::stop)).await;
     }
 }
 
@@ -591,5 +589,100 @@ mod tests {
             }])
         );
         assert_eq!(response.path, absolute_path(head_path));
+    }
+
+    #[tokio::test]
+    async fn file_change_is_delivered_to_the_watch_owner() {
+        use crate::outgoing_message::OutgoingEnvelope;
+        use crate::outgoing_message::OutgoingMessage;
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let path = absolute_path(temp_dir.path().join("HEAD"));
+        std::fs::write(&path, "before").unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let manager = FsWatchManager::new_with_file_watcher(
+            Arc::new(OutgoingMessageSender::new(
+                tx,
+                codex_analytics::AnalyticsEventsClient::disabled(),
+            )),
+            Arc::new(FileWatcher::new().expect("filesystem watcher")),
+        );
+        manager
+            .watch(
+                ConnectionId(7),
+                FsWatchParams {
+                    watch_id: "head".to_string(),
+                    path: path.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        std::fs::write(&path, "after").unwrap();
+
+        let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("file change must reach the connection")
+            .unwrap();
+        match delivered {
+            OutgoingEnvelope::ToConnection {
+                connection_id,
+                message:
+                    OutgoingMessage::AppServerNotification(ServerNotification::FsChanged(notification)),
+                ..
+            } => {
+                assert_eq!(connection_id, ConnectionId(7));
+                assert_eq!(notification.watch_id, "head");
+                assert_eq!(notification.changed_paths, vec![path]);
+            }
+            other => panic!("unexpected notification: {other:?}"),
+        }
+        manager.connection_closed(ConnectionId(7)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_closed_bounds_the_total_grace_for_stalled_watches() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("HEAD");
+        std::fs::write(&path, "before").unwrap();
+        let manager = manager_with_noop_watcher();
+        for watch_id in ["first", "second"] {
+            manager
+                .watch(
+                    ConnectionId(1),
+                    FsWatchParams {
+                        watch_id: watch_id.to_string(),
+                        path: absolute_path(path.clone()),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let mut stalled_tasks = Vec::new();
+        let mut done_senders = Vec::new();
+        {
+            let mut state = manager.state.lock().await;
+            for entry in state.entries.values_mut() {
+                let WatchEntry::Active(entry) = entry else {
+                    panic!("watch must be active")
+                };
+                let (done_tx, done_rx) = oneshot::channel();
+                let task = tokio::spawn(std::future::pending::<()>());
+                entry.done_rx = done_rx;
+                entry.abort_handle = task.abort_handle();
+                done_senders.push(done_tx);
+                stalled_tasks.push(task);
+            }
+        }
+
+        let started = tokio::time::Instant::now();
+        manager.connection_closed(ConnectionId(1)).await;
+
+        assert_eq!(started.elapsed(), FS_WATCH_SHUTDOWN_GRACE);
+        assert!(manager.state.lock().await.entries.is_empty());
+        for task in stalled_tasks {
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+        drop(done_senders);
     }
 }

@@ -167,13 +167,21 @@ impl MetricsClientInner {
         validate_metric_name(name)?;
         let attributes = self.attributes(tags)?;
 
-        let mut histograms = self
+        let cached = self
             .histograms
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let histogram = histograms
-            .entry(name.to_string())
-            .or_insert_with(|| self.meter.f64_histogram(name.to_string()).build());
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)
+            .cloned();
+        let histogram = cached.unwrap_or_else(|| {
+            let created = self.meter.f64_histogram(name.to_string()).build();
+            self.histograms
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(name.to_string())
+                .or_insert(created)
+                .clone()
+        });
         histogram.record(value as f64, &attributes);
         Ok(())
     }
@@ -188,21 +196,29 @@ impl MetricsClientInner {
         validate_metric_name(name)?;
         let attributes = self.attributes(tags)?;
 
-        let mut gauges = self
-            .gauges
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let key = InstrumentKey {
             name: name.to_string(),
             unit: None,
             description: description.map(str::to_string),
         };
-        let gauge = gauges.entry(key).or_insert_with(|| {
+        let cached = self
+            .gauges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .cloned();
+        let gauge = cached.unwrap_or_else(|| {
             let builder = self.meter.i64_gauge(name.to_string());
-            match description {
+            let created = match description {
                 Some(description) => builder.with_description(description.to_string()).build(),
                 None => builder.build(),
-            }
+            };
+            self.gauges
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(key)
+                .or_insert(created)
+                .clone()
         });
         gauge.record(value, &attributes);
         Ok(())
@@ -251,22 +267,31 @@ impl MetricsClientInner {
         boundaries: &'static [f64],
         attributes: &[KeyValue],
     ) {
-        let mut histograms = self
-            .duration_histograms
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let key = InstrumentKey {
             name: name.to_string(),
             unit: Some(unit),
             description: Some(description.to_string()),
         };
-        let histogram = histograms.entry(key).or_insert_with(|| {
-            self.meter
+        let cached = self
+            .duration_histograms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .cloned();
+        let histogram = cached.unwrap_or_else(|| {
+            let created = self
+                .meter
                 .f64_histogram(name.to_string())
                 .with_unit(unit)
                 .with_description(description.to_string())
                 .with_boundaries(boundaries.to_vec())
-                .build()
+                .build();
+            self.duration_histograms
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(key)
+                .or_insert(created)
+                .clone()
         });
         histogram.record(value, attributes);
     }
@@ -291,7 +316,7 @@ impl MetricsClientInner {
         self.record_counter(count_name, /*description*/ None, inc, &attributes);
         self.record_duration_histogram(
             duration_name,
-            duration.as_millis().min(i64::MAX as u128) as f64,
+            (duration.as_secs_f64() * 1000.0).min(i64::MAX as f64),
             MILLISECOND_DURATION_UNIT,
             MILLISECOND_DURATION_DESCRIPTION,
             MILLISECOND_DURATION_BOUNDARIES,
@@ -324,13 +349,11 @@ impl MetricsClientInner {
 
     fn shutdown(&self) -> Result<()> {
         debug!("flushing OTEL metrics");
-        self.meter_provider
-            .force_flush()
-            .map_err(|source| MetricsError::ProviderShutdown { source })?;
-        self.meter_provider
-            .shutdown()
-            .map_err(|source| MetricsError::ProviderShutdown { source })?;
-        Ok(())
+        let flushed = self.meter_provider.force_flush();
+        let stopped = self.meter_provider.shutdown();
+        flushed
+            .and(stopped)
+            .map_err(|source| MetricsError::ProviderShutdown { source })
     }
 }
 
@@ -454,7 +477,7 @@ impl MetricsClient {
     ) -> Result<()> {
         self.0.duration_histogram(
             name,
-            duration.as_millis().min(i64::MAX as u128) as f64,
+            (duration.as_secs_f64() * 1000.0).min(i64::MAX as f64),
             MILLISECOND_DURATION_UNIT,
             MILLISECOND_DURATION_DESCRIPTION,
             MILLISECOND_DURATION_BOUNDARIES,
@@ -498,10 +521,16 @@ impl MetricsClient {
         name: &str,
         tags: &[(&str, &str)],
     ) -> std::result::Result<Timer, MetricsError> {
+        validate_metric_name(name)?;
+        for (key, value) in tags {
+            validate_tag_key(key)?;
+            validate_tag_value(value)?;
+        }
         Ok(Timer::new(name, tags, self))
     }
 
     /// Collect a runtime metrics snapshot without shutting down the provider.
+    /// Clones share the delta reader: each collection drains the preceding interval.
     pub fn snapshot(&self) -> Result<ResourceMetrics> {
         let Some(reader) = &self.0.runtime_reader else {
             return Err(MetricsError::RuntimeSnapshotUnavailable);
@@ -575,7 +604,11 @@ fn build_otlp_metric_exporter(
         } => {
             debug!("Using OTLP Grpc exporter for metrics: {endpoint}");
 
-            let header_map = crate::otlp::build_header_map(&headers);
+            let header_map = crate::otlp::build_header_map(&headers).map_err(|err| {
+                MetricsError::InvalidConfig {
+                    message: err.to_string(),
+                }
+            })?;
 
             let base_tls_config = ClientTlsConfig::new()
                 .with_enabled_roots()
@@ -605,6 +638,9 @@ fn build_otlp_metric_exporter(
             tls,
         } => {
             debug!("Using OTLP Http exporter for metrics: {endpoint}");
+            crate::otlp::build_header_map(&headers).map_err(|err| MetricsError::InvalidConfig {
+                message: err.to_string(),
+            })?;
 
             let protocol = match protocol {
                 OtelHttpProtocol::Binary => Protocol::HttpBinary,
@@ -618,14 +654,15 @@ fn build_otlp_metric_exporter(
                 .with_protocol(protocol)
                 .with_headers(headers);
 
-            if let Some(tls) = tls.as_ref() {
-                let client =
-                    crate::otlp::build_http_client(tls, OTEL_EXPORTER_OTLP_METRICS_TIMEOUT)
-                        .map_err(|err| MetricsError::InvalidConfig {
-                            message: err.to_string(),
-                        })?;
-                exporter_builder = exporter_builder.with_http_client(client);
-            }
+            let client = crate::otlp::build_http_client(
+                tls.as_ref()
+                    .unwrap_or(&crate::config::OtelTlsConfig::default()),
+                OTEL_EXPORTER_OTLP_METRICS_TIMEOUT,
+            )
+            .map_err(|err| MetricsError::InvalidConfig {
+                message: err.to_string(),
+            })?;
+            exporter_builder = exporter_builder.with_http_client(client);
 
             exporter_builder
                 .build()
@@ -641,8 +678,76 @@ mod counter_cache_tests {
     use opentelemetry_sdk::metrics::data::AggregatedMetrics;
     use opentelemetry_sdk::metrics::data::MetricData;
 
+    #[derive(Debug)]
+    struct FailingFlushReader(Arc<Mutex<Vec<&'static str>>>);
+
+    impl MetricReader for FailingFlushReader {
+        fn register_pipeline(&self, _: Weak<Pipeline>) {}
+        fn collect(&self, _: &mut ResourceMetrics) -> opentelemetry_sdk::error::OTelSdkResult {
+            Ok(())
+        }
+        fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+            self.0.lock().unwrap().push("flush");
+            Err(opentelemetry_sdk::error::OTelSdkError::InternalFailure(
+                "flush failed".to_string(),
+            ))
+        }
+        fn shutdown_with_timeout(&self, _: Duration) -> opentelemetry_sdk::error::OTelSdkResult {
+            self.0.lock().unwrap().push("shutdown");
+            Ok(())
+        }
+        fn temporality(&self, _: InstrumentKind) -> Temporality {
+            Temporality::Cumulative
+        }
+    }
+
     #[test]
-    fn cached_counter_progresses_during_sdk_registration_and_collects_all_values() {
+    fn shutdown_still_stops_provider_after_flush_failure() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let provider = SdkMeterProvider::builder()
+            .with_reader(FailingFlushReader(Arc::clone(&calls)))
+            .build();
+        let metrics = MetricsClient(Arc::new(MetricsClientInner {
+            meter: provider.meter(METER_NAME),
+            meter_provider: provider,
+            counters: Mutex::new(HashMap::new()),
+            gauges: Mutex::new(HashMap::new()),
+            histograms: Mutex::new(HashMap::new()),
+            duration_histograms: Mutex::new(HashMap::new()),
+            runtime_reader: None,
+            default_tags: BTreeMap::new(),
+        }));
+        let error = metrics.shutdown().unwrap_err();
+        assert!(matches!(error, MetricsError::ProviderShutdown { .. }));
+        assert!(error.to_string().contains("flush failed"));
+        assert_eq!(*calls.lock().unwrap(), vec!["flush", "shutdown"]);
+    }
+
+    #[test]
+    fn cached_instruments_progress_during_sdk_registration_and_collect_all_values() {
+        for kind in ["counter", "gauge", "histogram", "duration"] {
+            check_cached_instrument(kind);
+        }
+    }
+
+    fn record(
+        metrics: &MetricsClient,
+        kind: &str,
+        name: &str,
+        value: i64,
+        status: &str,
+    ) -> Result<()> {
+        let tags = &[("status", status)];
+        match kind {
+            "counter" => metrics.counter(name, value, tags),
+            "gauge" => metrics.gauge(name, value, tags),
+            "histogram" => metrics.histogram(name, value, tags),
+            "duration" => metrics.record_duration(name, Duration::from_millis(value as u64), tags),
+            _ => unreachable!(),
+        }
+    }
+
+    fn check_cached_instrument(kind: &'static str) {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let release_rx = Mutex::new(release_rx);
@@ -671,17 +776,14 @@ mod counter_cache_tests {
             runtime_reader: Some(reader),
             default_tags: BTreeMap::new(),
         }));
-        metrics
-            .counter("codex.warm", 2, &[("status", "upserted")])
-            .unwrap();
+        record(&metrics, kind, "codex.warm", 2, "upserted").unwrap();
         let cold = metrics.clone();
-        let cold_task =
-            std::thread::spawn(move || cold.counter("codex.cold", 5, &[("status", "failed")]));
+        let cold_task = std::thread::spawn(move || record(&cold, kind, "codex.cold", 5, "failed"));
         entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         let (completed_tx, completed_rx) = std::sync::mpsc::channel();
         let warm = metrics.clone();
         let warm_task = std::thread::spawn(move || {
-            let result = warm.counter("codex.warm", 3, &[("status", "upserted")]);
+            let result = record(&warm, kind, "codex.warm", 3, "upserted");
             completed_tx.send(result).unwrap();
         });
         let during_registration = completed_rx.recv_timeout(Duration::from_secs(1));
@@ -689,32 +791,55 @@ mod counter_cache_tests {
         cold_task.join().unwrap().unwrap();
         warm_task.join().unwrap();
         during_registration
-            .expect("cached counter must complete while unrelated SDK view is blocked")
+            .expect("cached instrument must complete while unrelated SDK view is blocked")
             .unwrap();
 
         let snapshot = metrics.snapshot().unwrap();
         let mut observed = BTreeMap::new();
         for scope in snapshot.scope_metrics() {
             for metric in scope.metrics() {
-                if let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() {
-                    let points: Vec<_> = sum.data_points().collect();
-                    assert_eq!(points.len(), 1);
-                    observed.insert(
-                        metric.name().to_string(),
-                        (
-                            points[0].value(),
-                            points[0]
-                                .attributes()
-                                .map(|value| {
-                                    (
-                                        value.key.as_str().to_string(),
-                                        value.value.as_str().to_string(),
-                                    )
-                                })
-                                .collect::<Vec<_>>(),
-                        ),
-                    );
-                }
+                let points: Vec<_> = match metric.data() {
+                    AggregatedMetrics::U64(MetricData::Sum(sum)) => sum
+                        .data_points()
+                        .map(|point| {
+                            (
+                                point.value() as f64,
+                                point.attributes().cloned().collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect(),
+                    AggregatedMetrics::I64(MetricData::Gauge(gauge)) => gauge
+                        .data_points()
+                        .map(|point| {
+                            (
+                                point.value() as f64,
+                                point.attributes().cloned().collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect(),
+                    AggregatedMetrics::F64(MetricData::Histogram(histogram)) => histogram
+                        .data_points()
+                        .map(|point| (point.sum(), point.attributes().cloned().collect::<Vec<_>>()))
+                        .collect(),
+                    _ => panic!("unexpected instrument data"),
+                };
+                assert_eq!(points.len(), 1);
+                observed.insert(
+                    metric.name().to_string(),
+                    (
+                        points[0].0,
+                        points[0]
+                            .1
+                            .iter()
+                            .map(|value| {
+                                (
+                                    value.key.as_str().to_string(),
+                                    value.value.as_str().to_string(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                );
             }
         }
         assert_eq!(
@@ -722,11 +847,14 @@ mod counter_cache_tests {
             BTreeMap::from([
                 (
                     "codex.cold".to_string(),
-                    (5, vec![("status".to_string(), "failed".to_string())])
+                    (5.0, vec![("status".to_string(), "failed".to_string())])
                 ),
                 (
                     "codex.warm".to_string(),
-                    (5, vec![("status".to_string(), "upserted".to_string())])
+                    (
+                        if kind == "gauge" { 3.0 } else { 5.0 },
+                        vec![("status".to_string(), "upserted".to_string())]
+                    )
                 ),
             ])
         );

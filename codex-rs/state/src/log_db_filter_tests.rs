@@ -28,7 +28,7 @@ async fn sqlite_sink_drops_low_level_opentelemetry_sdk_logs() {
     tracing::info!(target: "opentelemetry_sdk", "retained-info");
     tracing::trace!(target: "codex_state", "retained-trace");
 
-    layer.flush().await;
+    layer.flush().await.expect("flush logs");
     drop(guard);
 
     let logs = runtime

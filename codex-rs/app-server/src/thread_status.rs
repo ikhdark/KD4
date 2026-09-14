@@ -28,6 +28,7 @@ pub(crate) struct ThreadWatchActiveGuard {
     manager: ThreadWatchManager,
     thread_id: String,
     guard_type: ThreadWatchActiveGuardType,
+    lifecycle: Arc<()>,
     handle: tokio::runtime::Handle,
 }
 
@@ -66,6 +67,10 @@ impl ThreadStatusSubscription {
 }
 
 impl Drop for ThreadStatusSubscription {
+    #[expect(
+        clippy::expect_used,
+        reason = "A poisoned canonical status lock cannot safely update watcher ownership"
+    )]
     fn drop(&mut self) {
         drop(self.receiver.take());
         self.state
@@ -80,11 +85,13 @@ impl ThreadWatchActiveGuard {
         manager: ThreadWatchManager,
         thread_id: String,
         guard_type: ThreadWatchActiveGuardType,
+        lifecycle: Arc<()>,
     ) -> Self {
         Self {
             manager,
             thread_id,
             guard_type,
+            lifecycle,
             handle: tokio::runtime::Handle::current(),
         }
     }
@@ -92,9 +99,11 @@ impl ThreadWatchActiveGuard {
 
 impl Drop for ThreadWatchActiveGuard {
     fn drop(&mut self) {
-        let notification = self
-            .manager
-            .note_active_guard_released(&self.thread_id, self.guard_type);
+        let notification = self.manager.note_active_guard_released(
+            &self.thread_id,
+            self.guard_type,
+            &self.lifecycle,
+        );
         if let Some(notification) = notification
             && let Some(outgoing) = self.manager.outgoing.clone()
         {
@@ -160,6 +169,10 @@ impl ThreadWatchManager {
             .await;
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "A poisoned canonical status lock may contain a partial mutation and must not publish it"
+    )]
     pub(crate) async fn loaded_status_for_thread(&self, thread_id: &str) -> ThreadStatus {
         self.state
             .lock()
@@ -167,6 +180,10 @@ impl ThreadWatchManager {
             .loaded_status_for_thread(thread_id)
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "A poisoned canonical status lock may contain a partial mutation and must not publish it"
+    )]
     pub(crate) async fn loaded_statuses_for_threads(
         &self,
         thread_ids: Vec<String>,
@@ -219,6 +236,7 @@ impl ThreadWatchManager {
             runtime.running = false;
             runtime.pending_permission_requests = 0;
             runtime.pending_user_input_requests = 0;
+            runtime.lifecycle = Arc::new(());
             runtime.is_loaded = false;
         })
         .await;
@@ -229,6 +247,7 @@ impl ThreadWatchManager {
             runtime.running = false;
             runtime.pending_permission_requests = 0;
             runtime.pending_user_input_requests = 0;
+            runtime.lifecycle = Arc::new(());
             runtime.has_system_error = true;
         })
         .await;
@@ -239,6 +258,7 @@ impl ThreadWatchManager {
             runtime.running = false;
             runtime.pending_permission_requests = 0;
             runtime.pending_user_input_requests = 0;
+            runtime.lifecycle = Arc::new(());
             if let Some(failed) = failed {
                 runtime.has_system_error = failed;
             }
@@ -267,33 +287,41 @@ impl ThreadWatchManager {
         thread_id: &str,
         guard_type: ThreadWatchActiveGuardType,
     ) -> ThreadWatchActiveGuard {
+        let mut lifecycle = Arc::new(());
         let notification = self.mutate_state(|state| {
-            state.update_runtime(thread_id, move |runtime| {
+            state.update_runtime(thread_id, |runtime| {
+                lifecycle = Arc::clone(&runtime.lifecycle);
                 runtime.is_loaded = true;
                 let counter = Self::pending_counter(runtime, guard_type);
                 *counter = counter.saturating_add(1);
             })
         });
         // Own the decrement before notification delivery can suspend or be canceled.
-        let guard = ThreadWatchActiveGuard::new(self.clone(), thread_id.to_string(), guard_type);
+        let guard =
+            ThreadWatchActiveGuard::new(self.clone(), thread_id.to_string(), guard_type, lifecycle);
         self.publish_notification(notification).await;
         guard
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "A poisoned canonical status lock may contain a partial mutation and must not publish it"
+    )]
     fn mutate_state<F>(&self, mutate: F) -> Option<ThreadStatusChangedNotification>
     where
         F: FnOnce(&mut ThreadWatchState) -> Option<ThreadStatusChangedNotification>,
     {
         let mut state = self.state.lock().expect("thread watch state poisoned");
         let notification = mutate(&mut state);
-        let running_turn_count = state
-            .runtime_by_thread_id
-            .values()
-            .filter(|runtime| runtime.running)
-            .count();
         // Retain the count for late subscribers and publish under the state
         // lock so an older mutation cannot overwrite a newer count.
-        self.running_turn_count_tx.send_replace(running_turn_count);
+        self.running_turn_count_tx.send_if_modified(|count| {
+            if *count == state.running_turn_count {
+                return false;
+            }
+            *count = state.running_turn_count;
+            true
+        });
         notification
     }
 
@@ -315,6 +343,10 @@ impl ThreadWatchManager {
         }
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "A poisoned canonical status lock may contain a partial mutation and must not publish it"
+    )]
     pub(crate) async fn subscribe(&self, thread_id: ThreadId) -> Option<ThreadStatusSubscription> {
         let thread_id = thread_id.to_string();
         let receiver = self
@@ -333,12 +365,18 @@ impl ThreadWatchManager {
         &self,
         thread_id: &str,
         guard_type: ThreadWatchActiveGuardType,
+        lifecycle: &Arc<()>,
     ) -> Option<ThreadStatusChangedNotification> {
         self.mutate_state(|state| {
-            state.update_runtime(thread_id, move |runtime| {
-                let counter = Self::pending_counter(runtime, guard_type);
-                *counter = counter.saturating_sub(1);
-            })
+            let previous_status = state.status_for(thread_id);
+            let runtime = state.runtime_by_thread_id.get_mut(thread_id)?;
+            if !Arc::ptr_eq(&runtime.lifecycle, lifecycle) {
+                return None;
+            }
+            let counter = Self::pending_counter(runtime, guard_type);
+            *counter = counter.saturating_sub(1);
+            state.update_status_watcher_for_thread(thread_id);
+            state.status_changed_notification(thread_id.to_string(), previous_status)
         })
     }
 
@@ -380,6 +418,7 @@ pub(crate) fn resolve_thread_status(
 
 #[derive(Default)]
 struct ThreadWatchState {
+    running_turn_count: usize,
     runtime_by_thread_id: HashMap<String, RuntimeFacts>,
     status_watcher_by_thread_id: HashMap<String, watch::Sender<ThreadStatus>>,
 }
@@ -406,7 +445,9 @@ impl ThreadWatchState {
 
     fn remove_thread(&mut self, thread_id: &str) -> Option<ThreadStatusChangedNotification> {
         let previous_status = self.status_for(thread_id);
-        self.runtime_by_thread_id.remove(thread_id);
+        if let Some(runtime) = self.runtime_by_thread_id.remove(thread_id) {
+            self.running_turn_count -= usize::from(runtime.running);
+        }
         self.update_status_watcher(thread_id, &ThreadStatus::NotLoaded);
         if previous_status.is_some() && previous_status != Some(ThreadStatus::NotLoaded) {
             Some(ThreadStatusChangedNotification {
@@ -432,7 +473,10 @@ impl ThreadWatchState {
             .entry(thread_id.to_string())
             .or_default();
         runtime.is_loaded = true;
+        let was_running = runtime.running;
         mutate(runtime);
+        self.running_turn_count =
+            self.running_turn_count - usize::from(was_running) + usize::from(runtime.running);
         self.update_status_watcher_for_thread(thread_id);
         self.status_changed_notification(thread_id.to_string(), previous_status)
     }
@@ -504,6 +548,7 @@ impl ThreadWatchState {
 
 #[derive(Clone, Default)]
 struct RuntimeFacts {
+    lifecycle: Arc<()>,
     is_loaded: bool,
     running: bool,
     pending_permission_requests: u32,
@@ -546,6 +591,105 @@ mod tests {
 
     const INTERACTIVE_THREAD_ID: &str = "00000000-0000-0000-0000-000000000001";
     const NON_INTERACTIVE_THREAD_ID: &str = "00000000-0000-0000-0000-000000000002";
+
+    #[tokio::test]
+    async fn stale_guards_cannot_clear_requests_from_a_new_lifecycle() {
+        for reset in 0..4 {
+            let manager = ThreadWatchManager::new();
+            manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
+            let old_permission = manager
+                .note_permission_requested(INTERACTIVE_THREAD_ID)
+                .await;
+            let old_input = manager
+                .note_user_input_requested(INTERACTIVE_THREAD_ID)
+                .await;
+            match reset {
+                0 => {
+                    manager
+                        .note_turn_completed(INTERACTIVE_THREAD_ID, false)
+                        .await
+                }
+                1 => manager.note_system_error(INTERACTIVE_THREAD_ID).await,
+                2 => manager.note_thread_shutdown(INTERACTIVE_THREAD_ID).await,
+                _ => manager.remove_thread(INTERACTIVE_THREAD_ID).await,
+            }
+            manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
+            let permission = manager
+                .note_permission_requested(INTERACTIVE_THREAD_ID)
+                .await;
+            let input = manager
+                .note_user_input_requested(INTERACTIVE_THREAD_ID)
+                .await;
+            drop(old_permission);
+            drop(old_input);
+            assert_eq!(
+                manager
+                    .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                    .await,
+                ThreadStatus::Active {
+                    active_flags: vec![
+                        ThreadActiveFlag::WaitingOnApproval,
+                        ThreadActiveFlag::WaitingOnUserInput
+                    ],
+                }
+            );
+            assert_eq!(*manager.subscribe_running_turn_count().borrow(), 1);
+            drop(permission);
+            drop(input);
+            assert_eq!(
+                manager
+                    .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                    .await,
+                ThreadStatus::Active {
+                    active_flags: vec![]
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_guard_drop_does_not_reload_removed_or_shutdown_thread() {
+        for remove in [false, true] {
+            let manager = ThreadWatchManager::new();
+            let guard = manager
+                .note_permission_requested(INTERACTIVE_THREAD_ID)
+                .await;
+            if remove {
+                manager.remove_thread(INTERACTIVE_THREAD_ID).await;
+            } else {
+                manager.note_thread_shutdown(INTERACTIVE_THREAD_ID).await;
+            }
+            drop(guard);
+            assert_eq!(
+                manager
+                    .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                    .await,
+                ThreadStatus::NotLoaded
+            );
+            assert_eq!(*manager.subscribe_running_turn_count().borrow(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn running_count_watcher_only_wakes_when_count_changes() {
+        let manager = ThreadWatchManager::new();
+        let mut count = manager.subscribe_running_turn_count();
+        manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
+        assert_eq!(*count.borrow_and_update(), 1);
+        let guard = manager
+            .note_permission_requested(INTERACTIVE_THREAD_ID)
+            .await;
+        drop(guard);
+        assert!(!count.has_changed().expect("watcher open"));
+        manager.note_turn_started(NON_INTERACTIVE_THREAD_ID).await;
+        assert_eq!(*count.borrow_and_update(), 2);
+        manager.remove_thread(INTERACTIVE_THREAD_ID).await;
+        assert_eq!(*count.borrow_and_update(), 1);
+        manager
+            .note_thread_shutdown(NON_INTERACTIVE_THREAD_ID)
+            .await;
+        assert_eq!(*count.borrow_and_update(), 0);
+    }
 
     #[tokio::test]
     async fn loaded_status_defaults_to_not_loaded_for_untracked_threads() {

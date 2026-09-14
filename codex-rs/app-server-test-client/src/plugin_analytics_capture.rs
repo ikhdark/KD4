@@ -10,36 +10,47 @@ pub(super) fn read_events_for_remote_plugin(
     path: &Path,
     remote_plugin_id: &str,
 ) -> Result<Vec<Value>> {
-    let contents = match fs::read_to_string(path) {
+    Ok(read_capture_events(path)?
+        .into_iter()
+        .filter(|event| event["event_params"]["remote_plugin_id"] == remote_plugin_id)
+        .collect())
+}
+
+pub(super) fn read_capture_events(path: &Path) -> Result<Vec<Value>> {
+    let contents = match fs::read(path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => {
             return Err(err).with_context(|| format!("read capture file {}", path.display()));
         }
     };
-    let mut matching = Vec::new();
-    for (index, line) in contents.lines().enumerate() {
-        if line.trim().is_empty() {
+    let mut captured = Vec::new();
+    let mut lines = contents.split(|byte| *byte == b'\n').peekable();
+    let mut index = 0;
+    while let Some(line) = lines.next() {
+        index += 1;
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let payload: Value = serde_json::from_str(line).with_context(|| {
-            format!(
-                "parse analytics capture line {} from {}",
-                index + 1,
-                path.display()
-            )
-        })?;
-        let events = payload["events"]
-            .as_array()
+        let mut payload: Value = match serde_json::from_slice(line) {
+            Ok(payload) => payload,
+            Err(err) if lines.peek().is_none() && err.is_eof() => break,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "parse analytics capture line {index} from {}",
+                        path.display()
+                    )
+                });
+            }
+        };
+        let events = payload
+            .get_mut("events")
+            .and_then(Value::as_array_mut)
             .context("analytics capture payload is missing events")?;
-        matching.extend(
-            events
-                .iter()
-                .filter(|event| event["event_params"]["remote_plugin_id"] == remote_plugin_id)
-                .cloned(),
-        );
+        captured.append(events);
     }
-    Ok(matching)
+    Ok(captured)
 }
 
 pub(super) struct PluginEventIdentity<'a> {
@@ -78,18 +89,29 @@ fn validate_event(event: &Value, expected: &PluginEventIdentity<'_>) -> Result<(
     require_string(params, "remote_plugin_id", expected.remote_plugin_id)?;
     require_string(params, "plugin_name", expected.plugin_name)?;
     require_string(params, "marketplace_name", expected.marketplace_name)?;
-    for field in [
-        "has_skills",
-        "mcp_server_count",
-        "connector_ids",
-        "product_client_id",
-    ] {
-        if params.get(field).is_none_or(Value::is_null) {
-            bail!(
-                "{} event has null or missing `{field}`",
-                event["event_type"]
-            );
-        }
+    validate_capability_metadata(params)?;
+    require_field_type(params, "product_client_id", Value::is_string)
+}
+
+pub(super) fn validate_capability_metadata(params: &Value) -> Result<()> {
+    require_field_type(params, "has_skills", Value::is_boolean)?;
+    require_field_type(params, "mcp_server_count", |value| value.as_u64().is_some())?;
+    require_field_type(params, "connector_ids", is_string_array)
+}
+
+pub(super) fn is_string_array(value: &Value) -> bool {
+    value
+        .as_array()
+        .is_some_and(|values| values.iter().all(Value::is_string))
+}
+
+pub(super) fn require_field_type(
+    params: &Value,
+    field: &str,
+    valid: impl FnOnce(&Value) -> bool,
+) -> Result<()> {
+    if !params.get(field).is_some_and(valid) {
+        bail!("analytics event has invalid or missing `{field}`");
     }
     Ok(())
 }

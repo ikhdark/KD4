@@ -279,4 +279,37 @@ inspect = "low"
     merge_owned_toml_values(&mut owned_base, overlay);
 
     assert_eq!(borrowed_base, owned_base);
+    assert_eq!(
+        owned_base,
+        parse_toml(
+            r#"
+[memories]
+disable_on_external_context = true
+
+[reasoning_phase_efforts]
+inspect = "low"
+orient = "high"
+"#,
+        )
+    );
+}
+#[test]
+fn domain_normalization_applies_to_inserted_and_replaced_ancestors() {
+    for original in [
+        "",
+        "permissions = false",
+        "[permissions]\ndev = false",
+        "[permissions.dev]\nnetwork = false",
+    ] {
+        let mut base = parse_toml(original);
+        merge_toml_values(
+            &mut base,
+            &parse_toml("[permissions.dev.network.domains]\n'EXAMPLE.COM' = 'deny'"),
+        );
+        assert_eq!(
+            base,
+            parse_toml("[permissions.dev.network.domains]\n'example.com' = 'deny'"),
+            "{original}"
+        );
+    }
 }

@@ -28,6 +28,13 @@ fn workspace_headline_from_response_uses_first_non_empty_headline() {
                 created_at: None,
                 archived_at: None,
             },
+            WorkspaceMessage {
+                message_id: "later-headline-id".to_string(),
+                message_type: WorkspaceMessageType::Headline,
+                message_body: "Later headline".to_string(),
+                created_at: None,
+                archived_at: None,
+            },
         ],
     };
 
@@ -41,11 +48,39 @@ fn workspace_headline_from_response_uses_first_non_empty_headline() {
 fn workspace_headline_from_response_reports_feature_disabled() {
     let response = GetWorkspaceMessagesResponse {
         feature_enabled: false,
-        messages: Vec::new(),
+        messages: vec![WorkspaceMessage {
+            message_id: "headline-id".to_string(),
+            message_type: WorkspaceMessageType::Headline,
+            message_body: "Available headline".to_string(),
+            created_at: None,
+            archived_at: None,
+        }],
     };
 
     assert_eq!(
         workspace_headline_from_response(response),
         WorkspaceHeadlineFetchResult::FeatureDisabled
     );
+}
+
+#[test]
+fn workspace_headline_from_response_reports_no_usable_headline() {
+    for messages in [
+        Vec::new(),
+        vec![WorkspaceMessage {
+            message_id: "empty-headline-id".to_string(),
+            message_type: WorkspaceMessageType::Headline,
+            message_body: " \t ".to_string(),
+            created_at: None,
+            archived_at: None,
+        }],
+    ] {
+        assert_eq!(
+            workspace_headline_from_response(GetWorkspaceMessagesResponse {
+                feature_enabled: true,
+                messages,
+            }),
+            WorkspaceHeadlineFetchResult::Available(None)
+        );
+    }
 }

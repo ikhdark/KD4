@@ -10,6 +10,33 @@ from scripts import readme_toc
 
 
 class ReadmeTocTest(unittest.TestCase):
+    def test_literal_identifiers_survive_inline_formatting(self) -> None:
+        self.assertEqual(
+            readme_toc.generate_toc_lines(
+                [
+                    "## foo_bar **bold** _italic_ ~~old~~ `a_*b*_c`",
+                    "## _private",
+                ]
+            ),
+            [
+                "- [foo_bar bold italic old a_*b*_c](#foo_bar-bold-italic-old-a_b_c)",
+                "- [_private](#_private)",
+            ],
+        )
+
+    def test_generated_slugs_and_code_literals_remain_distinct(self):
+        self.assertEqual(
+            readme_toc.generate_toc_lines(
+                ["## Foo", "## Foo", "## Foo 1", "## `foo_bar`"]
+            ),
+            [
+                "- [Foo](#foo)",
+                "- [Foo](#foo-1)",
+                "- [Foo 1](#foo-1-1)",
+                "- [foo_bar](#foo_bar)",
+            ],
+        )
+
     def test_generate_toc_lines_skips_code_blocks_and_normalizes_slugs(self) -> None:
         lines = [
             "# Title",

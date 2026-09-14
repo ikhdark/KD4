@@ -31,6 +31,7 @@ use crate::spec::create_update_goal_tool;
 #[derive(Clone)]
 pub(crate) struct GoalToolExecutor {
     kind: GoalToolKind,
+    runtime: Arc<crate::runtime::GoalRuntimeHandle>,
     thread_id: ThreadId,
     state_db: Arc<codex_state::StateRuntime>,
     accounting_state: Arc<GoalAccountingState>,
@@ -75,6 +76,7 @@ enum CompletionBudgetReport {
 
 impl GoalToolExecutor {
     pub(crate) fn get(
+        runtime: Arc<crate::runtime::GoalRuntimeHandle>,
         thread_id: ThreadId,
         state_db: Arc<codex_state::StateRuntime>,
         accounting_state: Arc<GoalAccountingState>,
@@ -84,6 +86,7 @@ impl GoalToolExecutor {
     ) -> Self {
         Self {
             kind: GoalToolKind::Get,
+            runtime,
             thread_id,
             state_db,
             accounting_state,
@@ -94,6 +97,7 @@ impl GoalToolExecutor {
     }
 
     pub(crate) fn create(
+        runtime: Arc<crate::runtime::GoalRuntimeHandle>,
         thread_id: ThreadId,
         state_db: Arc<codex_state::StateRuntime>,
         accounting_state: Arc<GoalAccountingState>,
@@ -103,6 +107,7 @@ impl GoalToolExecutor {
     ) -> Self {
         Self {
             kind: GoalToolKind::Create,
+            runtime,
             thread_id,
             state_db,
             accounting_state,
@@ -113,6 +118,7 @@ impl GoalToolExecutor {
     }
 
     pub(crate) fn update(
+        runtime: Arc<crate::runtime::GoalRuntimeHandle>,
         thread_id: ThreadId,
         state_db: Arc<codex_state::StateRuntime>,
         accounting_state: Arc<GoalAccountingState>,
@@ -122,6 +128,7 @@ impl GoalToolExecutor {
     ) -> Self {
         Self {
             kind: GoalToolKind::Update,
+            runtime,
             thread_id,
             state_db,
             accounting_state,
@@ -158,6 +165,20 @@ impl ToolExecutor<ToolCall> for GoalToolExecutor {
 
     fn handle(&self, invocation: ToolCall) -> codex_extension_api::ToolExecutorFuture<'_> {
         Box::pin(async move {
+            let _goal_state_permit = self
+                .runtime
+                .goal_state_permit()
+                .await
+                .map_err(FunctionCallError::Fatal)?;
+            if self
+                .accounting_state
+                .current_turn_id()
+                .is_some_and(|turn_id| turn_id != invocation.turn_id)
+            {
+                return Err(FunctionCallError::RespondToModel(
+                    "goal tool call belongs to an inactive turn".to_string(),
+                ));
+            }
             match self.kind {
                 GoalToolKind::Get => self.handle_get(invocation).await,
                 GoalToolKind::Create => self.handle_create(invocation).await,
@@ -173,6 +194,17 @@ impl GoalToolExecutor {
         invocation: ToolCall,
     ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let _ = invocation.function_arguments()?;
+        if let Some(goal) = self
+            .account_active_goal_progress(
+                &invocation.turn_id,
+                codex_state::GoalAccountingMode::ActiveOnly,
+                &invocation.call_id,
+                BudgetLimitedGoalDisposition::KeepActive,
+            )
+            .await?
+        {
+            return goal_response(Some(goal), CompletionBudgetReport::Omit);
+        }
         let goal = self
             .state_db
             .thread_goals()
@@ -208,7 +240,7 @@ impl GoalToolExecutor {
             .map_err(|err| FunctionCallError::RespondToModel(format!("failed to create goal: {err}")))?
             .ok_or_else(|| {
                 FunctionCallError::RespondToModel(
-                    "cannot create a new goal because this thread has an unfinished goal; complete the existing goal first"
+                    "cannot create a new goal because this thread has an unfinished goal; continue it or ask the user to clear or replace it. Do not mark it complete merely to replace it"
                         .to_string(),
                 )
             })?;
@@ -241,7 +273,21 @@ impl GoalToolExecutor {
             ));
         }
 
+        let intended_goal = self
+            .state_db
+            .thread_goals()
+            .get_thread_goal(self.thread_id)
+            .await
+            .map_err(|err| {
+                FunctionCallError::RespondToModel(format!("failed to read goal: {err}"))
+            })?
+            .ok_or_else(|| {
+                FunctionCallError::RespondToModel(
+                    "cannot update goal because this thread has no goal".to_string(),
+                )
+            })?;
         self.account_active_goal_progress(
+            &invocation.turn_id,
             match args.status {
                 ThreadGoalStatus::Complete => codex_state::GoalAccountingMode::ActiveOrComplete,
                 ThreadGoalStatus::Blocked => codex_state::GoalAccountingMode::ActiveOrStopped,
@@ -266,7 +312,7 @@ impl GoalToolExecutor {
                     objective: None,
                     status: Some(args.status),
                     token_budget: None,
-                    expected_goal_id: None,
+                    expected_goal_id: Some(intended_goal.goal_id),
                 },
             )
             .await
@@ -310,6 +356,7 @@ impl GoalToolExecutor {
 
     async fn account_active_goal_progress(
         &self,
+        turn_id: &str,
         mode: codex_state::GoalAccountingMode,
         event_id: &str,
         budget_limited_goal_disposition: BudgetLimitedGoalDisposition,
@@ -317,18 +364,15 @@ impl GoalToolExecutor {
         for pending_turn_id in self.accounting_state.pending_turn_ids() {
             self.account_goal_progress_for_turn(
                 pending_turn_id.clone(),
-                codex_state::GoalAccountingMode::ActiveOnly,
+                codex_state::GoalAccountingMode::ActiveOrStopped,
                 event_id,
                 BudgetLimitedGoalDisposition::ClearActive,
             )
             .await?;
             self.accounting_state.finish_turn(&pending_turn_id);
         }
-        let Some(turn_id) = self.accounting_state.current_turn_id() else {
-            return Ok(None);
-        };
         self.account_goal_progress_for_turn(
-            turn_id,
+            turn_id.to_string(),
             mode,
             event_id,
             budget_limited_goal_disposition,

@@ -38,7 +38,8 @@ pub struct TaskSummary {
     pub id: TaskId,
     pub title: String,
     pub status: TaskStatus,
-    pub updated_at: DateTime<Utc>,
+    /// Last known update time; absent when the backend supplies no valid timestamp.
+    pub updated_at: Option<DateTime<Utc>>,
     /// Backend environment identifier (when available)
     pub environment_id: Option<String>,
     /// Human-friendly environment label (when available)
@@ -83,6 +84,8 @@ pub enum ApplyStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplyOutcome {
+    /// True only for a fully successful, non-preflight application. A partial
+    /// application can modify files while this is false; inspect `status`.
     pub applied: bool,
     pub status: ApplyStatus,
     pub message: String,
@@ -160,6 +163,8 @@ pub trait CloudBackend: Send + Sync {
         id: TaskId,
         diff_override: Option<String>,
     ) -> CloudBackendFuture<'_, ApplyOutcome>;
+    /// Apply locally. Dropping the future does not stop an already-started Git
+    /// worker, so cancellation alone is not a safe signal to retry a mutation.
     fn apply_task(
         &self,
         id: TaskId,

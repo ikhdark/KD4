@@ -38,12 +38,222 @@ def repository_owned_paths() -> list[Path]:
 
 
 class BuildToolingPolicyTest(unittest.TestCase):
+    def test_python_launcher_bounds_only_the_capability_probe(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node is not available")
+        harness = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+const results = [];
+for (const timeout of [false, true]) {
+  const calls = [], errors = [];
+  let exitCode;
+  try {
+    vm.runInNewContext(source, {
+      require: () => ({spawnSync: (command, args, options) => {
+        calls.push({command, args, options});
+        return timeout ? {error: {code: 'ETIMEDOUT'}} : {status: 0};
+      }}),
+      process: {argv: ['node', 'run-python.js', 'maintenance.py'], env: {PYTHON: 'chosen-python'}, exit: code => {exitCode = code; throw new Error('exit');}},
+      console: {error: message => errors.push(message)},
+    });
+  } catch (error) { if (error.message !== 'exit') throw error; }
+  results.push({calls, errors, exitCode});
+}
+console.log(JSON.stringify(results));
+"""
+        result = subprocess.run(
+            [node, "-e", harness, str(REPO_ROOT / "scripts" / "run-python.js")],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=15,
+        )
+        success, timeout = json.loads(result.stdout)
+        self.assertEqual(success["exitCode"], 0)
+        self.assertEqual(len(success["calls"]), 2)
+        self.assertEqual(success["calls"][0]["options"]["timeout"], 10000)
+        self.assertNotIn("timeout", success["calls"][1]["options"])
+        self.assertEqual(success["calls"][1]["args"], ["maintenance.py"])
+        self.assertEqual(timeout["exitCode"], 1)
+        self.assertEqual(len(timeout["calls"]), 1)
+        self.assertIn("probe timed out", timeout["errors"][0])
+
+    def test_mixed_changed_scripts_report_uncovered_path(self):
+        maintenance = load_root_maintenance_module()
+        with mock.patch.object(maintenance, "run") as run:
+            self.assertEqual(
+                maintenance.main(
+                    [
+                        "test-python",
+                        "--changed",
+                        "scripts/readme_toc.py",
+                        "--changed",
+                        "scripts/unmapped_audit189_helper.py",
+                    ]
+                ),
+                2,
+            )
+            run.assert_not_called()
+        with mock.patch.object(
+            maintenance,
+            "script_inventory",
+            side_effect=AssertionError("broad discovery"),
+        ):
+            self.assertIn(
+                "scripts.test_readme_toc",
+                maintenance.test_modules_for_changed_path("scripts/readme_toc.py"),
+            )
+
+    def test_explicit_package_bound_allows_nested_codex_rs_package(self):
+        from scripts.rust_packages import nearest_package_root
+
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            package = repo / "codex-rs" / "nested" / "codex-rs"
+            package.mkdir(parents=True)
+            (package / "Cargo.toml").write_text('[package]\nname = "nested"\n')
+            self.assertEqual(
+                nearest_package_root(
+                    package / "src" / "lib.rs", repo_root=repo, assume_file=True
+                ),
+                package,
+            )
+
+    def test_analyzer_preserves_child_exit_and_streams_progress(self):
+        result, calls = self.run_workspace_analyzer(
+            "clippy",
+            "--workspace",
+            "--all-features",
+            child_exit=7,
+            os_name="Windows_NT",
+        )
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("child progress", result.stdout)
+
+    def test_analyzer_keeps_excludes_before_compiler_separator(self):
+        result, calls = self.run_workspace_analyzer(
+            "clippy",
+            "--workspace",
+            "--all-features",
+            "--",
+            "-Dwarnings",
+            os_name="Windows_NT",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            calls[0]["args"][-4:], ["--exclude", "codex-code-mode", "--", "-Dwarnings"]
+        )
+        self.assertEqual(calls[1]["args"][-2:], ["--", "-Dwarnings"])
+
+    def test_analyzer_respects_explicit_sandbox_exclusion(self):
+        for exclusion in (
+            ("--exclude", "codex-code-mode"),
+            ("--exclude=codex-code-mode",),
+        ):
+            result, calls = self.run_workspace_analyzer(
+                "clippy",
+                "--workspace",
+                "--all-features",
+                *exclusion,
+                os_name="Windows_NT",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len(calls), 1)
+
+    def test_dead_code_updates_authoritative_encoded_flags(self):
+        result, calls = self.run_workspace_analyzer(
+            "dead-code", "--package=codex-core", encoded_flags="--cfg\x1fexisting"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls[0]["encoded"], "--cfg\x1fexisting\x1f-Ddead_code")
+
+    def run_just_recipe(
+        self, *args: str, missing: str = "", from_subdirectory: bool = False
+    ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
+        if os.name != "nt" or not shutil.which("just") or not shutil.which("pwsh"):
+            self.skipTest("Windows, just, and pwsh are required for recipe tests")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "codex-rs").mkdir()
+            (root / "scripts").mkdir()
+            shutil.copyfile(REPO_ROOT / "justfile", root / "justfile")
+            # Keep real just dispatch and PowerShell argument handling; record
+            # external build/sign/publish commands without executing them.
+            prefix = r"""
+function Record-Call($program, $arguments) {
+    @{ program = $program; args = @($arguments); cwd = (Get-Location).Path } |
+        ConvertTo-Json -Compress | Add-Content -LiteralPath $env:RECIPE_CALLS
+    $global:LASTEXITCODE = 0
+}
+function python { Record-Call 'python' $args }
+function cargo { Record-Call 'cargo' $args }
+function cosign { Record-Call 'cosign' $args }
+function gh {
+    Record-Call 'gh' $args
+    if ($args[1] -eq 'view') { 'artifact.zip' }
+}
+function Get-Command($Name) {
+    if ($Name -ne $env:RECIPE_MISSING) {
+        Microsoft.PowerShell.Core\Get-Command $Name -ErrorAction SilentlyContinue
+    }
+}
+"""
+            (root / "scripts" / "just-shell.py").write_text(
+                "import runpy, sys\n"
+                f"adapter = runpy.run_path({str(REPO_ROOT / 'scripts' / 'just-shell.py')!r})\n"
+                f"raise SystemExit(adapter['run_powershell']({prefix!r} + sys.argv[1], "
+                "sys.argv[2], sys.argv[3:]))\n",
+                encoding="utf-8",
+            )
+            release = root / "_build" / "release" / "test-version"
+            release.mkdir(parents=True)
+            (release / "artifact.zip").write_bytes(b"fixture")
+            calls_path = root / "calls.jsonl"
+            env = {
+                **os.environ,
+                "RECIPE_CALLS": str(calls_path),
+                "RECIPE_MISSING": missing,
+                "CODEX_RELEASE_CERTIFICATE_IDENTITY": "fixture-identity",
+                "CODEX_RELEASE_OIDC_ISSUER": "fixture-issuer",
+            }
+            if missing == "identity":
+                env.pop("CODEX_RELEASE_CERTIFICATE_IDENTITY")
+            result = subprocess.run(
+                ["just", *args],
+                cwd=root / "codex-rs" if from_subdirectory else root,
+                env=env,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                check=False,
+                timeout=45,
+            )
+            calls = (
+                [
+                    json.loads(line)
+                    for line in calls_path.read_text(encoding="utf-8-sig").splitlines()
+                ]
+                if calls_path.exists()
+                else []
+            )
+            for call in calls:
+                call["cwd"] = Path(call["cwd"]).relative_to(root).as_posix()
+            return result, calls
+
     def run_workspace_analyzer(
         self,
         analyzer: str,
         *forwarded_args: str,
         rustflags: str = "",
         os_name: str | None = None,
+        encoded_flags: str | None = None,
+        child_exit: int = 0,
     ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
         shell = powershell()
         if shell is None:
@@ -56,14 +266,13 @@ class BuildToolingPolicyTest(unittest.TestCase):
                 analyzer_path,
             )
             (temp_root / "cargo-lane.ps1").write_text(
-                "param(\n"
-                "    [string]$Lane,\n"
-                "    [Parameter(ValueFromRemainingArguments = $true)]\n"
-                "    [string[]]$Command\n"
-                ")\n"
-                "[ordered]@{ lane = $Lane; args = @($Command); rustflags = $env:RUSTFLAGS } "
+                "$Lane = $args[1]\n"
+                "$Command = @($args | Select-Object -Skip 2)\n"
+                "[ordered]@{ lane = $Lane; args = @($Command); rustflags = $env:RUSTFLAGS; encoded = $env:CARGO_ENCODED_RUSTFLAGS } "
                 "| ConvertTo-Json -Compress | Add-Content -LiteralPath "
-                "$env:CODEX_ANALYZER_TEST_OUTPUT\n",
+                "$env:CODEX_ANALYZER_TEST_OUTPUT\n"
+                "Write-Output 'child progress'\n"
+                f"exit {child_exit}\n",
                 encoding="utf-8",
             )
             output_path = temp_root / "calls.jsonl"
@@ -72,6 +281,9 @@ class BuildToolingPolicyTest(unittest.TestCase):
                 "RUSTFLAGS": rustflags,
                 "CODEX_ANALYZER_TEST_OUTPUT": str(output_path),
             }
+            env.pop("CARGO_ENCODED_RUSTFLAGS", None)
+            if encoded_flags is not None:
+                env["CARGO_ENCODED_RUSTFLAGS"] = encoded_flags
             if os_name is not None:
                 env["OS"] = os_name
             result = subprocess.run(
@@ -222,7 +434,9 @@ class BuildToolingPolicyTest(unittest.TestCase):
                 line for line in skill.splitlines() if line.startswith("name: ")
             ]
             self.assertEqual(len(name_lines), 1, f"invalid skill name in {skill_path}")
-            frontmatter_names.append(name_lines[0].removeprefix("name: ").strip())
+            parsed_name = name_lines[0].removeprefix("name: ").strip()
+            self.assertEqual(parsed_name, skill_dir.name)
+            frontmatter_names.append(parsed_name)
         self.assertEqual(len(frontmatter_names), len(set(frontmatter_names)))
 
     def test_agents_skill_inventory_matches_local_build_tree(self) -> None:
@@ -608,21 +822,24 @@ class BuildToolingPolicyTest(unittest.TestCase):
     def test_root_maintenance_covers_current_script_tooling_tests(self) -> None:
         root_maintenance = load_root_maintenance_module()
 
+        source_paths = []
+        for root in root_maintenance.SCRIPT_AUDIT_ROOTS:
+            for directory, dirs, files in os.walk(root):
+                dirs[:] = [
+                    name for name in dirs if name not in {".venv", "__pycache__"}
+                ]
+                source_paths.extend(
+                    Path(directory) / name for name in files if name.endswith(".py")
+                )
         expected_ruff_targets = sorted(
-            path.relative_to(REPO_ROOT).as_posix()
-            for root in root_maintenance.SCRIPT_AUDIT_ROOTS
-            for path in root.rglob("*.py")
-            if "__pycache__" not in path.parts and ".venv" not in path.parts
+            path.relative_to(REPO_ROOT).as_posix() for path in source_paths
         )
         expected_unittest_targets = sorted(
-            (
-                path.relative_to(REPO_ROOT).with_suffix("").as_posix().replace("/", ".")
-                if root_maintenance.SCRIPTS_ROOT in path.parents
-                else path.relative_to(REPO_ROOT).as_posix()
-            )
-            for root in root_maintenance.SCRIPT_AUDIT_ROOTS
-            for path in root.rglob("test_*.py")
-            if "__pycache__" not in path.parts and ".venv" not in path.parts
+            path.relative_to(REPO_ROOT).with_suffix("").as_posix().replace("/", ".")
+            if root_maintenance.SCRIPTS_ROOT in path.parents
+            else path.relative_to(REPO_ROOT).as_posix()
+            for path in source_paths
+            if path.name.startswith("test_")
         )
 
         self.assertEqual(
@@ -929,9 +1146,13 @@ class BuildToolingPolicyTest(unittest.TestCase):
             with self.subTest(schema_key=retired_key):
                 self.assertNotIn(retired_key, schema)
 
+        repository_paths = repository_owned_paths()
         conditional_dependencies: list[str] = []
-        for manifest_path in (REPO_ROOT / "codex-rs").rglob("Cargo.toml"):
-            if "target" in manifest_path.parts:
+        for manifest_path in repository_paths:
+            if (
+                manifest_path.name != "Cargo.toml"
+                or "codex-rs" not in manifest_path.relative_to(REPO_ROOT).parts
+            ):
                 continue
             manifest = manifest_path.read_text(encoding="utf-8")
             if "[target.'cfg(" in manifest:
@@ -964,8 +1185,6 @@ class BuildToolingPolicyTest(unittest.TestCase):
             with self.subTest(dotslash_platform=retired_platform):
                 self.assertNotIn(retired_platform, dotslash_manifest)
 
-        repository_paths = repository_owned_paths()
-        rust_paths = [path for path in repository_paths if path.suffix == ".rs"]
         host_cfg_pattern = re.compile(
             r"(?:#\s*\[\s*cfg(?:_attr)?|cfg!)\s*\([^)]{0,500}"
             r"\b(?:target_family|target_os|unix|windows)\b"
@@ -978,19 +1197,6 @@ class BuildToolingPolicyTest(unittest.TestCase):
             r"\b_unix_script\b|\bconst\s+IS_(?:MACOS|WINDOWS)\s*:|"
             r"#\[ignore\s*=\s*[\"'][^\"']*(?:linux|macos|unix|windows)[^\"']*[\"']\]"
         )
-        for path in rust_paths:
-            relative_path = path.relative_to(REPO_ROOT).as_posix()
-            source = path.read_text(encoding="utf-8")
-            if host_cfg_pattern.search(source):
-                host_cfg_branches.append(relative_path)
-            if "std::os::unix" in source:
-                unix_imports.append(relative_path)
-            if retired_platform_test_pattern.search(source):
-                retired_platform_test_residue.append(relative_path)
-        self.assertEqual(sorted(host_cfg_branches), [])
-        self.assertEqual(sorted(unix_imports), [])
-        self.assertEqual(sorted(retired_platform_test_residue), [])
-
         source_suffixes = {".js", ".md", ".ps1", ".py", ".rs", ".toml", ".ts"}
         policy_path = Path(__file__).resolve()
         retired_harness_pattern = re.compile(
@@ -999,17 +1205,6 @@ class BuildToolingPolicyTest(unittest.TestCase):
             r"[A-Z0-9_]*)\b"
         )
         retired_harness_variables: list[str] = []
-        for path in repository_paths:
-            if (
-                path.resolve() == policy_path
-                or path.suffix.lower() not in source_suffixes
-            ):
-                continue
-            source = path.read_text(encoding="utf-8")
-            if retired_harness_pattern.search(source):
-                retired_harness_variables.append(path.relative_to(REPO_ROOT).as_posix())
-        self.assertEqual(sorted(retired_harness_variables), [])
-
         compatibility_parser_roots = (
             (REPO_ROOT / "codex-rs" / "apply-patch").resolve(),
             (REPO_ROOT / "codex-rs" / "shell-command").resolve(),
@@ -1025,20 +1220,32 @@ class BuildToolingPolicyTest(unittest.TestCase):
         )
         posix_runtime_launchers: list[str] = []
         for path in repository_paths:
-            resolved_path = path.resolve()
-            if (
-                resolved_path == policy_path
-                or path.suffix.lower() not in source_suffixes
-            ):
+            if path.suffix.lower() not in source_suffixes:
                 continue
-            if any(
+            source = path.read_text(encoding="utf-8")
+            relative_path = path.relative_to(REPO_ROOT).as_posix()
+            if path.suffix == ".rs":
+                if host_cfg_pattern.search(source):
+                    host_cfg_branches.append(relative_path)
+                if "std::os::unix" in source:
+                    unix_imports.append(relative_path)
+                if retired_platform_test_pattern.search(source):
+                    retired_platform_test_residue.append(relative_path)
+            resolved_path = path.resolve()
+            if resolved_path == policy_path:
+                continue
+            if retired_harness_pattern.search(source):
+                retired_harness_variables.append(relative_path)
+            if not any(
                 resolved_path == root or root in resolved_path.parents
                 for root in compatibility_parser_roots
             ):
-                continue
-            source = path.read_text(encoding="utf-8")
-            if posix_runtime_launcher_pattern.search(source):
-                posix_runtime_launchers.append(path.relative_to(REPO_ROOT).as_posix())
+                if posix_runtime_launcher_pattern.search(source):
+                    posix_runtime_launchers.append(relative_path)
+        self.assertEqual(sorted(host_cfg_branches), [])
+        self.assertEqual(sorted(unix_imports), [])
+        self.assertEqual(sorted(retired_platform_test_residue), [])
+        self.assertEqual(sorted(retired_harness_variables), [])
         self.assertEqual(sorted(posix_runtime_launchers), [])
 
         runtime_docs = "\n".join(
@@ -1306,8 +1513,33 @@ class BuildToolingPolicyTest(unittest.TestCase):
                 0,
             )
 
-        for command in calls:
-            self.assertEqual(command[:4], ("uv", "run", "--frozen", "--project"))
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "uv",
+                    "run",
+                    "--frozen",
+                    "--project",
+                    "scripts",
+                    "ruff",
+                    "check",
+                    "scripts/root_maintenance.py",
+                ),
+                (
+                    "uv",
+                    "run",
+                    "--frozen",
+                    "--project",
+                    "scripts",
+                    "python",
+                    "-m",
+                    "unittest",
+                    "scripts.test_build_tooling_policy",
+                    "-v",
+                ),
+            ],
+        )
 
     def test_codex_cli_launcher_parses_under_node(self) -> None:
         node = shutil.which("node")
@@ -1675,10 +1907,6 @@ class BuildToolingPolicyTest(unittest.TestCase):
 
         self.assertIn('$v8SandboxPackage = "codex-code-mode"', analyzer)
         self.assertNotIn("codex-v8-poc", analyzer)
-        self.assertIn(
-            '$workspaceArgs = $cargoArgs + @("--exclude", $v8SandboxPackage)',
-            analyzer,
-        )
         self.assertIn('$packageArgs += @("--package", $v8SandboxPackage)', analyzer)
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
         workspace_recipe = justfile.split("clippy-workspace *args:", 1)[1].split(
@@ -1696,17 +1924,129 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertIn("--package", payloads[1]["args"])
 
     def test_package_validation_defaults_do_not_expand_to_workspace(self) -> None:
-        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+        rejected = (
+            (),
+            ("--quiet",),
+            ("--tests",),
+            ("-p",),
+            ("--package=",),
+            ("--", "-p", "codex-cli"),
+            ("-p", "codex-cli", "--workspace"),
+            ("--all", "--package=codex-cli"),
+        )
+        accepted = (
+            ("-p", "codex-cli"),
+            ("--package", "codex-cli"),
+            ("--package=codex-cli",),
+            ("-pcodex-cli",),
+            ("-p", "codex-cli", "-p", "codex-utils-pty", "--", "-Dwarnings"),
+        )
+        for recipe in ("clippy", "fix"):
+            for args in rejected:
+                with self.subTest(recipe=recipe, args=args):
+                    result, calls = self.run_just_recipe(recipe, *args)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("Pass a package selection", result.stderr)
+                    self.assertEqual(
+                        calls, [], "unscoped invocation reached the lane runner"
+                    )
+            for args in accepted:
+                with self.subTest(recipe=recipe, args=args):
+                    result, calls = self.run_just_recipe(recipe, *args)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(len(calls), 1)
+                    command = calls[0]["args"]
+                    self.assertEqual(
+                        # PowerShell consumes the literal -- when calling the
+                        # recording function instead of a native executable.
+                        command[1:6],
+                        ["run-lane", "--lane", "auto", "cargo", "clippy"],
+                    )
+                    self.assertEqual(command[-len(args) :], list(args))
+                    self.assertEqual("--fix" in command, recipe == "fix")
 
-        self.assertIn("Pass a package/filter to 'just clippy'", justfile)
-        self.assertIn("clippy-workspace *args:", justfile)
-        clippy_recipe = justfile.split("clippy *args:", 1)[1].split("\n\n", 1)[0]
-        workspace_recipe = justfile.split("clippy-workspace *args:", 1)[1].split(
-            "\n\n", 1
-        )[0]
-        self.assertIn("cargo clippy --tests @forwarded_args", clippy_recipe)
-        self.assertNotIn("--workspace", clippy_recipe)
-        self.assertIn("-Analyzer clippy --workspace @forwarded_args", workspace_recipe)
+    def test_release_prerequisites_fail_before_preparation(self) -> None:
+        for recipe, missing, diagnostic in (
+            ("sign-codex-release", "cosign", "cosign is required"),
+            (
+                "publish-codex-release",
+                "identity",
+                "Set CODEX_RELEASE_CERTIFICATE_IDENTITY",
+            ),
+            ("publish-codex-release", "gh", "gh is required"),
+            ("publish-codex-release", "cosign", "cosign is required"),
+        ):
+            with self.subTest(recipe=recipe, missing=missing):
+                result, calls = self.run_just_recipe(
+                    recipe, "test-version", missing=missing
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(diagnostic, result.stderr)
+                self.assertEqual(
+                    calls, [], "missing prerequisite allowed preparation or signing"
+                )
+        result, calls = self.run_just_recipe("publish-codex-release", "test-version")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [call["program"] for call in calls],
+            ["python", "python", "cosign", "cosign", "gh", "gh"],
+        )
+        self.assertEqual(
+            [call["args"][0] for call in calls[2:4]], ["sign-blob", "verify-blob"]
+        )
+        self.assertEqual(
+            [call["args"][:2] for call in calls[4:]],
+            [["release", "create"], ["release", "view"]],
+        )
+
+    def test_app_server_runtime_check_batches_the_existing_test_selections(
+        self,
+    ) -> None:
+        result, calls = self.run_just_recipe("app-server-runtime-check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([call["program"] for call in calls], ["cargo"] * 3)
+        expected = (
+            (
+                "codex-app-server-protocol",
+                {
+                    "command_exec_response_round_trips_runtime_status",
+                    "process_notifications_round_trip",
+                },
+            ),
+            (
+                "codex-app-server",
+                {
+                    "suite::v2::command_exec::command_exec_non_streaming_respects_output_cap",
+                    "process_spawn_reports_buffered_output_cap_reached",
+                    "thread_status::tests::stale_active_running_thread_resume_clears_watch_status",
+                    "thread_status::tests::stale_active_repair_preserves_pending_approval_status",
+                },
+            ),
+        )
+        for call, (package, tests) in zip(calls[:2], expected, strict=True):
+            self.assertEqual(call["args"][:5], ["nextest", "run", "-p", package, "-E"])
+            self.assertEqual(
+                set(call["args"][5].split(" | ")), {f"test({test})" for test in tests}
+            )
+        self.assertEqual(calls[2]["args"], ["check", "-p", "codex-app-server"])
+
+    def test_release_tooling_recipe_runs_from_repository_root(self) -> None:
+        result, calls = self.run_just_recipe(
+            "test-release-tooling", from_subdirectory=True
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["cwd"], ".")
+        self.assertEqual(
+            calls[0]["args"],
+            [
+                "-m",
+                "unittest",
+                "scripts.test_build_tooling_policy",
+                "scripts.test_check_blob_size",
+                "scripts.test_stage_npm_packages",
+            ],
+        )
 
     def test_windows_process_suite_cannot_silently_skip_required_coverage(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
@@ -1857,8 +2197,8 @@ class BuildToolingPolicyTest(unittest.TestCase):
             "cargo clippy --tests @forwarded_args",
             "fix-workspace *args:",
             "clippy-workspace *args:",
-            "Pass a package/filter to 'just fix'",
-            "Pass a package/filter to 'just clippy'",
+            "Pass a package selection (-p/--package) to 'just fix'",
+            "Pass a package selection (-p/--package) to 'just clippy'",
             "cargo nextest run --no-run @forwarded_args",
             'cargo watch -x "check --target-dir $target_dir -p {{ package }}" @forwarded_args',
             'cargo llvm-cov -p "{{ package }}" @($args | Select-Object -Skip 2)',

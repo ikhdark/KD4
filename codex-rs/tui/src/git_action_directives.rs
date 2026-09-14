@@ -68,7 +68,11 @@ pub(crate) fn parse_assistant_markdown(markdown: &str, cwd: &Path) -> ParsedAssi
                 git_actions.push(action);
             }
         }
-        visible_lines.push(visible_line.trim_end().to_string());
+        if visible_line == line {
+            visible_lines.push(visible_line);
+        } else {
+            visible_lines.push(visible_line.trim_end().to_string());
+        }
     }
 
     while visible_lines
@@ -143,7 +147,13 @@ fn strip_line_directives(line: &str) -> (String, Vec<GitActionDirective>) {
             visible.push_str(&remaining[start..]);
             return (visible, actions);
         };
-        let Some(close_brace) = directive[open_brace + 1..].find('}') else {
+        let mut quoted = false;
+        let Some(close_brace) = directive[open_brace + 1..].find(|character| {
+            if character == '"' {
+                quoted = !quoted;
+            }
+            character == '}' && !quoted
+        }) else {
             visible.push_str(&remaining[start..]);
             return (visible, actions);
         };
@@ -270,6 +280,21 @@ fn parse_quoted_value(input: &str) -> Option<(String, &str)> {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn preserves_markdown_hard_breaks_and_braces_inside_quoted_attributes() {
+        let parsed = parse_assistant_markdown(
+            "First line  \nSecond line\n::git-stage{cwd=\"/repo/with}brace\"}",
+            Path::new("/repo"),
+        );
+        assert_eq!(parsed.visible_markdown, "First line  \nSecond line");
+        assert_eq!(
+            parsed.git_actions,
+            vec![GitActionDirective::Stage {
+                cwd: "/repo/with}brace".to_string()
+            }]
+        );
+    }
 
     #[test]
     fn strips_and_parses_git_action_directives() {

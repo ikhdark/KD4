@@ -974,7 +974,7 @@ mod tests {
         // characters. The extra separator and two exclamation marks add three.
         let budget = SkillMetadataBudget::Tokens(18);
 
-        let rendered = build_available_skills_from_metadata(&[long_skill.clone()], budget)
+        let rendered = build_available_skills_from_metadata(std::slice::from_ref(&long_skill), budget)
             .expect("skills should render");
 
         assert_eq!(rendered.report.total_count, 1);

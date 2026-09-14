@@ -256,6 +256,145 @@ fn test_uses_openai_actor_authorization() {
 }
 
 #[test]
+fn configured_header_errors_are_observable_without_exposing_values() {
+    for (name, value) in [
+        ("invalid header", "secret"),
+        (OPENAI_ACTOR_AUTHORIZATION_HEADER, "secret\ninvalid"),
+    ] {
+        let provider = ModelProviderInfo {
+            http_headers: Some(HashMap::from([(name.into(), value.into())])),
+            ..Default::default()
+        };
+        let error = provider
+            .to_api_provider(None)
+            .expect_err("invalid header must fail")
+            .to_string();
+        assert!(error.contains(name));
+        assert!(!error.contains("secret"));
+        assert!(!provider.uses_openai_actor_authorization());
+    }
+    let provider = ModelProviderInfo {
+        env_http_headers: Some(HashMap::from([(
+            "invalid header".into(),
+            "CODEX_MISSING_HEADER_FIXTURE".into(),
+        )])),
+        ..Default::default()
+    };
+    assert!(
+        provider
+            .to_api_provider(None)
+            .expect_err("validate names even when env is absent")
+            .to_string()
+            .contains("invalid header")
+    );
+}
+
+#[test]
+fn actor_authorization_uses_effective_environment_headers() {
+    const VARIABLE: &str = "CODEX_ACTOR_HEADER_TEST_VALUE";
+    const CASE: &str = "CODEX_ACTOR_HEADER_TEST_CASE";
+    if let Ok(case) = std::env::var(CASE) {
+        let provider = ModelProviderInfo {
+            env_http_headers: Some(HashMap::from([(
+                OPENAI_ACTOR_AUTHORIZATION_HEADER.into(),
+                VARIABLE.into(),
+            )])),
+            ..Default::default()
+        };
+        let resolved = provider.to_api_provider(None);
+        match case.as_str() {
+            "valid" => {
+                let resolved = resolved.expect("valid environment header");
+                assert_eq!(
+                    resolved.headers[OPENAI_ACTOR_AUTHORIZATION_HEADER],
+                    "actor-token"
+                );
+                assert!(provider.uses_openai_actor_authorization());
+            }
+            "invalid" => {
+                let error = resolved
+                    .expect_err("invalid environment header")
+                    .to_string();
+                assert!(error.contains(VARIABLE));
+                assert!(!error.contains("secret"));
+                assert!(!provider.uses_openai_actor_authorization());
+            }
+            "missing" | "blank" => {
+                assert!(
+                    !resolved
+                        .expect("optional header")
+                        .headers
+                        .contains_key(OPENAI_ACTOR_AUTHORIZATION_HEADER)
+                );
+                assert!(!provider.uses_openai_actor_authorization());
+            }
+            _ => panic!("unknown header test case"),
+        }
+        return;
+    }
+    // Child processes isolate environment fixtures from concurrently running tests.
+    for (case, value) in [
+        ("valid", Some("actor-token")),
+        ("invalid", Some("secret\ninvalid")),
+        ("blank", Some("  ")),
+        ("missing", None),
+    ] {
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("test executable"));
+        child
+            .args([
+                "--exact",
+                "tests::actor_authorization_uses_effective_environment_headers",
+                "--nocapture",
+            ])
+            .env(CASE, case)
+            .env_remove(VARIABLE);
+        if let Some(value) = value {
+            child.env(VARIABLE, value);
+        }
+        let output = child.output().expect("header test child");
+        assert!(
+            output.status.success(),
+            "{case}: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+            "{case}: the child must execute the header assertions"
+        );
+    }
+}
+
+#[test]
+fn command_auth_validation_rejects_blank_commands_and_conflicts() {
+    for (suffix, expected) in [
+        (
+            "auth.command = ' '",
+            "provider auth.command must not be empty",
+        ),
+        (
+            "auth.command = 'token'\nenv_key = 'TOKEN'",
+            "provider auth cannot be combined with env_key",
+        ),
+        (
+            "auth.command = 'token'\nexperimental_bearer_token = 'token'",
+            "provider auth cannot be combined with experimental_bearer_token",
+        ),
+        (
+            "auth.command = 'token'\nrequires_openai_auth = true",
+            "provider auth cannot be combined with requires_openai_auth",
+        ),
+    ] {
+        let provider: ModelProviderInfo = toml::from_str(suffix).expect("provider fixture");
+        assert_eq!(provider.validate(), Err(expected.to_string()));
+    }
+    let provider: ModelProviderInfo =
+        toml::from_str("auth.command = 'token'").expect("valid provider");
+    assert_eq!(provider.validate(), Ok(()));
+}
+
+#[test]
 fn test_deserialize_provider_auth_config_defaults() {
     let base_dir = tempdir().unwrap();
     let provider_toml = r#"

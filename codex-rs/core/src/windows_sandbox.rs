@@ -298,8 +298,10 @@ async fn run_windows_sandbox_setup_and_persist(
 }
 
 #[cfg(test)]
+type SetupNativeOverride = Box<dyn FnOnce() -> anyhow::Result<()> + Send>;
+#[cfg(test)]
 thread_local! {
-    static SETUP_NATIVE_OVERRIDE: std::cell::RefCell<Option<Box<dyn FnOnce() -> anyhow::Result<()> + Send>>> =
+    static SETUP_NATIVE_OVERRIDE: std::cell::RefCell<Option<SetupNativeOverride>> =
         const { std::cell::RefCell::new(None) };
 }
 

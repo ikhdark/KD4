@@ -26,12 +26,13 @@ pub fn start_memories_startup_task(
     thread: Arc<CodexThread>,
     config: Arc<Config>,
     source: &SessionSource,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     if config.ephemeral
+        || !config.memories.generate_memories
         || !config.features.enabled(Feature::MemoryTool)
         || source.is_non_root_agent()
     {
-        return;
+        return None;
     }
 
     let context = Arc::new(MemoryStartupContext::new(
@@ -45,10 +46,12 @@ pub fn start_memories_startup_task(
 
     if context.state_db().is_none() {
         warn!("state db unavailable for memories startup pipeline; skipping");
-        return;
+        return None;
     }
 
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
+        let lock = crate::control::memory_pipeline_lock(&config.codex_home);
+        let _pipeline_guard = lock.read_owned().await;
         let root = memory_root(&config.codex_home);
         if let Err(err) = tokio::fs::create_dir_all(&root).await {
             warn!("failed creating memories root: {err}");
@@ -75,5 +78,5 @@ pub fn start_memories_startup_task(
         phase1::run(Arc::clone(&context), Arc::clone(&config)).await;
         // Run phase 2.
         phase2::run(context, config).await;
-    });
+    }))
 }

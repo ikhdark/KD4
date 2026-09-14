@@ -823,3 +823,83 @@ fn to_url_returns_the_validated_url() {
         Url::parse("file:///workspace/a%20file.rs").expect("valid URL")
     );
 }
+
+#[test]
+fn repeated_separators_do_not_count_as_parent_components() {
+    for (base, parent, joined) in [
+        ("file:///a//b///", "file:///a", "file:///a/child"),
+        (
+            "file:///a%20b//c///",
+            "file:///a%20b",
+            "file:///a%20b/child",
+        ),
+        ("file:///C:/a//b///", "file:///C:/a", "file:///C:/a/child"),
+        (
+            "file://server/share//b///",
+            "file://server/share",
+            "file://server/share/child",
+        ),
+    ] {
+        let uri = PathUri::parse(base).unwrap();
+        assert_eq!(uri.parent().unwrap().to_string(), parent);
+        assert_eq!(uri.join("../child").unwrap().to_string(), joined);
+    }
+    assert_eq!(
+        PathUri::parse("file:///C:/a//b///")
+            .unwrap()
+            .join(r"\child")
+            .unwrap()
+            .to_string(),
+        "file:///C:/child"
+    );
+}
+
+#[test]
+fn relative_windows_null_paths_remain_relative() {
+    for raw in ["relative\0file", "C:relative\0file", "\\relative\0file"] {
+        let legacy = LegacyAppPathString::from_path(Path::new(raw));
+        assert!(legacy.to_path_uri(PathConvention::Windows).is_err());
+        assert!(legacy.to_inferred_path_uri().is_none());
+    }
+}
+
+#[test]
+fn native_localhost_unc_keeps_its_share_and_convention() {
+    for raw in [r"\\localhost\share\file.rs", r"\\LOCALHOST\share\file.rs"] {
+        let legacy = LegacyAppPathString::from_path(Path::new(raw));
+        let uri = legacy.to_path_uri(PathConvention::Windows).unwrap();
+        assert!(uri.to_string().starts_with(BAD_PATH_URI_PREFIX));
+        assert_eq!(
+            LegacyAppPathString::from_path_uri(&uri, PathConvention::Windows).unwrap(),
+            legacy
+        );
+        let native = AbsolutePathBuf::from_absolute_path_checked(raw).unwrap();
+        assert_eq!(
+            PathUri::from_abs_path(&native).to_abs_path().unwrap(),
+            native
+        );
+    }
+}
+
+#[test]
+fn legacy_posix_drive_shaped_paths_keep_posix_display() {
+    let legacy = LegacyAppPathString::from_path(Path::new("/C:/workspace/file.rs"));
+    assert_eq!(
+        legacy.to_inferred_path_uri().unwrap().to_string(),
+        "file:///C:/workspace/file.rs"
+    );
+    assert_eq!(legacy.render_for_ui(), "/C:/workspace/file.rs");
+    assert!(legacy.to_inferred_abs_path().is_none());
+}
+
+#[test]
+fn absolute_join_can_replace_an_opaque_windows_base() {
+    let base = LegacyAppPathString::from_path(Path::new(r"\\?\C:\base"))
+        .to_path_uri(PathConvention::Windows)
+        .unwrap();
+    assert!(base.join("relative").is_err());
+    assert_eq!(
+        base.join(r"D:\replacement").unwrap().to_string(),
+        "file:///D:/replacement"
+    );
+}

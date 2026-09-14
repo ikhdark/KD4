@@ -102,22 +102,11 @@ pub fn objective_updated_prompt(goal: &ThreadGoal) -> String {
     }
 }
 
-fn escape_xml_text(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
 fn bounded_goal_objective(input: &str) -> String {
-    let escaped = escape_xml_text(input);
-    if escaped.len() <= MAX_RENDERED_GOAL_OBJECTIVE_BYTES {
-        return escaped;
-    }
-
     let content_budget =
         MAX_RENDERED_GOAL_OBJECTIVE_BYTES.saturating_sub(GOAL_OBJECTIVE_TRUNCATED_MARKER.len());
-    let mut bounded = String::with_capacity(MAX_RENDERED_GOAL_OBJECTIVE_BYTES);
+    let mut bounded = String::with_capacity(input.len().min(MAX_RENDERED_GOAL_OBJECTIVE_BYTES));
+    let mut truncation_boundary = 0;
     for character in input.chars() {
         let mut utf8 = [0; 4];
         let escaped_character = match character {
@@ -126,13 +115,18 @@ fn bounded_goal_objective(input: &str) -> String {
             '>' => "&gt;",
             _ => character.encode_utf8(&mut utf8),
         };
-        if bounded.len() + escaped_character.len() > content_budget {
-            break;
+        if bounded.len() + escaped_character.len() > MAX_RENDERED_GOAL_OBJECTIVE_BYTES {
+            bounded.truncate(truncation_boundary);
+            bounded.truncate(bounded.trim_end().len());
+            bounded.push_str(GOAL_OBJECTIVE_TRUNCATED_MARKER);
+            return bounded;
         }
         bounded.push_str(escaped_character);
+        // Reserve marker space only after actual overflow, at a whole escape boundary.
+        if bounded.len() <= content_budget {
+            truncation_boundary = bounded.len();
+        }
     }
-    bounded.truncate(bounded.trim_end().len());
-    bounded.push_str(GOAL_OBJECTIVE_TRUNCATED_MARKER);
     bounded
 }
 

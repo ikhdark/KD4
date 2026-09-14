@@ -1,4 +1,8 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::path::PathBuf;
 use std::string::String;
@@ -25,7 +29,6 @@ use tiny_http::Server;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 use url::Url;
-use urlencoding::decode;
 
 use crate::StoredOAuthTokens;
 use crate::WrappedOAuthTokenResponse;
@@ -59,6 +62,10 @@ pub struct OAuthProviderError {
 }
 
 impl OAuthProviderError {
+    pub fn error_code(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
     pub fn new(error: Option<String>, error_description: Option<String>) -> Self {
         Self {
             error,
@@ -288,10 +295,11 @@ fn spawn_callback_server(
                     if let Err(err) = request.respond(response) {
                         eprintln!("Failed to respond to OAuth callback: {err}");
                     }
-                    if let Err(err) =
-                        tx.send(CallbackResult::Success(OauthCallbackResult { code, state }))
+                    if tx
+                        .send(CallbackResult::Success(OauthCallbackResult { code, state }))
+                        .is_err()
                     {
-                        eprintln!("Failed to send OAuth callback: {err:?}");
+                        eprintln!("OAuth callback receiver closed");
                     }
                     break;
                 }
@@ -300,8 +308,8 @@ fn spawn_callback_server(
                     if let Err(err) = request.respond(response) {
                         eprintln!("Failed to respond to OAuth callback: {err}");
                     }
-                    if let Err(err) = tx.send(CallbackResult::Error(error)) {
-                        eprintln!("Failed to send OAuth callback error: {err:?}");
+                    if tx.send(CallbackResult::Error(error)).is_err() {
+                        eprintln!("OAuth callback receiver closed");
                     }
                     break;
                 }
@@ -354,21 +362,20 @@ fn parse_oauth_callback(path: &str, expected_callback_path: &str) -> CallbackOut
     let mut error = None;
     let mut error_description = None;
 
-    for pair in query.split('&') {
-        let Some((key, value)) = pair.split_once('=') else {
-            continue;
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        let slot = match key.as_ref() {
+            "code" => &mut code,
+            "state" => &mut state,
+            "error" => &mut error,
+            "error_description" => &mut error_description,
+            _ => continue,
         };
-        let Ok(decoded) = decode(value) else {
-            continue;
-        };
-        let decoded = decoded.into_owned();
-        match key {
-            "code" => code = Some(decoded),
-            "state" => state = Some(decoded),
-            "error" => error = Some(decoded),
-            "error_description" => error_description = Some(decoded),
-            _ => {}
+        if slot.replace(value.into_owned()).is_some() {
+            return CallbackOutcome::Invalid;
         }
+    }
+    if code.is_some() && (error.is_some() || error_description.is_some()) {
+        return CallbackOutcome::Invalid;
     }
 
     if let (Some(code), Some(state)) = (code, state.clone()) {
@@ -498,18 +505,14 @@ fn callback_path_from_redirect_uri(redirect_uri: &str) -> Result<String> {
     Ok(parsed.path().to_string())
 }
 
-fn callback_bind_host(callback_url: Option<&str>) -> &'static str {
-    let Some(callback_url) = callback_url else {
-        return "127.0.0.1";
-    };
-
-    let Ok(parsed) = Url::parse(callback_url) else {
-        return "127.0.0.1";
-    };
-
-    match parsed.host_str() {
-        Some("localhost" | "127.0.0.1" | "::1") | None => "127.0.0.1",
-        Some(_) => "0.0.0.0",
+fn callback_bind_host(callback_url: Option<&str>) -> IpAddr {
+    let parsed = callback_url.and_then(|url| Url::parse(url).ok());
+    match parsed.as_ref().and_then(Url::host) {
+        Some(url::Host::Ipv6(ip)) if ip.is_loopback() => IpAddr::V6(ip),
+        Some(url::Host::Ipv6(_)) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        Some(url::Host::Ipv4(ip)) if ip.is_loopback() => IpAddr::V4(ip),
+        Some(url::Host::Domain("localhost")) | None => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        Some(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
     }
 }
 
@@ -534,12 +537,8 @@ impl OauthLoginFlow {
 
         let bind_host = callback_bind_host(callback_url);
         let callback_port = resolve_callback_port(callback_port)?;
-        let bind_addr = match callback_port {
-            Some(port) => format!("{bind_host}:{port}"),
-            None => format!("{bind_host}:0"),
-        };
-
-        let server = Arc::new(Server::http(&bind_addr).map_err(|err| anyhow!(err))?);
+        let bind_addr = SocketAddr::new(bind_host, callback_port.unwrap_or(0));
+        let server = Arc::new(Server::http(bind_addr).map_err(|err| anyhow!(err))?);
         let guard = CallbackServerGuard {
             server: Arc::clone(&server),
         };
@@ -759,7 +758,11 @@ fn append_query_param(url: &str, key: &str, value: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+    use std::net::Ipv6Addr;
+    use std::net::SocketAddr;
     use std::sync::Arc;
+    use super::callback_bind_host;
 
     use axum::Json;
     use axum::Router;
@@ -968,6 +971,45 @@ mod tests {
             .map(|(_, value)| value.into_owned());
 
         assert_eq!(client_id.as_deref(), Some("eci-prd-pub-codex-123"));
+    }
+
+    #[test]
+    fn callback_form_decodes_plus_and_rejects_ambiguous_parameters() {
+        assert_eq!(
+            parse_oauth_callback(
+                "/callback?error=access_denied&error_description=try+again%2Bplease&state=x",
+                "/callback"
+            ),
+            CallbackOutcome::Error {
+                error: OAuthProviderError::new(
+                    Some("access_denied".into()),
+                    Some("try again+please".into())
+                ),
+                state: "x".into(),
+            }
+        );
+        for query in [
+            "code=a&code=b&state=x",
+            "code=a&state=x&state=y",
+            "code=a&state=x&error=denied",
+            "error=a&error=b&state=x",
+        ] {
+            assert_eq!(
+                parse_oauth_callback(&format!("/callback?{query}"), "/callback"),
+                CallbackOutcome::Invalid
+            );
+        }
+    }
+
+    #[test]
+    fn callback_binds_ipv6_loopback_address() {
+        let address = SocketAddr::new(callback_bind_host(Some("http://[::1]:1234/callback")), 0);
+        assert_eq!(address.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        let listener = std::net::TcpListener::bind(address).expect("bind IPv6 loopback");
+        assert_eq!(
+            listener.local_addr().unwrap().ip(),
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        );
     }
 
     #[test]

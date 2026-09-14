@@ -356,11 +356,11 @@ impl PagerView {
             .sum();
         let last = first + self.renderables[idx].desired_height(area.width) as usize;
         let current_top = self.scroll_offset;
-        let current_bottom = current_top.saturating_add(area.height.saturating_sub(1) as usize);
+        let current_bottom = current_top.saturating_add(area.height as usize);
         if first < current_top {
             self.scroll_offset = first;
         } else if last > current_bottom {
-            self.scroll_offset = last.saturating_sub(area.height.saturating_sub(1) as usize);
+            self.scroll_offset = last.saturating_sub(area.height as usize);
         }
     }
 }
@@ -383,6 +383,10 @@ impl CachedRenderable {
 }
 
 impl Renderable for CachedRenderable {
+    fn render_scrolled(&self, area: Rect, buf: &mut Buffer, rows: u16) -> bool {
+        self.renderable.render_scrolled(area, buf, rows)
+    }
+
     fn render(&self, area: Rect, buf: &mut Buffer) {
         self.renderable.render(area, buf);
     }
@@ -403,12 +407,18 @@ struct CellRenderable {
 
 impl Renderable for CellRenderable {
     fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.render_scrolled(area, buf, 0);
+    }
+
+    fn render_scrolled(&self, area: Rect, buf: &mut Buffer, rows: u16) -> bool {
         let hyperlink_lines = self.cell.transcript_hyperlink_lines(area.width);
         let p = Paragraph::new(Text::from(visible_lines(hyperlink_lines.clone())))
             .style(self.style)
-            .wrap(Wrap { trim: false });
+            .wrap(Wrap { trim: false })
+            .scroll((rows, 0));
         p.render(area, buf);
-        mark_buffer_hyperlinks(buf, area, &hyperlink_lines, /*scroll_rows*/ 0);
+        mark_buffer_hyperlinks(buf, area, &hyperlink_lines, usize::from(rows));
+        true
     }
 
     fn desired_height(&self, width: u16) -> u16 {
@@ -422,10 +432,16 @@ struct HyperlinkLinesRenderable {
 
 impl Renderable for HyperlinkLinesRenderable {
     fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.render_scrolled(area, buf, 0);
+    }
+
+    fn render_scrolled(&self, area: Rect, buf: &mut Buffer, rows: u16) -> bool {
         Paragraph::new(Text::from(visible_lines(self.lines.clone())))
             .wrap(Wrap { trim: false })
+            .scroll((rows, 0))
             .render(area, buf);
-        mark_buffer_hyperlinks(buf, area, &self.lines, /*scroll_rows*/ 0);
+        mark_buffer_hyperlinks(buf, area, &self.lines, usize::from(rows));
+        true
     }
 
     fn desired_height(&self, width: u16) -> u16 {
@@ -433,7 +449,7 @@ impl Renderable for HyperlinkLinesRenderable {
             .wrap(Wrap { trim: false })
             .line_count(width)
             .try_into()
-            .unwrap_or(/*default*/ 0)
+            .unwrap_or(u16::MAX)
     }
 }
 
@@ -493,40 +509,38 @@ impl TranscriptOverlay {
         cells
             .iter()
             .enumerate()
-            .flat_map(|(i, c)| {
-                let mut v: Vec<Box<dyn Renderable>> = Vec::new();
-                let mut cell_renderable = if c.as_any().is::<UserHistoryCell>() {
-                    Box::new(CachedRenderable::new(CellRenderable {
-                        cell: c.clone(),
-                        style: if highlight_cell == Some(i) {
-                            user_message_style().reversed()
-                        } else {
-                            user_message_style()
-                        },
-                    })) as Box<dyn Renderable>
-                } else {
-                    Box::new(CachedRenderable::new(CellRenderable {
-                        cell: c.clone(),
-                        style: Style::default(),
-                    })) as Box<dyn Renderable>
-                };
-                if !c.is_stream_continuation() && i > 0 {
-                    cell_renderable = Box::new(InsetRenderable::new(
-                        cell_renderable,
-                        Insets::tlbr(
-                            /*top*/ 1, /*left*/ 0, /*bottom*/ 0, /*right*/ 0,
-                        ),
-                    ));
-                }
-                v.push(cell_renderable);
-                v
-            })
+            .map(|(i, c)| Self::render_cell(c, i, highlight_cell))
             .collect()
+    }
+
+    fn render_cell(
+        c: &Arc<dyn HistoryCell>,
+        i: usize,
+        highlight: Option<usize>,
+    ) -> Box<dyn Renderable> {
+        let style = if c.as_any().is::<UserHistoryCell>() {
+            if highlight == Some(i) {
+                user_message_style().reversed()
+            } else {
+                user_message_style()
+            }
+        } else {
+            Style::default()
+        };
+        let cell: Box<dyn Renderable> = Box::new(CachedRenderable::new(CellRenderable {
+            cell: c.clone(),
+            style,
+        }));
+        if i > 0 && !c.is_stream_continuation() {
+            Box::new(InsetRenderable::new(cell, Insets::tlbr(1, 0, 0, 0)))
+        } else {
+            cell
+        }
     }
 
     /// Insert a committed history cell while keeping any cached live tail.
     ///
-    /// The live tail is temporarily removed, the committed cells are rebuilt,
+    /// The live tail is temporarily removed, the new committed cell is appended,
     /// then the tail is reattached. If the tail previously had no leading
     /// spacing because it was the only renderable, we add the missing inset
     /// when the first committed cell arrives.
@@ -538,8 +552,12 @@ impl TranscriptOverlay {
         let follow_bottom = self.view.is_scrolled_to_bottom();
         let had_prior_cells = !self.cells.is_empty();
         let tail_renderable = self.take_live_tail_renderable();
+        self.view.renderables.push(Self::render_cell(
+            &cell,
+            self.cells.len(),
+            self.highlight_cell,
+        ));
         self.cells.push(cell);
-        self.view.renderables = Self::render_cells(&self.cells, self.highlight_cell);
         if let Some(tail) = tail_renderable {
             let tail = if !had_prior_cells
                 && self
@@ -571,6 +589,12 @@ impl TranscriptOverlay {
     /// transcript overlay immediately reflects the same committed cells as the main transcript.
     pub(crate) fn replace_cells(&mut self, cells: Vec<Arc<dyn HistoryCell>>) {
         let follow_bottom = self.view.is_scrolled_to_bottom();
+        let mut tail = self.take_live_tail_renderable();
+        if self.cells.is_empty() != cells.is_empty() {
+            // The next normal draw rebuilds the tail with the updated leading spacing.
+            tail = None;
+            self.live_tail_key = None;
+        }
         self.cells = cells;
         if self
             .highlight_cell
@@ -578,7 +602,7 @@ impl TranscriptOverlay {
         {
             self.highlight_cell = None;
         }
-        self.rebuild_renderables();
+        self.rebuild_renderables(tail);
         if follow_bottom {
             self.view.scroll_offset = usize::MAX;
         }
@@ -602,6 +626,7 @@ impl TranscriptOverlay {
         let clamped_end = range.end.min(self.cells.len());
         let clamped_start = range.start.min(clamped_end);
         if clamped_start < clamped_end {
+            let tail = self.take_live_tail_renderable();
             let removed = clamped_end - clamped_start;
             if let Some(highlight_cell) = self.highlight_cell.as_mut()
                 && *highlight_cell >= clamped_start
@@ -620,7 +645,17 @@ impl TranscriptOverlay {
             {
                 self.highlight_cell = None;
             }
-            self.rebuild_renderables();
+            self.view.renderables.splice(
+                clamped_start..clamped_end,
+                std::iter::once(Self::render_cell(
+                    &self.cells[clamped_start],
+                    clamped_start,
+                    self.highlight_cell,
+                )),
+            );
+            if let Some(tail) = tail {
+                self.view.renderables.push(tail);
+            }
         }
         if follow_bottom {
             self.view.scroll_offset = usize::MAX;
@@ -676,8 +711,16 @@ impl TranscriptOverlay {
     }
 
     pub(crate) fn set_highlight_cell(&mut self, cell: Option<usize>) {
+        if self.highlight_cell == cell {
+            return;
+        }
+        let previous = self.highlight_cell;
         self.highlight_cell = cell;
-        self.rebuild_renderables();
+        for idx in previous.into_iter().chain(cell) {
+            if let Some(c) = self.cells.get(idx) {
+                self.view.renderables[idx] = Self::render_cell(c, idx, cell);
+            }
+        }
         if let Some(idx) = self.highlight_cell {
             self.view.scroll_chunk_into_view(idx);
         }
@@ -691,8 +734,7 @@ impl TranscriptOverlay {
         self.view.is_scrolled_to_bottom()
     }
 
-    fn rebuild_renderables(&mut self) {
-        let tail_renderable = self.take_live_tail_renderable();
+    fn rebuild_renderables(&mut self, tail_renderable: Option<Box<dyn Renderable>>) {
         self.view.renderables = Self::render_cells(&self.cells, self.highlight_cell);
         if let Some(tail) = tail_renderable {
             self.view.renderables.push(tail);
@@ -920,6 +962,10 @@ fn render_offset_content(
     scroll_offset: u16,
 ) -> u16 {
     let height = renderable.desired_height(area.width);
+    if renderable.render_scrolled(area, buf, scroll_offset) {
+        return area.height.min(height.saturating_sub(scroll_offset));
+    }
+
     let mut tall_buf = Buffer::empty(Rect::new(
         0,
         0,
@@ -1655,5 +1701,102 @@ mod tests {
                 .collect::<String>();
             assert_eq!(actual, expected);
         }
+    }
+    #[test]
+    fn replacing_and_consolidating_history_keeps_exactly_the_real_tail() {
+        let cell = |text: &'static str| -> Arc<dyn HistoryCell> {
+            Arc::new(TestCell {
+                lines: vec![Line::from(text)],
+            })
+        };
+        for live in [false, true] {
+            let mut overlay = transcript_overlay(vec![cell("old-a"), cell("old-b"), cell("old-c")]);
+            if live {
+                overlay.sync_live_tail(
+                    40,
+                    Some(ActiveCellTranscriptKey {
+                        revision: 1,
+                        is_stream_continuation: false,
+                        animation_tick: None,
+                    }),
+                    |_| Some(vec![HyperlinkLine::from("tail")]),
+                );
+            }
+            overlay.replace_cells(vec![cell("new")]);
+            assert_eq!(overlay.view.renderables.len(), 1 + usize::from(live));
+            overlay.replace_cells(vec![cell("a"), cell("b"), cell("c"), cell("d")]);
+            assert_eq!(overlay.view.renderables.len(), 4 + usize::from(live));
+            overlay.consolidate_cells(0..3, cell("merged"));
+            assert_eq!(overlay.view.renderables.len(), 2 + usize::from(live));
+            let area = Rect::new(0, 0, 40, 3);
+            let mut buffer = Buffer::empty(area);
+            overlay
+                .view
+                .renderables
+                .last()
+                .unwrap()
+                .render(area, &mut buffer);
+            let text: String = buffer
+                .content
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect();
+            assert!(text.contains(if live { "tail" } else { "d" }));
+            assert!(!text.contains("old-"));
+        }
+    }
+
+    #[test]
+    fn scrolled_paragraph_renders_only_visible_rows_with_inset() {
+        let renderable =
+            InsetRenderable::new(paragraph_block("row", 10000), Insets::tlbr(1, 0, 0, 0));
+        let area = Rect::new(0, 0, 20, 2);
+        let mut buffer = Buffer::empty(area);
+        assert!(renderable.render_scrolled(area, &mut buffer, 9999));
+        assert_eq!(buffer_to_text(&buffer, area), "row9998\nrow9999\n");
+    }
+
+    #[test]
+    fn exact_bottom_chunk_does_not_scroll() {
+        let mut view = PagerView::new(
+            vec![paragraph_block("row", 3)],
+            "test".into(),
+            0,
+            default_pager_keymap(),
+        );
+        view.ensure_chunk_visible(0, Rect::new(0, 0, 20, 3));
+        assert_eq!(view.scroll_offset, 0);
+        let lines = HyperlinkLinesRenderable {
+            lines: vec![HyperlinkLine::from("x"); 65536],
+        };
+        assert_eq!(lines.desired_height(1), u16::MAX);
+    }
+    #[test]
+    fn append_and_unchanged_highlight_preserve_height_cache() {
+        #[derive(Debug)]
+        struct CountingCell(Arc<std::sync::atomic::AtomicUsize>);
+        impl HistoryCell for CountingCell {
+            fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+                vec![Line::from("cached")]
+            }
+            fn raw_lines(&self) -> Vec<Line<'static>> {
+                vec![Line::from("cached")]
+            }
+            fn desired_transcript_height(&self, _width: u16) -> u16 {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                1
+            }
+        }
+        let measurements = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut overlay = transcript_overlay(vec![Arc::new(CountingCell(measurements.clone()))]);
+        assert_eq!(overlay.view.content_height(40), 1);
+        overlay.set_highlight_cell(None);
+        overlay.insert_cell(Arc::new(TestCell {
+            lines: vec![Line::from("new")],
+        }));
+        assert_eq!(overlay.view.content_height(40), 3);
+        assert_eq!(measurements.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(overlay.view.content_height(20), 3);
+        assert_eq!(measurements.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 }

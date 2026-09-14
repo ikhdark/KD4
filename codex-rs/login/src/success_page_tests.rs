@@ -7,7 +7,7 @@ use super::*;
 #[test]
 fn compose_success_url_uses_local_page_by_default() {
     let LoginSuccessRedirect::Local(url) = compose_success_url(
-        /*port*/ 1455,
+        /*port*/ 43123,
         DEFAULT_ISSUER,
         "e30.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnt9fQ.sig",
         "e30.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnt9fQ.sig",
@@ -19,7 +19,9 @@ fn compose_success_url_uses_local_page_by_default() {
     let url = Url::parse(&url).expect("success URL should parse");
 
     assert_eq!(url.host_str(), Some("localhost"));
+    assert_eq!(url.port(), Some(43123));
     assert_eq!(url.path(), "/success");
+    assert!(!url.query_pairs().any(|(key, _)| key == "id_token"));
     assert_eq!(
         url.query_pairs()
             .find(|(key, _)| key == "codex_streamlined_login"),
@@ -59,7 +61,8 @@ fn compose_success_url_uses_hosted_page_when_requested() {
             "e30.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnt9fQ.sig",
             /*codex_streamlined_login*/ false,
             &LoginSuccessPage::Hosted {
-                url: Url::parse(CODEX_OPEN_APP_URL).expect("open app URL should parse"),
+                url: Url::parse("https://chatgpt.com/codex/open-app?id_token=secret&old=value")
+                    .expect("open app URL should parse"),
                 app_brand: LoginSuccessPageBrand::Chatgpt,
             },
         ),
@@ -117,4 +120,33 @@ fn compose_success_url_keeps_setup_on_local_page() {
             .map(|(_, value)| value.into_owned()),
         Some("true".to_string())
     );
+}
+
+#[test]
+fn issuer_trailing_slash_and_jwt_shape_preserve_setup_contract() {
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({
+        "https://api.openai.com/auth": {"is_org_owner": true, "organization_id": "org", "project_id": "project", "chatgpt_plan_type": "pro"}
+    })).unwrap());
+    let jwt = format!("e30.{payload}.sig");
+    let LoginSuccessRedirect::Local(url) = compose_success_url(
+        1455,
+        &format!("{DEFAULT_ISSUER}/"),
+        &jwt,
+        &jwt,
+        false,
+        &LoginSuccessPage::Local,
+    ) else {
+        panic!("expected local setup");
+    };
+    let url = Url::parse(&url).unwrap();
+    let params: std::collections::HashMap<_, _> = url.query_pairs().collect();
+    assert_eq!(params["platform_url"], "https://platform.openai.com");
+    assert_eq!(params["needs_setup"], "true");
+    assert_eq!(params["org_id"], "org");
+    assert_eq!(params["project_id"], "project");
+    assert_eq!(params["plan_type"], "pro");
+    assert_eq!(params["id_token"], jwt);
+    for invalid in [format!("{jwt}.extra"), format!("{jwt}."), "e30..sig".into()] {
+        assert!(jwt_auth_claims(&invalid).is_empty());
+    }
 }

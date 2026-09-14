@@ -313,9 +313,9 @@ async fn remove_legacy_tui_log_file(codex_home: &Path) {
 }
 
 fn remote_addr_has_explicit_port(addr: &str, parsed: &Url) -> bool {
-    let Some(host) = parsed.host_str() else {
+    if parsed.host_str().is_none() {
         return false;
-    };
+    }
     if parsed.port().is_some() {
         return true;
     }
@@ -333,12 +333,9 @@ fn remote_addr_has_explicit_port(addr: &str, parsed: &Url) -> bool {
         "wss" => 443,
         _ => return false,
     };
-    let expected_host = if host.contains(':') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    };
-    host_and_port == format!("{expected_host}:{explicit_default_port}")
+    host_and_port
+        .rsplit_once(':')
+        .is_some_and(|(_, port)| port.parse::<u16>().ok() == Some(explicit_default_port))
 }
 
 pub fn resolve_remote_addr(addr: &str) -> color_eyre::Result<RemoteAppServerEndpoint> {
@@ -632,7 +629,16 @@ async fn lookup_session_target_with_app_server(
                     %err,
                     "thread/read failed during TUI session lookup"
                 );
-                Ok(None)
+                if app_server_session::server_error_data_from_report::<
+                    codex_app_server_protocol::ThreadErrorData,
+                >(&err)
+                .is_some_and(|data| {
+                    data.reason == codex_app_server_protocol::ThreadErrorReason::NotFound
+                }) {
+                    Ok(None)
+                } else {
+                    Err(err)
+                }
             }
         };
     }
@@ -1034,14 +1040,14 @@ pub async fn run_main(
         ..Default::default()
     };
 
-    let config = load_config_or_exit(
+    let config = load_config(
         cli_kv_overrides.clone(),
         overrides.clone(),
         loader_overrides.clone(),
         cloud_config_bundle.clone(),
         strict_config,
     )
-    .await;
+    .await?;
 
     set_default_client_residency_requirement(config.enforce_residency.value());
 
@@ -1077,7 +1083,14 @@ pub async fn run_main(
         }
     }
 
-    remove_legacy_tui_log_file(config.codex_home.as_path()).await;
+    let config_toml_log_dir_configured = config
+        .config_layer_stack
+        .effective_config()
+        .as_table()
+        .is_some_and(|table| table.contains_key("log_dir"));
+    if !config_toml_log_dir_configured {
+        remove_legacy_tui_log_file(config.codex_home.as_path()).await;
+    }
 
     let otel_originator = originator().value;
     let otel = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1111,12 +1124,6 @@ pub async fn run_main(
         let _ = codex_state::install_process_db_telemetry(telemetry);
     }
     let state_db = init_state_db_for_app_server_target(&config, &app_server_target).await?;
-
-    let config_toml_log_dir_configured = config
-        .config_layer_stack
-        .effective_config()
-        .as_table()
-        .is_some_and(|table| table.contains_key("log_dir"));
 
     let (tui_file_layer, _tui_file_log_guard) = if config_toml_log_dir_configured {
         let log_dir = config.log_dir.clone();
@@ -1257,21 +1264,36 @@ async fn run_ratatui_app(
         prev_hook(info);
     }));
     let mut initialized_terminal = tui::init()?;
+    let mut terminal_restore_guard = TerminalRestoreGuard::new();
     initialized_terminal.terminal.clear()?;
 
     let mut tui = Tui::new(
         initialized_terminal.terminal,
         initialized_terminal.enhanced_keys_supported,
     );
-    let mut terminal_restore_guard = TerminalRestoreGuard::new();
+
+    #[cfg(not(debug_assertions))]
+    let update_action = update_action::get_update_action();
+    #[cfg(not(debug_assertions))]
+    let startup_version = updates::startup_version_info(&initial_config, update_action).await;
 
     #[cfg(not(debug_assertions))]
     {
         use crate::update_prompt::UpdatePromptOutcome;
 
         let skip_update_prompt = cli.prompt.as_ref().is_some_and(|prompt| !prompt.is_empty());
-        if !skip_update_prompt {
-            match update_prompt::run_update_prompt_if_needed(&mut tui, &initial_config).await? {
+        if !skip_update_prompt
+            && let Some(action) = update_action
+            && let Some(latest) = updates::get_upgrade_version_for_popup(startup_version.as_ref())
+        {
+            match update_prompt::run_update_prompt_if_needed(
+                &mut tui,
+                &initial_config,
+                latest,
+                action,
+            )
+            .await?
+            {
                 UpdatePromptOutcome::Continue => {}
                 UpdatePromptOutcome::RunUpdate(action) => {
                     terminal_restore_guard.restore()?;
@@ -1401,14 +1423,14 @@ async fn run_ratatui_app(
             if onboarding_result.directory_trust_persisted
                 || (show_login_screen && !uses_remote_workspace)
             {
-                load_config_or_exit(
+                load_config(
                     cli_kv_overrides.clone(),
                     overrides.clone(),
                     loader_overrides.clone(),
                     cloud_config_bundle.clone(),
                     strict_config,
                 )
-                .await
+                .await?
             } else {
                 initial_config
             }
@@ -1601,7 +1623,7 @@ async fn run_ratatui_app(
 
         let mut config = match &session_selection {
             resume_picker::SessionSelection::Resume(_) | resume_picker::SessionSelection::Fork(_) => {
-                load_config_or_exit_with_fallback_cwd(
+                load_config_with_fallback_cwd(
                     cli_kv_overrides.clone(),
                     overrides.clone(),
                     loader_overrides.clone(),
@@ -1609,17 +1631,17 @@ async fn run_ratatui_app(
                     strict_config,
                     fallback_cwd,
                 )
-                .await
+                .await?
             }
             resume_picker::SessionSelection::StartFresh if picker_cancelled_without_selection => {
-                load_config_or_exit(
+                load_config(
                     cli_kv_overrides.clone(),
                     overrides.clone(),
                     loader_overrides.clone(),
                     cloud_config_bundle.clone(),
                     strict_config,
                 )
-                .await
+                .await?
             }
             _ => config,
         };
@@ -1718,17 +1740,20 @@ async fn run_ratatui_app(
         );
         let startup_bootstrap = Some(startup_bootstrap?);
         let startup_elapsed_before_app = startup_prefetch_started_at.elapsed();
-        let startup_hooks_browser = match maybe_run_startup_hooks_review(
-            &mut app_server,
-            &mut tui,
-            &config,
-            bypass_hook_trust_for_startup_review,
-            startup_hooks_entry,
-        )
-        .await?
-        {
-            StartupHooksReviewOutcome::Continue => None,
-            StartupHooksReviewOutcome::OpenHooksBrowser(data) => Some(data),
+        let startup_hooks_browser = match startup_hooks_entry {
+            Ok(entry) => match maybe_run_startup_hooks_review(
+                &mut app_server,
+                &mut tui,
+                &config,
+                bypass_hook_trust_for_startup_review,
+                entry,
+            )
+            .await?
+            {
+                StartupHooksReviewOutcome::Continue => Ok(None),
+                StartupHooksReviewOutcome::OpenHooksBrowser(data) => Ok(Some(data)),
+            },
+            Err(err) => Err(format!("Failed to load startup hook review: {err:#}")),
         };
 
         let app_result = App::run(
@@ -1751,6 +1776,8 @@ async fn run_ratatui_app(
             startup_elapsed_before_app,
             startup_bootstrap,
             startup_hooks_browser,
+            #[cfg(not(debug_assertions))]
+            startup_version.map(|info| info.latest_version),
         )
         .await;
 
@@ -1848,14 +1875,14 @@ async fn get_login_status(
     })
 }
 
-async fn load_config_or_exit(
+async fn load_config(
     cli_kv_overrides: Vec<(String, toml::Value)>,
     overrides: ConfigOverrides,
     loader_overrides: LoaderOverrides,
     cloud_config_bundle: CloudConfigBundleLoader,
     strict_config: bool,
-) -> Config {
-    load_config_or_exit_with_fallback_cwd(
+) -> std::io::Result<Config> {
+    load_config_with_fallback_cwd(
         cli_kv_overrides,
         overrides,
         loader_overrides,
@@ -1866,16 +1893,15 @@ async fn load_config_or_exit(
     .await
 }
 
-async fn load_config_or_exit_with_fallback_cwd(
+async fn load_config_with_fallback_cwd(
     cli_kv_overrides: Vec<(String, toml::Value)>,
     overrides: ConfigOverrides,
     loader_overrides: LoaderOverrides,
     cloud_config_bundle: CloudConfigBundleLoader,
     strict_config: bool,
     fallback_cwd: Option<PathBuf>,
-) -> Config {
-    #[allow(clippy::print_stderr)]
-    match ConfigBuilder::default()
+) -> std::io::Result<Config> {
+    ConfigBuilder::default()
         .cli_overrides(cli_kv_overrides)
         .harness_overrides(overrides)
         .loader_overrides(loader_overrides)
@@ -1884,13 +1910,9 @@ async fn load_config_or_exit_with_fallback_cwd(
         .fallback_cwd(fallback_cwd)
         .build()
         .await
-    {
-        Ok(config) => config,
-        Err(err) => {
-            eprintln!("Error loading configuration: {err}");
-            std::process::exit(1);
-        }
-    }
+        .map_err(|err| {
+            std::io::Error::new(err.kind(), format!("Error loading configuration: {err}"))
+        })
 }
 
 #[allow(clippy::print_stderr)]
@@ -2237,6 +2259,18 @@ mod tests {
         };
 
         assert_eq!(target.display_label(), format!("thread {thread_id}"));
+    }
+
+    #[test]
+    fn resolve_remote_addr_accepts_explicit_default_ipv6_ports() {
+        for address in ["ws://[::1]:80", "wss://[::1]:443"] {
+            assert!(
+                resolve_remote_addr(address).is_ok(),
+                "explicit IPv6 port rejected: {address}"
+            );
+        }
+        assert!(resolve_remote_addr("ws://[::1]").is_err());
+        assert!(resolve_remote_addr("wss://[::1]").is_err());
     }
 
     #[test]
@@ -3114,6 +3148,10 @@ trust_level = "untrusted"
     /// Exercise the production final-theme step with reloaded config, in a fresh process
     /// so syntax-highlighting OnceLocks and CODEX_HOME cannot affect other tests.
     #[test]
+    #[expect(
+        clippy::print_stdout,
+        reason = "The parent process requires this stdout marker to prove child assertions executed"
+    )]
     fn theme_warning_uses_final_config() -> std::io::Result<()> {
         const CHILD: &str = "CODEX_TEST_FINAL_THEME_CHILD";
         const PASSED: &str = "FINAL_THEME_CHILD_ASSERTIONS_PASSED";
@@ -3199,6 +3237,10 @@ trust_level = "untrusted"
         Ok(())
     }
     #[test]
+    #[expect(
+        clippy::print_stdout,
+        reason = "The parent process requires this stdout marker to prove child assertions executed"
+    )]
     fn run_main_configured_log_directory_creates_appends_and_reports_failure() -> std::io::Result<()>
     {
         const CHILD: &str = "CODEX_TEST_CONFIGURED_LOG_STARTUP";
@@ -3206,7 +3248,11 @@ trust_level = "untrusted"
         if let Some(case) = std::env::var_os(CHILD) {
             use clap::Parser;
             let home = PathBuf::from(std::env::var_os("CODEX_HOME").expect("isolated home"));
-            let log_dir = home.join("configured-logs");
+            let log_dir = home.join(if case == "legacy-append" {
+                "log"
+            } else {
+                "configured-logs"
+            });
             let log_file = log_dir.join(TUI_LOG_FILE_NAME);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -3218,11 +3264,29 @@ trust_level = "untrusted"
                 home.to_str().expect("UTF-8 temporary home"),
             ]);
             let result = runtime.block_on(async {
+                if case == "invalid-reload" {
+                    return load_config(
+                        vec![("model".to_string(), toml::Value::Integer(42))],
+                        ConfigOverrides {
+                            cwd: Some(home.clone()),
+                            ..Default::default()
+                        },
+                        LoaderOverrides::without_managed_config_for_tests(),
+                        CloudConfigBundleLoader::default(),
+                        true,
+                    )
+                    .await
+                    .map(|_| panic!("invalid model type must fail configuration reload"));
+                }
                 tokio::time::timeout(
                     std::time::Duration::from_secs(30),
                     run_main(
                         cli,
-                        Arg0DispatchPaths { codex_self_exe: Some(std::env::current_exe().expect("isolated test executable")) },
+                        Arg0DispatchPaths {
+                            codex_self_exe: Some(
+                                std::env::current_exe().expect("isolated test executable"),
+                            ),
+                        },
                         LoaderOverrides::without_managed_config_for_tests(),
                         None,
                     ),
@@ -3232,7 +3296,16 @@ trust_level = "untrusted"
             });
             let error = result
                 .expect_err("null stdin deliberately stops before interactive terminal setup");
-            if case == "occupied" {
+            if case == "invalid-reload" {
+                assert!(
+                    error.to_string().contains("Error loading configuration"),
+                    "{error}"
+                );
+                assert!(
+                    !log_file.exists(),
+                    "failed reload must return before opening the log"
+                );
+            } else if case == "occupied" {
                 assert_eq!(std::fs::read(&log_dir)?, b"occupied log path");
                 assert_eq!(
                     error.kind(),
@@ -3250,7 +3323,7 @@ trust_level = "untrusted"
                 );
                 assert!(log_dir.is_dir());
                 let contents = std::fs::read(&log_file)?;
-                if case == "append" {
+                if case == "append" || case == "legacy-append" {
                     assert!(contents.starts_with(b"keep prior log\n"));
                 }
                 #[cfg(windows)]
@@ -3272,13 +3345,23 @@ trust_level = "untrusted"
             println!("{PASSED}");
             return Ok(());
         }
-        for case in ["create", "append", "occupied"] {
+        for case in [
+            "create",
+            "append",
+            "legacy-append",
+            "occupied",
+            "invalid-reload",
+        ] {
             let home = TempDir::new()?;
-            let log_dir = home.path().join("configured-logs");
+            let log_dir = home.path().join(if case == "legacy-append" {
+                "log"
+            } else {
+                "configured-logs"
+            });
             if case == "occupied" {
                 std::fs::write(&log_dir, "occupied log path")?;
             }
-            if case == "append" {
+            if case == "append" || case == "legacy-append" {
                 std::fs::create_dir(&log_dir)?;
                 std::fs::write(log_dir.join(TUI_LOG_FILE_NAME), "keep prior log\n")?;
             }

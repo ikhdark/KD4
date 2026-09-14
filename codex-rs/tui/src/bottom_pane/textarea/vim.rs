@@ -145,7 +145,6 @@ impl TextArea {
 
     fn big_word_range_at_cursor(&self) -> Option<Range<usize>> {
         self.non_ws_runs()
-            .into_iter()
             .find(|range| self.cursor_overlaps_range(range) || self.cursor_is_at_range_end(range))
     }
 
@@ -170,22 +169,15 @@ impl TextArea {
         None
     }
 
-    fn non_ws_runs(&self) -> Vec<Range<usize>> {
-        let mut runs = Vec::new();
-        let mut start = None;
-        for (idx, ch) in self.text.char_indices() {
-            if ch.is_whitespace() {
-                if let Some(run_start) = start.take() {
-                    runs.push(run_start..idx);
-                }
-            } else if start.is_none() {
-                start = Some(idx);
-            }
-        }
-        if let Some(run_start) = start {
-            runs.push(run_start..self.text.len());
-        }
-        runs
+    fn non_ws_runs(&self) -> impl Iterator<Item = Range<usize>> + '_ {
+        let mut chars = self.text.char_indices();
+        std::iter::from_fn(move || {
+            let (start, _) = chars.find(|(_, ch)| !ch.is_whitespace())?;
+            let end = chars
+                .find(|(_, ch)| ch.is_whitespace())
+                .map_or(self.text.len(), |(idx, _)| idx);
+            Some(start..end)
+        })
     }
 
     fn cursor_overlaps_range(&self, range: &Range<usize>) -> bool {
@@ -235,7 +227,7 @@ impl TextArea {
         let mut stack: Vec<usize> = Vec::new();
         let mut best: Option<Range<usize>> = None;
         for (idx, ch) in self.text.char_indices() {
-            if self.is_inside_element(idx) {
+            if (ch != open && ch != close) || self.is_inside_element(idx) {
                 continue;
             }
             if ch == open {
@@ -273,7 +265,7 @@ impl TextArea {
         let mut best: Option<Range<usize>> = None;
         for (offset, ch) in self.text[line.clone()].char_indices() {
             let idx = line.start + offset;
-            if self.is_inside_element(idx) || ch != quote || self.is_escaped(idx) {
+            if ch != quote || self.is_inside_element(idx) || self.is_escaped(idx) {
                 continue;
             }
             if let Some(open_idx) = open.take() {

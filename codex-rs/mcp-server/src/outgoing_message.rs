@@ -70,18 +70,26 @@ impl OutgoingMessageSender {
         }
     }
 
+    pub(crate) fn supports_form_elicitation(&self) -> bool {
+        self.supports_form_elicitation.load(Ordering::Acquire)
+    }
+
     pub(crate) async fn send_request(
         &self,
         method: &str,
         params: Option<serde_json::Value>,
-    ) -> PendingRequest {
-        let id = RequestId::Number(self.next_request_id.fetch_add(1, Ordering::Relaxed));
+    ) -> Result<PendingRequest, ErrorData> {
+        let id = RequestId::Number(
+            self.next_request_id
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .map_err(|_| ErrorData::internal_error("MCP request IDs are exhausted", None))?,
+        );
         let (tx_approve, rx_approve) = oneshot::channel();
         let Ok(permit) = self.sender.clone().reserve_owned().await else {
-            return PendingRequest {
+            return Ok(PendingRequest {
                 id,
                 receiver: rx_approve,
-            };
+            });
         };
         {
             let mut request_id_to_callback = self.request_id_to_callback.lock().await;
@@ -93,10 +101,10 @@ impl OutgoingMessageSender {
             method: method.to_string(),
             params,
         }));
-        PendingRequest {
+        Ok(PendingRequest {
             id,
             receiver: rx_approve,
-        }
+        })
     }
 
     pub(crate) async fn cancel_request(&self, id: &RequestId) -> bool {
@@ -155,21 +163,16 @@ impl OutgoingMessageSender {
         meta: Option<OutgoingNotificationMeta>,
     ) {
         #[expect(clippy::expect_used)]
-        let event_json = serde_json::to_value(event).expect("Event must serialize");
-
-        let params = if let Ok(params) = serde_json::to_value(OutgoingNotificationParams {
-            meta,
-            event: event_json.clone(),
-        }) {
-            params
-        } else {
-            warn!("Failed to serialize event as OutgoingNotificationParams");
-            event_json
-        };
+        let mut params = serde_json::to_value(event).expect("Event must serialize");
+        if let Some(meta) = meta {
+            #[expect(clippy::expect_used)]
+            let meta = serde_json::to_value(meta).expect("notification metadata must serialize");
+            params["_meta"] = meta;
+        }
 
         self.send_notification(OutgoingNotification {
             method: "codex/event".to_string(),
-            params: Some(params.clone()),
+            params: Some(params),
         })
         .await;
     }
@@ -180,7 +183,10 @@ impl OutgoingMessageSender {
     }
 
     pub(crate) async fn send_error(&self, id: RequestId, error: ErrorData) {
-        let outgoing_message = OutgoingMessage::Error(OutgoingError { id, error });
+        let outgoing_message = OutgoingMessage::Error(OutgoingError {
+            id: Some(id),
+            error,
+        });
         let _ = self.sender.send(outgoing_message).await;
     }
 }
@@ -219,7 +225,7 @@ impl From<OutgoingMessage> for OutgoingJsonRpcMessage {
             }
             Error(OutgoingError { id, error }) => JsonRpcMessage::Error(JsonRpcError {
                 jsonrpc: JsonRpcVersion2_0,
-                id: Some(id),
+                id,
                 error,
             }),
         }
@@ -239,15 +245,6 @@ pub(crate) struct OutgoingNotification {
     pub method: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct OutgoingNotificationParams {
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
-    pub meta: Option<OutgoingNotificationMeta>,
-
-    #[serde(flatten)]
-    pub event: serde_json::Value,
 }
 
 // Additional mcp-specific data to be added to a [`codex_protocol::protocol::Event`] as notification.params._meta
@@ -273,7 +270,7 @@ pub(crate) struct OutgoingResponse {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct OutgoingError {
     pub error: ErrorData,
-    pub id: RequestId,
+    pub id: Option<RequestId>,
 }
 
 #[cfg(test)]
@@ -548,7 +545,10 @@ mod tests {
     async fn cancelling_an_elicitation_removes_its_callback() {
         let (outgoing_tx, _outgoing_rx) = mpsc::channel::<OutgoingMessage>(1);
         let outgoing = OutgoingMessageSender::new(outgoing_tx);
-        let pending = outgoing.send_request("elicitation/create", None).await;
+        let pending = outgoing
+            .send_request("elicitation/create", None)
+            .await
+            .expect("request admitted");
 
         assert_eq!(outgoing.request_id_to_callback.lock().await.len(), 1);
         assert!(outgoing.cancel_request(&pending.id).await);
@@ -557,11 +557,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_id_exhaustion_preserves_pending_mcp_correlation() {
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingMessage>(1);
+        let outgoing = OutgoingMessageSender::new(outgoing_tx);
+        outgoing
+            .next_request_id
+            .store(i64::MAX - 1, Ordering::Relaxed);
+        let pending = outgoing
+            .send_request("elicitation/create", Some(json!({"message": "retained"})))
+            .await
+            .expect("last request before exhaustion must be admitted");
+        let OutgoingMessage::Request(request) = outgoing_rx.recv().await.expect("request emitted")
+        else {
+            panic!("expected elicitation request");
+        };
+        assert_eq!(request.id, RequestId::Number(i64::MAX - 1));
+        assert_eq!(request.id, pending.id);
+        assert_eq!(request.method, "elicitation/create");
+        assert_eq!(request.params, Some(json!({"message": "retained"})));
+
+        for _ in 0..2 {
+            let error = outgoing
+                .send_request("elicitation/create", None)
+                .await
+                .err()
+                .expect("exhausted sender must reject admission");
+            assert_eq!(
+                error,
+                ErrorData::internal_error("MCP request IDs are exhausted", None)
+            );
+            assert_eq!(outgoing.request_id_to_callback.lock().await.len(), 1);
+            assert!(matches!(
+                outgoing_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+
+        let expected = json!({"action": "accept", "content": {"retained_result": 42}});
+        outgoing
+            .notify_client_response(pending.id, expected.clone())
+            .await;
+        assert_eq!(
+            pending
+                .receiver
+                .await
+                .expect("retained response must arrive"),
+            expected
+        );
+        assert!(outgoing.request_id_to_callback.lock().await.is_empty());
+        assert_eq!(outgoing.next_request_id.load(Ordering::Relaxed), i64::MAX);
+        assert!(
+            outgoing
+                .send_request("elicitation/create", None)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            outgoing_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
     async fn cancelling_all_requests_closes_every_pending_receiver() {
         let (outgoing_tx, _outgoing_rx) = mpsc::channel::<OutgoingMessage>(2);
         let outgoing = OutgoingMessageSender::new(outgoing_tx);
-        let first = outgoing.send_request("elicitation/create", None).await;
-        let second = outgoing.send_request("elicitation/create", None).await;
+        let first = outgoing
+            .send_request("elicitation/create", None)
+            .await
+            .expect("request admitted");
+        let second = outgoing
+            .send_request("elicitation/create", None)
+            .await
+            .expect("request admitted");
+        assert_eq!(first.id, RequestId::Number(0));
+        assert_eq!(second.id, RequestId::Number(1));
 
         outgoing.cancel_all_requests().await;
 

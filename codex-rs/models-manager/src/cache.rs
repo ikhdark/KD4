@@ -292,7 +292,7 @@ impl ModelsCacheManager {
             );
             return false;
         }
-        if let Err(err) = self.save_internal(&cache).await {
+        if let Err(err) = self.save_internal(&cache, _file_lock).await {
             error!("failed to write models cache: {err}");
             return false;
         }
@@ -344,11 +344,10 @@ impl ModelsCacheManager {
                 "cache identity changed before TTL renewal",
             ));
         }
-        let mut cache = self
-            .load(None)
-            .await?
-            .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "cache not found"))?;
-        let current_basis = self.read_write_basis().await?;
+        let contents = fs::read(&self.cache_path).await?;
+        let mut cache: ModelsCache = serde_json::from_slice(&contents)
+            .map_err(|err| io::Error::new(ErrorKind::InvalidData, err.to_string()))?;
+        let current_basis = cache.write_basis(contents);
         if &current_basis != expected_basis {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
@@ -372,7 +371,7 @@ impl ModelsCacheManager {
                 "cache identity changed during TTL renewal",
             ));
         }
-        self.save_internal(&cache).await
+        self.save_internal(&cache, _file_lock).await
     }
 
     async fn load(&self, expected_version: Option<&str>) -> io::Result<Option<ModelsCache>> {
@@ -415,15 +414,7 @@ impl ModelsCacheManager {
             Err(err) => return Err(err),
         };
         match serde_json::from_slice::<ModelsCache>(&contents) {
-            Ok(cache) => Ok(CacheWriteBasis {
-                disk_revision: cache
-                    .revision
-                    .map(DiskRevision::Persisted)
-                    .unwrap_or_else(|| DiskRevision::Legacy(contents)),
-                client_version: cache.client_version,
-                provider_cache_identity: cache.provider_cache_identity,
-                etag: cache.etag,
-            }),
+            Ok(cache) => Ok(cache.write_basis(contents)),
             Err(_) => Ok(CacheWriteBasis {
                 disk_revision: DiskRevision::Opaque(contents),
                 client_version: None,
@@ -433,16 +424,21 @@ impl ModelsCacheManager {
         }
     }
 
-    async fn save_internal(&self, cache: &ModelsCache) -> io::Result<()> {
-        if let Some(parent) = self.cache_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
+    async fn save_internal(
+        &self,
+        cache: &ModelsCache,
+        file_lock: AtomicWriteLock,
+    ) -> io::Result<()> {
         let json = serde_json::to_vec_pretty(cache)
             .map_err(|err| io::Error::new(ErrorKind::InvalidData, err.to_string()))?;
         let cache_path = self.cache_path.clone();
-        tokio::task::spawn_blocking(move || write_bytes_atomically(&cache_path, &json))
-            .await
-            .map_err(|err| io::Error::other(format!("models cache write task failed: {err}")))?
+        tokio::task::spawn_blocking(move || {
+            // A started blocking write outlives cancellation of the awaiting future.
+            let _file_lock = file_lock;
+            write_bytes_atomically(&cache_path, &json)
+        })
+        .await
+        .map_err(|err| io::Error::other(format!("models cache write task failed: {err}")))?
     }
 
     #[cfg(test)]
@@ -466,7 +462,7 @@ impl ModelsCacheManager {
         let current_basis = self.read_write_basis().await?;
         f(&mut cache.fetched_at);
         cache.revision = Some(next_revision(&current_basis.disk_revision));
-        self.save_internal(&cache).await
+        self.save_internal(&cache, _file_lock).await
     }
 
     #[cfg(test)]
@@ -484,7 +480,7 @@ impl ModelsCacheManager {
         let current_basis = self.read_write_basis().await?;
         f(&mut cache);
         cache.revision = Some(next_revision(&current_basis.disk_revision));
-        self.save_internal(&cache).await
+        self.save_internal(&cache, _file_lock).await
     }
 }
 
@@ -511,6 +507,18 @@ fn next_revision(revision: &DiskRevision) -> u64 {
 }
 
 impl ModelsCache {
+    fn write_basis(&self, contents: Vec<u8>) -> CacheWriteBasis {
+        CacheWriteBasis {
+            disk_revision: self
+                .revision
+                .map(DiskRevision::Persisted)
+                .unwrap_or_else(|| DiskRevision::Legacy(contents)),
+            client_version: self.client_version.clone(),
+            provider_cache_identity: self.provider_cache_identity.clone(),
+            etag: self.etag.clone(),
+        }
+    }
+
     /// Returns `true` when the cache entry has not exceeded the configured TTL.
     fn is_fresh(&self, ttl: Duration) -> bool {
         if ttl.is_zero() {
@@ -696,6 +704,115 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn revision_alone_rejects_stale_writes_and_renewals() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cache = ModelsCacheManager::new(
+            temp.path().join("models_cache.json"),
+            Duration::from_secs(300),
+            fixed_identity("provider"),
+        );
+        cache
+            .persist_cache(&[], Some("same-etag".into()), "client".into())
+            .await;
+        let stale = cache
+            .write_basis_for_identity("provider")
+            .await
+            .expect("basis");
+        cache
+            .renew_cache_ttl("client", "same-etag")
+            .await
+            .expect("renew");
+        assert!(
+            !cache
+                .persist_cache_for_identity_if_unchanged(
+                    &[],
+                    Some("same-etag".into()),
+                    "client".into(),
+                    "provider",
+                    &stale
+                )
+                .await
+        );
+        let error = cache
+            .renew_cache_ttl_for_identity_if_unchanged("client", "same-etag", "provider", &stale)
+            .await
+            .expect_err("reject stale renewal");
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        let persisted = cache
+            .load_fresh("client")
+            .await
+            .expect("read")
+            .expect("cache");
+        assert_eq!(persisted.revision, Some(2));
+        assert_eq!(persisted.etag.as_deref(), Some("same-etag"));
+    }
+
+    #[test]
+    fn cancelled_write_keeps_file_lock_until_blocking_task_finishes() {
+        use std::future::Future;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let path = temp.path().join("models_cache.json");
+            let manager = ModelsCacheManager::new(
+                path.clone(),
+                Duration::from_secs(300),
+                fixed_identity("provider"),
+            );
+            let file_lock = manager.acquire_file_lock().await.expect("file lock");
+            let document = ModelsCache {
+                revision: Some(1),
+                fetched_at: Utc::now(),
+                etag: Some("written".into()),
+                client_version: Some("client".into()),
+                provider_cache_identity: Some("provider".into()),
+                models: Vec::new(),
+            };
+            let (release, wait) = std::sync::mpsc::channel();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).expect("started");
+                wait.recv().expect("release");
+            });
+            ready.await.expect("blocking pool occupied");
+            let mut save = Box::pin(manager.save_internal(&document, file_lock));
+            std::future::poll_fn(|cx| {
+                assert!(save.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            drop(save);
+            let contender = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(codex_file_system::atomic_write_lock_path(&path).expect("lock path"))
+                .expect("lock file");
+            let lock_result = contender.try_lock();
+            // Release the pool before asserting so a regression cannot hang runtime shutdown.
+            release.send(()).expect("release writer");
+            assert!(matches!(
+                lock_result,
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+            blocker.await.expect("blocker");
+            tokio::task::spawn_blocking(move || acquire_atomic_write_lock(&path))
+                .await
+                .expect("lock task")
+                .expect("write released lock");
+            let written = manager
+                .load_fresh("client")
+                .await
+                .expect("read")
+                .expect("written cache");
+            assert_eq!(written.etag.as_deref(), Some("written"));
+        });
     }
 
     #[tokio::test]

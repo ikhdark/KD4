@@ -1703,11 +1703,7 @@ fn test_git(repo: &Path, args: &[&str]) {
     assert!(status.success(), "git {} should succeed", args.join(" "));
 }
 
-fn test_prepared_artifact(
-    root: &Path,
-    worktree: PathBuf,
-    name: &str,
-) -> AbPreparedBuild {
+fn test_prepared_artifact(root: &Path, worktree: PathBuf, name: &str) -> AbPreparedBuild {
     let target = root.join(format!("{name}-target"));
     let profile_dir = target.join(AB_BUILD_PROFILE_DIR);
     let deps = profile_dir.join("deps");
@@ -2527,14 +2523,10 @@ fn request_component_snapshot_preserves_prompt_cache_key_identity() {
             "input": [{"role": "user", "content": "same prompt"}],
         })
     };
-    let first = request_component_snapshot(
-        &body("11111111-1111-4111-8111-111111111111"),
-        "initial",
-    );
-    let second = request_component_snapshot(
-        &body("22222222-2222-4222-8222-222222222222"),
-        "initial",
-    );
+    let first =
+        request_component_snapshot(&body("11111111-1111-4111-8111-111111111111"), "initial");
+    let second =
+        request_component_snapshot(&body("22222222-2222-4222-8222-222222222222"), "initial");
 
     assert_ne!(
         first.prompt_cache_key_sha256, second.prompt_cache_key_sha256,
@@ -4133,10 +4125,7 @@ fn ab_overlay_execution_profiles_are_exact() {
     )
     .expect("batch hard gate should be measurable");
     assert_eq!(batch_failure.decision, AbSequentialDecision::Failed);
-    assert_eq!(
-        batch_failure.stop_reason,
-        AbStopReason::LatencyClearFailure
-    );
+    assert_eq!(batch_failure.stop_reason, AbStopReason::LatencyClearFailure);
     assert!(!batch_failure.passed);
 
     let mut hard_failure =
@@ -5627,7 +5616,10 @@ fn ab_overlay_canonical_controllable_time_excludes_overlapping_unions() {
     timing.counters.tool_output_recursive_spill_count = 13;
     timing.counters.generations_by_purpose.wait = 2;
     timing.counters.generations_by_purpose.repair = 1;
-    timing.counters.generations_by_purpose.terminal_completion_reasoning = 3;
+    timing
+        .counters
+        .generations_by_purpose
+        .terminal_completion_reasoning = 3;
     timing.tool_calls.push(TurnTimingToolCall {
         source: TurnTimingToolCallSource::Direct,
         output_projection_ms: Some(17),
@@ -5913,7 +5905,7 @@ fn ab_overlay_imports_only_verified_accepted_reports() {
     assert!(
         import_accepted_ab_report(&AbImportReportArgs {
             report: rejected_source,
-            manifest: manifest_path.clone(),
+            manifest: manifest_path,
             repo,
         })
         .is_err(),
@@ -6034,8 +6026,7 @@ fn ab_worker_tree_cleanup_process_group_survives_root_exit() {
 
     terminate_ab_worker(&mut worker).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while unsafe { libc::kill(descendant_pid as libc::pid_t, 0) } == 0
-        && Instant::now() < deadline
+    while unsafe { libc::kill(descendant_pid as libc::pid_t, 0) } == 0 && Instant::now() < deadline
     {
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -6099,12 +6090,8 @@ fn accepted_workload_rejects_samples_collected_after_a_terminal_look() {
         latency_hard_gate: true,
     };
     let stopped_at_pairs_per_cluster = TEST_LOOKS[1];
-    let clusters = paired_request_cache_clusters_with_pairs(
-        workload,
-        100,
-        50,
-        stopped_at_pairs_per_cluster,
-    );
+    let clusters =
+        paired_request_cache_clusters_with_pairs(workload, 100, 50, stopped_at_pairs_per_cluster);
     let sequential_looks = TEST_LOOKS
         .into_iter()
         .map(|pairs_per_cluster| {

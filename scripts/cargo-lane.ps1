@@ -95,6 +95,9 @@ function Parse-CargoLaneArguments {
     if ($parsedLane -notmatch "^[A-Za-z0-9_.-]+$") {
         throw "Lane '$parsedLane' contains unsupported characters."
     }
+    if ($parsedLane -match "\.trash-\d{17}$") {
+        throw "Lane names ending in a trash timestamp are reserved for cleanup."
+    }
     if ($parsedLane -match "^\.+$") {
         # Pure-dot names pass the character filter but Windows path
         # normalization can collapse them to a parent directory, escaping lane
@@ -236,20 +239,18 @@ function Enable-SccacheEnvironment {
         [string]$RepoRoot
     )
 
-    if ([string]::IsNullOrWhiteSpace($env:RUSTC_WRAPPER)) {
+    if (-not (Test-Path Env:RUSTC_WRAPPER)) {
         $env:RUSTC_WRAPPER = "sccache"
         if ([string]::IsNullOrWhiteSpace($env:CARGO_INCREMENTAL)) {
             $env:CARGO_INCREMENTAL = "0"
         }
         Set-CodexRustSccacheEnvironment -RepoRoot $RepoRoot
-        Ensure-CodexRustSccacheServer -RepoRoot $RepoRoot
     }
     elseif (Test-SccacheWrapper -Value $env:RUSTC_WRAPPER) {
         if ([string]::IsNullOrWhiteSpace($env:CARGO_INCREMENTAL)) {
             $env:CARGO_INCREMENTAL = "0"
         }
         Set-CodexRustSccacheEnvironment -RepoRoot $RepoRoot
-        Ensure-CodexRustSccacheServer -RepoRoot $RepoRoot
     }
 }
 
@@ -865,46 +866,51 @@ if ($commandArgs.Count -eq 1 -and [string]::IsNullOrWhiteSpace($commandArgs[0]))
 $requestedLane = Normalize-RequestedLaneName $Lane
 $activeLaneNames = @(Get-ActiveCargoLaneNames -LanesRoot $cargoLanesRoot)
 $candidateLane = Resolve-CargoLaneName -RequestedLane $requestedLane -CommandArgs $commandArgs -LanesRoot $cargoLanesRoot -ActiveNames $activeLaneNames
-$reservation = Acquire-CargoLaneReservation -LaneRoot $cargoLanesRoot -BaseLane $candidateLane -ActiveNames $activeLaneNames
-$resolvedLane = $reservation.Lane
-$targetDir = $reservation.TargetDir
 $previousLaneTargetDir = $env:CODEX_CARGO_LANE_TARGET_DIR
-$env:CODEX_CARGO_LANE_TARGET_DIR = $targetDir
-if ($requestedLane -ne "auto" -and $resolvedLane -ne $requestedLane) {
-    Write-Warning "Requested Cargo lane '$requestedLane' is busy; using '$resolvedLane'."
-}
-Update-CargoLaneLastUsed -TargetDir $targetDir
+$didPushLocation = $false
+$ranCommand = $false
+$reservation = Acquire-CargoLaneReservation -LaneRoot $cargoLanesRoot -BaseLane $candidateLane -ActiveNames $activeLaneNames
 try {
-    Invoke-CargoLanePrune -RepoRoot $repoRoot -LanesRoot $cargoLanesRoot -ActiveNames $activeLaneNames -ExcludedNames @($resolvedLane)
-}
-catch {
-    Write-Warning "Cargo lane pruning failed unexpectedly ($($_.Exception.Message)); continuing without pruning."
-}
-
-if ([string]::IsNullOrWhiteSpace($env:RUST_MIN_STACK)) {
-    $env:RUST_MIN_STACK = "8388608"
-}
-
-Enable-SccacheForLane -RepoRoot $repoRoot
-Set-CodexRustMsvcLinkerEnvironment
-
-if ($IsolateCargoHome) {
-    if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
-        throw "LOCALAPPDATA is not set. Pass a normal lane without -IsolateCargoHome."
+    $resolvedLane = $reservation.Lane
+    $targetDir = $reservation.TargetDir
+    $env:CODEX_CARGO_LANE_TARGET_DIR = $targetDir
+    if ($requestedLane -ne "auto" -and $resolvedLane -ne $requestedLane) {
+        Write-Warning "Requested Cargo lane '$requestedLane' is busy; using '$resolvedLane'."
+    }
+    Update-CargoLaneLastUsed -TargetDir $targetDir
+    try {
+        Invoke-CargoLanePrune -RepoRoot $repoRoot -LanesRoot $cargoLanesRoot -ActiveNames $activeLaneNames -ExcludedNames @($resolvedLane)
+    }
+    catch {
+        Write-Warning "Cargo lane pruning failed unexpectedly ($($_.Exception.Message)); continuing without pruning."
     }
 
-    $cargoHome = Join-Path $env:LOCALAPPDATA "cargo-lanes\codexKD\$resolvedLane"
-    New-Item -ItemType Directory -Force -Path $cargoHome | Out-Null
-    $env:CARGO_HOME = $cargoHome
-
-    if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
-        Add-PathPrefix (Join-Path $env:USERPROFILE ".cargo\bin")
+    if ([string]::IsNullOrWhiteSpace($env:RUST_MIN_STACK)) {
+        $env:RUST_MIN_STACK = "8388608"
     }
-    Enable-SccacheForCargoHome -CargoHome $cargoHome -RepoRoot $repoRoot
-}
 
-Push-Location $rustRoot
-try {
+    Set-CodexRustMsvcLinkerEnvironment
+
+    if ($IsolateCargoHome) {
+        if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+            throw "LOCALAPPDATA is not set. Pass a normal lane without -IsolateCargoHome."
+        }
+
+        $cargoHome = Join-Path $env:LOCALAPPDATA "cargo-lanes\codexKD\$resolvedLane"
+        New-Item -ItemType Directory -Force -Path $cargoHome | Out-Null
+        $env:CARGO_HOME = $cargoHome
+
+        if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+            Add-PathPrefix (Join-Path $env:USERPROFILE ".cargo\bin")
+        }
+        Enable-SccacheForCargoHome -CargoHome $cargoHome -RepoRoot $repoRoot
+    }
+    else {
+        Enable-SccacheForLane -RepoRoot $repoRoot
+    }
+
+    Push-Location $rustRoot
+    $didPushLocation = $true
     if ($Fetch) {
         cargo fetch --locked
         if ($LASTEXITCODE -ne 0) {
@@ -939,6 +945,7 @@ try {
     $program = $commandArgs[0]
     $arguments = @($commandArgs | Select-Object -Skip 1)
     $global:LASTEXITCODE = $null
+    $ranCommand = $true
     & $program @arguments
     if ($null -eq $LASTEXITCODE) {
         if ($?) {
@@ -961,12 +968,14 @@ finally {
             # The pre-build GC is hourly-throttled, but a single build burst can
             # add hundreds of GiB. Re-check after the build and keep the lane
             # that just completed while pruning older inactive lanes.
-            $postBuildActiveLaneNames = @(Get-ActiveCargoLaneNames -LanesRoot $cargoLanesRoot)
-            Invoke-CargoLanePrune -RepoRoot $repoRoot -LanesRoot $cargoLanesRoot -ActiveNames $postBuildActiveLaneNames -ExcludedNames @($resolvedLane) -Force
+            if ($ranCommand) {
+                $postBuildActiveLaneNames = @(Get-ActiveCargoLaneNames -LanesRoot $cargoLanesRoot)
+                Invoke-CargoLanePrune -RepoRoot $repoRoot -LanesRoot $cargoLanesRoot -ActiveNames $postBuildActiveLaneNames -ExcludedNames @($resolvedLane) -Force
+            }
         }
         catch {
             Write-Warning "Post-build Cargo lane pruning failed unexpectedly ($($_.Exception.Message)); continuing without pruning."
         }
-        Pop-Location
+        if ($didPushLocation) { Pop-Location }
     }
 }

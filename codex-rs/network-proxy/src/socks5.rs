@@ -179,7 +179,7 @@ async fn run_socks5_with_listener(
 }
 
 async fn handle_socks5_tcp(
-    req: TcpRequest,
+    mut req: TcpRequest,
     _tcp_connector: TargetCheckedTcpConnector,
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
     environment_id: Option<String>,
@@ -348,6 +348,10 @@ async fn handle_socks5_tcp(
         }
     }
 
+    if let Some(target) = policy_snapshot.local_target(&host) {
+        req.extensions_mut().insert(target);
+    }
+
     let host_mitm_requirement = policy_snapshot.host_mitm_requirement(&host);
     let mitm_state = policy_snapshot.mitm_state();
     let socks_mitm_mode = if mode == NetworkMode::Limited {
@@ -409,14 +413,14 @@ async fn handle_socks5_tcp(
                 target,
                 mode,
                 mitm: mitm_state,
-                extensions: Extensions::new(),
+                extensions: req.extensions().clone(),
             }),
             SocksMitmMode::DetectTls => Some(Socks5TcpConnection::DetectTls {
                 target,
                 mode,
                 mitm: mitm_state,
                 allow_local_binding: policy_snapshot.allow_local_binding(),
-                extensions: Extensions::new(),
+                extensions: req.extensions().clone(),
             }),
         };
         if let Some(conn) = conn {
@@ -572,7 +576,7 @@ async fn proxy_socks5_tcp(
             mode,
             mitm,
             allow_local_binding,
-            ..
+            extensions,
         } => {
             source.extensions_mut().insert(ProxyTarget(target.clone()));
             source.extensions_mut().insert(mode);
@@ -587,7 +591,7 @@ async fn proxy_socks5_tcp(
                 let connect_started_at = Instant::now();
                 let EstablishedClientConnection { conn: upstream, .. } =
                     TargetCheckedTcpConnector::from_allow_local_binding(allow_local_binding)
-                        .serve(TcpRequest::new(target.clone()))
+                        .serve(TcpRequest::new_with_extensions(target.clone(), extensions))
                         .await?;
                 info!(
                     "SOCKS opaque upstream dial established (target={target}, elapsed_ms={})",
@@ -911,6 +915,53 @@ mod tests {
 
         assert!(result.is_err(), "proxy-disabled request should be denied");
         assert_eq!(reload_checks.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confirmed_performance_allowed_socks_request_reloads_policy_once() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let target = listener.local_addr().unwrap();
+            let mut config = NetworkProxyConfig {
+                enabled: true,
+                mode: NetworkMode::Full,
+                allow_local_binding: false,
+                ..NetworkProxyConfig::default()
+            };
+            config.set_allowed_domains(vec!["127.0.0.1".to_string()]);
+            let config_state =
+                build_config_state(config, NetworkProxyConstraints::default()).unwrap();
+            let reload_checks = Arc::new(AtomicUsize::new(0));
+            let state = Arc::new(NetworkProxyState::with_reloader(
+                config_state,
+                Arc::new(CountingReloader {
+                    reload_checks: reload_checks.clone(),
+                }),
+            ));
+            let mut request = TcpRequest::new(HostWithPort::from(target));
+            request.extensions_mut().insert(state.clone());
+            let connection = handle_socks5_tcp(
+                request,
+                TargetCheckedTcpConnector::new(state),
+                /*policy_decider*/ None,
+                /*environment_id*/ None,
+            )
+            .await
+            .expect("allowed request should connect");
+            let Socks5TcpConnection::Direct(mut stream) = connection.conn else {
+                panic!("expected a direct upstream connection");
+            };
+            let (mut accepted, _) = listener.accept().await.unwrap();
+            use tokio::io::AsyncReadExt as _;
+            use tokio::io::AsyncWriteExt as _;
+            stream.write_all(b"probe").await.unwrap();
+            let mut received = [0; 5];
+            accepted.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, b"probe");
+            assert_eq!(reload_checks.load(Ordering::SeqCst), 1);
+        })
+        .await
+        .expect("allowed SOCKS request should finish");
     }
 
     #[tokio::test(flavor = "current_thread")]

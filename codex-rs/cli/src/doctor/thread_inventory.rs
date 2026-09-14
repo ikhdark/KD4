@@ -18,6 +18,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 const MAX_PARITY_SCAN_FILES: usize = 10_000;
+const MAX_PARITY_SCAN_ENTRIES: usize = 50_000;
 const SAMPLE_LIMIT: usize = 5;
 const SUMMARY_LIMIT: usize = 8;
 const CHECK_ID: &str = "state.rollout_db_parity";
@@ -34,6 +35,7 @@ struct RolloutAuditFile {
 #[derive(Default)]
 struct RolloutScan {
     files: Vec<RolloutAuditFile>,
+    visited_entries: usize,
     scan_errors: Vec<String>,
     malformed_names: Vec<PathBuf>,
     reached_scan_cap: bool,
@@ -149,7 +151,20 @@ async fn thread_inventory_check_for_roots(
         }
     };
 
-    parity_check_from_scan_and_rows(codex_home, scan, rows, details)
+    let codex_home = codex_home.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        parity_check_from_scan_and_rows(&codex_home, scan, rows, details)
+    })
+    .await
+    .unwrap_or_else(|err| {
+        DoctorCheck::new(
+            CHECK_ID,
+            CHECK_CATEGORY,
+            CheckStatus::Warning,
+            "rollout/state DB comparison is incomplete",
+        )
+        .detail(format!("comparison error: {err}"))
+    })
 }
 
 fn missing_state_db_check(scan: RolloutScan, details: Vec<String>) -> DoctorCheck {
@@ -220,42 +235,42 @@ fn parity_check_from_scan_and_rows(
         .iter()
         .map(|file| (file.key.clone(), file))
         .collect::<HashMap<_, _>>();
+    let row_keys = rows
+        .iter()
+        .map(|row| path_key(&row.rollout_path))
+        .collect::<Vec<_>>();
     let mut rows_by_key: HashMap<PathBuf, Vec<&ThreadStateAuditRow>> = HashMap::new();
-    for row in &rows {
-        rows_by_key
-            .entry(path_key(&row.rollout_path))
-            .or_default()
-            .push(row);
+    for (row, key) in rows.iter().zip(&row_keys) {
+        rows_by_key.entry(key.clone()).or_default().push(row);
     }
-
-    let missing_active = missing_rollout_paths(&scan.files, &rows_by_key, /*archived*/ false);
-    let missing_archived = missing_rollout_paths(&scan.files, &rows_by_key, /*archived*/ true);
-    let scan_complete = !scan.reached_scan_cap;
-    let stale_rows = if scan_complete {
-        rows.iter()
-            .filter(|row| !row.rollout_path.is_file())
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    let archive_mismatches = if scan_complete {
-        rows.iter()
-            .filter_map(|row| {
-                let expected_archived = rollout_by_key
-                    .get(&path_key(&row.rollout_path))
-                    .map(|file| file.archived)
-                    .or_else(|| {
-                        row.rollout_path
-                            .is_file()
-                            .then(|| archived_from_rollout_path(codex_home, &row.rollout_path))
-                            .flatten()
-                    })?;
-                (expected_archived != row.archived).then_some(row)
-            })
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    let missing_active = missing_rollout_paths(&scan.files, &rows_by_key, false);
+    let missing_archived = missing_rollout_paths(&scan.files, &rows_by_key, true);
+    let scan_complete = !scan.reached_scan_cap && scan.scan_errors.is_empty();
+    let mut stale_rows = Vec::new();
+    let mut unverified_rows = Vec::new();
+    let mut archive_mismatches = Vec::new();
+    let active_root = path_key(&codex_home.join("sessions"));
+    let archived_root = path_key(&codex_home.join("archived_sessions"));
+    for (row, key) in rows.iter().zip(&row_keys) {
+        if let Some(file) = rollout_by_key.get(key) {
+            if row.id != file.thread_id {
+                stale_rows.push(row);
+            }
+            if row.archived != file.archived {
+                archive_mismatches.push(row);
+            }
+        } else if scan_complete {
+            if key.starts_with(&active_root)
+                || key.starts_with(&archived_root)
+                || !row.rollout_path.is_file()
+            {
+                stale_rows.push(row);
+            } else {
+                // External references were not scanned; existence alone cannot prove identity.
+                unverified_rows.push(row);
+            }
+        }
+    }
     let duplicate_rollout_thread_ids = duplicate_rollout_thread_ids(&scan.files);
     let duplicate_db_paths = duplicate_db_paths(&rows_by_key);
     let archived_rows = rows.iter().filter(|row| row.archived).count();
@@ -263,6 +278,7 @@ fn parity_check_from_scan_and_rows(
 
     details.extend([
         format!("rollout DB rows: {}", rows.len()),
+        format!("rollout DB unverified rows: {}", unverified_rows.len()),
         format!("rollout DB active rows: {active_rows}"),
         format!("rollout DB archived rows: {archived_rows}"),
         format!("rollout DB missing active rows: {}", missing_active.len()),
@@ -333,6 +349,7 @@ fn parity_check_from_scan_and_rows(
         && !scan.reached_scan_cap
         && missing_active.is_empty()
         && missing_archived.is_empty()
+        && unverified_rows.is_empty()
         && stale_rows.is_empty()
         && archive_mismatches.is_empty()
         && duplicate_rollout_thread_ids.is_empty()
@@ -345,8 +362,16 @@ fn parity_check_from_scan_and_rows(
 
     let summary = if status == CheckStatus::Ok {
         "rollout files and state DB thread inventory agree"
-    } else {
+    } else if !missing_active.is_empty()
+        || !missing_archived.is_empty()
+        || !stale_rows.is_empty()
+        || !archive_mismatches.is_empty()
+        || !duplicate_rollout_thread_ids.is_empty()
+        || !duplicate_db_paths.is_empty()
+    {
         "rollout files and state DB thread inventory differ"
+    } else {
+        "rollout/state DB comparison is incomplete"
     };
     let mut check = DoctorCheck::new(CHECK_ID, CHECK_CATEGORY, status, summary).details(details);
 
@@ -364,6 +389,16 @@ fn parity_check_from_scan_and_rows(
             .expected("every rollout file has a matching threads row"),
         );
     }
+    if !unverified_rows.is_empty() {
+        check = check.issue(
+            DoctorIssue::new(
+                CheckStatus::Warning,
+                "state DB references outside the scanned rollout roots are unverified",
+            )
+            .measured(format!("{} unverified rows", unverified_rows.len()))
+            .expected("verified rollout identity for each state DB reference"),
+        );
+    }
     if !stale_rows.is_empty() {
         check = check.issue(
             DoctorIssue::new(
@@ -371,7 +406,7 @@ fn parity_check_from_scan_and_rows(
                 "state DB rows point at missing or unusable rollout files",
             )
             .measured(format!("{} stale rows", stale_rows.len()))
-            .expected("every state DB rollout path is a file on disk"),
+            .expected("every state DB rollout path contains the matching thread identity"),
         );
     }
     if !archive_mismatches.is_empty() {
@@ -463,6 +498,11 @@ async fn scan_rollout_root(root: &Path, archived: bool, scan: &mut RolloutScan) 
                     continue;
                 }
             };
+            if scan.visited_entries >= MAX_PARITY_SCAN_ENTRIES {
+                scan.reached_scan_cap = true;
+                return;
+            }
+            scan.visited_entries += 1;
             let path = entry.path();
             let file_type = match entry.file_type().await {
                 Ok(file_type) => file_type,
@@ -504,14 +544,24 @@ async fn scan_rollout_root(root: &Path, archived: bool, scan: &mut RolloutScan) 
 }
 
 async fn thread_id_from_rollout(path: &Path) -> RolloutThreadId {
-    let items = match RolloutRecorder::load_rollout_items(path).await {
-        Ok((items, _, _)) => items,
-        Err(err) => return RolloutThreadId::Unusable(err.to_string()),
-    };
-    if items.is_empty() {
+    let mut saw_item = false;
+    let mut first_meta = Vec::new();
+    let result = RolloutRecorder::for_each_rollout_item(path, |item| {
+        saw_item = true;
+        if first_meta.is_empty()
+            && matches!(item, codex_protocol::protocol::RolloutItem::SessionMeta(_))
+        {
+            first_meta.push(item);
+        }
+    })
+    .await;
+    if let Err(err) = result {
+        return RolloutThreadId::Unusable(err.to_string());
+    }
+    if !saw_item {
         return RolloutThreadId::Unusable("no parseable rollout items".to_string());
     }
-    codex_rollout::builder_from_items(items.as_slice(), path)
+    codex_rollout::builder_from_items(&first_meta, path)
         .map(|builder| RolloutThreadId::Id(builder.id.to_string()))
         .unwrap_or(RolloutThreadId::MalformedName)
 }
@@ -528,23 +578,12 @@ fn count_or_skipped(count: usize, complete: bool) -> String {
     if complete {
         count.to_string()
     } else {
-        "skipped (scan cap reached)".to_string()
+        "skipped (scan incomplete)".to_string()
     }
 }
 
 fn path_key(path: &Path) -> PathBuf {
     normalize_for_path_comparison(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-fn archived_from_rollout_path(codex_home: &Path, path: &Path) -> Option<bool> {
-    let key = path_key(path);
-    if key.starts_with(path_key(&codex_home.join("archived_sessions"))) {
-        return Some(true);
-    }
-    if key.starts_with(path_key(&codex_home.join("sessions"))) {
-        return Some(false);
-    }
-    None
 }
 
 fn missing_rollout_paths<'a>(
@@ -685,6 +724,87 @@ mod tests {
     use sqlx::sqlite::SqliteConnectOptions;
     use sqlx::sqlite::SqlitePoolOptions;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn inventory_rejects_regular_files_without_rollout_identity() {
+        let fixture = Fixture::new().await;
+        let path = fixture.codex_home.path().join("sessions/notes.txt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "notes").unwrap();
+        fixture
+            .insert_thread_row("00000000-0000-0000-0000-000000000001", &path, false)
+            .await;
+        let external_path = fixture.sqlite_home.path().join("notes.txt");
+        std::fs::write(&external_path, "external notes").unwrap();
+        fixture
+            .insert_thread_row(
+                "00000000-0000-0000-0000-000000000002",
+                &external_path,
+                false,
+            )
+            .await;
+        let check = thread_inventory_check_for_roots(
+            fixture.codex_home.path(),
+            fixture.sqlite_home.path(),
+            "test",
+        )
+        .await;
+        assert_eq!(check.status, CheckStatus::Warning);
+        assert_detail(&check, "rollout DB stale rows", "1");
+        assert_detail(&check, "rollout DB unverified rows", "1");
+    }
+
+    #[tokio::test]
+    async fn streamed_identity_preserves_metadata_and_legacy_fallback() {
+        let fixture = Fixture::new().await;
+        let metadata_id = "00000000-0000-0000-0000-000000000001";
+        let filename_id = "00000000-0000-0000-0000-000000000002";
+        let original = fixture.write_rollout(false, "2025-01-02T10-00-00", metadata_id);
+        let path =
+            original.with_file_name(format!("rollout-2025-01-02T10-00-00-{filename_id}.jsonl"));
+        std::fs::copy(original, &path).unwrap();
+        assert!(
+            matches!(thread_id_from_rollout(&path).await, RolloutThreadId::Id(id) if id == metadata_id)
+        );
+
+        let legacy = RolloutLine {
+            timestamp: "2025-01-02T10:00:00Z".to_string(),
+            item: RolloutItem::Compacted(codex_protocol::protocol::CompactedItem {
+                message: "legacy history".to_string(),
+                replacement_history: None,
+                window_number: None,
+                first_window_id: None,
+                previous_window_id: None,
+                window_id: None,
+            }),
+        };
+        std::fs::write(&path, serde_json::to_string(&legacy).unwrap()).unwrap();
+        assert!(
+            matches!(thread_id_from_rollout(&path).await, RolloutThreadId::Id(id) if id == filename_id)
+        );
+        std::fs::write(&path, "not a rollout record").unwrap();
+        assert!(matches!(
+            thread_id_from_rollout(&path).await,
+            RolloutThreadId::Unusable(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn scan_budget_counts_irrelevant_entries_and_reports_incomplete() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("notes.txt"), "notes").unwrap();
+        std::fs::create_dir(temp.path().join("other")).unwrap();
+        let mut scan = RolloutScan {
+            visited_entries: MAX_PARITY_SCAN_ENTRIES - 1,
+            ..RolloutScan::default()
+        };
+        scan_rollout_root(temp.path(), false, &mut scan).await;
+        assert!(scan.reached_scan_cap);
+        assert_eq!(scan.visited_entries, MAX_PARITY_SCAN_ENTRIES);
+        let check = parity_check_from_scan_and_rows(temp.path(), scan, Vec::new(), Vec::new());
+        assert_eq!(check.status, CheckStatus::Warning);
+        assert_eq!(check.summary, "rollout/state DB comparison is incomplete");
+    }
 
     #[tokio::test]
     async fn thread_inventory_check_ok_when_rollouts_match_db() {

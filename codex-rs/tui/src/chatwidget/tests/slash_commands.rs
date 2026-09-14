@@ -1975,16 +1975,15 @@ async fn copy_shortcut_can_be_remapped() {
 }
 
 #[tokio::test]
-async fn slash_copy_stores_clipboard_lease_and_preserves_it_on_failure() {
+async fn slash_copy_reports_success_and_failure() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.transcript.last_agent_markdown = Some("copy me".to_string());
 
     chat.copy_last_agent_markdown_with(|markdown| {
         assert_eq!(markdown, "copy me");
-        Ok(Some(crate::clipboard_copy::ClipboardLease::test()))
+        Ok(())
     });
 
-    assert!(chat.clipboard_lease.is_some());
     let cells = drain_insert_history(&mut rx);
     assert_eq!(cells.len(), 1, "expected one success message");
     let rendered = lines_to_single_string(&cells[0]);
@@ -1998,7 +1997,6 @@ async fn slash_copy_stores_clipboard_lease_and_preserves_it_on_failure() {
         Err("blocked".into())
     });
 
-    assert!(chat.clipboard_lease.is_some());
     let cells = drain_insert_history(&mut rx);
     assert_eq!(cells.len(), 1, "expected one failure message");
     let rendered = lines_to_single_string(&cells[0]);
@@ -2147,7 +2145,7 @@ async fn slash_copy_uses_latest_surviving_response_after_rollback() {
     assert_eq!(chat.last_agent_markdown_text(), Some("foo response"));
     chat.copy_last_agent_markdown_with(|markdown| {
         assert_eq!(markdown, "foo response");
-        Ok(None)
+        Ok(())
     });
 }
 
@@ -2484,6 +2482,29 @@ async fn slash_pets_opens_picker() {
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
     assert_chatwidget_snapshot!("slash_pets_picker", popup);
+}
+
+#[tokio::test]
+async fn pet_picker_resize_clears_previous_preview_area() {
+    use crate::render::renderable::Renderable;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    force_pet_image_support(&mut chat);
+    chat.dispatch_command(SlashCommand::Pets);
+    chat.pet_picker_preview_pet = Some(crate::pets::test_ambient_pet(
+        FrameRequester::test_dummy(),
+        false,
+    ));
+    chat.pet_picker_preview_state.set_ready();
+    let wide = Rect::new(0, 0, 120, 40);
+    chat.render(wide, &mut Buffer::empty(wide));
+    assert!(chat.pet_picker_preview_draw().is_some());
+    let narrow = Rect::new(0, 0, 25, 40);
+    chat.render(narrow, &mut Buffer::empty(narrow));
+    assert!(chat.pet_picker_preview_draw().is_none());
+    chat.render(wide, &mut Buffer::empty(wide));
+    assert!(chat.pet_picker_preview_draw().is_some());
 }
 
 #[tokio::test]
@@ -2968,4 +2989,58 @@ async fn compact_queues_user_messages_snapshot() {
         "compact_queues_user_messages_snapshot",
         normalize_snapshot_paths(term.backend().vt100().screen().contents())
     );
+}
+
+#[tokio::test]
+async fn idle_queue_preserves_slash_action_and_pending_pastes() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.set_feature_enabled(Feature::Goals, true);
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+    let placeholder = "[Pasted text]".to_string();
+    let paste = "goal details".repeat(1000);
+    chat.queue_user_message_with_options(
+        UserMessage::from(format!("/goal {placeholder}")),
+        QueuedInputAction::ParseSlash,
+        vec![(placeholder.clone(), paste.clone())],
+    );
+    let draft = next_goal_draft(&mut rx, thread_id);
+    assert_eq!(draft.objective, placeholder);
+    assert_eq!(draft.pending_pastes, vec![(placeholder, paste)]);
+    assert!(chat.input_queue.queued_user_messages.is_empty());
+    assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test]
+async fn queued_input_cannot_drain_before_session_configuration() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.queue_user_message(UserMessage::from("wait for session"));
+    assert!(!chat.maybe_send_next_queued_input());
+    assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
+    assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test]
+async fn ide_status_failure_preserves_enabled_preference() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.handle_ide_command_args_with_fetch("on", |_| {
+        Ok(serde_json::from_str(r#"{"openTabs":[]}"#).expect("IDE context"))
+    });
+    assert!(chat.ide_context.is_enabled());
+    chat.handle_ide_command_args_with_fetch(
+        "status",
+        |_| Err("temporary test failure".to_string()),
+    );
+    assert!(chat.ide_context.is_enabled());
+    let history = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<String>();
+    assert!(
+        history.contains("IDE context is on, but currently unavailable."),
+        "{history}"
+    );
+    chat.handle_ide_command_args("off");
+    chat.handle_ide_command_args_with_fetch("on", |_| Err("initial test failure".to_string()));
+    assert!(!chat.ide_context.is_enabled());
 }

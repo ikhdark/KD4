@@ -78,31 +78,7 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
             }
         };
 
-        let mut stdout = std::io::stdout();
-        let mut stderr = std::io::stderr();
-        let cwd = match codex_utils_absolute_path::AbsolutePathBuf::current_dir() {
-            Ok(cwd) => cwd,
-            Err(_) => std::process::exit(1),
-        };
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(_) => std::process::exit(1),
-        };
-        let cwd = cwd.into();
-        let exit_code = match runtime.block_on(codex_apply_patch::apply_patch(
-            &patch_arg,
-            &cwd,
-            &mut stdout,
-            &mut stderr,
-            codex_exec_server::LOCAL_FS.as_ref(),
-            /*sandbox*/ None,
-        )) {
-            Ok(_) => 0,
-            Err(_) => 1,
-        };
+        let exit_code = codex_apply_patch::run_apply_patch(&patch_arg);
         std::process::exit(exit_code);
     }
 
@@ -342,14 +318,7 @@ fn prepare_path_entry_for_codex_aliases(
         .tempdir_in(&temp_root)?;
     let path = temp_dir.path();
 
-    let lock_path = path.join(LOCK_FILENAME);
-    let lock_file = File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)?;
-    lock_file.try_lock()?;
+    let lock_file = lock_session_dir(path)?;
 
     for filename in &[APPLY_PATCH_ARG0, MISSPELLED_APPLY_PATCH_ARG0] {
         let exe = std::env::current_exe()?;
@@ -365,7 +334,7 @@ fn prepare_path_entry_for_codex_aliases(
         )?;
     }
 
-    let updated_path_env_var = path_env_with_entry(path, existing_path);
+    let updated_path_env_var = path_env_with_entry(path, existing_path)?;
 
     let paths = Arg0DispatchPaths {
         codex_self_exe: std::env::current_exe().ok(),
@@ -377,6 +346,16 @@ fn prepare_path_entry_for_codex_aliases(
     ))
 }
 
+fn lock_session_dir(path: &Path) -> std::io::Result<File> {
+    // Publish only an already locked handle so concurrent janitors cannot
+    // acquire a newly created session's lock before its owner does.
+    let pending_lock = tempfile::NamedTempFile::new_in(path)?;
+    pending_lock.as_file().try_lock()?;
+    pending_lock
+        .persist(path.join(LOCK_FILENAME))
+        .map_err(|err| err.error)
+}
+
 fn path_env_with_package_path_dir(
     install_context: &InstallContext,
     existing_path: Option<OsString>,
@@ -385,23 +364,27 @@ fn path_env_with_package_path_dir(
         .package_layout
         .as_ref()
         .and_then(|package_layout| package_layout.path_dir.as_ref())?;
-    Some(path_env_with_entry(path_dir.as_path(), existing_path))
+    match path_env_with_entry(path_dir.as_path(), existing_path) {
+        Ok(path) => Some(path),
+        Err(err) => {
+            eprintln!("WARNING: could not prepend package PATH directory: {err}");
+            None
+        }
+    }
 }
 
-fn path_env_with_entry(path_entry: &Path, existing_path: Option<OsString>) -> OsString {
-    const PATH_SEPARATOR: &str = ";";
-
-    let capacity = path_entry.as_os_str().len()
-        + existing_path
+fn path_env_with_entry(
+    path_entry: &Path,
+    existing_path: Option<OsString>,
+) -> std::io::Result<OsString> {
+    let entries = std::iter::once(path_entry.to_path_buf()).chain(
+        existing_path
             .as_ref()
-            .map_or(0, |existing_path| 1 + existing_path.len());
-    let mut path_env_var = OsString::with_capacity(capacity);
-    path_env_var.push(path_entry);
-    if let Some(existing_path) = existing_path {
-        path_env_var.push(PATH_SEPARATOR);
-        path_env_var.push(existing_path);
-    }
-    path_env_var
+            .into_iter()
+            .flat_map(std::env::split_paths),
+    );
+    std::env::join_paths(entries)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))
 }
 
 fn janitor_cleanup(temp_root: &Path) -> std::io::Result<()> {
@@ -418,15 +401,22 @@ fn janitor_cleanup(temp_root: &Path) -> std::io::Result<()> {
         }
 
         // Skip the directory if locking fails or the lock is currently held.
-        let Some(_lock_file) = try_lock_dir(&path)? else {
-            continue;
+        let _lock_file = match try_lock_dir(&path) {
+            Ok(Some(file)) => file,
+            Ok(None) => continue,
+            Err(err) => {
+                eprintln!("WARNING: could not lock stale arg0 directory {path:?}: {err}");
+                continue;
+            }
         };
 
         match std::fs::remove_dir_all(&path) {
             Ok(()) => {}
             // Expected TOCTOU race: directory can disappear after read_dir/lock checks.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err),
+            Err(err) => {
+                eprintln!("WARNING: could not remove stale arg0 directory {path:?}: {err}");
+            }
         }
     }
 
@@ -490,10 +480,10 @@ mod tests {
 
     fn package_path_test_fixture() -> anyhow::Result<PackagePathTestFixture> {
         let temp_dir = TempDir::new()?;
-        let arg0_dir = temp_dir.path().join("arg0");
+        let arg0_dir = temp_dir.path().join("arg0;aliases");
         let package_dir = temp_dir.path().join("package");
         let bin_dir = package_dir.join("bin");
-        let path_dir = package_dir.join("codex-path");
+        let path_dir = package_dir.join("codex;path");
         let existing_dir = temp_dir.path().join("existing-bin");
         fs::create_dir_all(&arg0_dir)?;
         fs::create_dir_all(&bin_dir)?;
@@ -608,7 +598,7 @@ mod tests {
             Some(fixture.existing_dir.as_os_str().to_owned()),
         )
         .expect("package path dir should update PATH");
-        let updated_path = super::path_env_with_entry(&fixture.arg0_dir, Some(package_path));
+        let updated_path = super::path_env_with_entry(&fixture.arg0_dir, Some(package_path))?;
 
         assert_eq!(
             std::env::split_paths(&updated_path).collect::<Vec<_>>(),
@@ -657,6 +647,20 @@ mod tests {
     }
 
     #[test]
+    fn janitor_continues_after_an_unreadable_lock() -> std::io::Result<()> {
+        let root = tempfile::tempdir()?;
+        let broken = root.path().join("broken");
+        fs::create_dir_all(broken.join(LOCK_FILENAME))?;
+        let stale = root.path().join("stale");
+        fs::create_dir(&stale)?;
+        create_lock(&stale)?;
+        janitor_cleanup(root.path())?;
+        assert!(broken.exists());
+        assert!(!stale.exists());
+        Ok(())
+    }
+
+    #[test]
     fn janitor_removes_only_directories_with_unlocked_lock_files() -> std::io::Result<()> {
         let root = tempfile::tempdir()?;
         let lockless = root.path().join("no-lock");
@@ -665,8 +669,10 @@ mod tests {
         for dir in [&lockless, &locked, &stale] {
             fs::create_dir(dir)?;
         }
-        let lock_file = create_lock(&locked)?;
-        lock_file.try_lock()?;
+        // An initializing directory without a published lock must survive cleanup.
+        janitor_cleanup(root.path())?;
+        assert!(locked.exists());
+        let lock_file = super::lock_session_dir(&locked)?;
         create_lock(&stale)?;
 
         janitor_cleanup(root.path())?;
@@ -674,6 +680,9 @@ mod tests {
         assert!(lockless.exists());
         assert!(locked.exists());
         assert!(!stale.exists());
+        drop(lock_file);
+        janitor_cleanup(root.path())?;
+        assert!(!locked.exists());
         Ok(())
     }
 }

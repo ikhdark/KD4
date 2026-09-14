@@ -4,6 +4,159 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 use pretty_assertions::assert_eq;
 
+#[tokio::test]
+async fn startup_overlaps_catalog_reads_and_applies_default_service_tier() -> Result<()> {
+    use codex_app_server_client::AppServerClient;
+    use codex_app_server_client::RemoteAppServerClient;
+    use codex_app_server_client::RemoteAppServerConnectArgs;
+    use codex_app_server_client::RemoteAppServerEndpoint;
+    use futures::SinkExt;
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (mut app, mut events, _ops) = Box::pin(make_test_app_with_channels()).await;
+    app.config.model = Some("startup-fixture".into());
+    app.config.service_tier = None;
+    app.config.notices.fast_default_opt_out = None;
+    app.config.features.set_enabled(Feature::FastMode, true)?;
+    while events.try_recv().is_ok() {}
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        for method in ["initialize", "initialized", "account/read"] {
+            let frame = socket.next().await.unwrap().unwrap();
+            let request: serde_json::Value =
+                serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(request["method"], method);
+            let result = match method {
+                "initialized" => continue,
+                "account/read" => serde_json::json!({"account": null, "requiresOpenaiAuth": false}),
+                _ => serde_json::json!({}),
+            };
+            socket
+                .send(Message::Text(
+                    serde_json::json!({"id": request["id"], "result": result})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+        }
+        // Receive both requests before replying to either: sequential bootstrap would time out.
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("both independent bootstrap requests must be in flight")
+                .unwrap()
+                .unwrap();
+            requests
+                .push(serde_json::from_str::<serde_json::Value>(frame.to_text().unwrap()).unwrap());
+        }
+        let mut methods = requests
+            .iter()
+            .map(|r| r["method"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        methods.sort_unstable();
+        assert_eq!(methods, vec!["configRequirements/read", "model/list"]);
+        for request in requests.into_iter().rev() {
+            let result = if request["method"] == "configRequirements/read" {
+                serde_json::json!({"requirements": null})
+            } else {
+                serde_json::json!({"data": [{
+                    "id": "startup-fixture", "model": "startup-fixture",
+                    "displayName": "Startup fixture", "description": "Startup fixture",
+                    "hidden": false, "supportedReasoningEfforts": [],
+                    "defaultReasoningEffort": "medium", "isDefault": true,
+                    "serviceTiers": [{"id": "fixture-tier", "name": "Fixture", "description": "Fixture tier"}],
+                    "defaultServiceTier": "fixture-tier"
+                }], "nextCursor": null})
+            };
+            socket
+                .send(Message::Text(
+                    serde_json::json!({"id": request["id"], "result": result})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+        }
+        let frame = socket.next().await.unwrap().unwrap();
+        let request: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(request["method"], "thread/start");
+        assert_eq!(request["params"]["model"], "startup-fixture");
+        assert_eq!(request["params"]["serviceTier"], "fixture-tier");
+        socket
+            .send(Message::Text(
+                serde_json::json!({"id": request["id"], "error": {
+                    "code": -32600, "message": "fixture finished observing startup"
+                }})
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        done_rx.await.unwrap();
+    });
+    let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+        endpoint: RemoteAppServerEndpoint::WebSocket {
+            websocket_url: endpoint,
+            auth_token: None,
+        },
+        client_name: "codex-tui-test".into(),
+        client_version: "0.0.0-test".into(),
+        experimental_api: true,
+        mcp_server_openai_form_elicitation: false,
+        opt_out_notification_methods: Vec::new(),
+        channel_capacity: 8,
+    })
+    .await?;
+    let mut session = AppServerSession::new(
+        AppServerClient::Remote(client),
+        crate::app_server_session::ThreadParamsMode::Remote,
+    );
+    let bootstrap =
+        tokio::time::timeout(Duration::from_secs(10), session.bootstrap(&app.config)).await??;
+    assert_eq!(bootstrap.default_model, "startup-fixture");
+    spawn_startup_thread_start(&session, app.config.clone(), app.app_event_tx.clone());
+    let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await?
+        .expect("startup event");
+    match event {
+        AppEvent::StartupThreadStarted { result: Err(error) } => {
+            assert!(error.contains("fixture finished observing startup"))
+        }
+        event => panic!("unexpected startup event: {event:?}"),
+    }
+    done_tx.send(()).unwrap();
+    peer.await?;
+    session.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pasted_mixed_line_endings_reach_composer_without_extra_lines() -> Result<()> {
+    let mut app = Box::pin(make_test_app()).await;
+    let mut app_server = start_config_write_test_app_server(&app).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    Box::pin(app.handle_tui_event(
+        &mut tui,
+        &mut app_server,
+        TuiEvent::Paste("one\r\ntwo\rthree\nfour".into()),
+    ))
+    .await?;
+    assert_eq!(
+        app.chat_widget.composer_text_with_pending(),
+        "one\ntwo\nthree\nfour"
+    );
+    app_server.shutdown().await?;
+    Ok(())
+}
+
 #[test]
 fn startup_waiting_gate_is_only_for_fresh_or_exit_session_selection() {
     assert_eq!(

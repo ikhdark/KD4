@@ -1,6 +1,7 @@
 use crate::decision::Decision;
 use crate::error::Error;
 use crate::error::Result;
+use crate::executable_name::executable_lookup_key;
 use crate::executable_name::executable_path_lookup_key;
 use crate::rule::NetworkRule;
 use crate::rule::NetworkRuleProtocol;
@@ -15,6 +16,7 @@ use multimap::MultiMap;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 type HeuristicsFallback<'a> = Option<&'a dyn Fn(&[String]) -> Decision>;
@@ -36,6 +38,8 @@ impl Policy {
         Self::from_parts(rules_by_program, Vec::new(), HashMap::new())
     }
 
+    /// `host_executables_by_name` keys must use native executable identity: on Windows,
+    /// lowercase names without .exe/.cmd/.bat/.com; elsewhere, exact basenames.
     pub fn from_parts(
         rules_by_program: MultiMap<String, RuleRef>,
         network_rules: Vec<NetworkRule>,
@@ -134,7 +138,8 @@ impl Policy {
     }
 
     pub fn set_host_executable_paths(&mut self, name: String, paths: Vec<AbsolutePathBuf>) {
-        self.host_executables_by_name.insert(name, paths.into());
+        self.host_executables_by_name
+            .insert(executable_lookup_key(&name), paths.into());
     }
 
     pub fn merge_overlay(&self, overlay: &Policy) -> Policy {
@@ -163,24 +168,25 @@ impl Policy {
         )
     }
 
+    /// Projects rules into the proxy's host-wide permissions. Protocol records the
+    /// originating request; the last non-prompt decision applies to the whole host.
     pub fn compiled_network_domains(&self) -> (Vec<String>, Vec<String>) {
         let mut allowed = Vec::new();
         let mut denied = Vec::new();
+        let mut seen = HashSet::new();
 
-        for rule in &self.network_rules {
+        for rule in self.network_rules.iter().rev() {
+            if rule.decision == Decision::Prompt || !seen.insert(&rule.host) {
+                continue;
+            }
             match rule.decision {
-                Decision::Allow => {
-                    denied.retain(|entry| entry != &rule.host);
-                    upsert_domain(&mut allowed, &rule.host);
-                }
-                Decision::Forbidden => {
-                    allowed.retain(|entry| entry != &rule.host);
-                    upsert_domain(&mut denied, &rule.host);
-                }
+                Decision::Allow => allowed.push(rule.host.clone()),
+                Decision::Forbidden => denied.push(rule.host.clone()),
                 Decision::Prompt => {}
             }
         }
-
+        allowed.reverse();
+        denied.reverse();
         (allowed, denied)
     }
 
@@ -211,6 +217,9 @@ impl Policy {
     }
 
     /// Checks multiple commands and aggregates the results.
+    ///
+    /// # Panics
+    /// Panics if `commands` is empty.
     pub fn check_multiple<Commands, F>(
         &self,
         commands: Commands,
@@ -224,6 +233,10 @@ impl Policy {
         self.check_multiple_with_options(commands, heuristics_fallback, &MatchOptions::default())
     }
 
+    /// Checks a nonempty command collection with executable resolution options.
+    ///
+    /// # Panics
+    /// Panics if `commands` is empty.
     pub fn check_multiple_with_options<Commands, F>(
         &self,
         commands: Commands,
@@ -331,11 +344,6 @@ impl Policy {
             .map(|rule_match| rule_match.with_resolved_program(&program))
             .collect()
     }
-}
-
-fn upsert_domain(entries: &mut Vec<String>, host: &str) {
-    entries.retain(|entry| entry != host);
-    entries.push(host.to_string());
 }
 
 fn render_pattern_token(token: &PatternToken) -> String {

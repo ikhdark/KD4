@@ -93,7 +93,6 @@ impl AgentRegistry {
         Ok(SpawnReservation {
             state: Arc::clone(self),
             active: true,
-            reserved_agent_nickname: None,
             reserved_agent_path: None,
             parent_thread_id: None,
         })
@@ -480,7 +479,6 @@ impl Drop for AgentTreeClosingGuard {
 pub(crate) struct SpawnReservation {
     state: Arc<AgentRegistry>,
     active: bool,
-    reserved_agent_nickname: Option<String>,
     reserved_agent_path: Option<AgentPath>,
     parent_thread_id: Option<ThreadId>,
 }
@@ -497,7 +495,6 @@ impl SpawnReservation {
             .ok_or_else(|| {
                 CodexErr::UnsupportedOperation("no available agent nicknames".to_string())
             })?;
-        self.reserved_agent_nickname = Some(agent_nickname.clone());
         Ok(agent_nickname)
     }
 
@@ -522,7 +519,6 @@ impl SpawnReservation {
                 .release_parent_spawn_reservation(parent_thread_id);
         }
         result?;
-        self.reserved_agent_nickname = None;
         self.reserved_agent_path = None;
         self.active = false;
         Ok(())

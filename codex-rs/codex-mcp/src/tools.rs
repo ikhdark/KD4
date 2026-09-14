@@ -288,15 +288,19 @@ fn rewrite_input_property_schema_as_local_file_path(schema: &mut JsonValue) {
         .and_then(JsonValue::as_str)
         .map(str::to_string)
         .unwrap_or_default();
-    let guidance = "This parameter expects an absolute local file path. If you want to upload a file, provide the absolute path to that file here.";
+    let is_array = object.get("type").and_then(JsonValue::as_str) == Some("array")
+        || object.get("items").is_some();
+    let guidance = if is_array {
+        "Absolute local paths to the files to upload."
+    } else {
+        "Absolute local path to the file to upload."
+    };
     if description.is_empty() {
         description = guidance.to_string();
     } else if !description.contains(guidance) {
         description = format!("{description} {guidance}");
     }
 
-    let is_array = object.get("type").and_then(JsonValue::as_str) == Some("array")
-        || object.get("items").is_some();
     object.clear();
     object.insert("description".to_string(), JsonValue::String(description));
     if is_array {
@@ -365,11 +369,12 @@ fn unique_callable_parts(
     namespace: &str,
     tool_name: &str,
     raw_identity: &str,
-    used_names: &mut HashSet<String>,
+    used_names: &mut HashSet<(String, String)>,
     reserved_len: usize,
 ) -> (String, String) {
-    let model_name = format!("{namespace}{tool_name}");
-    if model_name.len() + reserved_len <= MAX_TOOL_NAME_LENGTH && used_names.insert(model_name) {
+    if namespace.len() + tool_name.len() + reserved_len <= MAX_TOOL_NAME_LENGTH
+        && used_names.insert((namespace.to_string(), tool_name.to_string()))
+    {
         return (namespace.to_string(), tool_name.to_string());
     }
 
@@ -382,8 +387,7 @@ fn unique_callable_parts(
         };
         let (namespace, tool_name) =
             fit_callable_parts_with_hash(namespace, tool_name, &hash_input, reserved_len);
-        let model_name = format!("{namespace}{tool_name}");
-        if used_names.insert(model_name) {
+        if used_names.insert((namespace.clone(), tool_name.clone())) {
             return (namespace, tool_name);
         }
         attempt = attempt.saturating_add(1);

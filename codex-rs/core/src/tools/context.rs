@@ -103,6 +103,7 @@ impl ToolDispatchState {
         }
     }
 
+    #[expect(clippy::expect_used, reason = "Each dispatch must attach exactly one trace; a duplicate is a programming error")]
     pub(crate) fn attach_trace(&self, trace: ToolDispatchTrace) {
         self.trace.set(trace).expect("one trace per dispatch");
     }
@@ -1274,10 +1275,10 @@ impl ExecCommandToolOutput {
     pub(crate) async fn prepare_reduction_notice(&mut self) {
         self.raw_output_reduction_notice = None;
         let raw_output = String::from_utf8_lossy(&self.raw_output);
-        if self.projected_model_output(raw_output.as_ref()).reduced {
-            if let Some(artifact) = &self.raw_output_artifact {
-                self.raw_output_reduction_notice = artifact.reduction_notice().await;
-            }
+        if self.projected_model_output(raw_output.as_ref()).reduced
+            && let Some(artifact) = &self.raw_output_artifact
+        {
+            self.raw_output_reduction_notice = artifact.reduction_notice().await;
         }
     }
 

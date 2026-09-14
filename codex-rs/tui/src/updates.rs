@@ -1,9 +1,8 @@
-#![cfg(not(debug_assertions))]
+#![cfg(any(not(debug_assertions), test))]
 
 use crate::legacy_core::config::Config;
 use crate::npm_registry;
 use crate::npm_registry::NpmPackageInfo;
-use crate::update_action;
 use crate::update_action::UpdateAction;
 use crate::updates_cache::VersionInfo;
 use crate::updates_cache::read_version_info_async;
@@ -23,14 +22,19 @@ use crate::version::CODEX_CLI_VERSION;
 
 pub(crate) use crate::updates_cache::dismiss_version;
 
-pub async fn get_upgrade_version(config: &Config) -> Option<String> {
+pub(crate) async fn startup_version_info(
+    config: &Config,
+    action: Option<UpdateAction>,
+) -> Option<VersionInfo> {
     if !config.check_for_update_on_startup || is_source_build_version(CODEX_CLI_VERSION) {
         return None;
     }
 
-    let action = update_action::get_update_action();
     let version_file = version_filepath(config);
-    let info = read_version_info_async(&version_file).await.ok();
+    let info = read_version_info_async(&version_file)
+        .await
+        .ok()
+        .filter(|info| !requires_npm_readiness(action) || info.npm_ready == Some(true));
 
     if match &info {
         None => true,
@@ -47,13 +51,18 @@ pub async fn get_upgrade_version(config: &Config) -> Option<String> {
         });
     }
 
-    info.and_then(|info| {
-        if is_newer_version(&info.latest_version, CODEX_CLI_VERSION).unwrap_or(false) {
-            Some(info.latest_version)
-        } else {
-            None
-        }
-    })
+    info.filter(|info| is_newer_version(&info.latest_version, CODEX_CLI_VERSION).unwrap_or(false))
+}
+
+fn requires_npm_readiness(action: Option<UpdateAction>) -> bool {
+    matches!(
+        action,
+        Some(
+            UpdateAction::NpmGlobalLatest
+                | UpdateAction::BunGlobalLatest
+                | UpdateAction::PnpmGlobalLatest
+        )
+    )
 }
 
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
@@ -88,20 +97,12 @@ async fn check_for_update(
         }
     };
 
-    // Preserve any previously dismissed version if present.
-    let prev_info = read_version_info_async(version_file).await.ok();
-    let info = VersionInfo {
+    crate::updates_cache::cache_release(
+        version_file,
         latest_version,
-        last_checked_at: Utc::now(),
-        dismissed_version: prev_info.and_then(|p| p.dismissed_version),
-    };
-
-    let json_line = format!("{}\n", serde_json::to_string(&info)?);
-    if let Some(parent) = version_file.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    tokio::fs::write(version_file, json_line).await?;
-    Ok(())
+        requires_npm_readiness(action),
+    )
+    .await
 }
 
 async fn fetch_latest_github_release_version(
@@ -128,6 +129,14 @@ async fn fetch_github_release_version(
         .ok_or_else(|| anyhow::anyhow!("Failed to parse latest tag name '{latest_tag_name}'"))
 }
 
+/// Returns the latest version to show in a popup, if it should be shown.
+/// This respects the user's dismissal choice for the current latest version.
+pub(crate) fn get_upgrade_version_for_popup(info: Option<&VersionInfo>) -> Option<&str> {
+    let info = info?;
+    (info.dismissed_version.as_deref() != Some(info.latest_version.as_str()))
+        .then_some(info.latest_version.as_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +147,34 @@ mod tests {
     use wiremock::MockServer;
     use wiremock::ResponseTemplate;
     use wiremock::matchers::method;
+
+    #[test]
+    fn popup_uses_dismissal_from_the_supplied_snapshot() {
+        let mut info = VersionInfo {
+            latest_version: "9999.0.0".into(),
+            last_checked_at: Utc::now(),
+            dismissed_version: Some("9999.0.0".into()),
+            npm_ready: None,
+        };
+        assert_eq!(super::get_upgrade_version_for_popup(Some(&info)), None);
+        info.dismissed_version = Some("9998.0.0".into());
+        assert_eq!(
+            super::get_upgrade_version_for_popup(Some(&info)),
+            Some("9999.0.0")
+        );
+        assert_eq!(super::get_upgrade_version_for_popup(None), None);
+    }
+
+    async fn get_upgrade_version(config: &Config) -> Option<String> {
+        startup_version_info(config, None)
+            .await
+            .map(|info| info.latest_version)
+    }
+
+    async fn get_upgrade_version_for_popup(config: &Config) -> Option<String> {
+        let info = startup_version_info(config, None).await;
+        super::get_upgrade_version_for_popup(info.as_ref()).map(str::to_owned)
+    }
 
     #[test]
     fn cached_upgrade_getters_yield_and_preserve_version_and_dismissal_behavior() {
@@ -246,22 +283,4 @@ mod tests {
 
         assert_eq!(version, "9.9.9");
     }
-}
-
-/// Returns the latest version to show in a popup, if it should be shown.
-/// This respects the user's dismissal choice for the current latest version.
-pub async fn get_upgrade_version_for_popup(config: &Config) -> Option<String> {
-    if !config.check_for_update_on_startup || is_source_build_version(CODEX_CLI_VERSION) {
-        return None;
-    }
-
-    let version_file = version_filepath(config);
-    let latest = get_upgrade_version(config).await?;
-    // If the user dismissed this exact version previously, do not show the popup.
-    if let Ok(info) = read_version_info_async(&version_file).await
-        && info.dismissed_version.as_deref() == Some(latest.as_str())
-    {
-        return None;
-    }
-    Some(latest)
 }

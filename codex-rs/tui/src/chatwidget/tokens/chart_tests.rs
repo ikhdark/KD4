@@ -76,7 +76,7 @@ fn maximum_token_counts_keep_grades_and_totals_nonnegative() {
 fn duplicate_dates_sum_and_negative_values_clamp() {
     let today =
         NaiveDate::from_ymd_opt(/*year*/ 2026, /*month*/ 5, /*day*/ 29).expect("valid date");
-    let buckets = vec![
+    let mut buckets = vec![
         AccountTokenUsageDailyBucket {
             start_date: "2026-05-29".to_string(),
             tokens: 10,
@@ -91,9 +91,18 @@ fn duplicate_dates_sum_and_negative_values_clamp() {
         },
     ];
 
+    for date in ["invalid", "2020-01-01", "2026-05-30", "2030-01-01"] {
+        buckets.push(AccountTokenUsageDailyBucket {
+            start_date: date.to_string(),
+            tokens: 99,
+        });
+    }
     let values = daily_values(&buckets, today);
 
-    assert_eq!(values.iter().sum::<i64>(), 15);
+    let mut expected = vec![0; 364];
+    // This Friday is the penultimate day in the final Sunday-based week.
+    expected[362] = 15;
+    assert_eq!(values, expected);
 }
 
 #[test]

@@ -67,7 +67,14 @@ impl ChatWidget {
             {
                 Ok(()) => None,
                 Err(err) => Some(err.to_string()),
-            };
+            }
+            .or_else(|| {
+                self.config
+                    .permissions
+                    .can_set_permission_profile(&preset.permission_profile)
+                    .err()
+                    .map(|err| err.to_string())
+            });
             let default_disabled_reason = approval_disabled_reason
                 .clone()
                 .or_else(|| guardian_disabled_reason(false));

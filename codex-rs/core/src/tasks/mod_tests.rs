@@ -81,6 +81,85 @@ impl SessionTask for FenceBlockingTask {
 #[derive(Clone, Copy)]
 struct ImmediateCompletingTask;
 
+#[derive(Debug)]
+struct ReviewStartupFailingModelsManager {
+    inner: codex_models_manager::manager::SharedModelsManager,
+}
+
+impl codex_models_manager::manager::ModelsManager for ReviewStartupFailingModelsManager {
+    fn model_catalog_activity(&self) -> Arc<codex_models_manager::manager::ModelCatalogActivity> {
+        self.inner.model_catalog_activity()
+    }
+
+    fn refresh_models_for_background(
+        &self,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> codex_models_manager::manager::ModelsManagerFuture<'_, codex_protocol::error::Result<()>>
+    {
+        self.inner
+            .refresh_models_for_background(http_client_factory)
+    }
+
+    fn raw_model_catalog(
+        &self,
+        refresh_strategy: codex_models_manager::manager::RefreshStrategy,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> codex_models_manager::manager::ModelsManagerFuture<
+        '_,
+        codex_protocol::error::Result<codex_protocol::openai_models::ModelsResponse>,
+    > {
+        self.inner
+            .raw_model_catalog(refresh_strategy, http_client_factory)
+    }
+
+    fn get_remote_models(
+        &self,
+    ) -> codex_models_manager::manager::ModelsManagerFuture<
+        '_,
+        Vec<codex_protocol::openai_models::ModelInfo>,
+    > {
+        self.inner.get_remote_models()
+    }
+
+    fn try_get_remote_models(
+        &self,
+    ) -> std::result::Result<Vec<codex_protocol::openai_models::ModelInfo>, tokio::sync::TryLockError>
+    {
+        self.inner.try_get_remote_models()
+    }
+
+    fn auth_manager(&self) -> Option<&codex_login::AuthManager> {
+        self.inner.auth_manager()
+    }
+
+    fn list_collaboration_modes(&self) -> Vec<codex_protocol::config_types::CollaborationModeMask> {
+        self.inner.list_collaboration_modes()
+    }
+
+    fn get_default_model<'a>(
+        &'a self,
+        _model: &'a Option<String>,
+        _allow_provider_model_fallback: bool,
+        _refresh_strategy: codex_models_manager::manager::RefreshStrategy,
+        _http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> codex_models_manager::manager::ModelsManagerFuture<'a, codex_protocol::error::Result<String>>
+    {
+        Box::pin(async {
+            Err(codex_protocol::error::CodexErr::Fatal(
+                "injected review model startup failure".to_string(),
+            ))
+        })
+    }
+
+    fn notify_etag(
+        self: Arc<Self>,
+        etag: String,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> codex_models_manager::manager::ModelsManagerFuture<'static, ()> {
+        Arc::clone(&self.inner).notify_etag(etag, http_client_factory)
+    }
+}
+
 impl SessionTask for ImmediateCompletingTask {
     fn kind(&self) -> TaskKind {
         TaskKind::Regular
@@ -624,6 +703,77 @@ async fn panicked_worker_emits_error_before_internal_error_abort() {
     })
     .await
     .expect("panicked worker must publish a bounded terminal outcome");
+}
+
+#[tokio::test]
+async fn review_startup_failure_preserves_terminal_error_and_closes_review_mode() {
+    let (mut session, turn_context, events) = make_session_and_context_with_rx().await;
+    let models_manager = Arc::clone(&session.services.models_manager);
+    Arc::get_mut(&mut session)
+        .expect("session has not started any tasks")
+        .services
+        .models_manager = Arc::new(ReviewStartupFailingModelsManager {
+        inner: models_manager,
+    });
+    session
+        .start_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            super::review::ReviewTask::new(codex_protocol::items::EnteredReviewModeItem {
+                id: "review-startup-failure".to_string(),
+                target: codex_protocol::protocol::ReviewTarget::UncommittedChanges,
+                user_facing_hint: "review current changes".to_string(),
+            }),
+        )
+        .await;
+
+    let mut entered_review = false;
+    let mut exited_review = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = events
+                .recv()
+                .await
+                .expect("review event channel remains open");
+            match event.msg {
+                EventMsg::ItemCompleted(completed) => match completed.item {
+                    codex_protocol::items::TurnItem::EnteredReviewMode(_) => {
+                        entered_review = true;
+                    }
+                    codex_protocol::items::TurnItem::ExitedReviewMode(exited) => {
+                        assert!(entered_review, "review must enter before exiting");
+                        assert!(!exited_review, "review must exit only once");
+                        assert!(exited.review_output.is_none());
+                        exited_review = true;
+                    }
+                    _ => {}
+                },
+                EventMsg::TurnComplete(completed) if completed.turn_id == turn_context.sub_id => {
+                    assert!(entered_review);
+                    assert!(
+                        exited_review,
+                        "failed review must close before its terminal event"
+                    );
+                    assert_eq!(
+                        completed
+                            .error
+                            .expect("startup failure must fail the turn")
+                            .message,
+                        "Fatal error: injected review model startup failure"
+                    );
+                    break;
+                }
+                EventMsg::TurnAborted(aborted)
+                    if aborted.turn_id.as_deref() == Some(turn_context.sub_id.as_str()) =>
+                {
+                    panic!("startup failure must preserve its error in TurnComplete");
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("failed review must publish a bounded terminal outcome");
 }
 
 #[tokio::test]

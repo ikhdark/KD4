@@ -69,6 +69,10 @@ pub(crate) fn clear_instruction_messages(model: &mut ModelInfo) {
 /// Build a minimal fallback model descriptor for missing/unknown slugs.
 pub fn model_info_from_slug(slug: &str) -> ModelInfo {
     warn!("Unknown model {slug} is used. This will use fallback model metadata.");
+    let base_instructions = crate::prompt_resolver::resolve_prompt(slug, None)
+        .content
+        .to_string();
+    let model_messages = local_personality_messages_for_slug(slug, &base_instructions);
     ModelInfo {
         slug: slug.to_string(),
         display_name: slug.to_string(),
@@ -84,10 +88,8 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         default_service_tier: None,
         availability_nux: None,
         upgrade: None,
-        base_instructions: crate::prompt_resolver::resolve_prompt(slug, None)
-            .content
-            .to_string(),
-        model_messages: local_personality_messages_for_slug(slug),
+        base_instructions,
+        model_messages,
         include_skills_usage_instructions: false,
         supports_reasoning_summaries: false,
         default_reasoning_summary: ReasoningSummary::Auto,
@@ -99,7 +101,7 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
         context_window: Some(272_000),
-        max_context_window: Some(272_000),
+        max_context_window: None,
         auto_compact_token_limit: None,
         comp_hash: None,
         effective_context_window_percent: 95,
@@ -114,11 +116,14 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
     }
 }
 
-fn local_personality_messages_for_slug(slug: &str) -> Option<ModelMessages> {
+fn local_personality_messages_for_slug(
+    slug: &str,
+    base_instructions: &str,
+) -> Option<ModelMessages> {
     match slug {
         "gpt-5.2-codex" | "exp-codex-personality" => Some(ModelMessages {
             instructions_template: Some(format!(
-                "{PERSONALITY_PLACEHOLDER}\n\n{BASE_INSTRUCTIONS}"
+                "{PERSONALITY_PLACEHOLDER}\n\n{base_instructions}"
             )),
             instructions_variables: Some(ModelInstructionsVariables {
                 personality_default: Some(String::new()),
@@ -132,7 +137,9 @@ fn local_personality_messages_for_slug(slug: &str) -> Option<ModelMessages> {
 }
 
 pub(crate) fn apply_local_personality_messages(model: &mut ModelInfo, requested_slug: &str) {
-    let Some(mut local_messages) = local_personality_messages_for_slug(requested_slug) else {
+    let Some(mut local_messages) =
+        local_personality_messages_for_slug(requested_slug, &model.base_instructions)
+    else {
         return;
     };
     local_messages.approvals = model

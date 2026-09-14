@@ -106,6 +106,12 @@ struct HookPromptXml {
     text: String,
 }
 
+#[derive(Deserialize)]
+enum HookPromptRoot {
+    #[serde(rename = "hook_prompt")]
+    HookPrompt(HookPromptXml),
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
 #[serde(tag = "type")]
 #[ts(tag = "type")]
@@ -224,7 +230,7 @@ pub struct CommandExecutionItem {
     #[ts(optional)]
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "string", optional)]
+    #[ts(type = "{ secs: number, nanos: number }", optional)]
     pub duration: Option<Duration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -258,7 +264,7 @@ pub struct DynamicToolCallItem {
     #[ts(optional)]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "string", optional)]
+    #[ts(type = "{ secs: number, nanos: number }", optional)]
     pub duration: Option<Duration>,
 }
 
@@ -402,7 +408,7 @@ pub struct McpToolCallItem {
     #[ts(optional)]
     pub error: Option<McpToolCallError>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "string", optional)]
+    #[ts(type = "{ secs: number, nanos: number }", optional)]
     pub duration: Option<Duration>,
 }
 
@@ -453,14 +459,13 @@ impl UserMessageItem {
     }
 
     pub fn message(&self) -> String {
-        self.content
-            .iter()
-            .map(|c| match c {
-                UserInput::Text { text, .. } => text.clone(),
-                _ => String::new(),
-            })
-            .collect::<Vec<String>>()
-            .join("")
+        let mut message = String::new();
+        for input in &self.content {
+            if let UserInput::Text { text, .. } = input {
+                message.push_str(text);
+            }
+        }
+        message
     }
 
     pub fn text_elements(&self) -> Vec<TextElement> {
@@ -609,7 +614,8 @@ pub fn parse_hook_prompt_message(
 
 pub fn parse_hook_prompt_fragment(text: &str) -> Option<HookPromptFragment> {
     let trimmed = text.trim();
-    let HookPromptXml { text, hook_run_id } = from_xml_str::<HookPromptXml>(trimmed).ok()?;
+    let HookPromptRoot::HookPrompt(HookPromptXml { text, hook_run_id }) =
+        from_xml_str::<HookPromptRoot>(trimmed).ok()?;
     if hook_run_id.trim().is_empty() {
         return None;
     }
@@ -700,6 +706,78 @@ mod tests {
                 text: "Retry with tests.".to_string(),
                 hook_run_id: "hook-run-1".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn hook_prompt_message_rejects_unrelated_roots_and_mixed_content() {
+        let wrong_root = ContentItem::InputText {
+            text: r#"<other hook_run_id="hook-run-1">Ordinary text.</other>"#.to_string(),
+        };
+        assert!(parse_hook_prompt_message(None, std::slice::from_ref(&wrong_root)).is_none());
+        let valid = ContentItem::InputText {
+            text: r#"<hook_prompt hook_run_id="hook-run-1">Hook text.</hook_prompt>"#.to_string(),
+        };
+        assert!(parse_hook_prompt_message(None, &[valid, wrong_root]).is_none());
+    }
+
+    #[test]
+    fn user_message_concatenates_text_around_images() {
+        let item = UserMessageItem::new(&[
+            UserInput::Text {
+                text: "hello é".to_string(),
+                text_elements: vec![],
+            },
+            UserInput::Image {
+                image_url: "data:image/png;base64,aGVsbG8=".to_string(),
+                detail: None,
+            },
+            UserInput::Text {
+                text: "世界".to_string(),
+                text_elements: vec![],
+            },
+        ]);
+        assert_eq!(item.as_legacy_user_message_event().message, "hello é世界");
+    }
+
+    #[test]
+    fn mcp_completion_requires_duration_and_preserves_result() {
+        let mut item: McpToolCallItem = serde_json::from_value(serde_json::json!({
+            "id": "call-1", "server": "server", "tool": "tool", "arguments": {},
+            "status": "completed", "result": {"content": [{"type": "text", "text": "result"}]}
+        }))
+        .unwrap();
+        assert!(item.as_legacy_end_event().is_none());
+        item.duration = Some(Duration::from_millis(42));
+        let Some(crate::protocol::EventMsg::McpToolCallEnd(event)) = item.as_legacy_end_event()
+        else {
+            panic!("expected MCP completion");
+        };
+        assert_eq!(event.duration, Duration::from_millis(42));
+        assert_eq!(event.result.unwrap(), item.result.unwrap());
+    }
+
+    #[test]
+    fn tool_item_duration_types_match_serialized_duration() {
+        for declaration in [
+            CommandExecutionItem::decl(),
+            DynamicToolCallItem::decl(),
+            McpToolCallItem::decl(),
+        ] {
+            assert!(
+                declaration.contains("duration?: { secs: number, nanos: number }"),
+                "{declaration}"
+            );
+        }
+        let item: DynamicToolCallItem = serde_json::from_value(serde_json::json!({
+            "id": "call-1", "tool": "test", "arguments": {}, "status": "completed",
+            "duration": {"secs": 2, "nanos": 345}
+        }))
+        .unwrap();
+        assert_eq!(item.duration, Some(Duration::new(2, 345)));
+        assert_eq!(
+            serde_json::to_value(item).unwrap()["duration"],
+            serde_json::json!({"secs": 2, "nanos": 345})
         );
     }
 }

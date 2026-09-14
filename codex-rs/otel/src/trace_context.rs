@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::env;
-use std::str::FromStr;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 
@@ -38,14 +37,16 @@ pub fn span_w3c_trace_context(span: &Span) -> Option<W3cTraceContext> {
 
     let mut headers = HashMap::new();
     TraceContextPropagator::new().inject_context(&context, &mut headers);
-    let tracestate = headers.remove("tracestate");
     let configured_tracestate_guard = tracestate_entries()
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     Some(W3cTraceContext {
         traceparent: headers.remove("traceparent"),
-        tracestate: merge_tracestate_entries(tracestate.as_deref(), &configured_tracestate_guard),
+        tracestate: merge_tracestate_entries(
+            context.span().span_context().trace_state(),
+            &configured_tracestate_guard,
+        ),
     })
 }
 
@@ -55,6 +56,8 @@ pub fn span_w3c_trace_context(span: &Span) -> Option<W3cTraceContext> {
 /// safely reuse a request header map while keeping the supplied span as the
 /// source of truth.
 pub fn inject_span_w3c_trace_headers(span: &Span, headers: &mut http::HeaderMap) -> bool {
+    headers.remove("traceparent");
+    headers.remove("tracestate");
     let Some(trace) = span_w3c_trace_context(span) else {
         return false;
     };
@@ -109,8 +112,7 @@ pub fn context_from_w3c_trace_context(trace: &W3cTraceContext) -> Option<Context
 
 pub fn set_parent_from_w3c_trace_context(span: &Span, trace: &W3cTraceContext) -> bool {
     if let Some(context) = context_from_w3c_trace_context(trace) {
-        set_parent_from_context(span, context);
-        true
+        span.set_parent(context).is_ok()
     } else {
         false
     }
@@ -165,33 +167,42 @@ fn tracestate_entries() -> &'static RwLock<BTreeMap<String, BTreeMap<String, Str
 }
 
 fn merge_tracestate_entries(
-    tracestate: Option<&str>,
+    tracestate: &TraceState,
     configured_entries: &BTreeMap<String, BTreeMap<String, String>>,
 ) -> Option<String> {
-    let mut trace_state = tracestate
-        .and_then(|tracestate| match TraceState::from_str(tracestate) {
-            Ok(trace_state) => Some(trace_state),
-            Err(err) => {
-                warn!("ignoring invalid tracestate while propagating trace context: {err}");
-                None
-            }
-        })
-        .unwrap_or_default();
+    let mut trace_state = tracestate.clone();
 
     // TraceState::insert places members at the front. Reverse iteration keeps
     // deterministic map order while upserting fields inside configured members.
     for (key, fields) in configured_entries.iter().rev() {
         let value = merge_tracestate_member_fields(trace_state.get(key), fields);
+        if !is_tracestate_member_key(key) || !is_header_safe_tracestate_member_value(&value) {
+            warn!("ignoring invalid configured tracestate member update");
+            continue;
+        }
         trace_state = match trace_state.insert(key.clone(), value) {
             Ok(trace_state) => trace_state,
             Err(err) => {
                 warn!("ignoring configured tracestate while propagating trace context: {err}");
-                break;
+                continue;
             }
         };
     }
 
-    let tracestate = trace_state.header();
+    // The pinned SDK does not enforce all W3C constraints. Preserve valid
+    // members in priority order, dropping rightmost entries beyond the limit.
+    let mut seen = BTreeSet::new();
+    let tracestate = trace_state
+        .into_iter()
+        .filter(|(key, value)| {
+            is_tracestate_member_key(key)
+                && is_header_safe_tracestate_member_value(value)
+                && seen.insert(*key)
+        })
+        .take(32)
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(",");
     (!tracestate.is_empty()).then_some(tracestate)
 }
 
@@ -199,10 +210,11 @@ fn merge_tracestate_entries(
 pub fn validate_tracestate_entries(
     entries: &BTreeMap<String, BTreeMap<String, String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Reject malformed entries before installing them so propagated trace
-    // context remains acceptable to other W3C Trace Context extractors. The
-    // SDK validates member keys and list structure, but configured member
-    // fields are joined into header values here and need stricter validation.
+    if entries.len() > 32 {
+        return Err(invalid_tracestate_config(
+            "configured tracestate exceeds 32 members".to_string(),
+        ));
+    }
     let entries = entries
         .iter()
         .map(|(key, fields)| encode_tracestate_member_fields(key, fields))
@@ -240,6 +252,11 @@ fn encode_tracestate_member_fields(
     member_key: &str,
     fields: &BTreeMap<String, String>,
 ) -> Result<(String, String), Box<dyn std::error::Error>> {
+    if !is_tracestate_member_key(member_key) {
+        return Err(invalid_tracestate_config(format!(
+            "invalid configured tracestate member key {member_key:?}"
+        )));
+    }
     // Configured fields are encoded into one opaque tracestate member value.
     // Validate both the field grammar and the final header value so malformed
     // config cannot produce propagated trace context that downstream W3C
@@ -281,9 +298,30 @@ fn is_configured_tracestate_field_value(value: &str) -> bool {
 }
 
 fn is_header_safe_tracestate_member_value(value: &str) -> bool {
-    value.is_empty()
-        || (value.bytes().all(is_tracestate_member_value_byte)
-            && value.as_bytes().last().is_some_and(|byte| *byte != b' '))
+    !value.is_empty()
+        && value.len() <= 256
+        && value.bytes().all(is_tracestate_member_value_byte)
+        && value.as_bytes().last().is_some_and(|byte| *byte != b' ')
+}
+
+fn is_tracestate_member_key(key: &str) -> bool {
+    let valid_part = |part: &str, max_len: usize, allow_digit: bool| {
+        !part.is_empty()
+            && part.len() <= max_len
+            && part
+                .as_bytes()
+                .first()
+                .is_some_and(|b| b.is_ascii_lowercase() || (allow_digit && b.is_ascii_digit()))
+            && part.bytes().all(|b| {
+                b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || matches!(b, b'_' | b'-' | b'*' | b'/')
+            })
+    };
+    match key.split_once('@') {
+        Some((tenant, system)) => valid_part(tenant, 241, true) && valid_part(system, 14, false),
+        None => valid_part(key, 256, false),
+    }
 }
 
 fn is_tracestate_member_value_byte(byte: u8) -> bool {
@@ -400,5 +438,165 @@ mod tests {
         assert_eq!(trace_id.len(), 32);
         assert!(trace_id.chars().all(|ch| ch.is_ascii_hexdigit()));
         assert_ne!(trace_id, "00000000000000000000000000000000");
+    }
+
+    #[test]
+    fn reused_headers_follow_supplied_span_and_clear_for_invalid_span() {
+        let provider = SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("headers")));
+        let _guard = subscriber.set_default();
+        let span = tracing::info_span!("request");
+        let mut headers = http::HeaderMap::new();
+        headers.insert("traceparent", "stale".parse().unwrap());
+        headers.insert("tracestate", "stale=value".parse().unwrap());
+        headers.insert("authorization", "preserved".parse().unwrap());
+        assert!(super::inject_span_w3c_trace_headers(&span, &mut headers));
+        let expected = super::span_w3c_trace_context(&span).unwrap();
+        assert_eq!(
+            headers["traceparent"].to_str().unwrap(),
+            expected.traceparent.unwrap()
+        );
+        assert!(!headers.contains_key("tracestate"));
+        headers.insert("tracestate", "stale=value".parse().unwrap());
+        assert!(!super::inject_span_w3c_trace_headers(
+            &tracing::Span::none(),
+            &mut headers
+        ));
+        assert!(!headers.contains_key("traceparent"));
+        assert!(!headers.contains_key("tracestate"));
+        assert_eq!(headers["authorization"], "preserved");
+    }
+
+    #[test]
+    fn parenting_reports_rejection_after_span_start() {
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        let provider = SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("parenting")));
+        let _guard = subscriber.set_default();
+        let trace = W3cTraceContext {
+            traceparent: Some(
+                "00-00000000000000000000000000000001-0000000000000002-01".to_string(),
+            ),
+            tracestate: None,
+        };
+        assert!(!super::set_parent_from_w3c_trace_context(
+            &tracing::Span::none(),
+            &trace
+        ));
+        let span = tracing::info_span!("request");
+        assert!(super::set_parent_from_w3c_trace_context(&span, &trace));
+        let context = span.context();
+        assert_eq!(
+            context.span().span_context().trace_id(),
+            TraceId::from_hex("00000000000000000000000000000001").unwrap()
+        );
+        let different_parent = W3cTraceContext {
+            traceparent: Some(
+                "00-00000000000000000000000000000003-0000000000000004-01".to_string(),
+            ),
+            tracestate: None,
+        };
+        assert!(!super::set_parent_from_w3c_trace_context(
+            &span,
+            &different_parent
+        ));
+        assert_eq!(
+            span.context().span().span_context().trace_id(),
+            context.span().span_context().trace_id()
+        );
+    }
+
+    #[test]
+    fn configured_tracestate_enforces_key_value_and_member_limits() {
+        use std::collections::BTreeMap;
+        let fields = BTreeMap::from([("field".to_string(), "value".to_string())]);
+        for key in ["", "123", "tenant@", "tenant@1system", "a@@b"] {
+            assert!(
+                super::validate_tracestate_member(key, &fields).is_err(),
+                "{key:?}"
+            );
+        }
+        for key in ["vendor", "1tenant@vendor"] {
+            super::validate_tracestate_member(key, &fields).unwrap();
+        }
+        assert!(super::validate_tracestate_member("vendor", &BTreeMap::new()).is_err());
+        let oversized = BTreeMap::from([("f".to_string(), "v".repeat(255))]);
+        assert!(super::validate_tracestate_member("vendor", &oversized).is_err());
+        let mut entries: BTreeMap<_, _> = (0..32)
+            .map(|i| (format!("vendor{i}"), fields.clone()))
+            .collect();
+        super::validate_tracestate_entries(&entries).unwrap();
+        entries.insert("extra".to_string(), fields);
+        assert!(super::validate_tracestate_entries(&entries).is_err());
+    }
+
+    #[test]
+    fn tracestate_merge_preserves_failed_member_and_applies_unrelated_update() {
+        use opentelemetry::trace::TraceState;
+        use std::collections::BTreeMap;
+        let original = format!("keep:{}", "x".repeat(245));
+        let state =
+            TraceState::from_key_value([("z", original.as_str()), ("other", "value")]).unwrap();
+        let entries = BTreeMap::from([
+            (
+                "z".to_string(),
+                BTreeMap::from([("extra".to_string(), "too-long".to_string())]),
+            ),
+            (
+                "a".to_string(),
+                BTreeMap::from([("f".to_string(), "ok".to_string())]),
+            ),
+        ]);
+        assert_eq!(
+            super::merge_tracestate_entries(&state, &entries),
+            Some(format!("a=f:ok,z={original},other=value"))
+        );
+        assert_eq!(
+            super::merge_tracestate_entries(&state, &BTreeMap::new()),
+            Some(format!("z={original},other=value"))
+        );
+    }
+
+    #[test]
+    fn tracestate_merge_caps_final_members_and_discards_invalid_native_members() {
+        use opentelemetry::trace::TraceState;
+        use std::collections::BTreeMap;
+        let mut pairs: Vec<_> = (0..32)
+            .map(|i| (format!("v{i}"), "value".to_string()))
+            .collect();
+        pairs.insert(0, ("".to_string(), "value".to_string()));
+        pairs.insert(0, ("empty".to_string(), "".to_string()));
+        let state = TraceState::from_key_value(pairs).unwrap();
+        let entries = BTreeMap::from([(
+            "first".to_string(),
+            BTreeMap::from([("f".to_string(), "ok".to_string())]),
+        )]);
+        let merged = super::merge_tracestate_entries(&state, &entries).unwrap();
+        let expected = std::iter::once("first=f:ok".to_string())
+            .chain((0..31).map(|i| format!("v{i}=value")))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(merged, expected);
+    }
+    #[test]
+    fn tracestate_merge_preserves_original_when_field_order_creates_trailing_space() {
+        use opentelemetry::trace::TraceState;
+        use std::collections::BTreeMap;
+        let state =
+            TraceState::from_key_value([("vendor", "z:old;a:old"), ("other", "keep")]).unwrap();
+        let entries = BTreeMap::from([(
+            "vendor".to_string(),
+            BTreeMap::from([
+                ("a".to_string(), "x ".to_string()),
+                ("z".to_string(), "y".to_string()),
+            ]),
+        )]);
+        super::validate_tracestate_entries(&entries).expect("sorted configuration is valid");
+        assert_eq!(
+            super::merge_tracestate_entries(&state, &entries),
+            Some("vendor=z:old;a:old,other=keep".to_string())
+        );
     }
 }

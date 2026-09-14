@@ -115,6 +115,28 @@ impl App {
             return;
         };
 
+        // The flat effort field cannot distinguish a reset from an omitted update.
+        // Collaboration settings carry an explicit nullable effort on the existing wire contract.
+        if matches!(effort, Some(None))
+            && collaboration_mode.is_none()
+            && self.active_thread_id != Some(thread_id)
+        {
+            self.chat_widget.add_error_message(
+                "Select this thread before resetting its reasoning effort.".to_string(),
+            );
+            return;
+        }
+        let collaboration_mode = collaboration_mode.clone().or_else(|| {
+            matches!(effort, Some(None)).then(|| {
+                let mut mode = self.chat_widget.effective_collaboration_mode();
+                mode.settings.reasoning_effort = None;
+                if let Some(model) = model {
+                    mode.settings.model = model.clone();
+                }
+                mode
+            })
+        });
+
         let params = ThreadSettingsUpdateParams {
             thread_id: thread_id.to_string(),
             cwd: cwd.clone(),
@@ -132,7 +154,7 @@ impl App {
             effort: effort.clone().unwrap_or_default(),
             summary: *summary,
             service_tier: service_tier.clone(),
-            collaboration_mode: collaboration_mode.clone(),
+            collaboration_mode,
             personality: *personality,
             ..ThreadSettingsUpdateParams::default()
         };

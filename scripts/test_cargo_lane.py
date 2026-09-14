@@ -35,6 +35,104 @@ def ps_single_quote(value: str | Path) -> str:
 
 
 class CargoLaneTest(unittest.TestCase):
+    def test_setup_failure_releases_reservation_in_surviving_host(self):
+        command = f"""
+$ErrorActionPreference = 'Stop'
+$before = (Get-Location).Path
+$env:CODEX_CARGO_LANE_TARGET_DIR = 'previous-lane'
+$env:LOCALAPPDATA = $null
+$env:CODEX_CARGO_LANE_DISABLE_BACKGROUND_DELETE = '1'
+$env:CODEX_CARGO_TARGET_MAX_TOTAL_BYTES = '0'
+try {{
+    & {ps_single_quote(SCRIPT)} -LanesRoot {ps_single_quote(self.lanes_root)} -Lane setup-failure -IsolateCargoHome
+    throw 'Expected setup to fail'
+}} catch {{
+    if ($_.Exception.Message -notlike '*LOCALAPPDATA is not set*') {{ throw }}
+}}
+if ($env:CODEX_CARGO_LANE_TARGET_DIR -ne 'previous-lane') {{ throw 'Lane environment leaked' }}
+if ((Get-Location).Path -ne $before) {{ throw 'Location changed' }}
+$probe = [IO.File]::Open({ps_single_quote(self.lanes_root / "setup-failure" / ".lane-active.lock")}, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+$probe.Dispose()
+Write-Output 'reservation released'
+"""
+        result = subprocess.run(
+            [self.shell, "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("reservation released", result.stdout)
+
+    def test_trash_namespace_is_rejected_before_mutation(self):
+        result = self.run_script("-Lane", "active.trash-20260102030405000")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("reserved for cleanup", result.stderr)
+        self.assertEqual(list(self.lanes_root.iterdir()), [])
+
+    def test_watch_rewrites_all_execs_before_terminal_separator(self):
+        result = self.run_fake_cargo(
+            "-Lane", "watch", "cargo", "watch", "-x", "test --", "--exec=check", "--"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"test --target-dir {self.lane_path('watch')} --", result.stdout)
+        self.assertIn(
+            f"--exec=check --target-dir {self.lane_path('watch')}", result.stdout
+        )
+
+    def test_alias_and_nextest_list_are_isolated(self):
+        for command in (("b",), ("clean",), ("nextest", "list")):
+            result = self.run_fake_cargo("-Lane", "alias", "cargo", *command)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"--target-dir {self.lane_path('alias')}", result.stdout)
+        result = self.run_fake_cargo("-Lane", "alias", "cargo", "local-alias")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("cargo-args:", result.stdout)
+
+    def test_cleanup_keeps_reserved_trash_then_removes_released_directory(self):
+        self.mark_lanes_root()
+        path = self.make_lane("held.trash-20260102030405000", size=10)
+        held = rust_build_status._try_acquire_binary_file_lock(
+            path / ".lane-active.lock"
+        )
+        self.assertIsNotNone(held)
+        with held:
+            result = subprocess.run(
+                [
+                    self.shell,
+                    "-NoProfile",
+                    "-File",
+                    str(CLEANUP_SCRIPT),
+                    "-LanesRoot",
+                    str(self.lanes_root),
+                    "-MaxPasses",
+                    "1",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(path.exists())
+        result = subprocess.run(
+            [
+                self.shell,
+                "-NoProfile",
+                "-File",
+                str(CLEANUP_SCRIPT),
+                "-LanesRoot",
+                str(self.lanes_root),
+                "-MaxPasses",
+                "1",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(path.exists())
+
     def setUp(self) -> None:
         shell = powershell()
         if shell is None:
@@ -55,13 +153,13 @@ class CargoLaneTest(unittest.TestCase):
         lanes_root: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
-        if extra_env:
-            env.update(extra_env)
-        env.setdefault("CODEX_CARGO_LANE_DISABLE_BACKGROUND_DELETE", "1")
+        env["CODEX_CARGO_LANE_DISABLE_BACKGROUND_DELETE"] = "1"
         # Most lane-wrapper tests exercise naming, locking, and forwarding. Keep
         # them isolated from the real repository's large non-lane target tree;
         # target-budget tests opt back into the production default explicitly.
-        env.setdefault("CODEX_CARGO_TARGET_MAX_TOTAL_BYTES", "0")
+        env["CODEX_CARGO_TARGET_MAX_TOTAL_BYTES"] = "0"
+        if extra_env:
+            env.update(extra_env)
         return subprocess.run(
             [
                 self.shell,
@@ -260,6 +358,7 @@ class CargoLaneTest(unittest.TestCase):
         )
         env = os.environ.copy()
         env["CODEX_CARGO_LANE_DISABLE_BACKGROUND_DELETE"] = "1"
+        env["CODEX_CARGO_TARGET_MAX_TOTAL_BYTES"] = "0"
         result = subprocess.run(
             [
                 self.shell,
@@ -571,7 +670,23 @@ class CargoLaneTest(unittest.TestCase):
         self.assertIn("target=", lines)
 
     def test_no_command_guidance_routes_core_tests_through_named_lanes(self) -> None:
-        result = self.run_script("-Lane", f"unit-guidance-{os.getpid()}")
+        fake_bin = self.fake_cargo_bin()
+        args_log = self.temp_root / "guidance-gc-args.txt"
+        (fake_bin / "python.cmd").write_text(
+            '@echo off\r\necho %* >> "%CODEX_TEST_GC_ARGS_LOG%"\r\n',
+            encoding="utf-8",
+        )
+        self.mark_lanes_root()
+        (self.lanes_root / ".gc-stamp").write_text("fresh\n", encoding="utf-8")
+        result = self.run_script(
+            "-Lane",
+            f"unit-guidance-{os.getpid()}",
+            extra_env={
+                "CODEX_CARGO_LANE_GC_INTERVAL_HOURS": "1",
+                "CODEX_TEST_GC_ARGS_LOG": str(args_log),
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            },
+        )
 
         self.assertEqual(
             result.returncode,
@@ -579,6 +694,7 @@ class CargoLaneTest(unittest.TestCase):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
         self.assertIn("just core-test-lane core_lib", result.stdout)
+        self.assertFalse(args_log.exists(), "Guidance must not force post-build GC")
         self.assertNotIn("test-lane-package codex-core", result.stdout)
         self.assertNotIn("cargo nextest run -p codex-core", result.stdout)
 

@@ -3,8 +3,6 @@
 //! Local rollout removal can be staged so callers that also own SQLite state have one logical
 //! commit point. Staged files are restored on drop until the caller commits the deletion.
 
-#[cfg(test)]
-use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -93,17 +91,26 @@ impl StagedThreadDelete<'_> {
 
 impl StagedRolloutFiles {
     fn restore(&mut self) {
+        let mut retain_staging = false;
         for staged in self.staged_files.iter().rev() {
-            if !staged.staged_path.exists() {
+            if matches!(staged.staged_path.try_exists(), Ok(false)) {
                 continue;
             }
             if let Err(err) = std::fs::rename(&staged.staged_path, &staged.original_path) {
+                retain_staging = true;
                 tracing::error!(
                     "failed to restore staged rollout `{}` to `{}`: {err}",
                     staged.staged_path.display(),
                     staged.original_path.display()
                 );
             }
+        }
+        if retain_staging && let Some(staging_dir) = self.staging_dir.take() {
+            let retained_path = staging_dir.keep();
+            tracing::error!(
+                "retained unrestored rollouts in `{}`",
+                retained_path.display()
+            );
         }
     }
 }
@@ -371,39 +378,6 @@ fn preflight_delete_access(path: &Path) -> ThreadStoreResult<()> {
         })
 }
 
-#[cfg(test)]
-fn delete_rollout_file(
-    store: &LocalThreadStore,
-    rollout_path: &Path,
-    thread_id: codex_protocol::ThreadId,
-) -> ThreadStoreResult<bool> {
-    let plain_path = codex_rollout::plain_rollout_path(rollout_path);
-    let compressed_path = plain_path.with_extension("jsonl.zst");
-    let deleted_plain = delete_rollout_path(store, plain_path.as_path(), thread_id)?;
-    let deleted_compressed = delete_rollout_path(store, compressed_path.as_path(), thread_id)?;
-    Ok(deleted_plain || deleted_compressed)
-}
-
-#[cfg(test)]
-fn delete_rollout_path(
-    store: &LocalThreadStore,
-    rollout_path: &Path,
-    thread_id: codex_protocol::ThreadId,
-) -> ThreadStoreResult<bool> {
-    let canonical_rollout_path =
-        checked_rollout_path(&store.config.codex_home, rollout_path, thread_id)?;
-    match std::fs::remove_file(&canonical_rollout_path) {
-        Ok(()) => Ok(true),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(ThreadStoreError::Internal {
-            message: format!(
-                "failed to delete rollout file `{}`: {err}",
-                canonical_rollout_path.display()
-            ),
-        }),
-    }
-}
-
 fn checked_rollout_path(
     codex_home: &Path,
     rollout_path: &Path,
@@ -494,7 +468,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_rollout_file_treats_vanished_path_as_already_deleted() {
+    async fn staged_delete_treats_vanished_path_as_already_deleted() {
         let home = TempDir::new().expect("temp dir");
         let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
         let uuid = Uuid::from_u128(305);
@@ -503,7 +477,35 @@ mod tests {
             write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("session file");
         std::fs::remove_file(&path).expect("remove session file");
 
-        assert!(!delete_rollout_file(&store, path.as_path(), thread_id).expect("delete rollout"));
+        let staged = store
+            .stage_thread_deletes(&[thread_id])
+            .await
+            .expect("stage delete");
+        assert!(!staged.found_thread(thread_id));
+        staged.commit().await;
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn staged_delete_retains_rollout_when_restore_fails() {
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), None);
+        let uuid = Uuid::from_u128(309);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+        let path = write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("rollout");
+        let original = std::fs::read(&path).expect("original bytes");
+        let staged = store
+            .stage_thread_deletes(&[thread_id])
+            .await
+            .expect("stage delete");
+        let retained_path = staged.files.staged_files[0].staged_path.clone();
+        std::fs::remove_dir(path.parent().expect("parent")).expect("remove empty parent");
+        drop(staged);
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read(retained_path).expect("retained rollout"),
+            original
+        );
     }
 
     #[tokio::test]

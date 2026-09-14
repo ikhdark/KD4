@@ -389,13 +389,22 @@ impl ChatWidget {
         push: impl FnOnce(&mut InterruptManager),
         handle: impl FnOnce(&mut Self),
     ) {
+        self.defer_or_handle_owned((), |q, ()| push(q), |s, ()| handle(s));
+    }
+
+    pub(super) fn defer_or_handle_owned<T>(
+        &mut self,
+        payload: T,
+        push: impl FnOnce(&mut InterruptManager, T),
+        handle: impl FnOnce(&mut Self, T),
+    ) {
         // Preserve deterministic FIFO across queued interrupts: once anything
         // is queued due to an active write cycle, continue queueing until the
         // queue is flushed to avoid reordering (e.g., ExecEnd before ExecBegin).
         if self.stream_controller.is_some() || !self.interrupts.is_empty() {
-            push(&mut self.interrupts);
+            push(&mut self.interrupts, payload);
         } else {
-            handle(self);
+            handle(self, payload);
         }
     }
 

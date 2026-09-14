@@ -4,10 +4,7 @@ use pretty_assertions::assert_eq;
 
 #[test]
 fn loaded_state_freezes_chart_anchor_date_at_completion() {
-    let state = Arc::new(RwLock::new(TokenActivityState::Loading));
-    let handle = TokenActivityHandle {
-        state: Arc::clone(&state),
-    };
+    let (cell, handle) = new_token_activity_output(TokenActivityView::Daily);
     let today =
         NaiveDate::from_ymd_opt(/*year*/ 2026, /*month*/ 5, /*day*/ 29).expect("valid date");
 
@@ -20,19 +17,29 @@ fn loaded_state_freezes_chart_anchor_date_at_completion() {
                 current_streak_days: None,
                 longest_streak_days: None,
             },
-            daily_usage_buckets: None,
+            daily_usage_buckets: Some(vec![
+                codex_app_server_protocol::AccountTokenUsageDailyBucket {
+                    start_date: "2026-05-29".to_string(),
+                    tokens: 100,
+                },
+            ]),
         }),
         today,
     );
 
-    let state = state.read().expect("token activity state poisoned");
-    match &*state {
-        TokenActivityState::Loaded {
-            today: loaded_today,
-            ..
-        } => {
-            assert_eq!(*loaded_today, today);
-        }
-        other => panic!("expected loaded state, got {other:?}"),
-    }
+    let lines = cell.display_lines(108);
+    let last_day_cell = |label: &str| {
+        lines
+            .iter()
+            .find(|line| line.spans.first().is_some_and(|span| span.content == label))
+            .expect("weekday row")
+            .spans
+            .last()
+            .expect("final week cell")
+    };
+    // May 29, 2026 is Friday: Friday has activity and Saturday is still in the future.
+    assert_eq!(last_day_cell(" Sa ").content, " ");
+    assert!(!last_day_cell(" Fr ").content.trim().is_empty());
+    assert_ne!(last_day_cell(" Fr "), last_day_cell(" Th "));
+    assert!(lines.iter().any(|line| line.to_string().contains("May")));
 }

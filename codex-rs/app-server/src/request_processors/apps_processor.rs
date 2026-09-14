@@ -5,7 +5,6 @@ use codex_app_server_protocol::AppToolSummary;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::MCP_TOOL_CODEX_APPS_META_KEY;
 use codex_mcp::ToolInfo;
-use codex_mcp::codex_apps_tools_cache_key;
 use codex_mcp::tool_is_model_visible;
 use std::future::Future;
 use std::pin::Pin;
@@ -71,6 +70,16 @@ impl AppsRequestProcessor {
             )));
         }
 
+        if app_ids.is_empty() {
+            return Ok(Some(
+                AppsReadResponse {
+                    apps: Vec::new(),
+                    missing_app_ids: Vec::new(),
+                }
+                .into(),
+            ));
+        }
+
         let mut seen_app_ids = HashSet::new();
         let app_ids = app_ids
             .into_iter()
@@ -107,7 +116,10 @@ impl AppsRequestProcessor {
                 loaded_plugins.capability_summaries(),
             );
         let plugin_apps = connector_snapshot.connector_ids().to_vec();
-        let mut tool_summaries_by_app_id = if include_tools {
+        let load_tools = async {
+            if !include_tools {
+                return Ok(HashMap::new());
+            }
             let mcp_manager = self.thread_manager.mcp_manager();
             connectors::list_accessible_connectors_from_mcp_tools_with_mcp_manager(
                 &config,
@@ -117,29 +129,28 @@ impl AppsRequestProcessor {
             )
             .await
             .map_err(|err| internal_error(format!("failed to read app tools: {err}")))?;
+            let mcp_config = mcp_manager.runtime_config(&config).await;
             let tools = mcp_manager
                 .codex_apps_tools_cache()
                 .current_tools(
                     config.codex_home.to_path_buf(),
-                    codex_apps_tools_cache_key(
-                        auth.as_ref(),
-                        &config.chatgpt_base_url,
-                        config.apps_mcp_product_sku.as_deref(),
-                    ),
+                    mcp_config.codex_apps_tools_cache_key(auth.as_ref()),
                 )
                 .await
                 .unwrap_or_default();
-            app_tool_summaries_by_connector(&tools)
-        } else {
-            HashMap::new()
+            Ok::<_, JSONRPCErrorError>(app_tool_summaries_by_connector(&tools, &seen_app_ids))
         };
-        let available_apps = connectors::list_all_connectors_with_options(
-            &config,
-            /*force_refetch*/ false,
-            &plugin_apps,
-        )
-        .await
-        .map_err(|err| internal_error(format!("failed to read app metadata: {err}")))?;
+        let load_metadata = async {
+            connectors::list_all_connectors_with_options(
+                &config,
+                /*force_refetch*/ false,
+                &plugin_apps,
+            )
+            .await
+            .map_err(|err| internal_error(format!("failed to read app metadata: {err}")))
+        };
+        let (mut tool_summaries_by_app_id, available_apps) =
+            tokio::try_join!(load_tools, load_metadata)?;
         let mut available_apps = available_apps
             .into_iter()
             .map(|app| (app.id.clone(), app))
@@ -515,7 +526,10 @@ where
     }
 }
 
-fn app_tool_summaries_by_connector(tools: &[ToolInfo]) -> HashMap<String, Vec<AppToolSummary>> {
+fn app_tool_summaries_by_connector(
+    tools: &[ToolInfo],
+    requested_ids: &HashSet<String>,
+) -> HashMap<String, Vec<AppToolSummary>> {
     let mut summaries = HashMap::<String, Vec<AppToolSummary>>::new();
     for tool in tools {
         if tool.server_name != CODEX_APPS_MCP_SERVER_NAME || !tool_is_model_visible(tool) {
@@ -537,6 +551,9 @@ fn app_tool_summaries_by_connector(tools: &[ToolInfo]) -> HashMap<String, Vec<Ap
         else {
             continue;
         };
+        if !requested_ids.contains(connector_id) {
+            continue;
+        }
         summaries
             .entry(connector_id.to_string())
             .or_default()
@@ -628,28 +645,23 @@ async fn send_app_list_updated_notification(
     data: Vec<AppInfo>,
     dedupe_across_requests: bool,
 ) {
-    let notification_data = {
-        let mut last_notified_apps = last_notified_apps.lock().await;
-        if request_last_notified_apps.as_ref() == Some(&data)
-            || (dedupe_across_requests && last_notified_apps.as_ref() == Some(&data))
-        {
-            *request_last_notified_apps = Some(data);
-            return;
-        }
-
-        // Claim the snapshot atomically, but never hold the shared dedupe lock
-        // while a backpressured client notification waits on the outgoing queue.
+    let mut last_notified_apps = last_notified_apps.lock().await;
+    if request_last_notified_apps.as_ref() == Some(&data)
+        || (dedupe_across_requests && last_notified_apps.as_ref() == Some(&data))
+    {
+        *request_last_notified_apps = Some(data);
+        return;
+    }
+    // Advisory snapshots must not stall discovery. Enqueue and record success
+    // atomically, without awaiting queue capacity while holding the dedupe lock.
+    if outgoing.try_send_server_notification(ServerNotification::AppListUpdated(
+        AppListUpdatedNotification {
+            data: data.iter().cloned().map(app_info_to_api).collect(),
+        },
+    )) {
         *request_last_notified_apps = Some(data.clone());
-        *last_notified_apps = Some(data.clone());
-        data.into_iter().map(app_info_to_api).collect()
-    };
-    outgoing
-        .send_server_notification(ServerNotification::AppListUpdated(
-            AppListUpdatedNotification {
-                data: notification_data,
-            },
-        ))
-        .await;
+        *last_notified_apps = Some(data);
+    }
 }
 
 #[cfg(test)]
@@ -659,6 +671,64 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     struct DropFlag(Arc<AtomicBool>);
+
+    #[tokio::test]
+    async fn app_list_notification_retries_after_full_queue_without_recording_unsent_data() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            sender,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        assert!(
+            outgoing.try_send_server_notification(ServerNotification::AppListUpdated(
+                AppListUpdatedNotification { data: Vec::new() },
+            ))
+        );
+        let shared = Mutex::new(None);
+        let mut request = None;
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            send_app_list_updated_notification(&outgoing, &shared, &mut request, Vec::new(), true),
+        )
+        .await
+        .expect("advisory delivery must not wait for a full queue");
+        assert_eq!(request, None);
+        assert_eq!(*shared.lock().await, None);
+        receiver
+            .try_recv()
+            .expect("the occupied queue slot remains");
+
+        send_app_list_updated_notification(&outgoing, &shared, &mut request, Vec::new(), true)
+            .await;
+        assert_eq!(request, Some(Vec::new()));
+        assert_eq!(*shared.lock().await, Some(Vec::new()));
+        let envelope = receiver
+            .try_recv()
+            .expect("retry must enqueue the unsent snapshot");
+        assert!(matches!(
+            envelope,
+            crate::outgoing_message::OutgoingEnvelope::Broadcast {
+                message: crate::outgoing_message::OutgoingMessage::AppServerNotification(
+                    ServerNotification::AppListUpdated(AppListUpdatedNotification { data })
+                ),
+            } if data.is_empty()
+        ));
+
+        let mut later_request = None;
+        send_app_list_updated_notification(
+            &outgoing,
+            &shared,
+            &mut later_request,
+            Vec::new(),
+            true,
+        )
+        .await;
+        assert_eq!(later_request, Some(Vec::new()));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
 
     impl Drop for DropFlag {
         fn drop(&mut self) {

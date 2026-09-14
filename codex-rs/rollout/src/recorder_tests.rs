@@ -157,7 +157,7 @@ async fn ascending_thread_listing_scans_each_rollout_once_per_page() -> std::io:
         /*search_term*/ None,
     )
     .await?;
-    assert_eq!(first.num_scanned_files, ROLLOUT_COUNT);
+    assert!(first.num_scanned_files <= 2);
     let cursor = first.next_cursor.as_ref().expect("second page cursor");
 
     let second = RolloutRecorder::list_threads(
@@ -174,8 +174,15 @@ async fn ascending_thread_listing_scans_each_rollout_once_per_page() -> std::io:
         /*search_term*/ None,
     )
     .await?;
-    assert_eq!(second.num_scanned_files, ROLLOUT_COUNT);
-    assert_ne!(first.items[0].thread_id, second.items[0].thread_id);
+    assert!(second.num_scanned_files <= 2);
+    assert_eq!(
+        first.items[0].thread_id.map(|id| id.to_string()),
+        Some(Uuid::from_u128(10_000).to_string())
+    );
+    assert_eq!(
+        second.items[0].thread_id.map(|id| id.to_string()),
+        Some(Uuid::from_u128(10_001).to_string())
+    );
     Ok(())
 }
 
@@ -1244,7 +1251,7 @@ async fn assert_failed_append_is_written_once(
 #[tokio::test]
 async fn writer_state_does_not_retry_an_ambiguously_flushed_record() -> std::io::Result<()> {
     assert_failed_append_is_written_once(
-        JsonlWriteFault::AfterCompleteWrite,
+        JsonlWriteFault::Complete,
         "ambiguous-flush-record",
     )
     .await
@@ -1253,10 +1260,57 @@ async fn writer_state_does_not_retry_an_ambiguously_flushed_record() -> std::io:
 #[tokio::test]
 async fn writer_state_rolls_back_a_partial_record_before_retry() -> std::io::Result<()> {
     assert_failed_append_is_written_once(
-        JsonlWriteFault::AfterPartialWrite(32),
+        JsonlWriteFault::Partial(32),
         "partial-write-record",
     )
     .await
+}
+
+#[tokio::test]
+async fn unrecoverable_append_stops_writer_with_live_senders() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    File::create(&rollout_path)?;
+    let mut writer = open_log_file(&rollout_path)?.into_jsonl_writer();
+    writer.write_fault = Some(JsonlWriteFault::Unexpected);
+    let writer_task = Arc::new(RolloutWriterTask::new());
+    let (tx, rx) = mpsc::channel(1);
+    let worker = tokio::spawn(rollout_writer(
+        Some(writer),
+        None,
+        rx,
+        None,
+        home.path().to_path_buf(),
+        None,
+        rollout_path.clone(),
+        Default::default(),
+        Arc::clone(&writer_task),
+    ));
+    tx.send(RolloutCmd::AddItems {
+        items: vec![RolloutItem::EventMsg(EventMsg::AgentMessage(
+            AgentMessageEvent {
+                message: "cannot safely retry".into(),
+                phase: None,
+                memory_citation: None,
+            },
+        ))],
+        flush_if_materialized: true,
+        accepted: None,
+    })
+    .await
+    .expect("writer accepts initial command");
+
+    let err = tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+        .await
+        .expect("writer must exit even while a sender remains alive")
+        .expect("writer task must not panic")
+        .expect_err("unrecoverable append must fail");
+    assert!(err.to_string().contains("retry is unsafe"));
+    assert!(tx.is_closed());
+    assert!(writer_task.ensure_active("append").is_err());
+    assert!(writer_task.terminal_failure().is_some());
+    assert_eq!(fs::read(&rollout_path)?, b"unexpected bytes");
+    Ok(())
 }
 
 #[tokio::test]
@@ -2147,5 +2201,120 @@ async fn find_latest_thread_path_filters_on_latest_turn_context_cwd() -> std::io
     .await?;
 
     assert_eq!(found, Some(path));
+    Ok(())
+}
+
+#[tokio::test]
+async fn deferred_writers_install_one_canonical_header_after_both_open() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let path = home.path().join("rollout.jsonl");
+    let id = ThreadId::new();
+    let make_state = || {
+        RolloutWriterState::new(
+            None,
+            Some(LogFileInfo {
+                path: path.clone(),
+                conversation_id: id,
+                timestamp: OffsetDateTime::now_utc(),
+            }),
+            Some(SessionMeta {
+                session_id: id.into(),
+                id,
+                ..SessionMeta::default()
+            }),
+            home.path().to_path_buf(),
+            Some(None),
+            path.clone(),
+            ToolManifestDictionary::default(),
+        )
+    };
+    let mut first = make_state();
+    let mut second = make_state();
+    first.ensure_writer_open().await?;
+    second.ensure_writer_open().await?;
+    let manifest = RolloutItem::ToolManifest(ToolManifestItem::full(
+        "shared".into(),
+        serde_json::json!({"tools": []}),
+    ));
+    first.add_items(vec![manifest.clone()]);
+    second.add_items(vec![manifest]);
+    let (first_result, second_result) = tokio::join!(first.persist(), second.persist());
+    first_result?;
+    second_result?;
+    let (items, loaded_id, errors) = RolloutRecorder::load_rollout_items(&path).await?;
+    assert_eq!(loaded_id, Some(id));
+    assert_eq!(errors, 0);
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| matches!(item, RolloutItem::SessionMeta(_)))
+            .count(),
+        1
+    );
+    let manifests = items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::ToolManifest(item) => Some(item),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(manifests.len(), 2);
+    assert!(manifests[0].manifest.is_some());
+    assert!(manifests[1].is_reference());
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_reconciliation_does_not_overlay_stale_readable_metadata() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let path = write_session_file(home.path(), "2025-01-03T12-00-00", Uuid::new_v4())?;
+    let runtime = StateRuntime::init(home.path().to_path_buf(), "test-provider".into()).await?;
+    let mut metadata = crate::metadata::extract_metadata_from_rollout(&path, "test-provider")
+        .await?
+        .metadata;
+    metadata.model_provider = "stale-provider".into();
+    metadata.cwd = home.path().join("stale-cwd");
+    metadata.title = "My chosen title".into();
+    runtime.upsert_thread(&metadata).await?;
+    let item = crate::list::read_thread_item_from_rollout(path.clone())
+        .await
+        .expect("filesystem snapshot");
+    fs::remove_file(&path)?;
+    let reconciled = state_integration::reconcile_rollout(
+        Some(runtime.as_ref()),
+        &path,
+        "test-provider",
+        None,
+        &[],
+        None,
+        None,
+    )
+    .await;
+    assert!(!reconciled);
+    assert_eq!(
+        runtime
+            .get_thread(metadata.id)
+            .await?
+            .unwrap()
+            .model_provider,
+        "stale-provider"
+    );
+    let expected_provider = item.model_provider.clone();
+    let expected_cwd = item.cwd.clone();
+    let expected_updated_at = item.updated_at.clone();
+    let page = overlay_thread_item_metadata_from_state_db(
+        Some(runtime.as_ref()),
+        ThreadsPage {
+            items: vec![item],
+            ..Default::default()
+        },
+        &HashSet::new(),
+    )
+    .await;
+    let actual = &page.items[0];
+    assert_eq!(actual.model_provider, expected_provider);
+    assert_eq!(actual.cwd, expected_cwd);
+    assert_eq!(actual.updated_at, expected_updated_at);
+    assert_eq!(actual.title.as_deref(), Some("My chosen title"));
     Ok(())
 }

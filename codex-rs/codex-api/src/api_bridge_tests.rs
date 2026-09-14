@@ -9,6 +9,31 @@ fn map_api_error_maps_server_overloaded() {
 }
 
 #[test]
+fn bad_request_transport_errors_publish_bad_request_events() {
+    for (body, expected_message) in [
+        ("invalid model parameter", "invalid model parameter"),
+        (
+            "The image data you provided does not represent a valid image",
+            "Image poisoning",
+        ),
+    ] {
+        let error = map_api_error(ApiError::Transport(TransportError::Http {
+            status: http::StatusCode::BAD_REQUEST,
+            url: Some("https://example.test/responses".to_string()),
+            headers: None,
+            body: Some(body.to_string()),
+        }));
+        assert!(!error.is_retryable());
+        let event = error.to_error_event(None);
+        assert_eq!(event.message, expected_message);
+        assert_eq!(
+            serde_json::to_value(event).unwrap()["codex_error_info"],
+            serde_json::json!("bad_request")
+        );
+    }
+}
+
+#[test]
 fn map_api_error_distinguishes_transport_stream_failures_from_provider_retries() {
     let transport = map_api_error(ApiError::Stream("websocket closed".to_string()));
     let provider = map_api_error(ApiError::Retryable {
@@ -87,18 +112,16 @@ fn map_api_error_maps_cloudflare_blocked_response_to_user_message() {
     }));
 
     assert!(!err.is_retryable());
-    let CodexErr::RegionRestricted(err) = err else {
-        panic!("expected CodexErr::RegionRestricted, got {err:?}");
+    let CodexErr::UnexpectedStatus(err) = err else {
+        panic!("expected CodexErr::UnexpectedStatus, got {err:?}");
     };
     assert_eq!(
         err.user_message.as_deref(),
-        Some(
-            "Access blocked by Cloudflare. This usually happens when connecting from a restricted region (status 403 Forbidden)"
-        )
+        Some("Access blocked by Cloudflare (status 403 Forbidden)")
     );
     assert_eq!(
         err.to_string(),
-        "Access blocked by Cloudflare. This usually happens when connecting from a restricted region (status 403 Forbidden), url: http://example.com/blocked, cf-ray: ray-id"
+        "Access blocked by Cloudflare (status 403 Forbidden), url: http://example.com/blocked, cf-ray: ray-id"
     );
 }
 
@@ -198,6 +221,32 @@ fn map_api_error_keeps_unknown_400_errors_generic() {
         panic!("expected CodexErr::InvalidRequest, got {err:?}");
     };
     assert_eq!(message, body);
+}
+
+#[test]
+fn http_provider_codes_preserve_context_and_quota_identity() {
+    for (status, code) in [
+        (http::StatusCode::BAD_REQUEST, "context_length_exceeded"),
+        (http::StatusCode::TOO_MANY_REQUESTS, "insufficient_quota"),
+    ] {
+        let error = map_api_error(ApiError::Transport(TransportError::Http {
+            status,
+            url: None,
+            headers: None,
+            body: Some(
+                serde_json::json!({
+                    "error": {"code": code, "resets_at": "unknown"}
+                })
+                .to_string(),
+            ),
+        }));
+        assert!(!error.is_retryable());
+        match code {
+            "context_length_exceeded" => assert!(matches!(error, CodexErr::ContextWindowExceeded)),
+            "insufficient_quota" => assert!(matches!(error, CodexErr::QuotaExceeded)),
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[test]

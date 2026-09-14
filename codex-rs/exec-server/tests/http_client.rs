@@ -723,6 +723,14 @@ async fn http_response_body_stream_fails_when_transport_disconnects() -> Result<
                 body: Vec::new().into(),
             },
         )
+        .await?;
+        peer.write_body_delta(HttpRequestBodyDeltaNotification {
+            request_id: params.request_id,
+            seq: 1,
+            delta: b"before disconnect".to_vec().into(),
+            done: false,
+            error: None,
+        })
         .await
     })
     .await?;
@@ -747,6 +755,10 @@ async fn http_response_body_stream_fails_when_transport_disconnects() -> Result<
 
     // Phase 3: assert transport disconnect wakes the body stream with a
     // terminal error instead of hanging.
+    assert_eq!(
+        timeout(TEST_TIMEOUT, body_stream.recv()).await??,
+        Some(b"before disconnect".to_vec())
+    );
     let error = timeout(TEST_TIMEOUT, body_stream.recv())
         .await
         .context("disconnect should wake http body stream")?

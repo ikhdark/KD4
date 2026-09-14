@@ -129,18 +129,34 @@ fn proxy_array_decision(
     target_url: &CFURL,
     origin: &RequestOrigin,
 ) -> SystemProxyDecision {
+    proxy_entries_decision(
+        proxies
+            .into_iter()
+            .map(|proxy| proxy_entry_decision(&proxy, target_url, origin)),
+    )
+}
+
+fn proxy_entries_decision(
+    entries: impl IntoIterator<Item = ProxyEntryDecision>,
+) -> SystemProxyDecision {
     let mut saw_unsupported = false;
-    let mut saw_unavailable = false;
+    let mut failure = None;
 
     // CFNetwork returns candidates in failover order, but the shared resolver currently carries
     // only one route. This matches the Windows limitation; cross-platform retry requires request
     // replay semantics and is intentionally deferred.
-    for proxy in proxies {
-        match proxy_entry_decision(&proxy, target_url, origin) {
+    for entry in entries {
+        match entry {
             ProxyEntryDecision::Direct => return SystemProxyDecision::Direct,
             ProxyEntryDecision::Proxy { url } => return SystemProxyDecision::Proxy { url },
             ProxyEntryDecision::UnsupportedScheme => saw_unsupported = true,
-            ProxyEntryDecision::Unavailable => saw_unavailable = true,
+            ProxyEntryDecision::Unavailable(reason) => {
+                if failure.is_none()
+                    || failure == Some(RouteFailureClass::ProxyResolutionUnavailable)
+                {
+                    failure = Some(reason);
+                }
+            }
         }
     }
 
@@ -148,10 +164,8 @@ fn proxy_array_decision(
         SystemProxyDecision::Unavailable {
             failure: RouteFailureClass::UnsupportedProxyScheme,
         }
-    } else if saw_unavailable {
-        SystemProxyDecision::Unavailable {
-            failure: RouteFailureClass::ProxyResolutionUnavailable,
-        }
+    } else if let Some(failure) = failure {
+        SystemProxyDecision::Unavailable { failure }
     } else {
         SystemProxyDecision::Direct
     }
@@ -163,7 +177,7 @@ fn proxy_entry_decision(
     origin: &RequestOrigin,
 ) -> ProxyEntryDecision {
     let Some(proxy_type) = cf_string_value(proxy, unsafe { kCFProxyTypeKey }) else {
-        return ProxyEntryDecision::Unavailable;
+        return ProxyEntryDecision::Unavailable(RouteFailureClass::ProxyResolutionUnavailable);
     };
 
     if cf_string_equals(&proxy_type, unsafe { kCFProxyTypeNone }) {
@@ -186,7 +200,7 @@ fn proxy_entry_decision(
 
     if cf_string_equals(&proxy_type, unsafe { kCFProxyTypeAutoConfigurationURL }) {
         let Some(pac_url) = cf_url_value(proxy, unsafe { kCFProxyAutoConfigurationURLKey }) else {
-            return ProxyEntryDecision::Unavailable;
+            return ProxyEntryDecision::Unavailable(RouteFailureClass::ProxyResolutionUnavailable);
         };
         return pac_decision(execute_pac_url(&pac_url, target_url), target_url, origin);
     }
@@ -197,7 +211,7 @@ fn proxy_entry_decision(
         let Some(script) =
             cf_string_value(proxy, unsafe { kCFProxyAutoConfigurationJavaScriptKey })
         else {
-            return ProxyEntryDecision::Unavailable;
+            return ProxyEntryDecision::Unavailable(RouteFailureClass::ProxyResolutionUnavailable);
         };
         return pac_decision(
             execute_pac(|callback, context| unsafe {
@@ -213,7 +227,7 @@ fn proxy_entry_decision(
         );
     }
 
-    ProxyEntryDecision::Unavailable
+    ProxyEntryDecision::Unavailable(RouteFailureClass::ProxyResolutionUnavailable)
 }
 
 fn pac_decision(
@@ -226,7 +240,7 @@ fn pac_decision(
         Err(RouteFailureClass::UnsupportedProxyScheme) => {
             return ProxyEntryDecision::UnsupportedScheme;
         }
-        Err(_) => return ProxyEntryDecision::Unavailable,
+        Err(failure) => return ProxyEntryDecision::Unavailable(failure),
     };
 
     match proxy_array_decision(&proxies, target_url, origin) {
@@ -235,7 +249,7 @@ fn pac_decision(
         SystemProxyDecision::Unavailable {
             failure: RouteFailureClass::UnsupportedProxyScheme,
         } => ProxyEntryDecision::UnsupportedScheme,
-        SystemProxyDecision::Unavailable { failure: _ } => ProxyEntryDecision::Unavailable,
+        SystemProxyDecision::Unavailable { failure } => ProxyEntryDecision::Unavailable(failure),
     }
 }
 
@@ -312,7 +326,7 @@ fn concrete_proxy_entry(proxy: &ProxyDictionary, proxy_scheme: &str) -> ProxyEnt
         .map(|host| host.to_string())
         .filter(|host| !host.is_empty())
     else {
-        return ProxyEntryDecision::Unavailable;
+        return ProxyEntryDecision::Unavailable(RouteFailureClass::ProxyResolutionUnavailable);
     };
 
     let host = bracket_ipv6_host(&host);
@@ -380,5 +394,38 @@ enum ProxyEntryDecision {
     Direct,
     Proxy { url: String },
     UnsupportedScheme,
-    Unavailable,
+    Unavailable(RouteFailureClass),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pac_timeout_survives_candidate_reduction_and_fallbacks_can_succeed() {
+        let target = cf_url("https://example.com/").expect("target URL");
+        let origin = RequestOrigin {
+            scheme: "https".into(),
+            host: "example.com".into(),
+            port: 443,
+        };
+        for fallback_succeeds in [false, true] {
+            let timeout = pac_decision(Err(RouteFailureClass::ConnectTimeout), &target, &origin);
+            let fallback = if fallback_succeeds {
+                ProxyEntryDecision::Direct
+            } else {
+                ProxyEntryDecision::Unavailable(RouteFailureClass::ProxyResolutionUnavailable)
+            };
+            assert_eq!(
+                proxy_entries_decision([timeout, fallback]),
+                if fallback_succeeds {
+                    SystemProxyDecision::Direct
+                } else {
+                    SystemProxyDecision::Unavailable {
+                        failure: RouteFailureClass::ConnectTimeout,
+                    }
+                }
+            );
+        }
+    }
 }

@@ -30,10 +30,7 @@ async fn rate_limits_check(auth_manager: &AuthManager, config: &Config) -> Optio
         .map_err(|err| warn!(%err, "failed to fetch rate limits"))
         .ok()?;
 
-    let snapshot = snapshots
-        .iter()
-        .find(|s| s.limit_id.as_deref() == Some(crate::guard_limits::CODEX_LIMIT_ID))
-        .or_else(|| snapshots.first())?;
+    let snapshot = codex_snapshot(&snapshots)?;
 
     let min_remaining_percent = config.memories.min_rate_limit_remaining_percent;
     let allowed = snapshot_allows_startup(snapshot, min_remaining_percent);
@@ -46,6 +43,13 @@ async fn rate_limits_check(auth_manager: &AuthManager, config: &Config) -> Optio
     }
 
     Some(allowed)
+}
+
+fn codex_snapshot(snapshots: &[RateLimitSnapshot]) -> Option<&RateLimitSnapshot> {
+    // The backend labels the primary bucket even for legacy payloads.
+    snapshots
+        .iter()
+        .find(|snapshot| snapshot.limit_id.as_deref() == Some(crate::guard_limits::CODEX_LIMIT_ID))
 }
 
 fn snapshot_allows_startup(snapshot: &RateLimitSnapshot, min_remaining_percent: i64) -> bool {

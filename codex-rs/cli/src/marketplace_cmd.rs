@@ -445,12 +445,12 @@ fn print_upgrade_outcome_json(outcome: &PluginMarketplaceUpgradeOutcome) -> Resu
             error.marketplace_name, error.message
         );
     }
-    if !outcome.all_succeeded() {
-        bail!("{} upgrade failure(s) occurred.", outcome.errors.len());
-    }
 
     let output = JsonMarketplaceUpgradeOutput::from_outcome(outcome);
     println!("{}", serde_json::to_string_pretty(&output)?);
+    if !outcome.all_succeeded() {
+        bail!("{} upgrade failure(s) occurred.", outcome.errors.len());
+    }
     Ok(())
 }
 
@@ -500,15 +500,14 @@ fn print_upgrade_outcome(
             error.marketplace_name, error.message
         );
     }
-    if !outcome.all_succeeded() {
-        bail!("{} upgrade failure(s) occurred.", outcome.errors.len());
-    }
 
     let selection_label = marketplace_name.unwrap_or("all configured Git marketplaces");
     if outcome.selected_marketplaces.is_empty() {
         println!("No configured Git marketplaces to upgrade.");
     } else if outcome.upgraded_roots.is_empty() {
-        if marketplace_name.is_some() {
+        if !outcome.all_succeeded() {
+            println!("No marketplace upgrades completed.");
+        } else if marketplace_name.is_some() {
             println!("Marketplace `{selection_label}` is already up to date.");
         } else {
             println!("All configured Git marketplaces are already up to date.");
@@ -525,6 +524,9 @@ fn print_upgrade_outcome(
         }
     }
 
+    if !outcome.all_succeeded() {
+        bail!("{} upgrade failure(s) occurred.", outcome.errors.len());
+    }
     Ok(())
 }
 

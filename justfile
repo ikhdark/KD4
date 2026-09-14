@@ -123,7 +123,7 @@ vscode-runtime-proof *args:
 
 [windows]
 fix *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); if ($forwarded_args.Count -eq 0) { Write-Error "Pass a package/filter to 'just fix', or use 'just fix-workspace' for the broad workspace clippy fix."; exit 2 }; python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane auto -- cargo clippy --fix --tests --allow-dirty @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 1); $has_package = $false; $broad = $false; for ($i = 0; $i -lt $forwarded_args.Count -and $forwarded_args[$i] -cne '--'; $i++) { $arg = $forwarded_args[$i]; if ($arg -cin @('--workspace', '--all')) { $broad = $true }; if ($arg -cmatch '^(--package=|-p)[^=\s-].*$') { $has_package = $true }; if ($arg -cin @('-p', '--package') -and $i + 1 -lt $forwarded_args.Count -and $forwarded_args[$i + 1] -cmatch '^[^\s-].*$') { $has_package = $true; $i++ } }; if (-not $has_package -or $broad) { Write-Error "Pass a package selection (-p/--package) to 'just fix', or use 'just fix-workspace' for workspace scope."; exit 2 }; python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane auto -- cargo clippy --fix --tests --allow-dirty @forwarded_args
 
 [windows]
 fix-workspace *args:
@@ -131,7 +131,7 @@ fix-workspace *args:
 
 [windows]
 clippy *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); if ($forwarded_args.Count -eq 0) { Write-Error "Pass a package/filter to 'just clippy', or use 'just clippy-workspace' for the broad workspace clippy check."; exit 2 }; python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane auto -- cargo clippy --tests @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 1); $has_package = $false; $broad = $false; for ($i = 0; $i -lt $forwarded_args.Count -and $forwarded_args[$i] -cne '--'; $i++) { $arg = $forwarded_args[$i]; if ($arg -cin @('--workspace', '--all')) { $broad = $true }; if ($arg -cmatch '^(--package=|-p)[^=\s-].*$') { $has_package = $true }; if ($arg -cin @('-p', '--package') -and $i + 1 -lt $forwarded_args.Count -and $forwarded_args[$i + 1] -cmatch '^[^\s-].*$') { $has_package = $true; $i++ } }; if (-not $has_package -or $broad) { Write-Error "Pass a package selection (-p/--package) to 'just clippy', or use 'just clippy-workspace' for workspace scope."; exit 2 }; python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane auto -- cargo clippy --tests @forwarded_args
 
 [windows]
 clippy-workspace *args:
@@ -175,15 +175,23 @@ prepare-codex-release version:
     @{{ python }} "{{ justfile_directory() }}\scripts\build_codex_package.py" --target x86_64-pc-windows-msvc --cargo-profile release --release-version "{{ version }}" --package-dir "{{ justfile_directory() }}\_build\packages\{{ version }}-x64" --release-dir "{{ justfile_directory() }}\_build\release\{{ version }}" --force
     @{{ python }} "{{ justfile_directory() }}\scripts\build_codex_package.py" --target aarch64-pc-windows-msvc --cargo-profile release --release-version "{{ version }}" --package-dir "{{ justfile_directory() }}\_build\packages\{{ version }}-arm64" --release-dir "{{ justfile_directory() }}\_build\release\{{ version }}" --force
 
-[no-cd]
 [windows]
-sign-codex-release version: (prepare-codex-release version)
-    $releaseDir = "{{ justfile_directory() }}\_build\release\{{ version }}"; if (-not (Get-Command cosign -ErrorAction SilentlyContinue)) { throw "cosign is required" }; foreach ($asset in @(Get-ChildItem -LiteralPath $releaseDir -File | Where-Object { $_.Name -notlike '*.sigstore.json' })) { cosign sign-blob --yes --bundle "$($asset.FullName).sigstore.json" $asset.FullName; if ($LASTEXITCODE -ne 0) { throw "cosign failed for $($asset.Name)" } }
+_sign-codex-release-preflight:
+    if (-not (Get-Command cosign -ErrorAction SilentlyContinue)) { throw "cosign is required" }
+
+[windows]
+_publish-codex-release-preflight:
+    if ([string]::IsNullOrWhiteSpace($env:CODEX_RELEASE_CERTIFICATE_IDENTITY) -or [string]::IsNullOrWhiteSpace($env:CODEX_RELEASE_OIDC_ISSUER)) { throw "Set CODEX_RELEASE_CERTIFICATE_IDENTITY and CODEX_RELEASE_OIDC_ISSUER to the authorized Sigstore identity" }; if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { throw "gh is required" }
 
 [no-cd]
 [windows]
-publish-codex-release version: (sign-codex-release version)
-    $releaseDir = "{{ justfile_directory() }}\_build\release\{{ version }}"; $tag = "rust-v{{ version }}"; if ([string]::IsNullOrWhiteSpace($env:CODEX_RELEASE_CERTIFICATE_IDENTITY) -or [string]::IsNullOrWhiteSpace($env:CODEX_RELEASE_OIDC_ISSUER)) { throw "Set CODEX_RELEASE_CERTIFICATE_IDENTITY and CODEX_RELEASE_OIDC_ISSUER to the authorized Sigstore identity" }; foreach ($asset in @(Get-ChildItem -LiteralPath $releaseDir -File | Where-Object { $_.Name -notlike '*.sigstore.json' })) { cosign verify-blob --bundle "$($asset.FullName).sigstore.json" --certificate-identity $env:CODEX_RELEASE_CERTIFICATE_IDENTITY --certificate-oidc-issuer $env:CODEX_RELEASE_OIDC_ISSUER $asset.FullName; if ($LASTEXITCODE -ne 0) { throw "Sigstore verification failed for $($asset.Name)" } }; $assets = @(Get-ChildItem -LiteralPath $releaseDir -File | Select-Object -ExpandProperty FullName); if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { throw "gh is required" }; gh release create $tag @assets --repo ikhdark/KD4 --verify-tag --title $tag; if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }; $expected = @($assets | ForEach-Object { Split-Path -Leaf $_ } | Sort-Object); $actual = @(gh release view $tag --repo ikhdark/KD4 --json assets --jq '.assets[].name' | Sort-Object); if (Compare-Object $expected $actual) { throw "Published release inventory does not match the prepared assets" }
+sign-codex-release version: _sign-codex-release-preflight (prepare-codex-release version)
+    $releaseDir = "{{ justfile_directory() }}\_build\release\{{ version }}"; foreach ($asset in @(Get-ChildItem -LiteralPath $releaseDir -File | Where-Object { $_.Name -notlike '*.sigstore.json' })) { cosign sign-blob --yes --bundle "$($asset.FullName).sigstore.json" $asset.FullName; if ($LASTEXITCODE -ne 0) { throw "cosign failed for $($asset.Name)" } }
+
+[no-cd]
+[windows]
+publish-codex-release version: _publish-codex-release-preflight (sign-codex-release version)
+    $releaseDir = "{{ justfile_directory() }}\_build\release\{{ version }}"; $tag = "rust-v{{ version }}"; foreach ($asset in @(Get-ChildItem -LiteralPath $releaseDir -File | Where-Object { $_.Name -notlike '*.sigstore.json' })) { cosign verify-blob --bundle "$($asset.FullName).sigstore.json" --certificate-identity $env:CODEX_RELEASE_CERTIFICATE_IDENTITY --certificate-oidc-issuer $env:CODEX_RELEASE_OIDC_ISSUER $asset.FullName; if ($LASTEXITCODE -ne 0) { throw "Sigstore verification failed for $($asset.Name)" } }; $assets = @(Get-ChildItem -LiteralPath $releaseDir -File | Select-Object -ExpandProperty FullName); gh release create $tag @assets --repo ikhdark/KD4 --verify-tag --title $tag; if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }; $expected = @($assets | ForEach-Object { Split-Path -Leaf $_ } | Sort-Object); $actual = @(gh release view $tag --repo ikhdark/KD4 --json assets --jq '.assets[].name' | Sort-Object); if (Compare-Object $expected $actual) { throw "Published release inventory does not match the prepared assets" }
 
 [no-cd]
 [windows]
@@ -354,7 +362,7 @@ cargo-lane lane *args:
 cargo-lane-isolated-home lane *args:
     @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\cargo-lane.ps1" -Lane "{{ lane }}" -IsolateCargoHome @($args | Select-Object -Skip 2)
 
-[no-cd]
+[working-directory("..")]
 test-release-tooling:
     {{ python }} -m unittest scripts.test_build_tooling_policy scripts.test_check_blob_size scripts.test_stage_npm_packages
 
@@ -491,9 +499,8 @@ config-schema-regenerate owner:
 
 # Run focused app-server runtime validation without regenerating schemas.
 app-server-runtime-check:
-    just _app-server-command-exec-tests
-    just _app-server-process-exec-tests
-    just _app-server-thread-status-tests
+    cargo nextest run -p codex-app-server-protocol -E 'test(command_exec_response_round_trips_runtime_status) | test(process_notifications_round_trip)'
+    cargo nextest run -p codex-app-server -E 'test(suite::v2::command_exec::command_exec_non_streaming_respects_output_cap) | test(process_spawn_reports_buffered_output_cap_reached) | test(thread_status::tests::stale_active_running_thread_resume_clears_watch_status) | test(thread_status::tests::stale_active_repair_preserves_pending_approval_status)'
     cargo check -p codex-app-server
 
 # Synchronize the tracked-path snapshot, then validate source-map inventories.

@@ -210,7 +210,7 @@ impl Template {
                     let Some(value) = variables.get(name.as_str()) else {
                         return Err(TemplateRenderError::MissingValue { name: name.clone() });
                     };
-                    rendered.push_str(value);
+                    rendered.push_str(value.as_ref());
                 }
             }
         }
@@ -267,9 +267,7 @@ fn parse_placeholder(source: &str, start: usize) -> Result<(String, usize), Temp
     Err(TemplateParseError::UnterminatedPlaceholder { start })
 }
 
-fn build_variable_map<I, K, V>(
-    variables: I,
-) -> Result<BTreeMap<String, String>, TemplateRenderError>
+fn build_variable_map<I, K, V>(variables: I) -> Result<BTreeMap<String, V>, TemplateRenderError>
 where
     I: IntoIterator<Item = (K, V)>,
     K: AsRef<str>,
@@ -278,10 +276,7 @@ where
     let mut map = BTreeMap::new();
     for (name, value) in variables {
         let name = name.as_ref().to_string();
-        if map
-            .insert(name.clone(), value.as_ref().to_string())
-            .is_some()
-        {
+        if map.insert(name.clone(), value).is_some() {
             return Err(TemplateRenderError::DuplicateValue { name });
         }
     }

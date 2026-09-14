@@ -98,6 +98,14 @@ impl ChatWidget {
     }
 
     pub(super) fn pop_latest_queued_composer_state(&mut self) -> Option<ComposerDraftSnapshot> {
+        self.input_queue.queued_user_message_history_records.resize(
+            self.input_queue.queued_user_messages.len(),
+            UserMessageHistoryRecord::UserMessageText,
+        );
+        self.input_queue.rejected_steer_history_records.resize(
+            self.input_queue.rejected_steers_queue.len(),
+            UserMessageHistoryRecord::UserMessageText,
+        );
         if let Some(user_message) = self.input_queue.queued_user_messages.pop_back() {
             let history_record = self
                 .input_queue
@@ -372,6 +380,9 @@ impl ChatWidget {
                 .queued_user_message_history_records
                 .clone(),
             user_turn_pending_start: self.input_queue.user_turn_pending_start,
+            submit_pending_steers_after_interrupt: self
+                .input_queue
+                .submit_pending_steers_after_interrupt,
             current_collaboration_mode: self.current_collaboration_mode.clone(),
             active_collaboration_mask: self.active_collaboration_mask.clone(),
             agent_turn_running: self.turn_lifecycle.agent_turn_running,
@@ -385,6 +396,8 @@ impl ChatWidget {
             self.turn_lifecycle
                 .restore_running(input_state.agent_turn_running, Instant::now());
             self.input_queue.user_turn_pending_start = input_state.user_turn_pending_start;
+            self.input_queue.submit_pending_steers_after_interrupt =
+                input_state.submit_pending_steers_after_interrupt;
             self.update_collaboration_mode_indicator();
             self.refresh_model_dependent_surfaces();
             self.restore_composer_state(input_state.composer.unwrap_or_default());

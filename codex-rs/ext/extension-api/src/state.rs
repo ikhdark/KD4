@@ -81,8 +81,10 @@ impl ExtensionData {
 
     /// Returns the attached value of type `T`, inserting one from `init` when absent.
     ///
-    /// The initializer runs while this map is locked, so it should stay cheap;
-    /// heavyweight lazy work belongs inside the attached value itself.
+    /// The initializer runs under the attachment-map mutex, preserving single-winner initialization.
+    /// It must not access this store directly or indirectly, even for another attachment type, or
+    /// perform blocking or heavyweight work. Resolve stable dependencies before calling this method;
+    /// perform heavyweight lazy initialization inside the attached value after retrieving it.
     pub fn get_or_init<T>(&self, init: impl FnOnce() -> T) -> Arc<T>
     where
         T: Any + Send + Sync,

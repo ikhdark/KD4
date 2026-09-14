@@ -1926,6 +1926,7 @@ mod pending_spawn_cleanup_worker_tests {
             config.model_provider.clone(),
             config.codex_home.to_path_buf(),
             std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+            std::sync::Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         );
         let child = manager
             .start_thread(config)

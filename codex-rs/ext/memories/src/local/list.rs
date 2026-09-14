@@ -15,7 +15,7 @@ pub(super) async fn list(
     backend: &LocalMemoriesBackend,
     request: ListMemoriesRequest,
 ) -> Result<ListMemoriesResponse, MemoriesBackendError> {
-    let max_results = request.max_results.min(MAX_LIST_RESULTS);
+    let max_results = request.max_results.clamp(1, MAX_LIST_RESULTS);
     let start = backend.resolve_scoped_path(request.path.as_deref()).await?;
     let start_index = match request.cursor.as_deref() {
         Some(cursor) => cursor.parse::<usize>().map_err(|_| {
@@ -30,53 +30,62 @@ pub(super) async fn list(
     };
     reject_symlink(&display_relative_path(&backend.root, &start), &metadata)?;
 
-    let mut entries = if metadata.is_file() {
-        vec![MemoryEntry {
-            path: display_relative_path(&backend.root, &start),
-            entry_type: MemoryEntryType::File,
-        }]
-    } else if metadata.is_dir() {
-        let mut entries = Vec::new();
-        for path in read_sorted_dir_paths(&start).await? {
-            if is_hidden_path(&path) {
-                continue;
-            }
-            let Some(metadata) = LocalMemoriesBackend::metadata_or_none(&path).await? else {
-                continue;
-            };
-            if metadata.file_type().is_symlink() {
-                continue;
-            }
-
-            let entry_type = if metadata.is_dir() {
-                MemoryEntryType::Directory
-            } else if metadata.is_file() {
-                MemoryEntryType::File
-            } else {
-                continue;
-            };
-            entries.push(MemoryEntry {
-                path: display_relative_path(&backend.root, &path),
-                entry_type,
-            });
-        }
-        entries
+    let paths = if metadata.is_dir() {
+        read_sorted_dir_paths(&start).await?
+    } else if metadata.is_file() {
+        vec![start.clone()]
     } else {
         Vec::new()
     };
-    if start_index > entries.len() {
+    let mut entries = Vec::new();
+    let mut seen = 0usize;
+    let mut next_cursor = None;
+    for path in paths {
+        if is_hidden_path(&path) {
+            continue;
+        }
+        let metadata = if path == start {
+            metadata.clone()
+        } else {
+            let Some(metadata) = LocalMemoriesBackend::metadata_or_none(&path).await? else {
+                continue;
+            };
+            metadata
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        let entry_type = if metadata.is_dir() {
+            MemoryEntryType::Directory
+        } else if metadata.is_file() {
+            MemoryEntryType::File
+        } else {
+            continue;
+        };
+        if seen < start_index {
+            seen += 1;
+            continue;
+        }
+        if entries.len() == max_results {
+            next_cursor = Some(seen.to_string());
+            break;
+        }
+        entries.push(MemoryEntry {
+            path: display_relative_path(&backend.root, &path),
+            entry_type,
+        });
+        seen += 1;
+    }
+    if start_index > seen {
         return Err(MemoriesBackendError::invalid_cursor(
             start_index.to_string(),
             "exceeds result count",
         ));
     }
-
-    let end_index = start_index.saturating_add(max_results).min(entries.len());
-    let next_cursor = (end_index < entries.len()).then(|| end_index.to_string());
     let truncated = next_cursor.is_some();
     Ok(ListMemoriesResponse {
         path: request.path,
-        entries: entries.drain(start_index..end_index).collect(),
+        entries,
         next_cursor,
         truncated,
     })

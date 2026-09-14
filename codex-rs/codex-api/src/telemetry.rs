@@ -37,9 +37,11 @@ impl SsePollPhase {
 pub enum SseCleanupOutcome {
     CompletedAndDrained,
     CompletedDrainTimeout,
+    CompletedDrainError,
     ConsumerCancelled,
     IdleTimeout,
     ProtocolError,
+    ResponseError,
     TransportError,
     CarrierEofBeforeCompleted,
 }
@@ -49,9 +51,11 @@ impl SseCleanupOutcome {
         match self {
             Self::CompletedAndDrained => "completed_and_drained",
             Self::CompletedDrainTimeout => "completed_drain_timeout",
+            Self::CompletedDrainError => "completed_drain_error",
             Self::ConsumerCancelled => "consumer_cancelled",
             Self::IdleTimeout => "idle_timeout",
             Self::ProtocolError => "protocol_error",
+            Self::ResponseError => "response_error",
             Self::TransportError => "transport_error",
             Self::CarrierEofBeforeCompleted => "carrier_eof_before_completed",
         }
@@ -180,22 +184,25 @@ where
     }
     let start = Instant::now();
     let result = send(req).await;
+    let duration = start.elapsed();
     if let Some(t) = telemetry.as_ref() {
         t.on_transport_phase(
             attempt,
             TransportPhaseObservation {
                 phase: TransportPhase::ResponseHeaders,
-                duration: Some(start.elapsed()),
+                duration: None,
                 wire_bytes: None,
-                provenance: "http_send_until_response_headers",
-                unavailable_reason: None,
+                provenance: "request_attempt_boundary",
+                unavailable_reason: Some(
+                    "attempt includes authentication and may include response body reads",
+                ),
             },
         );
         let (status, err) = match &result {
             Ok(resp) => (Some(resp.status()), None),
             Err(err) => (http_status(err), Some(err)),
         };
-        t.on_request(attempt, status, err, start.elapsed());
+        t.on_request(attempt, status, err, duration);
     }
     result
 }
@@ -255,6 +262,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingTelemetry {
         observations: Mutex<Vec<(u64, TransportPhaseObservation)>>,
+        requests: Mutex<Vec<(u64, Option<StatusCode>, bool)>>,
     }
 
     impl RequestTelemetry for RecordingTelemetry {
@@ -267,12 +275,122 @@ mod tests {
 
         fn on_request(
             &self,
-            _attempt: u64,
-            _status: Option<StatusCode>,
-            _error: Option<&TransportError>,
+            attempt: u64,
+            status: Option<StatusCode>,
+            error: Option<&TransportError>,
             _duration: Duration,
         ) {
+            self.requests
+                .lock()
+                .expect("telemetry mutex poisoned")
+                .push((attempt, status, error.is_some()));
         }
+    }
+
+    #[tokio::test]
+    async fn failed_attempts_do_not_claim_response_header_timings() {
+        for expected_status in [None, Some(StatusCode::FORBIDDEN)] {
+            let recorder = Arc::new(RecordingTelemetry::default());
+            let result: Result<Response, TransportError> = observe_request_attempt(
+                Some(recorder.clone()),
+                |_| async move {
+                    Err(match expected_status {
+                        Some(status) => TransportError::Http {
+                            status,
+                            url: None,
+                            headers: None,
+                            body: None,
+                        },
+                        None => TransportError::Network("connection closed".into()),
+                    })
+                },
+                Request::new(Method::POST, "https://example.test/responses".into()),
+                7,
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(
+                *recorder.requests.lock().expect("telemetry mutex poisoned"),
+                vec![(7, expected_status, true)]
+            );
+            let observations = recorder
+                .observations
+                .lock()
+                .expect("telemetry mutex poisoned");
+            let headers = observations
+                .iter()
+                .filter(|(_, observation)| observation.phase == TransportPhase::ResponseHeaders)
+                .collect::<Vec<_>>();
+            assert_eq!(headers.len(), 1);
+            assert_eq!(headers[0].0, 7);
+            assert_eq!(headers[0].1.duration, None);
+            assert!(headers[0].1.unavailable_reason.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn request_duration_excludes_the_response_telemetry_callback() {
+        struct SlowTelemetry {
+            callback_duration: Mutex<Duration>,
+            request_duration: Mutex<Option<Duration>>,
+        }
+
+        impl RequestTelemetry for SlowTelemetry {
+            fn on_transport_phase(&self, _attempt: u64, observation: TransportPhaseObservation) {
+                if observation.phase == TransportPhase::ResponseHeaders {
+                    let start = Instant::now();
+                    std::thread::sleep(Duration::from_millis(50));
+                    *self.callback_duration.lock().unwrap() = start.elapsed();
+                }
+            }
+
+            fn on_request(
+                &self,
+                _attempt: u64,
+                _status: Option<StatusCode>,
+                _error: Option<&TransportError>,
+                duration: Duration,
+            ) {
+                *self.request_duration.lock().unwrap() = Some(duration);
+            }
+        }
+
+        let recorder = Arc::new(SlowTelemetry {
+            callback_duration: Mutex::new(Duration::ZERO),
+            request_duration: Mutex::new(None),
+        });
+        let result = run_with_request_telemetry_non_idempotent(
+            RetryPolicy {
+                max_retries: 0,
+                base_delay: Duration::ZERO,
+                retry_on: RetryOn {
+                    retry_429: false,
+                    retry_5xx: false,
+                    retry_transport: false,
+                },
+            },
+            Some(recorder.clone()),
+            || Request::new(Method::POST, "https://example.test/responses".into()),
+            |_| async {
+                Ok(Response {
+                    status: StatusCode::OK,
+                    headers: HeaderMap::new(),
+                    body: bytes::Bytes::new(),
+                })
+            },
+        )
+        .await
+        .expect("request succeeds");
+        assert_eq!(result.status, StatusCode::OK);
+        let measured = recorder
+            .request_duration
+            .lock()
+            .unwrap()
+            .expect("request timing");
+        assert!(
+            measured < *recorder.callback_duration.lock().unwrap(),
+            "request duration included the telemetry callback: {measured:?}",
+        );
     }
 
     #[tokio::test]
@@ -317,6 +435,8 @@ mod tests {
         assert_eq!(observations[7].1.phase, TransportPhase::RequestUpload);
         assert_eq!(observations[7].1.wire_bytes, Some(3));
         assert_eq!(observations[8].1.phase, TransportPhase::ResponseHeaders);
-        assert!(observations[8].1.duration.is_some());
+        assert_eq!(observations[8].1.duration, None);
+        assert_eq!(observations[8].1.provenance, "request_attempt_boundary");
+        assert!(observations[8].1.unavailable_reason.is_some());
     }
 }

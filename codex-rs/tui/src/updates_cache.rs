@@ -13,6 +13,8 @@ pub(crate) struct VersionInfo {
     pub(crate) last_checked_at: DateTime<Utc>,
     #[serde(default)]
     pub(crate) dismissed_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) npm_ready: Option<bool>,
 }
 
 const VERSION_FILENAME: &str = "version.json";
@@ -35,22 +37,59 @@ pub(crate) async fn read_version_info_async(version_file: &Path) -> anyhow::Resu
 /// Persist a dismissal for the current latest version so we don't show
 /// the update popup again for this version.
 pub(crate) async fn dismiss_version(config: &Config, version: &str) -> anyhow::Result<()> {
-    let version_file = version_filepath(config);
-    let mut info = match read_version_info_async(&version_file).await {
-        Ok(info) => info,
-        Err(_) => VersionInfo {
-            latest_version: version.to_string(),
+    let version = version.to_string();
+    merge_version_info(version_filepath(config), version.clone(), move |info| {
+        info.dismissed_version = Some(version);
+    })
+    .await
+}
+
+pub(crate) async fn cache_release(
+    version_file: &Path,
+    latest_version: String,
+    npm_ready: bool,
+) -> anyhow::Result<()> {
+    merge_version_info(
+        version_file.to_path_buf(),
+        latest_version.clone(),
+        move |info| {
+            // Keep registry eligibility only for the exact release that was checked.
+            let previously_ready =
+                info.latest_version == latest_version && info.npm_ready == Some(true);
+            info.latest_version = latest_version;
+            info.last_checked_at = Utc::now();
+            info.npm_ready = Some(npm_ready || previously_ready);
+        },
+    )
+    .await
+}
+
+async fn merge_version_info(
+    version_file: PathBuf,
+    fallback_version: String,
+    update: impl FnOnce(&mut VersionInfo) + Send + 'static,
+) -> anyhow::Result<()> {
+    // Keep the lock and the whole transaction on one worker. Cancellation of the
+    // async caller cannot release the lock before the replacement finishes.
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let _lock = codex_file_system::acquire_atomic_write_lock(&version_file)?;
+        let previous = match std::fs::read(&version_file) {
+            Ok(contents) => serde_json::from_slice(&contents).ok(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let mut info = previous.unwrap_or(VersionInfo {
+            latest_version: fallback_version,
             last_checked_at: DateTime::<Utc>::UNIX_EPOCH,
             dismissed_version: None,
-        },
-    };
-    info.dismissed_version = Some(version.to_string());
-    let json_line = format!("{}\n", serde_json::to_string(&info)?);
-    if let Some(parent) = version_file.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    tokio::fs::write(version_file, json_line).await?;
-    Ok(())
+            npm_ready: None,
+        });
+        update(&mut info);
+        let json_line = format!("{}\n", serde_json::to_string(&info)?);
+        codex_file_system::write_atomically(&version_file, &json_line)?;
+        Ok(())
+    })
+    .await?
 }
 
 #[cfg(test)]

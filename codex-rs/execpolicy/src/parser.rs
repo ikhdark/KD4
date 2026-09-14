@@ -39,6 +39,40 @@ pub struct PolicyParser {
     builder: RefCell<PolicyBuilder>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_local_examples_are_released_and_later_files_are_validated() {
+        let mut parser = PolicyParser::new();
+        parser
+            .parse(
+                "first.rules",
+                r#"
+prefix_rule(pattern=["git"], match=[["git", "status"]])
+prefix_rule(pattern=["echo"])
+"#,
+            )
+            .expect("valid examples");
+        assert!(
+            parser
+                .builder
+                .borrow()
+                .pending_example_validations
+                .is_empty()
+        );
+        assert_eq!(parser.builder.borrow().rules_by_program.len(), 2);
+        let error = parser
+            .parse(
+                "second.rules",
+                r#"prefix_rule(pattern=["rg"], match=[["git"]])"#,
+            )
+            .expect_err("later examples must still be checked");
+        assert!(error.to_string().contains("second.rules"), "{error}");
+    }
+}
+
 impl Default for PolicyParser {
     fn default() -> Self {
         Self::new()
@@ -54,8 +88,9 @@ impl PolicyParser {
 
     /// Parses a policy, tagging parser errors with `policy_identifier` so failures include the
     /// identifier alongside line numbers.
+    /// Examples are checked against the declarations available at the end of this file.
+    /// After an error, discard this parser: evaluation may have partially mutated it.
     pub fn parse(&mut self, policy_identifier: &str, policy_file_contents: &str) -> Result<()> {
-        let pending_validation_count = self.builder.borrow().pending_example_validations.len();
         let mut dialect = Dialect::Extended.clone();
         dialect.enable_f_strings = true;
         let ast = AstModule::parse(
@@ -72,9 +107,7 @@ impl PolicyParser {
                 .map(|_| ())
                 .map_err(Error::Starlark)
         })?;
-        self.builder
-            .borrow()
-            .validate_pending_examples_from(pending_validation_count)?;
+        self.builder.borrow_mut().validate_pending_examples()?;
         Ok(())
     }
 
@@ -130,8 +163,8 @@ impl PolicyBuilder {
             });
     }
 
-    fn validate_pending_examples_from(&self, start: usize) -> Result<()> {
-        for validation in &self.pending_example_validations[start..] {
+    fn validate_pending_examples(&mut self) -> Result<()> {
+        for validation in self.pending_example_validations.drain(..) {
             let mut rules_by_program = MultiMap::new();
             for rule in &validation.rules {
                 rules_by_program.insert(rule.program().to_string(), rule.clone());
@@ -369,9 +402,13 @@ fn policy_builtins(builder: &mut GlobalsBuilder) {
             .map(parse_examples)
             .transpose()?
             .unwrap_or_default();
-        let location = eval
-            .call_stack_top_location()
-            .map(error_location_from_file_span);
+        let has_examples = !matches.is_empty() || !not_matches.is_empty();
+        let location = if has_examples {
+            eval.call_stack_top_location()
+                .map(error_location_from_file_span)
+        } else {
+            None
+        };
 
         let mut builder = policy_builder(eval);
 
@@ -396,7 +433,9 @@ fn policy_builtins(builder: &mut GlobalsBuilder) {
             })
             .collect();
 
-        builder.add_pending_example_validation(rules.clone(), matches, not_matches, location);
+        if has_examples {
+            builder.add_pending_example_validation(rules.clone(), matches, not_matches, location);
+        }
         rules.into_iter().for_each(|rule| builder.add_rule(rule));
         Ok(NoneType)
     }

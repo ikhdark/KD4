@@ -53,6 +53,27 @@ use codex_protocol::openai_models::ReasoningEffort;
 
 use crate::history_cell::HistoryCell;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorldWritableScanOrigin {
+    cwd: AbsolutePathBuf,
+    workspace_roots: Vec<AbsolutePathBuf>,
+    codex_home: PathBuf,
+    permission_profile: codex_protocol::models::PermissionProfile,
+    hidden: bool,
+}
+
+impl WorldWritableScanOrigin {
+    pub(crate) fn from_config(config: &crate::legacy_core::config::Config) -> Self {
+        Self {
+            cwd: config.cwd.clone(),
+            workspace_roots: config.effective_workspace_roots(),
+            codex_home: config.codex_home.to_path_buf(),
+            permission_profile: config.permissions.effective_permission_profile(),
+            hidden: config.notices.hide_world_writable_warning.unwrap_or(false),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ThreadGoalSetMode {
     ConfirmIfExists,
@@ -145,7 +166,7 @@ pub(crate) enum KeymapEditIntent {
 }
 
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug)]
+#[derive(Debug, strum_macros::IntoStaticStr)]
 pub(crate) enum AppEvent {
     /// Open the agent picker for switching active threads.
     OpenAgentPicker,
@@ -380,7 +401,11 @@ pub(crate) enum AppEvent {
     },
 
     /// Result of computing a `/diff` command.
-    DiffResult(String),
+    DiffResult {
+        thread_id: Option<ThreadId>,
+        cwd: PathBuf,
+        text: String,
+    },
 
     /// Open the app link view in the bottom pane.
     OpenAppLink {
@@ -770,6 +795,8 @@ pub(crate) enum AppEvent {
     /// approval/sandbox configuration on Continue; if `None`, it performs no
     /// policy change and only acknowledges/dismisses the warning.
     OpenWorldWritableWarningConfirmation {
+        /// Configuration captured by a background scan; absent for an immediate confirmation.
+        origin: Option<WorldWritableScanOrigin>,
         preset: Option<ApprovalPreset>,
         profile_selection: Option<PermissionProfileSelection>,
         /// Up to 3 sample world-writable directories to display in the warning.
@@ -975,11 +1002,13 @@ pub(crate) enum AppEvent {
 
     /// Async update of the current git branch for status line rendering.
     StatusLineBranchUpdated {
+        request_id: uuid::Uuid,
         cwd: PathBuf,
         branch: Option<String>,
     },
     /// Async update of Git summary fields for status line rendering.
     StatusLineGitSummaryUpdated {
+        request_id: uuid::Uuid,
         cwd: PathBuf,
         summary: crate::chatwidget::StatusLineGitSummary,
     },

@@ -190,7 +190,7 @@ async fn detect_home_lists_recent_sessions() {
 }
 
 #[tokio::test]
-async fn detect_repo_lists_agents_md_for_each_cwd() {
+async fn detect_repo_deduplicates_cwds_in_the_same_repository() {
     let root = TempDir::new().expect("create tempdir");
     let repo_root = root.path().join("repo");
     let nested = repo_root.join("nested").join("child");
@@ -213,28 +213,16 @@ async fn detect_repo_lists_agents_md_for_each_cwd() {
     .await
     .expect("detect");
 
-    let expected = vec![
-        ExternalAgentConfigMigrationItem {
-            item_type: ExternalAgentConfigMigrationItemType::AgentsMd,
-            description: format!(
-                "Migrate {} to {}",
-                repo_root.join(EXTERNAL_AGENT_CONFIG_MD).display(),
-                repo_root.join("AGENTS.md").display(),
-            ),
-            cwd: Some(repo_root.clone()),
-            details: None,
-        },
-        ExternalAgentConfigMigrationItem {
-            item_type: ExternalAgentConfigMigrationItemType::AgentsMd,
-            description: format!(
-                "Migrate {} to {}",
-                repo_root.join(EXTERNAL_AGENT_CONFIG_MD).display(),
-                repo_root.join("AGENTS.md").display(),
-            ),
-            cwd: Some(repo_root),
-            details: None,
-        },
-    ];
+    let expected = vec![ExternalAgentConfigMigrationItem {
+        item_type: ExternalAgentConfigMigrationItemType::AgentsMd,
+        description: format!(
+            "Migrate {} to {}",
+            repo_root.join(EXTERNAL_AGENT_CONFIG_MD).display(),
+            repo_root.join("AGENTS.md").display(),
+        ),
+        cwd: Some(repo_root.clone()),
+        details: None,
+    }];
 
     assert_eq!(items, expected);
 }
@@ -536,7 +524,7 @@ async fn import_repo_migrates_mcp_hooks_commands_and_subagents() {
             .join(EXTERNAL_AGENT_DIR)
             .join("agents")
             .join("researcher.md"),
-        format!("---\nname: researcher\ndescription: Research role\npermissionMode: acceptEdits\nskills: [deep-research]\ntools: Bash, Read\ndisallowedTools: WebFetch\neffort: high\n---\nResearch with {SOURCE_EXTERNAL_AGENT_PRODUCT_NAME} carefully.\n"),
+        format!("---\nname: researcher\ndescription: Research role\npermissionMode: acceptEdits\nskills: [deep-research]\neffort: high\n---\nResearch with {SOURCE_EXTERNAL_AGENT_PRODUCT_NAME} carefully.\n"),
     )
     .expect("write subagent");
 
@@ -671,7 +659,7 @@ description = "Research role"
 model_reasoning_effort = "high"
 sandbox_mode = "workspace-write"
 developer_instructions = """
-Research with Codex carefully."""
+Research with Claude Code carefully."""
 "#,
     )
     .expect("parse expected agent");
@@ -1659,7 +1647,7 @@ async fn import_continues_after_failed_migration_item() {
     fs::create_dir_all(repo_root.join(".git")).expect("create git");
     fs::write(repo_root.join(EXTERNAL_AGENT_CONFIG_MD), "Claude guidance").expect("write source");
 
-    service_for_paths(
+    let outcome = service_for_paths(
         root.path().join(EXTERNAL_AGENT_DIR),
         root.path().join(".codex"),
     )
@@ -1679,6 +1667,26 @@ async fn import_continues_after_failed_migration_item() {
     ])
     .await;
 
+    assert_eq!(outcome.item_results.len(), 2);
+    let failed = &outcome.item_results[0];
+    assert_eq!(
+        failed.item_type,
+        ExternalAgentConfigMigrationItemType::Plugins
+    );
+    assert_eq!(failed.success_count, 0);
+    assert_eq!(failed.error_count, 1);
+    assert_eq!(failed.raw_errors.len(), 1);
+    assert_eq!(
+        failed.raw_errors[0].message,
+        "plugins migration item is missing details"
+    );
+    let succeeded = &outcome.item_results[1];
+    assert_eq!(
+        succeeded.item_type,
+        ExternalAgentConfigMigrationItemType::AgentsMd
+    );
+    assert_eq!(succeeded.success_count, 1);
+    assert_eq!(succeeded.error_count, 0);
     assert_eq!(
         fs::read_to_string(repo_root.join("AGENTS.md")).expect("read target"),
         "Codex guidance"
@@ -2960,10 +2968,70 @@ fn import_skills_returns_only_new_skill_directory_names() {
     fs::create_dir_all(external_agent_home.join("skills").join("skill-b"))
         .expect("create source b");
     fs::create_dir_all(agents_skills.join("skill-a")).expect("create existing target");
+    fs::write(
+        external_agent_home.join("skills/skill-a/SKILL.md"),
+        "source a",
+    )
+    .unwrap();
+    fs::write(
+        external_agent_home.join("skills/skill-b/SKILL.md"),
+        "source b",
+    )
+    .unwrap();
+    fs::write(agents_skills.join("skill-a/SKILL.md"), "existing a").unwrap();
 
     let copied_names = service_for_paths(external_agent_home, codex_home)
         .import_skills(/*cwd*/ None)
         .expect("import skills");
 
     assert_eq!(copied_names, vec!["skill-b".to_string()]);
+    assert_eq!(
+        fs::read_to_string(agents_skills.join("skill-a/SKILL.md")).unwrap(),
+        "existing a"
+    );
+    assert_eq!(
+        fs::read_to_string(agents_skills.join("skill-b/SKILL.md")).unwrap(),
+        "source b"
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn failed_skill_copy_does_not_publish_a_partial_directory_and_can_retry() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let (root, external_agent_home, codex_home) = fixture_paths();
+    let source = external_agent_home.join("skills").join("retry-skill");
+    fs::create_dir_all(&source).expect("source directory");
+    fs::write(source.join("SKILL.md"), "Complete skill instructions").expect("skill file");
+    fs::write(source.join("data.txt"), "required data").expect("data file");
+    let locked_file = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(source.join("data.txt"))
+        .expect("deny access while copying");
+    let service = service_for_paths(external_agent_home, codex_home);
+    let item = ExternalAgentConfigMigrationItem {
+        item_type: ExternalAgentConfigMigrationItemType::Skills,
+        description: "import retry skill".to_string(),
+        cwd: None,
+        details: None,
+    };
+    let outcome = service.import(vec![item.clone()]).await;
+    assert_eq!(outcome.item_results.len(), 1);
+    assert_eq!(outcome.item_results[0].error_count, 1);
+    assert_eq!(outcome.item_results[0].success_count, 0);
+    let target = root.path().join(".agents/skills/retry-skill");
+    assert!(!target.exists(), "a failed import must remain retryable");
+    drop(locked_file);
+    let outcome = service.import(vec![item]).await;
+    assert_eq!(outcome.item_results[0].error_count, 0);
+    assert_eq!(outcome.item_results[0].success_count, 1);
+    assert_eq!(
+        fs::read_to_string(target.join("SKILL.md")).expect("published skill"),
+        "Complete skill instructions"
+    );
+    assert_eq!(
+        fs::read_to_string(target.join("data.txt")).expect("published data"),
+        "required data"
+    );
 }

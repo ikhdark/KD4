@@ -3,12 +3,29 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use codex_http_client::HttpClientFactory;
+use codex_models_manager::manager::ModelCatalogActivity;
 use codex_models_manager::manager::SharedModelsManager;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 const MODELS_REFRESH_INTERVAL: Duration = Duration::from_secs(3 * 60);
+
+struct InitialRefresh(Option<Arc<ModelCatalogActivity>>);
+
+impl InitialRefresh {
+    fn finish(&mut self) {
+        if let Some(activity) = self.0.take() {
+            activity.finish_initial_refresh();
+        }
+    }
+}
+
+impl Drop for InitialRefresh {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct ModelsRefreshWorker {
@@ -67,6 +84,9 @@ fn spawn_with_interval(
     let worker_shutdown = shutdown.clone();
     let first_refresh_at = Instant::now() + refresh_interval;
     model_catalog_activity.arm_initial_refresh(first_refresh_at);
+    // Capture the guard before spawning so abortion before the first poll also
+    // releases catalog consumers waiting for this worker.
+    let mut initial_refresh = InitialRefresh(Some(model_catalog_activity));
     let task = tokio::spawn(async move {
         loop {
             let catalog_was_used = *activity_rx.borrow_and_update();
@@ -75,18 +95,15 @@ fn spawn_with_interval(
             }
             tokio::select! {
                 _ = worker_shutdown.cancelled() => {
-                    model_catalog_activity.finish_initial_refresh();
                     return;
                 },
                 result = activity_rx.changed() => {
                     if result.is_err() {
-                        model_catalog_activity.finish_initial_refresh();
                         return;
                     }
                 }
             }
         }
-        let mut initial_refresh_pending = true;
         let mut next_refresh_at = first_refresh_at;
         loop {
             // Model-dependent requests refresh an empty cache on demand. Wait
@@ -112,14 +129,8 @@ fn spawn_with_interval(
                 }
             }
             drop(models_manager);
-            if initial_refresh_pending {
-                model_catalog_activity.finish_initial_refresh();
-                initial_refresh_pending = false;
-            }
+            initial_refresh.finish();
             next_refresh_at = Instant::now() + refresh_interval;
-        }
-        if initial_refresh_pending {
-            model_catalog_activity.finish_initial_refresh();
         }
     });
     ModelsRefreshWorker {

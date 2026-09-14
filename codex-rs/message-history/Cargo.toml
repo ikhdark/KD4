@@ -17,10 +17,11 @@ codex-config = { workspace = true }
 memchr = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
 tracing = { workspace = true, features = ["log"] }
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
-tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

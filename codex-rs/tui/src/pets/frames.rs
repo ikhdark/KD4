@@ -8,20 +8,36 @@ use image::GenericImageView;
 
 use super::model::Pet;
 
-pub(super) fn prepare_png_frames(pet: &Pet, frame_dir: &Path) -> Result<Vec<PathBuf>> {
+pub(super) fn cached_png_frames(pet: &Pet, frame_dir: &Path) -> Option<Vec<PathBuf>> {
+    let paths = frame_paths(pet, frame_dir);
+    paths.iter().all(|path| path.is_file()).then_some(paths)
+}
+
+fn frame_paths(pet: &Pet, frame_dir: &Path) -> Vec<PathBuf> {
+    (0..pet.frame_count())
+        .map(|index| frame_dir.join(format!("frame_{index:03}.png")))
+        .collect()
+}
+
+pub(super) fn prepare_png_frames(
+    pet: &Pet,
+    bytes: &[u8],
+    frame_dir: &Path,
+) -> Result<Vec<PathBuf>> {
     fs::create_dir_all(frame_dir).with_context(|| format!("create {}", frame_dir.display()))?;
 
-    let expected: Vec<PathBuf> = (0..pet.frame_count())
-        .map(|index| frame_dir.join(format!("frame_{index:03}.png")))
-        .collect();
+    let expected = frame_paths(pet, frame_dir);
 
-    let complete = expected.iter().all(|path| path.exists());
+    let complete = expected.iter().all(|path| path.is_file());
     if !complete {
-        for stale in glob_frame_files(frame_dir)? {
-            let _ = fs::remove_file(stale);
-        }
-
-        let spritesheet = image::open(&pet.spritesheet_path)
+        let dimensions = image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()?
+            .into_dimensions()?;
+        anyhow::ensure!(
+            dimensions == (pet.frame_width * pet.columns, pet.frame_height * pet.rows),
+            "spritesheet dimensions changed after loading pet"
+        );
+        let spritesheet = image::load_from_memory(bytes)
             .with_context(|| format!("read {}", pet.spritesheet_path.display()))?;
         for row in 0..pet.rows {
             for column in 0..pet.columns {
@@ -33,6 +49,9 @@ pub(super) fn prepare_png_frames(pet: &Pet, frame_dir: &Path) -> Result<Vec<Path
                 let path = expected
                     .get(index)
                     .context("pet frame index exceeds expected frame count")?;
+                if path.is_file() {
+                    continue;
+                }
                 let x = column
                     .checked_mul(pet.frame_width)
                     .context("pet frame x offset overflow")?;
@@ -40,34 +59,19 @@ pub(super) fn prepare_png_frames(pet: &Pet, frame_dir: &Path) -> Result<Vec<Path
                     .checked_mul(pet.frame_height)
                     .context("pet frame y offset overflow")?;
                 let frame = spritesheet.try_view(x, y, pet.frame_width, pet.frame_height)?;
+                let staging = tempfile::NamedTempFile::new_in(frame_dir)?;
                 frame
                     .to_image()
-                    .save_with_format(path, image::ImageFormat::Png)
+                    .save_with_format(staging.path(), image::ImageFormat::Png)
                     .with_context(|| format!("write {}", path.display()))?;
+                staging
+                    .persist(path)
+                    .with_context(|| format!("publish {}", path.display()))?;
             }
         }
     }
 
     Ok(expected)
-}
-
-fn glob_frame_files(frame_dir: &Path) -> Result<Vec<PathBuf>> {
-    if !frame_dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut paths = Vec::new();
-    for entry in fs::read_dir(frame_dir).with_context(|| format!("read {}", frame_dir.display()))? {
-        let path = entry?.path();
-        if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("frame_") && name.ends_with(".png"))
-        {
-            paths.push(path);
-        }
-    }
-    Ok(paths)
 }
 
 #[cfg(test)]
@@ -92,22 +96,22 @@ mod tests {
         });
         spritesheet.save(&spritesheet_path).unwrap();
 
-        let frames = prepare_png_frames(
-            &Pet {
-                id: "tiny".to_string(),
-                display_name: "Tiny".to_string(),
-                description: String::new(),
-                spritesheet_path,
-                frame_width: 1,
-                frame_height: 1,
-                columns: 2,
-                rows: 1,
-                frame_count: 2,
-                animations: HashMap::new(),
-            },
-            &dir.path().join("frames"),
-        )
-        .unwrap();
+        let bytes = fs::read(&spritesheet_path).unwrap();
+        let pet = Pet {
+            display_name: "Tiny".to_string(),
+            description: String::new(),
+            spritesheet_path: spritesheet_path.clone(),
+            frame_width: 1,
+            frame_height: 1,
+            columns: 2,
+            rows: 1,
+            frame_count: 2,
+            animations: HashMap::new(),
+        };
+        let frame_dir = dir.path().join("frames");
+        // Extraction must use the same bytes as the cache key even if the source changes.
+        fs::write(&spritesheet_path, b"replaced source").unwrap();
+        let frames = prepare_png_frames(&pet, &bytes, &frame_dir).unwrap();
 
         assert_eq!(frames.len(), 2);
         let first = image::open(&frames[0]).unwrap().to_rgba8();
@@ -116,5 +120,18 @@ mod tests {
         assert_eq!(second.dimensions(), (1, 1));
         assert_eq!(first.get_pixel(0, 0), &Rgba([255, 0, 0, 255]));
         assert_eq!(second.get_pixel(0, 0), &Rgba([0, 255, 0, 255]));
+
+        let first_modified = fs::metadata(&frames[0]).unwrap().modified().unwrap();
+        fs::remove_file(&frames[1]).unwrap();
+        assert_eq!(
+            prepare_png_frames(&pet, &bytes, &frame_dir).unwrap(),
+            frames
+        );
+        assert_eq!(
+            fs::metadata(&frames[0]).unwrap().modified().unwrap(),
+            first_modified
+        );
+        assert_eq!(image::open(&frames[1]).unwrap().to_rgba8(), second);
+        assert_eq!(fs::read_dir(&frame_dir).unwrap().count(), 2);
     }
 }

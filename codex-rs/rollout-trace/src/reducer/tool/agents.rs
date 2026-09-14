@@ -11,6 +11,8 @@ use codex_protocol::protocol::SubAgentActivityEvent;
 use codex_protocol::protocol::SubAgentActivityKind;
 use serde::Deserialize;
 use serde_json::Value;
+use std::borrow::Cow;
+use std::collections::HashSet;
 
 use super::super::TraceReducer;
 use crate::model::ConversationItem;
@@ -256,7 +258,12 @@ impl TraceReducer {
         })?;
         let started_at_unix_ms = tool_call.execution.started_at_unix_ms;
         let message_author = self.agent_path_for_thread(&tool_call.thread_id)?;
-        let message_content = self.agent_message_content_from_invocation(tool_call_id)?;
+        let Some(message_content) = self.agent_message_content_from_invocation(tool_call_id)?
+        else {
+            // Invocation recording is best-effort. Keep the runtime evidence
+            // without inventing a message to match against the recipient.
+            return Ok(());
+        };
         let carried_raw_payload_ids = self.agent_tool_payload_ids(tool_call_id)?;
         self.queue_or_resolve_agent_interaction_edge(PendingAgentInteractionEdge {
             edge_id,
@@ -274,16 +281,13 @@ impl TraceReducer {
         })
     }
 
-    fn agent_message_content_from_invocation(&self, tool_call_id: &str) -> Result<String> {
+    fn agent_message_content_from_invocation(&self, tool_call_id: &str) -> Result<Option<String>> {
         let tool_call = self.rollout.tool_calls.get(tool_call_id).with_context(|| {
             format!("agent activity referenced unknown tool call {tool_call_id}")
         })?;
-        let invocation_payload_id = tool_call
-            .raw_invocation_payload_id
-            .as_deref()
-            .with_context(|| {
-                format!("agent activity tool call {tool_call_id} missing invocation payload")
-            })?;
+        let Some(invocation_payload_id) = tool_call.raw_invocation_payload_id.as_deref() else {
+            return Ok(None);
+        };
         let invocation_payload = self
             .rollout
             .raw_payloads
@@ -303,7 +307,7 @@ impl TraceReducer {
             })?;
         let args: AgentMessageInvocationArgs = serde_json::from_str(arguments)
             .with_context(|| format!("parse agent activity tool call {tool_call_id} arguments"))?;
-        Ok(args.message)
+        Ok(Some(args.message))
     }
 
     /// Adds the canonical tool result payload to an already reduced multi-agent edge.
@@ -315,12 +319,20 @@ impl TraceReducer {
         let Some(result_payload) = result_payload else {
             return Ok(());
         };
-        if let Some(edge) = self
-            .rollout
-            .interaction_edges
-            .values_mut()
-            .find(|edge| tool_call_source_matches(&edge.source, tool_call_id))
-        {
+        let edge = if matches!(
+            self.rollout.tool_calls[tool_call_id].kind,
+            ToolCallKind::SpawnAgent
+        ) {
+            self.rollout
+                .interaction_edges
+                .values_mut()
+                .find(|edge| tool_call_source_matches(&edge.source, tool_call_id))
+        } else {
+            self.rollout
+                .interaction_edges
+                .get_mut(&tool_edge_id(tool_call_id))
+        };
+        if let Some(edge) = edge {
             push_unique(
                 &mut edge.carried_raw_payload_ids,
                 &result_payload.raw_payload_id,
@@ -517,7 +529,7 @@ impl TraceReducer {
         &mut self,
         item_id: &str,
     ) -> Result<()> {
-        if self.is_interaction_edge_target_item(item_id) {
+        if self.pending_agent_interaction_edges.is_empty() {
             return Ok(());
         }
         let Some((thread_id, message_author, message_content)) =
@@ -525,6 +537,9 @@ impl TraceReducer {
         else {
             return Ok(());
         };
+        if self.is_interaction_edge_target_item(item_id) {
+            return Ok(());
+        }
         let Some(pending_index) = self
             .pending_agent_interaction_edges
             .iter()
@@ -544,6 +559,26 @@ impl TraceReducer {
         &mut self,
         pending: PendingAgentInteractionEdge,
     ) -> Result<()> {
+        if let Some(existing) = self.rollout.interaction_edges.get(&pending.edge_id) {
+            let TraceAnchor::ConversationItem { item_id } = &existing.target else {
+                bail!("interaction edge {} has no delivery item", pending.edge_id);
+            };
+            if !self
+                .inter_agent_message_item(item_id)
+                .is_some_and(|(thread, author, content)| {
+                    thread == pending.target_thread_id
+                        && author == pending.message_author
+                        && content == pending.message_content
+                })
+            {
+                bail!(
+                    "interaction edge {} was observed with conflicting delivery data",
+                    pending.edge_id
+                );
+            }
+            let item_id = item_id.clone();
+            return self.upsert_agent_interaction_edge_for_item(pending, item_id);
+        }
         if let Some(item_id) = self.find_unlinked_inter_agent_message_item(
             &pending.target_thread_id,
             &pending.message_author,
@@ -682,13 +717,22 @@ impl TraceReducer {
         message_author: &str,
         message_content: &str,
     ) -> Option<String> {
+        let linked_items: HashSet<&str> = self
+            .rollout
+            .interaction_edges
+            .values()
+            .filter_map(|edge| match &edge.target {
+                TraceAnchor::ConversationItem { item_id } => Some(item_id.as_str()),
+                _ => None,
+            })
+            .collect();
         self.rollout
             .threads
             .get(thread_id)?
             .conversation_item_ids
             .iter()
             .find(|item_id| {
-                !self.is_interaction_edge_target_item(item_id)
+                !linked_items.contains(item_id.as_str())
                     && self
                         .inter_agent_message_item(item_id)
                         .is_some_and(|(_, author, content)| {
@@ -698,7 +742,10 @@ impl TraceReducer {
             .cloned()
     }
 
-    fn inter_agent_message_item(&self, item_id: &str) -> Option<(String, String, String)> {
+    fn inter_agent_message_item(
+        &self,
+        item_id: &str,
+    ) -> Option<(&str, Cow<'_, str>, Cow<'_, str>)> {
         let item = self.rollout.conversation_items.get(item_id)?;
         let (author_agent_path, recipient_agent_path, message_content) =
             inter_agent_message_fields(item)?;
@@ -706,7 +753,7 @@ impl TraceReducer {
         if recipient_agent_path != thread.agent_path {
             return None;
         }
-        Some((item.thread_id.clone(), author_agent_path, message_content))
+        Some((&item.thread_id, author_agent_path, message_content))
     }
 
     fn agent_path_for_thread(&self, thread_id: &str) -> Result<String> {
@@ -730,16 +777,19 @@ impl TraceReducer {
         codex_turn_id: &str,
     ) -> Option<String> {
         self.rollout
-            .conversation_items
-            .values()
-            .filter(|item| {
-                item.thread_id == thread_id
-                    && item.codex_turn_id.as_deref() == Some(codex_turn_id)
+            .threads
+            .get(thread_id)?
+            .conversation_item_ids
+            .iter()
+            .rev()
+            .filter_map(|item_id| self.rollout.conversation_items.get(item_id))
+            .find(|item| {
+                item.codex_turn_id.as_deref() == Some(codex_turn_id)
                     && item.role == ConversationRole::Assistant
                     && item.kind == ConversationItemKind::Message
                     && item.agent_message.is_none()
+                    && inter_agent_message_fields(item).is_none()
             })
-            .max_by_key(|item| item.first_seen_at_unix_ms)
             .map(|item| item.item_id.clone())
     }
 }
@@ -766,7 +816,9 @@ fn push_unique(items: &mut Vec<String>, item: &str) {
     }
 }
 
-fn inter_agent_message_fields(item: &ConversationItem) -> Option<(String, String, String)> {
+fn inter_agent_message_fields(
+    item: &ConversationItem,
+) -> Option<(Cow<'_, str>, Cow<'_, str>, Cow<'_, str>)> {
     if item.role != ConversationRole::Assistant || item.kind != ConversationItemKind::Message {
         return None;
     }
@@ -781,9 +833,9 @@ fn inter_agent_message_fields(item: &ConversationItem) -> Option<(String, String
             _ => return None,
         };
         return Some((
-            agent_message.author.clone(),
-            agent_message.recipient.clone(),
-            message_content.clone(),
+            Cow::Borrowed(&agent_message.author),
+            Cow::Borrowed(&agent_message.recipient),
+            Cow::Borrowed(message_content),
         ));
     }
 
@@ -796,11 +848,13 @@ fn inter_agent_message_fields(item: &ConversationItem) -> Option<(String, String
     };
     let communication = serde_json::from_str::<InterAgentCommunication>(text).ok()?;
     Some((
-        communication.author.to_string(),
-        communication.recipient.to_string(),
-        communication
-            .encrypted_content
-            .unwrap_or(communication.content),
+        Cow::Owned(communication.author.to_string()),
+        Cow::Owned(communication.recipient.to_string()),
+        Cow::Owned(
+            communication
+                .encrypted_content
+                .unwrap_or(communication.content),
+        ),
     ))
 }
 

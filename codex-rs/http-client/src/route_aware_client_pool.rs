@@ -40,12 +40,14 @@ const MAX_CACHED_ROUTES: usize = 16;
 /// Request creation stays on the pool so the URL used for PAC or system-proxy resolution cannot
 /// differ from the URL that is sent. Redirects are followed through the pool as new requests, so
 /// each hop gets its own route decision while connections are still reused by route.
+/// Cached transports retain their TLS trust settings; recreate the pool after changing CA roots.
 #[derive(Clone)]
 pub struct RouteAwareClientPool {
     http_client_factory: HttpClientFactory,
     route_class: ClientRouteClass,
     client_builder: HttpClientBuilder,
     clients: Arc<Mutex<CachedRouteClients>>,
+    client_build: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug, Default)]
@@ -371,6 +373,7 @@ impl RouteAwareClientPool {
             route_class,
             client_builder,
             clients: Arc::new(Mutex::new(CachedRouteClients::default())),
+            client_build: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -535,6 +538,8 @@ impl RouteAwareClientPool {
         Fut: Future<Output = io::Result<OutboundProxyRoute>>,
     {
         let request_method = request.method().clone();
+        self.client_builder
+            .apply_default_headers(request.headers_mut());
         let request_url = request.url().to_string();
         let follows_redirects_manually = self.client_builder.follows_redirects()
             && self.http_client_factory.outbound_proxy_policy()
@@ -542,6 +547,7 @@ impl RouteAwareClientPool {
         let timeout_deadline = request
             .timeout()
             .copied()
+            .or(self.client_builder.configured_timeout())
             .map(|timeout| tokio::time::Instant::now() + timeout);
         let mut redirects = 0;
         let mut previous_route = None;
@@ -575,11 +581,15 @@ impl RouteAwareClientPool {
                 }
                 *request.timeout_mut() = Some(remaining);
             }
-            let method = request.method().clone();
-            let headers = request.headers().clone();
-            let version = request.version();
-            let timeout = request.timeout().copied();
-            let replay = request.try_clone();
+            let redirect_state = follows_redirects_manually.then(|| {
+                (
+                    request.method().clone(),
+                    request.headers().clone(),
+                    request.version(),
+                    request.timeout().copied(),
+                    request.try_clone(),
+                )
+            });
             let execute_request = async {
                 if follows_redirects_manually {
                     client.execute_without_request_logging(request).await
@@ -614,6 +624,10 @@ impl RouteAwareClientPool {
                 if follows_redirects_manually {
                     client.log_response(&request_method, &request_url, &response);
                 }
+                return Ok(response);
+            };
+            let Some((method, headers, version, timeout, replay)) = redirect_state else {
+                client.log_response(&request_method, &request_url, &response);
                 return Ok(response);
             };
             let Some(mut next_request) =
@@ -653,15 +667,15 @@ impl RouteAwareClientPool {
             .await
             .map_err(RouteAwareClientPoolError::Resolve)?;
         let cached_client = {
-            let mut clients = match self.clients.lock() {
-                Ok(clients) => clients,
-                Err(error) => {
-                    panic!("route-aware client cache lock should not be poisoned: {error}")
-                }
-            };
+            let mut clients = self.clients.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             clients.get(&route)
         };
         if let Some(client) = cached_client {
+            return Ok((route, client));
+        }
+
+        let build_guard = Arc::clone(&self.client_build).lock_owned().await;
+        if let Some(client) = self.clients.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&route) {
             return Ok((route, client));
         }
 
@@ -674,23 +688,24 @@ impl RouteAwareClientPool {
         let http_client_factory = self.http_client_factory.clone();
         let route_class = self.route_class;
         let route_for_build = route.clone();
+        let clients = Arc::clone(&self.clients);
         let client = tokio::task::spawn_blocking(move || {
-            client_builder.build_for_resolved_route(
+            // Keep both construction and publication protected even if the awaiting request is
+            // cancelled: spawn_blocking continues running after its waiter is dropped.
+            let _build_guard = build_guard;
+            let client = client_builder.build_for_resolved_route(
                 &http_client_factory,
                 route_class,
                 &route_for_build,
-            )
+            )?;
+            clients
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(route_for_build, client.clone());
+            Ok::<_, BuildRouteAwareHttpClientError>(client)
         })
         .await
         .map_err(RouteAwareClientPoolError::BuildTask)??;
-        let mut clients = match self.clients.lock() {
-            Ok(clients) => clients,
-            Err(error) => panic!("route-aware client cache lock should not be poisoned: {error}"),
-        };
-        if let Some(existing_client) = clients.get(&route) {
-            return Ok((route, existing_client));
-        }
-        clients.insert(route.clone(), client.clone());
         Ok((route, client))
     }
 }

@@ -30,11 +30,30 @@ fn exclusive_tls_roots_select_explicit_root_policy() {
 }
 
 #[test]
-fn blocking_client_streams_request_and_response_without_exposing_transport_types() {
+fn blocking_client_sends_buffered_request_and_reads_response_without_exposing_transport_types() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback server");
     let address = listener.local_addr().expect("read loopback address");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept request");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < deadline, "request must arrive");
+                    thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept request: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
         let mut request = Vec::new();
         let mut chunk = [0_u8; 1024];
         loop {
@@ -68,6 +87,7 @@ fn blocking_client_streams_request_and_response_without_exposing_transport_types
     let mut headers = HeaderMap::new();
     headers.insert("x-codex-test", HeaderValue::from_static("blocking"));
     let client = BlockingHttpClientBuilder::new()
+        .timeout(std::time::Duration::from_secs(2))
         .build_direct()
         .expect("build blocking client");
     let mut response = client
@@ -95,4 +115,56 @@ fn blocking_client_streams_request_and_response_without_exposing_transport_types
             .contains("x-codex-test: blocking")
     );
     assert!(request.ends_with("payload"));
+}
+
+#[test]
+fn explicit_none_disables_blocking_transport_timeout() {
+    // Reqwest's blocking default is 30 seconds. Only a response beyond that boundary
+    // distinguishes an explicit None from accidentally leaving the default in place.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind server");
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < deadline, "request must arrive");
+                    thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept request: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        thread::sleep(std::time::Duration::from_secs(31));
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+    });
+    let result = BlockingHttpClientBuilder::new()
+        .request_timeout(None)
+        .build_direct()
+        .expect("build without timeout")
+        .get(format!("http://{address}/"))
+        .send();
+    server
+        .join()
+        .expect("server completes")
+        .expect("response written");
+    assert_eq!(
+        result
+            .expect("explicit None permits a response after 30 seconds")
+            .status(),
+        StatusCode::OK
+    );
 }

@@ -1,4 +1,7 @@
 use crate::ContextualUserFragment;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseInputItem;
+use codex_protocol::models::ResponseItem;
 use codex_utils_string::approx_bytes_for_tokens;
 
 /// Maximum approximate token budget for one aggregate model-context contribution.
@@ -69,26 +72,11 @@ impl ModelContextBudget {
             let suffix = &text[suffix_start..];
             format!("{prefix}{TRUNCATION_MARKER}{suffix}")
         };
+        if admitted.is_empty() {
+            return None;
+        }
         self.remaining_bytes = self.remaining_bytes.saturating_sub(admitted.len());
         Some(admitted)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn item_cap_preserves_aggregate_budget_for_later_fragments() {
-        let mut budget = ModelContextBudget::new(10);
-        let initial_bytes = budget.remaining_bytes();
-
-        let first = budget
-            .take_up_to(&"x".repeat(100), 12)
-            .expect("capped fragment");
-        assert!(first.len() <= 12);
-        assert_eq!(budget.remaining_bytes(), initial_bytes - first.len());
-        assert_eq!(budget.take("later"), Some("later".to_string()));
     }
 }
 
@@ -120,5 +108,27 @@ impl ContextualUserFragment for RenderedContextFragment {
 
     fn type_markers() -> (&'static str, &'static str) {
         ("", "")
+    }
+
+    fn into(self) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: self.role.to_string(),
+            content: vec![ContentItem::InputText { text: self.text }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    fn into_boxed_response_item(self: Box<Self>) -> ResponseItem {
+        ContextualUserFragment::into(*self)
+    }
+
+    fn into_response_input_item(self) -> ResponseInputItem {
+        ResponseInputItem::Message {
+            role: self.role.to_string(),
+            content: vec![ContentItem::InputText { text: self.text }],
+            phase: None,
+        }
     }
 }

@@ -102,14 +102,17 @@ pub(crate) async fn run(
         };
     }
 
-    let input_json = match serde_json::to_string(&build_command_input(&request)) {
+    let cwd = request.cwd.clone();
+    let turn_id = request.turn_id.clone();
+    let run_id_suffix = request.run_id_suffix.clone();
+    let input_json = match serde_json::to_string(&build_command_input(request)) {
         Ok(input_json) => input_json,
         Err(error) => {
             let hook_events = common::serialization_failure_hook_events_for_tool_use(
                 matched,
-                Some(request.turn_id.clone()),
+                Some(turn_id.clone()),
                 format!("failed to serialize permission request hook input: {error}"),
-                &request.run_id_suffix,
+                &run_id_suffix,
             );
             return PermissionRequestOutcome {
                 hook_events,
@@ -122,8 +125,8 @@ pub(crate) async fn run(
         shell,
         matched,
         input_json,
-        request.cwd.as_path(),
-        Some(request.turn_id.clone()),
+        cwd.as_path(),
+        Some(turn_id.clone()),
         parse_completed,
     )
     .await;
@@ -139,9 +142,7 @@ pub(crate) async fn run(
     PermissionRequestOutcome {
         hook_events: results
             .into_iter()
-            .map(|result| {
-                common::hook_completed_for_tool_use(result.completed, &request.run_id_suffix)
-            })
+            .map(|result| common::hook_completed_for_tool_use(result.completed, &run_id_suffix))
             .collect(),
         decision,
     }
@@ -169,20 +170,20 @@ fn resolve_permission_request_decision<'a>(
     resolved_allow
 }
 
-fn build_command_input(request: &PermissionRequestRequest) -> PermissionRequestCommandInput {
+fn build_command_input(request: PermissionRequestRequest) -> PermissionRequestCommandInput {
     let subagent = SubagentCommandInputFields::from(request.subagent.as_ref());
     PermissionRequestCommandInput {
         session_id: request.session_id.to_string(),
-        turn_id: request.turn_id.clone(),
+        turn_id: request.turn_id,
         agent_id: subagent.agent_id,
         agent_type: subagent.agent_type,
-        transcript_path: crate::schema::NullableString::from_path(request.transcript_path.clone()),
+        transcript_path: crate::schema::NullableString::from_path(request.transcript_path),
         cwd: request.cwd.display().to_string(),
         hook_event_name: "PermissionRequest".to_string(),
-        model: request.model.clone(),
-        permission_mode: request.permission_mode.clone(),
-        tool_name: request.tool_name.clone(),
-        tool_input: request.tool_input.clone(),
+        model: request.model,
+        permission_mode: request.permission_mode,
+        tool_name: request.tool_name,
+        tool_input: request.tool_input,
     }
 }
 
@@ -254,7 +255,12 @@ fn parse_completed(
                     });
                     decision = Some(PermissionRequestDecision::Deny { message });
                 } else {
-                    status = HookRunStatus::Failed;
+                    status = HookRunStatus::Blocked;
+                    decision = Some(PermissionRequestDecision::Deny {
+                        message:
+                            "PermissionRequest hook denied execution without providing a reason"
+                                .to_string(),
+                    });
                     entries.push(HookOutputEntry {
                         kind: HookOutputEntryKind::Error,
                         text: "PermissionRequest hook exited with code 2 but did not write a denial reason to stderr".to_string(),

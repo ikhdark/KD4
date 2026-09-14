@@ -99,14 +99,17 @@ pub(crate) async fn run(
         };
     }
 
-    let input_json = match command_input_json(&request) {
+    let cwd = request.cwd.clone();
+    let turn_id = request.turn_id.clone();
+    let tool_use_id = request.tool_use_id.clone();
+    let input_json = match command_input_json(request) {
         Ok(input_json) => input_json,
         Err(error) => {
             let hook_events = common::serialization_failure_hook_events_for_tool_use(
                 matched,
-                Some(request.turn_id.clone()),
+                Some(turn_id.clone()),
                 format!("failed to serialize post tool use hook input: {error}"),
-                &request.tool_use_id,
+                &tool_use_id,
             );
             return serialization_failure_outcome(hook_events);
         }
@@ -116,35 +119,28 @@ pub(crate) async fn run(
         shell,
         matched,
         input_json,
-        request.cwd.as_path(),
-        Some(request.turn_id.clone()),
+        cwd.as_path(),
+        Some(turn_id.clone()),
         parse_completed,
     )
     .await;
 
-    let additional_contexts = common::flatten_additional_contexts(
-        results
-            .iter()
-            .map(|result| result.data.additional_contexts_for_model.as_slice()),
-    );
     let should_block = results.iter().any(|result| result.data.should_block);
-    let feedback_message = common::join_text_chunks(
-        results
-            .iter()
-            .flat_map(|result| result.data.feedback_messages_for_model.clone())
-            .collect(),
-    );
 
+    let mut additional_contexts = Vec::new();
+    let mut feedback_messages = Vec::new();
     PostToolUseOutcome {
         hook_events: results
             .into_iter()
             .map(|result| {
-                common::hook_completed_for_tool_use(result.completed, &request.tool_use_id)
+                additional_contexts.extend(result.data.additional_contexts_for_model);
+                feedback_messages.extend(result.data.feedback_messages_for_model);
+                common::hook_completed_for_tool_use(result.completed, &tool_use_id)
             })
             .collect(),
         should_block,
         additional_contexts,
-        feedback_message,
+        feedback_message: common::join_text_chunks(feedback_messages),
     }
 }
 
@@ -154,22 +150,22 @@ pub(crate) async fn run(
 /// the canonical `tool_name` for logs and for consumers that pair pre/post
 /// events across processes. Shell-like tools pass `{ "command": ... }` as
 /// `tool_input`; MCP tools pass their resolved JSON arguments.
-fn command_input_json(request: &PostToolUseRequest) -> Result<String, serde_json::Error> {
+fn command_input_json(request: PostToolUseRequest) -> Result<String, serde_json::Error> {
     let subagent = SubagentCommandInputFields::from(request.subagent.as_ref());
     serde_json::to_string(&PostToolUseCommandInput {
         session_id: request.session_id.to_string(),
-        turn_id: request.turn_id.clone(),
+        turn_id: request.turn_id,
         agent_id: subagent.agent_id,
         agent_type: subagent.agent_type,
-        transcript_path: crate::schema::NullableString::from_path(request.transcript_path.clone()),
+        transcript_path: crate::schema::NullableString::from_path(request.transcript_path),
         cwd: request.cwd.display().to_string(),
         hook_event_name: "PostToolUse".to_string(),
-        model: request.model.clone(),
-        permission_mode: request.permission_mode.clone(),
-        tool_name: request.tool_name.clone(),
-        tool_input: request.tool_input.clone(),
-        tool_response: request.tool_response.clone(),
-        tool_use_id: request.tool_use_id.clone(),
+        model: request.model,
+        permission_mode: request.permission_mode,
+        tool_name: request.tool_name,
+        tool_input: request.tool_input,
+        tool_response: request.tool_response,
+        tool_use_id: request.tool_use_id,
     })
 }
 
@@ -346,7 +342,7 @@ mod tests {
         let mut request = request_for_tool_use("call-apply-patch");
         request.tool_name = "apply_patch".to_string();
 
-        let input_json = command_input_json(&request).expect("serialize command input");
+        let input_json = command_input_json(request).expect("serialize command input");
         let input: serde_json::Value =
             serde_json::from_str(&input_json).expect("parse command input");
 
@@ -585,7 +581,7 @@ mod tests {
     fn handler() -> ConfiguredHandler {
         ConfiguredHandler {
             event_name: HookEventName::PostToolUse,
-            matcher: Some("^Bash$".to_string()),
+            matcher: Some(common::HookMatcher::new("^Bash$").expect("valid matcher")),
             command: "python3 post_tool_use_hook.py".to_string(),
             timeout_sec: 5,
             status_message: Some("running post tool use hook".to_string()),

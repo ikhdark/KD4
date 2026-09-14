@@ -72,6 +72,14 @@ async fn reconnect_reuses_registration_until_url_is_rejected() -> Result<()> {
     // An ordinary disconnect retries the same URL without registering again.
     let (mut rejected_socket, _peer_addr) =
         timeout(Duration::from_secs(5), listener.accept()).await??;
+    assert_eq!(
+        registry
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .len(),
+        1
+    );
     let mut request = [0u8; 4096];
     let _ = rejected_socket.read(&mut request).await?;
     rejected_socket
@@ -91,40 +99,51 @@ async fn reconnect_reuses_registration_until_url_is_rejected() -> Result<()> {
 
 #[tokio::test]
 async fn validate_harness_key_requires_explicit_valid_response() {
-    let server = MockServer::start().await;
-    let harness_public_key = NoiseChannelIdentity::generate()
-        .expect("identity")
-        .public_key();
-    Mock::given(method("POST"))
-        .and(path("/cloud/environment/environment-requested/validate"))
-        .and(header("authorization", "Bearer registry-token"))
-        .and(body_partial_json(serde_json::json!({
-            "executor_registration_id": "registration-1",
-            "harness_public_key": harness_public_key.clone(),
-            "harness_key_authorization": HARNESS_KEY_AUTHORIZATION,
-        })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "valid": false,
-        })))
-        .mount(&server)
+    for (body, valid) in [
+        (serde_json::json!({"valid": true}), true),
+        (serde_json::json!({"valid": false}), false),
+        (serde_json::json!({}), false),
+    ] {
+        let server = MockServer::start().await;
+        let harness_public_key = NoiseChannelIdentity::generate()
+            .expect("identity")
+            .public_key();
+        Mock::given(method("POST"))
+            .and(path("/cloud/environment/environment-requested/validate"))
+            .and(header("authorization", "Bearer registry-token"))
+            .and(body_partial_json(serde_json::json!({
+                "executor_registration_id": "registration-1",
+                "harness_public_key": harness_public_key.clone(),
+                "harness_key_authorization": HARNESS_KEY_AUTHORIZATION,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = EnvironmentRegistryClient::new(server.uri(), static_registry_auth_provider())
+            .expect("client");
+
+        let result = RegistryHarnessKeyValidator {
+            client,
+            environment_id: "environment-requested".to_string(),
+            executor_registration_id: "registration-1".to_string(),
+        }
+        .validate_harness_key(&harness_public_key, HARNESS_KEY_AUTHORIZATION)
         .await;
-    let client = EnvironmentRegistryClient::new(server.uri(), static_registry_auth_provider())
-        .expect("client");
 
-    let error = RegistryHarnessKeyValidator {
-        client,
-        environment_id: "environment-requested".to_string(),
-        executor_registration_id: "registration-1".to_string(),
+        if valid {
+            result.expect("explicit true authorizes the key");
+        } else if body.get("valid").is_some() {
+            assert!(matches!(
+                result.expect_err("explicit false must fail closed"),
+                ExecServerError::Protocol(message)
+                    if message == "environment registry rejected Noise relay harness key"
+            ));
+        } else {
+            assert!(result.is_err(), "missing valid must fail closed");
+        }
+        server.verify().await;
     }
-    .validate_harness_key(&harness_public_key, HARNESS_KEY_AUTHORIZATION)
-    .await
-    .expect_err("a false validation response must fail closed");
-
-    assert!(matches!(
-        error,
-        ExecServerError::Protocol(message)
-            if message == "environment registry rejected Noise relay harness key"
-    ));
 }
 
 #[tokio::test]
@@ -136,6 +155,7 @@ async fn validate_harness_key_does_not_expose_error_body() {
     Mock::given(method("POST"))
         .and(path("/cloud/environment/environment-requested/validate"))
         .respond_with(ResponseTemplate::new(500).set_body_string(HARNESS_KEY_AUTHORIZATION))
+        .expect(1)
         .mount(&server)
         .await;
     let client = EnvironmentRegistryClient::new(server.uri(), static_registry_auth_provider())

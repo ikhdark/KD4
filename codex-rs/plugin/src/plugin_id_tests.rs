@@ -29,3 +29,32 @@ fn constructors_reject_path_traversal_segments() {
         "invalid marketplace name: only ASCII letters, digits, `_`, and `-` are allowed in `sample@../test`"
     );
 }
+
+#[test]
+fn constructors_enforce_the_identifier_grammar() {
+    for segment in [
+        "", ".", "..", "a/b", "a\\b", "a b", "a\tb", "a\nb", "a@b", "café",
+    ] {
+        assert!(PluginId::new(segment.to_string(), "market".to_string()).is_err());
+        assert!(PluginId::new("plugin".to_string(), segment.to_string()).is_err());
+        assert!(PluginId::parse(&format!("{segment}@market")).is_err());
+        assert!(PluginId::parse(&format!("plugin@{segment}")).is_err());
+    }
+    for key in ["", "plugin", "@", "plugin@", "@market", "plugin@@market"] {
+        assert!(
+            PluginId::parse(key).is_err(),
+            "accepted malformed key {key:?}"
+        );
+    }
+
+    let key = "Plugin_42-name@Market_7-place";
+    let parsed = PluginId::parse(key).expect("all allowed character classes");
+    assert_eq!(parsed.plugin_name(), "Plugin_42-name");
+    assert_eq!(parsed.marketplace_name(), "Market_7-place");
+    assert_eq!(parsed.as_key(), key);
+    assert_eq!(
+        parsed,
+        PluginId::new("Plugin_42-name".to_string(), "Market_7-place".to_string())
+            .expect("valid segments")
+    );
+}

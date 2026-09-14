@@ -251,6 +251,28 @@ mod tests {
             .expect("thread metadata should exist");
         assert_eq!(unchanged.rollout_path, active_path);
         assert_eq!(unchanged.archived_at, None);
+        let visible = store
+            .read_thread(crate::ReadThreadParams {
+                thread_id,
+                include_archived: true,
+                include_history: false,
+            })
+            .await
+            .expect("read moved rollout");
+        assert_eq!(visible.rollout_path, Some(archived_path));
+        assert!(visible.archived_at.is_some());
+        let hidden = store
+            .read_thread(crate::ReadThreadParams {
+                thread_id,
+                include_archived: false,
+                include_history: false,
+            })
+            .await
+            .expect_err("archived thread is hidden");
+        assert!(matches!(
+            hidden,
+            ThreadStoreError::ThreadNotFound { .. } | ThreadStoreError::InvalidRequest { .. }
+        ));
     }
 
     async fn install_archival_update_failure(runtime: &codex_state::StateRuntime) {

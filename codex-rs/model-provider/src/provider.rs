@@ -372,11 +372,6 @@ fn model_provider_cache_identity(
         "effective_auth_mode": auth_identity.auth_mode,
         "account_scope_digest": auth_identity.account_scope_digest,
         "aws": &provider_info.aws,
-        "request_max_retries": provider_info.request_max_retries,
-        "stream_max_retries": provider_info.stream_max_retries,
-        "stream_idle_timeout_ms": provider_info.stream_idle_timeout_ms,
-        "websocket_connect_timeout_ms": provider_info.websocket_connect_timeout_ms,
-        "supports_websockets": provider_info.supports_websockets,
     });
     let canonical = serde_json::to_vec(&value).unwrap_or_else(|error| {
         let mut fallback = b"\0provider-cache-identity-serialization-error:".to_vec();
@@ -644,7 +639,11 @@ mod tests {
 
         first = second.clone();
         first.request_max_retries = Some(100);
-        assert_ne!(
+        first.stream_max_retries = Some(100);
+        first.stream_idle_timeout_ms = Some(100);
+        first.websocket_connect_timeout_ms = Some(100);
+        first.supports_websockets = !first.supports_websockets;
+        assert_eq!(
             model_provider_cache_identity("custom", &first, None),
             model_provider_cache_identity("custom", &second, None)
         );

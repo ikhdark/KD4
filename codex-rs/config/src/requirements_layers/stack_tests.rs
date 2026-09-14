@@ -57,6 +57,179 @@ fn empty_layers_compose_to_none() {
 }
 
 #[test]
+fn composition_preserves_semantic_emptiness() {
+    for (contents, empty, composed_empty) in [
+        ("", true, true),
+        ("guardian_policy_config = '   '", true, true),
+        ("[features]", true, true),
+        ("[hooks]", true, true),
+        ("[models.new_thread]", true, true),
+        ("[computer_use]", true, true),
+        ("[windows]", true, true),
+        ("[plugins.empty]", true, true),
+        ("[marketplaces]", true, true),
+        ("[apps]", true, true),
+        ("[rules]\nprefix_rules = []", false, false),
+        ("allowed_approval_policies = []", false, false),
+        ("allow_remote_control = false", false, false),
+        ("default_permissions = ''", false, false),
+        ("guardian_policy_config = 'policy'", false, false),
+        ("[models.new_thread]\nmodel = 'model'", false, false),
+        ("[mcp_servers]", false, false),
+        // Special-field stripping prunes an empty permissions table.
+        ("[permissions]", false, true),
+        ("[experimental_network]", false, false),
+    ] {
+        let requirements = expected_requirements(contents);
+        assert_eq!(requirements.is_empty(), empty, "{contents}");
+        let mut sourced = ConfigRequirementsWithSources::default();
+        sourced.merge_unset_fields(RequirementSource::Unknown, requirements);
+        assert_eq!(sourced.is_empty(), empty, "{contents}");
+        assert_eq!(sourced.clone().into_toml().is_empty(), empty, "{contents}");
+        assert_eq!(
+            compose(vec![layer("req", "Layer", contents)])
+                .expect("compose requirements")
+                .is_none(),
+            composed_empty,
+            "{contents}"
+        );
+    }
+}
+
+#[test]
+fn text_and_value_layers_preserve_context_and_results() {
+    let base = TempDir::new().expect("create base directory");
+    let base = AbsolutePathBuf::try_from(base.path()).expect("absolute base");
+    let contents = r#"
+[feature_requirements]
+enabled = true
+
+[permissions.filesystem]
+deny_read = ["./private"]
+
+[marketplaces.allowed_sources.local]
+source = "local"
+path = "../plugins"
+"#;
+    let source = layer("req", "Layer", "").source;
+    for entry in [
+        RequirementsLayerEntry::from_toml(source.clone(), contents),
+        RequirementsLayerEntry::from_toml_value(
+            source.clone(),
+            toml::from_str(contents).expect("parse value"),
+        ),
+    ] {
+        let output = super::compose_requirements([entry.with_base_dir(base.clone())])
+            .expect("compose layer")
+            .expect("requirements present");
+        assert_eq!(
+            output.permissions.as_ref().expect("permissions").source,
+            source
+        );
+        assert_eq!(
+            output.into_toml(),
+            expected_requirements(format!(
+                r#"
+[features]
+enabled = true
+
+[permissions.filesystem]
+deny_read = [{:?}]
+
+[marketplaces.allowed_sources.local]
+source = "local"
+path = "../plugins"
+"#,
+                base.as_path().join("private").to_string_lossy()
+            ))
+        );
+    }
+}
+
+#[test]
+fn invalid_lower_layer_cannot_be_hidden_for_either_input_representation() {
+    let source = layer("bad", "Bad layer", "").source;
+    let contents = "allowed_approval_policies = [1]";
+    for entry in [
+        RequirementsLayerEntry::from_toml(source.clone(), contents),
+        RequirementsLayerEntry::from_toml_value(
+            source.clone(),
+            toml::from_str(contents).expect("parse syntactically valid TOML"),
+        ),
+    ] {
+        let err = super::compose_requirements([
+            entry,
+            layer("high", "High", "allowed_approval_policies = ['never']"),
+        ])
+        .expect_err("validate every layer before merging");
+        let RequirementsCompositionError::Parse {
+            layer_source,
+            message,
+        } = err
+        else {
+            panic!("expected layer parse error: {err}");
+        };
+        assert_eq!(layer_source, source);
+        assert!(message.contains("allowed_approval_policies"), "{message}");
+    }
+}
+
+#[test]
+fn feature_aliases_merge_in_both_priority_orders() {
+    for (low_key, high_key) in [
+        ("features", "feature_requirements"),
+        ("feature_requirements", "features"),
+    ] {
+        let low = layer(
+            "low",
+            "Low",
+            &format!("[{low_key}]\nlow = true\nshared = false"),
+        );
+        let high = layer(
+            "high",
+            "High",
+            &format!("[{high_key}]\nhigh = true\nshared = true"),
+        );
+        let source = RequirementSource::composite([high.source.clone(), low.source.clone()]);
+        let output = super::compose_requirements([low, high])
+            .expect("aliases share one merge key")
+            .expect("requirements present");
+        assert_eq!(
+            output
+                .feature_requirements
+                .as_ref()
+                .expect("features")
+                .source,
+            source
+        );
+        assert_eq!(
+            output.into_toml(),
+            expected_requirements("[features]\nlow = true\nhigh = true\nshared = true")
+        );
+    }
+}
+
+#[test]
+fn duplicate_feature_spellings_in_one_layer_are_rejected() {
+    let entry = layer(
+        "bad",
+        "Bad layer",
+        "[features]\na = true\n[feature_requirements]\nb = false",
+    );
+    let source = entry.source.clone();
+    let err = super::compose_requirements([entry]).expect_err("duplicate fields must fail");
+    let RequirementsCompositionError::Parse {
+        layer_source,
+        message,
+    } = err
+    else {
+        panic!("expected layer parse error: {err}");
+    };
+    assert_eq!(layer_source, source);
+    assert!(message.contains("duplicate field `features`"), "{message}");
+}
+
+#[test]
 fn top_level_values_use_toml_priority() {
     let composed = compose(vec![
         layer(
@@ -615,6 +788,28 @@ allowed_sandbox_modes = ["read-only"]
 }
 
 #[test]
+fn hostname_resolver_is_not_called_for_empty_remote_sandbox_config() {
+    let calls = Cell::<usize>::default();
+    let composed = compose_requirements_with_hostname_resolver(
+        [
+            layer("low", "Low", "allowed_sandbox_modes = ['read-only']"),
+            layer("high", "High", "remote_sandbox_config = []"),
+        ],
+        || {
+            calls.set(calls.get() + 1);
+            Some("build.example.com".to_string())
+        },
+    )
+    .expect("compose requirements")
+    .expect("requirements present");
+    assert_eq!(calls.get(), 0);
+    assert_eq!(
+        composed.into_toml(),
+        expected_requirements("allowed_sandbox_modes = ['read-only']")
+    );
+}
+
+#[test]
 fn hostname_resolver_is_called_once_for_multiple_remote_sandbox_layers() {
     let calls = Cell::<usize>::default();
     let composed = compose_requirements_with_hostname_resolver(
@@ -786,8 +981,14 @@ managed_dir = "/managed/high"
     )
     .expect_err("conflicting managed dirs should fail closed");
     assert!(err.to_string().contains("hooks.managed_dir"));
-    assert!(err.to_string().contains("High (req_high)"));
-    assert!(err.to_string().contains("Low (req_low)"));
+    assert_conflict_sources(
+        err,
+        "hooks.managed_dir",
+        "req_high",
+        "High",
+        "req_low",
+        "Low",
+    );
 }
 
 #[test]
@@ -816,8 +1017,78 @@ windows_managed_dir = 'C:\managed\high'
     .expect_err("conflicting windows managed dirs should fail closed");
 
     assert!(err.to_string().contains("hooks.windows_managed_dir"));
-    assert!(err.to_string().contains("High (req_high)"));
-    assert!(err.to_string().contains("Low (req_low)"));
+    assert_conflict_sources(
+        err,
+        "hooks.windows_managed_dir",
+        "req_high",
+        "High",
+        "req_low",
+        "Low",
+    );
+}
+
+fn assert_conflict_sources(
+    error: RequirementsCompositionError,
+    expected_field: &str,
+    existing_id: &str,
+    existing_name: &str,
+    incoming_id: &str,
+    incoming_name: &str,
+) {
+    let RequirementsCompositionError::Conflict {
+        field,
+        existing_source,
+        incoming_source,
+        ..
+    } = error
+    else {
+        panic!("expected conflict: {error}");
+    };
+    assert_eq!(field, expected_field);
+    assert_eq!(
+        existing_source,
+        layer(existing_id, existing_name, "").source
+    );
+    assert_eq!(
+        incoming_source,
+        layer(incoming_id, incoming_name, "").source
+    );
+}
+
+#[test]
+fn default_hook_conflict_reports_directory_owner_instead_of_event_source() {
+    let err = super::compose_requirements([
+        layer(
+            "low",
+            "Conflicting directory",
+            "[hooks]\nwindows_managed_dir = 'C:\\low'",
+        ),
+        layer(
+            "middle",
+            "Directory owner",
+            "[hooks]\nwindows_managed_dir = 'C:\\middle'",
+        ),
+        layer(
+            "high",
+            "Events only",
+            r#"
+[[hooks.PreToolUse]]
+matcher = "Bash"
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "high"
+"#,
+        ),
+    ])
+    .expect_err("default composition must reject conflicting Windows directories");
+    assert_conflict_sources(
+        err,
+        "hooks.windows_managed_dir",
+        "middle",
+        "Directory owner",
+        "low",
+        "Conflicting directory",
+    );
 }
 
 #[test]
@@ -1028,6 +1299,56 @@ deny_read = [{path:?}]
 deny_read = [{path:?}]
 "#
         ))
+    );
+}
+
+#[test]
+fn deny_read_union_tracks_only_contributing_layers_and_preserves_order() {
+    let high = layer(
+        "high",
+        "High",
+        r#"
+[permissions.filesystem]
+deny_read = ['C:\high', 'C:\shared', 'C:\high']
+"#,
+    );
+    let duplicate = layer(
+        "duplicate",
+        "Duplicate only",
+        r#"
+[permissions.filesystem]
+deny_read = ['C:\shared', 'C:\high']
+"#,
+    );
+    let low = layer(
+        "low",
+        "Low",
+        r#"
+[permissions.filesystem]
+deny_read = ['C:\shared', 'C:\low', 'C:\other', 'C:\low']
+"#,
+    );
+    let source = RequirementSource::composite([high.source.clone(), low.source.clone()]);
+    let output = super::compose_requirements([
+        layer("empty", "Empty", "[permissions.filesystem]\ndeny_read = []"),
+        low,
+        duplicate,
+        high,
+    ])
+    .expect("compose requirements")
+    .expect("requirements present");
+    assert_eq!(
+        output.permissions.as_ref().expect("permissions").source,
+        source
+    );
+    assert_eq!(
+        output.into_toml(),
+        expected_requirements(
+            r#"
+[permissions.filesystem]
+deny_read = ['C:\high', 'C:\shared', 'C:\low', 'C:\other']
+"#
+        )
     );
 }
 

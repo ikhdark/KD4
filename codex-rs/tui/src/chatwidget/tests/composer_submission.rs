@@ -1060,6 +1060,7 @@ async fn restore_thread_input_state_syncs_sleep_inhibitor_state() {
         queued_user_messages: VecDeque::new(),
         queued_user_message_history_records: VecDeque::new(),
         user_turn_pending_start: false,
+        submit_pending_steers_after_interrupt: false,
         current_collaboration_mode: chat.current_collaboration_mode.clone(),
         active_collaboration_mask: chat.active_collaboration_mask.clone(),
         agent_turn_running: true,
@@ -1506,4 +1507,111 @@ async fn interrupt_prepends_queued_messages_before_existing_composer_text() {
     );
 
     let _ = drain_insert_history(&mut rx);
+}
+
+#[tokio::test]
+async fn queued_edit_missing_history_tail_keeps_earlier_override() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    for rejected in [false, true] {
+        let earlier = UserMessage::from("expanded earlier".to_string());
+        let latest = UserMessage::from("latest draft".to_string());
+        let history = UserMessageHistoryRecord::Override(UserMessageHistoryOverride {
+            text: "/original earlier".to_string(),
+            text_elements: Vec::new(),
+        });
+        if rejected {
+            chat.input_queue
+                .rejected_steers_queue
+                .extend([earlier, latest]);
+            chat.input_queue
+                .rejected_steer_history_records
+                .push_back(history);
+        } else {
+            chat.input_queue
+                .queued_user_messages
+                .extend([earlier.into(), latest.into()]);
+            chat.input_queue
+                .queued_user_message_history_records
+                .push_back(history);
+        }
+        let latest = chat
+            .pop_latest_queued_composer_state()
+            .expect("latest draft");
+        chat.restore_composer_state(latest);
+        assert_eq!(chat.bottom_pane.composer_text(), "latest draft");
+        let earlier = chat
+            .pop_latest_queued_composer_state()
+            .expect("earlier draft");
+        chat.restore_composer_state(earlier);
+        assert_eq!(chat.bottom_pane.composer_text(), "/original earlier");
+    }
+}
+
+#[tokio::test]
+async fn queued_edit_preserves_current_draft() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.chat_keymap.edit_queued_message = vec![crate::key_hint::alt(KeyCode::Up)];
+    chat.input_queue
+        .queued_user_messages
+        .push_back(UserMessage::from("queued".to_string()).into());
+    chat.bottom_pane
+        .set_composer_text("unfinished draft".to_string(), Vec::new(), Vec::new());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+    assert_eq!(chat.bottom_pane.composer_text(), "unfinished draft");
+    assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
+    assert_eq!(chat.input_queue.queued_user_messages[0].text, "queued");
+}
+
+#[tokio::test]
+async fn failed_submission_restores_draft_without_recording_success() {
+    for text in ["normal prompt", "!echo hello"] {
+        let (mut chat, mut rx, op_rx) = make_chatwidget_manual(None).await;
+        chat.thread_id = Some(ThreadId::new());
+        drop(op_rx);
+        let accepted = chat.submit_user_message_with_history_record(
+            UserMessage::from(text.to_string()),
+            UserMessageHistoryRecord::UserMessageText,
+        );
+        assert!(!accepted);
+        assert_eq!(chat.bottom_pane.composer_text(), text);
+        assert!(!chat.input_queue.user_turn_pending_start);
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::InsertHistoryCell(cell) = event {
+                assert!(cell.as_any().downcast_ref::<UserHistoryCell>().is_none());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn queued_plain_submission_preserves_shell_escape_policy() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    assert!(
+        chat.submit_user_message_with_shell_escape_policy(
+            UserMessage::from("!explain this literally".to_string()),
+            ShellEscapePolicy::Disallow
+        )
+        .is_none()
+    );
+    assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
+    chat.thread_id = Some(ThreadId::new());
+    chat.maybe_send_next_queued_input();
+    let Op::UserTurn { items, .. } = next_submit_op(&mut op_rx) else {
+        panic!("user turn");
+    };
+    assert!(items.iter().any(
+        |item| matches!(item, UserInput::Text { text, .. } if text == "!explain this literally")
+    ));
+    assert!(chat.input_queue.queued_user_messages.is_empty());
+}
+
+#[tokio::test]
+async fn thread_input_snapshot_preserves_interrupt_resubmit_intent() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.input_queue.submit_pending_steers_after_interrupt = true;
+    let snapshot = chat.capture_thread_input_state();
+    chat.restore_thread_input_state(None);
+    assert!(!chat.input_queue.submit_pending_steers_after_interrupt);
+    chat.restore_thread_input_state(snapshot);
+    assert!(chat.input_queue.submit_pending_steers_after_interrupt);
 }

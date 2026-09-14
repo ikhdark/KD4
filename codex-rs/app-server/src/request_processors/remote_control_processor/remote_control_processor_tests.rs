@@ -43,13 +43,15 @@ async fn pairing_status_returns_internal_error_when_remote_control_is_unavailabl
     );
 }
 
-#[test]
-fn pairing_status_rejects_missing_pairing_codes() {
+#[tokio::test]
+async fn pairing_status_rejects_missing_pairing_codes_before_resolving_handle() {
     assert_eq!(
-        validate_pairing_status_params(&RemoteControlPairingStatusParams {
-            pairing_code: None,
-            manual_pairing_code: None,
-        }),
+        RemoteControlRequestProcessor::new(/*remote_control_handle*/ None)
+            .pairing_status(RemoteControlPairingStatusParams {
+                pairing_code: None,
+                manual_pairing_code: None,
+            })
+            .await,
         Err(JSONRPCErrorError {
             code: INVALID_REQUEST_ERROR_CODE,
             data: None,
@@ -59,13 +61,15 @@ fn pairing_status_rejects_missing_pairing_codes() {
     );
 }
 
-#[test]
-fn pairing_status_rejects_conflicting_pairing_codes() {
+#[tokio::test]
+async fn pairing_status_rejects_conflicting_pairing_codes_before_resolving_handle() {
     assert_eq!(
-        validate_pairing_status_params(&RemoteControlPairingStatusParams {
-            pairing_code: Some("pairing-code".to_string()),
-            manual_pairing_code: Some("ABCD-EFGH".to_string()),
-        }),
+        RemoteControlRequestProcessor::new(/*remote_control_handle*/ None)
+            .pairing_status(RemoteControlPairingStatusParams {
+                pairing_code: Some("pairing-code".to_string()),
+                manual_pairing_code: Some("ABCD-EFGH".to_string()),
+            })
+            .await,
         Err(JSONRPCErrorError {
             code: INVALID_REQUEST_ERROR_CODE,
             data: None,

@@ -145,6 +145,7 @@ use codex_protocol::request_permissions::PermissionGrantScope as CorePermissionG
 use codex_protocol::request_permissions::RequestPermissionsResponse as CoreRequestPermissionsResponse;
 use sha1::Digest;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::hash::Hash;
 use std::path::Path;
 use std::path::PathBuf;
@@ -165,6 +166,7 @@ fn insert_pending<K: Eq + Hash, V>(pending: &mut HashMap<K, V>, key: K, value: V
 pub(crate) struct AnalyticsReducer {
     requests: HashMap<(u64, RequestId), RequestState>,
     turns: HashMap<String, TurnState>,
+    turn_order: VecDeque<String>,
     connections: HashMap<u64, ConnectionState>,
     threads: HashMap<String, ThreadAnalyticsState>,
     tool_items_in_progress: HashMap<ToolItemKey, PendingToolItem>,
@@ -380,6 +382,7 @@ struct CompletedTurnState {
 
 #[derive(Default)]
 struct TurnState {
+    emitted: bool,
     connection_id: Option<u64>,
     thread_id: Option<String>,
     num_input_images: Option<usize>,
@@ -447,6 +450,31 @@ impl TurnToolCounts {
 }
 
 impl AnalyticsReducer {
+    // Keep recent completed IDs as lightweight markers so late facts cannot
+    // recreate their payloads. The same FIFO bound also retires lost completions.
+    fn turn_state(&mut self, turn_id: &str) -> Option<&mut TurnState> {
+        if !self.turns.contains_key(turn_id) {
+            if self.turns.len() >= MAX_PENDING_ANALYTICS_ITEMS
+                && let Some(oldest) = self.turn_order.pop_front()
+            {
+                self.turns.remove(&oldest);
+                self.clear_turn_items(&oldest);
+            }
+            self.turn_order.push_back(turn_id.to_string());
+            self.turns.insert(turn_id.to_string(), TurnState::default());
+        }
+        self.turns.get_mut(turn_id).filter(|turn| !turn.emitted)
+    }
+
+    fn clear_turn_items(&mut self, turn_id: &str) {
+        self.tool_items_in_progress
+            .retain(|key, _| key.turn_id != turn_id);
+        self.item_review_summaries
+            .retain(|key, _| key.turn_id != turn_id);
+        self.pending_reviews
+            .retain(|_, review| review.turn_id != turn_id);
+    }
+
     pub(crate) async fn ingest(&mut self, input: AnalyticsFact, out: &mut Vec<TrackEventRequest>) {
         match input {
             AnalyticsFact::Initialize {
@@ -709,7 +737,9 @@ impl AnalyticsReducer {
         let turn_id = input.turn_id.clone();
         let thread_id = input.thread_id.clone();
         let num_input_images = input.num_input_images;
-        let turn_state = self.turns.entry(turn_id.clone()).or_default();
+        let Some(turn_state) = self.turn_state(&turn_id) else {
+            return;
+        };
         turn_state.thread_id = Some(thread_id);
         turn_state.num_input_images = Some(num_input_images);
         turn_state.resolved_config = Some(input);
@@ -722,7 +752,9 @@ impl AnalyticsReducer {
         out: &mut Vec<TrackEventRequest>,
     ) {
         let turn_id = input.turn_id.clone();
-        let turn_state = self.turns.entry(turn_id.clone()).or_default();
+        let Some(turn_state) = self.turn_state(&turn_id) else {
+            return;
+        };
         turn_state.thread_id = Some(input.thread_id);
         turn_state.token_usage = Some(input.token_usage);
         self.maybe_emit_turn_event(&turn_id, out).await;
@@ -738,7 +770,9 @@ impl AnalyticsReducer {
             profile,
             timing,
         } = input;
-        let turn_state = self.turns.entry(turn_id.clone()).or_default();
+        let Some(turn_state) = self.turn_state(&turn_id) else {
+            return;
+        };
         turn_state.profile = Some(profile);
         turn_state.timing = timing;
         self.maybe_emit_turn_event(&turn_id, out).await;
@@ -750,7 +784,9 @@ impl AnalyticsReducer {
             thread_id,
             error,
         } = input;
-        let turn_state = self.turns.entry(turn_id).or_default();
+        let Some(turn_state) = self.turn_state(&turn_id) else {
+            return;
+        };
         turn_state.thread_id.get_or_insert(thread_id);
         turn_state.codex_error = Some(error);
     }
@@ -764,6 +800,7 @@ impl AnalyticsReducer {
             tracking,
             invocations,
         } = input;
+        let mut repo_urls: HashMap<PathBuf, Option<String>> = HashMap::new();
         for invocation in invocations {
             let skill_scope = match invocation.skill_scope {
                 SkillScope::User => "user",
@@ -773,9 +810,15 @@ impl AnalyticsReducer {
             };
             let repo_root = get_git_repo_root(invocation.skill_path.as_path());
             let repo_url = if let Some(root) = repo_root.as_ref() {
-                collect_git_info(root)
-                    .await
-                    .and_then(|info| info.repository_url)
+                if let Some(url) = repo_urls.get(root) {
+                    url.clone()
+                } else {
+                    let url = collect_git_info(root)
+                        .await
+                        .and_then(|info| info.repository_url);
+                    repo_urls.insert(root.clone(), url.clone());
+                    url
+                }
             } else {
                 None
             };
@@ -983,7 +1026,9 @@ impl AnalyticsReducer {
                 else {
                     return;
                 };
-                let turn_state = self.turns.entry(turn_id.clone()).or_default();
+                let Some(turn_state) = self.turn_state(&turn_id) else {
+                    return;
+                };
                 turn_state.connection_id = Some(connection_id);
                 turn_state.thread_id = Some(pending_request.thread_id);
                 turn_state.num_input_images = Some(pending_request.num_input_images);
@@ -1268,7 +1313,15 @@ impl AnalyticsReducer {
                     return;
                 };
                 let item_id = item_id.to_string();
-                self.tool_items_in_progress.insert(
+                if self
+                    .turns
+                    .get(&notification.turn_id)
+                    .is_some_and(|turn| turn.emitted || turn.completed.is_some())
+                {
+                    return;
+                }
+                insert_pending(
+                    &mut self.tool_items_in_progress,
                     ToolItemKey {
                         thread_id: notification.thread_id,
                         turn_id: notification.turn_id,
@@ -1296,6 +1349,13 @@ impl AnalyticsReducer {
                 let Some(item_id) = tracked_tool_item_id(&notification.item) else {
                     return;
                 };
+                let key = ToolItemKey {
+                    thread_id: notification.thread_id.clone(),
+                    turn_id: notification.turn_id.clone(),
+                    item_id: item_id.to_string(),
+                };
+                let pending_item = self.tool_items_in_progress.remove(&key);
+                let review_summary = self.item_review_summaries.remove(&key);
                 let Some(turn_state) = self.turns.get_mut(&notification.turn_id) else {
                     tracing::warn!(
                         thread_id = %notification.thread_id,
@@ -1306,12 +1366,7 @@ impl AnalyticsReducer {
                     return;
                 };
                 turn_state.tool_counts.record(&notification.item);
-                let key = ToolItemKey {
-                    thread_id: notification.thread_id.clone(),
-                    turn_id: notification.turn_id.clone(),
-                    item_id: item_id.to_string(),
-                };
-                let Some(pending_item) = self.tool_items_in_progress.remove(&key) else {
+                let Some(pending_item) = pending_item else {
                     tracing::warn!(
                         thread_id = %notification.thread_id,
                         turn_id = %notification.turn_id,
@@ -1345,11 +1400,10 @@ impl AnalyticsReducer {
                     connection_state,
                     thread_state,
                     thread_metadata,
-                    review_summary: self.item_review_summaries.get(&key),
+                    review_summary: review_summary.as_ref(),
                 }) {
                     out.push(event);
                 }
-                self.item_review_summaries.remove(&key);
             }
             ServerNotification::ItemGuardianApprovalReviewStarted(notification) => {
                 let _ = notification;
@@ -1358,14 +1412,19 @@ impl AnalyticsReducer {
                 self.ingest_guardian_review_completed(notification, out);
             }
             ServerNotification::TurnStarted(notification) => {
-                let turn_state = self.turns.entry(notification.turn.id).or_default();
+                let Some(turn_state) = self.turn_state(&notification.turn.id) else {
+                    return;
+                };
+                turn_state.thread_id = Some(notification.thread_id);
                 turn_state.started_at = notification
                     .turn
                     .started_at
                     .and_then(|started_at| u64::try_from(started_at).ok());
             }
             ServerNotification::TurnDiffUpdated(notification) => {
-                let turn_state = self.turns.entry(notification.turn_id.clone()).or_default();
+                let Some(turn_state) = self.turn_state(&notification.turn_id) else {
+                    return;
+                };
                 turn_state.thread_id = Some(notification.thread_id);
                 turn_state.latest_diff = Some(notification.diff);
             }
@@ -1386,7 +1445,10 @@ impl AnalyticsReducer {
                     .turn
                     .completed_at
                     .and_then(|completed_at| u64::try_from(completed_at).ok());
-                let turn_state = self.turns.entry(turn_id.clone()).or_default();
+                let Some(turn_state) = self.turn_state(&turn_id) else {
+                    return;
+                };
+                turn_state.thread_id = Some(thread_id.clone());
                 turn_state.completed = Some(CompletedTurnState {
                     status: analytics_turn_status(notification.turn.status),
                     turn_error: notification
@@ -1399,17 +1461,19 @@ impl AnalyticsReducer {
                         .duration_ms
                         .and_then(|duration_ms| u64::try_from(duration_ms).ok()),
                 });
-                if let (Some(terminal_status), Some(completed_at)) =
-                    (abandoned_tool_status, completed_at)
-                {
+                if let (Some(terminal_status), Some(completed_at_ms)) = (
+                    abandoned_tool_status,
+                    completed_at.and_then(|seconds| seconds.checked_mul(1000)),
+                ) {
                     self.emit_abandoned_tool_items(
                         &thread_id,
                         &turn_id,
-                        completed_at,
+                        completed_at_ms,
                         terminal_status,
                         out,
                     );
                 }
+                self.clear_turn_items(&turn_id);
                 self.maybe_emit_turn_event(&turn_id, out).await;
             }
             _ => {}
@@ -1674,7 +1738,23 @@ impl AnalyticsReducer {
         resolution: ReviewResolution,
         pending_review: &PendingReviewState,
     ) {
-        let summary = self.item_review_summaries.entry(item_key).or_default();
+        if self
+            .turns
+            .get(&item_key.turn_id)
+            .is_some_and(|turn| turn.emitted || turn.completed.is_some())
+        {
+            return;
+        }
+        if !self.item_review_summaries.contains_key(&item_key) {
+            insert_pending(
+                &mut self.item_review_summaries,
+                item_key.clone(),
+                ItemReviewSummary::default(),
+            );
+        }
+        let Some(summary) = self.item_review_summaries.get_mut(&item_key) else {
+            return;
+        };
         summary.review_count += 1;
         match reviewer {
             Reviewer::Guardian => summary.guardian_review_count += 1,
@@ -1800,7 +1880,14 @@ impl AnalyticsReducer {
             input.repo_hash = accepted_line_repo_hash_for_cwd(cwd.as_path()).await;
             out.extend(accepted_line_fingerprint_event_requests(input));
         }
-        self.turns.remove(turn_id);
+        self.clear_turn_items(turn_id);
+        self.turns.insert(
+            turn_id.to_string(),
+            TurnState {
+                emitted: true,
+                ..TurnState::default()
+            },
+        );
     }
 
     fn thread_connection_or_warn(
@@ -1866,7 +1953,7 @@ fn warn_missing_analytics_context(
     );
 }
 
-fn tracked_tool_item_id(item: &ThreadItem) -> Option<&str> {
+pub(crate) fn tracked_tool_item_id(item: &ThreadItem) -> Option<&str> {
     match item {
         ThreadItem::CommandExecution { id, .. }
         | ThreadItem::FileChange { id, .. }
@@ -2792,7 +2879,7 @@ fn accepted_line_event_input(
     }
 
     let thread_id = turn_state.thread_id.clone()?;
-    let resolved_config = turn_state.resolved_config.clone()?;
+    let resolved_config = turn_state.resolved_config.as_ref()?;
 
     Some((
         AcceptedLineFingerprintEventInput {
@@ -2801,12 +2888,16 @@ fn accepted_line_event_input(
             thread_id,
             product_surface: Some("codex".to_string()),
             model_slug: Some(resolved_config.model.clone()),
-            completed_at: now_unix_seconds(),
+            completed_at: turn_state
+                .completed
+                .as_ref()
+                .and_then(|completed| completed.completed_at)
+                .unwrap_or_else(now_unix_seconds),
             repo_hash: None,
             accepted_added_lines: summary.accepted_added_lines,
             accepted_deleted_lines: summary.accepted_deleted_lines,
         },
-        resolved_config.permission_profile_cwd,
+        resolved_config.permission_profile_cwd.clone(),
     ))
 }
 
@@ -3067,9 +3158,164 @@ pub(crate) fn normalize_path_for_skill_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analytics_client_tests::ingest_turn_prerequisites;
+    use crate::analytics_client_tests::sample_command_execution_item;
+    use crate::analytics_client_tests::sample_turn_completed_notification;
+    use crate::analytics_client_tests::sample_turn_token_usage_fact;
     use codex_protocol::models::SandboxEnforcement;
     use codex_protocol::permissions::FileSystemSandboxPolicy;
     use codex_protocol::permissions::NetworkSandboxPolicy;
+
+    fn started_tool(turn_id: &str) -> AnalyticsFact {
+        AnalyticsFact::Notification(Box::new(ServerNotification::ItemStarted(
+            codex_app_server_protocol::ItemStartedNotification {
+                thread_id: "thread-2".to_string(),
+                turn_id: turn_id.to_string(),
+                started_at_ms: 1,
+                item: sample_command_execution_item(CommandExecutionStatus::InProgress, None, None),
+            },
+        )))
+    }
+
+    #[tokio::test]
+    async fn item_completion_retires_payload_and_review_without_turn_context() {
+        let mut reducer = AnalyticsReducer::default();
+        let mut out = Vec::new();
+        reducer.ingest(started_tool("turn-2"), &mut out).await;
+        let key = reducer
+            .tool_items_in_progress
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        reducer.record_item_review_summary(
+            key,
+            Reviewer::User,
+            ReviewStatus::Approved,
+            ReviewResolution::None,
+            &PendingReviewState {
+                thread_id: "thread-2".to_string(),
+                turn_id: "turn-2".to_string(),
+                item_id: Some("item-1".to_string()),
+                review_id: "review".to_string(),
+                subject_kind: ReviewSubjectKind::CommandExecution,
+                subject_name: "shell".to_string(),
+                trigger: ReviewTrigger::Initial,
+                started_at_ms: 1,
+                requested_additional_permissions: false,
+                requested_network_access: false,
+            },
+        );
+        assert_eq!(reducer.item_review_summaries.len(), 1);
+        reducer
+            .ingest(
+                AnalyticsFact::Notification(Box::new(ServerNotification::ItemCompleted(
+                    codex_app_server_protocol::ItemCompletedNotification {
+                        thread_id: "thread-2".to_string(),
+                        turn_id: "turn-2".to_string(),
+                        completed_at_ms: 2,
+                        item: sample_command_execution_item(
+                            CommandExecutionStatus::Completed,
+                            Some(0),
+                            Some(1),
+                        ),
+                    },
+                ))),
+                &mut out,
+            )
+            .await;
+        assert!(reducer.tool_items_in_progress.is_empty());
+        assert!(reducer.item_review_summaries.is_empty());
+        assert!(reducer.turns.is_empty());
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_turn_retires_tools_and_rejects_late_payloads() {
+        let mut reducer = AnalyticsReducer::default();
+        let mut out = Vec::new();
+        ingest_turn_prerequisites(&mut reducer, &mut out, true, true, true, true).await;
+        reducer.ingest(started_tool("turn-2"), &mut out).await;
+        reducer.ingest(started_tool("other-turn"), &mut out).await;
+        assert_eq!(reducer.tool_items_in_progress.len(), 2);
+        reducer
+            .ingest(
+                AnalyticsFact::Notification(Box::new(sample_turn_completed_notification(
+                    "thread-2",
+                    "turn-2",
+                    codex_app_server_protocol::TurnStatus::Completed,
+                    None,
+                ))),
+                &mut out,
+            )
+            .await;
+        assert_eq!(
+            out.iter()
+                .filter(|event| matches!(event, TrackEventRequest::TurnEvent(_)))
+                .count(),
+            1
+        );
+        assert_eq!(reducer.tool_items_in_progress.len(), 1);
+        assert!(
+            reducer
+                .tool_items_in_progress
+                .keys()
+                .all(|key| key.turn_id == "other-turn")
+        );
+        out.clear();
+        reducer
+            .ingest(
+                AnalyticsFact::Custom(CustomAnalyticsFact::TurnTokenUsage(Box::new(
+                    sample_turn_token_usage_fact("thread-2", "turn-2"),
+                ))),
+                &mut out,
+            )
+            .await;
+        reducer.ingest(started_tool("turn-2"), &mut out).await;
+        assert!(out.is_empty());
+        let turn = &reducer.turns["turn-2"];
+        assert!(turn.emitted);
+        assert!(turn.token_usage.is_none());
+        assert!(turn.resolved_config.is_none());
+        assert_eq!(reducer.tool_items_in_progress.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn lost_turn_completions_have_bounded_retention_and_admit_new_turns() {
+        let mut reducer = AnalyticsReducer::default();
+        let mut out = Vec::new();
+        for id in 0..=MAX_PENDING_ANALYTICS_ITEMS {
+            let turn_id = format!("turn-{id}");
+            reducer
+                .ingest(
+                    AnalyticsFact::Custom(CustomAnalyticsFact::TurnTokenUsage(Box::new(
+                        sample_turn_token_usage_fact("thread-2", &turn_id),
+                    ))),
+                    &mut out,
+                )
+                .await;
+            reducer.ingest(started_tool(&turn_id), &mut out).await;
+        }
+        assert_eq!(reducer.turns.len(), MAX_PENDING_ANALYTICS_ITEMS);
+        assert_eq!(reducer.turn_order.len(), MAX_PENDING_ANALYTICS_ITEMS);
+        assert_eq!(
+            reducer.tool_items_in_progress.len(),
+            MAX_PENDING_ANALYTICS_ITEMS
+        );
+        assert!(!reducer.turns.contains_key("turn-0"));
+        assert!(
+            reducer
+                .turns
+                .contains_key(&format!("turn-{MAX_PENDING_ANALYTICS_ITEMS}"))
+        );
+        assert!(
+            reducer
+                .tool_items_in_progress
+                .keys()
+                .all(|key| key.turn_id != "turn-0")
+        );
+        assert!(out.is_empty());
+    }
 
     #[test]
     fn managed_full_disk_with_restricted_network_reports_external_sandbox() {

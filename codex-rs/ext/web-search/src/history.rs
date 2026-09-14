@@ -4,7 +4,6 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::plaintext_agent_message_content;
-use codex_tools::retain_tail_from_last_n_user_messages;
 use codex_tools::truncate_assistant_output_text_to_token_budget;
 
 const ASSISTANT_CONTEXT_TOKEN_LIMIT: usize = 1_000;
@@ -16,14 +15,27 @@ const USER_ROLE: &str = "user";
 /// The tail keeps the previous user text message, up to 1k tokens of assistant
 /// text that followed it, and the current user text message.
 pub(crate) fn recent_input(items: &[ResponseItem]) -> Option<SearchInput> {
+    let mut users = items
+        .iter()
+        .enumerate()
+        .rev()
+        .filter_map(|(index, item)| is_visible_user_text(item).then_some(index));
+    let latest = users.next()?;
+    let earliest = users.next().unwrap_or(latest);
     let mut messages = Vec::new();
-    for item in items {
+    for item in &items[earliest..=latest] {
         push_visible_message(&mut messages, item);
     }
 
-    retain_tail_from_last_n_user_messages(&mut messages, /*user_message_count*/ 2);
     truncate_assistant_output_text_to_token_budget(&mut messages, ASSISTANT_CONTEXT_TOKEN_LIMIT);
     (!messages.is_empty()).then_some(SearchInput::Items(messages))
+}
+
+fn is_visible_user_text(item: &ResponseItem) -> bool {
+    matches!(item, ResponseItem::Message { role, content, .. }
+        if role == USER_ROLE
+            && content.iter().any(|item| matches!(item, ContentItem::InputText { .. }))
+            && matches!(parse_turn_item(item), Some(TurnItem::UserMessage(_))))
 }
 
 fn push_visible_message(messages: &mut Vec<ResponseItem>, item: &ResponseItem) {
@@ -57,9 +69,7 @@ fn push_visible_message(messages: &mut Vec<ResponseItem>, item: &ResponseItem) {
             content,
             phase,
             internal_chat_message_metadata_passthrough: metadata,
-        } if role == USER_ROLE
-            && matches!(parse_turn_item(item), Some(TurnItem::UserMessage(_))) =>
-        {
+        } if is_visible_user_text(item) => {
             let content = content
                 .iter()
                 .filter(|item| matches!(item, ContentItem::InputText { .. }))
@@ -198,6 +208,51 @@ mod tests {
                 message(USER_ROLE, "previous user"),
                 message(ASSISTANT_ROLE, "previous assistant"),
                 message(USER_ROLE, "current user"),
+            ]))
+        );
+    }
+    #[test]
+    fn handles_single_or_missing_user_text_and_image_only_messages() {
+        let image = ResponseItem::Message {
+            id: None,
+            role: USER_ROLE.to_string(),
+            content: vec![ContentItem::InputImage {
+                image_url: "data:image/png;base64,image".to_string(),
+                detail: None,
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        assert_eq!(recent_input(&[]), None);
+        assert_eq!(
+            recent_input(&[message(ASSISTANT_ROLE, "leading"), image.clone()]),
+            None
+        );
+        assert_eq!(
+            recent_input(&[
+                message(ASSISTANT_ROLE, "leading"),
+                message(USER_ROLE, "current"),
+                image,
+                message(ASSISTANT_ROLE, "current commentary"),
+            ]),
+            Some(SearchInput::Items(vec![message(USER_ROLE, "current")]))
+        );
+    }
+
+    #[test]
+    fn shares_the_assistant_budget_between_retained_messages() {
+        let budget_text = "x".repeat(4_000);
+        assert_eq!(
+            recent_input(&[
+                message(USER_ROLE, "previous"),
+                message(ASSISTANT_ROLE, &budget_text),
+                message(ASSISTANT_ROLE, "exceeds remaining budget"),
+                message(USER_ROLE, "current"),
+            ]),
+            Some(SearchInput::Items(vec![
+                message(USER_ROLE, "previous"),
+                message(ASSISTANT_ROLE, &budget_text),
+                message(USER_ROLE, "current")
             ]))
         );
     }

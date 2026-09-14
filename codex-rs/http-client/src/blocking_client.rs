@@ -107,7 +107,7 @@ impl BlockingHttpClientBuilder {
         if !self.follow_redirects {
             builder = builder.redirect(reqwest::redirect::Policy::none());
         }
-        if let Some(Some(timeout)) = self.request_timeout {
+        if let Some(timeout) = self.request_timeout {
             builder = builder.timeout(timeout);
         }
         if let Some(certificates) = self.tls_certs_only {

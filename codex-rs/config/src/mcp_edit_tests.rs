@@ -7,6 +7,103 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 #[tokio::test]
+async fn merge_preserves_latest_existing_document_entries() -> anyhow::Result<()> {
+    for original in [
+        "# user settings\n[mcp_servers.existing]\ncommand = 'old' # keep\nfuture_field = 'retained'\n",
+        "mcp_servers = { existing = { command = 'old', future_field = 'retained' } } # keep\n",
+    ] {
+        let home = tempfile::tempdir()?;
+        let path = home.path().join(CONFIG_TOML_FILE);
+        std::fs::write(&path, original)?;
+        let additions = BTreeMap::from([
+            (
+                "existing".into(),
+                toml::from_str::<McpServerConfig>("command = 'replacement'")?,
+            ),
+            (
+                "added".into(),
+                toml::from_str::<McpServerConfig>("command = 'new'")?,
+            ),
+        ]);
+        let edit = ConfigEditsBuilder::new(home.path()).merge_mcp_servers(&additions);
+        let latest = original.replace("'old'", "'user-edit'");
+        std::fs::write(&path, &latest)?;
+        edit.apply().await?;
+        let stored = std::fs::read_to_string(&path)?;
+        assert!(stored.contains("# keep"), "{stored}");
+        assert!(stored.contains("future_field = 'retained'"), "{stored}");
+        assert!(stored.contains("command = 'user-edit'"), "{stored}");
+        if original.starts_with("# user") {
+            assert!(stored.starts_with(&latest), "{stored}");
+        }
+        let reloaded = load_global_mcp_servers(home.path()).await?;
+        assert_eq!(reloaded.len(), 2);
+        assert_eq!(
+            reloaded["existing"],
+            toml::from_str::<McpServerConfig>("command = 'user-edit'")?
+        );
+        assert_eq!(reloaded["added"], additions["added"]);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn merge_noops_do_not_write_but_still_validate() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let path = home.path().join(CONFIG_TOML_FILE);
+    ConfigEditsBuilder::new(home.path())
+        .merge_mcp_servers(&BTreeMap::new())
+        .apply()
+        .await?;
+    assert!(!path.exists());
+    let original = "[mcp_servers.existing]\ncommand = 'original' # keep\n";
+    std::fs::write(&path, original)?;
+    let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+    file.set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))?;
+    drop(file);
+    let modified = std::fs::metadata(&path)?.modified()?;
+    let additions = BTreeMap::from([(
+        "existing".into(),
+        toml::from_str::<McpServerConfig>("command = 'replacement'")?,
+    )]);
+    for servers in [&BTreeMap::new(), &additions] {
+        ConfigEditsBuilder::new(home.path())
+            .merge_mcp_servers(servers)
+            .apply()
+            .await?;
+        assert_eq!(std::fs::read_to_string(&path)?, original);
+        assert_eq!(std::fs::metadata(&path)?.modified()?, modified);
+    }
+    for invalid in ["broken = [", "[mcp_servers.invalid]\ncommand = 42\n"] {
+        std::fs::write(&path, invalid)?;
+        let error = ConfigEditsBuilder::new(home.path())
+            .merge_mcp_servers(&BTreeMap::new())
+            .apply()
+            .await
+            .expect_err("empty merge must validate config");
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert_eq!(std::fs::read_to_string(&path)?, invalid);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_mcp_merge_still_rejects_invalid_server_configuration() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let path = home.path().join(CONFIG_TOML_FILE);
+    let original = "[mcp_servers.invalid]\nenabled = true\n";
+    std::fs::write(&path, original)?;
+    let error = ConfigEditsBuilder::new(home.path())
+        .merge_mcp_servers(&BTreeMap::new())
+        .apply()
+        .await
+        .expect_err("missing transport");
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
+    assert_eq!(std::fs::read_to_string(&path)?, original);
+    Ok(())
+}
+
+#[tokio::test]
 async fn mcp_server_edits_preserve_empty_tool_allowlists() -> anyhow::Result<()> {
     for merge in [false, true] {
         let codex_home = tempfile::tempdir()?;

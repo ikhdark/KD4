@@ -90,7 +90,10 @@ impl App {
         thread_id: ThreadId,
     ) -> Option<(mpsc::Receiver<ThreadBufferedEvent>, ThreadEventSnapshot)> {
         let channel = self.thread_event_channels.get_mut(&thread_id)?;
-        let receiver = channel.receiver.take()?;
+        // All producers enqueue through App, so replacing delivery before the snapshot
+        // excludes exactly the events already represented in the store.
+        channel.receiver.as_ref()?;
+        let receiver = channel.reset_delivery();
         let mut store = channel.store.lock().await;
         store.active = true;
         let snapshot = store.snapshot();
@@ -902,17 +905,23 @@ impl App {
             (channel.forwarder.clone(), Arc::clone(&channel.store))
         };
 
-        let (should_send, pending_status) = {
+        let (should_send, pending_status, approvals_changed) = {
             let mut guard = store.lock().await;
             if guard.session.is_none()
                 && let Some(session) = inferred_session
             {
                 guard.session = Some(session);
             }
+            let had_approvals = guard.has_pending_thread_approvals();
             guard.push_notification(notification.clone());
-            (guard.active, guard.side_parent_pending_status())
+            (
+                guard.active,
+                guard.side_parent_pending_status(),
+                had_approvals != guard.has_pending_thread_approvals(),
+            )
         };
         let notification_status_change = SideParentStatusChange::for_notification(&notification);
+        let labels_changed = matches!(notification, ServerNotification::ThreadStarted(_));
 
         if should_send {
             forwarder.try_send(thread_id, ThreadBufferedEvent::Notification(notification));
@@ -922,7 +931,9 @@ impl App {
         } else if let Some(change) = notification_status_change {
             self.apply_side_parent_status_change(thread_id, change);
         }
-        self.refresh_pending_thread_approvals().await;
+        if approvals_changed || labels_changed {
+            self.refresh_pending_thread_approvals().await;
+        }
         Ok(())
     }
 
@@ -1057,14 +1068,7 @@ impl App {
             guard
                 .buffer
                 .push_back(ThreadBufferedEvent::HistoryEntryResponse(event.clone()));
-            if guard.buffer.len() > guard.capacity
-                && let Some(removed) = guard.buffer.pop_front()
-                && let ThreadBufferedEvent::Request(request) = &removed
-            {
-                guard
-                    .pending_interactive_replay
-                    .note_evicted_server_request(request);
-            }
+            guard.trim_buffer();
             guard.active
         };
 
@@ -1168,6 +1172,33 @@ impl App {
             return;
         }
 
+        if snapshot.history_truncated {
+            match app_server
+                .thread_read(thread_id, /*include_turns*/ true)
+                .await
+            {
+                Ok(thread) => {
+                    let session = match snapshot.session.clone() {
+                        Some(session) => session,
+                        None => self.session_state_for_thread_read(thread_id, &thread).await,
+                    };
+                    self.apply_refreshed_snapshot_thread(
+                        thread_id,
+                        AppServerStartedThread {
+                            session,
+                            turns: thread.turns,
+                        },
+                        snapshot,
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    tracing::warn!(%thread_id, %err, "failed to recover truncated thread history")
+                }
+            }
+            return;
+        }
+
         match app_server
             .resume_thread(self.config.clone(), thread_id)
             .await
@@ -1192,11 +1223,12 @@ impl App {
         is_replay_only: bool,
         snapshot: &ThreadEventSnapshot,
     ) -> bool {
-        !is_replay_only
-            && !self.side_threads.contains_key(&thread_id)
-            && snapshot.session.as_ref().is_none_or(|session| {
-                session.model.trim().is_empty() || session.rollout_path.is_none()
-            })
+        snapshot.history_truncated
+            || (!is_replay_only
+                && !self.side_threads.contains_key(&thread_id)
+                && snapshot.session.as_ref().is_none_or(|session| {
+                    session.model.trim().is_empty() || session.rollout_path.is_none()
+                }))
     }
 
     pub(super) async fn apply_refreshed_snapshot_thread(
@@ -1205,14 +1237,16 @@ impl App {
         started: AppServerStartedThread,
         snapshot: &mut ThreadEventSnapshot,
     ) {
-        let AppServerStartedThread { session, turns } = started;
+        let AppServerStartedThread { session, mut turns } = started;
         if let Some(channel) = self.thread_event_channels.get(&thread_id) {
             let mut store = channel.store.lock().await;
             store.set_session(session.clone(), turns.clone());
             store.rebase_buffer_after_session_refresh();
+            turns = store.turns.clone();
         }
         snapshot.session = Some(session);
         snapshot.turns = turns;
+        snapshot.history_truncated = false;
         snapshot
             .events
             .retain(ThreadEventStore::event_survives_session_refresh);
@@ -1320,7 +1354,7 @@ impl App {
                 .send(AppEvent::EndInitialHistoryReplayBuffer);
         }
         self.chat_widget
-            .set_queue_autosend_suppressed(/*suppressed*/ false);
+            .set_queue_autosend_suppressed(/*suppressed*/ !resume_restored_queue);
         self.chat_widget
             .set_initial_user_message_submit_suppressed(/*suppressed*/ false);
         self.chat_widget.submit_initial_user_message_if_pending();
@@ -1392,29 +1426,13 @@ impl App {
         response: &ThreadRollbackResponse,
         origin: ThreadRollbackOrigin,
     ) {
-        if let Some(channel) = self.thread_event_channels.get(&thread_id) {
-            let mut store = channel.store.lock().await;
-            store.apply_thread_rollback(response);
-        }
-        if self.active_thread_id == Some(thread_id)
-            && let Some(mut rx) = self.active_thread_rx.take()
-        {
-            let mut disconnected = false;
-            loop {
-                match rx.try_recv() {
-                    Ok(_) => {}
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
-                }
-            }
-
-            if !disconnected {
-                self.active_thread_rx = Some(rx);
+        if let Some(channel) = self.thread_event_channels.get_mut(&thread_id) {
+            let receiver = channel.reset_delivery();
+            channel.store.lock().await.apply_thread_rollback(response);
+            if self.active_thread_id == Some(thread_id) {
+                self.active_thread_rx = Some(receiver);
             } else {
-                self.clear_active_thread().await;
+                channel.receiver = Some(receiver);
             }
         }
         match origin {
@@ -1484,8 +1502,36 @@ impl App {
         &mut self,
         tui: &mut tui::Tui,
         app_server: &mut AppServerSession,
-        event: ThreadBufferedEvent,
+        mut event: ThreadBufferedEvent,
     ) -> Result<()> {
+        if let Some(thread_id) = self.active_thread_id
+            && let Some(channel) = self.thread_event_channels.get(&thread_id)
+            && channel.forwarder.has_delivery_gap()
+        {
+            // A full relay always has a queued event to wake this consumer. Rebuild from
+            // the store (or the server after truncation) before applying further deliveries.
+            let closed_event = channel
+                .store
+                .lock()
+                .await
+                .buffer
+                .iter()
+                .rev()
+                .find(|event| {
+                    matches!(
+                        event,
+                        ThreadBufferedEvent::Notification(ServerNotification::ThreadClosed(_))
+                    )
+                })
+                .cloned();
+            self.select_agent_thread_for_replay(tui, app_server, thread_id, true)
+                .await?;
+            if let Some(closed_event) = closed_event {
+                event = closed_event;
+            } else {
+                return Ok(());
+            }
+        }
         // Capture this before any potential thread switch: we only want to clear
         // the exit marker when the currently active thread acknowledges shutdown.
         let pending_shutdown_exit_completed = matches!(

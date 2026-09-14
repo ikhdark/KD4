@@ -569,6 +569,16 @@ impl ApprovalOverlay {
 
 impl BottomPaneView for ApprovalOverlay {
     fn handle_key_event(&mut self, key_event: KeyEvent) {
+        if key_hint::plain(KeyCode::Esc).is_press(key_event)
+            && matches!(
+                self.current_request,
+                Some(ApprovalRequest::McpElicitation { .. })
+            )
+        {
+            self.cancel_current_request();
+            return;
+        }
+
         if self.try_handle_shortcut(&key_event) {
             return;
         }
@@ -2320,6 +2330,8 @@ mod tests {
         ];
         keymap.approval.cancel = vec![key_hint::plain(KeyCode::Char('x'))];
 
+        keymap.list.cancel = vec![key_hint::plain(KeyCode::Char('q'))];
+        keymap.approval.approve = vec![key_hint::plain(KeyCode::Esc)];
         let mut view = make_overlay_with_keymap(
             make_elicitation_request(),
             tx,

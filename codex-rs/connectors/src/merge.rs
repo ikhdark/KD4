@@ -43,6 +43,18 @@ pub fn merge_connectors(
             if existing.distribution_channel.is_none() && connector.distribution_channel.is_some() {
                 existing.distribution_channel = connector.distribution_channel;
             }
+            if existing.branding.is_none() {
+                existing.branding = connector.branding;
+            }
+            if existing.app_metadata.is_none() {
+                existing.app_metadata = connector.app_metadata;
+            }
+            if existing.labels.is_none() {
+                existing.labels = connector.labels;
+            }
+            // The accessible result carries runtime enablement; directory entries and
+            // plugin placeholders are metadata. Hosts still apply effective app policy.
+            existing.is_enabled = connector.is_enabled;
             existing
                 .plugin_display_names
                 .extend(connector.plugin_display_names);
@@ -84,22 +96,14 @@ where
 }
 
 pub fn merge_plugin_connectors_with_accessible<I>(
-    plugin_app_ids: I,
+    _plugin_app_ids: I,
     accessible_connectors: Vec<AppInfo>,
 ) -> Vec<AppInfo>
 where
     I: IntoIterator<Item = String>,
 {
-    let accessible_connector_ids: HashSet<&str> = accessible_connectors
-        .iter()
-        .map(|connector| connector.id.as_str())
-        .collect();
-    let plugin_connectors = plugin_app_ids
-        .into_iter()
-        .filter(|connector_id| accessible_connector_ids.contains(connector_id.as_str()))
-        .map(plugin_connector_to_app_info)
-        .collect::<Vec<_>>();
-    merge_connectors(plugin_connectors, accessible_connectors)
+    // Declarations add no installed IDs here. Preserve accessible metadata directly.
+    merge_connectors(Vec::new(), accessible_connectors)
 }
 
 pub fn plugin_connector_to_app_info(connector_id: String) -> AppInfo {
@@ -216,5 +220,60 @@ mod tests {
                 plugin_display_names: plugin_names(&["alpha", "beta", "sample"]),
             }]
         );
+    }
+
+    #[test]
+    fn merge_preserves_accessible_metadata_and_enablement_on_collision() {
+        let mut accessible = google_calendar_accessible_connector(&[]);
+        accessible.is_enabled = false;
+        accessible.branding = Some(
+            serde_json::from_value(serde_json::json!({
+                "category": "productivity", "isDiscoverableApp": true
+            }))
+            .unwrap(),
+        );
+        accessible.app_metadata = Some(
+            serde_json::from_value(serde_json::json!({
+                "categories": ["calendar"], "developer": "Calendar developer"
+            }))
+            .unwrap(),
+        );
+        accessible.labels = Some(HashMap::from([("label".to_string(), "value".to_string())]));
+        let mut expected = accessible.clone();
+        expected.install_url = Some(connector_install_url("calendar", "calendar"));
+        assert_eq!(
+            merge_connectors(
+                vec![plugin_connector_to_app_info("calendar".to_string())],
+                vec![accessible.clone()]
+            ),
+            vec![expected]
+        );
+
+        let mut directory = plugin_connector_to_app_info("calendar".to_string());
+        directory.labels = Some(HashMap::from([(
+            "directory".to_string(),
+            "kept".to_string(),
+        )]));
+        let merged = merge_connectors(vec![directory.clone()], vec![accessible]);
+        assert_eq!(merged[0].labels, directory.labels);
+    }
+
+    #[test]
+    fn plugin_accessible_merge_preserves_real_metadata_and_only_accessible_ids() {
+        let mut accessible = google_calendar_accessible_connector(&["Plugin", "Plugin"]);
+        accessible.is_enabled = false;
+        accessible.labels = Some(HashMap::from([("label".to_string(), "value".to_string())]));
+        let mut expected = accessible.clone();
+        expected.plugin_display_names = vec!["Plugin".to_string()];
+        expected.install_url = Some(connector_install_url("Google Calendar", "calendar"));
+        for plugin_ids in [
+            vec![],
+            vec!["calendar".to_string(), "uninstalled".to_string()],
+        ] {
+            assert_eq!(
+                merge_plugin_connectors_with_accessible(plugin_ids, vec![accessible.clone()]),
+                vec![expected.clone()]
+            );
+        }
     }
 }

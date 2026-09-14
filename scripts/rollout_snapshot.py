@@ -76,7 +76,9 @@ def _open_shared_binary(path: Path) -> BinaryIO:
 
 def read_rollout_snapshot(path: Path) -> RolloutSnapshot:
     resolved = path.resolve(strict=True)
-    with _open_shared_binary(resolved) as handle:
+    with (
+        _open_shared_binary(resolved) if os.name == "nt" else resolved.open("rb")
+    ) as handle:
         byte_length = os.fstat(handle.fileno()).st_size
         chunks: list[bytes] = []
         remaining = byte_length
@@ -121,7 +123,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     metadata = snapshot.metadata()
     if args.output is not None:
         output = args.output.resolve()
-        if output == snapshot.path:
+        if output == snapshot.path or (
+            output.exists() and output.samefile(snapshot.path)
+        ):
             raise ValueError("snapshot output must not overwrite the live rollout")
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(snapshot.data)

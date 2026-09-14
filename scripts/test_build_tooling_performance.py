@@ -51,6 +51,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             check=False,
             env=env,
             creationflags=CREATE_NO_WINDOW,
+            timeout=30,
         )
 
         self.assertEqual(
@@ -116,6 +117,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                 check=False,
                 env=env,
                 creationflags=CREATE_NO_WINDOW,
+                timeout=30,
             )
 
         self.assertNotEqual(result.returncode, 0)
@@ -154,6 +156,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                     capture_output=True,
                     check=False,
                     creationflags=CREATE_NO_WINDOW,
+                    timeout=30,
                 )
 
                 self.assertNotEqual(result.returncode, 0)
@@ -208,6 +211,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                 check=False,
                 env=env,
                 creationflags=CREATE_NO_WINDOW,
+                timeout=30,
             )
 
         self.assertEqual(
@@ -247,6 +251,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             capture_output=True,
             check=False,
             creationflags=CREATE_NO_WINDOW,
+            timeout=30,
         )
 
         self.assertEqual(
@@ -280,6 +285,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             capture_output=True,
             check=False,
             creationflags=CREATE_NO_WINDOW,
+            timeout=30,
         )
 
         self.assertEqual(
@@ -323,6 +329,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             capture_output=True,
             check=False,
             creationflags=CREATE_NO_WINDOW,
+            timeout=30,
         )
 
         self.assertEqual(
@@ -399,6 +406,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                 check=False,
                 env=env,
                 creationflags=CREATE_NO_WINDOW,
+                timeout=30,
             )
 
             self.assertEqual(
@@ -448,6 +456,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                     check=False,
                     env=env,
                     creationflags=CREATE_NO_WINDOW,
+                    timeout=30,
                 )
 
                 self.assertEqual(
@@ -498,6 +507,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             capture_output=True,
             check=False,
             creationflags=CREATE_NO_WINDOW,
+            timeout=30,
         )
 
         self.assertEqual(
@@ -559,6 +569,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                 check=False,
                 env=env,
                 creationflags=CREATE_NO_WINDOW,
+                timeout=30,
             )
             call_lines = (
                 calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
@@ -623,6 +634,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                 check=False,
                 env=env,
                 creationflags=CREATE_NO_WINDOW,
+                timeout=30,
             )
             call_lines = (
                 calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
@@ -683,6 +695,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                 check=False,
                 env=env,
                 creationflags=CREATE_NO_WINDOW,
+                timeout=30,
             )
 
         self.assertNotEqual(result.returncode, 0)
@@ -725,6 +738,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             errors="replace",
             check=True,
             creationflags=CREATE_NO_WINDOW,
+            timeout=30,
         ).stdout.splitlines()
         actual_agent_files = sorted(
             path for path in discovered_agent_files if (REPO_ROOT / path).is_file()
@@ -738,6 +752,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             errors="replace",
             check=True,
             creationflags=CREATE_NO_WINDOW,
+            timeout=30,
         ).stdout.splitlines()
         expected_eol_attributes = [f"{path}: eol: lf" for path in expected_agent_files]
         root_text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")

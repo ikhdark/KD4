@@ -541,8 +541,6 @@ pub(crate) struct ChatWidget {
     // Stream lifecycle controller for proposed plan output.
     plan_stream_controller: Option<PlanStreamController>,
     pending_stream_consolidations: usize,
-    /// Holds the platform clipboard lease so copied text remains available while supported.
-    clipboard_lease: Option<crate::clipboard_copy::ClipboardLease>,
     #[cfg(test)]
     clipboard_image_reader_for_test: Option<crate::clipboard_paste::ClipboardImageReader>,
     #[cfg(test)]
@@ -567,6 +565,7 @@ pub(crate) struct ChatWidget {
     /// as "running" while this is populated, even if no agent turn is currently
     /// executing.
     mcp_startup_status: Option<HashMap<String, McpStartupStatus>>,
+    mcp_startup_last_finished_status: HashMap<String, McpStartupStatus>,
     /// Expected MCP servers for the current startup round, seeded from enabled local config.
     mcp_startup_expected_servers: Option<HashSet<String>>,
     /// After startup settles, ignore stale updates until enough notifications confirm a new round.
@@ -687,7 +686,7 @@ pub(crate) struct ChatWidget {
     // CWD used to resolve the cached branch; change resets branch state.
     status_line_branch_cwd: Option<PathBuf>,
     // True while an async branch lookup is in flight.
-    status_line_branch_pending: bool,
+    status_line_branch_pending_request_id: Option<uuid::Uuid>,
     // True once we've attempted a branch lookup for the current CWD.
     status_line_branch_lookup_complete: bool,
     // Cached PR and branch-change summary for the active status-line cwd.
@@ -695,7 +694,7 @@ pub(crate) struct ChatWidget {
     // CWD used to resolve the cached Git summary; change resets summary state.
     status_line_git_summary_cwd: Option<PathBuf>,
     // True while an async Git summary lookup is in flight.
-    status_line_git_summary_pending: bool,
+    status_line_git_summary_pending_request_id: Option<uuid::Uuid>,
     // True once we've attempted a Git summary lookup for the current CWD.
     status_line_git_summary_lookup_complete: bool,
     // Cached workspace notification headline for the status line.

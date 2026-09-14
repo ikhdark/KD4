@@ -88,16 +88,13 @@ impl WinChild {
 
     fn is_complete(&mut self) -> IoResult<Option<ExitStatus>> {
         let mut status: DWORD = 0;
-        let proc = clone_process_handle(
-            &*self
-                .proc
-                .lock()
-                .map_err(|_| IoError::other("process handle lock poisoned"))?,
-        )?;
+        let proc = self
+            .proc
+            .lock()
+            .map_err(|_| IoError::other("process handle lock poisoned"))?;
         // A terminating process can publish its exit code before its handle is
         // signaled. Only the native wait proves that the process has exited.
-        // SAFETY: proc is an owned duplicate of the process handle and remains live for the
-        // entire zero-duration wait.
+        // SAFETY: the mutex guard keeps the process handle live throughout this zero-duration wait.
         match unsafe { WaitForSingleObject(proc.as_raw_handle() as _, 0) } {
             winapi::shared::winerror::WAIT_TIMEOUT => return Ok(None),
             WAIT_FAILED_RESULT => return Err(IoError::last_os_error()),
@@ -111,6 +108,7 @@ impl WinChild {
         // SAFETY: proc owns a live process handle and status is writable DWORD storage for the
         // exit-code output.
         let res = unsafe { GetExitCodeProcess(proc.as_raw_handle() as _, &mut status) };
+        drop(proc);
         if res != 0 {
             self.preserve_descendants();
             Ok(Some(ExitStatus::with_exit_code(status)))
@@ -183,12 +181,13 @@ fn terminate_job_or_process(job: &JobObject, process: &Mutex<OwnedHandle>) -> Io
             log::warn!(
                 "ConPTY failed to terminate process tree; terminating root process: {job_err}"
             );
-            terminate_process(process).map_err(|process_err| {
-                IoError::other(format!(
-                    "failed to terminate ConPTY job ({job_err}); root process fallback also \
-                     failed: {process_err}"
-                ))
-            })
+            let fallback = match terminate_process(process) {
+                Ok(()) => "succeeded".to_owned(),
+                Err(err) => format!("also failed: {err}"),
+            };
+            Err(IoError::other(format!(
+                "failed to terminate ConPTY job ({job_err}); root process fallback {fallback}"
+            )))
         }
     }
 }
@@ -253,11 +252,12 @@ impl std::future::Future for WinChild {
             Err(err) => Poll::Ready(Err(err).context("Failed to retrieve process exit status")),
             Ok(None) => {
                 if self.waiter.is_none() {
-                    let proc = self
-                        .proc
-                        .lock()
-                        .map_err(|_| IoError::other("process handle lock poisoned"))?
-                        .try_clone()?;
+                    let proc = clone_process_handle(
+                        &*self
+                            .proc
+                            .lock()
+                            .map_err(|_| IoError::other("process handle lock poisoned"))?,
+                    )?;
                     let (sender, receiver) = tokio::sync::oneshot::channel();
                     std::thread::Builder::new()
                         .name("codex-process-wait".into())
@@ -281,7 +281,7 @@ impl std::future::Future for WinChild {
                 }
                 // oneshot replaces the registered waker on each poll. Repolling
                 // the child never creates another native waiter thread.
-                let receiver = self.waiter.as_mut().expect("waiter initialized above");
+                let receiver = self.waiter.as_mut().ok_or_else(|| anyhow::anyhow!("process waiter was not initialized"))?;
                 match std::future::Future::poll(Pin::new(receiver), cx) {
                     Poll::Pending => Poll::Pending,
                     Poll::Ready(result) => {
@@ -334,6 +334,27 @@ mod waiter_tests {
         let mut command = portable_pty::CommandBuilder::new("cmd.exe");
         command.args(["/D", "/Q", "/K"]);
         let mut child = console.spawn_command(command)?;
+        // SAFETY: the query writes a correctly sized job information structure.
+        let mut limits: winapi::um::winnt::JOBOBJECT_EXTENDED_LIMIT_INFORMATION =
+            unsafe { std::mem::zeroed() };
+        assert_ne!(
+            unsafe {
+                winapi::um::jobapi2::QueryInformationJobObject(
+                    child.job.as_raw_handle().cast(),
+                    winapi::um::winnt::JobObjectExtendedLimitInformation,
+                    (&mut limits as *mut winapi::um::winnt::JOBOBJECT_EXTENDED_LIMIT_INFORMATION)
+                        .cast(),
+                    std::mem::size_of_val(&limits) as u32,
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        assert_eq!(
+            limits.BasicLimitInformation.LimitFlags,
+            winapi::um::winnt::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        );
+
         let native = {
             let process = child.proc.lock().unwrap();
             // SAFETY: The process mutex guard keeps the original handle alive until it has been
@@ -344,33 +365,31 @@ mod waiter_tests {
             unsafe { WaitForSingleObject(native.as_raw_handle() as _, 0) },
             winapi::shared::winerror::WAIT_TIMEOUT
         );
-        for fail_on_clone in [1, 2] {
-            DUPLICATION_FAILURE_COUNTDOWN.with(|remaining| remaining.set(fail_on_clone));
-            let error = if fail_on_clone == 1 {
-                child
-                    .try_wait()
-                    .expect_err("status duplication failure must return an error")
-            } else {
-                child
-                    .wait()
-                    .expect_err("native wait handle duplication failure must return an error")
-            };
-            assert_eq!(error.raw_os_error(), Some(8));
-            assert_eq!(
-                DUPLICATION_FAILURE_COUNTDOWN.with(std::cell::Cell::get),
-                0,
-                "normal status/wait must reach the selected external duplication boundary"
-            );
-            assert_eq!(
-                unsafe { WaitForSingleObject(native.as_raw_handle() as _, 0) },
-                winapi::shared::winerror::WAIT_TIMEOUT,
-                "reporting a handle error must not terminate the actual child"
-            );
-            assert!(
-                child.try_wait()?.is_none(),
-                "retry must still observe the running native child"
-            );
-        }
+        DUPLICATION_FAILURE_COUNTDOWN.with(|remaining| remaining.set(1));
+        assert!(child.try_wait()?.is_none());
+        assert_eq!(DUPLICATION_FAILURE_COUNTDOWN.with(std::cell::Cell::get), 1);
+        assert_eq!(
+            child
+                .wait()
+                .expect_err("wait must report duplication failure")
+                .raw_os_error(),
+            Some(8)
+        );
+        DUPLICATION_FAILURE_COUNTDOWN.with(|remaining| remaining.set(1));
+        let waker = Waker::from(Arc::new(WakeCount(AtomicUsize::new(0))));
+        let mut context = Context::from_waker(&waker);
+        let Poll::Ready(Err(error)) = Pin::new(&mut child).poll(&mut context) else {
+            panic!("async wait must report duplication failure");
+        };
+        assert_eq!(
+            error.downcast_ref::<IoError>().unwrap().raw_os_error(),
+            Some(8)
+        );
+        assert_eq!(DUPLICATION_FAILURE_COUNTDOWN.with(std::cell::Cell::get), 0);
+        assert!(
+            child.try_wait()?.is_none(),
+            "handle errors must leave the child running"
+        );
         child.kill()?;
         assert_eq!(child.wait()?.exit_code(), 1);
         assert_eq!(
@@ -457,6 +476,44 @@ mod waiter_tests {
             panic!("terminated child must complete")
         };
         assert_eq!(result?.exit_code(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn root_fallback_still_reports_failed_tree_termination() -> anyhow::Result<()> {
+        let mut process = ChildCleanup(
+            std::process::Command::new("cmd.exe")
+                .args(["/d", "/c", "set /p value="])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?,
+        );
+        // SAFETY: the child owns this live process handle while it is duplicated.
+        let native =
+            unsafe { std::os::windows::io::BorrowedHandle::borrow_raw(AsRawHandle::as_raw_handle(&process.0)) }
+                .try_clone_to_owned()?;
+        use std::os::windows::io::IntoRawHandle;
+        // SAFETY: ownership of the duplicate is transferred into the native wrapper.
+        let owned = unsafe { OwnedHandle::from_raw_handle(native.into_raw_handle()) };
+        let mut job = JobObject::create()?;
+        job.assign_process(owned.as_raw_handle())?;
+        job.restrict_to_query_access_for_test()?;
+        let mut child = WinChild::new(owned, Arc::new(job));
+        let error = child
+            .kill()
+            .expect_err("root fallback cannot establish tree termination");
+        assert!(
+            error
+                .to_string()
+                .contains("root process fallback succeeded")
+        );
+        assert_eq!(process.0.wait()?.code(), Some(1));
+        assert_eq!(child.wait()?.exit_code(), 1);
+        assert!(
+            child.job.terminate().is_err(),
+            "observing exit must not erase failed termination"
+        );
         Ok(())
     }
 }

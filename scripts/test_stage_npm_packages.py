@@ -9,7 +9,6 @@ import sys
 import tarfile
 import tempfile
 import threading
-import time
 import types
 import unittest
 import zipfile
@@ -439,18 +438,30 @@ class StageNpmPackagesTests(unittest.TestCase):
         with mock.patch.object(
             stage.subprocess,
             "check_output",
-            return_value=(f"42\tx86_64-pc-windows-msvc\t1024\tsha256:{'a' * 64}\n"),
+            side_effect=[
+                f"{artifact_id}\tx86_64-pc-windows-msvc\t1024\tsha256:{'a' * 64}\n"
+                for artifact_id in (42, 43, 44)
+            ],
         ) as check_output:
             first = stage.list_workflow_artifacts("12345", "local/fork")
             second = stage.list_workflow_artifacts("12345", "local/fork")
             third = stage.list_workflow_artifacts("12345", "other/fork")
+            fourth = stage.list_workflow_artifacts("67890", "local/fork")
+            self.assertEqual(
+                stage.list_workflow_artifacts("67890", "local/fork"), fourth
+            )
 
         self.assertEqual(first, second)
-        self.assertEqual(first, third)
+        self.assertEqual(third[0].artifact_id, 43)
+        self.assertEqual(fourth[0].artifact_id, 44)
         self.assertEqual(first[0].name, "x86_64-pc-windows-msvc")
         self.assertEqual(first[0].artifact_id, 42)
         self.assertEqual(first[0].archive_sha256, "a" * 64)
-        self.assertEqual(check_output.call_count, 2)
+        self.assertEqual(check_output.call_count, 3)
+        self.assertIn(
+            "repos/local/fork/actions/runs/67890/artifacts",
+            check_output.call_args_list[2].args[0],
+        )
         self.assertIn(
             "repos/local/fork/actions/runs/12345/artifacts",
             check_output.call_args_list[0].args[0],
@@ -597,7 +608,134 @@ class StageNpmPackagesTests(unittest.TestCase):
         old = stage.WorkflowArtifact("windows-x64", 10, 1, "a" * 64)
         stage.write_complete_marker(artifact_dir, old)
         replacement = stage.WorkflowArtifact("windows-x64", 10, 2, "a" * 64)
-        self.assertFalse(stage.artifact_is_complete(artifact_dir, replacement))
+        with mock.patch.object(
+            stage,
+            "artifact_tree_digest",
+            side_effect=AssertionError("obsolete cache scanned"),
+        ):
+            self.assertFalse(stage.artifact_is_complete(artifact_dir, replacement))
+
+    def test_zip_rejects_windows_paths_and_aliases(self) -> None:
+        for name in (
+            "D:escaped.txt",
+            "safe/./file.txt",
+            "safe//file.txt",
+            "safe/../file.txt",
+            "safe/file.txt:stream",
+            "safe/file.txt.",
+            "NUL.txt",
+            "SAFE/FILE.TXT",
+        ):
+            with self.subTest(name=name):
+                archive_path = self.root / "input.zip"
+                with zipfile.ZipFile(archive_path, "w") as archive:
+                    archive.writestr("safe/file.txt", "original")
+                    archive.writestr(name, "overwrite")
+                with tempfile.TemporaryDirectory(dir=self.root) as destination:
+                    with self.assertRaisesRegex(
+                        RuntimeError, "unsafe workflow artifact path"
+                    ):
+                        stage.extract_artifact_zip(archive_path, Path(destination))
+                    self.assertEqual(
+                        (Path(destination) / "safe/file.txt").read_text(), "original"
+                    )
+
+    def test_cache_digests_frame_file_contents(self) -> None:
+        for module, digest_function in (
+            (stage, stage.artifact_tree_digest),
+            (archives, archives.cache_tree_digest),
+        ):
+            with self.subTest(module=module.__name__):
+                root = self.root / module.__name__
+                root.mkdir()
+                first, second = root / "a", root / "b"
+                first.write_bytes(b"left")
+                second.write_bytes(b"right")
+                header = b"f" + (1).to_bytes(8, "big") + b"b"
+                if module is archives:
+                    header += (second.stat().st_mode & 0o777).to_bytes(4, "big")
+                first.write_bytes(b"left" + header)
+                before = digest_function(root)
+                first.write_bytes(b"left")
+                second.write_bytes(header + b"right")
+                self.assertNotEqual(digest_function(root), before)
+
+    def test_invalid_utf8_markers_are_cache_misses(self) -> None:
+        marker = self.root / stage.COMPLETE_MARKER
+        marker.write_bytes(b"\xff")
+        self.assertFalse(
+            stage.artifact_is_complete(
+                self.root, stage.WorkflowArtifact("test", 1, 1, "a" * 64)
+            )
+        )
+        self.assertFalse(
+            archives.extracted_cache_is_complete(self.root, marker, "a" * 64)
+        )
+
+    def test_cross_device_package_activation_and_rollback(self) -> None:
+        for fail_second in (False, True):
+            with (
+                self.subTest(fail_second=fail_second),
+                tempfile.TemporaryDirectory(dir=self.root) as directory,
+            ):
+                root = Path(directory)
+                staging, output = root / "staging", root / "output"
+                staging.mkdir()
+                output.mkdir()
+                results = []
+                for name in ("one.tgz", "two.tgz"):
+                    (staging / name).write_bytes(b"new")
+                    (output / name).write_bytes(b"old")
+                    results.append(stage.StagePackageResult(name, staging / name, ""))
+                real_replace = Path.replace
+
+                def replace(source, destination):
+                    if (source.parent == staging) != (destination.parent == staging):
+                        raise OSError(errno.EXDEV, "cross device")
+                    if (
+                        fail_second
+                        and source.suffix == ".tmp"
+                        and destination.name == "two.tgz"
+                    ):
+                        raise OSError("activation failed")
+                    return real_replace(source, destination)
+
+                with mock.patch.object(Path, "replace", replace):
+                    if fail_second:
+                        with self.assertRaisesRegex(OSError, "activation failed"):
+                            stage.commit_staged_packages(results, output)
+                    else:
+                        activated = stage.commit_staged_packages(results, output)
+                        self.assertEqual(
+                            [item.pack_output for item in activated],
+                            [output / "one.tgz", output / "two.tgz"],
+                        )
+                self.assertEqual(
+                    {p.name: p.read_bytes() for p in output.iterdir()},
+                    {
+                        name: b"old" if fail_second else b"new"
+                        for name in ("one.tgz", "two.tgz")
+                    },
+                )
+
+    def test_command_capture_bounds_large_output_and_reports_failures(self) -> None:
+        for status in (0, 7):
+            with self.subTest(status=status):
+                command = [
+                    sys.executable,
+                    "-c",
+                    f"import sys; print('BEGIN' + 'x' * 100000 + 'END'); sys.exit({status})",
+                ]
+                if status:
+                    with self.assertRaisesRegex(RuntimeError, "exit code 7") as error:
+                        stage.run_command_capture(command)
+                    log = str(error.exception)
+                else:
+                    log = stage.run_command_capture(command)
+                self.assertIn("BEGIN", log)
+                self.assertIn("END", log)
+                self.assertIn("truncated", log)
+                self.assertLess(len(log), stage.MAX_CAPTURED_LOG_CHARS + 1000)
 
     def test_codex_package_archive_extraction_is_reused(self) -> None:
         target = "x86_64-pc-windows-msvc"
@@ -844,17 +982,38 @@ class StageNpmPackagesTests(unittest.TestCase):
     def test_kernel_lock_serializes_concurrent_holders(self) -> None:
         lock_path = self.root / "cache" / ".artifact.lock"
         second_acquired = threading.Event()
+        contention_seen = threading.Event()
+        errors: list[BaseException] = []
+        acquire = archives._acquire_file_lock
+
+        def observe_acquire(fd: int) -> None:
+            try:
+                acquire(fd)
+            except OSError as error:
+                if archives._lock_error_is_contention(error):
+                    contention_seen.set()
+                raise
 
         def acquire_second() -> None:
-            with stage.exclusive_file_lock(lock_path):
-                second_acquired.set()
+            try:
+                with stage.exclusive_file_lock(lock_path, timeout_seconds=3):
+                    second_acquired.set()
+            except BaseException as error:
+                errors.append(error)
 
-        with stage.exclusive_file_lock(lock_path):
-            worker = threading.Thread(target=acquire_second)
-            worker.start()
-            time.sleep(0.05)
-            self.assertFalse(second_acquired.is_set())
-        worker.join(timeout=2)
+        with mock.patch.object(
+            archives, "_acquire_file_lock", side_effect=observe_acquire
+        ):
+            with stage.exclusive_file_lock(lock_path):
+                worker = threading.Thread(target=acquire_second)
+                worker.start()
+                contended = contention_seen.wait(timeout=2)
+                acquired_while_held = second_acquired.is_set()
+            worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(contended, "second holder must attempt the held kernel lock")
+        self.assertFalse(acquired_while_held)
         self.assertTrue(second_acquired.is_set())
         self.assertTrue(lock_path.exists())
 
@@ -907,12 +1066,16 @@ class StageNpmPackagesTests(unittest.TestCase):
 
         with (
             mock.patch.object(stage.os, "write", side_effect=OSError("disk full")),
+            mock.patch.object(archives.os, "close", wraps=archives.os.close) as close,
             self.assertRaisesRegex(OSError, "disk full"),
         ):
             with stage.exclusive_file_lock(lock_path):
                 self.fail("lock should not have been acquired")
 
         self.assertTrue(lock_path.exists())
+        close.assert_called_once()
+        with self.assertRaises(OSError):
+            os.fstat(close.call_args.args[0])
 
     def test_head_mismatch_fails_without_explicit_override(self) -> None:
         stderr = io.StringIO()
@@ -991,6 +1154,15 @@ class StageNpmPackagesTests(unittest.TestCase):
 
     def test_stage_packages_returns_results_in_package_order(self) -> None:
         calls: list[tuple[str, bool]] = []
+        second_collected = threading.Event()
+        completion_order: list[str] = []
+        as_completed = stage.as_completed
+
+        def observe_completion(futures):
+            for future in as_completed(futures, timeout=5):
+                completion_order.append(future.result().package)
+                yield future
+                second_collected.set()
 
         def fake_stage_package(
             package: str,
@@ -1003,13 +1175,18 @@ class StageNpmPackagesTests(unittest.TestCase):
             capture_output: bool,
         ) -> stage.StagePackageResult:
             calls.append((package, capture_output))
+            if package == "codex":
+                self.assertTrue(second_collected.wait(timeout=3))
             return stage.StagePackageResult(
                 package=package,
                 pack_output=output_dir / f"{package}.tgz",
                 log="",
             )
 
-        with mock.patch.object(stage, "stage_package", fake_stage_package):
+        with (
+            mock.patch.object(stage, "stage_package", fake_stage_package),
+            mock.patch.object(stage, "as_completed", observe_completion),
+        ):
             results = stage.stage_packages(
                 ["codex", "codex-win32-x64"],
                 "1.2.3",
@@ -1028,6 +1205,7 @@ class StageNpmPackagesTests(unittest.TestCase):
             calls,
             [("codex", True), ("codex-win32-x64", True)],
         )
+        self.assertEqual(completion_order, ["codex-win32-x64", "codex"])
 
 
 if __name__ == "__main__":

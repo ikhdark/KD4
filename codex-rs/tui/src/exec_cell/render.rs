@@ -196,6 +196,9 @@ impl HistoryCell for ExecCell {
                         push_owned_lines(&wrapped, &mut lines);
                     }
                 }
+                if !call.is_complete() {
+                    continue;
+                }
                 let duration = call
                     .duration
                     .map(format_duration)
@@ -247,38 +250,25 @@ impl ExecCell {
             },
         ]));
 
-        let mut calls = self.calls.clone();
+        let mut calls = self.calls.iter().peekable();
         let mut out_indented = Vec::new();
-        while !calls.is_empty() {
-            let mut call = calls.remove(0);
-            if call
-                .parsed
-                .iter()
-                .all(|parsed| matches!(parsed, ParsedCommand::Read { .. }))
-            {
-                while let Some(next) = calls.first() {
-                    if next
-                        .parsed
-                        .iter()
-                        .all(|parsed| matches!(parsed, ParsedCommand::Read { .. }))
-                    {
-                        call.parsed.extend(next.parsed.clone());
-                        calls.remove(0);
-                    } else {
-                        break;
-                    }
-                }
-            }
-
+        while let Some(call) = calls.next() {
             let reads_only = call
                 .parsed
                 .iter()
                 .all(|parsed| matches!(parsed, ParsedCommand::Read { .. }));
 
             let call_lines: Vec<(&str, Vec<Span<'static>>)> = if reads_only {
-                let names = call
-                    .parsed
-                    .iter()
+                let mut parsed = call.parsed.iter().collect_vec();
+                while let Some(next) = calls.next_if(|next| {
+                    next.parsed
+                        .iter()
+                        .all(|parsed| matches!(parsed, ParsedCommand::Read { .. }))
+                }) {
+                    parsed.extend(&next.parsed);
+                }
+                let names = parsed
+                    .into_iter()
                     .map(|parsed| match parsed {
                         ParsedCommand::Read { name, .. } => name.clone(),
                         _ => unreachable!(),
@@ -339,7 +329,11 @@ impl ExecCell {
             panic!("Expected exactly one call in a command display cell");
         };
         let layout = EXEC_DISPLAY_LAYOUT;
-        let success = call.output.as_ref().map(CommandOutput::is_success);
+        let success = call
+            .output
+            .as_ref()
+            .filter(|_| call.is_complete())
+            .map(CommandOutput::is_success);
         let bullet = match success {
             Some(true) => "•".green().bold(),
             Some(false) => "•".red().bold(),
@@ -455,6 +449,14 @@ impl ExecCell {
                 let output_opts =
                     RtOptions::new(output_wrap_width).word_splitter(WordSplitter::NoHyphenation);
                 for line in &raw_output.lines {
+                    // Keep the logical omission marker intact; viewport truncation replaces it.
+                    if raw_output
+                        .omitted
+                        .is_some_and(|omitted| line == &Self::output_ellipsis_line(omitted))
+                    {
+                        wrapped_output.push(line.clone());
+                        continue;
+                    }
                     push_owned_lines(
                         &adaptive_wrap_line(line, output_opts.clone()),
                         &mut wrapped_output,
@@ -509,11 +511,9 @@ impl ExecCell {
     /// long URL (which wraps to several viewport rows) is properly
     /// accounted for.
     ///
-    /// The ellipsis message reports the number of omitted *lines*
-    /// (logical, not rows) to keep the count stable across terminal
-    /// widths. `omitted_hint` carries forward any previously reported
-    /// omitted count (from upstream truncation); `ellipsis_prefix`
-    /// prepends the output gutter prefix to the ellipsis line.
+    /// Viewport truncation uses a generic hint because inputs may already be wrapped.
+    /// `omitted_hint` identifies a logical omission marker to replace, and
+    /// `ellipsis_prefix` aligns the replacement with the output gutter.
     fn truncate_lines_middle(
         lines: &[Line<'static>],
         max_rows: usize,
@@ -546,20 +546,25 @@ impl ExecCell {
         if total_rows <= max_rows {
             return lines.to_vec();
         }
-        // Reserve space for the transcript hint itself so the returned output
-        // still respects the row budget on narrow terminals.
-        let estimated_omitted = omitted_hint.unwrap_or(0)
-            + lines
-                .len()
-                .saturating_sub(usize::from(omitted_hint.is_some()));
-        let ellipsis_rows =
-            Self::output_ellipsis_row_count(estimated_omitted, width, ellipsis_prefix.as_ref());
-        if ellipsis_rows >= max_rows {
-            return vec![Self::output_ellipsis_line_with_prefix(
-                estimated_omitted,
-                ellipsis_prefix.as_ref(),
-            )];
+        // These are wrapped fragments, so a logical-line omission count would be misleading.
+        let mut ellipsis = ellipsis_prefix.unwrap_or_default();
+        ellipsis.push_span(format!("… output truncated ({TRANSCRIPT_HINT})").dim());
+        let mut ellipsis_rows = Paragraph::new(ellipsis.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(width)
+            .max(1);
+        if ellipsis_rows > max_rows {
+            ellipsis = Line::from("…".dim());
+            ellipsis_rows = 1;
         }
+        let old_marker = omitted_hint.map(Self::output_ellipsis_text);
+        let is_marker = |line: &Line<'static>| {
+            old_marker.as_ref().is_some_and(|marker| {
+                line.spans
+                    .last()
+                    .is_some_and(|span| span.content == *marker)
+            })
+        };
 
         let available_rows = max_rows - ellipsis_rows;
         let head_budget = available_rows / 2;
@@ -568,6 +573,9 @@ impl ExecCell {
         let mut head_rows = 0usize;
         let mut head_end = 0usize;
         while head_end < lines.len() {
+            if is_marker(&lines[head_end]) {
+                break;
+            }
             let line_row_count = line_rows[head_end];
             if head_rows + line_row_count > head_budget {
                 break;
@@ -582,6 +590,9 @@ impl ExecCell {
         let mut tail_start = lines.len();
         while tail_start > head_end {
             let idx = tail_start - 1;
+            if is_marker(&lines[idx]) {
+                break;
+            }
             let line_row_count = line_rows[idx];
             if tail_rows + line_row_count > tail_budget {
                 break;
@@ -592,15 +603,7 @@ impl ExecCell {
         }
 
         let mut out = head_lines;
-        let base = omitted_hint.unwrap_or(0);
-        let additional = lines
-            .len()
-            .saturating_sub(out.len() + tail_lines_reversed.len())
-            .saturating_sub(usize::from(omitted_hint.is_some()));
-        out.push(Self::output_ellipsis_line_with_prefix(
-            base + additional,
-            ellipsis_prefix.as_ref(),
-        ));
+        out.push(ellipsis);
 
         out.extend(tail_lines_reversed.into_iter().rev());
 
@@ -609,30 +612,6 @@ impl ExecCell {
 
     fn ellipsis_line(omitted: usize) -> Line<'static> {
         Line::from(vec![format!("… +{omitted} lines").dim()])
-    }
-
-    fn output_ellipsis_row_count(
-        omitted: usize,
-        width: u16,
-        prefix: Option<&Line<'static>>,
-    ) -> usize {
-        Paragraph::new(Text::from(vec![Self::output_ellipsis_line_with_prefix(
-            omitted, prefix,
-        )]))
-        .wrap(Wrap { trim: false })
-        .line_count(width)
-        .max(1)
-    }
-
-    /// Builds an output ellipsis line (`… +N lines (ctrl + t to view transcript)`)
-    /// with an optional leading prefix so the ellipsis aligns with the output gutter.
-    fn output_ellipsis_line_with_prefix(
-        omitted: usize,
-        prefix: Option<&Line<'static>>,
-    ) -> Line<'static> {
-        let mut line = prefix.cloned().unwrap_or_default();
-        line.push_span(Self::output_ellipsis_text(omitted).dim());
-        line
     }
 }
 
@@ -691,6 +670,94 @@ const EXEC_DISPLAY_LAYOUT: ExecDisplayLayout = ExecDisplayLayout::new(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streamed_command_stays_running_and_interruption_preserves_output() {
+        let mut cell = new_active_exec_command(
+            "live".into(),
+            vec!["work".into()],
+            vec![],
+            ExecCommandSource::Agent,
+            false,
+        );
+        assert!(cell.append_output("live", "still working\n"));
+        assert!(cell.is_active());
+        assert!(!cell.should_flush());
+        assert_eq!(cell.display_lines(80)[0].to_string(), "• Running work");
+        assert_eq!(
+            cell.transcript_lines(80).last().unwrap().to_string(),
+            "still working"
+        );
+        cell.mark_failed();
+        assert!(!cell.is_active());
+        assert!(cell.should_flush());
+        let transcript = cell.transcript_lines(80);
+        assert_eq!(transcript[1].to_string(), "still working");
+        assert!(
+            transcript
+                .last()
+                .unwrap()
+                .to_string()
+                .starts_with("✗ (1) • ")
+        );
+        assert!(!cell.append_output("live", "late output"));
+        assert_eq!(cell.transcript_lines(80), transcript);
+    }
+
+    #[test]
+    fn completed_stream_replaces_live_preview_and_rejects_late_deltas() {
+        let mut cell = new_active_exec_command(
+            "live".into(),
+            vec!["work".into()],
+            vec![],
+            ExecCommandSource::Agent,
+            false,
+        );
+        assert!(cell.append_output("live", "partial"));
+        assert!(cell.complete_call(
+            "live",
+            CommandOutput::from_shared_output(0, "complete".into()),
+            std::time::Duration::from_secs(1)
+        ));
+        assert!(!cell.append_output("live", "late"));
+        assert!(!cell.is_active());
+        assert!(cell.should_flush());
+        assert_eq!(
+            cell.transcript_lines(80)
+                .iter()
+                .map(Line::to_string)
+                .collect_vec(),
+            vec!["$ work", "complete", "✓ • 1s"]
+        );
+    }
+
+    #[test]
+    fn narrow_agent_output_stays_within_row_budget_without_false_line_counts() {
+        for width in [5, 10, 20, 40] {
+            let mut cell = new_active_exec_command(
+                "narrow".into(),
+                vec!["x".into()],
+                vec![],
+                ExecCommandSource::Agent,
+                false,
+            );
+            let output = format!("{}\n{}", "first ".repeat(200), "last ".repeat(200));
+            assert!(cell.complete_call(
+                "narrow",
+                CommandOutput::from_shared_output(0, output),
+                std::time::Duration::ZERO
+            ));
+            let lines = cell.display_lines(width);
+            let output = &lines[1..];
+            let rows = Paragraph::new(Text::from(output.to_vec()))
+                .wrap(Wrap { trim: false })
+                .line_count(width);
+            assert!(rows <= TOOL_CALL_MAX_LINES, "width {width}: {rows} rows");
+            let text = output.iter().map(Line::to_string).join("\n");
+            assert!(text.contains('…'));
+            assert!(!text.contains(" lines"), "{text}");
+        }
+    }
 
     #[test]
     fn completed_command_transcript_preserves_large_duration() {
@@ -798,9 +865,11 @@ mod tests {
             .line_count(width);
         let output_screen_rows = rendered_rows.saturating_sub(header_rows);
 
-        let contains_ellipsis = lines
-            .iter()
-            .any(|line| line.spans.iter().any(|span| span.content.contains("… +")));
+        let contains_ellipsis = lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.contains("… output truncated"))
+        });
 
         // Regression guard: previously this scenario could render hundreds of
         // wrapped rows because truncation happened before final viewport
@@ -826,7 +895,7 @@ mod tests {
     }
 
     #[test]
-    fn truncate_lines_middle_keeps_omitted_count_in_line_units() {
+    fn truncate_lines_middle_does_not_count_fragments_as_logical_lines() {
         let lines = vec![
             Line::from("  └ short"),
             Line::from("    this-is-a-very-long-token-that-wraps-many-rows"),
@@ -849,8 +918,8 @@ mod tests {
         assert!(
             rendered
                 .iter()
-                .any(|line| line.contains("… +6 lines (ctrl + t to view transcript)")),
-            "expected omitted hint to count hidden lines (not wrapped rows), got: {rendered:?}"
+                .any(|line| line.contains("… output truncated (ctrl + t to view transcript)")),
+            "expected a generic viewport hint, got: {rendered:?}"
         );
     }
 
@@ -893,7 +962,11 @@ mod tests {
         let streamed = format!("head-{}-tail", "x".repeat(1024 * 1024));
 
         assert!(cell.append_output("call-id", &streamed));
+        assert!(cell.is_active());
+        assert!(!cell.should_flush());
+        assert!(cell.active_start_time().is_some());
         let output = cell.calls[0].output.as_ref().expect("streamed output");
+        assert!(!output.is_success());
         let preview = output.lines().next().expect("preview line");
         let transcript = output.transcript_lines().next().expect("transcript line");
 

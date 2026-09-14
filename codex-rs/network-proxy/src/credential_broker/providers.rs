@@ -52,8 +52,35 @@ impl CredentialProvider {
         (self.request_header)(headers)
     }
 
+    pub(super) fn request_matches_credential(&self, headers: &HeaderMap, credential: &str) -> bool {
+        // Both current providers use Authorization. Reject duplicate fields rather than choosing
+        // a credential whose interpretation could differ from the upstream server's.
+        if headers
+            .get_all(rama_http::header::AUTHORIZATION)
+            .iter()
+            .count()
+            != 1
+        {
+            return false;
+        }
+        let Some(value) = self
+            .request_header(headers)
+            .and_then(|value| value.to_str().ok())
+        else {
+            return false;
+        };
+        let Some((scheme, value)) = value.split_once(' ') else {
+            return false;
+        };
+        let valid_scheme = scheme.eq_ignore_ascii_case("bearer")
+            || (std::ptr::eq(self, &github::PROVIDER) && scheme.eq_ignore_ascii_case("token"));
+        valid_scheme && value.trim_matches(' ') == credential
+    }
+
     pub(super) fn request_header_value(&self, value: &str) -> Option<HeaderValue> {
-        (self.request_header_value)(value)
+        let mut header = (self.request_header_value)(value)?;
+        header.set_sensitive(true);
+        Some(header)
     }
 
     pub(super) fn insert_request_header(&self, headers: &mut HeaderMap, value: HeaderValue) {
@@ -91,12 +118,27 @@ pub(super) fn credential_providers() -> impl Iterator<Item = &'static Credential
 
 fn shaped_dummy_value(real_value: &str, prefix: &str, minimum_len: usize) -> String {
     let target_len = real_value.len().max(minimum_len).max(prefix.len() + 16);
+    // Keep supported separators only when the remaining positions provide enough randomness.
+    // Otherwise replace the entire suffix, including unsupported UTF-8 bytes.
+    let preserve_shape = real_value.is_ascii()
+        && real_value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        && (prefix.len()..target_len)
+            .filter(|&index| {
+                real_value
+                    .as_bytes()
+                    .get(index)
+                    .is_none_or(u8::is_ascii_alphanumeric)
+            })
+            .count()
+            >= 16;
     let mut rng = rand::rng();
     let mut dummy = String::with_capacity(target_len);
     dummy.push_str(prefix);
     for index in prefix.len()..target_len {
         let character = match real_value.as_bytes().get(index).copied() {
-            Some(template) if !template.is_ascii_alphanumeric() => template,
+            Some(template) if preserve_shape && matches!(template, b'-' | b'_') => template,
             _ => DUMMY_ALPHANUMERIC[rng.random_range(0..DUMMY_ALPHANUMERIC.len())],
         };
         dummy.push(char::from(character));

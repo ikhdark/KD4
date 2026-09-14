@@ -358,15 +358,43 @@ pub(crate) fn create_raw_auth_client(
 }
 
 /// Builds the default Codex HTTP client wrapper for an auth endpoint.
-pub(crate) fn create_default_auth_client(
+pub(crate) async fn create_default_auth_client(
     endpoint: &str,
     auth_route_config: &AuthRouteConfig,
-) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
-    create_client_for_route(
-        auth_route_config.http_client_factory(),
-        endpoint,
-        ClientRouteClass::Auth,
-    )
+) -> std::io::Result<HttpClient> {
+    let factory = auth_route_config.http_client_factory().clone();
+    let endpoint = endpoint.to_owned();
+    let serialize_build = matches!(
+        factory.outbound_proxy_policy(),
+        OutboundProxyPolicy::RespectSystemProxy
+    ) && !is_sandboxed();
+    let permit = if serialize_build {
+        Some(
+            ROUTE_AWARE_CLIENT_BUILD_PERMIT
+                .acquire()
+                .await
+                .map_err(std::io::Error::other)?,
+        )
+    } else {
+        None
+    };
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let builder = default_http_client_builder().without_request_logging();
+        if matches!(
+            factory.outbound_proxy_policy(),
+            OutboundProxyPolicy::ReqwestDefault
+        ) || is_sandboxed()
+        {
+            build_default_client(builder).map_err(std::io::Error::other)
+        } else {
+            builder
+                .build_respecting_outbound_proxy_policy(&factory, &endpoint, ClientRouteClass::Auth)
+                .map_err(std::io::Error::from)
+        }
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 pub fn default_headers() -> HeaderMap {

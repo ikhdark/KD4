@@ -34,8 +34,18 @@ fn expected(
     }
 }
 
+#[cfg(windows)]
 fn create_symlink_loop(path: &Path) {
     std::os::windows::fs::symlink_file(
+        path.file_name().expect("override path should have a name"),
+        path,
+    )
+    .expect("create symlink loop");
+}
+
+#[cfg(unix)]
+fn create_symlink_loop(path: &Path) {
+    std::os::unix::fs::symlink(
         path.file_name().expect("override path should have a name"),
         path,
     )
@@ -98,14 +108,15 @@ async fn directory_override_falls_back_to_default() {
 }
 
 #[tokio::test]
-async fn recoverable_override_read_error_warns_and_falls_back_to_default() {
+async fn recoverable_override_metadata_error_warns_and_falls_back_to_default() {
     let home = TempDir::new().expect("temp dir");
     let override_path = home.path().join(LOCAL_AGENTS_MD_FILENAME);
     create_symlink_loop(&override_path);
     fs::write(home.path().join(DEFAULT_AGENTS_MD_FILENAME), "default").expect("write default");
-    let read_error = fs::read(&override_path).expect_err("symlink loop should not be readable");
+    let metadata_error =
+        fs::metadata(&override_path).expect_err("symlink loop metadata should fail");
     let warning = format!(
-        "Failed to read global AGENTS.md instructions from `{}`: {read_error}",
+        "Failed to read global AGENTS.md instructions from `{}`: {metadata_error}",
         override_path.display()
     );
 

@@ -474,7 +474,7 @@ async fn run_agent_job_loop(
                 break;
             }
             if !progressed {
-                wait_for_status_change(&active_items).await;
+                wait_for_status_change(active_items).await;
             }
             continue;
         }

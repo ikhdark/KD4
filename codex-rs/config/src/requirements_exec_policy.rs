@@ -233,6 +233,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn managed_policy_requires_restrictive_decisions() {
+        for (setting, missing) in [("", true), ("decision = 'allow'", false)] {
+            let config: RequirementsExecPolicyToml = toml::from_str(&format!(
+                "[[prefix_rules]]\npattern = [{{ token = 'git' }}]\n{setting}\n"
+            ))
+            .unwrap();
+            let error = config.to_policy().unwrap_err();
+            if missing {
+                assert!(matches!(
+                    error,
+                    RequirementsExecPolicyParseError::MissingDecision { rule_index: 0 }
+                ));
+            } else {
+                assert!(matches!(
+                    error,
+                    RequirementsExecPolicyParseError::AllowDecisionNotAllowed { rule_index: 0 }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn managed_restrictive_decisions_apply_only_to_matching_commands() {
+        for (decision, expected) in [
+            ("prompt", Decision::Prompt),
+            ("forbidden", Decision::Forbidden),
+        ] {
+            let input = format!(
+                "[[prefix_rules]]\npattern = [{{ any_of = ['git', 'jj'] }}, {{ token = 'push' }}]\ndecision = '{decision}'\n"
+            );
+            let config: RequirementsExecPolicyToml = toml::from_str(&input).unwrap();
+            let policy = config.to_policy().unwrap();
+            for program in ["git", "jj"] {
+                assert_eq!(
+                    policy
+                        .check(&[program.into(), "push".into()], &|_| Decision::Allow)
+                        .decision,
+                    expected
+                );
+                assert_eq!(
+                    policy
+                        .check(&[program.into(), "status".into()], &|_| Decision::Allow)
+                        .decision,
+                    Decision::Allow
+                );
+            }
+        }
+    }
+
+    #[test]
     fn requirements_policy_uses_shared_pattern_token_validation() {
         let config = RequirementsExecPolicyToml {
             prefix_rules: vec![RequirementsExecPolicyPrefixRuleToml {

@@ -3,6 +3,9 @@
 import argparse
 import codecs
 import re
+import os
+import stat
+import tempfile
 import sys
 from pathlib import Path
 
@@ -57,6 +60,7 @@ _INVALID_TEXT_RE = re.compile(
 )
 _READ_CHUNK_SIZE = 1024 * 1024
 _OUTPUT_BATCH_CHARS = 64 * 1024
+_MAX_REPORTED_ERRORS = 100
 _safe_char_cache: dict[int, str] = {}
 
 
@@ -92,20 +96,28 @@ def lint_utf8_ascii(filename: Path, fix: bool) -> bool:
 
 def lint_utf8_ascii_check(filename: Path) -> bool:
     """Check a file without loading non-ASCII files fully into memory."""
-    reporter = ErrorReporter()
+    reporter = ErrorReporter(filename)
     decoder = codecs.getincrementaldecoder("utf-8")()
     line = 1
     col = 1
     byte_line = 1
     byte_col = 1
     byte_offset = 0
+    previous_cr = False
+    text_previous_cr = False
 
     try:
         with open(filename, "rb") as f:
             while chunk := f.read(_READ_CHUNK_SIZE):
                 pending = decoder.getstate()[0]
                 if chunk.isascii() and not pending:
-                    line, col = scan_ascii_chunk(chunk, line, col, reporter)
+                    scan_chunk = (
+                        chunk[1:]
+                        if text_previous_cr and chunk.startswith(b"\n")
+                        else chunk
+                    )
+                    line, col = scan_ascii_chunk(scan_chunk, line, col, reporter)
+                    text_previous_cr = chunk.endswith(b"\r")
                 else:
                     try:
                         text = decoder.decode(chunk, final=False)
@@ -115,12 +127,27 @@ def lint_utf8_ascii_check(filename: Path) -> bool:
                             byte_offset - len(pending),
                             byte_line,
                             max(1, byte_col - len(pending)),
+                            filename=filename,
+                            previous_cr=previous_cr,
                         )
                         reporter.flush()
                         return True
-                    line, col = scan_text(text, line, col, reporter)
+                    if text:
+                        scan_chunk = (
+                            text[1:]
+                            if text_previous_cr and text.startswith("\n")
+                            else text
+                        )
+                        line, col = scan_text(scan_chunk, line, col, reporter)
+                        text_previous_cr = text.endswith("\r")
 
-                byte_line, byte_col = advance_position_bytes(chunk, byte_line, byte_col)
+                position_chunk = (
+                    chunk[1:] if previous_cr and chunk.startswith(b"\n") else chunk
+                )
+                byte_line, byte_col = advance_position_bytes(
+                    position_chunk, byte_line, byte_col
+                )
+                previous_cr = chunk.endswith(b"\r")
                 byte_offset += len(chunk)
     except OSError as error:
         print_file_error(filename, "read", error)
@@ -135,6 +162,8 @@ def lint_utf8_ascii_check(filename: Path) -> bool:
             byte_offset - len(pending),
             byte_line,
             max(1, byte_col - len(pending)),
+            filename=filename,
+            previous_cr=previous_cr,
         )
         reporter.flush()
         return True
@@ -156,10 +185,10 @@ def lint_utf8_ascii_fix(filename: Path) -> bool:
             return False
         text = raw.decode("utf-8")
     except UnicodeDecodeError as error:
-        print_decode_error(error, 0, 1, 1)
+        print_decode_error(error, 0, 1, 1, filename=filename)
         return True
 
-    reporter = ErrorReporter()
+    reporter = ErrorReporter(filename)
     scan_text(text, 1, 1, reporter)
     reporter.flush()
 
@@ -169,8 +198,24 @@ def lint_utf8_ascii_fix(filename: Path) -> bool:
         # newline="" prevents \r\n in the decoded text from being re-expanded
         # to \r\r\n by platform newline translation.
         try:
-            with open(filename, "w", encoding="utf-8", newline="") as f:
-                f.write(new_contents)
+            target = filename.resolve()
+            mode = stat.S_IMODE(target.stat().st_mode)
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    newline="",
+                    dir=target.parent,
+                    delete=False,
+                ) as f:
+                    temporary = Path(f.name)
+                    f.write(new_contents)
+                os.chmod(temporary, mode)
+                os.replace(temporary, target)
+            finally:
+                if temporary is not None and temporary.exists():
+                    temporary.unlink()
         except OSError as error:
             print_file_error(filename, "write", error)
             return True
@@ -182,7 +227,9 @@ def lint_utf8_ascii_fix(filename: Path) -> bool:
 
 
 class ErrorReporter:
-    def __init__(self) -> None:
+    def __init__(self, filename: Path | None = None) -> None:
+        self.filename = filename
+        self._reported_suppressed = 0
         self.error_count = 0
         self.fixable_count = 0
         self._parts: list[str] = []
@@ -198,8 +245,11 @@ class ErrorReporter:
         self.error_count += 1
         if codepoint in substitutions:
             self.fixable_count += 1
+        if self.error_count > _MAX_REPORTED_ERRORS:
+            return
         self._write(
-            f"Invalid character at line {lineno}, column {colno}: "
+            (f"{self.filename}: " if self.filename is not None else "")
+            + f"Invalid character at line {lineno}, column {colno}: "
             f"U+{codepoint:04X} ({safe_char_display(char, codepoint)})\n"
         )
 
@@ -208,6 +258,13 @@ class ErrorReporter:
             sys.stdout.write("".join(self._parts))
             self._parts.clear()
             self._chars = 0
+
+        suppressed = max(0, self.error_count - _MAX_REPORTED_ERRORS)
+        if suppressed > self._reported_suppressed:
+            print(
+                f"{self.filename}: {suppressed} additional errors omitted; {self.error_count} errors total."
+            )
+            self._reported_suppressed = suppressed
 
     def _write(self, message: str) -> None:
         self._parts.append(message)
@@ -269,12 +326,21 @@ def advance_position_text(text: str, line: int, col: int) -> tuple[int, int]:
 
 
 def print_decode_error(
-    error: UnicodeDecodeError, byte_offset: int, line: int, col: int
+    error: UnicodeDecodeError,
+    byte_offset: int,
+    line: int,
+    col: int,
+    *,
+    filename: Path | None = None,
+    previous_cr: bool = False,
 ) -> None:
     partial = error.object[: error.start]
+    if previous_cr and partial.startswith(b"\n"):
+        partial = partial[1:]
     line, col = advance_position_bytes(partial, line, col)
+    prefix = f"{filename}: " if filename is not None else ""
     sys.stdout.write(
-        "UTF-8 decoding error:\n"
+        f"{prefix}UTF-8 decoding error:\n"
         f"  byte offset: {byte_offset + error.start}\n"
         f"  reason: {error.reason}\n"
         f"  location: line {line}, column {col}\n"

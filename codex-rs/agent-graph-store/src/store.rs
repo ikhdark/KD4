@@ -20,6 +20,10 @@ pub trait AgentGraphStore: Send + Sync {
     /// `child_thread_id` has at most one persisted parent, and persisted edges must remain
     /// acyclic. Re-inserting the same child should update both the parent and status to match the
     /// supplied values, unless the requested reparenting would create a cycle.
+    ///
+    /// Topology validation and replacement must preserve these invariants under concurrent writes.
+    /// Rejected topology changes return `AgentGraphStoreError::InvalidRequest` and leave existing
+    /// relationships, including their statuses, unchanged.
     fn upsert_thread_spawn_edge(
         &self,
         parent_thread_id: ThreadId,

@@ -68,6 +68,16 @@ static HTTP_CLIENTS: LazyLock<Mutex<ReqwestHttpClients>> =
     LazyLock::new(|| Mutex::new(ReqwestHttpClients::default()));
 
 impl ReqwestHttpClient {
+    fn cached_client(redirect_policy: HttpRedirectPolicy) -> Option<Arc<SharedHttpClient>> {
+        // Cold construction holds this mutex while loading certificates. Never wait
+        // for it on an async worker.
+        let clients = HTTP_CLIENTS.try_lock().ok()?;
+        match redirect_policy {
+            HttpRedirectPolicy::Follow => clients.follow_redirects.clone(),
+            HttpRedirectPolicy::Stop => clients.stop_redirects.clone(),
+        }
+    }
+
     fn build_client(
         redirect_policy: HttpRedirectPolicy,
     ) -> Result<SharedHttpClient, ExecServerError> {
@@ -198,18 +208,25 @@ impl ReqwestHttpRequestRunner {
         // Client construction can read custom certificates and platform roots. Keep it off the
         // async worker and inside the same deadline as the request; this worker never sends HTTP.
         let redirect_policy = self.redirect_policy;
-        let prepare =
-            tokio::task::spawn_blocking(move || ReqwestHttpClient::shared_client(redirect_policy));
-        let client = match deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline, prepare)
-                .await
-                .map_err(|_| {
-                    internal_error("http/request timed out preparing HTTP client".into())
-                })?,
-            None => prepare.await,
-        }
-        .map_err(|error| internal_error(format!("http client preparation failed: {error}")))?
-        .map_err(|error| internal_error(error.to_string()))?;
+        let client = if let Some(client) = ReqwestHttpClient::cached_client(redirect_policy) {
+            client
+        } else {
+            let prepare = tokio::task::spawn_blocking(move || {
+                ReqwestHttpClient::shared_client(redirect_policy)
+            });
+            match deadline {
+                Some(deadline) => {
+                    tokio::time::timeout_at(deadline, prepare)
+                        .await
+                        .map_err(|_| {
+                            internal_error("http/request timed out preparing HTTP client".into())
+                        })?
+                }
+                None => prepare.await,
+            }
+            .map_err(|error| internal_error(format!("http client preparation failed: {error}")))?
+            .map_err(|error| internal_error(error.to_string()))?
+        };
         let mut request = client
             .request(method.clone(), params.url.clone())
             .headers(headers);
@@ -239,7 +256,7 @@ impl ReqwestHttpRequestRunner {
         };
         let status = response.status().as_u16();
         request_span.record("http.response.status_code", u64::from(status));
-        let headers = Self::response_headers(response.headers());
+        let headers = Self::response_headers(response.headers())?;
 
         if params.stream_response {
             return Ok((
@@ -347,13 +364,15 @@ impl ReqwestHttpRequestRunner {
         Ok(header_map)
     }
 
-    fn response_headers(headers: &HeaderMap) -> Vec<HttpHeader> {
+    fn response_headers(headers: &HeaderMap) -> Result<Vec<HttpHeader>, JSONRPCErrorError> {
         headers
             .iter()
-            .filter_map(|(name, value)| {
-                Some(HttpHeader {
+            .map(|(name, value)| {
+                Ok(HttpHeader {
                     name: name.as_str().to_string(),
-                    value: value.to_str().ok()?.to_string(),
+                    value: value.to_str().map_err(|_| {
+                        internal_error(format!("http/request response header `{name}` has an unsupported non-text value"))
+                    })?.to_string(),
                 })
             })
             .collect()
@@ -397,8 +416,19 @@ mod tests {
 
     use super::*;
 
+    // These tests deliberately occupy the global cache or blocking pool. Keep
+    // those manipulations separate when run with Cargo's in-process test runner.
+    static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Deliberately blocks the cache on a current-thread runtime to test preparation deadlines and cancellation"
+    )]
     fn http_client_preparation_obeys_deadline_and_cancellation_without_network() {
+        let _test_guard = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .max_blocking_threads(1)
@@ -409,6 +439,11 @@ mod tests {
                 .await
                 .expect("listener");
             for (stream, cancel) in [(false, false), (true, false), (false, true)] {
+                // Force the cold/contended preparation path regardless of other tests
+                // warming the process-global cache.
+                let cache_guard = HTTP_CLIENTS
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
                 let (started_tx, started_rx) = tokio::sync::oneshot::channel();
                 let blocker = tokio::task::spawn_blocking(move || {
@@ -444,6 +479,7 @@ mod tests {
                     request,
                 )
                 .await;
+                drop(cache_guard);
                 release_tx.send(()).expect("release worker");
                 blocker.await.expect("worker joined");
                 tokio::task::spawn_blocking(|| ())
@@ -477,6 +513,9 @@ mod tests {
 
     #[test]
     fn request_runners_reuse_client_per_redirect_policy() {
+        let _test_guard = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let first = ReqwestHttpClient::shared_client(HttpRedirectPolicy::Follow)
             .expect("build first HTTP client");
         let second = ReqwestHttpClient::shared_client(HttpRedirectPolicy::Follow)
@@ -486,6 +525,92 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert!(!Arc::ptr_eq(&first, &stop));
+    }
+
+    #[test]
+    fn warm_http_request_does_not_wait_for_blocking_pool() {
+        let _test_guard = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ReqwestHttpClient::shared_client(HttpRedirectPolicy::Follow).expect("warm cache");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/warm"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("cached"))
+                .mount(&server)
+                .await;
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+            });
+            started_rx.await.expect("blocking pool occupied");
+            let response = tokio::time::timeout(
+                Duration::from_secs(2),
+                ReqwestHttpClient.http_request(HttpRequestParams {
+                    method: "GET".into(),
+                    url: format!("{}/warm", server.uri()),
+                    headers: Vec::new(),
+                    body: None,
+                    timeout_ms: Some(1_000),
+                    redirect_policy: HttpRedirectPolicy::Follow,
+                    request_id: "warm".into(),
+                    stream_response: false,
+                }),
+            )
+            .await;
+            release_tx.send(()).expect("release blocker");
+            blocker.await.expect("blocker joined");
+            let response = response
+                .expect("warm request deadline")
+                .expect("warm request");
+            assert_eq!(response.status, 200);
+            assert_eq!(response.body.into_inner(), b"cached");
+        });
+    }
+
+    #[tokio::test]
+    async fn http_request_rejects_non_text_response_headers() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).insert_header(
+                HeaderName::from_static("x-binary"),
+                HeaderValue::from_bytes(&[0xff]).expect("header bytes"),
+            ))
+            .mount(&server)
+            .await;
+        for stream in [false, true] {
+            let runner = ReqwestHttpRequestRunner::new(Some(2_000), HttpRedirectPolicy::Follow);
+            let result = runner
+                .run(HttpRequestParams {
+                    method: "GET".into(),
+                    url: server.uri(),
+                    headers: Vec::new(),
+                    body: None,
+                    timeout_ms: Some(2_000),
+                    redirect_policy: HttpRedirectPolicy::Follow,
+                    request_id: "headers".into(),
+                    stream_response: stream,
+                })
+                .await;
+            let error = result
+                .err()
+                .expect("unsupported header must fail the request");
+            assert!(
+                error
+                    .message
+                    .contains("response header `x-binary` has an unsupported non-text value"),
+                "{}",
+                error.message
+            );
+        }
     }
 
     #[tokio::test]

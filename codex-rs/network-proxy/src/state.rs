@@ -373,14 +373,11 @@ pub fn validate_policy_against_constraints(
     }
 
     if let Some(allow_unix_sockets) = &constraints.allow_unix_sockets {
-        let allowed_set: HashSet<String> = allow_unix_sockets
-            .iter()
-            .map(|s| s.to_ascii_lowercase())
-            .collect();
+        let allowed_set: HashSet<&String> = allow_unix_sockets.iter().collect();
         validate(config_allow_unix_sockets, move |candidate| {
             let mut invalid = Vec::new();
             for entry in candidate {
-                if !allowed_set.contains(&entry.to_ascii_lowercase()) {
+                if !allowed_set.contains(entry) {
                     invalid.push(entry.clone());
                 }
             }

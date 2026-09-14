@@ -217,6 +217,12 @@ impl CatalogRequestProcessor {
             cursor,
             include_hidden,
         } = params;
+        let start = match cursor {
+            Some(cursor) => cursor
+                .parse::<usize>()
+                .map_err(|_| invalid_request(format!("invalid cursor: {cursor}")))?,
+            None => 0,
+        };
         let models = supported_models(
             models_manager,
             include_hidden.unwrap_or(false),
@@ -226,21 +232,8 @@ impl CatalogRequestProcessor {
         .map_err(|err| internal_error(format!("failed to list models: {err}")))?;
         let total = models.len();
 
-        if total == 0 {
-            return Ok(ModelListResponse {
-                data: Vec::new(),
-                next_cursor: None,
-            });
-        }
-
         let effective_limit = limit.unwrap_or(total as u32).max(1) as usize;
         let effective_limit = effective_limit.min(total);
-        let start = match cursor {
-            Some(cursor) => cursor
-                .parse::<usize>()
-                .map_err(|_| invalid_request(format!("invalid cursor: {cursor}")))?,
-            None => 0,
-        };
 
         if start > total {
             return Err(invalid_request(format!(
@@ -284,6 +277,13 @@ impl CatalogRequestProcessor {
             limit,
             thread_id,
         } = params;
+        let start = match cursor {
+            Some(cursor) => match cursor.parse::<usize>() {
+                Ok(idx) => idx,
+                Err(_) => return Err(invalid_request(format!("invalid cursor: {cursor}"))),
+            },
+            None => 0,
+        };
         let config = match thread_id.as_deref() {
             Some(thread_id) => {
                 let thread_id = ThreadId::from_string(thread_id)
@@ -358,23 +358,10 @@ impl CatalogRequestProcessor {
             .collect::<Vec<_>>();
 
         let total = data.len();
-        if total == 0 {
-            return Ok(ExperimentalFeatureListResponse {
-                data: Vec::new(),
-                next_cursor: None,
-            });
-        }
 
         // Clamp to 1 so limit=0 cannot return a non-advancing page.
         let effective_limit = limit.unwrap_or(total as u32).max(1) as usize;
         let effective_limit = effective_limit.min(total);
-        let start = match cursor {
-            Some(cursor) => match cursor.parse::<usize>() {
-                Ok(idx) => idx,
-                Err(_) => return Err(invalid_request(format!("invalid cursor: {cursor}"))),
-            },
-            None => 0,
-        };
 
         if start > total {
             return Err(invalid_request(format!(
@@ -578,65 +565,67 @@ impl CatalogRequestProcessor {
 
         let auth = self.auth_manager.auth().await;
         let plugins_manager = self.thread_manager.plugins_manager();
-        let mut data = Vec::new();
-        for cwd in cwds {
-            let config = match self
-                .config_manager
-                .load_for_cwd(
-                    /*request_overrides*/ None,
-                    ConfigOverrides::default(),
-                    Some(cwd.clone()),
-                )
-                .await
-            {
-                Ok(config) => config,
-                Err(err) => {
-                    let error_path = cwd.clone();
-                    data.push(codex_app_server_protocol::HooksListEntry {
-                        cwd,
-                        hooks: Vec::new(),
-                        warnings: Vec::new(),
-                        errors: vec![codex_app_server_protocol::HookErrorInfo {
-                            path: error_path,
-                            message: err.to_string(),
-                        }],
-                    });
-                    continue;
-                }
-            };
-            let workspace_codex_plugins_enabled = workspace_codex_plugins_enabled(
-                &config,
-                auth.as_ref(),
-                Some(&self.workspace_settings_cache),
-            )
-            .await;
-            let plugins_enabled =
-                config.features.enabled(Feature::Plugins) && workspace_codex_plugins_enabled;
-            let plugin_hooks = if plugins_enabled {
-                let plugins_input = config.plugins_config_input();
-                let plugin_outcome = plugins_manager.plugins_for_config(&plugins_input).await;
-                codex_core_plugins::PluginHookLoadOutcome {
-                    hook_sources: plugin_outcome.effective_plugin_hook_sources(),
-                    hook_load_warnings: plugin_outcome.effective_plugin_hook_warnings(),
-                }
-            } else {
-                codex_core_plugins::PluginHookLoadOutcome::default()
-            };
-            let hooks_config = codex_hooks::HooksConfig {
-                feature_enabled: config.features.enabled(Feature::CodexHooks),
-                bypass_hook_trust: config.bypass_hook_trust,
-                config_layer_stack: Some(config.config_layer_stack.as_ref().clone()),
-                plugin_hook_sources: plugin_hooks.hook_sources,
-                plugin_hook_load_warnings: plugin_hooks.hook_load_warnings,
-                ..Default::default()
-            };
-            let hooks =
-                match tokio::task::spawn_blocking(move || codex_hooks::list_hooks(hooks_config))
+        let data = futures::stream::iter(cwds.into_iter().map(|cwd| {
+            let auth = &auth;
+            let plugins_manager = &plugins_manager;
+            async move {
+                let config = match self
+                    .config_manager
+                    .load_for_cwd(
+                        /*request_overrides*/ None,
+                        ConfigOverrides::default(),
+                        Some(cwd.clone()),
+                    )
                     .await
+                {
+                    Ok(config) => config,
+                    Err(err) => {
+                        let error_path = cwd.clone();
+                        return codex_app_server_protocol::HooksListEntry {
+                            cwd,
+                            hooks: Vec::new(),
+                            warnings: Vec::new(),
+                            errors: vec![codex_app_server_protocol::HookErrorInfo {
+                                path: error_path,
+                                message: err.to_string(),
+                            }],
+                        };
+                    }
+                };
+                let workspace_codex_plugins_enabled = workspace_codex_plugins_enabled(
+                    &config,
+                    auth.as_ref(),
+                    Some(&self.workspace_settings_cache),
+                )
+                .await;
+                let plugins_enabled =
+                    config.features.enabled(Feature::Plugins) && workspace_codex_plugins_enabled;
+                let plugin_hooks = if plugins_enabled {
+                    let plugins_input = config.plugins_config_input();
+                    let plugin_outcome = plugins_manager.plugins_for_config(&plugins_input).await;
+                    codex_core_plugins::PluginHookLoadOutcome {
+                        hook_sources: plugin_outcome.effective_plugin_hook_sources(),
+                        hook_load_warnings: plugin_outcome.effective_plugin_hook_warnings(),
+                    }
+                } else {
+                    codex_core_plugins::PluginHookLoadOutcome::default()
+                };
+                let hooks_config = codex_hooks::HooksConfig {
+                    feature_enabled: config.features.enabled(Feature::CodexHooks),
+                    bypass_hook_trust: config.bypass_hook_trust,
+                    config_layer_stack: Some(config.config_layer_stack.as_ref().clone()),
+                    plugin_hook_sources: plugin_hooks.hook_sources,
+                    plugin_hook_load_warnings: plugin_hooks.hook_load_warnings,
+                    ..Default::default()
+                };
+                let hooks = match tokio::task::spawn_blocking(move || {
+                    codex_hooks::list_hooks(hooks_config)
+                })
+                .await
                 {
                     Ok(hooks) => hooks,
                     Err(err) => {
-                        data.push(codex_app_server_protocol::HooksListEntry {
+                        return codex_app_server_protocol::HooksListEntry {
                             errors: vec![codex_app_server_protocol::HookErrorInfo {
                                 path: cwd.clone(),
                                 message: format!("hook discovery task failed: {err}"),
@@ -644,17 +633,20 @@ impl CatalogRequestProcessor {
                             cwd,
                             hooks: Vec::new(),
                             warnings: Vec::new(),
-                        });
-                        continue;
+                        };
                     }
                 };
-            data.push(codex_app_server_protocol::HooksListEntry {
-                cwd,
-                hooks: hooks_to_info(&hooks.hooks),
-                warnings: hooks.warnings,
-                errors: Vec::new(),
-            });
-        }
+                codex_app_server_protocol::HooksListEntry {
+                    cwd,
+                    hooks: hooks_to_info(&hooks.hooks),
+                    warnings: hooks.warnings,
+                    errors: Vec::new(),
+                }
+            }
+        }))
+        .buffered(SKILLS_LIST_CWD_CONCURRENCY)
+        .collect()
+        .await;
         Ok(HooksListResponse { data })
     }
 
@@ -694,5 +686,56 @@ impl CatalogRequestProcessor {
                 }
             })
             .map_err(|err| internal_error(format!("failed to update skill settings: {err}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_http_client::HttpClientFactory;
+    use codex_http_client::OutboundProxyPolicy;
+    use codex_models_manager::manager::StaticModelsManager;
+    use codex_protocol::openai_models::ModelsResponse;
+    use pretty_assertions::assert_eq;
+
+    #[tokio::test]
+    async fn model_list_validates_cursors_even_when_catalog_is_empty() {
+        let models: SharedModelsManager = Arc::new(StaticModelsManager::new(
+            None,
+            ModelsResponse { models: Vec::new() },
+        ));
+        let http_clients = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+
+        for cursor in [None, Some("0")] {
+            let response = CatalogRequestProcessor::list_models(
+                models.clone(),
+                http_clients.clone(),
+                ModelListParams {
+                    cursor: cursor.map(str::to_string),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the start of an empty catalog is a valid page");
+            assert_eq!(response.data, Vec::new());
+            assert_eq!(response.next_cursor, None);
+        }
+
+        for (cursor, expected) in [
+            ("invalid", "invalid cursor: invalid"),
+            ("1", "cursor 1 exceeds total models 0"),
+        ] {
+            let error = CatalogRequestProcessor::list_models(
+                models.clone(),
+                http_clients.clone(),
+                ModelListParams {
+                    cursor: Some(cursor.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("an empty catalog must not bypass cursor validation");
+            assert_eq!(error, invalid_request(expected));
+        }
     }
 }

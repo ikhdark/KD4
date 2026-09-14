@@ -228,6 +228,8 @@ impl CodexErr {
             | CodexErr::InternalServerError
             | CodexErr::InternalAgentDied => CodexErrorInfo::InternalServerError,
             CodexErr::UnsupportedOperation(_)
+            | CodexErr::InvalidRequest(_)
+            | CodexErr::InvalidImageRequest()
             | CodexErr::ThreadNotFound(_)
             | CodexErr::AgentLimitReached { .. } => CodexErrorInfo::BadRequest,
             CodexErr::Sandbox(_) => CodexErrorInfo::SandboxError,
@@ -309,7 +311,7 @@ const UNEXPECTED_RESPONSE_BODY_MAX_BYTES: usize = 1000;
 impl UnexpectedResponseError {
     fn display_body(&self) -> String {
         if let Some(message) = self.extract_error_message() {
-            return message;
+            return truncate_with_ellipsis(&message, UNEXPECTED_RESPONSE_BODY_MAX_BYTES);
         }
 
         let trimmed_body = self.body.trim();
@@ -410,21 +412,6 @@ pub struct UsageLimitReachedError {
 
 impl std::fmt::Display for UsageLimitReachedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(limit_name) = self
-            .rate_limits
-            .as_ref()
-            .and_then(|snapshot| snapshot.limit_name.as_deref())
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            && !limit_name.eq_ignore_ascii_case("codex")
-        {
-            return write!(
-                f,
-                "You've hit your usage limit for {limit_name}. Switch to another model now,{}",
-                retry_suffix_after_or(self.resets_at.as_ref())
-            );
-        }
-
         if let Some(rate_limit_reached_type) = self.rate_limit_reached_type {
             match rate_limit_reached_type {
                 RateLimitReachedType::WorkspaceOwnerCreditsDepleted => {
@@ -455,6 +442,21 @@ impl std::fmt::Display for UsageLimitReachedError {
                     // Generic limits intentionally use the existing promo or plan copy below.
                 }
             }
+        }
+
+        if let Some(limit_name) = self
+            .rate_limits
+            .as_ref()
+            .and_then(|snapshot| snapshot.limit_name.as_deref())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            && !limit_name.eq_ignore_ascii_case("codex")
+        {
+            return write!(
+                f,
+                "You've hit your usage limit for {limit_name}. Switch to another model now,{}",
+                retry_suffix_after_or(self.resets_at.as_ref())
+            );
         }
 
         if let Some(promo_message) = &self.promo_message {

@@ -383,7 +383,7 @@ async fn revoke_remote_control_client_does_not_retry_forbidden() {
     assert_eq!(
         err.to_string(),
         format!(
-            "remote control client revoke failed at `{remote_control_url}wham/remote/control/environments/env-123/clients/client-123`: HTTP 403 Forbidden, request-id: request-123, cf-ray: ray-123, body: forbidden"
+            "remote control client revoke failed at `{remote_control_url}wham/remote/control/environments/env-123/clients/client-123`: HTTP 403 Forbidden, request-id: request-123, cf-ray: ray-123, body: <omitted non-JSON response body>"
         )
     );
 }
@@ -417,6 +417,9 @@ async fn list_remote_control_clients_preserves_decode_error_context() {
         )
     );
     assert!(err.to_string().contains("HTTP 200 OK"));
-    assert!(err.to_string().contains("body: {"));
+    assert!(
+        err.to_string()
+            .contains("body: <omitted non-JSON response body>")
+    );
     assert!(err.to_string().contains("decode error:"));
 }

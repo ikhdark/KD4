@@ -338,6 +338,7 @@ mod worker {
     const MIN_ROLLOUT_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
     const RUN_MARKER_STALE_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
     const TEMP_FILE_STALE_AFTER: Duration = RUN_MARKER_STALE_AFTER;
+    // Stop scheduling at this deadline, then drain in-flight compression jobs.
     const WORKER_MAX_RUNTIME: Duration = Duration::from_secs(5 * 60 * 60);
     const RUN_MARKER_FILE_NAME: &str = "rollout-compression.lock";
     const MAX_CONCURRENT_COMPRESSION_JOBS: usize = 2;
@@ -350,58 +351,59 @@ mod worker {
         failed: usize,
     }
 
+    // Keep the inode stable: ownership is the OS lock, and nonempty contents
+    // record the cooldown after a completed run.
     pub(super) struct CompressionRunMarker {
-        path: PathBuf,
-        remove_on_drop: bool,
+        file: File,
+        clear_on_drop: bool,
     }
 
     impl CompressionRunMarker {
         pub(super) fn try_claim(codex_home: &Path) -> io::Result<Option<Self>> {
             let marker_dir = codex_home.join(".tmp");
-            std::fs::create_dir_all(marker_dir.as_path())?;
-            let path = marker_dir.join(RUN_MARKER_FILE_NAME);
-            match create_run_marker_file(path.as_path()) {
-                Ok(()) => return Ok(Some(Self::new(path))),
-                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(err) => return Err(err),
+            std::fs::create_dir_all(&marker_dir)?;
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(marker_dir.join(RUN_MARKER_FILE_NAME))?;
+            match file.try_lock() {
+                Ok(()) => {}
+                Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+                Err(err) => return Err(err.into()),
             }
-
-            let stale = std::fs::metadata(path.as_path())
-                .and_then(|metadata| metadata.modified())
+            let metadata = file.metadata()?;
+            let stale = metadata
+                .modified()
                 .ok()
                 .and_then(|modified| SystemTime::now().duration_since(modified).ok())
                 .is_some_and(|age| age >= RUN_MARKER_STALE_AFTER);
-            if !stale {
+            if metadata.len() > 0 && !stale {
                 return Ok(None);
             }
-            match std::fs::remove_file(path.as_path()) {
-                Ok(()) => {}
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err),
-            }
-            match create_run_marker_file(path.as_path()) {
-                Ok(()) => Ok(Some(Self::new(path))),
-                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(None),
-                Err(err) => Err(err),
-            }
-        }
-
-        fn new(path: PathBuf) -> Self {
-            Self {
-                path,
-                remove_on_drop: true,
-            }
+            file.set_len(0)?;
+            writeln!(
+                file,
+                "pid={} started_at={:?}",
+                std::process::id(),
+                SystemTime::now()
+            )?;
+            Ok(Some(Self {
+                file,
+                clear_on_drop: true,
+            }))
         }
 
         pub(super) fn persist(mut self) {
-            self.remove_on_drop = false;
+            self.clear_on_drop = false;
         }
     }
 
     impl Drop for CompressionRunMarker {
         fn drop(&mut self) {
-            if self.remove_on_drop {
-                let _ = std::fs::remove_file(self.path.as_path());
+            if self.clear_on_drop {
+                let _ = self.file.set_len(0);
             }
         }
     }
@@ -451,7 +453,6 @@ mod worker {
         metrics::run("started");
         let started_at = Instant::now();
         let result = async {
-            cleanup_stale_temps(codex_home.as_path()).await?;
             let mut stats = CompressionStats::default();
             for root in [
                 codex_home.join(ARCHIVED_SESSIONS_SUBDIR),
@@ -483,20 +484,6 @@ mod worker {
         metrics::run("completed");
         metrics::run_duration("completed", started_at.elapsed());
         marker.persist();
-        Ok(())
-    }
-
-    fn create_run_marker_file(path: &Path) -> io::Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?;
-        writeln!(
-            file,
-            "pid={} started_at={:?}",
-            std::process::id(),
-            SystemTime::now()
-        )?;
         Ok(())
     }
 
@@ -554,6 +541,7 @@ mod worker {
                 if !file_type.is_file() {
                     continue;
                 }
+                cleanup_stale_temp(&entry).await;
                 let Some(rollout_file) = RolloutFile::from_path(path) else {
                     continue;
                 };
@@ -853,79 +841,36 @@ mod worker {
         file.set_permissions(permissions.clone())
     }
 
-    async fn cleanup_stale_temps(codex_home: &Path) -> io::Result<()> {
-        for root in [
-            codex_home.join(SESSIONS_SUBDIR),
-            codex_home.join(ARCHIVED_SESSIONS_SUBDIR),
-        ] {
-            cleanup_stale_temps_in_root(root.as_path()).await?;
+    async fn cleanup_stale_temp(entry: &tokio::fs::DirEntry) {
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.ends_with(TEMP_SUFFIX))
+        {
+            return;
         }
-        Ok(())
-    }
-
-    async fn cleanup_stale_temps_in_root(root: &Path) -> io::Result<()> {
-        if !tokio::fs::try_exists(root).await.unwrap_or(false) {
-            return Ok(());
+        let stale = entry
+            .metadata()
+            .await
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .is_some_and(|age| age >= TEMP_FILE_STALE_AFTER);
+        if !stale {
+            return;
         }
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            let mut read_dir = match tokio::fs::read_dir(dir.as_path()).await {
-                Ok(read_dir) => read_dir,
-                Err(err) => {
-                    warn!(
-                        "failed to read rollout temp cleanup directory {}: {err}",
-                        dir.display()
-                    );
-                    continue;
-                }
-            };
-            while let Some(entry) = read_dir.next_entry().await? {
-                let path = entry.path();
-                let file_type = match entry.file_type().await {
-                    Ok(file_type) => file_type,
-                    Err(err) => {
-                        warn!(
-                            "failed to read rollout temp cleanup file type {}: {err}",
-                            path.display()
-                        );
-                        continue;
-                    }
-                };
-                if file_type.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                if file_type.is_file()
-                    && path
-                        .file_name()
-                        .and_then(OsStr::to_str)
-                        .is_some_and(|name| name.ends_with(TEMP_SUFFIX))
-                {
-                    let stale = entry
-                        .metadata()
-                        .await
-                        .ok()
-                        .and_then(|metadata| metadata.modified().ok())
-                        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-                        .is_some_and(|age| age >= TEMP_FILE_STALE_AFTER);
-                    if !stale {
-                        continue;
-                    }
-                    match tokio::fs::remove_file(path.as_path()).await {
-                        Ok(()) => metrics::temp_cleanup("removed"),
-                        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                        Err(err) => {
-                            metrics::temp_cleanup("failed");
-                            warn!(
-                                "failed to remove stale rollout temp {}: {err}",
-                                path.display()
-                            );
-                        }
-                    }
-                }
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => metrics::temp_cleanup("removed"),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                metrics::temp_cleanup("failed");
+                warn!(
+                    "failed to remove stale rollout temp {}: {err}",
+                    path.display()
+                );
             }
         }
-        Ok(())
     }
 }
 

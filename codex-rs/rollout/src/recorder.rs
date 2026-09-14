@@ -563,7 +563,11 @@ impl RolloutRecorder {
             SortDirection::Desc => {
                 list_threads_from_files_desc(
                     codex_home,
-                    page_size.saturating_mul(2),
+                    if state_db_ctx.is_some() {
+                        page_size.saturating_mul(2)
+                    } else {
+                        page_size
+                    },
                     cursor,
                     sort_key,
                     allowed_sources,
@@ -604,8 +608,9 @@ impl RolloutRecorder {
         // Reconcile each filesystem hit once, then use SQLite as the authoritative projection.
         // Filesystem filtering already reduced the complete persisted-settings history, so the
         // same current provider/cwd facts drive both candidate selection and the database row.
+        let mut reconciled_ids = HashSet::new();
         for item in &fs_page.items {
-            state_integration::reconcile_rollout(
+            if state_integration::reconcile_rollout(
                 state_db_ctx.as_deref(),
                 item.path.as_path(),
                 default_provider,
@@ -614,7 +619,20 @@ impl RolloutRecorder {
                 Some(archived),
                 /*new_thread_memory_mode*/ None,
             )
-            .await;
+            .await
+            {
+                reconciled_ids.extend(item.thread_id);
+            }
+        }
+
+        if !listing_has_metadata_filters {
+            let page = page_from_filesystem_scan(fs_page, sort_direction, page_size, sort_key);
+            return Ok(overlay_thread_item_metadata_from_state_db(
+                state_db_ctx.as_deref(),
+                page,
+                &reconciled_ids,
+            )
+            .await);
         }
 
         let db_page = state_integration::list_threads_db(
@@ -653,6 +671,7 @@ impl RolloutRecorder {
                 return Ok(overlay_thread_item_metadata_from_state_db(
                     state_db_ctx.as_deref(),
                     page,
+                    &reconciled_ids,
                 )
                 .await);
             }
@@ -681,6 +700,7 @@ impl RolloutRecorder {
                     return Ok(overlay_thread_item_metadata_from_state_db(
                         state_db_ctx.as_deref(),
                         page,
+                        &reconciled_ids,
                     )
                     .await);
                 }
@@ -693,13 +713,17 @@ impl RolloutRecorder {
                 return Ok(overlay_thread_item_metadata_from_state_db(
                     state_db_ctx.as_deref(),
                     page,
+                    &reconciled_ids,
                 )
                 .await);
             }
             let page = page_from_filesystem_scan(fs_page, sort_direction, page_size, sort_key);
-            return Ok(
-                overlay_thread_item_metadata_from_state_db(state_db_ctx.as_deref(), page).await,
-            );
+            return Ok(overlay_thread_item_metadata_from_state_db(
+                state_db_ctx.as_deref(),
+                page,
+                &reconciled_ids,
+            )
+            .await);
         }
         if listing_has_metadata_filters {
             let page = page_from_filesystem_scan(fs_page, sort_direction, page_size, sort_key);
@@ -708,9 +732,12 @@ impl RolloutRecorder {
                 "db_error",
                 /*telemetry_override*/ None,
             );
-            return Ok(
-                overlay_thread_item_metadata_from_state_db(state_db_ctx.as_deref(), page).await,
-            );
+            return Ok(overlay_thread_item_metadata_from_state_db(
+                state_db_ctx.as_deref(),
+                page,
+                &reconciled_ids,
+            )
+            .await);
         }
         // If SQLite listing still fails, return the filesystem page rather than failing the list.
         warn_thread_list_db_fallback();
@@ -961,7 +988,7 @@ impl RolloutRecorder {
     }
 
     /// Queue canonical items in writer order without forcing the writer to flush. A later
-    /// persist/flush/shutdown command is the durability barrier for the queued prefix.
+    /// persist/flush/shutdown command is the write-completion barrier for the queued prefix.
     pub async fn record_canonical_items_ordered(
         &self,
         items: &[RolloutItem],
@@ -1315,6 +1342,7 @@ fn page_from_filesystem_scan(
 async fn overlay_thread_item_metadata_from_state_db(
     state_db_ctx: Option<&StateRuntime>,
     mut page: ThreadsPage,
+    reconciled_ids: &HashSet<ThreadId>,
 ) -> ThreadsPage {
     let Some(state_db_ctx) = state_db_ctx else {
         return page;
@@ -1334,6 +1362,15 @@ async fn overlay_thread_item_metadata_from_state_db(
                 continue;
             }
         };
+        if !reconciled_ids.contains(&thread_id) {
+            if !metadata.title.trim().is_empty()
+                && metadata.first_user_message.as_deref().map(str::trim)
+                    != Some(metadata.title.trim())
+            {
+                item.title = Some(metadata.title);
+            }
+            continue;
+        }
         overlay_thread_item_metadata(
             item,
             thread_item_from_state_metadata(metadata, /*parent_thread_id*/ None),
@@ -1775,7 +1812,7 @@ impl RolloutWriterState {
             return;
         }
         // Automatic writes retain coalesced token counts until a turn boundary
-        // or an explicit durability barrier.
+        // or an explicit write-completion barrier.
         if let Err(err) = self.write_pending_with_recovery("record").await {
             self.enter_recovery_mode(&err);
         }
@@ -1892,38 +1929,42 @@ impl RolloutWriterState {
             .map(|info| info.path.as_path())
             .unwrap_or(self.rollout_path.as_path());
         let path = path.to_path_buf();
-        let inspect_existing = self.meta.is_some();
-        let (file, has_existing_content) = tokio::task::spawn_blocking(move || {
-            let file = open_log_file(path.as_path())?;
-            let has_existing_content = inspect_existing && file.file.metadata()?.len() > 0;
-            Ok::<_, IoError>((file, has_existing_content))
-        })
-        .await
-        .map_err(IoError::other)??;
-        // Multiple recorders for the same newly-created thread can be initialized before any of
-        // them materializes the rollout. Re-check under the append lock so a later writer does not
-        // append another canonical session_meta or an already-persisted manifest.
-        let existing_rollout_state = if has_existing_content {
-            Some(RolloutRecorder::existing_rollout_state(&file.path).await?)
+        let file = tokio::task::spawn_blocking(move || open_log_file(path.as_path()))
+            .await
+            .map_err(IoError::other)??;
+        self.writer = Some(file.into_jsonl_writer());
+        self.deferred_log_file_info = None;
+        Ok(())
+    }
+
+    // Called while holding the write lock through the initial append.
+    async fn reconcile_initial_state(&mut self) -> std::io::Result<()> {
+        let existing_rollout_state = if self.meta.is_some()
+            && let Some(writer) = self.writer.as_ref()
+            && writer.file.metadata().await?.len() > 0
+        {
+            Some(RolloutRecorder::existing_rollout_state(&writer.path).await?)
         } else {
             None
         };
-        self.writer = Some(file.into_jsonl_writer());
-        self.deferred_log_file_info = None;
         if let Some((has_session_meta, mut persisted_tool_manifests)) = existing_rollout_state {
-            if has_session_meta {
-                self.meta = None;
-            }
             let known_manifests = self.tool_manifests.clone();
-            for item in &mut self.pending_items {
+            let mut rebased_items = self.pending_items.clone();
+            for item in &mut rebased_items {
                 let RolloutItem::ToolManifest(manifest) = item else {
                     continue;
                 };
                 let Some(full) = known_manifests.manifest(&manifest.hash).cloned() else {
                     continue;
                 };
-                *manifest = persisted_tool_manifests.encode(manifest.hash.clone(), full);
+                *manifest = persisted_tool_manifests
+                    .encode(manifest.hash.clone(), full)
+                    .map_err(IoError::other)?;
             }
+            if has_session_meta {
+                self.meta = None;
+            }
+            self.pending_items = rebased_items;
             self.tool_manifests = persisted_tool_manifests;
         }
         Ok(())
@@ -1946,6 +1987,13 @@ impl RolloutWriterState {
 
     async fn write_pending_once(&mut self) -> std::io::Result<()> {
         self.ensure_writer_open().await?;
+        let path = self.rollout_path.clone();
+        let write_lock = tokio::task::spawn_blocking(move || {
+            compression::lock_rollout_for_write_blocking(&path)
+        })
+        .await
+        .map_err(IoError::other)??;
+        self.reconcile_initial_state().await?;
         let session_meta_item = self.session_meta_item_if_needed().await?;
         let Some(writer) = self.writer.as_mut() else {
             return Err(IoError::other("rollout writer is not open"));
@@ -1958,7 +2006,9 @@ impl RolloutWriterState {
         if items.is_empty() {
             return Ok(());
         }
-        writer.write_rollout_items(&items).await?;
+        writer
+            .write_rollout_items_locked(&items, &write_lock)
+            .await?;
         if session_meta_item.is_some() {
             self.meta = None;
         }
@@ -2028,9 +2078,14 @@ async fn rollout_writer(
                 let _ = resume.await;
             }
         }
+        if let Some(message) = state.retry_blocked_error.as_ref() {
+            let err = IoError::other(message.clone());
+            writer_task.mark_failed(&err);
+            return Err(err);
+        }
     }
 
-    // Closing the last sender still owes durability for accepted records.
+    // Closing the last sender still must finish writes for accepted records.
     state.shutdown().await?;
     writer_task.finish_shutdown(true);
     Ok(())
@@ -2093,8 +2148,9 @@ enum FailedAppendRecovery {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 enum JsonlWriteFault {
-    AfterPartialWrite(usize),
-    AfterCompleteWrite,
+    Partial(usize),
+    Complete,
+    Unexpected,
 }
 
 #[derive(serde::Serialize)]
@@ -2111,6 +2167,21 @@ impl JsonlWriter {
     }
 
     async fn write_rollout_items(&mut self, rollout_items: &[&RolloutItem]) -> std::io::Result<()> {
+        let path = self.path.clone();
+        let write_lock = tokio::task::spawn_blocking(move || {
+            compression::lock_rollout_for_write_blocking(&path)
+        })
+        .await
+        .map_err(IoError::other)??;
+        self.write_rollout_items_locked(rollout_items, &write_lock)
+            .await
+    }
+
+    async fn write_rollout_items_locked(
+        &mut self,
+        rollout_items: &[&RolloutItem],
+        _write_lock: &compression::RolloutWriteLock,
+    ) -> std::io::Result<()> {
         if rollout_items.is_empty() {
             return Ok(());
         }
@@ -2144,12 +2215,6 @@ impl JsonlWriter {
         {
             self.append_transaction_count += 1;
         }
-        let path = self.path.clone();
-        let _write_lock = tokio::task::spawn_blocking(move || {
-            compression::lock_rollout_for_write_blocking(path.as_path())
-        })
-        .await
-        .map_err(IoError::other)??;
         let append_start = self.file.metadata().await?.len();
         let write_result = self.write_line_bytes(bytes).await;
         let Err(append_error) = write_result else {
@@ -2171,12 +2236,15 @@ impl JsonlWriter {
         #[cfg(test)]
         if let Some(fault) = self.write_fault.take() {
             match fault {
-                JsonlWriteFault::AfterPartialWrite(max_bytes) => {
+                JsonlWriteFault::Partial(max_bytes) => {
                     let partial_len = max_bytes.min(line.len().saturating_sub(1));
                     self.file.write_all(&line[..partial_len]).await?;
                 }
-                JsonlWriteFault::AfterCompleteWrite => {
+                JsonlWriteFault::Complete => {
                     self.file.write_all(line).await?;
+                }
+                JsonlWriteFault::Unexpected => {
+                    self.file.write_all(b"unexpected bytes").await?;
                 }
             }
             self.file.flush().await?;
@@ -2344,31 +2412,28 @@ async fn resume_candidate_matches_cwd(
     cwd: &Path,
     default_provider: &str,
 ) -> bool {
-    let Ok((items, _, _)) = RolloutRecorder::load_rollout_items(rollout_path).await else {
+    let mut latest_cwd = None;
+    let mut accumulator = metadata::RolloutMetadataAccumulator::default();
+    let Ok((_, parse_errors)) = RolloutRecorder::for_each_rollout_item(rollout_path, |item| {
+        if let RolloutItem::TurnContext(context) = &item {
+            latest_cwd = Some(context.cwd.clone());
+        }
+        accumulator.push(item, rollout_path, default_provider);
+    })
+    .await
+    else {
         return false;
     };
-    if let Some(latest_turn_context_cwd) = items.iter().rev().find_map(|item| match item {
-        RolloutItem::TurnContext(turn_context) => Some(&turn_context.cwd),
-        RolloutItem::SessionMeta(_)
-        | RolloutItem::ToolManifest(_)
-        | RolloutItem::SamplingBoundary(_)
-        | RolloutItem::ResponseItem(_)
-        | RolloutItem::InterAgentCommunication(_)
-        | RolloutItem::InterAgentCommunicationMetadata { .. }
-        | RolloutItem::Compacted(_)
-        | RolloutItem::WorldState(_)
-        | RolloutItem::EventMsg(_) => None,
-    }) {
-        return cwd_matches(latest_turn_context_cwd.as_path(), cwd);
+    if let Some(latest_cwd) = latest_cwd {
+        return cwd_matches(&latest_cwd, cwd);
     }
-
     if cached_cwd.is_some_and(|session_cwd| cwd_matches(session_cwd, cwd)) {
         return true;
     }
-
-    metadata::extract_metadata_from_rollout(rollout_path, default_provider)
+    accumulator
+        .finish(rollout_path, default_provider, parse_errors)
         .await
-        .is_ok_and(|outcome| cwd_matches(outcome.metadata.cwd.as_path(), cwd))
+        .is_ok_and(|outcome| cwd_matches(&outcome.metadata.cwd, cwd))
 }
 
 async fn select_resume_path_from_db_page(

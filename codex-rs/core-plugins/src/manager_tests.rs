@@ -97,7 +97,12 @@ fn plugin_config_clones_preserve_layer_stack_identity_for_cache_lookup() {
         String::new(),
     );
     let independent_key = PluginLoadCacheKey::from_config(&independently_loaded, false);
-    assert_ne!(shared_key, independent_key);
+    assert!(!Arc::ptr_eq(
+        &input.config_layer_stack,
+        &independently_loaded.config_layer_stack
+    ));
+    assert_eq!(shared_key, independent_key);
+    assert_ne!(shared_key, PluginLoadCacheKey::from_config(&input, true));
 }
 
 fn config_layer_stack_with_requirements(
@@ -322,15 +327,26 @@ path = {:?}
         ),
     );
 
+    let impostor = codex_home.path().join("a-impostor");
+    write_plugin(&impostor, "sample", "sample");
+    write_file(
+        &impostor.join(".agents/plugins/marketplace.json"),
+        r#"{"name":"company","plugins":[{"name":"sample","source":"./sample"}]}"#,
+    );
+    let impostor = AbsolutePathBuf::try_from(impostor).unwrap();
     let allowed_outcome = manager
         .list_marketplaces_for_config(
             &allowed,
-            std::slice::from_ref(&subdirectory),
+            &[impostor, subdirectory.clone()],
             /*include_openai_curated*/ false,
         )
         .expect("list allowed marketplace");
     assert_eq!(allowed_outcome.marketplaces.len(), 1);
     assert_eq!(allowed_outcome.marketplaces[0].name, "company");
+    assert_eq!(
+        allowed_outcome.marketplaces[0].path,
+        repo_root.join(".agents/plugins/marketplace.json")
+    );
 
     let blocked_outcome = manager
         .list_marketplaces_for_config(
@@ -5781,7 +5797,7 @@ fn refresh_curated_plugin_cache_replaces_existing_local_version_with_short_sha_v
 }
 
 #[test]
-fn refresh_curated_plugin_cache_reinstalls_missing_configured_plugin_with_current_short_version() {
+fn refresh_curated_plugin_cache_reinstalls_missing_configured_plugin_with_current_revision() {
     let tmp = tempfile::tempdir().unwrap();
     let curated_root = curated_plugins_repo_path(tmp.path());
     write_openai_curated_marketplace(&curated_root, &["slack"]);
@@ -5949,24 +5965,36 @@ fn refresh_curated_plugin_cache_returns_false_when_configured_plugins_are_curren
 }
 
 #[test]
-fn refresh_curated_plugin_cache_migrates_full_sha_cache_version_to_short_version() {
+fn refresh_curated_plugin_cache_migrates_short_cache_version_and_distinguishes_colliding_revisions()
+{
     let tmp = tempfile::tempdir().unwrap();
     let curated_root = curated_plugins_repo_path(tmp.path());
     write_openai_curated_marketplace(&curated_root, &["slack"]);
-    let plugin_id = PluginId::new(
-        "slack".to_string(),
-        OPENAI_CURATED_MARKETPLACE_NAME.to_string(),
-    )
-    .unwrap();
+    let plugin_id = PluginId::parse("slack@openai-curated").unwrap();
     write_plugin(
         &tmp.path().join("plugins/cache/openai-curated"),
-        &format!("slack/{TEST_CURATED_PLUGIN_SHA}"),
+        "slack/01234567",
         "slack",
     );
-
+    let store = PluginStore::new(tmp.path().to_path_buf());
     assert!(
-        refresh_curated_plugin_cache(tmp.path(), TEST_CURATED_PLUGIN_SHA, &[plugin_id])
-            .expect("cache refresh should migrate the full sha cache version")
+        refresh_curated_plugin_cache(tmp.path(), TEST_CURATED_PLUGIN_SHA, std::slice::from_ref(&plugin_id))
+            .unwrap()
+    );
+    assert_eq!(
+        store.active_plugin_version(&plugin_id).as_deref(),
+        Some(TEST_CURATED_PLUGIN_SHA)
+    );
+    assert!(
+        !tmp.path()
+            .join("plugins/cache/openai-curated/slack/01234567")
+            .exists()
+    );
+    let next_revision = "01234567ffffffffffffffffffffffffffffffff";
+    assert!(refresh_curated_plugin_cache(tmp.path(), next_revision, std::slice::from_ref(&plugin_id)).unwrap());
+    assert_eq!(
+        store.active_plugin_version(&plugin_id).as_deref(),
+        Some(next_revision)
     );
     assert!(
         !tmp.path()
@@ -5974,13 +6002,6 @@ fn refresh_curated_plugin_cache_migrates_full_sha_cache_version_to_short_version
                 "plugins/cache/openai-curated/slack/{TEST_CURATED_PLUGIN_SHA}"
             ))
             .exists()
-    );
-    assert!(
-        tmp.path()
-            .join(format!(
-                "plugins/cache/openai-curated/slack/{TEST_CURATED_PLUGIN_CACHE_VERSION}"
-            ))
-            .is_dir()
     );
 }
 
@@ -6449,4 +6470,246 @@ async fn plugin_hooks_for_layer_stack_loads_configured_plugin_hooks() {
         "hooks/hooks.json"
     );
     assert_eq!(outcome.hook_load_warnings, Vec::<String>::new());
+}
+
+#[test]
+fn curated_refresh_preserves_declared_plugins_with_unusable_sources() {
+    let tmp = TempDir::new().unwrap();
+    let curated = curated_plugins_repo_path(tmp.path());
+    let plugin_id = PluginId::parse("slack@openai-curated").unwrap();
+    write_plugin(
+        &tmp.path().join("plugins/cache/openai-curated"),
+        "slack/local",
+        "slack",
+    );
+    let marker = tmp
+        .path()
+        .join("plugins/cache/openai-curated/slack/local/keep.txt");
+    write_file(&marker, "installed content");
+    for source in [
+        r#"{"source":"future","path":"./slack"}"#,
+        r#"{"source":"local","path":"../outside"}"#,
+    ] {
+        write_file(
+            &curated.join(".agents/plugins/marketplace.json"),
+            &format!(
+                r#"{{"name":"openai-curated","plugins":[{{"name":"slack","source":{source}}}]}}"#
+            ),
+        );
+        assert!(
+            !refresh_curated_plugin_cache(
+                tmp.path(),
+                TEST_CURATED_PLUGIN_SHA,
+                std::slice::from_ref(&plugin_id)
+            )
+            .unwrap()
+        );
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "installed content");
+    }
+}
+
+#[test]
+fn non_curated_refresh_retains_discovery_errors_while_refreshing_valid_plugins() {
+    let tmp = TempDir::new().unwrap();
+    let broken = tmp.path().join("broken/.agents/plugins/marketplace.json");
+    write_file(&broken, "{");
+    let valid = tmp.path().join("valid");
+    write_plugin_with_version(&valid, "sample", "sample", Some("2.0.0"));
+    write_file(
+        &valid.join(".agents/plugins/marketplace.json"),
+        r#"{"name":"company","plugins":[{"name":"sample","source":"./sample"}]}"#,
+    );
+    let result = crate::loader::refresh_non_curated_plugin_cache_detailed(
+        tmp.path(),
+        &[
+            AbsolutePathBuf::try_from(broken.clone()).unwrap(),
+            AbsolutePathBuf::try_from(valid).unwrap(),
+        ],
+        &["sample@company".to_string()],
+    )
+    .unwrap();
+    assert!(result.cache_refreshed);
+    assert_eq!(result.errors.len(), 1);
+    assert!(
+        result.errors[0]
+            .message
+            .contains(&broken.display().to_string())
+    );
+    let store = PluginStore::new(tmp.path().to_path_buf());
+    assert_eq!(
+        store
+            .active_plugin_version(&PluginId::parse("sample@company").unwrap())
+            .as_deref(),
+        Some("2.0.0")
+    );
+}
+
+#[test]
+fn non_curated_background_refresh_respects_disabled_config_and_retries_discovery_failures() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("marketplace");
+    let manifest = root.join(".agents/plugins/marketplace.json");
+    write_file(&manifest, "{");
+    write_plugin_with_version(&root, "sample", "sample", Some("2.0.0"));
+    let stack = config_layer_stack_with_requirements(
+        tmp.path(),
+        r#"[plugins."sample@company"]
+enabled=true"#,
+        "[marketplaces]\nrestrict_to_allowed_sources=false",
+    );
+    let mut config = PluginsConfigInput::new(stack, false, false, String::new());
+    let manager = Arc::new(PluginsManager::new(tmp.path().to_path_buf()));
+    let roots = vec![AbsolutePathBuf::try_from(root).unwrap()];
+    manager.schedule_non_curated_plugin_cache_refresh(
+        &config,
+        &roots,
+        NonCuratedCacheRefreshMode::IfVersionChanged,
+    );
+    assert!(
+        manager
+            .non_curated_cache_refresh_state
+            .read()
+            .unwrap()
+            .requested
+            .is_none()
+    );
+    assert!(
+        !manager
+            .non_curated_cache_refresh_state
+            .read()
+            .unwrap()
+            .in_flight
+    );
+    let plugin_id = PluginId::parse("sample@company").unwrap();
+    assert!(!manager.store.is_installed(&plugin_id));
+    config.plugins_enabled = true;
+    let wait = || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while manager
+            .non_curated_cache_refresh_state
+            .read()
+            .unwrap()
+            .in_flight
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "refresh worker did not complete"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    manager.schedule_non_curated_plugin_cache_refresh(
+        &config,
+        &roots,
+        NonCuratedCacheRefreshMode::IfVersionChanged,
+    );
+    wait();
+    assert!(
+        manager
+            .non_curated_cache_refresh_state
+            .read()
+            .unwrap()
+            .last_refreshed
+            .is_none()
+    );
+    write_file(
+        &manifest,
+        r#"{"name":"company","plugins":[{"name":"sample","source":"./sample"}]}"#,
+    );
+    manager.schedule_non_curated_plugin_cache_refresh(
+        &config,
+        &roots,
+        NonCuratedCacheRefreshMode::IfVersionChanged,
+    );
+    wait();
+    assert!(
+        manager
+            .non_curated_cache_refresh_state
+            .read()
+            .unwrap()
+            .last_refreshed
+            .is_some()
+    );
+    assert_eq!(
+        manager.store.active_plugin_version(&plugin_id).as_deref(),
+        Some("2.0.0")
+    );
+}
+
+#[test]
+fn installed_marketplace_discovery_ignores_unknown_source_types() {
+    let tmp = TempDir::new().unwrap();
+    for name in ["legacy", "git", "unknown", "malformed"] {
+        write_file(
+            &marketplace_install_root(tmp.path())
+                .join(name)
+                .join(".agents/plugins/marketplace.json"),
+            &format!(r#"{{"name":"{name}","plugins":[]}}"#),
+        );
+    }
+    let stack = config_layer_stack_with_requirements(
+        tmp.path(),
+        r#"
+[marketplaces.legacy]
+source="legacy"
+[marketplaces.git]
+source_type="git"
+source="https://example.com/plugins.git"
+[marketplaces.unknown]
+source_type="future"
+source="anything"
+[marketplaces.malformed]
+source_type=123
+"#,
+        "[marketplaces]\nrestrict_to_allowed_sources=false",
+    );
+    let roots = installed_marketplace_roots_from_layer_stack(&stack, tmp.path());
+    assert_eq!(
+        roots,
+        vec![
+            AbsolutePathBuf::try_from(marketplace_install_root(tmp.path()).join("git")).unwrap(),
+            AbsolutePathBuf::try_from(marketplace_install_root(tmp.path()).join("legacy")).unwrap()
+        ]
+    );
+}
+
+#[test]
+fn async_marketplace_listing_yields_and_preserves_catalog_results() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    let home = TempDir::new().unwrap();
+    write_openai_curated_marketplace(&curated_plugins_repo_path(home.path()), &["slack"]);
+    let manager = PluginsManager::new(home.path().to_path_buf());
+    let config = PluginsConfigInput::new(ConfigLayerStack::default(), true, false, String::new());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let worker = runtime.spawn_blocking(move || {
+        started_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    runtime.block_on(async {
+        let mut listing = Box::pin(manager.list_marketplaces_for_config_async(&config, true));
+        let initial = listing
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()));
+        release_tx.send(()).unwrap();
+        assert!(
+            matches!(initial, Poll::Pending),
+            "filesystem discovery must yield"
+        );
+        worker.await.unwrap();
+        let outcome = listing.await.unwrap();
+        assert!(outcome.errors.is_empty());
+        assert_eq!(outcome.marketplaces.len(), 1);
+        assert_eq!(
+            outcome.marketplaces[0].plugins[0].id,
+            "slack@openai-curated"
+        );
+    });
 }

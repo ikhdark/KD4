@@ -28,6 +28,7 @@ pub(crate) fn lock_windows_sandbox_tests() -> anyhow::Result<std::fs::File> {
     let lock_path = resources_dir.join(".windows-sandbox-tests.lock");
     let lock = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)
@@ -101,6 +102,7 @@ pub(crate) fn stage_windows_sandbox_helpers_in(
     let staging_lock_path = resources_dir.join(".stage-windows-sandbox-helpers.lock");
     let staging_lock = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&staging_lock_path)

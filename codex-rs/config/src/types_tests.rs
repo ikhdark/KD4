@@ -87,6 +87,13 @@ fn memories_config_clamps_count_limits_to_nonzero_values() {
             ..MemoriesConfig::default()
         }
     );
+    let config = MemoriesConfig::from(MemoriesToml {
+        max_raw_memories_for_consolidation: Some(4097),
+        max_rollouts_per_startup: Some(129),
+        ..Default::default()
+    });
+    assert_eq!(config.max_raw_memories_for_consolidation, 4096);
+    assert_eq!(config.max_rollouts_per_startup, 128);
 }
 
 #[test]
@@ -114,4 +121,17 @@ fn memories_config_clamps_rate_limit_remaining_threshold() {
             ..MemoriesConfig::default()
         }
     );
+}
+
+#[test]
+fn rust_defaults_match_empty_config_tables() {
+    assert_eq!(
+        AppsDefaultConfig::default(),
+        toml::from_str::<AppsDefaultConfig>("").unwrap()
+    );
+    assert_eq!(
+        AppConfig::default(),
+        toml::from_str::<AppConfig>("").unwrap()
+    );
+    assert_eq!(Tui::default(), toml::from_str::<Tui>("").unwrap());
 }

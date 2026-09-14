@@ -216,3 +216,58 @@ command = "company-cli"
         }
     );
 }
+#[test]
+fn mixed_transport_identities_are_never_silently_accepted() {
+    for command in ["'server'", "{ executable = 'server', args = [] }"] {
+        for url in [
+            "'https://example.com/mcp'",
+            "{ match = 'prefix', value = 'https://' }",
+        ] {
+            let input = format!("[identity]\ncommand = {command}\nurl = {url}");
+            assert!(
+                toml::from_str::<McpServerRequirement>(&input).is_err(),
+                "{input}"
+            );
+        }
+    }
+}
+
+#[test]
+fn legacy_identity_keeps_ignoring_unrelated_inner_fields() {
+    for (identity, matching, nonmatching) in [
+        (
+            "command = 'server'",
+            "command = 'server'\nargs = ['different']",
+            "command = 'other'",
+        ),
+        (
+            "url = 'https://example.com/mcp'",
+            "url = 'https://example.com/mcp'",
+            "url = 'https://example.com/mcp/extra'",
+        ),
+    ] {
+        let requirement: McpServerRequirement = toml::from_str(&format!(
+            "[identity]\n{identity}\nargs = ['legacy']\nunrelated = 'ignored'"
+        ))
+        .expect("legacy identities tolerate fields other than the two transport identities");
+        assert!(requirement.matches(&toml::from_str(matching).unwrap()));
+        assert!(!requirement.matches(&toml::from_str(nonmatching).unwrap()));
+    }
+}
+
+#[test]
+fn parsed_url_requirement_checks_url_and_transport() {
+    let requirement: McpServerRequirement = toml::from_str(
+        "[identity]\nurl = { match = 'regex', expression = 'https://[a-z]+[.]example[.]com/mcp' }",
+    )
+    .unwrap();
+    for (url, expected) in [
+        ("https://docs.example.com/mcp", true),
+        ("https://docs.example.com/mcp/extra", false),
+        ("https://other.com/mcp", false),
+    ] {
+        let server = toml::from_str(&format!("url = '{url}'")).unwrap();
+        assert_eq!(requirement.matches(&server), expected, "{url}");
+    }
+    assert!(!requirement.matches(&stdio_server("https://docs.example.com/mcp", &[])));
+}

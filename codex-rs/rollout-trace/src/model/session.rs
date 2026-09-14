@@ -56,7 +56,8 @@ pub enum AgentOrigin {
     Root,
     Spawned {
         parent_thread_id: AgentThreadId,
-        /// Interaction edge that carried the spawn task.
+        /// Stable spawn relationship identity. The corresponding edge may be
+        /// absent when only origin metadata, without delivery evidence, was observed.
         spawn_edge_id: EdgeId,
         /// Stable path segment/task name selected by the parent/tool call.
         task_name: String,

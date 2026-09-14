@@ -27,14 +27,13 @@ pub fn ansi_escape_line(s: &str) -> Line<'static> {
     // Normalize tabs to spaces to avoid odd gutter collisions in transcript mode.
     let s = expand_tabs(s);
     let text = ansi_escape(&s);
-    match text.lines.as_slice() {
-        [] => "".into(),
-        [only] => only.clone(),
-        [first, rest @ ..] => {
-            tracing::warn!("ansi_escape_line: expected a single line, got {first:?} and {rest:?}");
-            first.clone()
-        }
+    if text.lines.len() > 1 {
+        tracing::warn!(
+            line_count = text.lines.len(),
+            "ansi_escape_line: expected a single line"
+        );
     }
+    text.lines.into_iter().next().unwrap_or_default()
 }
 
 pub fn ansi_escape(s: &str) -> Text<'static> {

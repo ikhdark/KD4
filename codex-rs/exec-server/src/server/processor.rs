@@ -105,8 +105,21 @@ async fn run_connection(
         }
     });
 
-    // Process inbound events sequentially to preserve initialize/initialized ordering.
-    while let Some(event) = incoming_rx.recv().await {
+    let mut reads = tokio::task::JoinSet::new();
+    // Preserve handshake and mutation ordering. Reads only snapshot process state
+    // under its lock and can wait independently without blocking later commands.
+    loop {
+        let event = tokio::select! {
+            _ = disconnected_rx.changed() => break,
+            result = reads.join_next(), if !reads.is_empty() => {
+                if !matches!(result, Some(Ok(true))) { break; }
+                continue;
+            }
+            event = incoming_rx.recv() => {
+                let Some(event) = event else { break; };
+                event
+            }
+        };
         if !handler.is_session_attached() {
             debug!("exec-server connection evicted after session resume");
             break;
@@ -129,35 +142,63 @@ async fn run_connection(
                 codex_exec_server_protocol::JSONRPCMessage::Request(request) => {
                     let request_started_at = Instant::now();
                     if let Some((method, route)) = router.request_route(request.method.as_str()) {
+                        let independent_read =
+                            method == crate::protocol::EXEC_READ_METHOD && handler.is_initialized();
+                        if independent_read && reads.len() >= CHANNEL_CAPACITY {
+                            if outgoing_tx
+                                .send(RpcServerOutboundMessage::Error {
+                                    request_id: request.id,
+                                    error: invalid_request(
+                                        "too many concurrent process reads".to_string(),
+                                    ),
+                                })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            continue;
+                        }
                         let request_span = request_span(method, &request);
-                        let message = tokio::select! {
-                            message = route(Arc::clone(&handler), request).instrument(request_span.clone()) => message,
-                            _ = disconnected_rx.changed() => {
+                        let response =
+                            route(Arc::clone(&handler), request).instrument(request_span.clone());
+                        let mut request_disconnected = disconnected_rx.clone();
+                        let outgoing_tx = outgoing_tx.clone();
+                        let telemetry = telemetry.clone();
+                        let operation = async move {
+                            let message = tokio::select! {
+                                message = response => message,
+                                _ = request_disconnected.changed() => {
+                                    request_span.record("result", "disconnected");
+                                    telemetry.request_completed(method, "disconnected", request_started_at.elapsed());
+                                    return false;
+                                }
+                            };
+                            let result = request_result(&message);
+                            if let Some(message) = message
+                                && outgoing_tx.send(message).await.is_err()
+                            {
                                 request_span.record("result", "disconnected");
                                 telemetry.request_completed(
                                     method,
                                     "disconnected",
                                     request_started_at.elapsed(),
                                 );
-                                debug!("exec-server transport disconnected while handling request");
-                                break;
+                                return false;
                             }
-                        };
-                        let result = request_result(&message);
-                        if let Some(message) = message
-                            && outgoing_tx.send(message).await.is_err()
-                        {
-                            request_span.record("result", "disconnected");
+                            request_span.record("result", result);
                             telemetry.request_completed(
                                 method,
-                                "disconnected",
+                                result,
                                 request_started_at.elapsed(),
                             );
+                            true
+                        };
+                        if independent_read {
+                            reads.spawn(operation);
+                        } else if !operation.await {
                             break;
                         }
-                        request_span.record("result", result);
-                        telemetry.request_completed(method, result, request_started_at.elapsed());
-                        drop(request_span);
                     } else {
                         let method = "unknown";
                         let request_span = request_span(method, &request);
@@ -231,6 +272,8 @@ async fn run_connection(
         }
     }
 
+    reads.abort_all();
+    while reads.join_next().await.is_some() {}
     handler.shutdown().await;
     drop(handler);
     drop(outgoing_tx);
@@ -404,6 +447,59 @@ mod tests {
             .await
             .expect("processor should exit")
             .expect("processor should join");
+    }
+
+    #[tokio::test]
+    async fn connection_serves_metadata_while_process_read_is_pending() {
+        let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());
+        let (mut writer, mut lines, task) =
+            spawn_test_connection(Arc::clone(&registry), "independent-read");
+        send_request(
+            &mut writer,
+            1,
+            INITIALIZE_METHOD,
+            &InitializeParams {
+                client_name: "test".into(),
+                resume_session_id: None,
+            },
+        )
+        .await;
+        let _: InitializeResponse = read_response(&mut lines, 1).await;
+        send_notification(&mut writer, INITIALIZED_METHOD, &()).await;
+        let process_id = ProcessId::from("pending-read");
+        send_request(
+            &mut writer,
+            2,
+            EXEC_METHOD,
+            &exec_params(process_id.clone()),
+        )
+        .await;
+        let response: ExecResponse = read_response(&mut lines, 2).await;
+        assert_eq!(response.process_id, process_id);
+        send_request(
+            &mut writer,
+            3,
+            EXEC_READ_METHOD,
+            &ReadParams {
+                process_id,
+                after_seq: None,
+                max_bytes: None,
+                wait_ms: Some(5_000),
+            },
+        )
+        .await;
+        send_request(&mut writer, 4, ENVIRONMENT_INFO_METHOD, &()).await;
+        let info: EnvironmentInfo = timeout(Duration::from_secs(1), read_response(&mut lines, 4))
+            .await
+            .expect("metadata must complete before the pending read");
+        assert_eq!(info, EnvironmentInfo::local());
+        drop(writer);
+        drop(lines);
+        timeout(Duration::from_secs(1), task)
+            .await
+            .expect("read must cancel on disconnect")
+            .unwrap();
+        registry.shutdown().await;
     }
 
     #[test]

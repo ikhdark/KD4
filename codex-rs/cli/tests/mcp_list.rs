@@ -90,6 +90,10 @@ async fn list_and_get_render_expected_output() -> Result<()> {
             "name": "docs",
             "enabled": true,
             "disabled_reason": null,
+            "environment_id": "local",
+            "required": false,
+            "supports_parallel_tool_calls": false,
+            "default_tools_approval_mode": null,
             "transport": {
               "type": "stdio",
               "command": "docs-server",
@@ -98,7 +102,7 @@ async fn list_and_get_render_expected_output() -> Result<()> {
                 "4000"
               ],
               "env": {
-                "TOKEN": "secret"
+                "TOKEN": "*****"
               },
               "env_vars": [
                 "APP_TOKEN",
@@ -135,6 +139,34 @@ async fn list_and_get_render_expected_output() -> Result<()> {
         .success()
         .stdout(contains("\"name\": \"docs\"").and(contains("\"enabled\": true")));
 
+    for args in [
+        vec!["mcp", "list", "--json"],
+        vec!["mcp", "get", "docs", "--json"],
+    ] {
+        let hidden = codex_command(codex_home.path())?
+            .args(&args)
+            .assert()
+            .success();
+        let hidden: JsonValue = serde_json::from_slice(&hidden.get_output().stdout)?;
+        let entry = if hidden.is_array() {
+            &hidden[0]
+        } else {
+            &hidden
+        };
+        assert_eq!(entry["transport"]["env"]["TOKEN"], "*****");
+        let revealed = codex_command(codex_home.path())?
+            .args(&args)
+            .arg("--show-secrets")
+            .assert()
+            .success();
+        let revealed: JsonValue = serde_json::from_slice(&revealed.get_output().stdout)?;
+        let entry = if revealed.is_array() {
+            &revealed[0]
+        } else {
+            &revealed
+        };
+        assert_eq!(entry["transport"]["env"]["TOKEN"], "secret");
+    }
     Ok(())
 }
 
@@ -162,5 +194,48 @@ async fn get_disabled_server_shows_single_line() -> Result<()> {
     let stdout = String::from_utf8(get_output.stdout)?;
     assert_eq!(stdout.trim_end(), "docs (disabled)");
 
+    Ok(())
+}
+
+#[test]
+fn selected_profile_controls_mcp_inspection_and_masks_http_headers() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        r#"[mcp_servers.docs]
+command = "global-server"
+"#,
+    )?;
+    std::fs::write(
+        codex_home.path().join("work.config.toml"),
+        r#"[mcp_servers.docs]
+url = "http://127.0.0.1:9/mcp"
+required = true
+supports_parallel_tool_calls = true
+http_headers = { Authorization = "Bearer secret" }
+"#,
+    )?;
+    for command in [
+        vec!["mcp", "list", "--json"],
+        vec!["mcp", "get", "docs", "--json"],
+    ] {
+        for reveal in [false, true] {
+            let mut cmd = codex_command(codex_home.path())?;
+            cmd.args(["--profile", "work"]).args(&command);
+            if reveal {
+                cmd.arg("--show-secrets");
+            }
+            let output = cmd.assert().success();
+            let value: JsonValue = serde_json::from_slice(&output.get_output().stdout)?;
+            let entry = if value.is_array() { &value[0] } else { &value };
+            assert_eq!(entry["transport"]["url"], "http://127.0.0.1:9/mcp");
+            assert_eq!(entry["required"], true);
+            assert_eq!(entry["supports_parallel_tool_calls"], true);
+            assert_eq!(
+                entry["transport"]["http_headers"]["Authorization"],
+                if reveal { "Bearer secret" } else { "*****" }
+            );
+        }
+    }
     Ok(())
 }

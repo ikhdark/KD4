@@ -2,16 +2,18 @@ use super::*;
 
 impl StateRuntime {
     pub async fn get_backfill_state(&self) -> anyhow::Result<crate::BackfillState> {
-        self.ensure_backfill_state_row().await?;
-        let row = sqlx::query(
-            r#"
-SELECT status, last_watermark, last_success_at
-FROM backfill_state
-WHERE id = 1
-            "#,
-        )
-        .fetch_one(self.pool.as_ref())
-        .await?;
+        let query =
+            "SELECT status, last_watermark, last_success_at FROM backfill_state WHERE id = 1";
+        let row = match sqlx::query(query)
+            .fetch_optional(self.pool.as_ref())
+            .await?
+        {
+            Some(row) => row,
+            None => {
+                self.ensure_backfill_state_row().await?;
+                sqlx::query(query).fetch_one(self.pool.as_ref()).await?
+            }
+        };
         crate::BackfillState::try_from_row(&row)
     }
 

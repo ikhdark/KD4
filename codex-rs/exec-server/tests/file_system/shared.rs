@@ -480,7 +480,7 @@ async fn file_system_walk_returns_a_bounded_tree(
     assert_eq!(
         directory_bounded,
         WalkOutcome {
-            entries: root_entries,
+            entries: root_entries.clone(),
             errors: Vec::new(),
             truncated: true,
         }
@@ -500,17 +500,11 @@ async fn file_system_walk_returns_a_bounded_tree(
         )
         .await
         .with_context(|| format!("mode={implementation}"))?;
-    assert_eq!(
-        bounded,
-        WalkOutcome {
-            entries: vec![WalkEntry {
-                path: PathUri::from_host_native_path(&nested_dir)?,
-                kind: WalkEntryKind::Directory,
-            }],
-            errors: Vec::new(),
-            truncated: true,
-        }
-    );
+    // Producer-bounded reads need not return the globally sorted first name.
+    assert_eq!(bounded.entries.len(), 1);
+    assert!(root_entries.contains(&bounded.entries[0]));
+    assert!(bounded.errors.is_empty());
+    assert!(bounded.truncated);
 
     Ok(())
 }

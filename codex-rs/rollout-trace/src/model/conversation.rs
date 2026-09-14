@@ -36,6 +36,12 @@ pub struct ConversationItem {
     /// Routing metadata carried by a Responses `agent_message` item.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_message: Option<AgentMessageMetadata>,
+    /// Model-authored callee; absent on outputs and non-tool items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// Namespace supplied alongside the callee, when present in the source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_namespace: Option<String>,
     pub body: ConversationBody,
     /// Protocol/model `call_id` for function/custom tool call and output items.
     pub call_id: Option<ModelVisibleCallId>,
@@ -125,6 +131,10 @@ pub enum ConversationPart {
     Json {
         summary: String,
         raw_payload_id: RawPayloadId,
+        /// Full canonical JSON identity, independent of the truncated preview
+        /// and observation-local payload reference. Absent in older traces.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        content_sha256: String,
     },
     Code {
         language: String,
@@ -177,7 +187,8 @@ pub struct InferenceCall {
     pub tool_call_ids_started_by_response: Vec<ToolCallId>,
     pub usage: Option<TokenUsage>,
     pub raw_request_payload_id: RawPayloadId,
-    /// Full upstream response payload. `None` while running or after pre-stream failures.
+    /// Full upstream response payload. `None` while running, after pre-stream
+    /// failures, or when response capture was unavailable.
     pub raw_response_payload_id: Option<RawPayloadId>,
 }
 

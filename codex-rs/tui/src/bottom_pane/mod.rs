@@ -255,7 +255,6 @@ impl BottomPane {
             placeholder_text,
             disable_paste_burst,
         );
-        composer.set_frame_requester(frame_requester.clone());
         let keymap = RuntimeKeymap::defaults();
         composer.set_keymap_bindings(&keymap);
         composer.set_skill_mentions(skills);
@@ -331,13 +330,8 @@ impl BottomPane {
         self.composer.record_pending_slash_command_history();
     }
 
-    /// Replace all bottom-pane keymap caches from one resolved runtime keymap.
-    ///
-    /// The bottom pane owns several input surfaces: composer, overlays, and
-    /// selection views. Applying one snapshot through this method keeps those
-    /// surfaces synchronized after config reloads or interactive remaps. Callers
-    /// should not update the composer directly unless they deliberately want
-    /// overlays and selection views to continue using the previous bindings.
+    /// Update the composer, key hints, and keymap used to construct new views.
+    /// Existing modal views retain the bindings captured when they were opened.
     pub fn set_keymap_bindings(&mut self, keymap: &RuntimeKeymap) {
         self.keymap = keymap.clone();
         self.composer.set_keymap_bindings(keymap);
@@ -1119,6 +1113,10 @@ impl BottomPane {
         true
     }
 
+    pub(crate) fn active_view_id(&self) -> Option<&'static str> {
+        self.view_stack.last().and_then(|view| view.view_id())
+    }
+
     pub(crate) fn selected_index_for_active_view(&self, view_id: &'static str) -> Option<usize> {
         self.view_stack
             .last()
@@ -1195,8 +1193,8 @@ impl BottomPane {
     ///
     /// The summary may be displayed inline in the status row or as a dedicated
     /// footer row depending on whether a status indicator is currently visible.
-    pub(crate) fn set_unified_exec_processes(&mut self, processes: Vec<String>) {
-        if self.unified_exec_footer.set_processes(processes) {
+    pub(crate) fn set_unified_exec_process_count(&mut self, process_count: usize) {
+        if self.unified_exec_footer.set_process_count(process_count) {
             self.sync_status_inline_message();
             self.request_redraw();
         }
@@ -1230,19 +1228,21 @@ impl BottomPane {
     }
 
     pub(crate) fn should_interrupt_running_task(&self, key_event: KeyEvent) -> bool {
-        let is_agent_command = self
-            .composer_text()
-            .lines()
-            .next()
-            .and_then(parse_slash_name)
-            .is_some_and(|(name, _, _)| name == "agent");
-
-        self.keymap.chat.interrupt_turn.is_pressed(key_event)
-            && self.is_task_running()
-            && !(is_agent_command && key_event.code == KeyCode::Esc)
-            && self.no_modal_or_popup_active()
-            && !self.composer_should_handle_vim_insert_escape(key_event)
-            && self.status.is_some()
+        if !self.keymap.chat.interrupt_turn.is_pressed(key_event)
+            || !self.is_task_running()
+            || !self.no_modal_or_popup_active()
+            || self.composer_should_handle_vim_insert_escape(key_event)
+            || self.status.is_none()
+        {
+            return false;
+        }
+        key_event.code != KeyCode::Esc
+            || self
+                .composer_text()
+                .lines()
+                .next()
+                .and_then(parse_slash_name)
+                .is_none_or(|(name, _, _)| name != "agent")
     }
 
     pub(crate) fn terminal_title_requires_action(&self) -> bool {
@@ -1259,11 +1259,6 @@ impl BottomPane {
             && self
                 .active_view()
                 .is_some_and(|view| view.will_interrupt_turn_on_key_event(key_event))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn active_view_id(&self) -> Option<&'static str> {
-        self.view_stack.last().and_then(|view| view.view_id())
     }
 
     /// Return true when the pane is in the regular composer state without any
@@ -2451,7 +2446,7 @@ mod tests {
         let width = 120;
         let before = pane.desired_height(width);
 
-        pane.set_unified_exec_processes(vec!["sleep 5".to_string()]);
+        pane.set_unified_exec_process_count(1);
         let after = pane.desired_height(width);
 
         assert_eq!(after, before);

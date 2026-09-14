@@ -327,6 +327,9 @@ async fn http_connect_accept(
         return Err(blocked_text_with_details(REASON_MITM_REQUIRED, &details));
     }
 
+    if let Some(target) = policy.local_target(&host) {
+        req.extensions_mut().insert(target);
+    }
     req.extensions_mut().insert(ProxyTarget(authority));
     req.extensions_mut().insert(connect_mitm_mode);
     req.extensions_mut().insert(mode);
@@ -673,6 +676,52 @@ async fn http_plain_proxy(
         .await);
     }
 
+    if !method_allowed && !policy.explicitly_denied(&host) {
+        emit_http_block_decision_audit_event(
+            &app_state,
+            BlockDecisionAuditEventArgs {
+                source: NetworkDecisionSource::ModeGuard,
+                reason: REASON_METHOD_NOT_ALLOWED,
+                protocol: NetworkProtocol::Http,
+                server_address: host.as_str(),
+                server_port: port,
+                method: Some(req.method().as_str()),
+                client_addr: client.as_deref(),
+            },
+        );
+        let details = PolicyDecisionDetails {
+            decision: NetworkPolicyDecision::Deny,
+            reason: REASON_METHOD_NOT_ALLOWED,
+            source: NetworkDecisionSource::ModeGuard,
+            protocol: NetworkProtocol::Http,
+            host: &host,
+            port,
+        };
+        let _ = app_state
+            .record_blocked_for_request(BlockedRequest::new(BlockedRequestArgs {
+                host: host.clone(),
+                reason: REASON_METHOD_NOT_ALLOWED.to_string(),
+                client: client.clone(),
+                method: Some(req.method().as_str().to_string()),
+                mode: Some(NetworkMode::Limited),
+                protocol: "http".to_string(),
+                decision: Some(details.decision.as_str().to_string()),
+                source: Some(details.source.as_str().to_string()),
+                port: Some(port),
+            }))
+            .await;
+        let client = client.as_deref().unwrap_or_default();
+        let method = req.method();
+        warn!(
+            "request blocked by method policy (client={client}, host={host}, method={method}, mode=limited, allowed_methods=GET, HEAD, OPTIONS)"
+        );
+        return Ok(json_blocked(
+            &host,
+            REASON_METHOD_NOT_ALLOWED,
+            Some(&details),
+        ));
+    }
+
     let request = NetworkPolicyRequest::new(NetworkPolicyRequestArgs {
         protocol: NetworkProtocol::Http,
         host: host.clone(),
@@ -724,52 +773,6 @@ async fn http_plain_proxy(
         }
     }
 
-    if !method_allowed {
-        emit_http_block_decision_audit_event(
-            &app_state,
-            BlockDecisionAuditEventArgs {
-                source: NetworkDecisionSource::ModeGuard,
-                reason: REASON_METHOD_NOT_ALLOWED,
-                protocol: NetworkProtocol::Http,
-                server_address: host.as_str(),
-                server_port: port,
-                method: Some(req.method().as_str()),
-                client_addr: client.as_deref(),
-            },
-        );
-        let details = PolicyDecisionDetails {
-            decision: NetworkPolicyDecision::Deny,
-            reason: REASON_METHOD_NOT_ALLOWED,
-            source: NetworkDecisionSource::ModeGuard,
-            protocol: NetworkProtocol::Http,
-            host: &host,
-            port,
-        };
-        let _ = app_state
-            .record_blocked_for_request(BlockedRequest::new(BlockedRequestArgs {
-                host: host.clone(),
-                reason: REASON_METHOD_NOT_ALLOWED.to_string(),
-                client: client.clone(),
-                method: Some(req.method().as_str().to_string()),
-                mode: Some(NetworkMode::Limited),
-                protocol: "http".to_string(),
-                decision: Some(details.decision.as_str().to_string()),
-                source: Some(details.source.as_str().to_string()),
-                port: Some(port),
-            }))
-            .await;
-        let client = client.as_deref().unwrap_or_default();
-        let method = req.method();
-        warn!(
-            "request blocked by method policy (client={client}, host={host}, method={method}, mode=limited, allowed_methods=GET, HEAD, OPTIONS)"
-        );
-        return Ok(json_blocked(
-            &host,
-            REASON_METHOD_NOT_ALLOWED,
-            Some(&details),
-        ));
-    }
-
     inject_plaintext_credentials_if_enabled(app_state.as_ref(), &policy, &host, req.headers_mut());
 
     let client = client.as_deref().unwrap_or_default();
@@ -781,6 +784,10 @@ async fn http_plain_proxy(
     } else {
         UpstreamClient::direct_with_current_roots(policy.allow_local_binding())
     };
+
+    if let Some(target) = policy.local_target(&host) {
+        req.extensions_mut().insert(target);
+    }
 
     // Strip hop-by-hop headers only after extracting metadata used for policy correlation.
     remove_hop_by_hop_request_headers(req.headers_mut());
@@ -853,21 +860,16 @@ fn validate_absolute_form_host_header(
     Ok(())
 }
 fn remove_hop_by_hop_request_headers(headers: &mut HeaderMap) {
-    while let Some(raw_connection) = headers.get(header::CONNECTION).cloned() {
-        headers.remove(header::CONNECTION);
-        if let Ok(raw_connection) = raw_connection.to_str() {
-            let connection_headers: Vec<String> = raw_connection
-                .split(',')
-                .map(str::trim)
-                .filter(|token| !token.is_empty())
-                .map(ToOwned::to_owned)
-                .collect();
-            for token in connection_headers {
-                if let Ok(name) = HeaderName::from_bytes(token.as_bytes()) {
-                    headers.remove(name);
-                }
-            }
-        }
+    let connection_headers = headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|token| HeaderName::from_bytes(token.trim().as_bytes()).ok())
+        .collect::<Vec<_>>();
+    headers.remove(header::CONNECTION);
+    for name in connection_headers {
+        headers.remove(name);
     }
     for name in [
         &header::KEEP_ALIVE,
@@ -1033,6 +1035,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use rama_http::Method;
     use rama_http::Request;
+    use rama_http::body::util::BodyExt as _;
     use std::collections::HashMap;
     use std::net::Ipv4Addr;
     use std::net::TcpListener as StdTcpListener;
@@ -1063,6 +1066,92 @@ mod tests {
         fn reload_now(&self) -> ConfigReloaderFuture<'_, crate::runtime::ConfigState> {
             Box::pin(async { Err(anyhow::anyhow!("reload not supported")) })
         }
+    }
+
+    #[tokio::test]
+    async fn allowed_http_forwards_to_explicit_local_target_and_reloads_once() {
+        timeout(Duration::from_secs(10), async {
+            let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+            let target = listener.local_addr().unwrap();
+            let upstream = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut received = Vec::new();
+                while !received.ends_with(b"\r\n\r\n") {
+                    received.push(stream.read_u8().await.unwrap());
+                }
+                let request = String::from_utf8(received).unwrap().to_ascii_lowercase();
+                assert!(request.starts_with("get /probe "));
+                assert!(!request.contains("x-hop"));
+                assert!(!request.contains("x-second-hop"));
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nproof",
+                    )
+                    .await
+                    .unwrap();
+            });
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut config = NetworkProxyConfig {
+                enabled: true,
+                allow_local_binding: false,
+                ..NetworkProxyConfig::default()
+            };
+            config.set_allowed_domains(vec!["127.0.0.1".to_string()]);
+            let state = Arc::new(NetworkProxyState::with_reloader(
+                build_config_state(config, NetworkProxyConstraints::default()).unwrap(),
+                Arc::new(CountingReloader {
+                    calls: calls.clone(),
+                }),
+            ));
+            let mut req = Request::builder()
+                .uri(format!("http://{target}/probe"))
+                .header("host", target.to_string())
+                .header("connection", "x-hop")
+                .header("connection", "x-second-hop")
+                .header("x-hop", "private")
+                .header("x-second-hop", "private")
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(state);
+            let response = http_plain_proxy(None, None, req).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&body[..], b"proof");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            upstream.await.unwrap();
+        })
+        .await
+        .expect("HTTP forwarding must finish");
+    }
+
+    #[tokio::test]
+    async fn limited_http_rejects_method_before_dns_or_decider() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let decider: Arc<dyn NetworkPolicyDecider> = Arc::new({
+            let calls = calls.clone();
+            move |_: NetworkPolicyRequest| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { NetworkDecision::Allow }
+            }
+        });
+        let state = Arc::new(network_proxy_state_for_policy(NetworkProxyConfig {
+            mode: NetworkMode::Limited,
+            ..NetworkProxyConfig::default()
+        }));
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("http://unresolved.invalid/")
+            .header("host", "unresolved.invalid")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(state.clone());
+        let response = http_plain_proxy(Some(decider), None, req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            state.blocked_snapshot().await.unwrap()[0].reason,
+            REASON_METHOD_NOT_ALLOWED
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1552,6 +1641,8 @@ mod tests {
             HeaderValue::from_static("x-hop, keep-alive"),
         );
         headers.insert("x-hop", HeaderValue::from_static("1"));
+        headers.append(header::CONNECTION, HeaderValue::from_static("x-second-hop"));
+        headers.insert("x-second-hop", HeaderValue::from_static("secret"));
         headers.insert(
             header::PROXY_AUTHORIZATION,
             HeaderValue::from_static("Basic abc"),
@@ -1566,6 +1657,7 @@ mod tests {
 
         assert_eq!(headers.get(header::CONNECTION), None);
         assert_eq!(headers.get("x-hop"), None);
+        assert_eq!(headers.get("x-second-hop"), None);
         assert_eq!(headers.get(header::PROXY_AUTHORIZATION), None);
         assert_eq!(
             headers.get(&header::X_FORWARDED_FOR),

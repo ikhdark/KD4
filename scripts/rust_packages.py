@@ -42,6 +42,7 @@ def nearest_package_root(
     package_root_cache: dict[Path, Path | None] | None = None,
     assume_file: bool = False,
 ) -> Path | None:
+    """Find an ancestor package; a supplied cache belongs to one fixed repo bound."""
     current = package_search_start(path, assume_file=assume_file)
     if package_root_cache is not None and current in package_root_cache:
         return package_root_cache[current]
@@ -63,7 +64,9 @@ def nearest_package_root(
             result = package_root_cache[current]
             break
         visited.append(current)
-        if current.name == "codex-rs" or current == codex_rs_root:
+        if (
+            repo_bound is None and current.name == "codex-rs"
+        ) or current == codex_rs_root:
             break
         manifest = current / CARGO_MANIFEST
         if manifest.is_file():

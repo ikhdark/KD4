@@ -1848,9 +1848,6 @@
       },
       "type": "object"
     },
-    "PermissionsToml": {
-      "type": "object"
-    },
     "Personality": {
       "enum": [
         "none",
@@ -4524,13 +4521,12 @@
       "description": "OTEL configuration."
     },
     "permissions": {
-      "allOf": [
-        {
-          "$ref": "#/definitions/PermissionsToml"
-        }
-      ],
+      "additionalProperties": {
+        "$ref": "#/definitions/PermissionProfileToml"
+      },
       "default": null,
-      "description": "Named permissions profiles."
+      "description": "Named permissions profiles.",
+      "type": "object"
     },
     "personality": {
       "allOf": [

@@ -83,6 +83,7 @@ async fn residency_slot_reservation_unloads_oldest_idle_v2_agent() {
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let root = manager
         .start_thread(config.clone())
@@ -140,6 +141,7 @@ async fn residency_materialization_failure_preserves_running_agent_and_buffered_
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let root = manager
         .start_thread(config.clone())
@@ -256,6 +258,7 @@ async fn late_residency_shutdown_keeps_claim_charged_until_slot_handoff() {
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let root = manager
         .start_thread(config.clone())
@@ -359,6 +362,7 @@ async fn registered_interrupted_v2_agent_reloads_after_residency_eviction() {
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let root = manager
         .start_thread(config.clone())
@@ -428,6 +432,7 @@ async fn duplicate_v2_agent_path_is_rejected_before_residency_eviction() {
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let root = manager
         .start_thread(config.clone())
@@ -672,6 +677,7 @@ async fn residency_cancellation_retains_cleanup_until_termination() {
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let root = manager
         .start_thread(config.clone())
@@ -752,6 +758,7 @@ async fn residency_foreground_timeout_retains_cleanup_until_termination() {
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let root = manager
         .start_thread(config.clone())
@@ -826,6 +833,7 @@ async fn explicit_v2_resume_preserves_cold_identity_and_accounts_for_residency()
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         Some(state_db),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let root = manager
         .start_thread(config.clone())

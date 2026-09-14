@@ -270,21 +270,26 @@ where
     let headers = response.headers().clone();
     let status = response.status();
     let retry_at = parse_retry_after(&headers, OffsetDateTime::now_utc());
-    let body = response.bytes().await.map_err(|err| {
-        let timed_out = err.is_timeout();
-        RemoteControlServerRequestError::io_error(
-            format!("failed to read remote control {response_kind} response from `{url}`: {err}"),
-            Some(status),
-            retry_at,
-            timed_out,
-        )
-    })?;
-    let body_preview = preview_remote_control_response_body(&body);
+    let body = super::enroll::read_remote_control_response_body(response)
+        .await
+        .map_err(|err| {
+            let timed_out = err.kind() == ErrorKind::TimedOut;
+            RemoteControlServerRequestError::io_error(
+                format!(
+                    "failed to read remote control {response_kind} response from `{url}`: {err}"
+                ),
+                Some(status),
+                retry_at,
+                timed_out,
+            )
+        })?;
+    let body_preview = || preview_remote_control_response_body(&body);
     if !status.is_success() {
         let headers_str = format_headers(&headers);
         return Err(RemoteControlServerRequestError::io_error(
             format!(
-                "remote control {response_kind} failed at `{url}`: HTTP {status}, {headers_str}, body: {body_preview}"
+                "remote control {response_kind} failed at `{url}`: HTTP {status}, {headers_str}, body: {}",
+                body_preview()
             ),
             Some(status),
             retry_at,
@@ -293,9 +298,11 @@ where
     }
 
     serde_json::from_slice::<Response>(&body).map_err(|err| {
+        let err = super::enroll::format_remote_control_decode_error(&err);
         let headers_str = format_headers(&headers);
         io::Error::other(format!(
-            "failed to parse remote control {response_kind} response from `{url}`: HTTP {status}, {headers_str}, body: {body_preview}, decode error: {err}"
+            "failed to parse remote control {response_kind} response from `{url}`: HTTP {status}, {headers_str}, body: {}, decode error: {err}",
+            body_preview()
         ))
     })
 }

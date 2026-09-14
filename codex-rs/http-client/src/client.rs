@@ -12,6 +12,7 @@ use reqwest::IntoUrl;
 use reqwest::Method;
 use serde::Serialize;
 use std::fmt::Display;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -27,6 +28,7 @@ pub type HttpResponse = reqwest::Response;
 pub struct HttpClient {
     inner: reqwest::Client,
     request_logging: RequestLogging,
+    default_headers: Arc<HeaderMap>,
 }
 
 impl HttpClient {
@@ -46,7 +48,18 @@ impl HttpClient {
         Self {
             inner,
             request_logging,
+            default_headers: Arc::default(),
         }
+    }
+
+    pub(crate) fn with_default_headers(mut self, headers: HeaderMap) -> Self {
+        self.default_headers = Arc::new(headers);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_transport_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.default_headers, &other.default_headers)
     }
 
     pub fn get<U>(&self, url: U) -> RequestBuilder
@@ -89,13 +102,15 @@ impl HttpClient {
             method,
             diagnostic_url,
             self.request_logging,
+            Arc::clone(&self.default_headers),
         )
     }
 
     pub(crate) async fn execute(
         &self,
-        request: reqwest::Request,
+        mut request: reqwest::Request,
     ) -> Result<reqwest::Response, reqwest::Error> {
+        apply_default_headers(request.headers_mut(), &self.default_headers);
         let method = request.method().clone();
         let diagnostic_url = self
             .request_logging_enabled()
@@ -175,12 +190,22 @@ pub(crate) enum RequestLogging {
 }
 
 #[must_use = "requests are not sent unless `send` is awaited"]
-#[derive(Debug)]
 pub struct RequestBuilder {
     builder: reqwest::RequestBuilder,
     method: Method,
     diagnostic_url: Option<String>,
     request_logging: RequestLogging,
+    default_headers: Arc<HeaderMap>,
+}
+
+impl std::fmt::Debug for RequestBuilder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RequestBuilder")
+            .field("method", &self.method)
+            .field("url", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl RequestBuilder {
@@ -189,12 +214,14 @@ impl RequestBuilder {
         method: Method,
         diagnostic_url: Option<String>,
         request_logging: RequestLogging,
+        default_headers: Arc<HeaderMap>,
     ) -> Self {
         Self {
             builder,
             method,
             diagnostic_url,
             request_logging,
+            default_headers,
         }
     }
 
@@ -204,6 +231,7 @@ impl RequestBuilder {
             method: self.method,
             diagnostic_url: self.diagnostic_url,
             request_logging: self.request_logging,
+            default_headers: self.default_headers,
         }
     }
 
@@ -266,7 +294,15 @@ impl RequestBuilder {
     pub async fn send(self) -> Result<HttpResponse, HttpError> {
         let headers = trace_headers();
 
-        match self.builder.headers(headers).send().await {
+        let (client, request) = self.builder.headers(headers).build_split();
+        let result = match request {
+            Ok(mut request) => {
+                apply_default_headers(request.headers_mut(), &self.default_headers);
+                client.execute(request).await
+            }
+            Err(error) => Err(error),
+        };
+        match result {
             Ok(response) => {
                 if let (RequestLogging::Enabled, Some(url)) =
                     (self.request_logging, self.diagnostic_url.as_deref())
@@ -297,6 +333,16 @@ impl RequestBuilder {
                     );
                 }
                 Err(error)
+            }
+        }
+    }
+}
+
+pub(crate) fn apply_default_headers(headers: &mut HeaderMap, defaults: &HeaderMap) {
+    for name in defaults.keys() {
+        if !headers.contains_key(name) {
+            for value in defaults.get_all(name) {
+                headers.append(name, value.clone());
             }
         }
     }
@@ -339,6 +385,17 @@ mod tests {
     use tracing::trace_span;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
+
+    #[test]
+    fn request_builder_debug_redacts_url_and_headers() {
+        let request = HttpClient::new(reqwest::Client::new())
+            .get("https://user:password@private.example/path-secret?sig=query-secret")
+            .header("authorization", "Bearer header-secret");
+        assert_eq!(
+            format!("{request:?}"),
+            "RequestBuilder { method: GET, url: \"<redacted>\", .. }"
+        );
+    }
 
     #[test]
     fn disabled_request_logging_does_not_capture_diagnostic_url() {

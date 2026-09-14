@@ -587,15 +587,18 @@ async fn worker_skips_when_fresh_run_marker_exists() -> anyhow::Result<()> {
 }
 
 #[test]
-fn run_marker_is_removed_unless_persisted() -> anyhow::Result<()> {
+fn run_marker_is_reusable_unless_persisted() -> anyhow::Result<()> {
     let home = TempDir::new()?;
     let marker_path = home.path().join(".tmp").join("rollout-compression.lock");
 
     {
         let marker = worker::CompressionRunMarker::try_claim(home.path())?;
         assert!(marker.is_some());
+        set_old_mtime(&marker_path)?;
+        // Even a stale timestamp cannot override an active owner.
+        assert!(worker::CompressionRunMarker::try_claim(home.path())?.is_none());
     }
-    assert!(!marker_path.exists());
+    assert_eq!(fs::metadata(&marker_path)?.len(), 0);
 
     let marker = worker::CompressionRunMarker::try_claim(home.path())?;
     let Some(marker) = marker else {

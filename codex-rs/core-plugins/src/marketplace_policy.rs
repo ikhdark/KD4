@@ -110,13 +110,31 @@ impl MarketplacePolicy {
         if !self.is_restricted() {
             return Ok(());
         }
+        self.validate_install_with_user_config(
+            config_layer_stack.effective_user_config().as_ref(),
+            codex_home,
+            marketplace_path,
+            marketplace_name,
+        )
+    }
+
+    pub(crate) fn validate_install_with_user_config(
+        &self,
+        user_config: Option<&toml::Value>,
+        codex_home: &Path,
+        marketplace_path: &AbsolutePathBuf,
+        marketplace_name: &str,
+    ) -> Result<(), String> {
+        if !self.is_restricted() {
+            return Ok(());
+        }
 
         let root = marketplace_root_dir(marketplace_path).map_err(|err| err.to_string())?;
         if let Some(expected_name) = managed_marketplace_name(codex_home, marketplace_path, &root) {
             return validate_expected_marketplace_name(expected_name, marketplace_name);
         }
 
-        let user_config = config_layer_stack.effective_user_config().ok_or_else(|| {
+        let user_config = user_config.ok_or_else(|| {
             format!(
                 "marketplace `{marketplace_name}` must be added to config before plugins can be installed while marketplace source restrictions are enabled"
             )

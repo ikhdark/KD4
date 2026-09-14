@@ -229,11 +229,11 @@ def audit_repository(
         raise RuntimeError(f"unexpected ahead/behind output: {counts!r}")
     ahead, behind = (int(value) for value in counts)
     worktree = parse_worktree_status(
-        _git_text(
+        _run_git(
             repo_root,
             ["status", "--porcelain=v1", "--untracked-files=all"],
             timeout_seconds=timeout_seconds,
-        )
+        ).stdout
     )
     merge_completed = _run_git(
         repo_root,

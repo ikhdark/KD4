@@ -44,8 +44,8 @@ fn managed_hooks_for_current_platform(
 ) -> ManagedHooksRequirementsToml {
     let managed_dir = managed_dir.as_ref().to_path_buf();
     ManagedHooksRequirementsToml {
-        managed_dir: None,
-        windows_managed_dir: Some(managed_dir),
+        managed_dir: (!cfg!(windows)).then(|| managed_dir.clone()),
+        windows_managed_dir: cfg!(windows).then_some(managed_dir),
         hooks,
     }
 }
@@ -163,7 +163,7 @@ fn reports_configured_event_presence_without_building_a_request() {
 }
 
 #[tokio::test]
-async fn requirements_managed_hooks_execute_from_managed_dir() {
+async fn requirements_managed_hooks_execute_declared_script() {
     let temp = tempdir().expect("create temp dir");
     let managed_dir =
         AbsolutePathBuf::try_from(temp.path().join("managed-hooks")).expect("absolute path");
@@ -354,7 +354,7 @@ async fn requirements_managed_hooks_execute_windows_command_override() {
         .await;
 
     assert!(!outcome.should_block);
-    let expected_exit_code = 19;
+    let expected_exit_code = if cfg!(windows) { 19 } else { 17 };
     assert_eq!(outcome.hook_events.len(), 1);
     assert_eq!(outcome.hook_events[0].run.status, HookRunStatus::Failed);
     assert_eq!(
@@ -649,7 +649,7 @@ async fn cancelling_registered_hook_terminates_descendants() {
                 profile: None,
             },
             config_with_pre_tool_use_hook(
-                "(printf ready > started; sleep 2; printf escaped > escaped) & exit 0",
+                "(printf ready > started; sleep 2; printf escaped > escaped) & sleep 60",
             ),
         )],
         ConfigRequirements::default(),
@@ -1374,8 +1374,8 @@ fn malformed_hooks_json_is_reported_as_startup_warning() {
 #[tokio::test]
 async fn plugin_hook_sources_run_with_plugin_env_and_plugin_source() {
     let temp = tempdir().expect("create temp dir");
-    let plugin_root =
-        AbsolutePathBuf::try_from(temp.path().join("demo-plugin")).expect("plugin root");
+    let plugin_root = AbsolutePathBuf::try_from(temp.path().join("demo plugin $cache & literal"))
+        .expect("plugin root");
     let plugin_data_root =
         AbsolutePathBuf::try_from(temp.path().join("plugin-data")).expect("plugin data root");
     fs::create_dir_all(plugin_root.join("hooks")).expect("create hooks dir");
@@ -1405,7 +1405,7 @@ print(json.dumps({
             pre_tool_use: vec![MatcherGroup {
                 matcher: Some("Bash".to_string()),
                 hooks: vec![HookHandlerConfig::Command {
-                    command: format!("python3 {}", script_path.display()),
+                    command: r#"python3 "${PLUGIN_ROOT}/hooks/write_env.py""#.to_string(),
                     command_windows: None,
                     timeout_sec: Some(10),
                     r#async: false,
@@ -1505,7 +1505,7 @@ print(json.dumps({
 }
 
 #[test]
-fn plugin_hook_sources_expand_plugin_placeholders() {
+fn plugin_hook_sources_preserve_placeholders_and_path_environment() {
     let temp = tempdir().expect("create temp dir");
     let plugin_root =
         AbsolutePathBuf::try_from(temp.path().join("demo-plugin")).expect("plugin root");
@@ -1553,13 +1553,7 @@ fn plugin_hook_sources_expand_plugin_placeholders() {
 
     assert_eq!(
         engine.handlers[0].command,
-        format!(
-            "run {} {} {} {}",
-            plugin_root.display(),
-            plugin_root.display(),
-            plugin_data_root.display(),
-            plugin_data_root.display()
-        )
+        "run ${PLUGIN_ROOT} ${CLAUDE_PLUGIN_ROOT} ${PLUGIN_DATA} ${CLAUDE_PLUGIN_DATA}"
     );
     assert_eq!(
         engine.handlers[0].env,
@@ -1596,4 +1590,201 @@ fn plugin_hook_load_warnings_are_startup_warnings() {
     );
 
     assert_eq!(engine.warnings(), &["failed plugin hook".to_string()]);
+}
+
+#[tokio::test]
+async fn blank_stderr_denial_overrides_allow_through_configured_hooks() {
+    let temp = tempdir().expect("tempdir");
+    let script = temp.path().join("gate.py");
+    fs::write(&script, r#"import json, sys
+request = json.load(sys.stdin)
+assert request['tool_input'] == {'command': 'echo hello'}
+if sys.argv[1] == 'deny':
+    sys.stderr.write('  \n')
+    sys.exit(2)
+event = request['hook_event_name']
+if event == 'PermissionRequest':
+    print(json.dumps({'hookSpecificOutput': {'hookEventName': event, 'decision': {'behavior': 'allow'}}}))
+else:
+    print(json.dumps({'hookSpecificOutput': {'hookEventName': event, 'permissionDecision': 'allow', 'updatedInput': {'command': 'echo rewritten'}, 'additionalContext': 'policy context'}}))
+"#).expect("write script");
+    let handlers = ["allow", "deny"].map(|mode| {
+        serde_json::json!({
+            "type": "command", "command": format!("python3 \"{}\" {mode}", script.display())
+        })
+    });
+    let config = serde_json::from_value(serde_json::json!({"hooks": {
+        "PreToolUse": [{"matcher": "^Bash$", "hooks": handlers}],
+        "PermissionRequest": [{"matcher": "^Bash$", "hooks": handlers}]
+    }}))
+    .expect("config");
+    let stack = ConfigLayerStack::new(
+        vec![ConfigLayerEntry::new(
+            ConfigLayerSource::User {
+                file: AbsolutePathBuf::try_from(temp.path().join("config.toml")).expect("path"),
+                profile: None,
+            },
+            config,
+        )],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("stack");
+    let hooks = crate::Hooks::new(crate::HooksConfig {
+        feature_enabled: true,
+        bypass_hook_trust: true,
+        config_layer_stack: Some(stack),
+        ..Default::default()
+    });
+    let pre = hooks
+        .run_pre_tool_use(PreToolUseRequest {
+            session_id: ThreadId::new(),
+            turn_id: "turn-1".into(),
+            subagent: None,
+            cwd: AbsolutePathBuf::try_from(temp.path()).expect("cwd"),
+            transcript_path: None,
+            model: "gpt-test".into(),
+            permission_mode: "default".into(),
+            tool_name: "Bash".into(),
+            matcher_aliases: vec!["BashOutput".into()],
+            tool_use_id: "tool-1".into(),
+            tool_input: serde_json::json!({"command": "echo hello"}),
+        })
+        .await;
+    assert!(pre.should_block);
+    assert_eq!(
+        pre.block_reason.as_deref(),
+        Some("PreToolUse hook blocked execution without providing a reason")
+    );
+    assert_eq!(pre.updated_input, None);
+    assert_eq!(pre.additional_contexts, ["policy context"]);
+    assert_eq!(
+        pre.hook_events
+            .iter()
+            .map(|event| event.run.status)
+            .collect::<Vec<_>>(),
+        [HookRunStatus::Completed, HookRunStatus::Blocked]
+    );
+
+    let permission = hooks
+        .run_permission_request(crate::PermissionRequestRequest {
+            session_id: ThreadId::new(),
+            turn_id: "turn-1".into(),
+            subagent: None,
+            cwd: temp.path().to_path_buf(),
+            transcript_path: None,
+            model: "gpt-test".into(),
+            permission_mode: "default".into(),
+            tool_name: "Bash".into(),
+            matcher_aliases: Vec::new(),
+            run_id_suffix: "tool-1".into(),
+            tool_input: serde_json::json!({"command": "echo hello"}),
+        })
+        .await;
+    assert_eq!(
+        permission.decision,
+        Some(crate::PermissionRequestDecision::Deny {
+            message: "PermissionRequest hook denied execution without providing a reason".into(),
+        })
+    );
+    assert_eq!(
+        permission
+            .hook_events
+            .iter()
+            .map(|event| event.run.status)
+            .collect::<Vec<_>>(),
+        [HookRunStatus::Completed, HookRunStatus::Blocked]
+    );
+}
+
+#[tokio::test]
+async fn malformed_permission_output_never_grants_approval() {
+    use crate::PermissionRequestDecision;
+    use crate::PermissionRequestRequest;
+
+    let temp = tempdir().expect("tempdir");
+    let script = temp.path().join("permission.py");
+    fs::write(
+        &script,
+        "from pathlib import Path\nprint(Path(__file__).with_suffix('.json').read_text())\n",
+    )
+    .expect("script");
+    let config = serde_json::from_value(serde_json::json!({
+        "hooks": {"PermissionRequest": [{"hooks": [{
+            "type": "command", "command": format!("python3 \"{}\"", script.display())
+        }]}]}
+    }))
+    .expect("config TOML");
+    let stack = ConfigLayerStack::new(
+        vec![ConfigLayerEntry::new(
+            ConfigLayerSource::User {
+                file: AbsolutePathBuf::try_from(temp.path().join("config.toml"))
+                    .expect("config path"),
+                profile: None,
+            },
+            config,
+        )],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("stack");
+    let hooks = crate::Hooks::new(crate::HooksConfig {
+        feature_enabled: true,
+        bypass_hook_trust: true,
+        config_layer_stack: Some(stack),
+        ..Default::default()
+    });
+    for (output, valid) in [
+        (
+            r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","decision":{"behavior":"allow"}}}"#,
+            false,
+        ),
+        (
+            r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow","updatedInput":null}}}"#,
+            false,
+        ),
+        (
+            r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow","updatedPermissions":null}}}"#,
+            false,
+        ),
+        (
+            r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","behavior":"allow"}}}"#,
+            false,
+        ),
+        (
+            r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#,
+            true,
+        ),
+    ] {
+        fs::write(script.with_extension("json"), output).expect("output fixture");
+        let outcome = hooks
+            .run_permission_request(PermissionRequestRequest {
+                session_id: ThreadId::new(),
+                turn_id: "turn-1".into(),
+                subagent: None,
+                cwd: temp.path().to_path_buf(),
+                transcript_path: None,
+                model: "gpt-test".into(),
+                permission_mode: "default".into(),
+                tool_name: "Bash".into(),
+                matcher_aliases: Vec::new(),
+                run_id_suffix: "tool-1".into(),
+                tool_input: serde_json::json!({"command": "echo hello"}),
+            })
+            .await;
+        assert_eq!(outcome.hook_events.len(), 1);
+        assert_eq!(
+            outcome.decision,
+            valid.then_some(PermissionRequestDecision::Allow),
+            "{output}"
+        );
+        assert_eq!(
+            outcome.hook_events[0].run.status,
+            if valid {
+                HookRunStatus::Completed
+            } else {
+                HookRunStatus::Failed
+            }
+        );
+    }
 }

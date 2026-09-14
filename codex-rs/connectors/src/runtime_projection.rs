@@ -41,7 +41,7 @@ pub fn installed_connector_runtime<'a>(
     tools: impl IntoIterator<Item = ConnectorRuntimeTool<'a>>,
 ) -> Vec<InstalledConnectorRuntime> {
     let policy = AppToolPolicyEvaluator::new(config_layer_stack);
-    let mut apps = BTreeMap::<String, (Option<String>, bool)>::new();
+    let mut apps = BTreeMap::<&str, (Option<&str>, bool)>::new();
 
     for tool in tools {
         if tool.synthetic {
@@ -54,35 +54,32 @@ pub fn installed_connector_runtime<'a>(
             continue;
         }
 
-        let runtime_name = tool
-            .connector_name
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map(str::to_string);
-        let entry = apps
-            .entry(connector_id.to_string())
-            .or_insert((None, false));
+        let entry = apps.entry(connector_id).or_insert((None, false));
         if entry.0.is_none() {
-            entry.0 = runtime_name;
+            entry.0 = tool
+                .connector_name
+                .map(str::trim)
+                .filter(|name| !name.is_empty());
         }
 
-        let policy_allows_tool = policy
-            .policy(AppToolPolicyInput {
-                connector_id: Some(connector_id),
-                tool_name: tool.tool_name,
-                tool_title: tool.tool_title,
-                destructive_hint: tool.destructive_hint,
-                open_world_hint: tool.open_world_hint,
-            })
-            .enabled;
-        entry.1 |= tool.model_visible && policy_allows_tool;
+        if !entry.1 && tool.model_visible {
+            entry.1 = policy
+                .policy(AppToolPolicyInput {
+                    connector_id: Some(connector_id),
+                    tool_name: tool.tool_name,
+                    tool_title: tool.tool_title,
+                    destructive_hint: tool.destructive_hint,
+                    open_world_hint: tool.open_world_hint,
+                })
+                .enabled;
+        }
     }
 
     apps.into_iter()
         .map(|(id, (runtime_name, callable))| InstalledConnectorRuntime {
-            enabled: policy.app_enabled(&id),
-            id,
-            runtime_name,
+            enabled: policy.app_enabled(id),
+            id: id.to_string(),
+            runtime_name: runtime_name.map(str::to_string),
             callable,
         })
         .collect()

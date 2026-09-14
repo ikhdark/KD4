@@ -657,49 +657,6 @@ unsafe fn set_deny_named_security_info(path: &Path, dacl: *mut ACL) -> u32 {
     )
 }
 
-// Fault only the external OS operation, on the calling thread and exact path.
-// Public ACL application, journaling, rollback, and admission checks stay real.
-#[cfg(test)]
-pub(crate) mod native_deny_write_test {
-    use std::cell::RefCell;
-    use std::path::Path;
-    use std::path::PathBuf;
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(crate) enum Stage {
-        Entries,
-        Security,
-    }
-
-    thread_local! {
-        static FAILURE: RefCell<Option<(PathBuf, Stage, u32)>> = const { RefCell::new(None) };
-    }
-
-    pub(super) fn error(path: &Path, stage: Stage) -> Option<u32> {
-        FAILURE.with(|failure| {
-            failure
-                .borrow()
-                .as_ref()
-                .and_then(|(target, operation, code)| {
-                    (target == path && *operation == stage).then_some(*code)
-                })
-        })
-    }
-
-    pub(crate) fn with_error<T>(path: &Path, stage: Stage, code: u32, f: impl FnOnce() -> T) -> T {
-        struct Restore(Option<(PathBuf, Stage, u32)>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                FAILURE.with(|failure| *failure.borrow_mut() = self.0.take());
-            }
-        }
-        let previous =
-            FAILURE.with(|failure| failure.replace(Some((path.to_path_buf(), stage, code))));
-        let _restore = Restore(previous);
-        f()
-    }
-}
-
 unsafe fn add_deny_ace(path: &Path, psid: *mut c_void, kind: DenyAceKind) -> Result<bool> {
     let mut p_sd: *mut c_void = std::ptr::null_mut();
     let mut p_dacl: *mut ACL = std::ptr::null_mut();
@@ -790,7 +747,7 @@ pub unsafe fn revoke_deny_read_ace(path: &Path, psid: *mut c_void) -> Result<boo
         std::ptr::copy_nonoverlapping(p_dacl.cast::<u8>(), storage.as_mut_ptr().cast(), size);
         let replacement = storage.as_mut_ptr().cast::<ACL>();
         let mut changed = false;
-        let mut mapping = GENERIC_MAPPING {
+        let mapping = GENERIC_MAPPING {
             GenericRead: FILE_GENERIC_READ,
             GenericWrite: FILE_GENERIC_WRITE,
             GenericExecute: FILE_GENERIC_EXECUTE,
@@ -798,8 +755,8 @@ pub unsafe fn revoke_deny_read_ace(path: &Path, psid: *mut c_void) -> Result<boo
         };
         let mut read_mask = DenyAceKind::Read.mask();
         let mut write_mask = DenyAceKind::Write.mask();
-        MapGenericMask(&mut read_mask, &mut mapping);
-        MapGenericMask(&mut write_mask, &mut mapping);
+        MapGenericMask(&mut read_mask, &mapping);
+        MapGenericMask(&mut write_mask, &mapping);
         for index in (0..u32::from((*replacement).AceCount)).rev() {
             let mut entry = std::ptr::null_mut();
             if GetAce(replacement, index, &mut entry) == 0 {
@@ -814,7 +771,7 @@ pub unsafe fn revoke_deny_read_ace(path: &Path, psid: *mut c_void) -> Result<boo
                 continue;
             }
             let mut mask = ace.Mask;
-            MapGenericMask(&mut mask, &mut mapping);
+            MapGenericMask(&mut mask, &mapping);
             if mask == read_mask {
                 if DeleteAce(replacement, index) == 0 {
                     return Err(std::io::Error::last_os_error().into());
@@ -924,3 +881,47 @@ pub unsafe fn allow_null_device(psid: *mut c_void) {
 }
 const CONTAINER_INHERIT_ACE: u32 = 0x2;
 const OBJECT_INHERIT_ACE: u32 = 0x1;
+
+// Fault only the external OS operation, on the calling thread and exact path.
+// Public ACL application, journaling, rollback, and admission checks stay real.
+#[cfg(test)]
+pub(crate) mod native_deny_write_test {
+    use std::cell::RefCell;
+    use std::path::Path;
+    use std::path::PathBuf;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Stage {
+        Entries,
+        Security,
+    }
+
+    thread_local! {
+        static FAILURE: RefCell<Option<(PathBuf, Stage, u32)>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn error(path: &Path, stage: Stage) -> Option<u32> {
+        FAILURE.with(|failure| {
+            failure
+                .borrow()
+                .as_ref()
+                .and_then(|(target, operation, code)| {
+                    (target == path && *operation == stage).then_some(*code)
+                })
+        })
+    }
+
+    pub(crate) fn with_error<T>(path: &Path, stage: Stage, code: u32, f: impl FnOnce() -> T) -> T {
+        struct Restore(Option<(PathBuf, Stage, u32)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FAILURE.with(|failure| *failure.borrow_mut() = self.0.take());
+            }
+        }
+        let previous =
+            FAILURE.with(|failure| failure.replace(Some((path.to_path_buf(), stage, code))));
+        let _restore = Restore(previous);
+        f()
+    }
+}
+

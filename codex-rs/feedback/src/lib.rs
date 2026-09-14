@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::collections::btree_map::Entry;
 use std::fs;
+use std::io::Read;
 use std::io::Write;
 use std::io::{self};
 use std::path::Path;
@@ -39,6 +40,9 @@ const SENTRY_DSN: &str =
 const UPLOAD_TIMEOUT_SECS: u64 = 10;
 const FEEDBACK_TAGS_TARGET: &str = "feedback_tags";
 const MAX_FEEDBACK_TAGS: usize = 64;
+const MAX_FEEDBACK_TAG_VALUE_BYTES: usize = 1024;
+const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+const MAX_TOTAL_ATTACHMENT_BYTES: usize = 40 * 1024 * 1024;
 
 /// Structured request/auth fields that should be attached to feedback uploads.
 pub struct FeedbackRequestTags<'a> {
@@ -108,20 +112,20 @@ pub fn emit_feedback_request_tags(tags: &FeedbackRequestTags<'_>) {
     let snapshot = FeedbackRequestSnapshot::from_tags(tags);
     tracing::info!(
         target: FEEDBACK_TAGS_TARGET,
-        endpoint = tracing::field::debug(snapshot.endpoint),
-        auth_header_attached = tracing::field::debug(snapshot.auth_header_attached),
-        auth_header_name = tracing::field::debug(snapshot.auth_header_name),
-        auth_mode = tracing::field::debug(snapshot.auth_mode),
-        auth_retry_after_unauthorized = tracing::field::debug(&snapshot.auth_retry_after_unauthorized),
-        auth_recovery_mode = tracing::field::debug(snapshot.auth_recovery_mode),
-        auth_recovery_phase = tracing::field::debug(snapshot.auth_recovery_phase),
-        auth_connection_reused = tracing::field::debug(&snapshot.auth_connection_reused),
-        auth_request_id = tracing::field::debug(snapshot.auth_request_id),
-        auth_cf_ray = tracing::field::debug(snapshot.auth_cf_ray),
-        auth_error = tracing::field::debug(snapshot.auth_error),
-        auth_error_code = tracing::field::debug(snapshot.auth_error_code),
-        auth_recovery_followup_success = tracing::field::debug(&snapshot.auth_recovery_followup_success),
-        auth_recovery_followup_status = tracing::field::debug(&snapshot.auth_recovery_followup_status),
+        endpoint = snapshot.endpoint,
+        auth_header_attached = snapshot.auth_header_attached,
+        auth_header_name = snapshot.auth_header_name,
+        auth_mode = snapshot.auth_mode,
+        auth_retry_after_unauthorized = &snapshot.auth_retry_after_unauthorized,
+        auth_recovery_mode = snapshot.auth_recovery_mode,
+        auth_recovery_phase = snapshot.auth_recovery_phase,
+        auth_connection_reused = &snapshot.auth_connection_reused,
+        auth_request_id = snapshot.auth_request_id,
+        auth_cf_ray = snapshot.auth_cf_ray,
+        auth_error = snapshot.auth_error,
+        auth_error_code = snapshot.auth_error_code,
+        auth_recovery_followup_success = &snapshot.auth_recovery_followup_success,
+        auth_recovery_followup_status = &snapshot.auth_recovery_followup_status,
     );
 }
 
@@ -132,33 +136,27 @@ pub fn emit_feedback_request_tags_with_auth_env(
     let snapshot = FeedbackRequestSnapshot::from_tags(tags);
     tracing::info!(
         target: FEEDBACK_TAGS_TARGET,
-        endpoint = tracing::field::debug(snapshot.endpoint),
-        auth_header_attached = tracing::field::debug(snapshot.auth_header_attached),
-        auth_header_name = tracing::field::debug(snapshot.auth_header_name),
-        auth_mode = tracing::field::debug(snapshot.auth_mode),
-        auth_retry_after_unauthorized = tracing::field::debug(&snapshot.auth_retry_after_unauthorized),
-        auth_recovery_mode = tracing::field::debug(snapshot.auth_recovery_mode),
-        auth_recovery_phase = tracing::field::debug(snapshot.auth_recovery_phase),
-        auth_connection_reused = tracing::field::debug(&snapshot.auth_connection_reused),
-        auth_request_id = tracing::field::debug(snapshot.auth_request_id),
-        auth_cf_ray = tracing::field::debug(snapshot.auth_cf_ray),
-        auth_error = tracing::field::debug(snapshot.auth_error),
-        auth_error_code = tracing::field::debug(snapshot.auth_error_code),
-        auth_recovery_followup_success = tracing::field::debug(&snapshot.auth_recovery_followup_success),
-        auth_recovery_followup_status = tracing::field::debug(&snapshot.auth_recovery_followup_status),
-        auth_env_openai_api_key_present = tracing::field::debug(auth_env.openai_api_key_env_present),
-        auth_env_codex_api_key_present = tracing::field::debug(auth_env.codex_api_key_env_present),
-        auth_env_codex_api_key_enabled = tracing::field::debug(auth_env.codex_api_key_env_enabled),
+        endpoint = snapshot.endpoint,
+        auth_header_attached = snapshot.auth_header_attached,
+        auth_header_name = snapshot.auth_header_name,
+        auth_mode = snapshot.auth_mode,
+        auth_retry_after_unauthorized = &snapshot.auth_retry_after_unauthorized,
+        auth_recovery_mode = snapshot.auth_recovery_mode,
+        auth_recovery_phase = snapshot.auth_recovery_phase,
+        auth_connection_reused = &snapshot.auth_connection_reused,
+        auth_request_id = snapshot.auth_request_id,
+        auth_cf_ray = snapshot.auth_cf_ray,
+        auth_error = snapshot.auth_error,
+        auth_error_code = snapshot.auth_error_code,
+        auth_recovery_followup_success = &snapshot.auth_recovery_followup_success,
+        auth_recovery_followup_status = &snapshot.auth_recovery_followup_status,
+        auth_env_openai_api_key_present = auth_env.openai_api_key_env_present,
+        auth_env_codex_api_key_present = auth_env.codex_api_key_env_present,
+        auth_env_codex_api_key_enabled = auth_env.codex_api_key_env_enabled,
         // Custom provider `env_key` is arbitrary config text, so emit only a safe bucket.
-        auth_env_provider_key_name = tracing::field::debug(
-            auth_env.provider_env_key_name.as_deref().unwrap_or("")
-        ),
-        auth_env_provider_key_present = tracing::field::debug(
-            &auth_env.provider_env_key_present.map_or_else(String::new, |value| value.to_string())
-        ),
-        auth_env_refresh_token_url_override_present = tracing::field::debug(
-            auth_env.refresh_token_url_override_present
-        ),
+        auth_env_provider_key_name = auth_env.provider_env_key_name.as_deref().unwrap_or(""),
+        auth_env_provider_key_present = auth_env.provider_env_key_present.map_or_else(String::new, |value| value.to_string()),
+        auth_env_refresh_token_url_override_present = auth_env.refresh_token_url_override_present,
     );
 }
 
@@ -328,9 +326,7 @@ impl RingBuffer {
         let needed = self.len() + data.len();
         if needed > self.max {
             let to_drop = needed - self.max;
-            for _ in 0..to_drop {
-                let _ = self.buf.pop_front();
-            }
+            self.buf.drain(..to_drop);
         }
 
         self.buf.extend(data.iter().copied());
@@ -412,11 +408,15 @@ impl FeedbackSnapshot {
         self.feedback_diagnostics.attachment_text()
     }
 
+    /// Exports a unique snapshot. The caller owns removal of the returned file.
     pub fn save_to_temp_file(&self) -> io::Result<PathBuf> {
-        let dir = std::env::temp_dir();
-        let filename = format!("codex-feedback-{}.log", self.thread_id);
-        let path = dir.join(filename);
-        fs::write(&path, self.as_bytes())?;
+        let mut file = tempfile::Builder::new()
+            .prefix("codex-feedback-")
+            .suffix(".log")
+            .tempfile()?;
+        file.write_all(self.as_bytes())?;
+        file.flush()?;
+        let (_, path) = file.keep().map_err(|error| error.error)?;
         Ok(path)
     }
 
@@ -427,10 +427,6 @@ impl FeedbackSnapshot {
 
         use sentry::Client;
         use sentry::ClientOptions;
-        use sentry::protocol::Envelope;
-        use sentry::protocol::EnvelopeItem;
-        use sentry::protocol::Event;
-        use sentry::protocol::Level;
         use sentry::transports::DefaultTransportFactory;
         use sentry::types::Dsn;
 
@@ -440,6 +436,19 @@ impl FeedbackSnapshot {
             transport: Some(Arc::new(DefaultTransportFactory {})),
             ..Default::default()
         });
+
+        self.upload_feedback_with_client(options, &client)
+    }
+
+    fn upload_feedback_with_client(
+        &self,
+        options: FeedbackUploadOptions<'_>,
+        client: &sentry::Client,
+    ) -> Result<()> {
+        use sentry::protocol::Envelope;
+        use sentry::protocol::EnvelopeItem;
+        use sentry::protocol::Event;
+        use sentry::protocol::Level;
 
         let tags = self.upload_tags(
             options.classification,
@@ -488,7 +497,9 @@ impl FeedbackSnapshot {
         }
 
         client.send_envelope(envelope);
-        client.flush(Some(Duration::from_secs(UPLOAD_TIMEOUT_SECS)));
+        if !client.flush(Some(Duration::from_secs(UPLOAD_TIMEOUT_SECS))) {
+            return Err(anyhow!("feedback upload did not finish before the timeout"));
+        }
         Ok(())
     }
 
@@ -551,24 +562,45 @@ impl FeedbackSnapshot {
         use sentry::protocol::Attachment;
 
         let mut attachments = Vec::new();
+        let mut remaining = MAX_TOTAL_ATTACHMENT_BYTES;
 
         if include_logs {
-            attachments.push(Attachment {
-                buffer: logs_override.unwrap_or_else(|| self.bytes.clone()),
-                filename: String::from("codex-logs.log"),
-                content_type: Some("text/plain".to_string()),
-                ty: None,
-            });
+            let logs = logs_override.as_deref().unwrap_or(&self.bytes);
+            if reserve_attachment_bytes("codex-logs.log", logs.len(), &mut remaining) {
+                attachments.push(Attachment {
+                    buffer: logs_override.unwrap_or_else(|| self.bytes.clone()),
+                    filename: String::from("codex-logs.log"),
+                    content_type: Some("text/plain".to_string()),
+                    ty: None,
+                });
+            }
         }
 
-        attachments.extend(extra_attachments.iter().map(|attachment| Attachment {
-            buffer: attachment.buffer.clone(),
-            filename: attachment.filename.clone(),
-            content_type: attachment.content_type.clone(),
-            ty: None,
-        }));
+        attachments.extend(
+            extra_attachments
+                .iter()
+                .filter(|attachment| {
+                    reserve_attachment_bytes(
+                        &attachment.filename,
+                        attachment.buffer.len(),
+                        &mut remaining,
+                    )
+                })
+                .map(|attachment| Attachment {
+                    buffer: attachment.buffer.clone(),
+                    filename: attachment.filename.clone(),
+                    content_type: attachment.content_type.clone(),
+                    ty: None,
+                }),
+        );
 
-        if let Some(text) = self.feedback_diagnostics_attachment_text(include_logs) {
+        if let Some(text) = self.feedback_diagnostics_attachment_text(include_logs)
+            && reserve_attachment_bytes(
+                FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME,
+                text.len(),
+                &mut remaining,
+            )
+        {
             attachments.push(Attachment {
                 buffer: text.into_bytes(),
                 filename: FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME.to_string(),
@@ -578,7 +610,12 @@ impl FeedbackSnapshot {
         }
 
         for attachment_path in extra_attachment_paths {
-            let data = match fs::read(&attachment_path.path) {
+            let limit = remaining.min(MAX_ATTACHMENT_BYTES);
+            let data = match fs::File::open(&attachment_path.path).and_then(|file| {
+                let mut data = Vec::new();
+                file.take(limit as u64 + 1).read_to_end(&mut data)?;
+                Ok(data)
+            }) {
                 Ok(data) => data,
                 Err(err) => {
                     tracing::warn!(
@@ -599,6 +636,9 @@ impl FeedbackSnapshot {
                         .map(|s| s.to_string_lossy().to_string())
                         .unwrap_or_else(|| "extra-log.log".to_string())
                 });
+            if !reserve_attachment_bytes(&filename, data.len(), &mut remaining) {
+                continue;
+            }
             let content_type = match Path::new(&filename)
                 .extension()
                 .and_then(|extension| extension.to_str())
@@ -621,6 +661,19 @@ impl FeedbackSnapshot {
 
         attachments
     }
+}
+
+fn reserve_attachment_bytes(filename: &str, bytes: usize, remaining: &mut usize) -> bool {
+    if bytes > MAX_ATTACHMENT_BYTES || bytes > *remaining {
+        tracing::warn!(
+            filename,
+            bytes,
+            "feedback attachment exceeds upload byte budget; skipping"
+        );
+        return false;
+    }
+    *remaining -= bytes;
+    true
 }
 
 fn display_classification(classification: &str) -> String {
@@ -693,13 +746,32 @@ impl Visit for FeedbackTagsVisitor {
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        self.tags
-            .insert(field.name().to_string(), value.to_string());
+        self.tags.insert(
+            field.name().to_string(),
+            value[..value.floor_char_boundary(MAX_FEEDBACK_TAG_VALUE_BYTES)].to_string(),
+        );
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.tags
-            .insert(field.name().to_string(), format!("{value:?}"));
+        use std::fmt::Write;
+        let mut formatted = BoundedTagValue(String::new());
+        let _ = write!(formatted, "{value:?}");
+        self.tags.insert(field.name().to_string(), formatted.0);
+    }
+}
+
+struct BoundedTagValue(String);
+
+impl std::fmt::Write for BoundedTagValue {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        let available = MAX_FEEDBACK_TAG_VALUE_BYTES - self.0.len();
+        let end = value.floor_char_boundary(available);
+        self.0.push_str(&value[..end]);
+        if end < value.len() {
+            Err(std::fmt::Error)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -713,6 +785,212 @@ mod tests {
     use pretty_assertions::assert_eq;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
+
+    #[test]
+    fn upload_reports_transport_flush_failure() {
+        struct TestTransport {
+            flushed: bool,
+            envelopes: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl sentry::Transport for TestTransport {
+            fn send_envelope(&self, envelope: sentry::protocol::Envelope) {
+                let classification = envelope.items().find_map(|item| match item {
+                    sentry::protocol::EnvelopeItem::Event(event) => {
+                        event.tags.get("classification").map(String::as_str)
+                    }
+                    _ => None,
+                });
+                assert_eq!(classification, Some("bug"));
+                self.envelopes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            fn flush(&self, _: Duration) -> bool {
+                self.flushed
+            }
+        }
+        for flushed in [false, true] {
+            let envelopes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let transport: Arc<dyn sentry::Transport> = Arc::new(TestTransport {
+                flushed,
+                envelopes: envelopes.clone(),
+            });
+            let client = sentry::Client::from_config(sentry::ClientOptions {
+                dsn: Some(SENTRY_DSN.parse().unwrap()),
+                transport: Some(Arc::new(move |_: &sentry::ClientOptions| transport.clone())),
+                ..Default::default()
+            });
+            let snapshot = CodexFeedback::new().snapshot(None);
+            let result = snapshot.upload_feedback_with_client(
+                FeedbackUploadOptions {
+                    classification: "bug",
+                    reason: None,
+                    tags: None,
+                    include_logs: false,
+                    extra_attachments: &[],
+                    extra_attachment_paths: &[],
+                    session_source: None,
+                    logs_override: None,
+                },
+                &client,
+            );
+            assert_eq!(envelopes.load(std::sync::atomic::Ordering::SeqCst), 1);
+            if flushed {
+                result.unwrap();
+            } else {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "feedback upload did not finish before the timeout"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn temporary_exports_preserve_distinct_snapshots() {
+        let fb = CodexFeedback::new();
+        let thread_id = ThreadId::new();
+        let mut writer = fb.make_writer().make_writer();
+        writer.write_all(b"first").unwrap();
+        let first = fb.snapshot(Some(thread_id)).save_to_temp_file().unwrap();
+        writer.write_all(b" second").unwrap();
+        let second = fb.snapshot(Some(thread_id)).save_to_temp_file().unwrap();
+        assert_ne!(first, second);
+        assert_eq!(fs::read(&first).unwrap(), b"first");
+        assert_eq!(fs::read(&second).unwrap(), b"first second");
+        fs::remove_file(first).unwrap();
+        fs::remove_file(second).unwrap();
+    }
+
+    #[test]
+    fn attachment_budgets_skip_oversized_inputs_without_truncating() {
+        let dir = tempfile::tempdir().unwrap();
+        let oversized = dir.path().join("large.zip");
+        fs::File::create(&oversized)
+            .unwrap()
+            .set_len((MAX_ATTACHMENT_BYTES + 1) as u64)
+            .unwrap();
+        let small = dir.path().join("small.zip");
+        fs::write(&small, b"complete archive").unwrap();
+        let paths = [oversized, small].map(|path| FeedbackAttachmentPath {
+            path,
+            attachment_filename_override: None,
+        });
+        let snapshot = CodexFeedback::new().snapshot(None);
+        let attachments = snapshot.feedback_attachments(false, &[], &paths, None);
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "small.zip");
+        assert_eq!(attachments[0].buffer, b"complete archive");
+
+        let extras = [
+            MAX_ATTACHMENT_BYTES + 1,
+            MAX_ATTACHMENT_BYTES,
+            MAX_ATTACHMENT_BYTES,
+            1,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, size)| FeedbackAttachment {
+            filename: format!("{index}.zip"),
+            content_type: None,
+            buffer: vec![index as u8; size],
+        })
+        .collect::<Vec<_>>();
+        let attachments = snapshot.feedback_attachments(false, &extras, &paths, None);
+        assert_eq!(
+            attachments
+                .iter()
+                .map(|item| item.filename.as_str())
+                .collect::<Vec<_>>(),
+            ["1.zip", "2.zip"]
+        );
+        assert_eq!(
+            attachments
+                .iter()
+                .map(|item| item.buffer.len())
+                .sum::<usize>(),
+            MAX_TOTAL_ATTACHMENT_BYTES
+        );
+        assert!(attachments[0].buffer.iter().all(|byte| *byte == 1));
+        assert!(attachments[1].buffer.iter().all(|byte| *byte == 2));
+    }
+
+    #[test]
+    fn request_emitters_preserve_plain_values_and_clear_absent_tags() {
+        let fb = CodexFeedback::new();
+        let _guard = tracing_subscriber::registry()
+            .with(fb.metadata_layer())
+            .set_default();
+        let mut tags = FeedbackRequestTags {
+            endpoint: "https://example.test/\"quoted\"",
+            auth_header_attached: true,
+            auth_header_name: Some("Authorization"),
+            auth_mode: Some("chatgpt"),
+            auth_retry_after_unauthorized: Some(false),
+            auth_recovery_mode: None,
+            auth_recovery_phase: None,
+            auth_connection_reused: Some(true),
+            auth_request_id: Some("request-id"),
+            auth_cf_ray: None,
+            auth_error: None,
+            auth_error_code: None,
+            auth_recovery_followup_success: Some(true),
+            auth_recovery_followup_status: Some(200),
+        };
+        emit_feedback_request_tags(&tags);
+        let snapshot = fb.snapshot(None);
+        assert_eq!(snapshot.tags["endpoint"], tags.endpoint);
+        assert_eq!(snapshot.tags["auth_header_name"], "Authorization");
+        assert_eq!(snapshot.tags["auth_retry_after_unauthorized"], "false");
+        assert_eq!(snapshot.tags["auth_recovery_followup_status"], "200");
+        assert_eq!(snapshot.tags["auth_request_id"], "request-id");
+        tags.auth_request_id = None;
+        tags.auth_retry_after_unauthorized = None;
+        emit_feedback_request_tags_with_auth_env(&tags, &AuthEnvTelemetry::default());
+        let snapshot = fb.snapshot(None);
+        assert_eq!(snapshot.tags["endpoint"], tags.endpoint);
+        assert_eq!(snapshot.tags["auth_request_id"], "");
+        assert_eq!(snapshot.tags["auth_retry_after_unauthorized"], "");
+        assert_eq!(snapshot.tags["auth_env_openai_api_key_present"], "false");
+    }
+
+    #[test]
+    fn metadata_values_are_bounded_during_collection_and_formatting() {
+        struct LargeDebug;
+        impl std::fmt::Debug for LargeDebug {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                for _ in 0..MAX_FEEDBACK_TAG_VALUE_BYTES + 1 {
+                    formatter.write_str("x")?;
+                }
+                panic!("formatting must stop when the byte budget is exhausted");
+            }
+        }
+        let fb = CodexFeedback::new();
+        let _guard = tracing_subscriber::registry()
+            .with(fb.metadata_layer())
+            .set_default();
+        let value = "€".repeat(MAX_FEEDBACK_TAG_VALUE_BYTES);
+        tracing::info!(target: FEEDBACK_TAGS_TARGET, text = value.as_str(), debug = ?LargeDebug);
+        let snapshot = fb.snapshot(None);
+        assert_eq!(
+            snapshot.tags["text"],
+            "€".repeat(MAX_FEEDBACK_TAG_VALUE_BYTES / 3)
+        );
+        assert_eq!(
+            snapshot.tags["debug"],
+            "x".repeat(MAX_FEEDBACK_TAG_VALUE_BYTES)
+        );
+        {
+            let mut tags = fb.inner.tags.lock().unwrap();
+            for index in 0..MAX_FEEDBACK_TAGS - 2 {
+                tags.insert(format!("filler-{index}"), String::new());
+            }
+        }
+        tracing::info!(target: FEEDBACK_TAGS_TARGET, text = "updated", rejected = "new key");
+        let snapshot = fb.snapshot(None);
+        assert_eq!(snapshot.tags.len(), MAX_FEEDBACK_TAGS);
+        assert_eq!(snapshot.tags["text"], "updated");
+        assert!(!snapshot.tags.contains_key("rejected"));
+    }
 
     #[test]
     fn ring_buffer_drops_front_when_full() {
@@ -1036,5 +1314,9 @@ mod tests {
             Some("from-client")
         );
         assert_eq!(upload_tags.get("model").map(String::as_str), Some("gpt-5"));
+        assert_eq!(
+            upload_tags.get("cli_version").map(String::as_str),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
     }
 }

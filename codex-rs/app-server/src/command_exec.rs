@@ -395,18 +395,32 @@ impl CommandExecManager {
                     };
                 let output = codex_core::sandboxing::execute_env(exec_request, stdout_stream).await;
                 let event_fallback = if let Some(handle) = event_relay_handle {
-                    handle.await.unwrap_or_default()
+                    handle.await
                 } else {
-                    UndeliveredOutput::default()
+                    Ok(UndeliveredOutput::default())
                 };
                 drop(delivery_relay);
-                let mut undelivered = if let Some(handle) = delivery_handle {
-                    handle.await.unwrap_or_default()
+                let undelivered = if let Some(handle) = delivery_handle {
+                    handle.await
                 } else {
-                    UndeliveredOutput::default()
+                    Ok(UndeliveredOutput::default())
                 };
-                undelivered.append_tail(event_fallback);
                 sessions.lock().await.remove(&process_key);
+                let undelivered = match undelivered.and_then(|mut output| {
+                    output.append_tail(event_fallback?);
+                    Ok(output)
+                }) {
+                    Ok(output) => output,
+                    Err(err) => {
+                        outgoing
+                            .send_error(
+                                request_id,
+                                internal_error(format!("command output capture failed: {err}")),
+                            )
+                            .await;
+                        return;
+                    }
+                };
                 match output {
                     Ok(output) => {
                         outgoing
@@ -839,21 +853,38 @@ async fn run_command(params: RunCommandParams) {
         let _ = stdio_timeout_tx.send(true);
     });
 
-    let stdout = stdout_handle.await.unwrap_or_default();
-    let stderr = stderr_handle.await.unwrap_or_default();
+    let stdout = stdout_handle.await;
+    let stderr = stderr_handle.await;
     timeout_handle.abort();
     drop(delivery_relay);
-    let mut undelivered = if let Some(delivery_handle) = delivery_handle {
-        delivery_handle.await.unwrap_or_default()
+    let undelivered = if let Some(delivery_handle) = delivery_handle {
+        delivery_handle.await
     } else {
-        UndeliveredOutput::default()
+        Ok(UndeliveredOutput::default())
     };
-    // Relay failures precede any chunks rejected by relay admission. Decode the
-    // entire suffix once, including UTF-8 codepoints split across those chunks.
-    undelivered.append_tail(UndeliveredOutput { stdout, stderr });
     if let Some(cleanup) = terminal_cleanup {
         cleanup.sessions.lock().await.remove(&cleanup.process_key);
     }
+    let undelivered = match undelivered.and_then(|mut output| {
+        // Relay failures precede chunks rejected by relay admission. Decode the
+        // entire suffix once, including split UTF-8 codepoints.
+        output.append_tail(UndeliveredOutput {
+            stdout: stdout?,
+            stderr: stderr?,
+        });
+        Ok(output)
+    }) {
+        Ok(output) => output,
+        Err(err) => {
+            outgoing
+                .send_error(
+                    request_id,
+                    internal_error(format!("command output capture failed: {err}")),
+                )
+                .await;
+            return;
+        }
+    };
 
     outgoing
         .send_response(
@@ -867,6 +898,10 @@ async fn run_command(params: RunCommandParams) {
         .await;
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "Queued deltas are encoded internally with the same base64 engine"
+)]
 fn spawn_output_delivery_relay(
     outgoing: Arc<OutgoingMessageSender>,
     connection_id: ConnectionId,

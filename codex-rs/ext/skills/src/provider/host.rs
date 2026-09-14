@@ -44,6 +44,17 @@ impl SkillProvider for HostSkillProvider {
 
     fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult> {
         Box::pin(async move {
+            if request.authority != SkillAuthority::new(SkillSourceKind::Host, HOST_AUTHORITY_ID) {
+                return Err(SkillProviderError::new(
+                    "host skill provider cannot read this authority",
+                ));
+            }
+            if request.package.0.replace('\\', "/") != request.resource.as_str().replace('\\', "/")
+            {
+                return Err(SkillProviderError::new(
+                    "host skill resource does not match its package",
+                ));
+            }
             let Some(host_snapshot) = request.host_snapshot else {
                 return Err(SkillProviderError::new(
                     "host skill provider requires a host skills snapshot",
@@ -91,9 +102,11 @@ fn catalog_from_outcome(outcome: &SkillLoadOutcome) -> SkillCatalog {
             .collect(),
     };
 
-    for (skill, enabled) in outcome.skills_with_enabled() {
-        catalog.push_entry(catalog_entry_from_skill(skill, enabled));
-    }
+    catalog.extend_entries(
+        outcome
+            .skills_with_enabled()
+            .map(|(skill, enabled)| catalog_entry_from_skill(skill, enabled)),
+    );
 
     catalog
 }

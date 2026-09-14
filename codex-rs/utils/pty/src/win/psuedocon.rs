@@ -42,6 +42,7 @@ use std::path::Path;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::Mutex;
 use winapi::shared::minwindef::DWORD;
 use winapi::shared::ntdef::NTSTATUS;
 use winapi::shared::ntstatus::STATUS_SUCCESS;
@@ -82,10 +83,10 @@ shared_library!(Ntdll,
     ) -> NTSTATUS,
 );
 
-static CONPTY: LazyLock<ConPtyFuncs> = LazyLock::new(|| {
-    ConPtyFuncs::open(Path::new("kernel32.dll")).expect(
-        "this system does not support conpty.  Windows 10 October 2018 or newer is required",
-    )
+static CONPTY: LazyLock<Result<ConPtyFuncs, String>> = LazyLock::new(|| {
+    ConPtyFuncs::open(Path::new("kernel32.dll")).map_err(|err| {
+        format!("failed to load ConPTY; Windows 10 October 2018 or newer is required: {err:?}")
+    })
 });
 
 pub fn conpty_supported() -> bool {
@@ -110,25 +111,25 @@ fn windows_build_number() -> Option<u32> {
 
 pub struct PsuedoCon {
     con: HPCON,
-    // CreatePseudoConsole borrows these pipe handles for the lifetime of the
-    // pseudoconsole, so we must keep owning them until ClosePseudoConsole.
-    _input: FileDescriptor,
-    _output: FileDescriptor,
+    functions: &'static ConPtyFuncs,
+    // Keep creation handles until a child is attached, then release our copies
+    // so the external reader can observe a broken channel during teardown.
+    creation_pipes: Mutex<Option<(FileDescriptor, FileDescriptor)>>,
 }
 
 // SAFETY: The pseudoconsole and its pipe handles are process-owned resources with no creator-
 // thread affinity; moving this sole owner preserves their lifetime and exclusive cleanup.
 unsafe impl Send for PsuedoCon {}
 // SAFETY: Shared methods only read the owned handle and issue Win32 resize or process-creation
-// requests. They do not mutate Rust fields, and exclusive Drop prevents closing the
+// requests. Pipe ownership is protected by a mutex, and exclusive Drop prevents closing the
 // pseudoconsole while borrowed.
 unsafe impl Sync for PsuedoCon {}
 
 impl Drop for PsuedoCon {
     fn drop(&mut self) {
-        // SAFETY: self owns the successfully created pseudoconsole; its retained input and
-        // output handles are dropped only after this call.
-        unsafe { (CONPTY.ClosePseudoConsole)(self.con) };
+        // SAFETY: self owns the successfully created pseudoconsole. Callers must keep
+        // draining its output (or close their reader) until teardown completes.
+        unsafe { (self.functions.ClosePseudoConsole)(self.con) };
     }
 }
 
@@ -138,11 +139,12 @@ impl PsuedoCon {
     }
 
     pub fn new(size: COORD, input: FileDescriptor, output: FileDescriptor) -> Result<Self, Error> {
+        let functions = CONPTY.as_ref().map_err(|err| anyhow::anyhow!("{err}"))?;
         let mut con: HPCON = INVALID_HANDLE_VALUE;
         // SAFETY: input and output own live pipe handles; con is writable HPCON storage, and
         // both pipes are retained in Self on success.
         let result = unsafe {
-            (CONPTY.CreatePseudoConsole)(
+            (functions.CreatePseudoConsole)(
                 size,
                 input.as_raw_handle() as _,
                 output.as_raw_handle() as _,
@@ -156,15 +158,15 @@ impl PsuedoCon {
         );
         Ok(Self {
             con,
-            _input: input,
-            _output: output,
+            functions,
+            creation_pipes: Mutex::new(Some((input, output))),
         })
     }
 
     pub fn resize(&self, size: COORD) -> Result<(), Error> {
         // SAFETY: self owns the live pseudoconsole for this call; dimensions are scalar values
         // validated by Windows.
-        let result = unsafe { (CONPTY.ResizePseudoConsole)(self.con, size) };
+        let result = unsafe { (self.functions.ResizePseudoConsole)(self.con, size) };
         ensure!(
             result == S_OK,
             "failed to resize console to {}x{}: HRESULT: {}",
@@ -177,6 +179,7 @@ impl PsuedoCon {
 
     pub fn spawn_command(&self, cmd: CommandBuilder) -> anyhow::Result<WinChild> {
         let job = Arc::new(JobObject::create()?);
+        job.require_descendant_containment()?;
         // SAFETY: STARTUPINFOEXW is an integer-and-pointer Windows structure with a valid all-
         // zero initial representation.
         let mut si: STARTUPINFOEXW = unsafe { mem::zeroed() };
@@ -198,8 +201,8 @@ impl PsuedoCon {
         let (mut exe, mut cmdline) = build_cmdline(&cmd)?;
         let cmd_os = OsString::from_wide(&cmdline);
 
-        let cwd = resolve_current_directory(&cmd);
-        let mut env_block = build_environment_block(&cmd);
+        let cwd = resolve_current_directory(&cmd)?;
+        let mut env_block = build_environment_block(&cmd)?;
 
         // SAFETY: exe, cmdline, cwd, and env_block are terminated buffers retained for the
         // call; si and pi are initialized writable structures and attrs retains the console/job
@@ -237,36 +240,45 @@ impl PsuedoCon {
         // ownership is transferred to OwnedHandle.
         let proc = unsafe { OwnedHandle::from_raw_handle(pi.hProcess as _) };
 
+        // CreateProcessW has attached the child; ConPTY now owns its pipe copies.
+        self.creation_pipes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         Ok(WinChild::new(proc, job))
     }
 }
 
-fn resolve_current_directory(cmd: &CommandBuilder) -> Option<Vec<u16>> {
-    let home = cmd
-        .get_env("USERPROFILE")
-        .and_then(|path| Path::new(path).is_dir().then(|| path.to_owned()));
-    let cwd = cmd
-        .get_cwd()
-        .and_then(|path| Path::new(path).is_dir().then(|| path.to_owned()));
-    let dir = cwd.or(home)?;
-
-    let mut wide = Vec::new();
-    if Path::new(&dir).is_relative() {
-        if let Ok(current_dir) = env::current_dir() {
-            wide.extend(current_dir.join(&dir).as_os_str().encode_wide());
-        } else {
-            wide.extend(dir.encode_wide());
-        }
+fn resolve_current_directory(cmd: &CommandBuilder) -> anyhow::Result<Option<Vec<u16>>> {
+    let dir = cmd.get_cwd().cloned().or_else(|| {
+        cmd.get_env("USERPROFILE")
+            .filter(|path| Path::new(path).is_dir())
+            .map(OsStr::to_os_string)
+    });
+    let Some(dir) = dir else {
+        return Ok(None);
+    };
+    let dir = if Path::new(&dir).is_relative() {
+        env::current_dir()?.join(&dir)
     } else {
-        wide.extend(dir.encode_wide());
-    }
+        dir.into()
+    };
+    let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+    ensure!(
+        !wide.contains(&0),
+        "current directory contains a null character"
+    );
     wide.push(0);
-    Some(wide)
+    Ok(Some(wide))
 }
 
-fn build_environment_block(cmd: &CommandBuilder) -> Vec<u16> {
+fn build_environment_block(cmd: &CommandBuilder) -> anyhow::Result<Vec<u16>> {
     let mut block = Vec::new();
     for (key, value) in cmd.iter_full_env_as_str() {
+        ensure!(
+            !key.contains('\0') && !value.contains('\0'),
+            "environment contains a null character"
+        );
         block.extend(OsStr::new(key).encode_wide());
         block.push(b'=' as u16);
         block.extend(OsStr::new(value).encode_wide());
@@ -276,7 +288,7 @@ fn build_environment_block(cmd: &CommandBuilder) -> Vec<u16> {
         block.push(0);
     }
     block.push(0);
-    block
+    Ok(block)
 }
 
 fn build_cmdline(cmd: &CommandBuilder) -> anyhow::Result<(Vec<u16>, Vec<u16>)> {
@@ -292,6 +304,10 @@ fn build_cmdline(cmd: &CommandBuilder) -> anyhow::Result<(Vec<u16>, Vec<u16>)> {
         search_path(cmd, first)
     };
 
+    ensure!(
+        !exe_os.encode_wide().any(|c| c == 0),
+        "program name contains a null character"
+    );
     let argv = cmd.get_argv();
     let args = argv.get(1..).unwrap_or_default();
     let cmd_payload_index = crate::windows_cmd_payload_index(&exe_os, args);
@@ -320,6 +336,14 @@ fn build_cmdline(cmd: &CommandBuilder) -> anyhow::Result<(Vec<u16>, Vec<u16>)> {
 }
 
 fn search_path(cmd: &CommandBuilder, exe: &OsStr) -> OsString {
+    if Path::new(exe).components().count() != 1
+        || Path::new(exe).file_name().is_none()
+        || exe
+            .encode_wide()
+            .any(|ch| ch == u16::from(b'/') || ch == u16::from(b'\\'))
+    {
+        return exe.to_os_string();
+    }
     let host_path = env::var_os("PATH");
     if let Some(path) = cmd.get_env("PATH").or(host_path.as_deref()) {
         let host_extensions = env::var_os("PATHEXT");
@@ -327,19 +351,25 @@ fn search_path(cmd: &CommandBuilder, exe: &OsStr) -> OsString {
             .get_env("PATHEXT")
             .or(host_extensions.as_deref())
             .unwrap_or(OsStr::new(".EXE"));
+        let extensions = env::split_paths(extensions)
+            .filter_map(|ext| {
+                ext.to_str()
+                    .map(|ext| ext.trim_start_matches('.').to_owned())
+            })
+            .filter(|ext| !ext.is_empty())
+            .collect::<Vec<_>>();
         for path in env::split_paths(path) {
             let candidate = path.join(exe);
-            if candidate.exists() {
+            if candidate.is_file() {
                 return candidate.into_os_string();
             }
 
-            for ext in env::split_paths(extensions) {
-                let ext = ext.to_str().unwrap_or("");
-                let path = path
-                    .join(exe)
-                    .with_extension(ext.strip_prefix('.').unwrap_or(ext));
-                if path.exists() {
-                    return path.into_os_string();
+            if Path::new(exe).extension().is_none() {
+                for ext in &extensions {
+                    let candidate = path.join(exe).with_extension(ext);
+                    if candidate.is_file() {
+                        return candidate.into_os_string();
+                    }
                 }
             }
         }
@@ -412,7 +442,7 @@ mod tests {
         // We can't stably check the version of the GH workers, but we can
         // at least check that this.
         let version = windows_build_number().unwrap();
-        assert!(version > MIN_CONPTY_BUILD);
+        assert!(version >= MIN_CONPTY_BUILD);
     }
 
     #[test]
@@ -468,7 +498,7 @@ mod tests {
         let mut command = CommandBuilder::new("cmd.exe");
         command.env_clear();
 
-        assert_eq!(build_environment_block(&command), vec![0, 0]);
+        assert_eq!(build_environment_block(&command).unwrap(), vec![0, 0]);
     }
 
     #[test]
@@ -488,5 +518,78 @@ mod tests {
             "{command_line}"
         );
         assert!(!command_line.contains(r#"\"CODEX_CMD_QUOTE"#));
+    }
+
+    #[test]
+    fn launch_rejects_nulls_in_every_native_string() {
+        assert!(build_cmdline(&CommandBuilder::new("cmd.exe\0ignored")).is_err());
+        let mut command = CommandBuilder::new("cmd.exe");
+        command.cwd("C:\\bad\0directory");
+        assert!(super::resolve_current_directory(&command).is_err());
+        for (key, value) in [("BAD\0KEY", "value"), ("KEY", "bad\0value")] {
+            let mut command = CommandBuilder::new("cmd.exe");
+            command.env(key, value);
+            assert!(build_environment_block(&command).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_missing_cwd_fails_and_pipe_copies_release_after_spawn() -> anyhow::Result<()> {
+        use portable_pty::Child;
+        let (console, input, output) = crate::win::conpty::RawConPty::new(80, 24)?.into_handles();
+        let mut command = CommandBuilder::new("cmd.exe");
+        command.args(["/d", "/c", "exit 0"]);
+        let mut invalid = command.clone();
+        invalid.cwd(std::env::temp_dir().join(format!(
+                "absent-codex-cwd-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_nanos()
+            )));
+        assert!(console.spawn_command(invalid).is_err());
+        assert!(console.creation_pipes.lock().unwrap().is_some());
+        let mut child = console.spawn_command(command)?;
+        assert!(console.creation_pipes.lock().unwrap().is_none());
+        assert_eq!(child.wait()?.exit_code(), 0);
+        drop(input);
+        drop(output);
+        drop(console);
+        Ok(())
+    }
+
+    #[test]
+    fn lookup_preserves_qualified_paths_extensions_and_skips_directories() -> anyhow::Result<()> {
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Directory(std::env::temp_dir().join(format!(
+                "codex-lookup-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_nanos()
+            )));
+        std::fs::create_dir_all(root.0.join("nested"))?;
+        std::fs::create_dir_all(root.0.join("tool.exe"))?;
+        std::fs::write(root.0.join("tool.com"), b"test")?;
+        std::fs::write(root.0.join("nested").join("tool.exe"), b"test")?;
+        let mut command = CommandBuilder::new("tool");
+        command.env("PATH", &root.0);
+        command.env("PATHEXT", ".EXE;.COM");
+        assert_eq!(
+            super::search_path(&command, std::ffi::OsStr::new("tool")),
+            root.0.join("tool.COM")
+        );
+        for name in [r"nested\tool.exe", ".\\tool", "tool.exe"] {
+            assert_eq!(
+                super::search_path(&command, std::ffi::OsStr::new(name)),
+                OsString::from(name)
+            );
+        }
+        Ok(())
     }
 }

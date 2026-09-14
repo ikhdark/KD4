@@ -55,8 +55,8 @@ impl ThreadMetadataSync {
     pub(crate) async fn collect_repository_context_for_create(
         params: &CreateThreadParams,
     ) -> Option<RepositoryContext> {
-        let cwd = params.metadata.cwd.clone().unwrap_or_default();
-        discover_repository_context(cwd.as_path()).await
+        let cwd = params.metadata.cwd.as_deref()?;
+        discover_repository_context(cwd).await
     }
 
     pub(crate) fn git_info_from_repository_context(context: &RepositoryContext) -> GitInfo {
@@ -181,11 +181,10 @@ impl ThreadMetadataSync {
                 Some(codex_state::latest_rollout_recency_at(items).unwrap_or_else(Utc::now));
         }
         self.merge_pending_update(Some(update));
-        if !affects_metadata
-            && !self
-                .pending_update
-                .as_ref()
-                .is_some_and(update_has_metadata_facts)
+        if !self
+            .pending_update
+            .as_ref()
+            .is_some_and(update_has_metadata_facts)
             && self.last_touch_persisted_at.is_some_and(|last_touch| {
                 Instant::now().duration_since(last_touch) < THREAD_UPDATED_AT_TOUCH_INTERVAL
             })
@@ -256,7 +255,9 @@ impl ThreadMetadataSync {
                     self.observe_user_message(user, &mut update);
                 }
                 RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => {
-                    if let TurnItem::UserMessage(user) = &event.item {
+                    if let TurnItem::UserMessage(user) = &event.item
+                        && !(self.preview_seen && self.first_user_message_seen && self.title_seen)
+                    {
                         self.observe_user_message(
                             &user.as_legacy_user_message_event(),
                             &mut update,
@@ -292,7 +293,9 @@ impl ThreadMetadataSync {
     }
 
     fn observe_user_message(&mut self, user: &UserMessageEvent, update: &mut ThreadMetadataPatch) {
-        if let Some(preview) = user_message_preview(user) {
+        if !(self.preview_seen && self.first_user_message_seen)
+            && let Some(preview) = user_message_preview(user)
+        {
             if !self.first_user_message_seen {
                 self.first_user_message_seen = true;
                 update.first_user_message = Some(preview.clone());
@@ -604,12 +607,18 @@ mod tests {
         ));
         let pending = sync.take_pending_update().expect("pending resume metadata");
         sync.mark_pending_update_applied(&pending);
+        sync.last_touch_persisted_at = Some(Instant::now());
 
+        assert!(
+            sync.observe_appended_items(&[RolloutItem::EventMsg(EventMsg::UserMessage(
+                user_message("later user text")
+            ))])
+            .is_none(),
+            "touch-only user messages should wait for a barrier"
+        );
         let update = sync
-            .observe_appended_items(&[RolloutItem::EventMsg(EventMsg::UserMessage(user_message(
-                "later user text",
-            )))])
-            .expect("updated_at touch");
+            .take_pending_update()
+            .expect("pending updated_at touch");
 
         assert_eq!(update.patch.preview, None);
         assert_eq!(update.patch.title, None);

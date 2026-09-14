@@ -74,7 +74,18 @@ pub(super) async fn update_thread_metadata(
     )
     .await?;
     if !needs_rollout_compat {
-        return Ok(updated);
+        if let Some(metadata) = updated {
+            return read_thread::stored_thread_from_sqlite_metadata(store, metadata).await;
+        }
+        return read_thread::read_thread(
+            store,
+            ReadThreadParams {
+                thread_id,
+                include_archived: params.include_archived,
+                include_history: false,
+            },
+        )
+        .await;
     }
 
     if live_writer::rollout_path(store, thread_id).await.is_ok() {
@@ -204,7 +215,7 @@ async fn apply_metadata_update(
     patch: ThreadMetadataPatch,
     include_archived: bool,
     require_sqlite_write: bool,
-) -> ThreadStoreResult<StoredThread> {
+) -> ThreadStoreResult<Option<codex_state::ThreadMetadata>> {
     let live_rollout_path = live_writer::rollout_path(store, thread_id).await.ok();
     let mut rollout_path = patch.rollout_path.clone().or(live_rollout_path);
     let mut rollout_path_archived = rollout_path
@@ -255,6 +266,16 @@ async fn apply_metadata_update(
                     .await?
                 }
             };
+            read_thread::resolve_sqlite_rollout_location(store, &mut metadata).await?;
+            if !include_archived
+                && (metadata.archived_at.is_some()
+                    || rollout_path_is_archived(&store.config.codex_home, &metadata.rollout_path)
+                    || rollout_path_archived)
+            {
+                return Err(ThreadStoreError::InvalidRequest {
+                    message: format!("thread {thread_id} is archived"),
+                });
+            }
             if let Some(rollout_path) = rollout_path {
                 metadata.rollout_path = rollout_path;
             }
@@ -394,26 +415,7 @@ async fn apply_metadata_update(
             None
         }
     };
-    if let Some(metadata) = updated_metadata
-        && (include_archived
-            || (metadata.archived_at.is_none()
-                && !rollout_path_is_archived(
-                    store.config.codex_home.as_path(),
-                    metadata.rollout_path.as_path(),
-                )))
-    {
-        return read_thread::stored_thread_from_sqlite_metadata(store, metadata).await;
-    }
-
-    read_thread::read_thread(
-        store,
-        ReadThreadParams {
-            thread_id,
-            include_archived,
-            include_history: false,
-        },
-    )
-    .await
+    Ok(updated_metadata)
 }
 
 async fn metadata_for_missing_sqlite_row(
@@ -423,6 +425,44 @@ async fn metadata_for_missing_sqlite_row(
     rollout_path_archived: bool,
     patch: &ThreadMetadataPatch,
 ) -> ThreadStoreResult<codex_state::ThreadMetadata> {
+    if let Ok(session_meta) = read_session_meta_line(rollout_path).await {
+        if session_meta.meta.id != thread_id {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: format!(
+                    "rollout session metadata id mismatch: expected {thread_id}, found {}",
+                    session_meta.meta.id
+                ),
+            });
+        }
+        let history_mode = session_meta.meta.history_mode;
+        let item = RolloutItem::SessionMeta(session_meta);
+        let mut builder =
+            codex_rollout::builder_from_items(std::slice::from_ref(&item), rollout_path)
+                .unwrap_or_else(|| {
+                    ThreadMetadataBuilder::new(
+                        thread_id,
+                        rollout_path.to_path_buf(),
+                        patch
+                            .created_at
+                            .or(patch.updated_at)
+                            .unwrap_or_else(Utc::now),
+                        SessionSource::Unknown,
+                    )
+                });
+        builder.id = thread_id;
+        builder.history_mode = history_mode;
+        let mut metadata = builder.build(&store.config.default_model_provider_id);
+        codex_state::apply_rollout_item(
+            &mut metadata,
+            &item,
+            &store.config.default_model_provider_id,
+        );
+        metadata.cwd = normalize_cwd(metadata.cwd);
+        if rollout_path_archived {
+            metadata.archived_at = Some(metadata.updated_at);
+        }
+        return Ok(metadata);
+    }
     let created_at = patch
         .created_at
         .or(patch.updated_at)
@@ -500,10 +540,11 @@ fn needs_rollout_compatibility_update(patch: &ThreadMetadataPatch) -> bool {
 
 fn sqlite_write_failure_should_block(patch: &ThreadMetadataPatch) -> bool {
     // Before live metadata sync moved above the rollout writer, SQLite sync failures for
-    // transcript-derived metadata, thread names, and memory-mode indexing were log-only. Keep that
+    // transcript-derived metadata and memory-mode indexing were log-only. Keep that
     // failure isolation so a corrupted optional state DB does not make JSONL transcript durability
     // look broken. Explicit git-only updates still require SQLite because partial git patches need
-    // the existing SQLite value to preserve unspecified fields.
+    // the existing SQLite value to preserve unspecified fields. Name compatibility writes still
+    // require their targeted SQLite update to succeed before writing the legacy name index.
     patch.git_info.is_some() && !has_observed_metadata_facts(patch)
 }
 
@@ -720,6 +761,49 @@ mod tests {
     use crate::local::test_support::write_archived_session_file;
     use crate::local::test_support::write_session_file;
     use crate::local::test_support::write_session_file_with_history_mode;
+
+    #[tokio::test]
+    async fn missing_sqlite_row_preserves_canonical_session_metadata() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let runtime = codex_state::StateRuntime::init(
+            home.path().to_path_buf(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db");
+        let store = LocalThreadStore::new(config, Some(runtime.clone()));
+        let uuid = Uuid::from_u128(9991);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+        write_session_file(home.path(), "2025-02-04T16-00-00", uuid).expect("rollout");
+        store
+            .update_thread_metadata(UpdateThreadMetadataParams {
+                thread_id,
+                patch: ThreadMetadataPatch {
+                    preview: Some("new preview".to_string()),
+                    ..Default::default()
+                },
+                include_archived: false,
+            })
+            .await
+            .expect("update");
+        let metadata = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("read")
+            .expect("metadata");
+        assert_eq!(metadata.source, "cli");
+        assert_eq!(metadata.cli_version, "test_version");
+        assert_eq!(metadata.model_provider, "test-provider");
+        assert_eq!(metadata.git_sha.as_deref(), Some("abcdef"));
+        assert_eq!(metadata.git_branch.as_deref(), Some("main"));
+        assert_eq!(metadata.cwd, normalize_cwd(home.path().to_path_buf()));
+        assert_eq!(
+            metadata.created_at.to_rfc3339(),
+            "2025-02-04T16:00:00+00:00"
+        );
+        assert_eq!(metadata.preview.as_deref(), Some("new preview"));
+    }
 
     #[tokio::test]
     async fn update_thread_metadata_sets_name_on_active_rollout_and_indexes_name() {
@@ -1872,6 +1956,33 @@ mod tests {
                 .expect("metadata")
                 .archived_at
                 .is_some()
+        );
+
+        let before = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("read metadata")
+            .expect("metadata");
+        let rollout_before = std::fs::read(&archived_path).expect("read rollout");
+        let error = store
+            .update_thread_metadata(UpdateThreadMetadataParams {
+                thread_id,
+                patch: ThreadMetadataPatch {
+                    preview: Some("must not be written".to_string()),
+                    ..Default::default()
+                },
+                include_archived: false,
+            })
+            .await
+            .expect_err("archived update rejected");
+        assert!(matches!(error, ThreadStoreError::InvalidRequest { .. }));
+        assert_eq!(
+            runtime.get_thread(thread_id).await.expect("read metadata"),
+            Some(before)
+        );
+        assert_eq!(
+            std::fs::read(&archived_path).expect("read rollout"),
+            rollout_before
         );
 
         let thread = store

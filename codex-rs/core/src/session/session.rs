@@ -795,7 +795,9 @@ impl SessionConfiguration {
         let updates = updates.clone();
         tokio::task::spawn_blocking(move || configuration.apply(&updates))
             .await
-            .expect("session settings projection worker panicked")
+            .map_err(|error| codex_config::ConstraintError::UpdateRejected {
+                reason: format!("session settings projection worker failed: {error}"),
+            })?
     }
 
     pub(crate) fn apply(&self, updates: &SessionSettingsUpdate) -> ConstraintResult<Self> {

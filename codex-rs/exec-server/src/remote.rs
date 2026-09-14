@@ -47,6 +47,7 @@ use crate::trace_context::current_trace_context_headers;
 
 const ERROR_BODY_PREVIEW_BYTES: usize = 4096;
 const NOISE_RELAY_SECURITY_PROFILE: &str = "noise_hybrid_ik_v1";
+const STABLE_RENDEZVOUS_SESSION: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct EnvironmentRegistryClient {
@@ -125,6 +126,7 @@ impl EnvironmentRegistryClient {
         let response = self
             .http
             .post(endpoint_url(&self.base_url, environment_id, "register")?)
+            .timeout(self.connect_timeout)
             .headers(self.auth_provider.to_auth_headers())
             .headers(current_trace_context_headers())
             .json(&EnvironmentRegistryRegistrationRequest {
@@ -135,6 +137,12 @@ impl EnvironmentRegistryClient {
             .await?;
         let response: EnvironmentRegistryRegistrationResponse =
             self.parse_json_response(response).await?;
+        if response.executor_registration_id.trim().is_empty() {
+            return Err(ExecServerError::Protocol(
+                "environment registry returned an empty executor registration id".to_string(),
+            ));
+        }
+        validate_rendezvous_url(&response.url)?;
         if response.environment_id != environment_id {
             return Err(ExecServerError::Protocol(
                 "environment registry returned a different environment id".to_string(),
@@ -195,6 +203,7 @@ impl EnvironmentRegistryClient {
                 "environment registry returned incomplete Noise connection data".to_string(),
             ));
         }
+        validate_rendezvous_url(&response.url)?;
         Ok(NoiseRendezvousConnectBundle {
             websocket_url: response.url,
             environment_id: response.environment_id,
@@ -204,7 +213,7 @@ impl EnvironmentRegistryClient {
         })
     }
 
-    async fn parse_json_response<R>(&self, response: HttpResponse) -> Result<R, ExecServerError>
+    async fn parse_json_response<R>(&self, mut response: HttpResponse) -> Result<R, ExecServerError>
     where
         R: for<'de> Deserialize<'de>,
     {
@@ -213,7 +222,21 @@ impl EnvironmentRegistryClient {
         }
 
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let mut body = Vec::new();
+        while let Ok(Some(chunk)) = response.chunk().await {
+            let remaining = (ERROR_BODY_PREVIEW_BYTES + 1).saturating_sub(body.len());
+            body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            if body.len() > ERROR_BODY_PREVIEW_BYTES {
+                break;
+            }
+        }
+        let body = String::from_utf8_lossy(&body);
+        // An incomplete body must not be interpreted as a complete registry error.
+        let body = if body.len() > ERROR_BODY_PREVIEW_BYTES {
+            preview_error_body(&body).unwrap_or_default()
+        } else {
+            body.into_owned()
+        };
         if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
             return Err(environment_registry_auth_error(status, &body));
         }
@@ -482,7 +505,7 @@ pub async fn run_remote_environment(
     loop {
         match connect_rendezvous(&response.url, &config.telemetry).await {
             Ok(websocket) => {
-                backoff = Duration::from_secs(1);
+                let connected_at = Instant::now();
                 let executor_registration_id = response.executor_registration_id.clone();
                 info!(
                     noise_event = "rendezvous_connection",
@@ -502,6 +525,9 @@ pub async fn run_remote_environment(
                     },
                 )
                 .await;
+                if connected_at.elapsed() >= STABLE_RENDEZVOUS_SESSION {
+                    backoff = Duration::from_secs(1);
+                }
                 info!(
                     noise_event = "rendezvous_connection",
                     noise_outcome = "disconnected",
@@ -558,8 +584,8 @@ async fn connect_rendezvous(
     tokio_tungstenite::tungstenite::Error,
 > {
     let started_at = Instant::now();
-    let result = async {
-        let connector = websocket_connector_with_custom_ca().await?;
+    let result = tokio::time::timeout(DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT, async {
+        let connector = websocket_connector_with_custom_ca(url).await?;
         let mut request = url.into_client_request()?;
         request
             .headers_mut()
@@ -574,12 +600,39 @@ async fn connect_rendezvous(
         )
         .await
         .map(|(websocket, _)| websocket)
-    }
-    .await;
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(tokio_tungstenite::tungstenite::Error::Io(
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out connecting to rendezvous",
+            ),
+        ))
+    });
     let result_name = if result.is_ok() { "success" } else { "error" };
     tracing::Span::current().record("result", result_name);
     telemetry.remote_rendezvous_completed(result_name, started_at.elapsed());
     result
+}
+
+fn validate_rendezvous_url(value: &str) -> Result<(), ExecServerError> {
+    let url = url::Url::parse(value).map_err(|_| {
+        ExecServerError::Protocol(
+            "environment registry returned an invalid rendezvous URL".to_string(),
+        )
+    })?;
+    if !matches!(url.scheme(), "ws" | "wss") || url.host_str().is_none() {
+        return Err(ExecServerError::Protocol(
+            "environment registry returned an invalid rendezvous URL".to_string(),
+        ));
+    }
+    value.into_client_request().map_err(|_| {
+        ExecServerError::Protocol(
+            "environment registry returned an invalid rendezvous URL".to_string(),
+        )
+    })?;
+    Ok(())
 }
 
 fn normalize_environment_id(environment_id: String) -> Result<String, ExecServerError> {
@@ -650,10 +703,13 @@ fn environment_registry_http_error(status: StatusCode, body: &str) -> ExecServer
         .and_then(|body| body.error)
         .map(|error| {
             (
-                error.code,
-                error.message.unwrap_or_else(|| {
-                    preview_error_body(body).unwrap_or_else(|| "empty error body".to_string())
-                }),
+                error.code.and_then(|code| preview_error_body(&code)),
+                error
+                    .message
+                    .and_then(|message| preview_error_body(&message))
+                    .unwrap_or_else(|| {
+                        preview_error_body(body).unwrap_or_else(|| "empty error body".to_string())
+                    }),
             )
         })
         .unwrap_or_else(|| {
@@ -675,6 +731,7 @@ fn registry_error_message(body: &str) -> Option<String> {
         .ok()
         .and_then(|body| body.error)
         .and_then(|error| error.message)
+        .and_then(|message| preview_error_body(&message))
         .or_else(|| preview_error_body(body))
 }
 
@@ -683,7 +740,15 @@ fn preview_error_body(body: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    Some(trimmed.chars().take(ERROR_BODY_PREVIEW_BYTES).collect())
+    if trimmed.len() <= ERROR_BODY_PREVIEW_BYTES {
+        return Some(trimmed.to_string());
+    }
+    const SUFFIX: &str = " [truncated]";
+    let mut end = ERROR_BODY_PREVIEW_BYTES - SUFFIX.len();
+    while !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(format!("{}{SUFFIX}", &trimmed[..end]))
 }
 
 #[cfg(test)]
@@ -947,11 +1012,16 @@ mod tests {
         assert_eq!(bundle.harness_key_authorization, "authorization-1");
     }
 
+    #[test_case::test_case(false; "connect")]
+    #[test_case::test_case(true; "register")]
     #[tokio::test]
-    async fn connect_environment_times_out_when_registry_stalls() {
+    async fn registry_request_times_out_when_registry_stalls(register: bool) {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/cloud/environment/environment-requested/connect"))
+            .and(path(format!(
+                "/cloud/environment/environment-requested/{}",
+                if register { "register" } else { "connect" }
+            )))
             .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(1)))
             .mount(&server)
             .await;
@@ -963,10 +1033,18 @@ mod tests {
             .expect("identity")
             .public_key();
 
-        let error = match client
-            .connect_environment("environment-requested", harness_public_key)
-            .await
-        {
+        let result = if register {
+            client
+                .register_environment("environment-requested", &harness_public_key)
+                .await
+                .map(|_| ())
+        } else {
+            client
+                .connect_environment("environment-requested", harness_public_key)
+                .await
+                .map(|_| ())
+        };
+        let error = match result {
             Ok(_) => panic!("stalled connect response should time out"),
             Err(error) => error,
         };
@@ -975,6 +1053,143 @@ mod tests {
             error,
             ExecServerError::EnvironmentRegistryRequest(error) if error.is_timeout()
         ));
+    }
+
+    #[test_case::test_case("", "wss://rendezvous.test/ws"; "missing_registration")]
+    #[test_case::test_case("   ", "wss://rendezvous.test/ws"; "blank_registration")]
+    #[test_case::test_case("registration-1", ""; "missing_url")]
+    #[test_case::test_case("registration-1", "https://rendezvous.test/ws"; "wrong_scheme")]
+    #[test_case::test_case("registration-1", "ws://"; "missing_host")]
+    #[tokio::test]
+    async fn register_rejects_unusable_connection_data(registration: &str, url: &str) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/cloud/environment/environment-requested/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "environment_id": "environment-requested",
+                "url": url,
+                "security_profile": NOISE_RELAY_SECURITY_PROFILE,
+                "executor_registration_id": registration,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = EnvironmentRegistryClient::new(server.uri(), static_registry_auth_provider())
+            .expect("client");
+        let public_key = NoiseChannelIdentity::generate()
+            .expect("identity")
+            .public_key();
+        let result = client
+            .register_environment("environment-requested", &public_key)
+            .await;
+        assert!(matches!(result, Err(ExecServerError::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn registry_error_body_is_bounded_before_response_finishes() -> anyhow::Result<()> {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = [0; 8192];
+            let read = stream.read(&mut request).await?;
+            assert!(read > 0, "client must send a request before the error response");
+            stream
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 1000000\r\n\r\n")
+                .await?;
+            // Non-ASCII content also proves the diagnostic limit counts UTF-8 bytes.
+            stream.write_all("\u{e9}".repeat(3000).as_bytes()).await?;
+            let _ = release_rx.await;
+            Ok::<_, std::io::Error>(())
+        });
+        let client = EnvironmentRegistryClient::new(url, static_registry_auth_provider())?;
+        let key = NoiseChannelIdentity::generate()?.public_key();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.register_environment("environment-requested", &key),
+        )
+        .await;
+        let _ = release_tx.send(());
+        server.await??;
+        match result? {
+            Err(ExecServerError::EnvironmentRegistryHttp {
+                status, message, ..
+            }) => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                assert!(message.len() <= ERROR_BODY_PREVIEW_BYTES);
+                assert!(message.starts_with('\u{e9}'));
+                assert!(message.ends_with(" [truncated]"));
+            }
+            other => panic!("expected bounded HTTP error, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rendezvous_connection_times_out_during_websocket_upgrade() -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("ws://{}", listener.local_addr()?);
+        let connection =
+            tokio::spawn(
+                async move { connect_rendezvous(&url, &ExecServerTelemetry::default()).await },
+            );
+        let (_stream, _) = listener.accept().await?;
+        tokio::time::pause();
+        tokio::time::advance(DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT).await;
+        let result = tokio::time::timeout(Duration::from_secs(1), connection).await??;
+        assert!(
+            matches!(result, Err(tokio_tungstenite::tungstenite::Error::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_short_rendezvous_sessions_increase_backoff() -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let registry = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/cloud/environment/environment-requested/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "environment_id": "environment-requested",
+                "url": format!("ws://{}", listener.local_addr()?),
+                "security_profile": NOISE_RELAY_SECURITY_PROFILE,
+                "executor_registration_id": "registration-1",
+            })))
+            .expect(1)
+            .mount(&registry)
+            .await;
+        let config = RemoteEnvironmentConfig::new(
+            registry.uri(),
+            "environment-requested".into(),
+            static_registry_auth_provider(),
+        )?;
+        let runtime_paths = ExecServerRuntimePaths::new(std::env::current_exe()?)?;
+        let task = tokio::spawn(run_remote_environment(config, runtime_paths));
+        let result = async {
+            for _ in 0..2 {
+                let (stream, _) =
+                    tokio::time::timeout(Duration::from_secs(3), listener.accept()).await??;
+                let mut websocket = tokio_tungstenite::accept_async(stream).await?;
+                websocket.close(None).await?;
+            }
+            // The next delay is two seconds even though both upgrades succeeded.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(1500), listener.accept())
+                    .await
+                    .is_err()
+            );
+            let (stream, _) =
+                tokio::time::timeout(Duration::from_secs(2), listener.accept()).await??;
+            let _websocket = tokio_tungstenite::accept_async(stream).await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        task.abort();
+        let _ = task.await;
+        result
     }
 
     #[tokio::test]

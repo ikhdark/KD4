@@ -1,3 +1,4 @@
+use codex_network_proxy::normalize_host;
 use toml::Value as TomlValue;
 use toml::map::Map as TomlMap;
 
@@ -15,6 +16,17 @@ const CONFIG_KEY_ALIASES: &[ConfigKeyAlias] = &[ConfigKeyAlias {
 }];
 
 pub(crate) fn normalize_key_aliases(path: &[String], table: &mut TomlMap<String, TomlValue>) {
+    if matches!(
+        path,
+        [permissions, _, network, domains]
+            if permissions == "permissions" && network == "network" && domains == "domains"
+    ) {
+        // Preserve the layer's last-declaration-wins order for equivalent hosts.
+        let entries = std::mem::take(table);
+        for (pattern, value) in entries {
+            table.insert(normalize_host(&pattern), value);
+        }
+    }
     for alias in CONFIG_KEY_ALIASES {
         if path
             .iter()

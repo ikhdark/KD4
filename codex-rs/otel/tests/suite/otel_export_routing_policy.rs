@@ -93,6 +93,57 @@ fn auth_env_metadata() -> AuthEnvTelemetryMetadata {
 }
 
 #[test]
+fn export_routing_requires_target_namespace_boundaries() {
+    let log_exporter = InMemoryLogExporter::default();
+    let logger_provider = SdkLoggerProvider::builder()
+        .with_simple_exporter(log_exporter.clone())
+        .build();
+    let span_exporter = InMemorySpanExporter::default();
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_simple_exporter(span_exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry()
+        .with(
+            opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(
+                &logger_provider,
+            )
+            .with_filter(filter_fn(OtelProvider::log_export_filter)),
+        )
+        .with(
+            tracing_opentelemetry::layer()
+                .with_tracer(tracer_provider.tracer("target-boundaries"))
+                .with_filter(filter_fn(OtelProvider::trace_export_filter)),
+        );
+    tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!("root");
+        let _guard = span.enter();
+        tracing::event!(target: "codex_otel", tracing::Level::INFO, event.name = "root", "test OTEL routing");
+        tracing::event!(target: "codex_otel::module", tracing::Level::INFO, event.name = "module", "test OTEL routing");
+        tracing::event!(target: "codex_otel.trace_safe_extra", tracing::Level::INFO, event.name = "near_safe", "test OTEL routing");
+        tracing::event!(target: "codex_otel_unrelated", tracing::Level::INFO, event.name = "unrelated", "test OTEL routing");
+        tracing::event!(target: "codex_otel.trace_safe", tracing::Level::INFO, event.name = "safe", "test OTEL routing");
+        tracing::event!(target: "codex_otel.trace_safe.child", tracing::Level::INFO, event.name = "safe_child", "test OTEL routing");
+    });
+    logger_provider.force_flush().expect("flush logs");
+    tracer_provider.force_flush().expect("flush spans");
+    let logs = log_exporter.get_emitted_logs().expect("logs");
+    let names: Vec<_> = logs
+        .iter()
+        .map(|log| log_attributes(&log.record)["event.name"].clone())
+        .collect();
+    assert_eq!(names, ["root", "module", "near_safe"]);
+    let spans = span_exporter.get_finished_spans().expect("spans");
+    assert_eq!(spans.len(), 1);
+    let names: Vec<_> = spans[0]
+        .events
+        .events
+        .iter()
+        .map(|event| span_event_attributes(event)["event.name"].clone())
+        .collect();
+    assert_eq!(names, ["safe", "safe_child"]);
+}
+
+#[test]
 fn otel_export_routing_policy_routes_user_prompt_log_and_trace_events() {
     let log_exporter = InMemoryLogExporter::default();
     let logger_provider = SdkLoggerProvider::builder()
@@ -471,6 +522,12 @@ fn otel_export_routing_policy_routes_auth_recovery_log_and_trace_events() {
     let recovery_trace_event = find_span_event_by_name_attr(span_events, "codex.auth_recovery");
     let recovery_trace_attrs = span_event_attributes(recovery_trace_event);
     assert_eq!(
+        recovery_trace_attrs
+            .get("auth.error_present")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
         recovery_trace_attrs.get("auth.mode").map(String::as_str),
         Some("managed")
     );
@@ -494,13 +551,13 @@ fn otel_export_routing_policy_routes_auth_recovery_log_and_trace_events() {
     );
     assert_eq!(
         recovery_trace_attrs.get("auth.error").map(String::as_str),
-        Some("missing_authorization_header")
+        None
     );
     assert_eq!(
         recovery_trace_attrs
             .get("auth.error_code")
             .map(String::as_str),
-        Some("token_expired")
+        None
     );
     assert_eq!(
         recovery_trace_attrs
@@ -678,6 +735,16 @@ fn otel_export_routing_policy_routes_api_request_auth_observability() {
         find_span_event_by_name_attr(&spans[0].events.events, "codex.api_request");
     let request_trace_attrs = span_event_attributes(request_trace_event);
     assert_eq!(
+        request_trace_attrs.get("error.present").map(String::as_str),
+        Some("true")
+    );
+    for key in ["error.message", "endpoint", "auth.error", "auth.error_code"] {
+        assert!(
+            !request_trace_attrs.contains_key(key),
+            "unexpected trace diagnostic: {key}"
+        );
+    }
+    assert_eq!(
         request_trace_attrs
             .get("auth.header_attached")
             .map(String::as_str),
@@ -697,7 +764,7 @@ fn otel_export_routing_policy_routes_api_request_auth_observability() {
     );
     assert_eq!(
         request_trace_attrs.get("endpoint").map(String::as_str),
-        Some("/responses")
+        None
     );
     assert_eq!(
         request_trace_attrs
@@ -832,6 +899,16 @@ fn otel_export_routing_policy_routes_websocket_connect_auth_observability() {
         find_span_event_by_name_attr(&spans[0].events.events, "codex.websocket_connect");
     let connect_trace_attrs = span_event_attributes(connect_trace_event);
     assert_eq!(
+        connect_trace_attrs.get("error.present").map(String::as_str),
+        Some("true")
+    );
+    for key in ["error.message", "endpoint", "auth.error", "auth.error_code"] {
+        assert!(
+            !connect_trace_attrs.contains_key(key),
+            "unexpected trace diagnostic: {key}"
+        );
+    }
+    assert_eq!(
         connect_trace_attrs
             .get("auth.recovery_phase")
             .map(String::as_str),
@@ -895,6 +972,12 @@ fn otel_export_routing_policy_routes_websocket_request_transport_observability()
         .with_auth_env(auth_env_metadata());
         let root_span = tracing::info_span!("root");
         let _root_guard = root_span.enter();
+        manager.sse_event_failed(
+            Some("response.failed"),
+            std::time::Duration::from_millis(2),
+            &"private SSE diagnostic",
+        );
+        manager.see_event_completed_failed(&"private completion diagnostic");
         let agent_identity_telemetry = AgentIdentityTelemetry {
             agent_id: "agent-runtime-ws-request".to_string(),
             task_id: "task-run-ws-request".to_string(),
@@ -938,10 +1021,44 @@ fn otel_export_routing_policy_routes_websocket_request_transport_observability()
         Some("task-run-ws-request")
     );
 
+    let sse_logs: Vec<_> = logs
+        .iter()
+        .map(|log| log_attributes(&log.record))
+        .filter(|attrs| attrs.get("event.name").map(String::as_str) == Some("codex.sse_event"))
+        .map(|attrs| attrs["error.message"].clone())
+        .collect();
+    assert_eq!(
+        sse_logs,
+        ["private SSE diagnostic", "private completion diagnostic"]
+    );
     let spans = span_exporter.get_finished_spans().expect("span export");
+    let sse_traces: Vec<_> = spans[0]
+        .events
+        .events
+        .iter()
+        .map(span_event_attributes)
+        .filter(|attrs| attrs.get("event.name").map(String::as_str) == Some("codex.sse_event"))
+        .collect();
+    assert_eq!(sse_traces.len(), 2);
+    for attrs in sse_traces {
+        assert_eq!(attrs.get("error.present").map(String::as_str), Some("true"));
+        assert!(!attrs.contains_key("error.message"));
+        assert!(!attrs.values().any(|value| value.contains("private")));
+    }
+
     let request_trace_event =
         find_span_event_by_name_attr(&spans[0].events.events, "codex.websocket_request");
     let request_trace_attrs = span_event_attributes(request_trace_event);
+    assert_eq!(
+        request_trace_attrs.get("error.present").map(String::as_str),
+        Some("true")
+    );
+    for key in ["error.message", "endpoint", "auth.error", "auth.error_code"] {
+        assert!(
+            !request_trace_attrs.contains_key(key),
+            "unexpected trace diagnostic: {key}"
+        );
+    }
     assert_eq!(
         request_trace_attrs
             .get("auth.connection_reused")
@@ -962,4 +1079,172 @@ fn otel_export_routing_policy_routes_websocket_request_transport_observability()
         request_trace_attrs.get("auth.task_id").map(String::as_str),
         Some("task-run-ws-request")
     );
+}
+
+#[test]
+fn otel_export_routing_policy_classifies_websocket_upgrade_as_success() {
+    let exporter = InMemoryLogExporter::default();
+    let provider = SdkLoggerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry().with(
+        opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&provider)
+            .with_filter(filter_fn(OtelProvider::log_export_filter)),
+    );
+    tracing::subscriber::with_default(subscriber, || {
+        let manager = SessionTelemetry::new(
+            ThreadId::new(),
+            "model",
+            "model",
+            None,
+            None,
+            None,
+            "test".to_string(),
+            false,
+            "test".to_string(),
+            SessionSource::Cli,
+        );
+        for (status, error) in [
+            (Some(101), None),
+            (Some(200), None),
+            (None, None),
+            (Some(401), None),
+            (Some(101), Some("upgrade failed")),
+        ] {
+            manager.record_websocket_connect(
+                std::time::Duration::ZERO,
+                status,
+                error,
+                false,
+                None,
+                false,
+                None,
+                None,
+                "/responses",
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+    });
+    let logs = exporter.get_emitted_logs().expect("export logs");
+    let results: Vec<_> = logs
+        .iter()
+        .map(|log| log_attributes(&log.record)["success"].clone())
+        .collect();
+    assert_eq!(results, ["true", "true", "true", "false", "false"]);
+}
+
+#[test]
+fn otel_export_routing_policy_trace_only_prompt_preserves_unicode_character_count() {
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer("trace-only"))
+            .with_filter(filter_fn(OtelProvider::trace_export_filter)),
+    );
+    tracing::subscriber::with_default(subscriber, || {
+        let manager = SessionTelemetry::new(
+            ThreadId::new(),
+            "model",
+            "model",
+            None,
+            None,
+            None,
+            "test".to_string(),
+            true,
+            "test".to_string(),
+            SessionSource::Cli,
+        );
+        let span = tracing::info_span!("root");
+        let _guard = span.enter();
+        manager.user_prompt(&[UserInput::Text {
+            text: "é🦀界".to_string(),
+            text_elements: Vec::new(),
+        }]);
+    });
+    let spans = exporter.get_finished_spans().expect("export traces");
+    assert_eq!(spans.len(), 1);
+    let attrs = span_event_attributes(find_span_event_by_name_attr(
+        &spans[0].events.events,
+        "codex.user_prompt",
+    ));
+    assert_eq!(attrs.get("prompt_length").map(String::as_str), Some("3"));
+    assert_eq!(attrs.get("text_input_count").map(String::as_str), Some("1"));
+    assert!(!attrs.contains_key("prompt"));
+}
+
+#[test]
+fn otel_export_routing_policy_component_ids_enforce_version_bounds_in_exported_logs() {
+    let exporter = InMemoryLogExporter::default();
+    let provider = SdkLoggerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry().with(
+        opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&provider)
+            .with_filter(filter_fn(OtelProvider::log_export_filter)),
+    );
+    tracing::subscriber::with_default(subscriber, || {
+        let manager = SessionTelemetry::new(
+            ThreadId::new(),
+            "model",
+            "model",
+            None,
+            None,
+            None,
+            "test".to_string(),
+            false,
+            "test".to_string(),
+            SessionSource::Cli,
+        );
+        for version in ["65535", "65536", "000001"] {
+            manager.model_context_component(&codex_otel::ModelContextComponentTelemetry {
+                sampling_request_id: "request".to_string(),
+                attempt_id: "attempt".to_string(),
+                retry_index: 0,
+                kind: "repository".to_string(),
+                contract_version: 1,
+                semantic_id: format!("repository:v{version}:0123456789abcdef01234567"),
+                content_hash: "0123456789abcdef01234567".to_string(),
+                serialized_bytes: 42,
+                approx_tokens: 10,
+                active: true,
+                disposition: "included".to_string(),
+                local_reused: false,
+                baseline_generation: None,
+                provider_baseline: codex_otel::ModelAttemptProviderBaseline::FreshFullReplay,
+                previous_response_id_present: false,
+                local_projection_policy_active: false,
+                fresh_response_id_established: false,
+            });
+        }
+    });
+    let logs = exporter.get_emitted_logs().expect("export logs");
+    assert_eq!(logs.len(), 3);
+    let ids: Vec<_> = logs
+        .iter()
+        .map(|log| log_attributes(&log.record).get("semantic_id").cloned())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            Some("repository:v65535:0123456789abcdef01234567".to_string()),
+            None,
+            None
+        ]
+    );
+    for log in logs {
+        assert_eq!(
+            log_attributes(&log.record)
+                .get("serialized_bytes")
+                .map(String::as_str),
+            Some("42")
+        );
+    }
 }

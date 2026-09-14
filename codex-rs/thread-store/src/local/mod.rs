@@ -307,14 +307,8 @@ impl ThreadStore for LocalThreadStore {
     fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
             let thread_id = params.thread_id;
-            let include_archived = params.include_archived;
-            let history = params.history.clone();
-            live_writer::resume_thread(self, params).await?;
-            if let Some(history) = history {
-                projection::initialize_from_items(self, thread_id, history.as_slice()).await?;
-            } else {
-                projection::initialize_from_store(self, thread_id, include_archived).await?;
-            }
+            let history = live_writer::resume_thread(self, params).await?;
+            projection::initialize_from_items(self, thread_id, history.as_slice()).await?;
             Ok(())
         })
     }
@@ -328,7 +322,7 @@ impl ThreadStore for LocalThreadStore {
             );
             let (projection, _operation) =
                 projection::initialized_entry_for_append(self, thread_id).await?;
-            live_writer::append_items(self, params).await?;
+            live_writer::append_persisted_items(self, thread_id, &persisted_items).await?;
             if !persisted_items.is_empty() {
                 projection
                     .append_durable(persisted_items.as_slice())
@@ -347,7 +341,7 @@ impl ThreadStore for LocalThreadStore {
             );
             let (projection, _operation) =
                 projection::initialized_entry_for_append(self, thread_id).await?;
-            live_writer::append_items_ordered(self, params).await?;
+            live_writer::append_persisted_items_ordered(self, thread_id, &persisted_items).await?;
             if !persisted_items.is_empty() {
                 projection.append_pending(persisted_items).await;
             }
@@ -1402,13 +1396,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_thread_rejects_mismatched_path_and_history_without_opening_writer() {
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), None);
+        let uuid = uuid::Uuid::from_u128(9992);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("id");
+        let path = write_session_file(home.path(), "2025-01-04T11-30-00", uuid).expect("rollout");
+        let other_path = write_session_file(
+            home.path(),
+            "2025-01-04T12-30-00",
+            uuid::Uuid::from_u128(9993),
+        )
+        .expect("other rollout");
+        let original = std::fs::read(&path).expect("bytes");
+        let other_original = std::fs::read(&other_path).expect("other bytes");
+        let (other_history, _, _) = RolloutRecorder::load_rollout_items(&other_path)
+            .await
+            .expect("history");
+        for (rollout_path, history) in [
+            (other_path.clone(), None),
+            (path.clone(), Some(Arc::new(other_history))),
+        ] {
+            let error = store
+                .resume_thread(ResumeThreadParams {
+                    thread_id,
+                    rollout_path: Some(rollout_path),
+                    history,
+                    include_archived: true,
+                    metadata: thread_metadata(),
+                })
+                .await
+                .expect_err("identity mismatch");
+            assert!(matches!(error, ThreadStoreError::InvalidRequest { .. }));
+            assert!(store.live_recorders.lock().await.is_empty());
+            assert_eq!(std::fs::read(&path).expect("bytes"), original);
+            assert_eq!(
+                std::fs::read(&other_path).expect("other bytes"),
+                other_original
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn resume_thread_rejects_missing_cwd() {
         let home = TempDir::new().expect("temp dir");
         let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
         let uuid = uuid::Uuid::from_u128(407);
         let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
-        let rollout_path =
-            write_session_file(home.path(), "2025-01-04T11-30-00", uuid).expect("session file");
+        let rollout_path = home.path().join("missing-rollout.jsonl");
         let err = store
             .resume_thread(ResumeThreadParams {
                 thread_id,

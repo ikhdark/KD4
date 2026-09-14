@@ -43,9 +43,10 @@ use self::tool::ToolCallStarted;
 /// Replays a local trace bundle into a reduced rollout graph.
 pub fn replay_bundle(bundle_dir: impl AsRef<Path>) -> Result<RolloutTrace> {
     let bundle_dir = bundle_dir.as_ref();
-    let manifest: TraceBundleManifest =
-        serde_json::from_reader(File::open(bundle_dir.join(MANIFEST_FILE_NAME))?)
-            .with_context(|| format!("read {}", bundle_dir.join(MANIFEST_FILE_NAME).display()))?;
+    let manifest: TraceBundleManifest = serde_json::from_reader(BufReader::new(File::open(
+        bundle_dir.join(MANIFEST_FILE_NAME),
+    )?))
+    .with_context(|| format!("read {}", bundle_dir.join(MANIFEST_FILE_NAME).display()))?;
     let mut reducer = TraceReducer {
         rollout: RolloutTrace::new(
             REDUCED_TRACE_SCHEMA_VERSION,
@@ -61,6 +62,7 @@ pub fn replay_bundle(bundle_dir: impl AsRef<Path>) -> Result<RolloutTrace> {
         pending_compaction_replacement_item_ids: BTreeMap::new(),
         code_cell_ids_by_runtime: BTreeMap::new(),
         pending_code_cell_starts: BTreeMap::new(),
+        pending_code_cell_waits: BTreeMap::new(),
         pending_code_cell_lifecycle_events: BTreeMap::new(),
         pending_agent_interaction_edges: Vec::new(),
     };
@@ -93,9 +95,8 @@ struct TraceReducer {
     /// Last model-visible conversation snapshot per thread.
     ///
     /// Requests and responses both advance this sequence because both are
-    /// model-facing payloads. Repeated request snapshots reuse item IDs only
-    /// when the same normalized item appears at the same position; identical
-    /// content at a new position must remain a distinct conversation item.
+    /// model-facing payloads. Full snapshots may reuse matching earlier item
+    /// IDs, including reordered items, at most once per snapshot.
     thread_conversation_snapshots: BTreeMap<String, Vec<String>>,
     /// Replacement snapshot installed by compaction but not yet seen in a sampling request.
     ///
@@ -119,6 +120,8 @@ struct TraceReducer {
     /// about eventual source-item ownership without requiring trace producers
     /// to reorder runtime events behind inference completion.
     pending_code_cell_starts: BTreeMap<String, PendingCodeCellStart>,
+    /// Wait links observed before the pending source item materializes.
+    pending_code_cell_waits: BTreeMap<String, Vec<String>>,
     /// Initial/end events that arrived while the matching start was queued.
     ///
     /// Fast cells can return before the inference response payload that proves
@@ -142,7 +145,7 @@ impl TraceReducer {
         let payload_path = self.bundle_dir.join(&payload.path);
         let file = File::open(&payload_path)
             .with_context(|| format!("open payload {}", payload.raw_payload_id))?;
-        serde_json::from_reader(file)
+        serde_json::from_reader(BufReader::new(file))
             .with_context(|| format!("parse payload {}", payload.raw_payload_id))
     }
 
@@ -416,7 +419,7 @@ impl TraceReducer {
                     compaction_id,
                     compaction_request_id,
                     ExecutionStatus::Completed,
-                    Some(response_payload),
+                    response_payload,
                 )?;
             }
             RawTraceEventPayload::CompactionRequestFailed {

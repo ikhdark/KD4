@@ -103,10 +103,18 @@ impl SessionTask for ReviewTask {
             )
             .await
             {
-                Some(receiver) => {
-                    process_review_events(session.clone(), ctx.clone(), receiver).await
+                Ok(receiver) => process_review_events(session.clone(), ctx.clone(), receiver).await,
+                Err(err) => {
+                    if !cancellation_token.is_cancelled() {
+                        let item = TurnItem::ExitedReviewMode(ExitedReviewModeItem {
+                            id: uuid::Uuid::now_v7().to_string(),
+                            review_output: None,
+                        });
+                        session.emit_turn_item_started(ctx.as_ref(), &item).await;
+                        session.emit_turn_item_completed(ctx.as_ref(), item).await;
+                    }
+                    return Err(err);
                 }
-                None => None,
             };
             drop(standalone_work_guard);
             if !cancellation_token.is_cancelled() {
@@ -128,7 +136,7 @@ async fn start_review_conversation(
     ctx: Arc<TurnContext>,
     input: Vec<UserInput>,
     cancellation_token: CancellationToken,
-) -> Option<async_channel::Receiver<Event>> {
+) -> codex_protocol::error::Result<async_channel::Receiver<Event>> {
     let config = ctx.config.clone();
     let mut sub_agent_config = config.as_ref().clone();
     // Carry over review-only feature restrictions so the delegate cannot
@@ -152,7 +160,7 @@ async fn start_review_conversation(
         .clone()
         .unwrap_or_else(|| ctx.model_info.slug.clone());
     sub_agent_config.model = Some(model);
-    (run_codex_thread_one_shot(
+    run_codex_thread_one_shot(
         sub_agent_config,
         Arc::clone(&session.services.auth_manager),
         Arc::clone(&session.services.models_manager),
@@ -164,9 +172,8 @@ async fn start_review_conversation(
         /*final_output_json_schema*/ None,
         /*initial_history*/ None,
     )
-    .await)
-        .ok()
-        .map(|io| io.rx_event)
+    .await
+    .map(|io| io.rx_event)
 }
 
 async fn process_review_events(
@@ -195,6 +202,12 @@ async fn process_review_events(
             // delegate's start would expose two `TurnStarted` events for one review turn.
             EventMsg::TurnStarted(_) => {}
             EventMsg::TurnComplete(task_complete) => {
+                if let Some(error) = task_complete.error {
+                    session
+                        .send_event(ctx.as_ref(), EventMsg::Error(error))
+                        .await;
+                    return None;
+                }
                 // Parse review output from the last agent message (if present).
                 let out = task_complete
                     .last_agent_message
@@ -303,4 +316,65 @@ pub(crate) async fn exit_review_mode(
     // materialize rollout persistence. Do this after emitting review output so
     // file creation + git metadata collection cannot delay client-facing items.
     session.ensure_rollout_materialized().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::protocol::CodexErrorInfo;
+    use codex_protocol::protocol::ErrorEvent;
+    use codex_protocol::protocol::TurnCompleteEvent;
+
+    #[tokio::test]
+    async fn failed_delegate_completion_preserves_error_and_closes_review_mode() {
+        let (session, ctx, events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        let (sender, receiver) = async_channel::unbounded();
+        let error = ErrorEvent {
+            message: "review delegate failed before completing".to_string(),
+            codex_error_info: Some(CodexErrorInfo::InternalServerError),
+        };
+        sender
+            .send(Event {
+                id: "delegate-turn".to_string(),
+                msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                    turn_id: "delegate-turn".to_string(),
+                    last_agent_message: Some(
+                        "partial review must not count as success".to_string(),
+                    ),
+                    surfaced_result: None,
+                    error: Some(error.clone()),
+                    completed_at: None,
+                    duration_ms: None,
+                    time_to_first_token_ms: None,
+                    timing: None,
+                }),
+            })
+            .await
+            .expect("delegate event receiver is open");
+        drop(sender);
+
+        let output = process_review_events(Arc::clone(&session), Arc::clone(&ctx), receiver).await;
+        assert!(
+            output.is_none(),
+            "failed delegate output must not become a successful review"
+        );
+        assert_eq!(*ctx.terminal_error.lock().await, Some(error.clone()));
+        exit_review_mode(Arc::clone(&session), output, Arc::clone(&ctx)).await;
+
+        let mut errors = Vec::new();
+        let mut exits = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            match event.msg {
+                EventMsg::Error(error) => errors.push(error),
+                EventMsg::ItemCompleted(ItemCompletedEvent {
+                    item: TurnItem::ExitedReviewMode(exited),
+                    ..
+                }) => exits.push(exited.review_output),
+                _ => {}
+            }
+        }
+        assert_eq!(errors, vec![error]);
+        assert_eq!(exits, vec![None]);
+    }
 }

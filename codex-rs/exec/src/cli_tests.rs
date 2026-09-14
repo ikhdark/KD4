@@ -13,12 +13,18 @@ fn resume_parses_prompt_after_global_flags() {
         "gpt-5.2-codex",
         "--dangerously-bypass-approvals-and-sandbox",
         "--skip-git-repo-check",
+        "--bypass-hook-trust",
         "--ephemeral",
         "--ignore-user-config",
         "--ignore-rules",
         PROMPT,
     ]);
 
+    assert!(cli.json);
+    assert_eq!(cli.model.as_deref(), Some("gpt-5.2-codex"));
+    assert!(cli.dangerously_bypass_approvals_and_sandbox);
+    assert!(cli.skip_git_repo_check);
+    assert!(cli.bypass_hook_trust);
     assert!(cli.ephemeral);
     assert!(cli.ignore_user_config);
     assert!(cli.ignore_rules);
@@ -73,4 +79,11 @@ fn removed_full_auto_flag_is_rejected() {
     let result = Cli::try_parse_from(["codex-exec", "--full-auto", "summarize"]);
 
     assert!(result.is_err());
+}
+
+#[test]
+fn resume_last_rejects_two_positionals() {
+    let error = Cli::try_parse_from(["codex-exec", "resume", "--last", "session-id", "prompt"])
+        .expect_err("--last takes only a prompt");
+    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
 }

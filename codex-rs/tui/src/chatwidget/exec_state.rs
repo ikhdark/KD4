@@ -61,11 +61,16 @@ pub(super) fn is_unified_exec_source(source: ExecCommandSource) -> bool {
     )
 }
 
-pub(super) fn is_standard_tool_call(parsed_cmd: &[ParsedCommand]) -> bool {
+pub(super) fn is_standard_tool_call(
+    parsed_cmd: &[codex_app_server_protocol::CommandAction],
+) -> bool {
     !parsed_cmd.is_empty()
-        && parsed_cmd
-            .iter()
-            .all(|parsed| !matches!(parsed, ParsedCommand::Unknown { .. }))
+        && parsed_cmd.iter().all(|parsed| {
+            !matches!(
+                parsed,
+                codex_app_server_protocol::CommandAction::Unknown { .. }
+            )
+        })
 }
 
 pub(super) fn command_execution_command_and_parsed(

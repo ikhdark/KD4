@@ -10,6 +10,8 @@ use std::path::PathBuf;
 const MAX_CONTEXT_BYTES: usize = 64 * 1024;
 const MAX_TOTAL_CONTEXT_BYTES: usize = 128 * 1024;
 const MAX_SELECTED_PATHS: usize = 16;
+const MAX_PATH_CANDIDATES: usize = 256;
+const CONTEXT_OMISSION: &str = "\n<context_omission recovery=\"read the original local path; additional content or instructions omitted\">\n";
 const MAX_FILE_BYTES: usize = 16 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 256;
 const MAX_DIRECTORY_FILES: usize = 48;
@@ -64,11 +66,22 @@ fn collect_with_discovery(
     cwd: &Path,
     discovery: &InstructionDiscovery<'_>,
 ) -> Vec<(PathBuf, String)> {
+    let project_root = fs::canonicalize(discovery.project_root)
+        .unwrap_or_else(|_| discovery.project_root.to_path_buf());
+    let discovery = InstructionDiscovery {
+        project_root: &project_root,
+        candidate_filenames: discovery.candidate_filenames.clone(),
+    };
     let mut seen = HashSet::new();
-    let mut contexts = Vec::new();
+    let mut candidates = HashSet::new();
+    let mut instructions_seen = HashSet::new();
+    let mut contexts: Vec<(PathBuf, String)> = Vec::new();
     let mut remaining = MAX_TOTAL_CONTEXT_BYTES;
-    for token in path_tokens(text) {
-        if contexts.len() == MAX_SELECTED_PATHS || remaining == 0 {
+    for token in path_tokens(text).into_iter().take(MAX_PATH_CANDIDATES) {
+        if contexts.len() == MAX_SELECTED_PATHS || remaining < 1024 {
+            if let Some((_, content)) = contexts.last_mut() {
+                content.push_str(CONTEXT_OMISSION);
+            }
             break;
         }
         let path = PathBuf::from(&token);
@@ -77,6 +90,9 @@ fn collect_with_discovery(
         } else {
             cwd.join(path)
         };
+        if !candidates.insert(path.clone()) {
+            continue;
+        }
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
         };
@@ -84,16 +100,25 @@ fn collect_with_discovery(
             continue;
         }
         let identity = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        if !seen.insert(identity) {
+        if !seen.insert(identity.clone()) {
             continue;
         }
         let content = if metadata.is_dir() {
-            render_directory(&path, discovery)
+            render_directory(
+                &identity,
+                &discovery,
+                &mut instructions_seen,
+                remaining.min(MAX_CONTEXT_BYTES),
+            )
         } else {
-            render_file_selection(&path, discovery)
+            render_file_selection(
+                &identity,
+                &discovery,
+                &mut instructions_seen,
+                remaining.min(MAX_CONTEXT_BYTES),
+            )
         };
-        let content = truncate_context(content, remaining);
-        remaining = remaining.saturating_sub(content.len());
+        remaining = remaining.saturating_sub(content.len() + CONTEXT_OMISSION.len());
         contexts.push((path, content));
     }
     contexts
@@ -159,6 +184,7 @@ fn path_tokens(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut quote = None;
+    let mut was_quoted = false;
     for ch in text.chars() {
         if let Some(active_quote) = quote {
             if ch == active_quote {
@@ -167,35 +193,78 @@ fn path_tokens(text: &str) -> Vec<String> {
                 current.push(ch);
             }
         } else if ch == '"' || ch == '\'' {
-            quote = Some(ch);
+            if current.is_empty() {
+                quote = Some(ch);
+                was_quoted = true;
+            } else {
+                current.push(ch);
+            }
         } else if ch.is_whitespace() {
-            push_token(&mut tokens, &mut current);
+            push_token(&mut tokens, &mut current, was_quoted);
+            was_quoted = false;
         } else {
             current.push(ch);
         }
     }
-    push_token(&mut tokens, &mut current);
+    push_token(&mut tokens, &mut current, was_quoted);
     tokens
 }
 
-fn push_token(tokens: &mut Vec<String>, current: &mut String) {
+fn push_token(tokens: &mut Vec<String>, current: &mut String, was_quoted: bool) {
     let token =
         current.trim_matches(|ch| matches!(ch, ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'));
-    if !token.is_empty() {
+    // Paths must be quoted or have a separator or filename extension. Bare prose
+    // and punctuation (especially ".") must not select the working directory.
+    if !token.is_empty()
+        && !matches!(token, "." | ".." | "/" | "\\")
+        && !token.contains("://")
+        && (was_quoted
+            || token.contains(['/', '\\'])
+            || Path::new(token)
+                .extension()
+                .is_some_and(|extension| !extension.is_empty()))
+        && tokens.len() < MAX_PATH_CANDIDATES
+    {
         tokens.push(token.to_string());
     }
     current.clear();
 }
 
-fn render_file_selection(path: &Path, discovery: &InstructionDiscovery<'_>) -> String {
+fn render_file_selection(
+    path: &Path,
+    discovery: &InstructionDiscovery<'_>,
+    instructions_seen: &mut HashSet<PathBuf>,
+    max_output: usize,
+) -> String {
+    let max_output = max_output.saturating_sub(CONTEXT_OMISSION.len());
+    // Reserve the selected content before filling the remaining space with instructions.
+    let mut selected = String::new();
+    append_file(
+        &mut selected,
+        path,
+        "selected file",
+        MAX_FILE_BYTES,
+        max_output,
+    );
     let mut output = String::new();
-    append_instruction_files(&mut output, applicable_agent_files(path, discovery));
-    append_file(&mut output, path, "selected file", MAX_FILE_BYTES);
+    append_instruction_files(
+        &mut output,
+        applicable_agent_files(path, discovery),
+        instructions_seen,
+        max_output.saturating_sub(selected.len()),
+    );
+    output.push_str(&selected);
     output
 }
 
-fn render_directory(root: &Path, discovery: &InstructionDiscovery<'_>) -> String {
-    let entries = directory_entries(root);
+fn render_directory(
+    root: &Path,
+    discovery: &InstructionDiscovery<'_>,
+    instructions_seen: &mut HashSet<PathBuf>,
+    max_output: usize,
+) -> String {
+    let max_output = max_output.saturating_sub(CONTEXT_OMISSION.len());
+    let (entries, inventory_omitted) = directory_entries(root);
     let mut output = String::new();
     let mut instructions = applicable_agent_files(root, discovery);
     instructions.extend(
@@ -206,51 +275,76 @@ fn render_directory(root: &Path, discovery: &InstructionDiscovery<'_>) -> String
     );
     instructions.sort();
     instructions.dedup();
-    append_instruction_files(&mut output, instructions);
+    append_instruction_files(&mut output, instructions, instructions_seen, max_output / 2);
 
-    append_bounded(&mut output, "[directory inventory]\n");
+    append_bounded(&mut output, "[directory inventory]\n", max_output);
     for path in &entries {
         let relative = path.strip_prefix(root).unwrap_or(path);
         let suffix = if path.is_dir() { "/" } else { "" };
-        append_bounded(&mut output, &format!("{}{}\n", relative.display(), suffix));
+        if !append_bounded(
+            &mut output,
+            &format!("{}{}\n", relative.display(), suffix),
+            max_output,
+        ) {
+            return output;
+        }
     }
-
+    if inventory_omitted {
+        append_bounded(
+            &mut output,
+            "<directory_inventory_omission recovery=\"list the original directory for a complete inventory\">\n",
+            max_output,
+        );
+    }
     let mut files_added = 0;
     for path in entries.iter().filter(|path| path.is_file()) {
         if is_instruction_filename(path, discovery) {
             continue;
         }
-        if files_added == MAX_DIRECTORY_FILES || output.len() >= MAX_CONTEXT_BYTES {
+        if files_added == MAX_DIRECTORY_FILES {
+            append_bounded(&mut output, CONTEXT_OMISSION, max_output);
             break;
         }
         let relative = path.strip_prefix(root).unwrap_or(path);
-        let remaining = MAX_CONTEXT_BYTES.saturating_sub(output.len());
-        append_file(
+        if !append_file(
             &mut output,
             path,
             &format!("file: {}", relative.display()),
-            MAX_FILE_BYTES.min(remaining),
-        );
+            MAX_FILE_BYTES,
+            max_output,
+        ) {
+            break;
+        }
         files_added += 1;
     }
     output
 }
 
-fn directory_entries(root: &Path) -> Vec<PathBuf> {
+fn directory_entries(root: &Path) -> (Vec<PathBuf>, bool) {
     let mut pending = vec![root.to_path_buf()];
     let mut entries = Vec::new();
-    while let Some(directory) = pending.pop() {
+    let mut examined = 0;
+    let mut omitted = false;
+    'directories: while let Some(directory) = pending.pop() {
         let Ok(read_dir) = fs::read_dir(directory) else {
+            omitted = true;
             continue;
         };
-        let mut children: Vec<PathBuf> =
-            read_dir.filter_map(Result::ok).map(|e| e.path()).collect();
-        children.sort();
-        for path in children {
-            if entries.len() == MAX_DIRECTORY_ENTRIES {
-                return entries;
+        // Count examined entries, including ignored entries and errors, before
+        // allocating paths or sorting. One lookahead detects a partial inventory.
+        for entry in read_dir {
+            if examined == MAX_DIRECTORY_ENTRIES {
+                omitted = true;
+                break 'directories;
             }
+            examined += 1;
+            let Ok(entry) = entry else {
+                omitted = true;
+                continue;
+            };
+            let path = entry.path();
             let Ok(metadata) = fs::symlink_metadata(&path) else {
+                omitted = true;
                 continue;
             };
             if metadata.file_type().is_symlink() || is_ignored_directory(&path, &metadata) {
@@ -265,7 +359,7 @@ fn directory_entries(root: &Path) -> Vec<PathBuf> {
         }
     }
     entries.sort();
-    entries
+    (entries, omitted)
 }
 
 fn is_ignored_directory(path: &Path, metadata: &fs::Metadata) -> bool {
@@ -320,47 +414,73 @@ fn is_instruction_filename(path: &Path, discovery: &InstructionDiscovery<'_>) ->
     })
 }
 
-fn append_instruction_files(output: &mut String, files: Vec<PathBuf>) {
+fn append_instruction_files(
+    output: &mut String,
+    files: Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf>,
+    max_output: usize,
+) {
     for path in files {
-        append_file(
+        let identity = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if seen.contains(&identity) {
+            if !append_bounded(
+                output,
+                &format!(
+                    "[instructions: {}; included earlier in this submission]\n",
+                    path.display()
+                ),
+                max_output,
+            ) {
+                break;
+            }
+            continue;
+        }
+        if !append_file(
             output,
             &path,
             &format!("instructions: {}", path.display()),
             MAX_FILE_BYTES,
-        );
+            max_output,
+        ) {
+            break;
+        }
+        seen.insert(identity);
     }
 }
 
-fn append_file(output: &mut String, path: &Path, label: &str, max_bytes: usize) {
-    if output.len() >= MAX_CONTEXT_BYTES || max_bytes == 0 {
-        return;
+fn append_file(
+    output: &mut String,
+    path: &Path,
+    label: &str,
+    max_bytes: usize,
+    max_output: usize,
+) -> bool {
+    let available = max_output.saturating_sub(output.len() + CONTEXT_OMISSION.len());
+    if available < 512 {
+        append_bounded(output, CONTEXT_OMISSION, max_output);
+        return false;
     }
-    append_bounded(output, &format!("\n[{label}]\n"));
-    match read_head_and_tail(path, max_bytes) {
+    let mut block = format!("\n[{label}]\n");
+    match read_head_and_tail(path, max_bytes.min(available.saturating_sub(512))) {
         Ok((head, tail, _)) if head.contains(&0) || tail.contains(&0) => {
-            append_bounded(output, "<binary content omitted>\n");
+            block.push_str("<binary content omitted>\n");
         }
         Ok((head, tail, original_bytes)) => {
-            append_bounded(output, &String::from_utf8_lossy(&head));
-            if tail.is_empty() {
-                append_bounded(output, "\n");
-            } else {
-                let retained_bytes = head.len().saturating_add(tail.len());
+            block.push_str(&String::from_utf8_lossy(&head));
+            let retained_bytes = head.len().saturating_add(tail.len());
+            if original_bytes > retained_bytes as u64 {
                 let omitted_bytes = original_bytes.saturating_sub(retained_bytes as u64);
-                append_bounded(
-                    output,
-                    &format!(
-                        "\n<file_content_omission original_bytes={original_bytes} \
-                         omitted_bytes={omitted_bytes} recovery=\"read the original path \
-                         {path:?}; do not infer missing content\">\n"
-                    ),
-                );
-                append_bounded(output, &String::from_utf8_lossy(&tail));
-                append_bounded(output, "\n");
+                block.push_str(&format!(
+                    "\n<file_content_omission original_bytes_at_least={original_bytes} omitted_bytes_at_least={omitted_bytes} recovery=\"read the original path; do not infer missing content\">\n"
+                ));
+                block.push_str(&String::from_utf8_lossy(&tail));
             }
+            block.push('\n');
         }
-        Err(error) => append_bounded(output, &format!("<unreadable: {error}>\n")),
+        Err(error) => block.push_str(&format!("<unreadable: {error}>\n")),
     }
+    let block = truncate_context(block, available);
+    append_bounded(output, &block, max_output)
 }
 
 fn read_head_and_tail(path: &Path, max_bytes: usize) -> std::io::Result<(Vec<u8>, Vec<u8>, u64)> {
@@ -377,8 +497,10 @@ fn read_head_and_tail_from(
     if original_bytes <= max_bytes as u64 {
         let mut bytes = Vec::new();
         // The file can grow after metadata is read, and virtual files may report zero.
-        file.take(max_bytes as u64).read_to_end(&mut bytes)?;
-        return Ok((bytes, Vec::new(), original_bytes));
+        file.take(max_bytes as u64 + 1).read_to_end(&mut bytes)?;
+        let observed_bytes = bytes.len() as u64;
+        bytes.truncate(max_bytes);
+        return Ok((bytes, Vec::new(), original_bytes.max(observed_bytes)));
     }
 
     let head_budget = max_bytes / 2;
@@ -393,16 +515,16 @@ fn read_head_and_tail_from(
     Ok((head, tail, original_bytes))
 }
 
-fn append_bounded(output: &mut String, value: &str) {
-    let remaining = MAX_CONTEXT_BYTES.saturating_sub(output.len());
-    if remaining == 0 {
-        return;
+fn append_bounded(output: &mut String, value: &str, max_output: usize) -> bool {
+    if output.len() + value.len() + CONTEXT_OMISSION.len() <= max_output {
+        output.push_str(value);
+        true
+    } else {
+        if output.len() + CONTEXT_OMISSION.len() <= max_output {
+            output.push_str(CONTEXT_OMISSION);
+        }
+        false
     }
-    let mut end = remaining.min(value.len());
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    output.push_str(&value[..end]);
 }
 
 #[cfg(test)]
@@ -434,11 +556,13 @@ mod tests {
     fn selected_file_read_is_bounded_when_metadata_understates_length() {
         let mut file = std::io::Cursor::new(b"first123unbounded tail".to_vec());
 
-        let (head, tail, _) = read_head_and_tail_from(&mut file, 0, 8).expect("read file");
+        let (head, tail, observed_bytes) =
+            read_head_and_tail_from(&mut file, 0, 8).expect("read file");
 
         assert_eq!(head, b"first123");
         assert!(tail.is_empty());
-        assert_eq!(file.position(), 8);
+        assert_eq!(file.position(), 9);
+        assert_eq!(observed_bytes, 9);
     }
 
     #[test]
@@ -461,7 +585,7 @@ mod tests {
         assert!(content.contains("BEGIN"));
         assert!(content.contains("ROOT_CAUSE_AT_END"));
         assert!(content.contains("file_content_omission"));
-        assert!(content.contains("omitted_bytes="));
+        assert!(content.contains("omitted_bytes_at_least="));
         assert!(content.contains("recovery=\"read the original path"));
         assert!(content.contains("do not infer missing content"));
         assert!(content.len() <= MAX_FILE_BYTES + 1024);
@@ -498,8 +622,18 @@ mod tests {
         );
         assert_eq!(contexts.len(), 1);
         let content = &contexts[0].1;
-        assert!(content.find("selected instructions") < content.find("[directory inventory]"));
-        assert!(content.find("nested instructions") < content.find("[directory inventory]"));
+        assert!(
+            content
+                .find("selected instructions")
+                .expect("selected instructions")
+                < content.find("[directory inventory]").expect("inventory")
+        );
+        assert!(
+            content
+                .find("nested instructions")
+                .expect("nested instructions")
+                < content.find("[directory inventory]").expect("inventory")
+        );
         assert!(content.contains("nested\\code.rs") || content.contains("nested/code.rs"));
         assert!(content.len() <= MAX_CONTEXT_BYTES);
     }
@@ -561,5 +695,97 @@ mod tests {
         assert!(content.contains("root override instructions"));
         assert!(content.contains("fallback instructions"));
         assert!(!content.contains("shadowed instructions"));
+    }
+    #[test]
+    fn parent_components_do_not_load_sibling_instructions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(temp.path().join("sibling")).expect("mkdir");
+        fs::write(temp.path().join("AGENTS.md"), "ROOT_RULE").expect("write");
+        fs::write(temp.path().join("sibling/AGENTS.md"), "WRONG_SIBLING_RULE").expect("write");
+        fs::write(temp.path().join("selected.rs"), "SELECTED_CONTENT").expect("write");
+        let contexts = collect_with_discovery(
+            "sibling/../selected.rs",
+            temp.path(),
+            &default_discovery(temp.path()),
+        );
+        assert_eq!(contexts.len(), 1);
+        assert!(contexts[0].1.contains("ROOT_RULE"));
+        assert!(contexts[0].1.contains("SELECTED_CONTENT"));
+        assert!(!contexts[0].1.contains("WRONG_SIBLING_RULE"));
+    }
+
+    #[test]
+    fn selected_files_share_instruction_bodies() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("AGENTS.md"), "SHARED_RULE").expect("write");
+        fs::write(temp.path().join("one.rs"), "FIRST_FILE").expect("write");
+        fs::write(temp.path().join("two.rs"), "SECOND_FILE").expect("write");
+        let contexts = collect_with_discovery(
+            "one.rs two.rs",
+            temp.path(),
+            &default_discovery(temp.path()),
+        );
+        assert_eq!(contexts.len(), 2);
+        let joined = contexts
+            .iter()
+            .map(|(_, body)| body.as_str())
+            .collect::<String>();
+        assert_eq!(joined.matches("SHARED_RULE").count(), 1);
+        assert!(
+            contexts[1]
+                .1
+                .contains("included earlier in this submission")
+        );
+        assert!(joined.contains("FIRST_FILE"));
+        assert!(joined.contains("SECOND_FILE"));
+    }
+
+    #[test]
+    fn explicit_paths_avoid_prose_and_keep_apostrophes() {
+        assert_eq!(
+            path_tokens("don't scan . or README; inspect user's.rs and ./src"),
+            vec!["user's.rs", "./src"]
+        );
+        assert_eq!(
+            path_tokens("read \"README\" and 'folder'"),
+            vec!["README", "folder"]
+        );
+    }
+
+    #[test]
+    fn directory_scan_and_inventory_are_bounded() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for index in 0..MAX_DIRECTORY_ENTRIES + 20 {
+            fs::write(temp.path().join(format!("{index}.txt")), "data").expect("write");
+        }
+        let (entries, omitted) = directory_entries(temp.path());
+        assert_eq!(entries.len(), MAX_DIRECTORY_ENTRIES);
+        assert!(omitted);
+        let contexts = collect_with_discovery("./", temp.path(), &default_discovery(temp.path()));
+        assert_eq!(contexts.len(), 1);
+        assert!(contexts[0].1.contains("directory_inventory_omission"));
+        assert!(contexts[0].1.len() <= MAX_CONTEXT_BYTES);
+    }
+
+    #[test]
+    fn large_instructions_leave_space_for_selected_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut directory = temp.path().to_path_buf();
+        for _ in 0..8 {
+            fs::write(directory.join("AGENTS.md"), "RULE".repeat(MAX_FILE_BYTES)).expect("write");
+            directory.push("nested");
+            fs::create_dir(&directory).expect("mkdir");
+        }
+        let selected = directory.join("selected.rs");
+        fs::write(&selected, "SELECTED_CONTENT").expect("write");
+        let contexts = collect_with_discovery(
+            selected.to_str().expect("path"),
+            temp.path(),
+            &default_discovery(temp.path()),
+        );
+        assert_eq!(contexts.len(), 1);
+        assert!(contexts[0].1.contains("SELECTED_CONTENT"));
+        assert!(contexts[0].1.contains("context_omission"));
+        assert!(contexts[0].1.len() <= MAX_CONTEXT_BYTES);
     }
 }

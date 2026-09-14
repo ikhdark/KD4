@@ -1,5 +1,4 @@
 use crate::certs::ManagedMitmCa;
-use crate::config::NetworkMode;
 use crate::mitm_hook::HookEvaluation;
 use crate::mitm_hook::MitmHookActions;
 use crate::policy::normalize_host;
@@ -74,14 +73,12 @@ pub(crate) struct MitmUpstreamConfig {
 struct MitmPolicyContext {
     target_host: String,
     target_port: u16,
-    mode: NetworkMode,
     app_state: Arc<NetworkProxyState>,
 }
 
 #[derive(Clone)]
 struct MitmRequestContext {
     policy: MitmPolicyContext,
-    mitm: Arc<MitmState>,
 }
 
 enum MitmPolicyDecision {
@@ -95,6 +92,7 @@ const MITM_INSPECT_BODIES: bool = false;
 const MITM_MAX_BODY_BYTES: usize = 4096;
 const TLS_PREFIX_LEN: usize = 5;
 const TLS_PREFIX_FIRST_BYTE_TIMEOUT: Duration = Duration::from_millis(250);
+const TLS_PREFIX_COMPLETION_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Peeks enough bytes to distinguish a TLS handshake from an opaque CONNECT stream.
 ///
@@ -111,6 +109,7 @@ where
             Ok(result) => result.context("read TLS prefix")?,
             Err(_) => 0,
         };
+    let deadline = tokio::time::Instant::now() + TLS_PREFIX_COMPLETION_TIMEOUT;
     while bytes_read > 0 && bytes_read < TLS_PREFIX_LEN {
         let possible_tls_prefix = matches!(
             &peek_buf[..bytes_read],
@@ -119,9 +118,9 @@ where
         if !possible_tls_prefix {
             break;
         }
-        let read = stream
-            .read(&mut peek_buf[bytes_read..])
+        let read = tokio::time::timeout_at(deadline, stream.read(&mut peek_buf[bytes_read..]))
             .await
+            .context("TLS prefix completion timed out")?
             .context("read TLS prefix")?;
         if read == 0 {
             break;
@@ -220,19 +219,12 @@ where
     let target_host = normalize_host(&target.host.to_string());
     let target_port = target.port;
     let acceptor_data = mitm.tls_acceptor_data_for_host(&target_host)?;
-    let mode = stream
-        .extensions()
-        .get::<NetworkMode>()
-        .copied()
-        .unwrap_or(NetworkMode::Full);
     let request_ctx = Arc::new(MitmRequestContext {
         policy: MitmPolicyContext {
             target_host,
             target_port,
-            mode,
             app_state,
         },
-        mitm,
     });
 
     let executor = stream
@@ -281,20 +273,31 @@ async fn handle_mitm_request(
 }
 
 async fn forward_request(req: Request, request_ctx: &MitmRequestContext) -> Result<Response> {
-    let hook_actions = match evaluate_mitm_policy(&req, &request_ctx.policy).await? {
-        MitmPolicyDecision::Allow { hook_actions } => hook_actions,
-        MitmPolicyDecision::Block(response) => return Ok(response),
-    };
+    let snapshot = request_ctx
+        .policy
+        .app_state
+        .request_policy_snapshot()
+        .await?;
+    let hook_actions =
+        match evaluate_mitm_policy_with_snapshot(&req, &request_ctx.policy, &snapshot).await? {
+            MitmPolicyDecision::Allow { hook_actions } => hook_actions,
+            MitmPolicyDecision::Block(response) => return Ok(response),
+        };
 
     let target_host = request_ctx.policy.target_host.clone();
     let target_port = request_ctx.policy.target_port;
-    let mitm = request_ctx.mitm.clone();
+    let mitm = snapshot
+        .mitm_state()
+        .context("MITM disabled during connection")?;
 
     let method = req.method().as_str().to_string();
     let path = path_and_query(req.uri());
     let log_path = path_for_log(req.uri());
 
     let (mut parts, body) = req.into_parts();
+    if let Some(target) = snapshot.local_target(&target_host) {
+        parts.extensions.insert(target);
+    }
     request_ctx
         .policy
         .app_state
@@ -334,9 +337,19 @@ async fn forward_request(req: Request, request_ctx: &MitmRequestContext) -> Resu
     )
 }
 
+#[cfg(test)]
 async fn evaluate_mitm_policy(
     req: &Request,
     policy: &MitmPolicyContext,
+) -> Result<MitmPolicyDecision> {
+    let snapshot = policy.app_state.request_policy_snapshot().await?;
+    evaluate_mitm_policy_with_snapshot(req, policy, &snapshot).await
+}
+
+async fn evaluate_mitm_policy_with_snapshot(
+    req: &Request,
+    policy: &MitmPolicyContext,
+    request_policy: &crate::runtime::RequestPolicySnapshot,
 ) -> Result<MitmPolicyDecision> {
     if req.method().as_str() == "CONNECT" {
         return Ok(MitmPolicyDecision::Block(text_response(
@@ -344,7 +357,13 @@ async fn evaluate_mitm_policy(
             "CONNECT not supported inside MITM",
         )));
     }
-    let request_policy = policy.app_state.request_policy_snapshot().await?;
+    let mode = request_policy.network_mode();
+    if !request_policy.enabled() {
+        return Ok(MitmPolicyDecision::Block(text_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "proxy disabled",
+        )));
+    }
 
     let method = req.method().as_str().to_string();
     let log_path = path_for_log(req.uri());
@@ -367,15 +386,14 @@ async fn evaluate_mitm_policy(
         }
     }
 
-    // CONNECT already handled allowlist/denylist + decider policy. Re-check local/private
-    // resolution here to defend against DNS rebinding between CONNECT and inner HTTPS requests.
-    if matches!(
-        request_policy
-            .host_blocked(&policy.target_host, policy.target_port)
-            .await?,
-        HostBlockDecision::Blocked(HostBlockReason::NotAllowedLocal)
-    ) {
-        let reason = HostBlockReason::NotAllowedLocal.as_str();
+    // Preserve the CONNECT grant, but enforce current explicit denies and guard against rebinding.
+    if let HostBlockDecision::Blocked(
+        reason @ (HostBlockReason::NotAllowedLocal | HostBlockReason::Denied),
+    ) = request_policy
+        .host_blocked(&policy.target_host, policy.target_port)
+        .await?
+    {
+        let reason = reason.as_str();
         let _ = policy
             .app_state
             .record_blocked_for_request(BlockedRequest::new(BlockedRequestArgs {
@@ -383,7 +401,7 @@ async fn evaluate_mitm_policy(
                 reason: reason.to_string(),
                 client: client.clone(),
                 method: Some(method.clone()),
-                mode: Some(policy.mode),
+                mode: Some(mode),
                 protocol: "https".to_string(),
                 decision: None,
                 source: None,
@@ -407,7 +425,7 @@ async fn evaluate_mitm_policy(
                     reason: REASON_MITM_HOOK_DENIED.to_string(),
                     client: client.clone(),
                     method: Some(method.clone()),
-                    mode: Some(policy.mode),
+                    mode: Some(mode),
                     protocol: "https".to_string(),
                     decision: None,
                     source: None,
@@ -416,7 +434,7 @@ async fn evaluate_mitm_policy(
                 .await;
             warn!(
                 "MITM blocked by hook policy (host={}, method={method}, mode={:?})",
-                policy.target_host, policy.mode
+                policy.target_host, mode
             );
             return Ok(MitmPolicyDecision::Block(blocked_text_response(
                 REASON_MITM_HOOK_DENIED,
@@ -425,7 +443,7 @@ async fn evaluate_mitm_policy(
         HookEvaluation::NoHooksForHost => None,
     };
 
-    if !policy.mode.allows_method(&method) {
+    if !mode.allows_method(&method) {
         let _ = policy
             .app_state
             .record_blocked_for_request(BlockedRequest::new(BlockedRequestArgs {
@@ -433,7 +451,7 @@ async fn evaluate_mitm_policy(
                 reason: REASON_METHOD_NOT_ALLOWED.to_string(),
                 client: client.clone(),
                 method: Some(method.clone()),
-                mode: Some(policy.mode),
+                mode: Some(mode),
                 protocol: "https".to_string(),
                 decision: None,
                 source: None,
@@ -442,7 +460,7 @@ async fn evaluate_mitm_policy(
             .await;
         warn!(
             "MITM blocked by method policy (host={}, method={method}, path={log_path}, mode={:?}, allowed_methods=GET, HEAD, OPTIONS)",
-            policy.target_host, policy.mode
+            policy.target_host, mode
         );
         return Ok(MitmPolicyDecision::Block(blocked_text_response(
             REASON_METHOD_NOT_ALLOWED,

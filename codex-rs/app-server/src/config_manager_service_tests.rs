@@ -454,6 +454,11 @@ async fn write_value_reports_override() {
     );
     assert_eq!(result.status, WriteStatus::Ok);
     assert!(result.overridden_metadata.is_none());
+    let persisted: toml::Value = std::fs::read_to_string(tmp.path().join(CONFIG_TOML_FILE))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(persisted["approval_policy"].as_str(), Some("never"));
 }
 
 #[tokio::test]
@@ -477,6 +482,10 @@ async fn version_conflict_rejected() {
     assert_eq!(
         error.write_error_code(),
         Some(ConfigWriteErrorCode::ConfigVersionConflict)
+    );
+    assert_eq!(
+        std::fs::read_to_string(user_path).unwrap(),
+        "model = \"user\""
     );
 }
 
@@ -527,6 +536,9 @@ async fn concurrent_writes_with_the_same_version_have_one_winner() {
 
     assert_eq!(successes, 1, "concurrent write results: {results:?}");
     assert_eq!(conflicts, 1, "concurrent write results: {results:?}");
+    let winner = if results.0.is_ok() { "first" } else { "second" };
+    let persisted: toml::Value = std::fs::read_to_string(user_path).unwrap().parse().unwrap();
+    assert_eq!(persisted["model"].as_str(), Some(winner));
 }
 
 #[tokio::test]
@@ -824,6 +836,11 @@ async fn write_value_reports_managed_override() {
         ApiConfigLayerSource::LegacyManagedConfigTomlFromFile { file: managed_file }
     );
     assert_eq!(overridden.effective_value, serde_json::json!("never"));
+    let persisted: toml::Value = std::fs::read_to_string(tmp.path().join(CONFIG_TOML_FILE))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(persisted["approval_policy"].as_str(), Some("on-request"));
 }
 
 #[tokio::test]

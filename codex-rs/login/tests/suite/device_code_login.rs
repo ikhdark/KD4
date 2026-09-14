@@ -41,7 +41,7 @@ async fn mock_usercode_success(server: &MockServer) {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "device_auth_id": "device-auth-123",
             "user_code": "CODE-12345",
-            // NOTE: Interval is kept 0 in order to avoid waiting for the interval to pass
+            // Zero uses the default five-second polling interval.
             "interval": "0"
         })))
         .mount(server)

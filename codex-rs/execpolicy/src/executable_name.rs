@@ -1,8 +1,10 @@
 use std::path::Path;
 
+#[cfg(windows)]
 const WINDOWS_EXECUTABLE_SUFFIXES: [&str; 4] = [".exe", ".cmd", ".bat", ".com"];
 
 pub(crate) fn executable_lookup_key(raw: &str) -> String {
+    #[cfg(windows)]
     {
         let raw = raw.to_ascii_lowercase();
         for suffix in WINDOWS_EXECUTABLE_SUFFIXES {
@@ -12,6 +14,10 @@ pub(crate) fn executable_lookup_key(raw: &str) -> String {
             }
         }
         raw
+    }
+    #[cfg(not(windows))]
+    {
+        raw.to_string()
     }
 }
 

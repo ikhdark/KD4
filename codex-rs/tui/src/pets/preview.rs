@@ -71,6 +71,10 @@ impl PetPickerPreviewState {
         self.inner.lock().ok().and_then(|inner| inner.last_area)
     }
 
+    pub(crate) fn clear_area(&self) {
+        self.update(|inner| inner.last_area = None);
+    }
+
     fn update(&self, f: impl FnOnce(&mut PetPickerPreviewInner)) {
         if let Ok(mut inner) = self.inner.lock() {
             f(&mut inner);

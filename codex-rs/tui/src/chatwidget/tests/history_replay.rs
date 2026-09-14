@@ -11,6 +11,54 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn completed_file_changes_are_visible_in_replayed_turns() {
+    for replay_kind in [
+        ReplayKind::ResumeInitialMessages,
+        ReplayKind::ThreadSnapshot,
+    ] {
+        let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+        chat.show_welcome_banner = false;
+        let _ = drain_insert_history(&mut rx);
+        let item = serde_json::from_value(json!({
+            "type": "fileChange", "id": "patch-1", "status": "completed",
+            "changes": [{"path": "replayed.txt", "kind": {"type": "add"}, "diff": "restored content\n"}]
+        })).unwrap();
+        chat.replay_thread_turns(
+            vec![AppServerTurn {
+                id: "turn-1".to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
+                items: vec![item],
+                status: AppServerTurnStatus::Completed,
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                timing: None,
+                surfaced_result: None,
+                reasoning_policy_history: None,
+            }],
+            replay_kind,
+        );
+        let mut transcript = String::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AppEvent::InsertHistoryCell(cell) => {
+                    transcript.push_str(&lines_to_single_string(&cell.display_lines(80)))
+                }
+                event => assert!(!matches!(event, AppEvent::SubmitThreadOp { .. })),
+            }
+        }
+        assert_eq!(
+            transcript.matches("replayed.txt").count(),
+            1,
+            "{transcript}"
+        );
+        assert!(transcript.contains("restored content"), "{transcript}");
+        assert!(op_rx.try_recv().is_err());
+    }
+}
+
+#[tokio::test]
 async fn dynamic_tool_results_render_through_live_notifications_and_resumed_turns() {
     for replay_kind in [
         None,

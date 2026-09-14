@@ -138,7 +138,7 @@ async fn request_current_time(
             bail!("current-time request deadline expired before delivery");
         }
         let connection_ids = [connection_id];
-        Ok(outgoing
+        outgoing
             .send_request_to_connections(
                 Some(&connection_ids),
                 ServerRequestPayload::CurrentTimeRead(CurrentTimeReadParams {
@@ -146,7 +146,14 @@ async fn request_current_time(
                 }),
                 Some(thread_id),
             )
-            .await)
+            .await
+            .map_err(|err| {
+                anyhow!(
+                    "current-time request failed: code={} message={}",
+                    err.code,
+                    err.message
+                )
+            })
     })
     .await
     .map_err(|_| {

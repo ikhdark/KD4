@@ -45,7 +45,9 @@ impl TraceReducer {
             .transpose()?;
         let spawn = metadata
             .as_ref()
-            .and_then(ThreadStartedMetadata::thread_spawn);
+            .map(ThreadStartedMetadata::thread_spawn)
+            .transpose()?
+            .flatten();
         // The v2 SessionSource is the authoritative child identity record.
         // Prefer its nested agent_path over the denormalized event field so
         // task derivation and the spawn edge are based on the same metadata.
@@ -225,19 +227,27 @@ struct ThreadStartedMetadata {
 }
 
 impl ThreadStartedMetadata {
-    fn thread_spawn(&self) -> Option<ThreadSpawnMetadata> {
-        let spawn = self
+    fn thread_spawn(&self) -> Result<Option<ThreadSpawnMetadata>> {
+        let Some(spawn) = self
             .session_source
-            .as_ref()?
-            .get("subagent")?
-            .get("thread_spawn")?;
+            .as_ref()
+            .and_then(|source| source.get("subagent"))
+            .and_then(|subagent| subagent.get("thread_spawn"))
+        else {
+            return Ok(None);
+        };
+        let parent_thread_id = spawn
+            .get("parent_thread_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .context("thread_spawn metadata requires a nonempty string parent_thread_id")?;
         let agent_path = spawn
             .get("agent_path")
             .and_then(Value::as_str)
             .map(str::to_string)
             .or_else(|| self.agent_path.clone());
-        Some(ThreadSpawnMetadata {
-            parent_thread_id: spawn.get("parent_thread_id")?.as_str()?.to_string(),
+        Ok(Some(ThreadSpawnMetadata {
+            parent_thread_id: parent_thread_id.to_string(),
             agent_path: agent_path.clone(),
             task_name: spawn
                 .get("task_name")
@@ -250,7 +260,7 @@ impl ThreadStartedMetadata {
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .or_else(|| self.agent_role.clone()),
-        })
+        }))
     }
 }
 

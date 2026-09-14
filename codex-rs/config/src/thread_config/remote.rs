@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
+use std::sync::Arc;
 use std::time::Duration;
 
 use codex_model_provider_info::ModelProviderInfo;
@@ -27,40 +28,55 @@ const REMOTE_THREAD_CONFIG_LOAD_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone, Debug)]
 pub struct RemoteThreadConfigLoader {
     endpoint: String,
+    channel: Arc<tokio::sync::OnceCell<tonic::transport::Channel>>,
 }
 
 impl RemoteThreadConfigLoader {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
+            channel: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
     async fn client(
         &self,
     ) -> Result<ThreadConfigLoaderClient<tonic::transport::Channel>, ThreadConfigLoadError> {
-        ThreadConfigLoaderClient::connect(self.endpoint.clone())
-            .await
-            .map_err(|err| {
-                ThreadConfigLoadError::new(
-                    ThreadConfigLoadErrorCode::RequestFailed,
-                    /*status_code*/ None,
-                    format!("failed to connect to remote thread config loader: {err}"),
-                )
+        let channel = self
+            .channel
+            .get_or_try_init(|| async {
+                tonic::transport::Endpoint::from_shared(self.endpoint.clone())
+                    .map_err(connection_error)?
+                    .connect()
+                    .await
+                    .map_err(connection_error)
             })
+            .await?;
+        Ok(ThreadConfigLoaderClient::new(channel.clone()))
     }
 
     async fn load(
         &self,
         context: ThreadConfigContext,
     ) -> Result<Vec<ThreadConfigSource>, ThreadConfigLoadError> {
-        let response = self
-            .client()
-            .await?
-            .load(load_thread_config_request(context))
-            .await
-            .map_err(remote_status_to_error)?
-            .into_inner();
+        let deadline = tokio::time::Instant::now() + REMOTE_THREAD_CONFIG_LOAD_TIMEOUT;
+        let response = tokio::time::timeout_at(deadline, async {
+            let mut client = self.client().await?;
+            let request = load_thread_config_request(
+                context,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            );
+            client.load(request).await.map_err(remote_status_to_error)
+        })
+        .await
+        .map_err(|_| {
+            ThreadConfigLoadError::new(
+                ThreadConfigLoadErrorCode::Timeout,
+                None,
+                "remote thread config load timed out",
+            )
+        })??
+        .into_inner();
 
         response
             .sources
@@ -81,16 +97,38 @@ impl ThreadConfigLoader for RemoteThreadConfigLoader {
 
 fn load_thread_config_request(
     context: ThreadConfigContext,
+    timeout: Duration,
 ) -> tonic::Request<proto::LoadThreadConfigRequest> {
     let mut request = tonic::Request::new(proto::LoadThreadConfigRequest {
         thread_id: context.thread_id,
         cwd: context.cwd.map(|cwd| cwd.to_string_lossy().into_owned()),
     });
-    request.set_timeout(REMOTE_THREAD_CONFIG_LOAD_TIMEOUT);
+    request.set_timeout(timeout);
     request
 }
 
+fn connection_error(err: tonic::transport::Error) -> ThreadConfigLoadError {
+    ThreadConfigLoadError::new(
+        ThreadConfigLoadErrorCode::RequestFailed,
+        None,
+        format!("failed to connect to remote thread config loader: {err}"),
+    )
+}
+
 fn remote_status_to_error(status: tonic::Status) -> ThreadConfigLoadError {
+    // Tonic maps its local transport deadline to Cancelled but retains the
+    // typed cause. A server cancellation alone must remain RequestFailed.
+    let mut source = std::error::Error::source(&status);
+    while let Some(error) = source {
+        if error.is::<tonic::TimeoutExpired>() {
+            return ThreadConfigLoadError::new(
+                ThreadConfigLoadErrorCode::Timeout,
+                None,
+                format!("remote thread config request timed out: {status}"),
+            );
+        }
+        source = error.source();
+    }
     let code = match status.code() {
         tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
             ThreadConfigLoadErrorCode::Auth
@@ -135,11 +173,21 @@ fn thread_config_source_from_proto(
 fn session_thread_config_from_proto(
     config: proto::SessionThreadConfig,
 ) -> Result<SessionThreadConfig, ThreadConfigLoadError> {
-    let model_providers = config
-        .model_providers
-        .into_iter()
-        .map(model_provider_from_proto)
-        .collect::<Result<HashMap<_, _>, _>>()?;
+    let mut model_providers = HashMap::new();
+    for provider in config.model_providers {
+        let (id, provider) = model_provider_from_proto(provider)?;
+        match model_providers.entry(id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(provider);
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                return Err(parse_error(format!(
+                    "remote thread config returned duplicate model provider id {:?}",
+                    entry.key()
+                )));
+            }
+        }
+    }
 
     Ok(SessionThreadConfig {
         model_provider: config.model_provider,
@@ -327,6 +375,7 @@ mod tests {
     struct TestServer {
         sources: Vec<proto::ThreadConfigSource>,
         expected_cwd: String,
+        stall: bool,
     }
 
     impl TestServer {
@@ -334,6 +383,9 @@ mod tests {
             &self,
             request: Request<proto::LoadThreadConfigRequest>,
         ) -> Result<Response<proto::LoadThreadConfigResponse>, Status> {
+            if self.stall {
+                std::future::pending::<()>().await;
+            }
             assert_eq!(
                 request.into_inner(),
                 proto::LoadThreadConfigRequest {
@@ -377,18 +429,23 @@ mod tests {
             .expect("bind test server");
         let addr = listener.local_addr().expect("test server addr");
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_connections = Arc::clone(&connections);
         let server = tokio::spawn(async move {
+            use futures::StreamExt;
+            let incoming =
+                tokio_stream::wrappers::TcpListenerStream::new(listener).inspect(move |_| {
+                    server_connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                });
             Server::builder()
                 .add_service(ThreadConfigLoaderServer::new(TestServer {
                     sources: proto_sources(),
                     expected_cwd,
+                    stall: false,
                 }))
-                .serve_with_incoming_shutdown(
-                    tokio_stream::wrappers::TcpListenerStream::new(listener),
-                    async {
-                        let _ = shutdown_rx.await;
-                    },
-                )
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = shutdown_rx.await;
+                })
                 .await
         });
 
@@ -396,19 +453,36 @@ mod tests {
         let loaded = loader
             .load(ThreadConfigContext {
                 thread_id: Some("thread-1".to_string()),
-                cwd: Some(cwd),
+                cwd: Some(cwd.clone()),
             })
             .await;
+
+        let loaded_again = ThreadConfigLoader::load(
+            &loader.clone(),
+            ThreadConfigContext {
+                thread_id: Some("thread-1".to_string()),
+                cwd: Some(cwd),
+            },
+        )
+        .await;
 
         let _ = shutdown_tx.send(());
         server.await.expect("join server").expect("server");
 
         assert_eq!(loaded.expect("load thread config"), expected_sources());
+        assert_eq!(
+            loaded_again.expect("reload thread config"),
+            expected_sources()
+        );
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
     fn load_thread_config_request_sets_timeout() {
-        let request = load_thread_config_request(ThreadConfigContext::default());
+        let request = load_thread_config_request(
+            ThreadConfigContext::default(),
+            REMOTE_THREAD_CONFIG_LOAD_TIMEOUT,
+        );
 
         assert_eq!(
             request
@@ -427,6 +501,84 @@ mod tests {
 
         assert_eq!(id, "local");
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn stalled_transport_times_out_through_loader_trait() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let loader =
+            RemoteThreadConfigLoader::new(format!("http://{}", listener.local_addr().unwrap()));
+        // Accept TCP but never complete the HTTP/2 handshake.
+        let stalled_peer = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let result = tokio::time::timeout(
+            REMOTE_THREAD_CONFIG_LOAD_TIMEOUT + Duration::from_secs(2),
+            ThreadConfigLoader::load(&loader, ThreadConfigContext::default()),
+        )
+        .await;
+        stalled_peer.abort();
+        let error = result
+            .expect("load must finish within its deadline")
+            .unwrap_err();
+        assert_eq!(error.code(), ThreadConfigLoadErrorCode::Timeout);
+    }
+
+    #[tokio::test]
+    async fn stalled_rpc_is_reported_as_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let loader =
+            RemoteThreadConfigLoader::new(format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(ThreadConfigLoaderServer::new(TestServer {
+                    sources: vec![],
+                    expected_cwd: String::new(),
+                    stall: true,
+                }))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+        });
+        let result = tokio::time::timeout(
+            REMOTE_THREAD_CONFIG_LOAD_TIMEOUT + Duration::from_secs(2),
+            ThreadConfigLoader::load(&loader, ThreadConfigContext::default()),
+        )
+        .await;
+        server.abort();
+        assert_eq!(
+            result.expect("RPC deadline").unwrap_err().code(),
+            ThreadConfigLoadErrorCode::Timeout
+        );
+    }
+
+    #[test]
+    fn duplicate_provider_ids_are_rejected_at_source_boundary() {
+        let provider = model_provider_to_proto("local", expected_provider());
+        let error = thread_config_source_from_proto(proto::ThreadConfigSource {
+            source: Some(proto::thread_config_source::Source::Session(
+                proto::SessionThreadConfig {
+                    model_providers: vec![provider.clone(), provider],
+                    ..Default::default()
+                },
+            )),
+        })
+        .unwrap_err();
+        assert_eq!(error.code(), ThreadConfigLoadErrorCode::Parse);
+        assert!(error.to_string().contains("duplicate model provider id"));
+        assert!(error.to_string().contains("local"));
+    }
+
+    #[test]
+    fn server_cancellation_is_not_a_timeout() {
+        assert_eq!(
+            remote_status_to_error(Status::cancelled("cancelled by server")).code(),
+            ThreadConfigLoadErrorCode::RequestFailed
+        );
+        assert_eq!(
+            remote_status_to_error(Status::deadline_exceeded("deadline")).code(),
+            ThreadConfigLoadErrorCode::Timeout
+        );
     }
 
     fn proto_sources() -> Vec<proto::ThreadConfigSource> {

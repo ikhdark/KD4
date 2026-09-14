@@ -4,10 +4,13 @@ use std::ffi::OsString;
 pub const FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME: &str = "codex-connectivity-diagnostics.txt";
 const PROXY_ENV_VARS: &[&str] = &[
     "HTTP_PROXY",
+    #[cfg(not(windows))]
     "http_proxy",
     "HTTPS_PROXY",
+    #[cfg(not(windows))]
     "https_proxy",
     "ALL_PROXY",
+    #[cfg(not(windows))]
     "all_proxy",
 ];
 
@@ -39,6 +42,13 @@ impl FeedbackDiagnostics {
         let env = pairs
             .into_iter()
             .filter_map(|(key, _)| key.into().into_string().ok())
+            .map(|key| {
+                if cfg!(windows) {
+                    key.to_ascii_uppercase()
+                } else {
+                    key
+                }
+            })
             .collect::<HashSet<_>>();
         let mut diagnostics = Vec::new();
 
@@ -100,8 +110,8 @@ mod tests {
                 "HTTPS_PROXY",
                 "https://user:password@secure-proxy.example.com:443?secret=1",
             ),
-            ("http_proxy", "proxy.example.com:8080"),
-            ("all_proxy", "socks5h://all-proxy.example.com:1080"),
+            ("HTTP_PROXY", "proxy.example.com:8080"),
+            ("ALL_PROXY", "socks5h://all-proxy.example.com:1080"),
         ]);
 
         assert_eq!(
@@ -111,9 +121,9 @@ mod tests {
                     headline: "Proxy environment variables are set and may affect connectivity."
                         .to_string(),
                     details: vec![
-                        "http_proxy is set; value redacted".to_string(),
+                        "HTTP_PROXY is set; value redacted".to_string(),
                         "HTTPS_PROXY is set; value redacted".to_string(),
-                        "all_proxy is set; value redacted".to_string(),
+                        "ALL_PROXY is set; value redacted".to_string(),
                     ],
                 },],
             }
@@ -125,12 +135,39 @@ mod tests {
                 r#"Connectivity diagnostics
 
 - Proxy environment variables are set and may affect connectivity.
-  - http_proxy is set; value redacted
+  - HTTP_PROXY is set; value redacted
   - HTTPS_PROXY is set; value redacted
-  - all_proxy is set; value redacted"#
+  - ALL_PROXY is set; value redacted"#
                     .to_string()
             )
         );
+    }
+
+    #[test]
+    fn collect_from_pairs_matches_platform_case_rules() {
+        let mixed_case = FeedbackDiagnostics::collect_from_pairs([("Https_Proxy", "secret")]);
+        if cfg!(windows) {
+            assert_eq!(
+                mixed_case.diagnostics()[0].details,
+                ["HTTPS_PROXY is set; value redacted"]
+            );
+        } else {
+            assert_eq!(mixed_case, FeedbackDiagnostics::default());
+        }
+        let diagnostics = FeedbackDiagnostics::collect_from_pairs([
+            ("Https_Proxy", "secret"),
+            ("https_proxy", "secret"),
+            ("HTTPS_PROXY", "secret"),
+        ]);
+        let expected = if cfg!(windows) {
+            vec!["HTTPS_PROXY is set; value redacted"]
+        } else {
+            vec![
+                "HTTPS_PROXY is set; value redacted",
+                "https_proxy is set; value redacted",
+            ]
+        };
+        assert_eq!(diagnostics.diagnostics()[0].details, expected);
     }
 
     #[test]
@@ -142,8 +179,10 @@ mod tests {
 
     #[test]
     fn collect_from_pairs_redacts_whitespace_and_empty_values() {
-        let diagnostics =
-            FeedbackDiagnostics::collect_from_pairs([("HTTP_PROXY", "  proxy with spaces  ")]);
+        let diagnostics = FeedbackDiagnostics::collect_from_pairs([
+            ("HTTP_PROXY", "  proxy with spaces  "),
+            ("HTTPS_PROXY", ""),
+        ]);
 
         assert_eq!(
             diagnostics,
@@ -151,7 +190,10 @@ mod tests {
                 diagnostics: vec![FeedbackDiagnostic {
                     headline: "Proxy environment variables are set and may affect connectivity."
                         .to_string(),
-                    details: vec!["HTTP_PROXY is set; value redacted".to_string()],
+                    details: vec![
+                        "HTTP_PROXY is set; value redacted".to_string(),
+                        "HTTPS_PROXY is set; value redacted".to_string(),
+                    ],
                 },],
             }
         );

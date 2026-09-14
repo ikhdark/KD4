@@ -68,7 +68,6 @@ use tokio_util::task::AbortOnDropHandle;
 
 #[cfg(test)]
 use super::RemoteControlEnrollmentState;
-use tracing::error;
 use tracing::info;
 use tracing::warn;
 
@@ -95,8 +94,31 @@ fn test_http_clients() -> RouteAwareClientPool {
     ))
 }
 
+struct BufferedServerEnvelope {
+    client_id: ClientId,
+    stream_id: StreamId,
+    seq_id: u64,
+    segment_id: Option<usize>,
+    payload: tungstenite::Utf8Bytes,
+}
+
+impl BufferedServerEnvelope {
+    fn new(envelope: ServerEnvelope) -> io::Result<Self> {
+        let payload = serde_json::to_string(&envelope)
+            .map_err(io::Error::other)?
+            .into();
+        Ok(Self {
+            segment_id: envelope.event.segment_id(),
+            client_id: envelope.client_id,
+            stream_id: envelope.stream_id,
+            seq_id: envelope.seq_id,
+            payload,
+        })
+    }
+}
+
 struct BoundedOutboundBuffer {
-    buffer_by_stream: HashMap<(ClientId, StreamId), VecDeque<ServerEnvelope>>,
+    buffer_by_stream: HashMap<(ClientId, StreamId), VecDeque<BufferedServerEnvelope>>,
     used_tx: watch::Sender<usize>,
 }
 
@@ -110,14 +132,22 @@ impl BoundedOutboundBuffer {
         (buffer, used_rx)
     }
 
+    #[cfg(test)]
     fn insert(&mut self, server_envelope: &ServerEnvelope) {
+        self.insert_encoded(
+            BufferedServerEnvelope::new(server_envelope.clone())
+                .expect("test envelope should serialize"),
+        );
+    }
+
+    fn insert_encoded(&mut self, server_envelope: BufferedServerEnvelope) {
         self.buffer_by_stream
             .entry((
                 server_envelope.client_id.clone(),
                 server_envelope.stream_id.clone(),
             ))
             .or_default()
-            .push_back(server_envelope.clone());
+            .push_back(server_envelope);
         self.used_tx.send_modify(|used| *used += 1);
     }
 
@@ -133,26 +163,49 @@ impl BoundedOutboundBuffer {
             return;
         };
         let acked_cursor = (acked_seq_id, acked_segment_id.unwrap_or(usize::MAX));
-        buffer.retain(|server_envelope| {
-            let envelope_cursor = (
-                server_envelope.seq_id,
-                server_envelope.event.segment_id().unwrap_or_default(),
-            );
-            let is_acked = envelope_cursor <= acked_cursor;
-            if is_acked {
-                self.used_tx.send_modify(|used| *used -= 1);
-            }
-            !is_acked
-        });
+        // The single writer inserts sequence IDs and their segments in order.
+        let mut removed = 0;
+        while buffer.front().is_some_and(|envelope| {
+            (envelope.seq_id, envelope.segment_id.unwrap_or_default()) <= acked_cursor
+        }) {
+            buffer.pop_front();
+            removed += 1;
+        }
+        if removed != 0 {
+            self.used_tx.send_modify(|used| *used -= removed);
+        }
         if buffer.is_empty() {
             self.buffer_by_stream.remove(&key);
         }
     }
 
-    fn server_envelopes(&self) -> impl Iterator<Item = &ServerEnvelope> {
+    fn server_envelopes(&self) -> impl Iterator<Item = &BufferedServerEnvelope> {
         self.buffer_by_stream
             .values()
             .flat_map(|buffer| buffer.iter())
+    }
+}
+
+struct ClientDeliveryMetadata {
+    cursor: Option<String>,
+    ack: Option<(ClientId, StreamId, u64, Option<usize>)>,
+}
+
+impl From<&ClientEnvelope> for ClientDeliveryMetadata {
+    fn from(envelope: &ClientEnvelope) -> Self {
+        let ack = match (&envelope.event, envelope.seq_id, &envelope.stream_id) {
+            (ClientEvent::Ack { segment_id }, Some(seq_id), Some(stream_id)) => Some((
+                envelope.client_id.clone(),
+                stream_id.clone(),
+                seq_id,
+                *segment_id,
+            )),
+            _ => None,
+        };
+        Self {
+            cursor: envelope.cursor.clone(),
+            ack,
+        }
     }
 }
 
@@ -212,26 +265,19 @@ impl WebsocketState {
 
     fn record_client_message_delivery(
         &mut self,
-        client_envelope: &ClientEnvelope,
+        delivery: ClientDeliveryMetadata,
         client_message_key: Option<((ClientId, Option<StreamId>), u64)>,
     ) {
-        if let Some(cursor) = client_envelope.cursor.as_deref() {
-            self.subscribe_cursor = Some(cursor.to_string());
+        if let Some(cursor) = delivery.cursor {
+            self.subscribe_cursor = Some(cursor);
         }
         if let Some((key, seq_id)) = client_message_key {
             self.last_completed_client_chunk_seq_id_by_stream
                 .insert(key, seq_id);
         }
-        if let ClientEvent::Ack { segment_id } = &client_envelope.event
-            && let Some(acked_seq_id) = client_envelope.seq_id
-            && let Some(stream_id) = client_envelope.stream_id.as_ref()
-        {
-            self.outbound_buffer.ack(
-                &client_envelope.client_id,
-                stream_id,
-                acked_seq_id,
-                *segment_id,
-            );
+        if let Some((client_id, stream_id, seq_id, segment_id)) = delivery.ack {
+            self.outbound_buffer
+                .ack(&client_id, &stream_id, seq_id, segment_id);
         }
     }
 
@@ -275,6 +321,7 @@ pub(crate) struct RemoteControlWebsocket {
     auth_recovery: UnauthorizedRecovery,
     auth_change_rx: watch::Receiver<u64>,
     current_enrollment: CurrentRemoteControlEnrollment,
+    transport_enrollment: Option<RemoteControlEnrollment>,
     pairing_persistence_key: RemoteControlPairingPersistenceKey,
     client_tracker: Arc<Mutex<ClientTracker>>,
     state: Arc<Mutex<WebsocketState>>,
@@ -316,6 +363,7 @@ enum ConnectionEndReason {
     Shutdown,
     Disabled,
     EnabledWatchClosed,
+    AuthChanged,
     ConnectionWorkerStopped,
 }
 
@@ -404,7 +452,7 @@ impl RemoteControlStatusPublisher {
 pub(super) struct RemoteControlConnectOptions<'a> {
     installation_id: &'a str,
     server_name: &'a str,
-    subscribe_cursor: Option<&'a str>,
+    subscribe_cursor: Option<(&'a RemoteControlEnrollment, &'a str)>,
     app_server_client_name: Option<&'a str>,
     desired_state_tx: &'a watch::Sender<RemoteControlDesiredState>,
     desired_state_persistence_lock: &'a Semaphore,
@@ -445,6 +493,7 @@ impl RemoteControlWebsocket {
             auth_recovery,
             auth_change_rx,
             current_enrollment: channels.current_enrollment,
+            transport_enrollment: None,
             pairing_persistence_key: channels.pairing_persistence_key,
             client_tracker: Arc::new(Mutex::new(client_tracker)),
             state: Arc::new(Mutex::new(WebsocketState {
@@ -578,7 +627,7 @@ impl RemoteControlWebsocket {
         &mut self,
         connection_end_reason: ConnectionEndReason,
     ) -> bool {
-        let Some((reconnect_delay, reconnect_backoff_reset)) = reconnect_delay_after_connection_end(
+        let Some(reconnect_delay) = reconnect_delay_after_connection_end(
             connection_end_reason,
             &mut self.reconnect_attempt,
         ) else {
@@ -589,7 +638,6 @@ impl RemoteControlWebsocket {
             installation_id = %self.installation_id,
             server_name = %self.server_name,
             reconnect_delay = ?reconnect_delay,
-            reconnect_backoff_reset,
             "remote control websocket connection stopped; delaying reconnect"
         );
         Self::wait_for_reconnect_delay(
@@ -674,6 +722,7 @@ impl RemoteControlWebsocket {
                     continue;
                 }
             };
+            let mut current_enrollment = self.current_enrollment.lock().await;
             let enrollment = match state_db
                 .get_remote_control_enrollment(
                     &remote_control_target.websocket_url,
@@ -688,13 +737,25 @@ impl RemoteControlWebsocket {
                         error = %err,
                         "failed to resolve persisted remote control preference; retrying"
                     );
+                    drop(current_enrollment);
                     if !self.wait_for_preference_resolution_retry().await {
                         return false;
                     }
                     continue;
                 }
             };
-            let desired_state = desired_state_from_persisted_enrollment(enrollment);
+            let desired_state = desired_state_from_persisted_enrollment(enrollment.as_ref());
+            if desired_state.is_enabled()
+                && matches!(
+                    *self.desired_state_rx.borrow(),
+                    RemoteControlDesiredState::Unknown
+                )
+            {
+                *current_enrollment = enrollment.map(|record| {
+                    RemoteControlEnrollment::from_persisted(&remote_control_target, record)
+                });
+            }
+            drop(current_enrollment);
             self.transition_unknown_to(desired_state);
             return true;
         }
@@ -774,7 +835,10 @@ impl RemoteControlWebsocket {
             let connect_options = RemoteControlConnectOptions {
                 installation_id: &self.installation_id,
                 server_name: &self.server_name,
-                subscribe_cursor: subscribe_cursor.as_deref(),
+                subscribe_cursor: self
+                    .transport_enrollment
+                    .as_ref()
+                    .zip(subscribe_cursor.as_deref()),
                 app_server_client_name,
                 desired_state_tx: &self.desired_state_tx,
                 desired_state_persistence_lock: &self.desired_state_persistence_lock,
@@ -808,7 +872,13 @@ impl RemoteControlWebsocket {
             };
 
             match connect_result {
-                Ok((websocket_connection, response)) => {
+                Ok((websocket_connection, response, enrollment)) => {
+                    if self.transport_enrollment.as_ref().is_some_and(|previous| {
+                        !same_remote_control_enrollment(previous, &enrollment)
+                    }) {
+                        self.retire_transport().await;
+                    }
+                    self.transport_enrollment = Some(enrollment);
                     if !self.desired_state_rx.borrow().is_enabled() {
                         return ConnectOutcome::Disabled;
                     }
@@ -834,13 +904,18 @@ impl RemoteControlWebsocket {
                         return ConnectOutcome::Disabled;
                     }
                     let reconnect_delay = if err.kind() == ErrorKind::WouldBlock {
-                        REMOTE_CONTROL_ACCOUNT_ID_RETRY_INTERVAL
+                        self.current_enrollment
+                            .snapshot()
+                            .and_then(|enrollment| enrollment.next_refresh_at)
+                            .and_then(|deadline| {
+                                (deadline - time::OffsetDateTime::now_utc()).try_into().ok()
+                            })
+                            .unwrap_or(REMOTE_CONTROL_ACCOUNT_ID_RETRY_INTERVAL)
                     } else {
                         self.status_publisher
                             .publish_status(RemoteControlConnectionStatus::Errored);
                         let reconnect_attempt = self.reconnect_attempt.saturating_add(1);
-                        let (reconnect_delay, reconnect_backoff_reset) =
-                            next_reconnect_delay(&mut self.reconnect_attempt);
+                        let reconnect_delay = next_reconnect_delay(&mut self.reconnect_attempt);
                         let enrollment = self.current_enrollment.snapshot();
                         warn!(
                             websocket_url = %remote_control_target.websocket_url,
@@ -850,19 +925,12 @@ impl RemoteControlWebsocket {
                             error_kind = ?err.kind(),
                             reconnect_attempt,
                             reconnect_delay = ?reconnect_delay,
-                            reconnect_backoff_reset,
                             has_enrollment = enrollment.is_some(),
                             server_id = ?enrollment.as_ref().map(|enrollment| enrollment.server_id.as_str()),
                             environment_id = ?enrollment.as_ref().map(|enrollment| enrollment.environment_id.as_str()),
                             subscribe_cursor_present = subscribe_cursor.is_some(),
                             "failed to connect to app-server remote control websocket"
                         );
-                        if reconnect_backoff_reset {
-                            info!(
-                                reconnect_backoff_cap = ?REMOTE_CONTROL_RECONNECT_BACKOFF_CAP,
-                                "reset app-server remote control websocket reconnect backoff after cap"
-                            );
-                        }
                         reconnect_delay
                     };
                     tokio::select! {
@@ -889,7 +957,7 @@ impl RemoteControlWebsocket {
     }
 
     async fn run_connection(
-        &self,
+        &mut self,
         websocket_connection: WebSocketStream<MaybeTlsStream<TcpStream>>,
         shutdown_token: CancellationToken,
     ) -> ConnectionEndReason {
@@ -913,7 +981,24 @@ impl RemoteControlWebsocket {
         ));
 
         let mut desired_state_rx = self.desired_state_rx.clone();
+        let account_id = self
+            .transport_enrollment
+            .as_ref()
+            .map(|enrollment| enrollment.account_id.clone());
+        let auth_changed = async {
+            loop {
+                // Check before waiting too: an auth change may have arrived during the handshake.
+                let auth = load_remote_control_auth(&self.auth_manager).await;
+                if auth.as_ref().ok().map(|auth| &auth.account_id) != account_id.as_ref() {
+                    return;
+                }
+                if self.auth_change_rx.changed().await.is_err() {
+                    return;
+                }
+            }
+        };
         let connection_end_reason = tokio::select! {
+            _ = auth_changed => ConnectionEndReason::AuthChanged,
             _ = shutdown_token.cancelled() => ConnectionEndReason::Shutdown,
             changed = desired_state_rx.wait_for(|state| !state.is_enabled()) => {
                 if changed.is_ok() {
@@ -930,7 +1015,31 @@ impl RemoteControlWebsocket {
 
         Self::join_connection_workers(&mut join_set, REMOTE_CONTROL_CONNECTION_SHUTDOWN_TIMEOUT)
             .await;
+        if matches!(connection_end_reason, ConnectionEndReason::AuthChanged) {
+            self.retire_transport().await;
+        }
         connection_end_reason
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serialize client cancellation against tracker access while closing all virtual clients"
+    )]
+    async fn retire_transport(&mut self) {
+        // Workers have stopped. Cancel virtual clients before draining their queued output.
+        self.client_tracker.lock().await.close_all_clients().await;
+        {
+            let mut queued = self.server_event_rx.lock().await;
+            while queued.try_recv().is_ok() {}
+        }
+        let mut state = self.state.lock().await;
+        state.outbound_buffer.buffer_by_stream.clear();
+        state.outbound_buffer.used_tx.send_replace(0);
+        state.subscribe_cursor = None;
+        state.next_seq_id_by_stream.clear();
+        state.last_completed_client_chunk_seq_id_by_stream.clear();
+        state.client_segment_reassembler = ClientSegmentReassembler::default();
+        self.transport_enrollment = None;
     }
 
     async fn join_connection_workers(
@@ -999,24 +1108,17 @@ impl RemoteControlWebsocket {
         ping_interval: std::time::Duration,
         shutdown_token: CancellationToken,
     ) -> io::Result<()> {
-        let server_envelopes = state
+        let payloads = state
             .lock()
             .await
             .outbound_buffer
             .server_envelopes()
-            .cloned()
+            .map(|envelope| envelope.payload.clone())
             .collect::<Vec<_>>();
-        for server_envelope in server_envelopes {
-            let payload = match serde_json::to_string(&server_envelope) {
-                Ok(payload) => payload,
-                Err(err) => {
-                    error!("failed to serialize remote-control server event: {err}");
-                    continue;
-                }
-            };
+        for payload in payloads {
             tokio::select! {
                 _ = shutdown_token.cancelled() => return Ok(()),
-                send_result = websocket_writer.send(tungstenite::Message::Text(payload.into())) => {
+                send_result = websocket_writer.send(tungstenite::Message::Text(payload)) => {
                     if let Err(err) = send_result {
                         return Err(io::Error::other(err));
                     }
@@ -1063,53 +1165,45 @@ impl RemoteControlWebsocket {
                     }
                 }
             };
-            let (payloads, write_complete_tx) = {
+            let seq_key = (
+                queued_server_envelope.client_id.clone(),
+                queued_server_envelope.stream_id.clone(),
+            );
+            let seq_id = *state
+                .lock()
+                .await
+                .next_seq_id_by_stream
+                .get(&seq_key)
+                .unwrap_or(&1);
+            let server_envelope = ServerEnvelope {
+                event: queued_server_envelope.event,
+                client_id: queued_server_envelope.client_id,
+                seq_id,
+                stream_id: queued_server_envelope.stream_id,
+            };
+            // Encode the complete batch before committing replay state or completion.
+            // Only this writer assigns sequence IDs; the reader can process ACKs meanwhile.
+            let server_envelopes = split_server_envelope_for_transport(server_envelope)?
+                .into_iter()
+                .map(BufferedServerEnvelope::new)
+                .collect::<io::Result<Vec<_>>>()?;
+            let mut payloads = Vec::with_capacity(server_envelopes.len());
+            {
                 let mut state = state.lock().await;
-                let seq_key = (
-                    queued_server_envelope.client_id.clone(),
-                    queued_server_envelope.stream_id.clone(),
-                );
-                let seq_id = *state
-                    .next_seq_id_by_stream
-                    .entry(seq_key.clone())
-                    .or_insert(1);
-
-                let server_envelope = ServerEnvelope {
-                    event: queued_server_envelope.event,
-                    client_id: queued_server_envelope.client_id,
-                    seq_id,
-                    stream_id: queued_server_envelope.stream_id,
-                };
-                let server_envelopes = match split_server_envelope_for_transport(server_envelope) {
-                    Ok(server_envelopes) => server_envelopes,
-                    Err(err) => {
-                        error!("failed to split remote-control server event: {err}");
-                        continue;
-                    }
-                };
-                let mut payloads = Vec::with_capacity(server_envelopes.len());
-                for server_envelope in server_envelopes {
-                    let payload = match serde_json::to_string(&server_envelope) {
-                        Ok(payload) => payload,
-                        Err(err) => {
-                            error!("failed to serialize remote-control server event: {err}");
-                            continue;
-                        }
-                    };
-                    state.outbound_buffer.insert(&server_envelope);
-                    payloads.push(payload);
+                for envelope in server_envelopes {
+                    payloads.push(envelope.payload.clone());
+                    state.outbound_buffer.insert_encoded(envelope);
                 }
                 state
                     .next_seq_id_by_stream
                     .insert(seq_key, seq_id.saturating_add(1));
-
-                (payloads, queued_server_envelope.write_complete_tx)
-            };
+            }
+            let write_complete_tx = queued_server_envelope.write_complete_tx;
 
             for payload in payloads {
                 tokio::select! {
                     _ = shutdown_token.cancelled() => return Ok(()),
-                    send_result = websocket_writer.send(tungstenite::Message::Text(payload.into())) => {
+                    send_result = websocket_writer.send(tungstenite::Message::Text(payload)) => {
                         if let Err(err) = send_result {
                             return Err(io::Error::other(err));
                         }
@@ -1264,7 +1358,7 @@ impl RemoteControlWebsocket {
                         client_envelope.stream_id.clone(),
                     )
                 });
-            let delivered_client_envelope = client_envelope.clone();
+            let delivery = ClientDeliveryMetadata::from(&client_envelope);
             if client_tracker
                 .handle_message(client_envelope)
                 .await
@@ -1273,7 +1367,7 @@ impl RemoteControlWebsocket {
                 return Ok(());
             }
             state.lock().await.record_client_message_delivery(
-                &delivered_client_envelope,
+                delivery,
                 client_message_key.filter(|((client_id, stream_id), _)| {
                     client_tracker.contains_client_stream(client_id, stream_id.as_ref())
                 }),
@@ -1361,21 +1455,18 @@ fn build_remote_control_websocket_request(
     Ok(request)
 }
 
-fn next_reconnect_delay(reconnect_attempt: &mut u64) -> (std::time::Duration, bool) {
+fn next_reconnect_delay(reconnect_attempt: &mut u64) -> std::time::Duration {
     let reconnect_delay = backoff(*reconnect_attempt).min(REMOTE_CONTROL_RECONNECT_BACKOFF_CAP);
-    let reconnect_backoff_reset = reconnect_delay == REMOTE_CONTROL_RECONNECT_BACKOFF_CAP;
-    *reconnect_attempt = if reconnect_backoff_reset {
-        0
-    } else {
-        (*reconnect_attempt).saturating_add(1)
-    };
-    (reconnect_delay, reconnect_backoff_reset)
+    if reconnect_delay < REMOTE_CONTROL_RECONNECT_BACKOFF_CAP {
+        *reconnect_attempt = (*reconnect_attempt).saturating_add(1);
+    }
+    reconnect_delay
 }
 
 fn reconnect_delay_after_connection_end(
     connection_end_reason: ConnectionEndReason,
     reconnect_attempt: &mut u64,
-) -> Option<(std::time::Duration, bool)> {
+) -> Option<std::time::Duration> {
     matches!(
         connection_end_reason,
         ConnectionEndReason::ConnectionWorkerStopped
@@ -1393,6 +1484,7 @@ pub(super) async fn connect_remote_control_websocket(
 ) -> io::Result<(
     WebSocketStream<MaybeTlsStream<TcpStream>>,
     tungstenite::http::Response<()>,
+    RemoteControlEnrollment,
 )> {
     // CA reads and native-root initialization may block. Keep them off the
     // connection task, before enrollment can change state or contact the server.
@@ -1433,7 +1525,10 @@ pub(super) async fn connect_remote_control_websocket(
         &remote_control_target.websocket_url,
         &enrollment,
         connect_options.installation_id,
-        connect_options.subscribe_cursor,
+        connect_options
+            .subscribe_cursor
+            .filter(|(previous, _)| same_remote_control_enrollment(previous, &enrollment))
+            .map(|(_, cursor)| cursor),
     )?;
 
     let websocket_connect_result = tokio::time::timeout(
@@ -1454,7 +1549,9 @@ pub(super) async fn connect_remote_control_websocket(
     })?;
 
     match websocket_connect_result {
-        Ok((websocket_stream, response)) => Ok((websocket_stream, response.map(|_| ()))),
+        Ok((websocket_stream, response)) => {
+            Ok((websocket_stream, response.map(|_| ()), enrollment))
+        }
         Err(err) => {
             match &err {
                 tungstenite::Error::Http(response)
@@ -1540,7 +1637,10 @@ async fn prepare_remote_control_enrollment(
         Ok(auth) => auth,
         Err(err) => {
             if err.kind() == ErrorKind::PermissionDenied {
-                *enrollment = None;
+                // Preserve account ownership of the durable preference while logged out.
+                if let Some(enrollment) = enrollment.as_mut() {
+                    enrollment.clear_server_token();
+                }
                 status_publisher.publish_environment_id(/*environment_id*/ None);
             }
             return Err(err);
@@ -1575,6 +1675,7 @@ async fn prepare_remote_control_enrollment(
     }
     if let Some(enrollment) = enrollment.as_mut() {
         enrollment.remote_control_target = remote_control_target.clone();
+        enrollment.server_name = connect_options.server_name.to_string();
     }
 
     if let Some(enrollment) = enrollment.as_ref() {
@@ -1722,7 +1823,7 @@ async fn resolve_desired_state_after_account_change(
             "remote control account changed while resolving persisted preference",
         ));
     }
-    let resolved_state = desired_state_from_persisted_enrollment(enrollment);
+    let resolved_state = desired_state_from_persisted_enrollment(enrollment.as_ref());
     connect_options.desired_state_tx.send_if_modified(|state| {
         if *state != durable_enabled || *state == resolved_state {
             return false;
@@ -1989,30 +2090,20 @@ mod tests {
     }
 
     #[test]
-    fn next_reconnect_delay_resets_after_cap() {
+    fn next_reconnect_delay_stays_capped() {
         let mut reconnect_attempt = 9;
-
-        let (reconnect_delay, reconnect_backoff_reset) =
-            next_reconnect_delay(&mut reconnect_attempt);
-
-        assert_eq!(reconnect_delay, REMOTE_CONTROL_RECONNECT_BACKOFF_CAP);
-        assert!(reconnect_backoff_reset);
-        assert_eq!(reconnect_attempt, 0);
-
-        let (reconnect_delay, reconnect_backoff_reset) =
-            next_reconnect_delay(&mut reconnect_attempt);
-
-        assert!(reconnect_delay >= Duration::from_millis(180));
-        assert!(reconnect_delay <= Duration::from_millis(220));
-        assert!(!reconnect_backoff_reset);
-        assert_eq!(reconnect_attempt, 1);
+        for _ in 0..3 {
+            let delay = next_reconnect_delay(&mut reconnect_attempt);
+            assert_eq!(delay, REMOTE_CONTROL_RECONNECT_BACKOFF_CAP);
+            assert_eq!(reconnect_attempt, 9);
+        }
     }
 
     #[test]
     fn stopped_connection_uses_first_reconnect_delay() {
         let mut reconnect_attempt = 0;
 
-        let (reconnect_delay, reconnect_backoff_reset) = reconnect_delay_after_connection_end(
+        let reconnect_delay = reconnect_delay_after_connection_end(
             ConnectionEndReason::ConnectionWorkerStopped,
             &mut reconnect_attempt,
         )
@@ -2020,7 +2111,6 @@ mod tests {
 
         assert!(reconnect_delay >= Duration::from_millis(180));
         assert!(reconnect_delay <= Duration::from_millis(220));
-        assert!(!reconnect_backoff_reset);
         assert_eq!(reconnect_attempt, 1);
         assert!(
             reconnect_delay_after_connection_end(
@@ -2221,7 +2311,7 @@ mod tests {
         let remote_control_target =
             normalize_remote_control_url(&remote_control_url).expect("target should parse");
         let expected_error = format!(
-            "failed to connect app-server remote control websocket `{}`: HTTP error: 503 Service Unavailable, request-id: <none>, cf-ray: <none>, body: upstream unavailable",
+            "failed to connect app-server remote control websocket `{}`: HTTP error: 503 Service Unavailable, request-id: <none>, cf-ray: <none>, body: <omitted non-JSON response body>",
             remote_control_target.websocket_url
         );
         let server_task = tokio::spawn(async move {
@@ -2439,7 +2529,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "remote control server enrollment failed at `{enroll_url}`: HTTP 401 Unauthorized, request-id: <none>, cf-ray: <none>, body: unauthorized; retrying after auth recovery"
+                "remote control server enrollment failed at `{enroll_url}`: HTTP 401 Unauthorized, request-id: <none>, cf-ray: <none>, body: <omitted non-JSON response body>; retrying after auth recovery"
             )
         );
         assert_eq!(
@@ -2548,7 +2638,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "remote control server refresh failed at `{refresh_url}`: HTTP 401 Unauthorized, request-id: <none>, cf-ray: <none>, body: unauthorized; retrying after auth recovery"
+                "remote control server refresh failed at `{refresh_url}`: HTTP 401 Unauthorized, request-id: <none>, cf-ray: <none>, body: <omitted non-JSON response body>; retrying after auth recovery"
             )
         );
         assert_eq!(
@@ -2817,7 +2907,10 @@ mod tests {
             err.to_string(),
             "remote control requires ChatGPT authentication"
         );
-        assert_eq!(*current_enrollment.lock().await, None);
+        let mut expected_enrollment =
+            remote_control_enrollment(Some(TEST_REMOTE_CONTROL_SERVER_TOKEN));
+        expected_enrollment.clear_server_token();
+        assert_eq!(*current_enrollment.lock().await, Some(expected_enrollment));
         assert_eq!(
             status_rx.borrow().clone(),
             RemoteControlStatusChangedNotification {
@@ -2827,6 +2920,115 @@ mod tests {
                 environment_id: None,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn reconnect_keeps_replay_only_for_the_same_enrollment() {
+        for replace_enrollment in [false, true] {
+            timeout(TEST_HTTP_ACCEPT_TIMEOUT, async {
+                let listener = TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("listener should bind");
+                let remote_control_url = remote_control_url_for_listener(&listener);
+                let target =
+                    normalize_remote_control_url(&remote_control_url).expect("target should parse");
+                let mut previous = remote_control_enrollment(Some("previous-token"));
+                previous.remote_control_target = target.clone();
+                let mut selected = previous.clone();
+                selected.remote_control_token = Some("rotated-token".to_string());
+                if replace_enrollment {
+                    selected.server_id = "replacement-server".to_string();
+                }
+                let codex_home = TempDir::new().expect("temp dir should create");
+                let (transport_event_tx, _transport_event_rx) = mpsc::channel(1);
+                let (status_publisher, _status_rx) = remote_control_status_channel();
+                let shutdown = CancellationToken::new();
+                let mut websocket = RemoteControlWebsocket::new(
+                    RemoteControlWebsocketConfig {
+                        remote_control_url,
+                        installation_id: TEST_INSTALLATION_ID.to_string(),
+                        remote_control_target: Some(target),
+                        server_name: "test-server".to_string(),
+                        http_clients: test_http_clients(),
+                    },
+                    Some(remote_control_state_runtime(&codex_home).await),
+                    remote_control_auth_manager(),
+                    RemoteControlChannels {
+                        transport_event_tx,
+                        status_publisher,
+                        current_enrollment: test_current_enrollment(Some(selected.clone())),
+                        pairing_persistence_key: watch::channel(None).0,
+                        desired_state_persistence_lock: Arc::new(Semaphore::new(1)),
+                    },
+                    shutdown.clone(),
+                    Arc::new(enabled_desired_state_sender()),
+                );
+                websocket.transport_enrollment = Some(previous);
+                let client_id = ClientId("client-1".to_string());
+                let stream_id = StreamId("stream-1".to_string());
+                {
+                    let mut state = websocket.state.lock().await;
+                    state.subscribe_cursor = Some("old-cursor".to_string());
+                    state
+                        .next_seq_id_by_stream
+                        .insert((client_id.clone(), stream_id.clone()), 2);
+                    state.outbound_buffer.insert(&ServerEnvelope {
+                        client_id,
+                        stream_id,
+                        seq_id: 1,
+                        event: ServerEvent::Pong {
+                            status: super::super::protocol::PongStatus::Active,
+                        },
+                    });
+                }
+                let server = async {
+                    let (stream, _) = listener.accept().await.expect("connection should arrive");
+                    tokio_tungstenite::accept_hdr_async(
+                        stream,
+                        |request: &tungstenite::handshake::server::Request, response| {
+                            assert_eq!(
+                                request
+                                    .headers()
+                                    .get(REMOTE_CONTROL_SUBSCRIBE_CURSOR_HEADER)
+                                    .map(|value| value.to_str().expect("cursor should be text")),
+                                if replace_enrollment {
+                                    None
+                                } else {
+                                    Some("old-cursor")
+                                },
+                            );
+                            Ok(response)
+                        },
+                    )
+                    .await
+                    .expect("handshake should succeed")
+                };
+                let (outcome, _server_socket) =
+                    tokio::join!(websocket.connect(&shutdown, None), server);
+                assert!(matches!(outcome, ConnectOutcome::Connected(_)));
+                assert_eq!(websocket.transport_enrollment, Some(selected));
+                let state = websocket.state.lock().await;
+                assert_eq!(
+                    state.outbound_buffer.server_envelopes().count(),
+                    usize::from(!replace_enrollment)
+                );
+                assert_eq!(
+                    *websocket.used_rx.borrow(),
+                    usize::from(!replace_enrollment)
+                );
+                assert_eq!(state.next_seq_id_by_stream.is_empty(), replace_enrollment);
+                assert_eq!(
+                    state.subscribe_cursor.as_deref(),
+                    if replace_enrollment {
+                        None
+                    } else {
+                        Some("old-cursor")
+                    }
+                );
+            })
+            .await
+            .expect("reconnect and assertions should finish");
+        }
     }
 
     #[tokio::test]
@@ -3021,6 +3223,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn writer_does_not_complete_or_buffer_unsendable_messages() {
+        let (client_stream, _server_stream) = connected_websocket_pair().await;
+        let (writer, _reader) = client_stream.split();
+        let (outbound_buffer, used_rx) = BoundedOutboundBuffer::new();
+        let state = Arc::new(Mutex::new(WebsocketState {
+            outbound_buffer,
+            subscribe_cursor: None,
+            next_seq_id_by_stream: HashMap::new(),
+            last_completed_client_chunk_seq_id_by_stream: HashMap::new(),
+            client_segment_reassembler: ClientSegmentReassembler::default(),
+        }));
+        let (tx, rx) = mpsc::channel(1);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        tx.send(super::super::QueuedServerEnvelope {
+            client_id: ClientId("x".repeat(REMOTE_CONTROL_SEGMENT_MAX_BYTES)),
+            stream_id: StreamId("stream".to_string()),
+            event: ServerEvent::ServerMessage {
+                message: Box::new(
+                    crate::outgoing_message::OutgoingMessage::AppServerNotification(
+                        codex_app_server_protocol::ServerNotification::ConfigWarning(
+                            codex_app_server_protocol::ConfigWarningNotification {
+                                summary: "warning".to_string(),
+                                details: None,
+                                path: None,
+                                range: None,
+                            },
+                        ),
+                    ),
+                ),
+            },
+            write_complete_tx: Some(done_tx),
+        })
+        .await
+        .expect("message should queue");
+        let err = timeout(
+            Duration::from_secs(2),
+            RemoteControlWebsocket::run_server_writer_inner(
+                state.clone(),
+                Arc::new(Mutex::new(rx)),
+                used_rx.clone(),
+                writer,
+                Duration::from_secs(60),
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("writer should fail promptly")
+        .expect_err("metadata cannot fit");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(
+            done_rx.await.is_err(),
+            "failed message must not report completion"
+        );
+        let state = state.lock().await;
+        assert!(state.next_seq_id_by_stream.is_empty());
+        assert_eq!(state.outbound_buffer.server_envelopes().count(), 0);
+        assert_eq!(*used_rx.borrow(), 0);
+    }
+
+    #[tokio::test]
     async fn run_server_writer_inner_assigns_contiguous_seq_ids_per_stream() {
         let (client_stream, mut server_stream) = connected_websocket_pair().await;
         let (websocket_writer, _websocket_reader) = client_stream.split();
@@ -3036,9 +3298,9 @@ mod tests {
         let server_event_rx = Arc::new(Mutex::new(server_event_rx));
         let shutdown_token = CancellationToken::new();
         let writer_task = tokio::spawn(RemoteControlWebsocket::run_server_writer_inner(
-            state,
-            server_event_rx,
-            used_rx,
+            state.clone(),
+            server_event_rx.clone(),
+            used_rx.clone(),
             websocket_writer,
             Duration::from_secs(60),
             shutdown_token.clone(),
@@ -3097,6 +3359,45 @@ mod tests {
             .await
             .expect("writer task should join")
             .expect("writer should stop cleanly");
+        // Replay must use the exact unacknowledged wire payloads and keep sequence IDs.
+        let expected = {
+            let mut state = state.lock().await;
+            state
+                .outbound_buffer
+                .ack(&client_id, &first_stream, 1, None);
+            state
+                .outbound_buffer
+                .server_envelopes()
+                .map(|envelope| envelope.payload.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(expected.len(), 2);
+        let (client_stream, mut server_stream) = connected_websocket_pair().await;
+        let (websocket_writer, _reader) = client_stream.split();
+        let shutdown_token = CancellationToken::new();
+        let replay = tokio::spawn(RemoteControlWebsocket::run_server_writer_inner(
+            state,
+            server_event_rx,
+            used_rx,
+            websocket_writer,
+            Duration::from_secs(60),
+            shutdown_token.clone(),
+        ));
+        for payload in expected {
+            assert_eq!(
+                timeout(Duration::from_secs(2), server_stream.next())
+                    .await
+                    .expect("replay should arrive")
+                    .expect("socket should stay open")
+                    .expect("replay should read"),
+                tungstenite::Message::Text(payload)
+            );
+        }
+        shutdown_token.cancel();
+        replay
+            .await
+            .expect("replay task should join")
+            .expect("replay should stop cleanly");
     }
 
     #[tokio::test]
@@ -3140,6 +3441,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Tracker shutdown owns its clients until their cancellation settles"
+    )]
     async fn websocket_reader_retains_chunk_cursors_only_for_live_clients() {
         let (client_stream, mut peer) = connected_websocket_pair().await;
         let (_writer, reader) = client_stream.split();
@@ -3387,6 +3692,16 @@ mod tests {
             &client_id, "stream-1", /*seq_id*/ 4, /*segment_id*/ 1,
         ));
 
+        outbound_buffer.ack(&client_id, &stream_id, 4, Some(0));
+        assert_eq!(
+            outbound_buffer
+                .server_envelopes()
+                .map(|envelope| (envelope.seq_id, envelope.segment_id))
+                .collect::<Vec<_>>(),
+            vec![(4, Some(1))]
+        );
+        assert_eq!(*used_rx.borrow(), 1);
+
         outbound_buffer.ack(
             &client_id,
             &stream_id,
@@ -3396,7 +3711,7 @@ mod tests {
 
         let retained = outbound_buffer
             .server_envelopes()
-            .map(|server_envelope| server_envelope.event.segment_id())
+            .map(|server_envelope| server_envelope.segment_id)
             .collect::<Vec<_>>();
         assert_eq!(retained, Vec::<Option<usize>>::new());
         assert_eq!(*used_rx.borrow(), 0);
@@ -3421,7 +3736,7 @@ mod tests {
 
         let retained = outbound_buffer
             .server_envelopes()
-            .map(|server_envelope| server_envelope.event.segment_id())
+            .map(|server_envelope| server_envelope.segment_id)
             .collect::<Vec<_>>();
         assert_eq!(retained, Vec::<Option<usize>>::new());
         assert_eq!(*used_rx.borrow(), 0);
@@ -3508,7 +3823,7 @@ mod tests {
             _ => panic!("expected completed client message"),
         };
         state.record_client_message_delivery(
-            &completed_envelope,
+            ClientDeliveryMetadata::from(&completed_envelope),
             Some((
                 (
                     ClientId("client-1".to_string()),
@@ -3790,15 +4105,21 @@ mod tests {
         let client_id = ClientId("client-1".to_string());
         let stream_id = StreamId("stream-1".to_string());
 
+        let raw = br#"{"jsonrpc":"2.0","method":"initialized"}"#;
+        let completed = client_chunk_envelope("client-1", "stream-1", 4, 0, 1, raw.len(), raw);
+        let key = WebsocketState::client_message_key(&completed);
+        let ClientSegmentObservation::Forward(completed) =
+            observe_client_message(&mut state, completed)
+        else {
+            panic!("valid single chunk should complete");
+        };
+        state.record_client_message_delivery(ClientDeliveryMetadata::from(completed.as_ref()), key);
         assert!(matches!(
             observe_client_message(
                 &mut state,
-                client_chunk_envelope(
-                    "client-1", "stream-1", /*seq_id*/ 4, /*segment_id*/ 0,
-                    /*segment_count*/ 2, /*message_size_bytes*/ 2, b"x",
-                )
+                client_chunk_envelope("client-1", "stream-1", 1, 0, 2, 2, b"x")
             ),
-            ClientSegmentObservation::Pending
+            ClientSegmentObservation::Dropped
         ));
         state.invalidate_client_message_stream(&client_id, &stream_id);
         state
@@ -3893,60 +4214,76 @@ mod tests {
     }
 
     pub(super) async fn accept_http_request(listener: &TcpListener) -> (TcpStream, String) {
-        let (stream, _) = timeout(TEST_HTTP_ACCEPT_TIMEOUT, listener.accept())
-            .await
-            .expect("HTTP request should arrive in time")
-            .expect("listener accept should succeed");
-        let mut reader = BufReader::new(stream);
-
-        let mut request_line = String::new();
-        reader
-            .read_line(&mut request_line)
-            .await
-            .expect("request line should read");
-        loop {
-            let mut line = String::new();
-            reader
-                .read_line(&mut line)
+        tokio::time::timeout(TEST_HTTP_ACCEPT_TIMEOUT, async {
+            let (stream, _) = timeout(TEST_HTTP_ACCEPT_TIMEOUT, listener.accept())
                 .await
-                .expect("header line should read");
-            if line == "\r\n" {
-                break;
-            }
-        }
+                .expect("HTTP request should arrive in time")
+                .expect("listener accept should succeed");
+            let mut reader = BufReader::new(stream);
 
-        (
-            reader.into_inner(),
-            request_line.trim_end_matches("\r\n").to_string(),
-        )
+            let mut request_line = String::new();
+            assert_ne!(
+                reader
+                    .read_line(&mut request_line)
+                    .await
+                    .expect("request line should read"),
+                0,
+                "unexpected EOF reading HTTP request"
+            );
+            loop {
+                let mut line = String::new();
+                assert_ne!(
+                    reader
+                        .read_line(&mut line)
+                        .await
+                        .expect("header line should read"),
+                    0,
+                    "unexpected EOF reading HTTP request"
+                );
+                if line == "\r\n" {
+                    break;
+                }
+            }
+
+            (
+                reader.into_inner(),
+                request_line.trim_end_matches("\r\n").to_string(),
+            )
+        })
+        .await
+        .expect("test exchange should finish in time")
     }
 
     async fn connected_websocket_pair() -> (
         WebSocketStream<MaybeTlsStream<TcpStream>>,
         WebSocketStream<TcpStream>,
     ) {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind");
-        let connect_task = tokio::spawn(connect_async(format!(
-            "ws://{}",
-            listener
-                .local_addr()
-                .expect("listener should have a local addr")
-        )));
-        let (server_stream, _) = listener
-            .accept()
-            .await
-            .expect("server should accept client");
-        let server_stream = accept_async(server_stream)
-            .await
-            .expect("server websocket handshake should succeed");
-        let (client_stream, _) = connect_task
-            .await
-            .expect("client connect task should join")
-            .expect("client websocket handshake should succeed");
+        tokio::time::timeout(TEST_HTTP_ACCEPT_TIMEOUT, async {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener should bind");
+            let connect_task = tokio::spawn(connect_async(format!(
+                "ws://{}",
+                listener
+                    .local_addr()
+                    .expect("listener should have a local addr")
+            )));
+            let (server_stream, _) = listener
+                .accept()
+                .await
+                .expect("server should accept client");
+            let server_stream = accept_async(server_stream)
+                .await
+                .expect("server websocket handshake should succeed");
+            let (client_stream, _) = connect_task
+                .await
+                .expect("client connect task should join")
+                .expect("client websocket handshake should succeed");
 
-        (client_stream, server_stream)
+            (client_stream, server_stream)
+        })
+        .await
+        .expect("test exchange should finish in time")
     }
 
     async fn read_server_text_event(

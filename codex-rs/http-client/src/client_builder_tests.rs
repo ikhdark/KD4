@@ -39,8 +39,8 @@ fn exclusive_tls_roots_select_explicit_root_policy() {
     assert!(client.is_ok());
 }
 
-#[test]
-fn async_builder_accepts_transport_neutral_tls_material() {
+#[tokio::test]
+async fn async_builder_enforces_https_with_transport_neutral_tls_material() {
     let ca_pem = include_bytes!("../tests/fixtures/test-ca.pem");
 
     let client = HttpClientBuilder::new()
@@ -48,7 +48,13 @@ fn async_builder_accepts_transport_neutral_tls_material() {
         .tls_certs_only_pem(ca_pem)
         .expect("valid CA certificate")
         .https_only(true)
-        .build_direct();
+        .build_direct()
+        .expect("build client");
 
-    assert!(client.is_ok());
+    let error = client
+        .get("http://127.0.0.1:1/")
+        .send()
+        .await
+        .expect_err("HTTPS-only rejects HTTP");
+    assert!(error.is_builder());
 }

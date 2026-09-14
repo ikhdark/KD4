@@ -1471,7 +1471,15 @@ async fn run_exec_server_command(
         let config = if strict_config {
             Some(config_result?)
         } else {
-            config_result.ok()
+            match config_result {
+                Ok(config) => Some(config),
+                Err(err) => {
+                    eprintln!(
+                        "Could not load exec-server telemetry configuration; continuing with default logging and no configured telemetry: {err:#}"
+                    );
+                    None
+                }
+            }
         };
         let (_otel, telemetry) = exec_server_telemetry::init(config.as_ref());
         let listen_url = cmd
@@ -2096,7 +2104,7 @@ async fn run_interactive_tui(
 
         local_state_db::print_auto_backup_start(startup_error);
         match local_state_db::backup_files_for_fresh_start(startup_error).await {
-            Ok(backups) => local_state_db::confirm_fresh_start_rebuild(startup_error, &backups)?,
+            Ok(backups) => local_state_db::confirm_fresh_start_retry(startup_error, &backups)?,
             Err(backup_err) => {
                 local_state_db::print_diagnostic_guidance(startup_error);
                 return Ok(AppExitInfo::fatal(format!(

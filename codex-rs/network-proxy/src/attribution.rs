@@ -72,16 +72,34 @@ where
 }
 
 async fn read_attribution_token(stream: &mut TcpStream) -> Result<Option<String>, BoxError> {
+    tokio::time::timeout(
+        ATTRIBUTION_FRAME_TIMEOUT,
+        read_attribution_token_inner(stream),
+    )
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "network proxy attribution frame timed out",
+        )
+    })?
+    .map_err(Into::into)
+}
+
+async fn read_attribution_token_inner(stream: &mut TcpStream) -> io::Result<Option<String>> {
     let mut marker = [0_u8; 1];
     let read = stream.stream.peek(&mut marker).await?;
     if read == 0 {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "empty proxy connection").into());
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "empty proxy connection",
+        ));
     }
     if marker[0] != ATTRIBUTION_FRAME_MAGIC[0] {
         return Ok(None);
     }
 
-    let token = tokio::time::timeout(ATTRIBUTION_FRAME_TIMEOUT, async {
+    let token = async {
         let mut magic = [0_u8; ATTRIBUTION_FRAME_MAGIC.len()];
         stream.read_exact(&mut magic).await?;
         if &magic != ATTRIBUTION_FRAME_MAGIC {
@@ -106,14 +124,8 @@ async fn read_attribution_token(stream: &mut TcpStream) -> Result<Option<String>
                 "network proxy attribution token is not UTF-8",
             )
         })
-    })
-    .await
-    .map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            "network proxy attribution frame timed out",
-        )
-    })??;
+    }
+    .await?;
 
     Ok(Some(token))
 }

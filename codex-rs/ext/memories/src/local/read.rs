@@ -1,3 +1,5 @@
+use std::io::BufRead;
+
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::truncate_text;
 
@@ -31,17 +33,31 @@ pub(super) async fn read(
         return Err(MemoriesBackendError::NotFile { path: request.path });
     }
 
-    let original_content = tokio::fs::read_to_string(&path).await?;
-    let start_byte = line_start_byte_offset(&original_content, request.line_offset)?;
-    let end_byte = line_end_byte_offset(&original_content, start_byte, request.max_lines);
-    let content_from_offset = &original_content[start_byte..end_byte];
+    let line_offset = request.line_offset;
+    let max_lines = request.max_lines;
+    let relative_path = request.path.clone();
+    let (selected, has_suffix) = tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(path).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                MemoriesBackendError::NotFound {
+                    path: relative_path,
+                }
+            } else {
+                err.into()
+            }
+        })?;
+        read_range(std::io::BufReader::new(file), line_offset, max_lines)
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+    let content_from_offset = selected.as_str();
     let max_tokens = if request.max_tokens == 0 {
         DEFAULT_READ_MAX_TOKENS
     } else {
         request.max_tokens
     };
     let content = truncate_text(content_from_offset, TruncationPolicy::Tokens(max_tokens));
-    let truncated = end_byte < original_content.len() || content != content_from_offset;
+    let truncated = has_suffix || content != content_from_offset;
     Ok(ReadMemoryResponse {
         path: request.path,
         start_line_number: request.line_offset,
@@ -50,41 +66,36 @@ pub(super) async fn read(
     })
 }
 
-fn line_start_byte_offset(
-    content: &str,
+// Validate the entire UTF-8 file, as read_to_string did, but retain only the requested
+// range. In particular, do not early-stop on a token budget: truncation keeps both ends.
+fn read_range(
+    mut reader: impl BufRead,
     line_offset: usize,
-) -> Result<usize, MemoriesBackendError> {
-    if line_offset == 1 {
-        return Ok(0);
-    }
-
-    let mut current_line = 1;
-    for (idx, ch) in content.char_indices() {
-        if ch == '\n' {
+    max_lines: Option<usize>,
+) -> Result<(String, bool), MemoriesBackendError> {
+    let mut selected = String::new();
+    let mut line = String::new();
+    let mut current_line = 1usize;
+    let mut has_suffix = false;
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        if current_line >= line_offset {
+            if max_lines.is_none_or(|limit| current_line - line_offset < limit) {
+                selected.push_str(&line);
+            } else {
+                has_suffix = true;
+            }
+        }
+        // A final newline makes the empty next line addressable, matching the old offsets.
+        if line.ends_with('\n') {
             current_line += 1;
-            if current_line == line_offset {
-                return Ok(idx + 1);
-            }
         }
     }
-
-    Err(MemoriesBackendError::LineOffsetExceedsFileLength)
-}
-
-fn line_end_byte_offset(content: &str, start_byte: usize, max_lines: Option<usize>) -> usize {
-    let Some(max_lines) = max_lines else {
-        return content.len();
-    };
-
-    let mut lines_seen = 1;
-    for (relative_idx, ch) in content[start_byte..].char_indices() {
-        if ch == '\n' {
-            if lines_seen == max_lines {
-                return start_byte + relative_idx + 1;
-            }
-            lines_seen += 1;
-        }
+    if current_line < line_offset {
+        return Err(MemoriesBackendError::LineOffsetExceedsFileLength);
     }
-
-    content.len()
+    Ok((selected, has_suffix))
 }

@@ -474,6 +474,10 @@ impl ListSelectionView {
     }
 
     fn apply_filter(&mut self) {
+        self.apply_filter_with_notification(true);
+    }
+
+    fn apply_filter_with_notification(&mut self, notify: bool) {
         let previously_selected = self
             .selected_actual_idx()
             .filter(|actual_idx| self.enabled_actual_idx(*actual_idx).is_some())
@@ -508,21 +512,13 @@ impl ListSelectionView {
         }
 
         let len = self.filtered_indices.len();
-        let selected_visible_idx = self
-            .state
-            .selected_idx
-            .and_then(|visible_idx| {
+        let selected_visible_idx = previously_selected
+            .and_then(|actual_idx| {
                 self.filtered_indices
-                    .get(visible_idx)
-                    .and_then(|idx| self.filtered_indices.iter().position(|cur| cur == idx))
+                    .iter()
+                    .position(|idx| *idx == actual_idx)
             })
-            .or_else(|| {
-                previously_selected.and_then(|actual_idx| {
-                    self.filtered_indices
-                        .iter()
-                        .position(|idx| *idx == actual_idx)
-                })
-            });
+            .or_else(|| self.state.selected_idx.filter(|idx| *idx < len));
         self.state.selected_idx = selected_visible_idx
             .filter(|visible_idx| {
                 self.filtered_indices
@@ -540,7 +536,7 @@ impl ListSelectionView {
         // Notify the callback when filtering changes the selected actual item
         // so live preview stays in sync (e.g. typing in the theme picker).
         let new_actual = self.selected_actual_idx();
-        if new_actual != previously_selected {
+        if notify && new_actual != previously_selected {
             self.fire_selection_changed();
         }
     }
@@ -632,7 +628,7 @@ impl ListSelectionView {
         self.active_tab_idx = Some(next_idx);
         self.search_query.clear();
         self.state.reset();
-        self.apply_filter();
+        self.apply_filter_with_notification(false);
         if self.state.selected_idx.is_none() {
             self.select_first_enabled_row();
         }
@@ -1022,7 +1018,7 @@ impl BottomPaneView for ListSelectionView {
                 && !modifiers.contains(KeyModifiers::CONTROL)
                 && !modifiers.contains(KeyModifiers::ALT) =>
             {
-                if let Some(idx) = self.items.iter().position(|item| {
+                if let Some(idx) = self.active_items().iter().position(|item| {
                     item.display_shortcut
                         .is_some_and(|shortcut| shortcut.is_press(key_event))
                         && Self::item_is_enabled(item)
@@ -1114,24 +1110,27 @@ impl Renderable for ListSelectionView {
         };
 
         // Measure wrapped height for up to MAX_POPUP_ROWS items.
-        let rows = self.build_rows();
         let column_width = ColumnWidthConfig::new(self.col_width_mode, self.name_column_width);
         let rows_height = match self.row_display {
             SelectionRowDisplay::Wrapped => measure_rows_height_with_col_width_mode(
-                &rows,
+                &self.build_rows(),
                 &self.state,
                 MAX_POPUP_ROWS,
                 effective_rows_width.saturating_add(1),
                 column_width,
             ),
-            SelectionRowDisplay::SingleLine => rows.len().clamp(1, MAX_POPUP_ROWS) as u16,
+            SelectionRowDisplay::SingleLine => {
+                self.filtered_indices.len().clamp(1, MAX_POPUP_ROWS) as u16
+            }
         };
 
         let header = self.active_header();
         let tab_height = tab_bar_height(&self.tabs, self.active_tab_idx.unwrap_or(0), inner_width);
         let mut height = header.desired_height(inner_width);
-        height = height.saturating_add(tab_height + u16::from(tab_height > 0));
-        height = height.saturating_add(rows_height + 3);
+        height = height
+            .saturating_add(tab_height)
+            .saturating_add(u16::from(tab_height > 0));
+        height = height.saturating_add(rows_height).saturating_add(3);
         if self.is_searchable {
             height = height.saturating_add(1);
         }
@@ -1566,6 +1565,74 @@ mod tests {
         let after_scroll = render_lines_with_width(&view, width);
 
         format!("before scroll:\n{before_scroll}\n\nafter scroll:\n{after_scroll}")
+    }
+
+    #[test]
+    fn filtering_keeps_selected_item_when_its_visible_index_changes() {
+        let (tx, _rx) = unbounded_channel();
+        let mut view = new_view(
+            SelectionViewParams {
+                is_searchable: true,
+                items: ["alpha", "beta", "gamma"]
+                    .into_iter()
+                    .map(|name| SelectionItem {
+                        name: name.to_string(),
+                        search_value: Some(name.to_string()),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            AppEventSender::new(tx),
+        );
+        view.handle_key_event(KeyEvent::from(KeyCode::Down));
+        assert_eq!(view.selected_actual_idx(), Some(1));
+        view.handle_paste("beta".to_string());
+        assert_eq!(view.selected_actual_idx(), Some(1));
+        view.set_search_query(String::new());
+        assert_eq!(view.selected_actual_idx(), Some(1));
+        assert_eq!(view.state.selected_idx, Some(1));
+    }
+
+    #[test]
+    fn switching_tabs_notifies_once_and_shortcuts_use_active_items() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut view = new_view(
+            SelectionViewParams {
+                tabs: ["alpha", "beta"]
+                    .into_iter()
+                    .map(|id| SelectionTab {
+                        id: id.to_string(),
+                        label: id.to_string(),
+                        header: Box::new(()),
+                        items: vec![SelectionItem {
+                            name: id.to_string(),
+                            display_shortcut: Some(crate::key_hint::plain(KeyCode::Char('x'))),
+                            actions: vec![Box::new(|tx| tx.send(AppEvent::ManageSkillsClosed))],
+                            dismiss_on_select: true,
+                            ..Default::default()
+                        }],
+                    })
+                    .collect(),
+                on_selection_changed: Some(Box::new(|_, tx| tx.send(AppEvent::ManageSkillsClosed))),
+                ..Default::default()
+            },
+            AppEventSender::new(tx),
+        );
+        while rx.try_recv().is_ok() {}
+        view.handle_key_event(KeyEvent::from(KeyCode::Right));
+        assert_eq!(view.active_tab_id(), Some("beta"));
+        assert!(matches!(rx.try_recv(), Ok(AppEvent::ManageSkillsClosed)));
+        assert!(
+            rx.try_recv().is_err(),
+            "tab switch must notify exactly once"
+        );
+        view.handle_key_event(KeyEvent::from(KeyCode::Char('x')));
+        assert!(matches!(rx.try_recv(), Ok(AppEvent::ManageSkillsClosed)));
+        assert!(
+            view.is_complete(),
+            "shortcut must activate the visible tab's item"
+        );
     }
 
     #[test]

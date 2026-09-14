@@ -1,13 +1,12 @@
-param(
-    [Parameter(Mandatory = $true)]
-    [ValidateSet("clippy", "dead-code")]
-    [string]$Analyzer,
-
-    [Parameter(ValueFromRemainingArguments = $true)]
-    [string[]]$ForwardedArgs
-)
-
 $ErrorActionPreference = "Stop"
+# Windows PowerShell's parameter binder treats a forwarded `--` as an
+# ambiguous empty parameter. Consume our selector and keep Cargo's tokens raw.
+$analyzerIndex = if ($args.Count -gt 0 -and $args[0] -eq "-Analyzer") { 1 } else { 0 }
+if ($args.Count -le $analyzerIndex -or $args[$analyzerIndex] -notin @("clippy", "dead-code")) {
+    throw "-Analyzer must be clippy or dead-code."
+}
+$Analyzer = [string]$args[$analyzerIndex]
+$ForwardedArgs = @($args | Select-Object -Skip ($analyzerIndex + 1))
 
 $cargoLaneScript = Join-Path $PSScriptRoot "cargo-lane.ps1"
 $v8SandboxPackage = "codex-code-mode"
@@ -23,7 +22,7 @@ function Invoke-CargoLane {
 
     & powershell -NoProfile -ExecutionPolicy Bypass -File $cargoLaneScript `
         -Lane $Lane cargo @CargoArgs
-    return $LASTEXITCODE
+    $script:CargoLaneExitCode = $LASTEXITCODE
 }
 
 function Remove-WorkspaceFeatureArgs {
@@ -53,6 +52,18 @@ function Remove-WorkspaceFeatureArgs {
 $forwarded = @(
     $ForwardedArgs | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
 )
+$separator = [Array]::IndexOf($forwarded, "--")
+$compilerArgs = @()
+if ($separator -ge 0) {
+    $compilerArgs = @($forwarded | Select-Object -Skip $separator)
+    $forwarded = @($forwarded | Select-Object -First $separator)
+}
+$excludedSandbox = $forwarded -contains "--exclude=$v8SandboxPackage"
+for ($index = 0; $index -lt $forwarded.Count - 1; $index++) {
+    if ($forwarded[$index] -eq "--exclude" -and $forwarded[$index + 1] -eq $v8SandboxPackage) {
+        $excludedSandbox = $true
+    }
+}
 $hasAllFeatures = $forwarded -contains "--all-features"
 $hasExplicitPackage =
     ($forwarded -contains "-p") -or
@@ -68,7 +79,10 @@ if ($Analyzer -eq "clippy") {
     $isWorkspace = $forwarded -contains "--workspace"
 } else {
     $lane = "rust-dead-code-matrix"
-    if ([string]::IsNullOrWhiteSpace($env:RUSTFLAGS)) {
+    if (Test-Path Env:CARGO_ENCODED_RUSTFLAGS) {
+        $env:CARGO_ENCODED_RUSTFLAGS = (@($env:CARGO_ENCODED_RUSTFLAGS, "-Ddead_code") | Where-Object { $_ -ne "" }) -join [char]0x1f
+    }
+    elseif ([string]::IsNullOrWhiteSpace($env:RUSTFLAGS)) {
         $env:RUSTFLAGS = "-Ddead_code"
     }
     else {
@@ -89,7 +103,8 @@ $needsWindowsV8Fallback =
     $isWorkspace
 
 if (-not $needsWindowsV8Fallback) {
-    exit (Invoke-CargoLane -Lane $lane -CargoArgs $cargoArgs)
+    Invoke-CargoLane -Lane $lane -CargoArgs ($cargoArgs + $compilerArgs)
+    exit $script:CargoLaneExitCode
 }
 
 # rusty_v8 does not publish a Windows archive for the ptrcomp+sandbox feature
@@ -101,10 +116,13 @@ Write-Warning (
     "checking the full workspace while omitting only that upstream feature."
 )
 
-$workspaceArgs = $cargoArgs + @("--exclude", $v8SandboxPackage)
-$exitCode = Invoke-CargoLane -Lane $lane -CargoArgs $workspaceArgs
-if ($exitCode -ne 0) {
-    exit $exitCode
+$workspaceArgs = $cargoArgs
+if (-not $excludedSandbox) {
+    $workspaceArgs += @("--exclude", $v8SandboxPackage)
+}
+Invoke-CargoLane -Lane $lane -CargoArgs ($workspaceArgs + $compilerArgs)
+if ($script:CargoLaneExitCode -ne 0 -or $excludedSandbox) {
+    exit $script:CargoLaneExitCode
 }
 
 $packageForwarded = Remove-WorkspaceFeatureArgs -Args $forwarded
@@ -116,4 +134,5 @@ if ($Analyzer -eq "clippy") {
 $packageArgs += @("--package", $v8SandboxPackage)
 $packageArgs += $packageForwarded
 
-exit (Invoke-CargoLane -Lane $lane -CargoArgs $packageArgs)
+Invoke-CargoLane -Lane $lane -CargoArgs ($packageArgs + $compilerArgs)
+exit $script:CargoLaneExitCode

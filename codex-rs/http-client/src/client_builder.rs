@@ -89,6 +89,16 @@ impl HttpClientBuilder {
         self.follow_redirects
     }
 
+    pub(crate) fn configured_timeout(&self) -> Option<Duration> {
+        self.request_timeout.flatten()
+    }
+
+    pub(crate) fn apply_default_headers(&self, headers: &mut HeaderMap) {
+        if let Some(defaults) = &self.default_headers {
+            crate::client::apply_default_headers(headers, defaults);
+        }
+    }
+
     /// Limits only connection establishment, not the request as a whole.
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = Some(timeout);
@@ -173,6 +183,9 @@ impl HttpClientBuilder {
         route: &OutboundProxyRoute,
     ) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
         self.chatgpt_cookie_store = http_client_factory.chatgpt_cookie_store();
+        // The facade applies these only to independent requests. Manual redirect hops already
+        // carry the defaults that survived redirect transformations.
+        let default_headers = self.default_headers.take().unwrap_or_default();
         let (builder, request_logging, custom_ca_policy) = self.into_reqwest_parts();
         let inner = http_client_factory.build_reqwest_client_for_resolved_route(
             builder,
@@ -180,7 +193,7 @@ impl HttpClientBuilder {
             route,
             custom_ca_policy,
         )?;
-        Ok(HttpClient::from_parts(inner, request_logging))
+        Ok(HttpClient::from_parts(inner, request_logging).with_default_headers(default_headers))
     }
 
     /// Builds a client that connects directly without using a proxy.

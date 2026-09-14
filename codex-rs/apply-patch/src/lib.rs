@@ -34,6 +34,7 @@ pub use invocation::maybe_parse_apply_patch_verified;
 pub use invocation::maybe_parse_apply_patch_verified_for_environment;
 pub use invocation::verify_apply_patch_args;
 pub use standalone_executable::main;
+pub use standalone_executable::run_apply_patch;
 
 use crate::invocation::ExtractHeredocError;
 
@@ -210,13 +211,21 @@ impl ApplyPatchAction {
     pub fn new_add_for_test(path: &PathUri, content: String) -> Self {
         #[expect(clippy::expect_used)]
         let filename = path.basename().expect("path should not be empty");
-        let patch = format!(
-            r#"*** Begin Patch
-*** Update File: {filename}
-@@
-+ {content}
-*** End Patch"#,
-        );
+        // Add hunks terminate every logical line with a newline.
+        let mut content = content;
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        let mut patch = format!("*** Begin Patch\n*** Add File: {filename}\n");
+        for line in content.split_terminator('\n') {
+            patch.push('+');
+            patch.push_str(line);
+            if line.ends_with('\r') {
+                patch.push('\r');
+            }
+            patch.push('\n');
+        }
+        patch.push_str("*** End Patch");
         let changes = HashMap::from([(path.clone(), ApplyPatchFileChange::Add { content })]);
         #[expect(clippy::expect_used)]
         Self {
@@ -563,6 +572,15 @@ async fn apply_hunks_to_files(
                 .await?;
                 if let Some(dest) = move_path {
                     let dest_uri = cwd.join(&dest.to_string_lossy())?;
+                    if invocation::mutation_endpoint_identity(fs, &path_uri, sandbox).await?
+                        == invocation::mutation_endpoint_identity(fs, &dest_uri, sandbox).await?
+                    {
+                        return Err(ApplyPatchError::ParseError(InvalidPatchError(format!(
+                            "move source and destination identify the same path: {}",
+                            path_uri.inferred_native_path_string()
+                        )))
+                        .into());
+                    }
                     let overwritten_move_content =
                         read_optional_file_text_for_delta(&dest_uri, fs, sandbox, &mut delta.exact)
                             .await;
@@ -806,11 +824,10 @@ async fn derive_new_contents_from_chunks(
         chunks,
     )?;
     let new_lines = apply_replacements(original_lines, &replacements);
-    let mut new_lines = new_lines;
-    if !new_lines.last().is_some_and(String::is_empty) {
-        new_lines.push(String::new());
+    let mut new_contents = new_lines.join("\n");
+    if !new_lines.is_empty() {
+        new_contents.push('\n');
     }
-    let new_contents = new_lines.join("\n");
     Ok(AppliedPatch {
         original_contents,
         new_contents,
@@ -843,7 +860,8 @@ fn compute_replacements(
             ) {
                 line_index = idx + 1;
             } else {
-                let message = format!("Failed to find context '{ctx_line}' in {path}");
+                let context = bounded_expected_lines(std::iter::once(ctx_line.as_str()));
+                let message = format!("Failed to find context '{context}' in {path}");
                 return Err(patch_context_mismatch(
                     PatchMismatchSource {
                         original_lines,
@@ -909,7 +927,7 @@ fn compute_replacements(
             let message = format!(
                 "Failed to find expected lines in {}:\n{}",
                 path,
-                chunk.old_lines.join("\n"),
+                bounded_expected_lines(chunk.old_lines.iter().map(String::as_str)),
             );
             return Err(patch_context_mismatch(
                 PatchMismatchSource {
@@ -934,6 +952,28 @@ fn compute_replacements(
 const PATCH_MISMATCH_CONTEXT_LINES: usize = 3;
 const PATCH_MISMATCH_MAX_LINES: usize = 20;
 const PATCH_MISMATCH_MAX_BYTES: usize = 4 * 1024;
+
+fn bounded_expected_lines<'a>(lines: impl Iterator<Item = &'a str>) -> String {
+    let mut rendered = String::new();
+    for (index, line) in lines.enumerate() {
+        let separator_bytes = usize::from(index > 0);
+        let remaining = PATCH_MISMATCH_MAX_BYTES
+            .saturating_sub(rendered.len() + separator_bytes + "\n...".len());
+        if index >= PATCH_MISMATCH_MAX_LINES || remaining == 0 {
+            rendered.push_str("\n...");
+            break;
+        }
+        if index > 0 {
+            rendered.push('\n');
+        }
+        rendered.push_str(&line[..line.floor_char_boundary(remaining)]);
+        if line.len() > remaining {
+            rendered.push_str("\n...");
+            break;
+        }
+    }
+    rendered
+}
 
 struct PatchMismatchSource<'a> {
     original_lines: &'a [String],
@@ -1011,19 +1051,17 @@ fn bounded_patch_mismatch_excerpt(
         for (current_index, current_line) in original_lines.iter().enumerate() {
             if current_line == expected_line && current_index >= expected_offset {
                 let start = current_index - expected_offset;
-                let score = expected
-                    .iter()
-                    .enumerate()
-                    .filter(|(offset, line)| {
-                        original_lines
-                            .get(start + offset)
-                            .is_some_and(|current| current == **line)
-                    })
-                    .count();
-                candidate_scores
-                    .entry(start)
-                    .and_modify(|current| *current = (*current).max(score))
-                    .or_insert(score);
+                candidate_scores.entry(start).or_insert_with(|| {
+                    expected
+                        .iter()
+                        .enumerate()
+                        .filter(|(offset, line)| {
+                            original_lines
+                                .get(start + offset)
+                                .is_some_and(|current| current == **line)
+                        })
+                        .count()
+                });
             }
         }
     }
@@ -1094,17 +1132,7 @@ fn apply_replacements(
         let start_idx = *start_idx;
         let old_len = *old_len;
 
-        // Remove old lines.
-        for _ in 0..old_len {
-            if start_idx < lines.len() {
-                lines.remove(start_idx);
-            }
-        }
-
-        // Insert new lines.
-        for (offset, new_line) in new_segment.iter().enumerate() {
-            lines.insert(start_idx + offset, new_line.clone());
-        }
+        lines.splice(start_idx..start_idx + old_len, new_segment.iter().cloned());
     }
 
     lines
@@ -1134,10 +1162,21 @@ pub async fn unified_diff_from_chunks_with_context(
     fs: &dyn ExecutorFileSystem,
     sandbox: Option<&FileSystemSandboxContext>,
 ) -> std::result::Result<ApplyPatchFileUpdate, ApplyPatchError> {
+    unified_diff_from_chunks_internal(path, chunks, context, None, fs, sandbox).await
+}
+
+async fn unified_diff_from_chunks_internal(
+    path: &PathUri,
+    chunks: &[UpdateFileChunk],
+    context: usize,
+    hunk_ordinal: Option<usize>,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+) -> std::result::Result<ApplyPatchFileUpdate, ApplyPatchError> {
     let AppliedPatch {
         original_contents,
         new_contents,
-    } = derive_new_contents_from_chunks(path, chunks, None, fs, sandbox).await?;
+    } = derive_new_contents_from_chunks(path, chunks, hunk_ordinal, fs, sandbox).await?;
     let text_diff = TextDiff::from_lines(&original_contents, &new_contents);
     let unified_diff = text_diff.unified_diff().context_radius(context).to_string();
     Ok(ApplyPatchFileUpdate {
@@ -1178,6 +1217,82 @@ mod tests {
     /// Helper to construct a patch with the given body.
     fn wrap_patch(body: &str) -> String {
         format!("*** Begin Patch\n{body}\n*** End Patch")
+    }
+
+    #[tokio::test]
+    async fn test_add_fixture_replays_recorded_contents() {
+        let tmp = tempdir().unwrap();
+        let path = PathUri::from_host_native_path(tmp.path().join("a.txt")).unwrap();
+        for (content, expected) in [
+            ("", ""),
+            ("hello", "hello\n"),
+            ("a\nb\n\n", "a\nb\n\n"),
+            ("x\r\n", "x\r\n"),
+        ] {
+            let action = ApplyPatchAction::new_add_for_test(&path, content.to_string());
+            assert_eq!(
+                action.changes().get(&path),
+                Some(&ApplyPatchFileChange::Add {
+                    content: expected.to_string()
+                })
+            );
+            apply_patch(
+                &action.patch,
+                &action.cwd,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                LOCAL_FS.as_ref(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_legacy_mismatch_expected_lines_are_bounded() {
+        let tmp = tempdir().unwrap();
+        let cwd = PathUri::from_host_native_path(tmp.path()).unwrap();
+        fs::write(tmp.path().join("a.txt"), "unrelated\n").unwrap();
+        for expected in [
+            vec!["\u{754c}".repeat(PATCH_MISMATCH_MAX_BYTES)],
+            vec!["absent".to_string(); 100],
+        ] {
+            let body = expected
+                .iter()
+                .map(|line| format!("-{line}\n"))
+                .collect::<String>();
+            let patch =
+                format!("*** Begin Patch\n*** Update File: a.txt\n@@\n{body}+new\n*** End Patch");
+            let mut stderr = Vec::new();
+            let failure = apply_patch(
+                &patch,
+                &cwd,
+                &mut Vec::new(),
+                &mut stderr,
+                LOCAL_FS.as_ref(),
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(failure.delta().is_empty());
+            let (error, _) = failure.into_parts();
+            let ApplyPatchError::ComputeReplacements(message) = error else {
+                panic!("{error:?}")
+            };
+            let (_, excerpt) = message.split_once(":\n").unwrap();
+            assert!(excerpt.len() <= PATCH_MISMATCH_MAX_BYTES);
+            assert!(excerpt.lines().count() <= PATCH_MISMATCH_MAX_LINES + 1);
+            assert!(excerpt.ends_with("..."));
+            assert_eq!(
+                fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+                "unrelated\n"
+            );
+        }
     }
 
     #[tokio::test]

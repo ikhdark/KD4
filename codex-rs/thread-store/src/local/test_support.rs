@@ -27,9 +27,12 @@ pub(super) fn write_session_file_with_history_mode(
     uuid: Uuid,
     history_mode: ThreadHistoryMode,
 ) -> std::io::Result<PathBuf> {
+    let file_name = format!("rollout-{ts}-{uuid}.jsonl");
+    let (year, month, day) = codex_rollout::rollout_date_parts(file_name.as_ref())
+        .ok_or_else(|| std::io::Error::other("invalid fixture timestamp"))?;
     write_session_file_with(
         root,
-        root.join("sessions/2025/01/03"),
+        root.join("sessions").join(year).join(month).join(day),
         ts,
         uuid,
         "Hello from user",

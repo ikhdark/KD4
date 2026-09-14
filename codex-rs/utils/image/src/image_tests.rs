@@ -122,8 +122,8 @@ async fn current_thread_runtime_loads_prompt_image() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn downscales_large_image() {
+#[test]
+fn downscales_large_image() {
     for (format, mime) in [
         (ImageFormat::Png, "image/png"),
         (ImageFormat::WebP, "image/webp"),
@@ -138,8 +138,7 @@ async fn downscales_large_image() {
         )
         .expect("process image");
 
-        assert!(processed.width <= MAX_DIMENSION);
-        assert!(processed.height <= MAX_DIMENSION);
+        assert_eq!((processed.width, processed.height), (2048, 1024));
         assert_eq!(processed.mime, mime);
 
         let detected_format =
@@ -152,8 +151,8 @@ async fn downscales_large_image() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn downscales_tall_image_to_fit_square_bounds() {
+#[test]
+fn downscales_tall_image_to_fit_square_bounds() {
     let image = ImageBuffer::from_pixel(1024, 4096, Rgba([200u8, 10, 10, 255]));
     let original_bytes = image_bytes(&image, ImageFormat::Png);
 
@@ -169,8 +168,8 @@ async fn downscales_tall_image_to_fit_square_bounds() {
     assert_eq!(processed.mime, "image/png");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn resizing_preserves_supported_metadata() {
+#[test]
+fn resizing_preserves_supported_metadata() {
     for format in [ImageFormat::Png, ImageFormat::Jpeg, ImageFormat::WebP] {
         let image = ImageBuffer::from_pixel(2050, 2, Rgba([200u8, 10, 10, 255]));
         let original_bytes = image_bytes_with_metadata(&image, format, TEST_RGB_ICC_PROFILE);
@@ -204,8 +203,8 @@ async fn resizing_preserves_supported_metadata() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn resizing_drops_non_rgb_icc_profile() {
+#[test]
+fn resizing_drops_non_rgb_icc_profile() {
     let image = ImageBuffer::from_pixel(2050, 2, Rgba([200u8, 10, 10, 255]));
     let original_bytes =
         image_bytes_with_metadata(&image, ImageFormat::Jpeg, TEST_CMYK_ICC_PROFILE);
@@ -229,8 +228,8 @@ async fn resizing_drops_non_rgb_icc_profile() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn preserves_large_image_in_original_mode() {
+#[test]
+fn preserves_large_image_in_original_mode() {
     let image = ImageBuffer::from_pixel(4096, 2048, Rgba([180u8, 30, 30, 255]));
     let original_bytes = image_bytes(&image, ImageFormat::Png);
 
@@ -247,8 +246,8 @@ async fn preserves_large_image_in_original_mode() {
     assert_eq!(processed.bytes.as_ref(), original_bytes);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn data_url_processing_preserves_supported_source_bytes() {
+#[test]
+fn data_url_processing_preserves_supported_source_bytes() {
     let image = ImageBuffer::from_pixel(64, 32, Rgba([10u8, 20, 30, 255]));
     let original_bytes = image_bytes(&image, ImageFormat::Png);
     let image_url = data_url_from_bytes("image/png", &original_bytes)
@@ -264,8 +263,8 @@ async fn data_url_processing_preserves_supported_source_bytes() {
     assert_eq!(processed.bytes.as_ref(), original_bytes);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn data_url_processing_converts_gif_to_png() {
+#[test]
+fn data_url_processing_converts_gif_to_png() {
     let image = ImageBuffer::from_pixel(64, 32, Rgba([10u8, 20, 30, 255]));
     let gif_bytes = image_bytes(&image, ImageFormat::Gif);
     let image_url = data_url_from_bytes("image/gif", &gif_bytes);
@@ -295,8 +294,8 @@ fn data_url_processing_rejects_malformed_input() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn resize_with_limits_respects_dimension_and_patch_budgets() {
+#[test]
+fn resize_with_limits_respects_dimension_and_patch_budgets() {
     let image = ImageBuffer::from_pixel(2048, 2048, Rgba([200u8, 10, 10, 255]));
     let original_bytes = image_bytes(&image, ImageFormat::Png);
     let limits = PromptImageResizeLimits {
@@ -314,8 +313,8 @@ async fn resize_with_limits_respects_dimension_and_patch_budgets() {
     assert_eq!((processed.width, processed.height), (1600, 1600));
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn fails_cleanly_for_invalid_images() {
+#[test]
+fn fails_cleanly_for_invalid_images() {
     let err = load_for_prompt_bytes(
         Path::new("in-memory-image"),
         b"not an image".to_vec(),
@@ -328,10 +327,8 @@ async fn fails_cleanly_for_invalid_images() {
     ));
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn reprocesses_updated_file_contents() {
-    IMAGE_CACHE.clear();
-
+#[test]
+fn reprocesses_updated_file_contents() {
     let first_image = ImageBuffer::from_pixel(32, 16, Rgba([20u8, 120, 220, 255]));
     let first_bytes = image_bytes(&first_image, ImageFormat::Png);
 
@@ -359,8 +356,8 @@ async fn reprocesses_updated_file_contents() {
     assert_ne!(second.bytes, first.bytes);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn bounds_cache_by_encoded_byte_size() {
+#[test]
+fn bounds_cache_by_encoded_byte_size() {
     let cache = ImageCache::new(NonZeroUsize::new(4).expect("non-zero cache capacity"));
     let key = |digest_byte| ImageCacheKey {
         digest: [digest_byte; 20],
@@ -380,4 +377,111 @@ async fn bounds_cache_by_encoded_byte_size() {
     assert!(cache.get(&key(1)).is_none());
     assert!(cache.get(&key(2)).is_some());
     assert!(cache.get(&key(3)).is_none());
+}
+
+#[test]
+fn narrow_images_use_the_available_patch_budget() {
+    for (width, height, expected) in [(2048, 1, (1024, 1)), (1, 2048, (1, 1024))] {
+        let input = ImageBuffer::from_pixel(width, height, Rgba([21u8, 34, 55, 255]));
+        let result = load_for_prompt_bytes(
+            Path::new("narrow.png"),
+            image_bytes(&input, ImageFormat::Png),
+            PromptImageMode::ResizeWithLimits(PromptImageResizeLimits {
+                max_dimension: 2048,
+                max_patches: 32,
+            }),
+        )
+        .unwrap();
+        assert_eq!((result.width, result.height), expected);
+        assert_eq!(
+            image::load_from_memory(&result.bytes).unwrap().dimensions(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn zero_resize_limits_are_rejected_at_both_entrypoints() {
+    let input = image_bytes(
+        &ImageBuffer::from_pixel(2, 2, Rgba([21u8, 34, 55, 255])),
+        ImageFormat::Png,
+    );
+    for limits in [
+        PromptImageResizeLimits {
+            max_dimension: 0,
+            max_patches: 32,
+        },
+        PromptImageResizeLimits {
+            max_dimension: 2048,
+            max_patches: 0,
+        },
+    ] {
+        let mode = PromptImageMode::ResizeWithLimits(limits);
+        assert!(matches!(
+            load_for_prompt_bytes(Path::new("zero.png"), input.clone(), mode),
+            Err(ImageProcessingError::InvalidResizeLimits)
+        ));
+        assert!(matches!(
+            load_data_url_for_prompt(&data_url_from_bytes("image/png", &input), mode),
+            Err(ImageProcessingError::InvalidResizeLimits)
+        ));
+    }
+}
+
+#[test]
+fn cache_reuses_buffers_and_separates_resize_modes() {
+    let input = image_bytes(
+        &ImageBuffer::from_pixel(32, 16, Rgba([19u8, 127, 243, 255])),
+        ImageFormat::Png,
+    );
+    let process =
+        |mode| load_for_prompt_bytes(Path::new("cache.png"), input.clone(), mode).unwrap();
+    let first = process(PromptImageMode::Original);
+    let second = process(PromptImageMode::Original);
+    assert!(Arc::ptr_eq(&first.bytes, &second.bytes));
+    let resized = process(PromptImageMode::ResizeWithLimits(PromptImageResizeLimits {
+        max_dimension: 16,
+        max_patches: 1,
+    }));
+    assert_eq!((first.width, first.height), (32, 16));
+    assert_eq!((resized.width, resized.height), (16, 8));
+    assert_ne!(first.bytes, resized.bytes);
+}
+
+#[test]
+fn decode_errors_preserve_io_and_resource_failures() {
+    for source in [
+        image::ImageError::IoError(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "incomplete image",
+        )),
+        image::ImageError::Limits(image::error::LimitError::from_kind(
+            image::error::LimitErrorKind::InsufficientMemory,
+        )),
+    ] {
+        let expected = source.to_string();
+        let error = ImageProcessingError::decode_error(Path::new("input.png"), source);
+        assert!(!error.is_invalid_image());
+        let ImageProcessingError::Decode { source, .. } = error else {
+            panic!("lost decode cause")
+        };
+        assert_eq!(source.to_string(), expected);
+    }
+}
+
+#[test]
+fn decoded_image_size_is_limited_before_allocation() {
+    let mut input = image_bytes(
+        &ImageBuffer::from_pixel(1, 1, Rgba([1u8, 2, 3, 255])),
+        ImageFormat::Gif,
+    );
+    // GIF logical-screen dimensions can exceed the small encoded frame dimensions.
+    input[6..10].copy_from_slice(&[255, 255, 255, 255]);
+    assert!(matches!(
+        load_for_prompt_bytes(Path::new("large.gif"), input, PromptImageMode::Original),
+        Err(ImageProcessingError::Decode {
+            source: image::ImageError::Limits(_),
+            ..
+        })
+    ));
 }

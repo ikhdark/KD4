@@ -7,6 +7,8 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Deserialize;
 use serde::Serialize;
 use shlex::try_join;
+use std::net::IpAddr;
+use std::net::Ipv6Addr;
 use std::sync::Arc;
 
 /// Matches a single command token, either a fixed string or one of several allowed alternatives.
@@ -208,31 +210,41 @@ pub(crate) fn normalize_network_rule_host(raw: &str) -> Result<String> {
         ));
     }
 
+    let bracketed = host.starts_with('[');
     if let Some(stripped) = host.strip_prefix('[') {
         let Some((inside, rest)) = stripped.split_once(']') else {
             return Err(Error::InvalidRule(
                 "network_rule host has an invalid bracketed IPv6 literal".to_string(),
             ));
         };
-        let port_ok = rest
-            .strip_prefix(':')
-            .is_some_and(|port| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()));
+        let port_ok = rest.strip_prefix(':').is_some_and(|port| {
+            port.parse::<u16>().is_ok() && port.bytes().all(|c| c.is_ascii_digit())
+        });
         if !rest.is_empty() && !port_ok {
             return Err(Error::InvalidRule(format!(
                 "network_rule host contains an unsupported suffix: {raw}"
             )));
         }
         host = inside;
-    } else if host.matches(':').count() == 1
-        && let Some((candidate, port)) = host.rsplit_once(':')
-        && !candidate.is_empty()
-        && !port.is_empty()
-        && port.chars().all(|c| c.is_ascii_digit())
+    } else if let Some((candidate, port)) = host.rsplit_once(':')
+        && !candidate.contains(':')
     {
+        if candidate.is_empty()
+            || port.parse::<u16>().is_err()
+            || !port.bytes().all(|c| c.is_ascii_digit())
+        {
+            return Err(Error::InvalidRule(
+                "network_rule host has an invalid port".to_string(),
+            ));
+        }
         host = candidate;
     }
 
-    let normalized = host.trim_end_matches('.').trim().to_ascii_lowercase();
+    let normalized = if bracketed || host.contains(':') {
+        host.to_ascii_lowercase()
+    } else {
+        host.trim_end_matches('.').to_ascii_lowercase()
+    };
     if normalized.is_empty() {
         return Err(Error::InvalidRule(
             "network_rule host cannot be empty".to_string(),
@@ -247,6 +259,38 @@ pub(crate) fn normalize_network_rule_host(raw: &str) -> Result<String> {
         return Err(Error::InvalidRule(
             "network_rule host cannot contain whitespace".to_string(),
         ));
+    }
+    if normalized.contains(['[', ']', '@', '\\']) {
+        return Err(Error::InvalidRule(
+            "network_rule host contains invalid syntax".to_string(),
+        ));
+    }
+    if bracketed || normalized.contains(':') {
+        // Match the proxy's IP identity, including raw and URL-escaped IPv6 scopes.
+        let scoped = normalized
+            .split_once("%25")
+            .or_else(|| normalized.split_once('%'));
+        let (literal, scope) = match scoped {
+            Some((literal, scope)) if !scope.is_empty() && !scope.contains('%') => {
+                (literal, Some(scope))
+            }
+            Some(_) => {
+                return Err(Error::InvalidRule(
+                    "network_rule host has an invalid IPv6 scope".to_string(),
+                ));
+            }
+            None => (normalized.as_str(), None),
+        };
+        let ip = literal.parse::<Ipv6Addr>().map_err(|_| {
+            Error::InvalidRule("network_rule host has an invalid IPv6 literal".to_string())
+        })?;
+        return Ok(match scope {
+            Some(scope) => format!("{ip}%{scope}"),
+            None => ip.to_string(),
+        });
+    }
+    if let Ok(ip) = normalized.parse::<IpAddr>() {
+        return Ok(ip.to_string());
     }
 
     Ok(normalized)

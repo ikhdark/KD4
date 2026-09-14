@@ -10,6 +10,42 @@ fn foreign_cwd() -> PathUri {
 }
 
 #[test]
+fn native_read_builder_resolves_relative_path() {
+    use codex_utils_absolute_path::test_support::PathBufExt;
+    use codex_utils_absolute_path::test_support::test_path_buf;
+    let cwd = test_path_buf("/workspace").abs();
+    let item = build_command_execution_begin_item(&ExecCommandBeginEvent {
+        call_id: "read-1".into(),
+        process_id: None,
+        turn_id: "turn-1".into(),
+        started_at_ms: 0,
+        command: vec!["cat".into(), "file.txt".into()],
+        cwd: cwd.into(),
+        parsed_cmd: vec![ParsedCommand::Read {
+            cmd: "cat file.txt".into(),
+            name: "file.txt".into(),
+            path: PathBuf::from("file.txt"),
+        }],
+        source: codex_protocol::protocol::ExecCommandSource::Agent,
+        interaction_input: None,
+    });
+    let ThreadItem::CommandExecution {
+        command_actions, ..
+    } = item
+    else {
+        panic!("command item");
+    };
+    assert_eq!(
+        command_actions,
+        vec![CommandAction::Read {
+            command: "cat file.txt".into(),
+            name: "file.txt".into(),
+            path: test_path_buf("/workspace/file.txt").abs(),
+        }]
+    );
+}
+
+#[test]
 fn windows_absolute_program_paths_use_windows_display_quoting() {
     for (program, expected) in [
         (

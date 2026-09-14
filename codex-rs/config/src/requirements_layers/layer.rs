@@ -65,8 +65,8 @@ impl ComposableRequirementsLayer {
             let _guard = base_dir
                 .as_ref()
                 .map(|base_dir| AbsolutePathBufGuard::new(base_dir.as_path()));
-            let regular_toml = parse_layer_toml(&toml, &source)?;
-            let requirements = parse_layer_requirements(&toml, &source)?;
+            let regular_toml = parse_layer_toml(toml, &source)?;
+            let requirements = parse_layer_requirements(&regular_toml, &source)?;
             (regular_toml, requirements)
         };
 
@@ -75,10 +75,18 @@ impl ComposableRequirementsLayer {
         let hostname = requirements
             .remote_sandbox_config
             .as_ref()
+            .filter(|selectors| !selectors.is_empty())
             .and_then(|_| hostname_resolver());
         requirements.apply_remote_sandbox_config(hostname.as_deref());
         materialize_remote_sandbox_config(&mut regular_toml, &requirements)?;
         strip_special_fields(&mut regular_toml);
+        // Validate first so a layer declaring both spellings still fails.
+        // Across layers, the accepted alias must share the canonical merge key.
+        if let Some(table) = regular_toml.as_table_mut()
+            && let Some(features) = table.remove("feature_requirements")
+        {
+            table.insert("features".to_string(), features);
+        }
 
         Ok(Self {
             source,
@@ -100,44 +108,32 @@ pub(super) struct DomainMergedRequirementsFields {
 }
 
 fn parse_layer_toml(
-    toml: &RequirementsLayerToml,
+    toml: RequirementsLayerToml,
     source: &RequirementSource,
 ) -> Result<TomlValue, RequirementsCompositionError> {
     match toml {
         RequirementsLayerToml::String(contents) => {
-            toml::from_str(contents).map_err(|err: toml::de::Error| {
+            toml::from_str(&contents).map_err(|err: toml::de::Error| {
                 RequirementsCompositionError::Parse {
                     layer_source: source.clone(),
                     message: err.to_string(),
                 }
             })
         }
-        RequirementsLayerToml::Value(value) => Ok(value.clone()),
+        RequirementsLayerToml::Value(value) => Ok(value),
     }
 }
 
 fn parse_layer_requirements(
-    toml: &RequirementsLayerToml,
+    toml: &TomlValue,
     source: &RequirementSource,
 ) -> Result<ConfigRequirementsToml, RequirementsCompositionError> {
-    match toml {
-        RequirementsLayerToml::String(contents) => {
-            toml::from_str(contents).map_err(|err: toml::de::Error| {
-                RequirementsCompositionError::Parse {
-                    layer_source: source.clone(),
-                    message: err.to_string(),
-                }
-            })
-        }
-        RequirementsLayerToml::Value(value) => {
-            value.clone().try_into().map_err(|err: toml::de::Error| {
-                RequirementsCompositionError::Parse {
-                    layer_source: source.clone(),
-                    message: err.to_string(),
-                }
-            })
-        }
-    }
+    toml.clone()
+        .try_into()
+        .map_err(|err: toml::de::Error| RequirementsCompositionError::Parse {
+            layer_source: source.clone(),
+            message: err.to_string(),
+        })
 }
 
 fn materialize_remote_sandbox_config(

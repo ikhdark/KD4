@@ -6,11 +6,21 @@ use codex_login::AuthKeyringBackendKind;
 use codex_login::load_auth_dot_json;
 use codex_protocol::auth::AuthMode;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct LocalChatgptAuth {
     pub(crate) access_token: String,
     pub(crate) chatgpt_account_id: String,
     pub(crate) chatgpt_plan_type: Option<String>,
+}
+
+impl std::fmt::Debug for LocalChatgptAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalChatgptAuth")
+            .field("access_token", &"[REDACTED]")
+            .field("chatgpt_account_id", &self.chatgpt_account_id)
+            .field("chatgpt_plan_type", &self.chatgpt_plan_type)
+            .finish()
+    }
 }
 
 impl LocalChatgptAuth {
@@ -234,5 +244,22 @@ mod tests {
             auth.chatgpt_plan_type.as_deref(),
             Some("self_serve_business_usage_based")
         );
+    }
+    #[test]
+    fn rejects_other_workspace_and_redacts_debug_token() {
+        let home = TempDir::new().expect("tempdir");
+        write_chatgpt_auth(home.path(), "plus");
+        let error = load_local_chatgpt_auth(
+            home.path(),
+            AuthCredentialsStoreMode::File,
+            Some(&["workspace-2".to_string()]),
+        )
+        .expect_err("workspace mismatch");
+        assert!(error.contains("workspace-2") && error.contains("workspace-1"));
+        let auth = load_local_chatgpt_auth(home.path(), AuthCredentialsStoreMode::File, None)
+            .expect("auth");
+        let debug = format!("{auth:?}");
+        assert!(!debug.contains(&auth.access_token));
+        assert!(debug.contains("[REDACTED]") && debug.contains("workspace-1"));
     }
 }

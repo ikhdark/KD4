@@ -257,6 +257,7 @@ function Resolve-SourceBundleManifest {
     }
 
     $rolePaths = @{}
+    $roleDigests = @{}
     $canonicalInventory = @()
     foreach ($file in @($metadata.files)) {
         $relative = [string]$file.path
@@ -281,6 +282,7 @@ function Resolve-SourceBundleManifest {
                 throw "Source bundle manifest contains duplicate role: $role"
             }
             $rolePaths[$role] = $path
+            $roleDigests[$role] = [string]$file.sha256
         }
         $canonicalInventory += [ordered]@{
             path = $relative
@@ -309,6 +311,7 @@ function Resolve-SourceBundleManifest {
         Version = [string]$metadata.version
         Target = [string]$metadata.target
         BundleId = [string]$metadata.bundleId
+        RoleDigests = $roleDigests
         Codex = $rolePaths["entrypoint"]
         CodeModeHost = $rolePaths["code-mode-host"]
         CommandRunner = $rolePaths["command-runner"]
@@ -1972,32 +1975,6 @@ function Sync-DesktopLocalCliRouting {
     }
 }
 
-function Sync-OfficialDesktopEnvironmentCleanup {
-    param(
-        [switch]$DryRun,
-        [ValidateSet("User", "Process")]
-        [string]$EnvironmentTarget
-    )
-
-    if ($EnvironmentTarget -ne "User") {
-        Write-ProofLine "officialEnvCleanup" "skipped: Process-scoped routing does not modify persisted User environment"
-        Write-ProofLine "officialEnvCleanupAction" "skipped"
-        return
-    }
-
-    Write-ProofLine "officialEnvCleanup" "CODEX_HOME unset, CODEX_CLI_PATH unset, CODEX_SQLITE_HOME unset"
-
-    if ($DryRun) {
-        Write-ProofLine "officialEnvCleanupAction" "would apply to User environment"
-        return
-    }
-
-    [System.Environment]::SetEnvironmentVariable("CODEX_HOME", $null, "User")
-    [System.Environment]::SetEnvironmentVariable("CODEX_CLI_PATH", $null, "User")
-    [System.Environment]::SetEnvironmentVariable("CODEX_SQLITE_HOME", $null, "User")
-    Write-ProofLine "officialEnvCleanupAction" "applied to User environment"
-}
-
 function Ensure-LocalCodexHomeDirectory {
     param(
         [string]$Path,
@@ -2173,11 +2150,17 @@ function Restart-CodexDesktop {
                 [pscustomobject]@{
                     Id = $_.Id
                     Path = $_.Path
+                    StartTimeUtcTicks = $_.StartTime.ToUniversalTime().Ticks
                 }
             }
     )
-    foreach ($process in $desktopProcesses) {
-        Stop-Process -Id $process.Id -ErrorAction SilentlyContinue
+    foreach ($process in @(Get-LiveProcessesById -Processes $desktopProcesses)) {
+        try {
+            Stop-Process -InputObject $process -ErrorAction SilentlyContinue
+        }
+        finally {
+            $process.Dispose()
+        }
     }
 
     $stopDeadline = [DateTime]::UtcNow.AddSeconds(5)
@@ -3621,6 +3604,19 @@ $sourceSha256 = Get-CachedLocalPublishFileSha256 -Path $SourceExe -ForceRefresh
 $sourceCodeModeHostSha256 = Get-CachedLocalPublishFileSha256 -Path $SourceCodeModeHostExe -ForceRefresh
 $sourceWindowsSandboxSetupSha256 = Get-CachedLocalPublishFileSha256 -Path $SourceWindowsSandboxSetupExe -ForceRefresh
 $sourceCommandRunnerSha256 = Get-CachedLocalPublishFileSha256 -Path $SourceCommandRunnerExe -ForceRefresh
+if ($null -ne $sourceBundle) {
+    $observedRoleDigests = @{
+        "entrypoint" = $sourceSha256
+        "code-mode-host" = $sourceCodeModeHostSha256
+        "sandbox-setup" = $sourceWindowsSandboxSetupSha256
+        "command-runner" = $sourceCommandRunnerSha256
+    }
+    foreach ($role in $observedRoleDigests.Keys) {
+        if ($observedRoleDigests[$role] -cne $sourceBundle.RoleDigests[$role]) {
+            throw "Source bundle file digest changed after manifest verification: $role"
+        }
+    }
+}
 Write-ProofLine "sourceSha256Mode" $sourceSha256Mode
 Write-ProofLine "sourceSha256" $sourceSha256
 Write-ProofLine "sourceCodeModeHostSha256" $sourceCodeModeHostSha256
@@ -3868,9 +3864,6 @@ if ($ConfigureDesktopLocalCli) {
             $desktopRoutingSnapshot = Get-DesktopEnvironmentRoutingSnapshot `
                 -EnvironmentTarget $DesktopCliEnvironmentTarget
         }
-        Sync-OfficialDesktopEnvironmentCleanup `
-            -DryRun:$DryRun `
-            -EnvironmentTarget $DesktopCliEnvironmentTarget
         Sync-DesktopLocalCliRouting `
             -TargetPath $targetPath `
             -InstallDir $InstallDir `

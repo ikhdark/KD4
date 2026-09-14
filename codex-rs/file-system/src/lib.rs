@@ -38,6 +38,7 @@ const MAX_WALK_DIRECTORIES: usize = 10_000;
 const MAX_WALK_ENTRIES: usize = 50_000;
 const MAX_WALK_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const WALK_RESPONSE_ITEM_OVERHEAD_BYTES: usize = 64;
+const MAX_CONCURRENT_WALK_METADATA: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CreateDirectoryOptions {
@@ -269,7 +270,7 @@ async fn collect_bounded_read(
     mut stream: FileSystemReadStream,
     max_bytes: usize,
 ) -> FileSystemResult<Option<Vec<u8>>> {
-    let mut bytes = Vec::with_capacity(max_bytes.min(FILE_READ_CHUNK_SIZE));
+    let mut bytes = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         if chunk.len() > max_bytes.saturating_sub(bytes.len()) {
@@ -303,8 +304,9 @@ pub trait ExecutorFileSystem: Send + Sync {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream>;
 
-    /// Reads a stable snapshot of at most `max_bytes`.
+    /// Performs two bounded reads and returns at most `max_bytes` when they agree.
     ///
+    /// The default checks byte agreement, not atomicity or stable object identity.
     /// Returns `None` if the file exceeds the limit or two bounded reads do not
     /// return identical bytes. Implementations that can also inspect native file
     /// metadata or identity should override this method to reject replacements
@@ -322,13 +324,20 @@ pub trait ExecutorFileSystem: Send + Sync {
             else {
                 return Ok(None);
             };
-            let Some(second) =
-                collect_bounded_read(self.read_file_stream(path, sandbox).await?, max_bytes)
-                    .await?
-            else {
-                return Ok(None);
-            };
-            Ok((first == second).then_some(first))
+            let mut stream = self.read_file_stream(path, sandbox).await?;
+            let mut offset = 0usize;
+            let mut matches = true;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                if chunk.len() > max_bytes.saturating_sub(offset) {
+                    return Ok(None);
+                }
+                let end = offset + chunk.len();
+                matches &= first.get(offset..end) == Some(chunk.as_ref());
+                offset = end;
+                // Continue after a mismatch so later I/O errors are still surfaced.
+            }
+            Ok((matches && offset == first.len()).then_some(first))
         })
     }
 
@@ -422,7 +431,9 @@ pub trait ExecutorFileSystem: Send + Sync {
 
     /// Performs a bounded walk using the primitive filesystem operations.
     ///
-    /// Implementations with an optimized walk transport can use this as a compatibility fallback.
+    /// Requires producer-bounded directory reads; unsupported backends fail explicitly.
+    /// Each bounded batch is sorted, but a truncated walk need not contain the
+    /// globally first names in a directory.
     fn walk_via_directory_reads<'a>(
         &'a self,
         path: &'a PathUri,
@@ -492,8 +503,16 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
     let mut response_bytes = 0usize;
 
     while let Some((directory, depth)) = queue.pop_front() {
-        let mut entries = match file_system.read_directory(&directory, sandbox).await {
-            Ok(entries) => entries,
+        if entry_count == options.max_entries {
+            outcome.truncated = true;
+            return Ok(outcome);
+        }
+        let batch = match file_system
+            .read_directory_bounded(&directory, options.max_entries - entry_count, sandbox)
+            .await
+        {
+            Ok(batch) => batch,
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => return Err(error),
             Err(error) => {
                 if !push_walk_error(
                     &mut outcome,
@@ -506,16 +525,27 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
                 continue;
             }
         };
+        entry_count += batch.entries_examined;
+        outcome.truncated |= batch.limit_reached;
+        let mut entries = batch.entries;
         entries.sort_by(|left, right| left.file_name.cmp(&right.file_name));
 
-        for entry in entries {
-            if entry_count == options.max_entries {
-                outcome.truncated = true;
-                return Ok(outcome);
-            }
-            entry_count += 1;
-
-            let path = match directory.join(&entry.file_name) {
+        let mut probes = futures::stream::iter(entries)
+            .map(|entry| {
+                let path = directory.join(&entry.file_name);
+                async move {
+                    match path {
+                        Ok(path) => {
+                            let metadata = file_system.get_metadata(&path, sandbox).await;
+                            (entry, Ok((path, metadata)))
+                        }
+                        Err(error) => (entry, Err(error)),
+                    }
+                }
+            })
+            .buffered(MAX_CONCURRENT_WALK_METADATA);
+        while let Some((entry, result)) = probes.next().await {
+            let (path, metadata) = match result {
                 Ok(path) => path,
                 Err(error) => {
                     if !push_walk_error(
@@ -529,7 +559,7 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
                     continue;
                 }
             };
-            let metadata = match file_system.get_metadata(&path, sandbox).await {
+            let metadata = match metadata {
                 Ok(metadata) => metadata,
                 Err(error) => {
                     if !push_walk_error(&mut outcome, &mut response_bytes, path, error.to_string())

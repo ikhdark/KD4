@@ -1,6 +1,7 @@
 use codex_backend_client::Client as BackendClient;
 use codex_backend_client::ConfigBundleResponse;
 use codex_backend_client::DeliveredTomlFragment;
+use codex_backend_client::RequestError;
 use codex_config::CloudConfigBundle;
 use codex_config::CloudConfigFragment;
 use codex_config::CloudConfigTomlBundle;
@@ -26,6 +27,9 @@ impl RetryableFailureKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BundleRequestError {
     Retryable(RetryableFailureKind),
+    Permanent {
+        status_code: Option<u16>,
+    },
     Unauthorized {
         status_code: Option<u16>,
         message: String,
@@ -71,17 +75,7 @@ impl BundleClient for BackendBundleClient {
             .inspect_err(|err| {
                 tracing::warn!(error = %err, "Failed to fetch cloud config bundle");
             })
-            .map_err(|err| {
-                let status_code = err.status().map(|status| status.as_u16());
-                if err.is_unauthorized() {
-                    BundleRequestError::Unauthorized {
-                        status_code,
-                        message: err.to_string(),
-                    }
-                } else {
-                    BundleRequestError::Retryable(RetryableFailureKind::Request { status_code })
-                }
-            })?;
+            .map_err(classify_request_error)?;
 
         Ok(bundle_from_response(response))
     }
@@ -132,5 +126,76 @@ fn requirements_fragment_from_delivered(
         id: fragment.id,
         name: fragment.name,
         contents: fragment.contents,
+    }
+}
+
+fn classify_request_error(err: RequestError) -> BundleRequestError {
+    let status_code = err.status().map(|status| status.as_u16());
+    if err.is_unauthorized() {
+        return BundleRequestError::Unauthorized {
+            status_code,
+            message: err.to_string(),
+        };
+    }
+    // The endpoint returns structured route/transport errors from send(), and
+    // Other errors from JSON decoding. Do not retry deterministic decoding errors.
+    let retryable = match &err {
+        RequestError::UnexpectedStatus { status, .. } => {
+            matches!(status.as_u16(), 408 | 429) || status.is_server_error()
+        }
+        RequestError::Other(err) => err
+            .downcast_ref::<codex_http_client::RouteAwareRequestError>()
+            .is_some(),
+    };
+    if retryable {
+        BundleRequestError::Retryable(RetryableFailureKind::Request { status_code })
+    } else {
+        BundleRequestError::Permanent { status_code }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_status_and_decode_failures() {
+        for status in [400u16, 401, 403, 404, 408, 422, 429, 500, 503] {
+            let err = RequestError::UnexpectedStatus {
+                method: "GET".into(),
+                url: "/config/bundle".into(),
+                status: status.try_into().expect("status"),
+                content_type: "application/json".into(),
+                body: String::new(),
+            };
+            let result = classify_request_error(err);
+            match status {
+                401 => assert!(matches!(
+                    result,
+                    BundleRequestError::Unauthorized {
+                        status_code: Some(401),
+                        ..
+                    }
+                )),
+                408 | 429 | 500 | 503 => assert_eq!(
+                    result,
+                    BundleRequestError::Retryable(RetryableFailureKind::Request {
+                        status_code: Some(status)
+                    })
+                ),
+                _ => assert_eq!(
+                    result,
+                    BundleRequestError::Permanent {
+                        status_code: Some(status)
+                    }
+                ),
+            }
+        }
+        let decode_error =
+            serde_json::from_str::<ConfigBundleResponse>("{").expect_err("invalid JSON");
+        assert_eq!(
+            classify_request_error(RequestError::Other(decode_error.into())),
+            BundleRequestError::Permanent { status_code: None }
+        );
     }
 }

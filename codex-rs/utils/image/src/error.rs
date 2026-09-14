@@ -27,6 +27,8 @@ pub enum ImageProcessingError {
     UnsupportedImageFormat { mime: String },
     #[error("invalid image data URL: {reason}")]
     InvalidDataUrl { reason: String },
+    #[error("image resize limits must have a nonzero dimension and patch budget")]
+    InvalidResizeLimits,
     #[error("image {representation} is too large ({size} bytes; max {max} bytes)")]
     ImageTooLarge {
         representation: &'static str,
@@ -37,7 +39,7 @@ pub enum ImageProcessingError {
 
 impl ImageProcessingError {
     pub fn decode_error(path: &std::path::Path, source: image::ImageError) -> Self {
-        if matches!(source, ImageError::Decoding(_)) {
+        if !matches!(source, ImageError::Unsupported(_)) {
             return ImageProcessingError::Decode {
                 path: path.to_path_buf(),
                 source,

@@ -220,6 +220,17 @@ fn next_goal_draft(
 ) -> crate::goal_files::GoalDraft {
     loop {
         let event = rx.try_recv().expect("expected goal draft event");
+        assert!(
+            !matches!(
+                &event,
+                AppEvent::CodexOp(Op::UserTurn { .. })
+                    | AppEvent::SubmitThreadOp {
+                        op: Op::UserTurn { .. },
+                        ..
+                    }
+            ),
+            "a user turn must not be submitted before the goal draft"
+        );
         if let AppEvent::SetThreadGoalDraft {
             thread_id, draft, ..
         } = event

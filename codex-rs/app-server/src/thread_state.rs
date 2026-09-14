@@ -368,12 +368,9 @@ impl ThreadTurnIndex {
             sort_direction,
         );
         let indexes = ordered_indexes(start, end, sort_direction);
-        let mut turns = indexes
-            .take(page_size.saturating_add(1))
-            .filter_map(|index| self.turns.get(&self.order[index]).cloned())
-            .collect::<Vec<_>>();
-        let more_turns_available = turns.len() > page_size;
-        turns.truncate(page_size);
+        let mut turns_iter = indexes.filter_map(|index| self.turns.get(&self.order[index]));
+        let turns = turns_iter.by_ref().take(page_size).cloned().collect();
+        let more_turns_available = turns_iter.next().is_some();
         Ok(Some(IndexedTurnPage {
             turns,
             more_turns_available,
@@ -414,23 +411,19 @@ impl ThreadTurnIndex {
                 anchor.map(|(_, _, include)| include),
                 sort_direction,
             );
-            let mut items = turn
-                .into_iter()
-                .flat_map(|turn| {
-                    ordered_indexes(start, end, sort_direction).filter_map(move |index| {
-                        turn.items
-                            .get(index)
-                            .cloned()
-                            .map(|item| IndexedThreadItem {
-                                turn_id: turn_id.to_string(),
-                                item,
-                            })
-                    })
+            let mut item_refs = turn.into_iter().flat_map(|turn| {
+                ordered_indexes(start, end, sort_direction)
+                    .filter_map(move |index| turn.items.get(index))
+            });
+            let items = item_refs
+                .by_ref()
+                .take(page_size)
+                .map(|item| IndexedThreadItem {
+                    turn_id: turn_id.to_string(),
+                    item: item.clone(),
                 })
-                .take(page_size.saturating_add(1))
-                .collect::<Vec<_>>();
-            let more_items_available = items.len() > page_size;
-            items.truncate(page_size);
+                .collect();
+            let more_items_available = item_refs.next().is_some();
             return Ok(Some(IndexedItemPage {
                 items,
                 more_items_available,
@@ -454,7 +447,8 @@ impl ThreadTurnIndex {
             anchor.map(|(_, _, include)| include),
             sort_direction,
         );
-        let mut items = Vec::with_capacity(page_size.saturating_add(1));
+        let mut items = Vec::new();
+        let mut more_items_available = false;
         for index in ordered_indexes(start, end, sort_direction) {
             let key = &self.item_order[index];
             let Some(offset) = self.item_offsets.get(key).copied() else {
@@ -464,20 +458,19 @@ impl ThreadTurnIndex {
                 .turns
                 .get(&key.turn_id)
                 .and_then(|turn| turn.items.get(offset))
-                .cloned()
             else {
                 continue;
             };
-            items.push(IndexedThreadItem {
-                turn_id: key.turn_id.clone(),
-                item,
-            });
-            if items.len() > page_size {
+            if items.len() == page_size {
+                more_items_available = true;
                 break;
             }
+            items.push(IndexedThreadItem {
+                turn_id: key.turn_id.clone(),
+                item: item.clone(),
+            });
         }
-        let more_items_available = items.len() > page_size;
-        items.truncate(page_size);
+
         Ok(Some(IndexedItemPage {
             items,
             more_items_available,
@@ -1244,6 +1237,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Holding the old state forces removal to overlap replacement and proves generation ownership"
+    )]
     async fn removing_old_thread_state_preserves_replacement_listener() {
         let manager = ThreadStateManager::default();
         let id = ThreadId::new();
@@ -1307,6 +1304,7 @@ mod tests {
         let (tx, _rx) = thread_listener_command_channel();
         state.listener_command_tx = Some(tx);
         assert!(state.seed_resume_history_for_listener(&history, 0));
+        state.seed_turn_index_from_history(&history);
         let before = state
             .indexed_items_page(None, None, 10, SortDirection::Asc)
             .unwrap()
@@ -1381,13 +1379,23 @@ mod tests {
         let (old, _old_rx) = thread_listener_command_channel();
         let (new, _new_rx) = thread_listener_command_channel();
         manager.register_listener_command_tx(id, old.clone());
-        manager.register_listener_command_tx(id, new.clone());
+        let overflow = manager.register_listener_command_tx(id, new.clone());
+        manager.fail_listener_command_delivery(id, &old);
+        assert!(
+            !overflow.is_cancelled(),
+            "retired listeners cannot fail the replacement"
+        );
         manager.unregister_listener_command_tx(id, &old);
         assert!(
             manager
                 .current_listener_command_tx(id)
                 .unwrap()
                 .same_channel(&new)
+        );
+        manager.fail_listener_command_delivery(id, &new);
+        assert!(
+            overflow.is_cancelled(),
+            "current route failure must trigger recovery"
         );
         manager.unregister_listener_command_tx(id, &new);
         assert!(manager.current_listener_command_tx(id).is_none());
@@ -1654,7 +1662,12 @@ pub(crate) struct ThreadStateManager {
     state: Arc<Mutex<ThreadStateManagerInner>>,
     // Extension event sinks are synchronous, so they need an await-free way to
     // enqueue work on the active per-thread listener.
-    listener_commands: Arc<StdMutex<HashMap<ThreadId, mpsc::Sender<ThreadListenerCommand>>>>,
+    listener_commands: Arc<StdMutex<HashMap<ThreadId, ListenerCommandRoute>>>,
+}
+
+struct ListenerCommandRoute {
+    tx: mpsc::Sender<ThreadListenerCommand>,
+    overflow: CancellationToken,
 }
 
 fn core_lease_id(lease: &OutOfBandElicitationLeaseKey) -> OutOfBandElicitationLeaseId {
@@ -1752,6 +1765,16 @@ impl ThreadStateManager {
             );
         }
         TurnStartClaim::Claimed
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pending_turn_start_for_test(&self, thread_id: ThreadId) -> Option<String> {
+        self.state
+            .lock()
+            .await
+            .in_flight_turn_starts
+            .get(&thread_id)
+            .cloned()
     }
 
     pub(crate) async fn release_turn_start(&self, thread_id: ThreadId, turn_id: &str) {
@@ -1970,18 +1993,42 @@ impl ThreadStateManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&thread_id)
-            .cloned()
+            .map(|route| route.tx.clone())
     }
 
     pub(crate) fn register_listener_command_tx(
         &self,
         thread_id: ThreadId,
         tx: mpsc::Sender<ThreadListenerCommand>,
-    ) {
+    ) -> CancellationToken {
+        let overflow = CancellationToken::new();
         self.listener_commands
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(thread_id, tx);
+            .insert(
+                thread_id,
+                ListenerCommandRoute {
+                    tx,
+                    overflow: overflow.clone(),
+                },
+            );
+        overflow
+    }
+
+    pub(crate) fn fail_listener_command_delivery(
+        &self,
+        thread_id: ThreadId,
+        tx: &mpsc::Sender<ThreadListenerCommand>,
+    ) {
+        if let Some(route) = self
+            .listener_commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&thread_id)
+            && route.tx.same_channel(tx)
+        {
+            route.overflow.cancel();
+        }
     }
 
     pub(crate) fn unregister_listener_command_tx(
@@ -1995,7 +2042,7 @@ impl ThreadStateManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if routes
             .get(&thread_id)
-            .is_some_and(|tx| tx.same_channel(retiring_tx))
+            .is_some_and(|route| route.tx.same_channel(retiring_tx))
         {
             routes.remove(&thread_id);
         }

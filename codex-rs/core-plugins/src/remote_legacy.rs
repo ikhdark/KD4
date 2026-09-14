@@ -25,6 +25,16 @@ pub enum RemotePluginFetchError {
         body: String,
     },
 
+    #[error("failed to read remote featured plugin response from {url}: {source}")]
+    Body {
+        url: String,
+        #[source]
+        source: codex_http_client::HttpError,
+    },
+
+    #[error("remote featured plugin response from {url} exceeds {max_bytes} bytes")]
+    TooLarge { url: String, max_bytes: usize },
+
     #[error("failed to parse remote featured plugin response from {url}: {source}")]
     Decode {
         url: String,
@@ -63,13 +73,32 @@ pub async fn fetch_remote_featured_plugin_ids(
             url: url.clone(),
             source,
         })?;
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(RemotePluginFetchError::UnexpectedStatus { url, status, body });
-    }
+    let body =
+        crate::remote::read_plugin_http_response(response, crate::remote::MAX_PLUGIN_JSON_BYTES)
+            .await
+            .map_err(|error| match error {
+                crate::remote::PluginHttpResponseError::Status { status, body } => {
+                    RemotePluginFetchError::UnexpectedStatus {
+                        url: url.clone(),
+                        status,
+                        body,
+                    }
+                }
+                crate::remote::PluginHttpResponseError::Body(source) => {
+                    RemotePluginFetchError::Body {
+                        url: url.clone(),
+                        source,
+                    }
+                }
+                crate::remote::PluginHttpResponseError::TooLarge { max_bytes } => {
+                    RemotePluginFetchError::TooLarge {
+                        url: url.clone(),
+                        max_bytes,
+                    }
+                }
+            })?;
 
-    serde_json::from_str(&body).map_err(|source| RemotePluginFetchError::Decode {
+    serde_json::from_slice(&body).map_err(|source| RemotePluginFetchError::Decode {
         url: url.clone(),
         source,
     })

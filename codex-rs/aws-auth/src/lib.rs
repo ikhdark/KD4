@@ -18,7 +18,8 @@ pub struct AwsAuthConfig {
     pub service: String,
 }
 
-/// Generic HTTP request shape consumed by SigV4 signing.
+/// Final unsigned HTTP request consumed by SigV4 signing.
+/// Retries must start from these unsigned parts, not a previously signed result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AwsRequestToSign {
     pub method: Method,
@@ -47,6 +48,8 @@ pub enum AwsAuthError {
     Credentials(#[from] aws_credential_types::provider::error::CredentialsError),
     #[error("request URL is not a valid URI: {0}")]
     InvalidUri(#[source] http::uri::InvalidUri),
+    #[error("request URL must be an absolute HTTP(S) URI with an authority")]
+    InvalidSigningUrl,
     #[error("failed to construct HTTP request for signing: {0}")]
     BuildHttpRequest(#[source] http::Error),
     #[error("request contains a non-UTF8 header value: {0}")]
@@ -98,9 +101,17 @@ impl AwsAuthContext {
     }
 
     pub async fn sign(&self, request: AwsRequestToSign) -> Result<AwsSignedRequest, AwsAuthError> {
-        self.sign_at(request, SystemTime::now()).await
+        let credentials = self.credentials_provider.provide_credentials().await?;
+        signing::sign_request(
+            &credentials,
+            &self.region,
+            &self.service,
+            request,
+            SystemTime::now(),
+        )
     }
 
+    #[cfg(test)]
     async fn sign_at(
         &self,
         request: AwsRequestToSign,
@@ -124,6 +135,7 @@ impl AwsAuthError {
             | AwsAuthError::MissingCredentialsProvider
             | AwsAuthError::MissingRegion
             | AwsAuthError::InvalidUri(_)
+            | AwsAuthError::InvalidSigningUrl
             | AwsAuthError::BuildHttpRequest(_)
             | AwsAuthError::InvalidHeaderValue(_)
             | AwsAuthError::SigningRequest(_)
@@ -244,6 +256,35 @@ mod tests {
             signing::header_value(&signed.headers, "x-amz-security-token"),
             Some("session-token".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn signature_depends_on_the_request_body() {
+        let context = test_context(None);
+        let time = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let request = test_request();
+        let original = context.sign_at(request.clone(), time).await.unwrap();
+        let mut changed = request;
+        changed.body = Bytes::from_static(b"different payload");
+        let changed = context.sign_at(changed, time).await.unwrap();
+        assert_ne!(
+            original.headers[http::header::AUTHORIZATION],
+            changed.headers[http::header::AUTHORIZATION]
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_rejects_relative_and_non_http_urls() {
+        for url in ["/v1/responses", "example.com:443", "ftp://example.com/v1"] {
+            let mut request = test_request();
+            request.url = url.to_string();
+            let error = test_context(None).sign(request).await.unwrap_err();
+            assert!(
+                matches!(error, AwsAuthError::InvalidSigningUrl),
+                "{url}: {error}"
+            );
+            assert!(!error.is_retryable());
+        }
     }
 
     #[tokio::test]

@@ -21,6 +21,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 
@@ -60,6 +62,10 @@ pub(super) const DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const DEFAULT_PORT: u16 = 1455;
 // Keep in sync with the Codex CLI Hydra redirect URI allow-list.
 const FALLBACK_PORT: u16 = 1457;
+const SUCCESS_HANDOFF_TIMEOUT: Duration = Duration::from_secs(5);
+const LOGIN_PENDING: u8 = 0;
+const LOGIN_CANCELLED: u8 = 1;
+const LOGIN_COMMITTING: u8 = 2;
 static LOGIN_ERROR_PAGE_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
     Template::parse(include_str!("assets/error.html"))
         .unwrap_or_else(|err| panic!("login error page template must parse: {err}"))
@@ -126,8 +132,10 @@ impl LoginServer {
     }
 
     /// Waits for login to finish and returns allowlisted callback metadata.
-    pub async fn block_until_done_with_callback_result(self) -> io::Result<LoginCallbackResult> {
-        self.server_handle
+    pub async fn block_until_done_with_callback_result(
+        mut self,
+    ) -> io::Result<LoginCallbackResult> {
+        (&mut self.server_handle)
             .await
             .map_err(|err| io::Error::other(format!("login server thread panicked: {err:?}")))?
     }
@@ -143,16 +151,53 @@ impl LoginServer {
     }
 }
 
+impl Drop for LoginServer {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
 /// Handle used to signal the login server loop to exit.
 #[derive(Clone, Debug)]
 pub struct ShutdownHandle {
     shutdown_notify: Arc<tokio::sync::Notify>,
+    state: Arc<AtomicU8>,
 }
 
 impl ShutdownHandle {
     /// Signals the login loop to terminate.
     pub fn shutdown(&self) {
-        self.shutdown_notify.notify_one();
+        if self
+            .state
+            .compare_exchange(
+                LOGIN_PENDING,
+                LOGIN_CANCELLED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            self.shutdown_notify.notify_one();
+        }
+    }
+
+    async fn cancelled(&self) {
+        if self.state.load(Ordering::SeqCst) != LOGIN_CANCELLED {
+            self.shutdown_notify.notified().await;
+        }
+    }
+
+    // Admission and shutdown have one ordering. An admitted blocking write must
+    // finish; cancellation cannot undo it by dropping its async waiter.
+    fn begin_commit(&self) -> bool {
+        self.state
+            .compare_exchange(
+                LOGIN_PENDING,
+                LOGIN_COMMITTING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
     }
 }
 
@@ -222,16 +267,29 @@ fn start_login_server(opts: ServerOptions, server: Server) -> io::Result<LoginSe
         })
     };
 
-    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+    let shutdown_handle = ShutdownHandle {
+        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        state: Arc::new(AtomicU8::new(LOGIN_PENDING)),
+    };
     let server_handle = {
-        let shutdown_notify = shutdown_notify.clone();
+        let shutdown_handle = shutdown_handle.clone();
         let server = server;
         tokio::spawn(async move {
-            let mut callback_result = LoginCallbackResult::default();
+            let mut callback_result = None;
+            let mut handoff_deadline = None;
             let result = loop {
                 tokio::select! {
-                    _ = shutdown_notify.notified() => {
-                        break Err(io::Error::other("Login was not completed"));
+                    biased;
+                    _ = shutdown_handle.cancelled() => {
+                        break callback_result.ok_or_else(|| io::Error::other("Login was not completed"));
+                    }
+                    _ = async {
+                        match handoff_deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        break callback_result.ok_or_else(|| io::Error::other("Login was not completed"));
                     }
                     maybe_req = rx.recv() => {
                         let Some(req) = maybe_req else {
@@ -247,26 +305,34 @@ fn start_login_server(opts: ServerOptions, server: Server) -> io::Result<LoginSe
                                 &pkce,
                                 actual_port,
                                 &state,
+                                callback_result.is_some(),
+                                &shutdown_handle,
                             )
                             .await;
 
                         let exit_result = match response {
                             HandledRequest::Response(response) => {
-                                let _ = tokio::task::spawn_blocking(move || req.respond(response)).await;
+                                let _ = send_login_response(move || req.respond(response)).await;
                                 None
                             }
                             HandledRequest::RedirectWithHeader { header, result } => {
-                                callback_result = result;
+                                callback_result = Some(result);
+                                handoff_deadline = Some(tokio::time::Instant::now() + SUCCESS_HANDOFF_TIMEOUT);
                                 let redirect = Response::empty(302).with_header(header);
-                                let _ = tokio::task::spawn_blocking(move || req.respond(redirect)).await;
-                                None
+                                match send_login_response(move || req.respond(redirect)).await {
+                                    Ok(Ok(())) => None,
+                                    _ => {
+                                        warn!("failed to send local login redirect after saving credentials");
+                                        Some(Ok(result))
+                                    }
+                                }
                             }
                             HandledRequest::ResponseAndExit {
                                 headers,
                                 body,
                                 result,
                             } => {
-                                let _ = tokio::task::spawn_blocking(move || {
+                                let _ = send_login_response(move || {
                                     send_response_with_disconnect(
                                         req,
                                         StatusCode(200),
@@ -275,10 +341,13 @@ fn start_login_server(opts: ServerOptions, server: Server) -> io::Result<LoginSe
                                     )
                                 })
                                 .await;
-                                Some(result.map(|()| callback_result))
+                                Some(match callback_result {
+                                    Some(result) => Ok(result),
+                                    None => result.and_then(|()| Err(io::Error::other("Login was not completed"))),
+                                })
                             }
                             HandledRequest::RedirectAndExit { header, result } => {
-                                match tokio::task::spawn_blocking(move || {
+                                match send_login_response(move || {
                                     send_response_with_disconnect(
                                         req,
                                         StatusCode(302),
@@ -318,8 +387,19 @@ fn start_login_server(opts: ServerOptions, server: Server) -> io::Result<LoginSe
         auth_url,
         actual_port,
         server_handle,
-        shutdown_handle: ShutdownHandle { shutdown_notify },
+        shutdown_handle,
     })
+}
+
+// A stalled browser must not hold the login task open after credentials commit.
+async fn send_login_response<F>(send: F) -> Result<io::Result<()>, io::Error>
+where
+    F: FnOnce() -> io::Result<()> + Send + 'static,
+{
+    tokio::time::timeout(SUCCESS_HANDOFF_TIMEOUT, tokio::task::spawn_blocking(send))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "login response timed out"))?
+        .map_err(io::Error::other)
 }
 
 /// Internal callback handling outcome.
@@ -340,6 +420,10 @@ enum HandledRequest {
     },
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Receives the active OAuth attempt state and shutdown context from the callback server"
+)]
 async fn process_request(
     url_raw: &str,
     opts: &ServerOptions,
@@ -347,6 +431,8 @@ async fn process_request(
     pkce: &PkceCodes,
     actual_port: u16,
     state: &str,
+    credentials_committed: bool,
+    shutdown_handle: &ShutdownHandle,
 ) -> HandledRequest {
     let parsed_url = match url::Url::parse(&format!("http://localhost{url_raw}")) {
         Ok(u) => u,
@@ -361,6 +447,11 @@ async fn process_request(
 
     match path.as_str() {
         "/auth/callback" => {
+            if credentials_committed {
+                return HandledRequest::Response(
+                    Response::from_string("Login already completed").with_status_code(409),
+                );
+            }
             let params: std::collections::HashMap<String, String> =
                 parsed_url.query_pairs().into_owned().collect();
             let has_code = params.get("code").is_some_and(|code| !code.is_empty());
@@ -395,7 +486,7 @@ async fn process_request(
                 let message = oauth_callback_error_message(error_code, error_description);
                 eprintln!("OAuth callback error: {message}");
                 warn!(
-                    error_code,
+                    error_code = loggable_oauth_error_code(Some(error_code)),
                     has_error_description = error_description.is_some_and(|s| !s.trim().is_empty()),
                     "oauth callback returned error"
                 );
@@ -419,16 +510,20 @@ async fn process_request(
             };
             let callback_result = callback_result.unwrap_or_default();
 
-            match exchange_code_for_tokens(
+            let exchange = exchange_code_for_tokens(
                 &opts.issuer,
                 &opts.client_id,
                 redirect_uri,
                 pkce,
                 &code,
                 &opts.auth_route_config,
-            )
-            .await
-            {
+            );
+            let exchanged = tokio::select! {
+                biased;
+                _ = shutdown_handle.cancelled() => return cancelled_login_response(),
+                result = exchange => result,
+            };
+            match exchanged {
                 Ok(tokens) => {
                     if let Err(message) = ensure_workspace_allowed(
                         opts.forced_chatgpt_workspace_id.as_deref(),
@@ -443,17 +538,25 @@ async fn process_request(
                         );
                     }
                     // Obtain API key via token-exchange and persist
-                    let api_key = obtain_api_key(
+                    let api_key_exchange = obtain_api_key(
                         &opts.issuer,
                         &opts.client_id,
                         &tokens.id_token,
                         &opts.auth_route_config,
-                    )
-                    .await
-                    .ok();
+                    );
+                    let api_key = tokio::select! {
+                        biased;
+                        _ = shutdown_handle.cancelled() => return cancelled_login_response(),
+                        result = api_key_exchange => result.ok(),
+                    };
+                    // Persistence is admitted here. Once the blocking write is
+                    // started, await its real outcome even if shutdown arrives.
+                    if !shutdown_handle.begin_commit() {
+                        return cancelled_login_response();
+                    }
                     if let Err(err) = persist_tokens_async(
                         &opts.codex_home,
-                        api_key.clone(),
+                        api_key,
                         tokens.id_token.clone(),
                         tokens.access_token.clone(),
                         tokens.refresh_token.clone(),
@@ -514,6 +617,11 @@ async fn process_request(
             }
         }
         "/success" => {
+            if !credentials_committed {
+                return HandledRequest::Response(
+                    Response::from_string("Login has not completed").with_status_code(409),
+                );
+            }
             let use_streamlined_success = parsed_url
                 .query_pairs()
                 .any(|(key, value)| key == "codex_streamlined_login" && value == "true");
@@ -534,27 +642,47 @@ async fn process_request(
                 result: Ok(()),
             }
         }
-        "/cancel" => HandledRequest::ResponseAndExit {
+        "/cancel" if credentials_committed => HandledRequest::ResponseAndExit {
             headers: Vec::new(),
-            body: b"Login cancelled".to_vec(),
-            result: Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "Login cancelled",
-            )),
+            body: b"Login already completed".to_vec(),
+            result: Ok(()),
         },
+        "/cancel" => cancelled_login_response(),
         _ => HandledRequest::Response(Response::from_string("Not Found").with_status_code(404)),
     }
 }
 
-/// tiny_http filters `Connection` headers out of `Response` objects, so using
-/// `req.respond` never informs the client (or the library) that a keep-alive
-/// socket should be closed. That leaves the per-connection worker parked in a
-/// loop waiting for more requests, which in turn causes the next login attempt
-/// to hang on the old connection. This helper bypasses tiny_http’s response
-/// machinery: it extracts the raw writer, prints the HTTP response manually,
-/// and always appends `Connection: close`, ensuring the socket is closed from
-/// the server side. Ideally, tiny_http would provide an API to control
-/// server-side connection persistence, but it does not.
+fn cancelled_login_response() -> HandledRequest {
+    HandledRequest::ResponseAndExit {
+        headers: Vec::new(),
+        body: b"Login cancelled".to_vec(),
+        result: Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Login cancelled",
+        )),
+    }
+}
+
+fn loggable_oauth_error_code(code: Option<&str>) -> &str {
+    match code {
+        Some(
+            code @ ("invalid_request"
+            | "invalid_client"
+            | "invalid_grant"
+            | "unauthorized_client"
+            | "unsupported_grant_type"
+            | "invalid_scope"
+            | "access_denied"
+            | "server_error"
+            | "temporarily_unavailable"),
+        ) => code,
+        _ => "unknown",
+    }
+}
+
+/// Write the terminal response with `Connection: close`, which tiny_http filters
+/// from ordinary responses. This asks the client to stop reusing the connection;
+/// it does not provide a hard shutdown of a stalled peer's socket.
 fn send_response_with_disconnect(
     req: Request,
     status: StatusCode,
@@ -621,7 +749,7 @@ fn build_authorize_url(
         query.push(("allowed_workspace_id".to_string(), workspace_ids.join(",")));
     }
     let qs = crate::form_urlencode(query);
-    format!("{issuer}/oauth/authorize?{qs}")
+    format!("{}/oauth/authorize?{qs}", issuer.trim_end_matches('/'))
 }
 
 fn generate_state() -> String {
@@ -868,8 +996,7 @@ pub(crate) async fn exchange_code_for_tokens(
         let detail = parse_token_endpoint_error(&body);
         warn!(
             %status,
-            error_code = detail.error_code.as_deref().unwrap_or("unknown"),
-            error_message = detail.error_message.as_deref().unwrap_or("unknown"),
+            error_code = loggable_oauth_error_code(detail.error_code.as_deref()),
             "oauth token exchange returned non-success status"
         );
         return Err(io::Error::other(format!(
@@ -905,12 +1032,7 @@ pub(crate) async fn persist_tokens_async(
             refresh_token,
             account_id: None,
         };
-        if let Some(acc) = jwt_auth_claims(&id_token)
-            .get("chatgpt_account_id")
-            .and_then(|v| v.as_str())
-        {
-            tokens.account_id = Some(acc.to_string());
-        }
+        tokens.account_id = tokens.id_token.chatgpt_account_id.clone();
         let auth = AuthDotJson {
             auth_mode: Some(AuthMode::Chatgpt),
             openai_api_key: api_key,
@@ -1015,9 +1137,8 @@ fn oauth_callback_error_message(error_code: &str, error_description: Option<&str
 
 /// Extracts token endpoint error detail for both structured logging and caller-visible errors.
 ///
-/// Parsed JSON fields are safe to log individually. If the response is not JSON, the raw body is
-/// preserved only for the returned error path so the CLI/browser can still surface the backend
-/// detail, while the structured log path continues to use the explicitly parsed safe fields above.
+/// JSON fields and raw bodies may contain credentials. Preserve them for the caller-visible
+/// error only; structured logs use allowlisted error classifications and HTTP status.
 fn parse_token_endpoint_error(body: &str) -> TokenEndpointErrorDetail {
     let trimmed = body.trim();
     if trimmed.is_empty() {
@@ -1073,7 +1194,7 @@ fn parse_token_endpoint_error(body: &str) -> TokenEndpointErrorDetail {
 
     // Preserve non-JSON token-endpoint bodies for the returned error so CLI/browser flows still
     // surface the backend detail users and admins need, but keep that text out of structured logs
-    // by only logging explicitly parsed fields above and avoiding `%err` logging at the callback
+    // by only logging allowlisted error classifications and avoiding `%err` logging at the callback
     // layer.
     TokenEndpointErrorDetail {
         error_code: None,
@@ -1149,9 +1270,10 @@ pub(crate) async fn obtain_api_key(
         access_token: String,
     }
     let token_endpoint = format!("{}/oauth/token", issuer.trim_end_matches('/'));
-    let client = create_raw_auth_client(&token_endpoint, auth_route_config)?;
+    let client = create_raw_auth_client(issuer.trim_end_matches('/'), auth_route_config)?;
     let resp = client
         .post(token_endpoint)
+        .timeout(Duration::from_secs(10))
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(crate::form_urlencode([
             (
@@ -1181,6 +1303,101 @@ pub(crate) async fn obtain_api_key(
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn logged_oauth_codes_exclude_unreviewed_values() {
+        assert_eq!(
+            super::loggable_oauth_error_code(Some("invalid_grant")),
+            "invalid_grant"
+        );
+        assert_eq!(
+            super::loggable_oauth_error_code(Some("token=secret")),
+            "unknown"
+        );
+        assert_eq!(super::loggable_oauth_error_code(None), "unknown");
+    }
+
+    #[tokio::test]
+    async fn structured_token_errors_do_not_log_backend_secrets() -> anyhow::Result<()> {
+        use tracing::instrument::WithSubscriber;
+        let issuer = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/oauth/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "error": "secret-code", "error_description": "secret-description"
+                })),
+            )
+            .expect(1)
+            .mount(&issuer)
+            .await;
+        let logs = tempfile::NamedTempFile::new()?;
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(logs.reopen()?)
+            .finish();
+        let pkce = crate::pkce::generate_pkce();
+        let result = super::exchange_code_for_tokens(
+            &issuer.uri(),
+            "client",
+            "http://localhost/auth/callback",
+            &pkce,
+            "secret-auth-code",
+            &crate::test_support::transport_default_auth_route_config(),
+        )
+        .with_subscriber(subscriber)
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("non-success status must fail"),
+        };
+        assert!(error.to_string().contains("secret-description"));
+        let output = std::fs::read_to_string(logs.path())?;
+        assert!(output.contains("oauth token exchange returned non-success status"));
+        assert!(output.contains("unknown"));
+        for secret in [
+            "secret-code",
+            "secret-description",
+            "secret-auth-code",
+            pkce.code_verifier.as_str(),
+        ] {
+            assert!(
+                !output.contains(secret),
+                "structured logs exposed a credential"
+            );
+        }
+        issuer.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_commit_admission_have_one_ordering() {
+        for cancel_first in [false, true] {
+            let handle = super::ShutdownHandle {
+                shutdown_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+                state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(super::LOGIN_PENDING)),
+            };
+            if cancel_first {
+                handle.shutdown();
+                assert!(!handle.begin_commit());
+                tokio::time::timeout(std::time::Duration::from_secs(1), handle.cancelled())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    handle.state.load(std::sync::atomic::Ordering::SeqCst),
+                    super::LOGIN_CANCELLED
+                );
+            } else {
+                assert!(handle.begin_commit());
+                handle.shutdown();
+                assert_eq!(
+                    handle.state.load(std::sync::atomic::Ordering::SeqCst),
+                    super::LOGIN_COMMITTING
+                );
+                assert!(!handle.begin_commit());
+            }
+        }
+    }
 
     use super::TokenEndpointErrorDetail;
     use super::html_escape;

@@ -154,15 +154,11 @@ impl AmbientPet {
             /*codex_home*/ Some(codex_home),
         )
         .with_context(|| "load ambient pet")?;
-        let cache_dir = codex_home
-            .join("cache")
-            .join("tui-pets")
-            .join("frame-cache")
-            .join(&pet.id)
-            .join(pet.frame_cache_key()?);
+        let bytes = pet.spritesheet_bytes()?;
+        let cache_dir = pet.frame_cache_dir(codex_home, &bytes);
         let frame_dir = cache_dir.join("frames");
         let sixel_dir = cache_dir.join("sixel");
-        let frames = frames::prepare_png_frames(&pet, &frame_dir)?;
+        let frames = frames::prepare_png_frames(&pet, &bytes, &frame_dir)?;
         Ok(Self {
             pet,
             support: default_image_support(),
@@ -200,15 +196,27 @@ impl AmbientPet {
     }
 
     fn next_frame_delay(&self) -> Option<Duration> {
-        if self.support.protocol().is_none() || !self.animations_enabled {
-            return None;
-        }
+        self.support.protocol()?;
 
-        current_animation_frame(
-            self.current_animation()?,
-            self.animation_started_at.elapsed(),
-        )?
-        .delay
+        let frame_delay = if self.animations_enabled {
+            self.current_animation()
+                .and_then(|(animation, elapsed)| current_animation_frame(animation, elapsed))
+                .and_then(|frame| frame.delay)
+        } else {
+            None
+        };
+        let expiry_delay = self
+            .visible_notification(Instant::now())
+            .map(|notification| {
+                notification
+                    .kind
+                    .lifetime()
+                    .saturating_sub(notification.updated_at.elapsed())
+            });
+        match (frame_delay, expiry_delay) {
+            (Some(frame), Some(expiry)) => Some(frame.min(expiry)),
+            (frame, expiry) => frame.or(expiry),
+        }
     }
 
     /// Build an image draw request for the ambient pet anchored above the composer.
@@ -280,7 +288,16 @@ impl AmbientPet {
             .filter(|notification| !notification.is_expired(now))
     }
 
-    fn current_animation(&self) -> Option<&Animation> {
+    fn current_animation(&self) -> Option<(&Animation, Duration)> {
+        let now = Instant::now();
+        let mut elapsed = now.saturating_duration_since(self.animation_started_at);
+        if let Some(notification) = &self.notification
+            && notification.is_expired(now)
+        {
+            elapsed = now
+                .saturating_duration_since(notification.updated_at)
+                .saturating_sub(notification.kind.lifetime());
+        }
         let animation_name = self
             .visible_notification(Instant::now())
             .map_or("idle", |notification| notification.kind.animation_name());
@@ -289,24 +306,21 @@ impl AmbientPet {
             .animations
             .get(animation_name)
             .or_else(|| self.pet.animations.get("idle"))?;
-        if animation.loop_start.is_none() {
-            let elapsed = self.animation_started_at.elapsed();
-            if elapsed >= animation.total_duration()
-                && let Some(fallback) = self.pet.animations.get(&animation.fallback)
-            {
-                return Some(fallback);
-            }
+        if animation.loop_start.is_none()
+            && elapsed >= animation.total_duration()
+            && let Some(fallback) = self.pet.animations.get(&animation.fallback)
+        {
+            return Some((fallback, elapsed - animation.total_duration()));
         }
-        Some(animation)
+        Some((animation, elapsed))
     }
 
     fn current_frame_path(&self) -> Option<PathBuf> {
         let sprite_index = self
             .current_animation()
-            .and_then(|animation| {
+            .and_then(|(animation, elapsed)| {
                 if self.animations_enabled {
-                    current_animation_frame(animation, self.animation_started_at.elapsed())
-                        .map(|frame| frame.sprite_index)
+                    current_animation_frame(animation, elapsed).map(|frame| frame.sprite_index)
                 } else {
                     animation.frames.first().map(|frame| frame.sprite_index)
                 }
@@ -374,7 +388,7 @@ struct AnimationFrameTick {
 }
 
 fn current_animation_frame(animation: &Animation, elapsed: Duration) -> Option<AnimationFrameTick> {
-    if animation.frames.len() <= 1 {
+    if animation.frames.len() <= 1 && animation.loop_start.is_some() {
         return Some(AnimationFrameTick {
             sprite_index: animation.frames.first()?.sprite_index,
             delay: None,
@@ -449,7 +463,6 @@ pub(crate) fn test_ambient_pet(
 ) -> AmbientPet {
     AmbientPet {
         pet: Pet {
-            id: "test".to_string(),
             display_name: "Test".to_string(),
             description: String::new(),
             spritesheet_path: PathBuf::from("spritesheet.webp"),
@@ -493,6 +506,75 @@ fn test_animation() -> Animation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_shot_fallback_starts_at_its_own_first_frame() {
+        let mut pet = test_ambient_pet(FrameRequester::test_dummy(), true);
+        let mut primary = test_animation();
+        primary.frames = vec![AnimationFrame {
+            sprite_index: 1,
+            duration: Duration::from_secs(3),
+        }];
+        primary.loop_start = None;
+        let mut idle = test_animation();
+        for frame in &mut idle.frames {
+            frame.duration = Duration::from_secs(2);
+        }
+        pet.pet.animations.insert("idle".to_string(), idle);
+        pet.pet.animations.insert("running".to_string(), primary);
+        pet.set_notification(PetNotificationKind::Running, None);
+        pet.animation_started_at = Instant::now() - Duration::from_millis(3100);
+        let request = pet.draw_request(Rect::new(0, 0, 80, 30), 29).unwrap();
+        assert_eq!(request.frame, PathBuf::from("frame-0.png"));
+        let delay = pet.next_frame_delay().unwrap();
+        assert!(delay > Duration::from_secs(1) && delay <= Duration::from_secs(2));
+    }
+
+    #[test]
+    fn single_frame_one_shot_schedules_transition() {
+        let animation = Animation {
+            frames: vec![AnimationFrame {
+                sprite_index: 1,
+                duration: Duration::from_secs(3),
+            }],
+            loop_start: None,
+            fallback: "idle".to_string(),
+        };
+        assert_eq!(
+            current_animation_frame(&animation, Duration::from_secs(1)),
+            Some(AnimationFrameTick {
+                sprite_index: 1,
+                delay: Some(Duration::from_secs(2)),
+            })
+        );
+    }
+
+    #[test]
+    fn static_notification_schedules_expiry_and_restarts_idle() {
+        let mut pet = test_ambient_pet(FrameRequester::test_dummy(), true);
+        let mut animation = test_animation();
+        animation.frames.truncate(1);
+        pet.pet.animations.insert("running".to_string(), animation);
+        pet.set_notification(PetNotificationKind::Running, None);
+        for animations_enabled in [true, false] {
+            pet.animations_enabled = animations_enabled;
+            let delay = pet.next_frame_delay().unwrap();
+            assert!(delay > RUNNING_LIFETIME - Duration::from_secs(1) && delay <= RUNNING_LIFETIME);
+        }
+        pet.animations_enabled = true;
+        // Keep the expired notification present, as normal rendering does.
+        pet.notification.as_mut().unwrap().updated_at =
+            Instant::now() - RUNNING_LIFETIME - Duration::from_secs(1);
+        let idle = pet.pet.animations.get_mut("idle").unwrap();
+        for frame in &mut idle.frames {
+            frame.duration = Duration::from_secs(10);
+        }
+        pet.animation_started_at = Instant::now() - RUNNING_LIFETIME - Duration::from_secs(15);
+        assert_eq!(
+            pet.draw_request(Rect::new(0, 0, 80, 30), 29).unwrap().frame,
+            PathBuf::from("frame-0.png")
+        );
+    }
 
     #[test]
     fn notification_labels_match_codex_app_vocabulary() {

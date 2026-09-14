@@ -137,6 +137,54 @@ fn unexpected_status_retryability_is_status_specific() {
     }
 }
 
+#[test]
+fn request_build_and_pre_dispatch_exhaustion_are_not_retryable() {
+    assert!(!CodexErr::RequestBuild("invalid request".to_string()).is_retryable());
+    assert!(!CodexErr::PreDispatchRetryExhausted("attempts exhausted".to_string()).is_retryable());
+}
+
+#[test]
+fn workspace_failure_takes_precedence_over_named_model_limit() {
+    let err = UsageLimitReachedError {
+        plan_type: Some(PlanType::Known(KnownPlan::Plus)),
+        resets_at: None,
+        rate_limits: Some(Box::new(RateLimitSnapshot {
+            limit_name: Some("other-model".to_string()),
+            ..rate_limit_snapshot()
+        })),
+        promo_message: None,
+        rate_limit_reached_type: Some(RateLimitReachedType::WorkspaceOwnerCreditsDepleted),
+    };
+    assert_eq!(
+        err.to_string(),
+        "Your workspace is out of credits. Add credits to continue."
+    );
+}
+
+#[test]
+fn unexpected_status_caps_structured_message_and_preserves_diagnostics() {
+    let body = serde_json::json!({"error": {"message": "界".repeat(400)}}).to_string();
+    let err = UnexpectedResponseError {
+        status: StatusCode::BAD_GATEWAY,
+        body: body.clone(),
+        user_message: None,
+        url: None,
+        cf_ray: None,
+        request_id: Some("req-json".to_string()),
+        identity_authorization_error: None,
+        identity_error_code: None,
+    };
+    assert_eq!(err.body, body);
+    let event = CodexErr::UnexpectedStatus(err).to_error_event(None);
+    assert_eq!(
+        event.message,
+        format!(
+            "unexpected status 502 Bad Gateway: {}..., request id: req-json",
+            "界".repeat(333)
+        )
+    );
+}
+
 fn unexpected_response(status: StatusCode) -> CodexErr {
     CodexErr::UnexpectedStatus(UnexpectedResponseError {
         status,

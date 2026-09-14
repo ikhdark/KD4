@@ -48,6 +48,20 @@ fn requests_history_only_for_history_backed_edits() {
         image_history_requirement(&payload(Some(2))),
         ConversationHistoryRequirement::Full
     );
+    for count in [0, 6, usize::MAX] {
+        assert_eq!(
+            image_history_requirement(&payload(Some(count))),
+            ConversationHistoryRequirement::None
+        );
+    }
+    for arguments in [
+        "{".to_string(),
+        serde_json::json!({"num_last_images_to_include": 1}).to_string(),
+        serde_json::json!({"prompt": "edit", "unknown": true, "num_last_images_to_include": 1}).to_string(),
+        serde_json::json!({"prompt": "edit", "referenced_image_paths": ["/tmp/image.png"], "num_last_images_to_include": 1}).to_string(),
+    ] {
+        assert_eq!(image_history_requirement(&ToolPayload::Function { arguments }), ConversationHistoryRequirement::None);
+    }
 }
 
 #[test]
@@ -250,6 +264,20 @@ async fn recent_image_fallback_requires_requested_count() {
 
 #[tokio::test]
 async fn referenced_paths_reject_an_unreadable_primary_environment() {
+    let cwd =
+        codex_utils_absolute_path::AbsolutePathBuf::try_from(std::env::current_dir().unwrap())
+            .unwrap();
+    let sandbox = codex_exec_server::FileSystemSandboxContext::from_legacy_sandbox_policy(
+        codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
+        codex_utils_path_uri::PathUri::from_abs_path(&cwd),
+    )
+    .unwrap();
+    let environments = [codex_extension_api::ToolEnvironment {
+        environment_id: "readable-alternative".to_string(),
+        cwd,
+        file_system: codex_exec_server::LOCAL_FS.clone(),
+        file_system_sandbox_context: sandbox,
+    }];
     let error = request_for_call_args(
         &ImagegenArgs {
             prompt: "change the lighting".to_string(),
@@ -262,7 +290,7 @@ async fn referenced_paths_reject_an_unreadable_primary_environment() {
         },
         &[],
         Some("foreign-primary"),
-        &[],
+        &environments,
     )
     .await
     .expect_err("an omitted primary environment must not fall back to another environment");

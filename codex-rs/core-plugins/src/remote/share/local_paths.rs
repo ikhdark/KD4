@@ -30,7 +30,12 @@ pub(crate) fn record_plugin_share_local_path(
     plugin_path: AbsolutePathBuf,
 ) -> io::Result<()> {
     let _guard = lock_plugin_share_local_paths()?;
+    let _file_guard =
+        codex_file_system::acquire_atomic_write_lock(&plugin_share_local_paths_path(codex_home))?;
     let mut mapping = read_plugin_share_local_paths_for_update(codex_home)?;
+    if mapping.get(remote_plugin_id) == Some(&plugin_path) {
+        return Ok(());
+    }
     mapping.insert(remote_plugin_id.to_string(), plugin_path);
     write_plugin_share_local_paths(codex_home, mapping)
 }
@@ -40,8 +45,18 @@ pub(crate) fn remove_plugin_share_local_path(
     remote_plugin_id: &str,
 ) -> io::Result<()> {
     let _guard = lock_plugin_share_local_paths()?;
-    let mut mapping = read_plugin_share_local_paths_for_update(codex_home)?;
-    mapping.remove(remote_plugin_id);
+    let _file_guard =
+        codex_file_system::acquire_atomic_write_lock(&plugin_share_local_paths_path(codex_home))?;
+    let mapping = match read_plugin_share_local_paths(codex_home) {
+        Ok(mut mapping) => {
+            if mapping.remove(remote_plugin_id).is_none() {
+                return Ok(());
+            }
+            mapping
+        }
+        Err(err) if err.kind() == io::ErrorKind::InvalidData => BTreeMap::new(),
+        Err(err) => return Err(err),
+    };
     write_plugin_share_local_paths(codex_home, mapping)
 }
 

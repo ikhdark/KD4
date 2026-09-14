@@ -1,5 +1,5 @@
 mod activation;
-mod git;
+pub(crate) mod git;
 
 use self::activation::activate_marketplace_root;
 use self::activation::installed_marketplace_metadata_matches;
@@ -217,7 +217,7 @@ fn upgrade_configured_git_marketplace(
 
     let activated_revision = clone_git_source(
         source,
-        ref_name,
+        Some(&remote_revision),
         &marketplace.sparse_paths,
         staged_dir.path(),
         MARKETPLACE_UPGRADE_GIT_TIMEOUT,

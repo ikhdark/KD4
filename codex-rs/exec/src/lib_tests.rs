@@ -17,6 +17,187 @@ use std::sync::Mutex;
 use tempfile::tempdir;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+pub(crate) fn recovery_completion() -> ServerNotification {
+    let mut turn = recovery_thread_fixture().turns.remove(0);
+    turn.items.clear();
+    ServerNotification::TurnCompleted(codex_app_server_protocol::TurnCompletedNotification {
+        thread_id: "thread-1".into(),
+        turn,
+        surfaced_result: None,
+        timing: None,
+    })
+}
+
+#[tokio::test]
+async fn notification_preparation_filters_before_reading_history() {
+    let mut notification = recovery_completion();
+    let result = prepare_server_notification(
+        false,
+        "other-thread",
+        "turn-1",
+        false,
+        &mut notification,
+        async |_| panic!("foreign completions must not read history"),
+    )
+    .await;
+    assert_eq!(result, Ok(false));
+    let result = prepare_server_notification(
+        false,
+        "thread-1",
+        "other-turn",
+        false,
+        &mut notification,
+        async |_| panic!("foreign turns must not read history"),
+    )
+    .await;
+    assert_eq!(result, Ok(false));
+    let result = prepare_server_notification(
+        false,
+        "thread-1",
+        "turn-1",
+        false,
+        &mut notification,
+        async |id| {
+            assert_eq!(id, "thread-1");
+            Ok(ThreadReadResponse {
+                thread: recovery_thread_fixture(),
+            })
+        },
+    )
+    .await;
+    assert_eq!(result, Ok(true));
+    let ServerNotification::TurnCompleted(payload) = notification else {
+        panic!("completion")
+    };
+    assert_eq!(
+        payload.turn.items,
+        recovery_thread_fixture().turns.remove(0).items
+    );
+}
+
+#[tokio::test]
+async fn required_recovery_failure_preserves_last_message_artifact() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("answer.txt");
+    std::fs::write(&path, "previous answer").expect("seed artifact");
+    let mut processor = EventProcessorWithJsonOutput::new(Some(path.clone()));
+    processor.collect_thread_events(ServerNotification::ItemCompleted(
+        codex_app_server_protocol::ItemCompletedNotification {
+            thread_id: "thread-1".into(),
+            turn_id: "turn-1".into(),
+            completed_at_ms: 0,
+            item: AppServerThreadItem::AgentMessage {
+                id: "early".into(),
+                text: "commentary".into(),
+                phase: Some(MessagePhase::Commentary),
+                memory_citation: None,
+            },
+        },
+    ));
+    let mut notification = recovery_completion();
+    let error = prepare_server_notification(
+        false,
+        "thread-1",
+        "turn-1",
+        false,
+        &mut notification,
+        async |_| Err("history unavailable".into()),
+    )
+    .await
+    .expect_err("required recovery must fail");
+    assert!(error.contains("history unavailable"));
+    processor.collect_event_stream_error(error);
+    processor.print_final_output().expect("preserve artifact");
+    assert_eq!(processor.final_message(), None);
+    assert_eq!(
+        std::fs::read_to_string(path).expect("read artifact"),
+        "previous answer"
+    );
+}
+
+#[tokio::test]
+async fn recovery_failure_preserves_authoritative_results_but_missing_turn_is_an_error() {
+    let mut notification = recovery_completion();
+    assert_eq!(
+        prepare_server_notification(
+            false,
+            "thread-1",
+            "turn-1",
+            true,
+            &mut notification,
+            async |_| Err("history unavailable".into())
+        )
+        .await,
+        Ok(true)
+    );
+    let missing_turn = prepare_server_notification(
+        false,
+        "thread-1",
+        "turn-1",
+        false,
+        &mut notification,
+        async |_| {
+            let mut thread = recovery_thread_fixture();
+            thread.turns.clear();
+            Ok(ThreadReadResponse { thread })
+        },
+    )
+    .await
+    .expect_err("missing requested turn is not successful recovery");
+    assert!(missing_turn.contains("did not contain completed turn turn-1"));
+    let ServerNotification::TurnCompleted(payload) = &mut notification else {
+        panic!("completion")
+    };
+    payload.surfaced_result = Some(codex_protocol::protocol::SurfacedToolResult {
+        adapter: "owner".into(),
+        value: serde_json::json!({"answer":42}),
+        canonical_message: None,
+    });
+    assert_eq!(
+        prepare_server_notification(
+            false,
+            "thread-1",
+            "turn-1",
+            false,
+            &mut notification,
+            async |_| Err("history unavailable".into())
+        )
+        .await,
+        Ok(true)
+    );
+}
+
+#[tokio::test]
+async fn latest_cwd_reads_across_chunks_and_skips_malformed_tail() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("rollout.jsonl");
+    let old_cwd = dir.path().join("old");
+    let latest_cwd = dir.path().join("latest-新");
+    let context = |cwd: &Path| {
+        serde_json::json!({
+        "timestamp":"2026-09-13T00:00:00Z", "type":"turn_context", "payload": {
+            "cwd":cwd, "approval_policy":"never", "sandbox_policy":{"type":"danger-full-access"},
+            "model":"gpt-5", "summary":"auto"
+        }
+    }).to_string()
+    };
+    std::fs::write(
+        &path,
+        format!(
+            "{}\r\n{}\r\n{}\n{{broken tail",
+            context(&old_cwd),
+            context(&latest_cwd),
+            "x".repeat(20000)
+        ),
+    )
+    .expect("write history");
+    assert_eq!(parse_latest_turn_context_cwd(&path).await, Some(latest_cwd));
+    std::fs::write(&path, context(&old_cwd)).expect("write first record without newline");
+    assert_eq!(parse_latest_turn_context_cwd(&path).await, Some(old_cwd));
+    std::fs::write(&path, "invalid\n").expect("invalid history");
+    assert_eq!(parse_latest_turn_context_cwd(&path).await, None);
+}
+
 fn test_tracing_subscriber() -> impl tracing::Subscriber + Send + Sync {
     let provider = SdkTracerProvider::builder().build();
     let tracer = provider.tracer("codex-exec-tests");
@@ -130,66 +311,20 @@ fn exec_root_span_can_be_parented_from_trace_context() {
     );
 }
 
-#[test]
-fn builds_uncommitted_review_request() {
-    let args = ReviewArgs {
-        uncommitted: true,
-        base: None,
-        commit: None,
-        commit_title: None,
-        prompt: None,
-    };
-    let request = build_review_request(&args).expect("builds uncommitted review request");
-
-    let expected = ReviewRequest {
-        target: ReviewTarget::UncommittedChanges,
-        user_facing_hint: None,
-    };
-
-    assert_eq!(request, expected);
-}
-
-#[test]
-fn builds_commit_review_request_with_title() {
-    let args = ReviewArgs {
-        uncommitted: false,
-        base: None,
-        commit: Some("123456789".to_string()),
-        commit_title: Some("Add review command".to_string()),
-        prompt: None,
-    };
-    let request = build_review_request(&args).expect("builds commit review request");
-
-    let expected = ReviewRequest {
-        target: ReviewTarget::Commit {
-            sha: "123456789".to_string(),
-            title: Some("Add review command".to_string()),
-        },
-        user_facing_hint: None,
-    };
-
-    assert_eq!(request, expected);
-}
-
-#[test]
-fn builds_custom_review_request_trims_prompt() {
-    let args = ReviewArgs {
-        uncommitted: false,
-        base: None,
-        commit: None,
-        commit_title: None,
-        prompt: Some("  custom review instructions  ".to_string()),
-    };
-    let request = build_review_request(&args).expect("builds custom review request");
-
-    let expected = ReviewRequest {
-        target: ReviewTarget::Custom {
-            instructions: "custom review instructions".to_string(),
-        },
-        user_facing_hint: None,
-    };
-
-    assert_eq!(request, expected);
+#[tokio::test]
+async fn review_rejects_before_configuration_is_loaded() {
+    use clap::Parser;
+    let mut cli = Cli::parse_from(["codex-exec", "review", "--uncommitted"]);
+    cli.config_overrides
+        .raw_overrides
+        .push("not a valid override".to_string());
+    let error = run_main(cli, Arg0DispatchPaths::default())
+        .await
+        .expect_err("review is unavailable");
+    assert_eq!(
+        error.to_string(),
+        "review requests are not available through the app-server protocol"
+    );
 }
 
 #[test]
@@ -349,9 +484,8 @@ async fn resume_lookup_model_providers_filters_only_last_lookup() {
     assert_eq!(resume_lookup_model_providers(&config, &named_args), None);
 }
 
-#[test]
-fn turn_items_for_thread_returns_matching_turn_items() {
-    let thread = AppServerThread {
+fn recovery_thread_fixture() -> AppServerThread {
+    AppServerThread {
         id: "thread-1".to_string(),
         extra: None,
         session_id: "thread-1".to_string(),
@@ -410,10 +544,15 @@ fn turn_items_for_thread_returns_matching_turn_items() {
                 reasoning_policy_history: None,
             },
         ],
-    };
+    }
+}
+
+#[test]
+fn turn_items_for_thread_returns_matching_turn_items() {
+    let thread = recovery_thread_fixture();
 
     assert_eq!(
-        turn_items_for_thread(&thread, "turn-1"),
+        turn_items_for_thread(thread.clone(), "turn-1"),
         Some(vec![AppServerThreadItem::AgentMessage {
             id: "msg-1".to_string(),
             text: "hello".to_string(),
@@ -421,12 +560,12 @@ fn turn_items_for_thread_returns_matching_turn_items() {
             memory_citation: None,
         }])
     );
-    assert_eq!(turn_items_for_thread(&thread, "missing-turn"), None);
+    assert_eq!(turn_items_for_thread(thread, "missing-turn"), None);
 }
 
 #[test]
-fn should_backfill_turn_completed_items_skips_ephemeral_threads() {
-    let notification =
+fn should_backfill_turn_completed_items_requires_missing_persisted_items() {
+    let mut notification =
         ServerNotification::TurnCompleted(codex_app_server_protocol::TurnCompletedNotification {
             surfaced_result: None,
             thread_id: "thread-1".to_string(),
@@ -450,6 +589,15 @@ fn should_backfill_turn_completed_items_skips_ephemeral_threads() {
         /*thread_ephemeral*/ true,
         &notification
     ));
+    assert!(should_backfill_turn_completed_items(false, &notification));
+    let ServerNotification::TurnCompleted(payload) = &mut notification else {
+        panic!("completion")
+    };
+    payload.turn.items.push(AppServerThreadItem::Plan {
+        id: "plan".into(),
+        text: "plan".into(),
+    });
+    assert!(!should_backfill_turn_completed_items(false, &notification));
 }
 
 #[test]
@@ -555,7 +703,7 @@ async fn thread_resume_params_only_include_explicit_review_policy_override() {
 }
 
 #[tokio::test]
-async fn headless_approval_policy_defers_to_auto_review_in_one_config_build() {
+async fn headless_approval_policy_defers_to_auto_review() {
     let codex_home = tempdir().expect("create temp codex home");
     let cwd = tempdir().expect("create temp cwd");
     std::fs::write(

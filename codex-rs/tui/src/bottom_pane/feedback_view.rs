@@ -142,17 +142,16 @@ impl Renderable for FeedbackNoteView {
         if area.height < 2 || area.width <= 2 {
             return None;
         }
-        let intro_height = self.intro_lines(area.width).len() as u16;
-        let text_area_height = self.input_height(area.width).saturating_sub(1);
-        if text_area_height == 0 {
+        let input_area = self.input_area(area);
+        let textarea_rect = Rect {
+            x: input_area.x.saturating_add(2),
+            y: input_area.y.saturating_add(1),
+            width: input_area.width.saturating_sub(2),
+            height: input_area.height.saturating_sub(1),
+        };
+        if textarea_rect.is_empty() {
             return None;
         }
-        let textarea_rect = Rect {
-            x: area.x.saturating_add(2),
-            y: area.y.saturating_add(intro_height).saturating_add(1),
-            width: area.width.saturating_sub(2),
-            height: text_area_height,
-        };
         let state = *self.textarea_state.borrow();
         self.textarea.cursor_pos_with_state(textarea_rect, state)
     }
@@ -166,7 +165,7 @@ impl Renderable for FeedbackNoteView {
         let (_, placeholder) = feedback_title_and_placeholder(self.category);
         let input_height = self.input_height(area.width);
 
-        for (offset, line) in intro_lines.iter().enumerate() {
+        for (offset, line) in intro_lines.iter().take(area.height as usize).enumerate() {
             Paragraph::new(line.clone()).render(
                 Rect {
                     x: area.x,
@@ -179,12 +178,7 @@ impl Renderable for FeedbackNoteView {
         }
 
         // Input line
-        let input_area = Rect {
-            x: area.x,
-            y: area.y.saturating_add(intro_lines.len() as u16),
-            width: area.width,
-            height: input_height,
-        };
+        let input_area = self.input_area(area);
         if input_area.width >= 2 {
             for row in 0..input_area.height {
                 Paragraph::new(Line::from(vec![gutter()])).render(
@@ -250,6 +244,18 @@ impl Renderable for FeedbackNoteView {
 }
 
 impl FeedbackNoteView {
+    fn input_area(&self, area: Rect) -> Rect {
+        let intro_height = (self.intro_lines(area.width).len() as u16).min(area.height);
+        Rect {
+            x: area.x,
+            y: area.y.saturating_add(intro_height),
+            width: area.width,
+            height: self
+                .input_height(area.width)
+                .min(area.height.saturating_sub(intro_height)),
+        }
+    }
+
     fn input_height(&self, width: u16) -> u16 {
         let usable_width = width.saturating_sub(2);
         let text_height = self.textarea.desired_height(usable_width).clamp(1, 8);
@@ -684,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn feedback_view_with_connectivity_diagnostics() {
+    fn feedback_view_without_logs() {
         let (tx_raw, _rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
         let view = FeedbackNoteView::new(
@@ -696,6 +702,42 @@ mod tests {
         let rendered = render(&view, /*width*/ 60);
 
         insta::assert_snapshot!("feedback_view_with_connectivity_diagnostics", rendered);
+    }
+
+    #[test]
+    fn feedback_view_with_connectivity_diagnostics() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        let diagnostics = FeedbackDiagnostics::new(vec![FeedbackDiagnostic {
+            headline: "Connectivity probe failed".to_string(),
+            details: vec!["DNS lookup timed out".to_string()],
+        }]);
+        let params = feedback_upload_consent_params(
+            AppEventSender::new(tx),
+            FeedbackCategory::Bug,
+            None,
+            None,
+            false,
+            &diagnostics,
+        );
+        let rendered = render_renderable(params.header.as_ref(), 60);
+        assert!(rendered.contains("Connectivity diagnostics"), "{rendered}");
+        assert!(rendered.contains("Connectivity probe failed"), "{rendered}");
+        assert!(rendered.contains("DNS lookup timed out"), "{rendered}");
+    }
+
+    #[test]
+    fn feedback_note_stays_inside_short_offset_area() {
+        let view = make_view(FeedbackCategory::Bug);
+        for height in 0..8 {
+            let area = Rect::new(3, 2, 24, height);
+            let input = view.input_area(area);
+            assert!(input.bottom() <= area.bottom());
+            let mut buf = Buffer::empty(area);
+            view.render(area, &mut buf);
+            if let Some((x, y)) = view.cursor_pos(area) {
+                assert!(area.contains((x, y).into()));
+            }
+        }
     }
 
     #[test]

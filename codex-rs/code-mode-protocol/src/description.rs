@@ -313,7 +313,14 @@ mod tests {
         assert!(description.contains("whole files when small or required"));
         assert!(!description.contains("never whole files"));
         assert!(description.contains("retained-artifact selectors after truncation"));
-        assert!(description.contains("Output defaults to the 10000-token hard cap"));
+        assert_eq!(
+            crate::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
+            crate::MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
+        );
+        assert!(description.contains(&format!(
+            "Output defaults to the {}-token hard cap",
+            crate::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
+        )));
         assert!(description.contains("smallest useful budget"));
         assert!(description.contains(r#"first-line `// @exec: {"max_output_tokens": 2000}`"#));
         assert!(
@@ -461,7 +468,14 @@ mod tests {
                     "required": ["cmd"],
                     (keyword): [{"properties": {"timeout": {"type": "number"}}}]
                 }),
-                "({ cmd: string; }) & ({ timeout?: number; })",
+                &format!(
+                    "({{ cmd: string; }}) & (string | number | boolean | null | unknown[] | {{ timeout?: number; }}){}",
+                    if keyword == "oneOf" {
+                        " /* oneOf: exactly one branch must match; consult JSON Schema */"
+                    } else {
+                        ""
+                    }
+                ),
             );
         }
         assert_input_declaration(
@@ -486,7 +500,10 @@ mod tests {
             "$ref": "#/$defs/base",
             "properties": {"path": {"type": "string"}}, "required": ["path"]
         });
-        assert_input_declaration(schema.clone(), "({ path: string; }) & ({ cmd: string; })");
+        assert_input_declaration(
+            schema.clone(),
+            "(string | number | boolean | null | unknown[] | { path: string; }) & ({ cmd: string; })",
+        );
         schema["$schema"] = json!("http://json-schema.org/draft-07/schema#");
         assert_input_declaration(schema, "{ cmd: string; }");
     }
@@ -646,5 +663,108 @@ mod tests {
         assert_input_declaration(deep, incomplete);
         // Exhaustion must not poison subsequent independent renders.
         assert_input_declaration(json!({"type": "string"}), "string");
+    }
+
+    #[test]
+    fn declarations_preserve_reviewed_schema_counterexamples() {
+        for (schema, expected) in [
+            (
+                json!({"$defs": {"a b": {"type": "integer"}, "a%20b": {"type": "boolean"}}, "$ref": "#/$defs/a%20b"}),
+                "number /* integer */",
+            ),
+            (
+                json!({"type": "object", "additionalProperties": false}),
+                "Record<string, never>",
+            ),
+            (
+                json!({"const": "ok", "required": ["id"]}),
+                "(string | number | boolean | null | unknown[] | { id: unknown; [key: string]: unknown; }) & (\"ok\")",
+            ),
+            (
+                json!({"items": false}),
+                "string | number | boolean | null | Array<never> | { [key: string]: unknown; }",
+            ),
+            (
+                json!({"required": ["id"], "items": false}),
+                "string | number | boolean | null | Array<never> | { id: unknown; [key: string]: unknown; }",
+            ),
+            (
+                json!({"type": "string", "pattern": "^[a-z]+$", "minLength": 1, "maxLength": 5}),
+                "string /* pattern: \"^[a-z]+$\"; minLength: 1; maxLength: 5 */",
+            ),
+            (
+                json!({"const": "ok", "type": "string", "pattern": "*/\n"}),
+                r#""ok" /* pattern: "* /\n" */"#,
+            ),
+            (
+                json!({"oneOf": [{"type": "number"}, {"type": "number"}]}),
+                "number | number /* oneOf: exactly one branch must match; consult JSON Schema */",
+            ),
+            (
+                json!({"type": "number", "not": {"const": 0}}),
+                "number /* unprojected keyword: not; consult JSON Schema */",
+            ),
+        ] {
+            assert_input_declaration(schema, expected);
+        }
+    }
+
+    #[test]
+    fn declarations_do_not_resolve_fragments_across_nested_resource_boundaries() {
+        let resource = json!({
+            "$id": "https://example.invalid/inner", "$defs": {"Value": {"type": "integer"}},
+            "$ref": "#/$defs/Value", "properties": {"value": {"$ref": "#/$defs/Value"}}
+        });
+        let incomplete = "unknown /* schema projection incomplete: nested $id resource not projected; consult JSON Schema */";
+        for reference in ["#/$defs/inner", "#/$defs/inner/properties/value"] {
+            assert_input_declaration(
+                json!({
+                    "$defs": {"Value": {"type": "string"}, "inner": resource}, "$ref": reference
+                }),
+                incomplete,
+            );
+        }
+        assert_input_declaration(
+            json!({
+                "$defs": {"Value": {"type": "string"}}, "type": "object",
+                "properties": {"inner": resource}, "required": ["inner"]
+            }),
+            &format!("{{ inner: {incomplete}; }}"),
+        );
+    }
+
+    #[test]
+    fn declarations_bound_reference_work_and_programmatically_constructed_literals() {
+        let incomplete = "unknown /* schema projection incomplete: rendering limit reached; consult the tool's JSON Schema */";
+        assert_input_declaration(
+            json!({"$ref": format!("#/{}", "x".repeat(200_000))}),
+            incomplete,
+        );
+        assert_input_declaration(
+            json!({"type": "string", "pattern": "x".repeat(200_000)}),
+            incomplete,
+        );
+        let mut literal = json!(0);
+        for _ in 0..70 {
+            literal = json!([literal]);
+        }
+        assert_input_declaration(json!({"const": literal}), incomplete);
+        assert_input_declaration(json!({"const": vec![0; 1024]}), incomplete);
+        assert_input_declaration(json!({"const": [1, {"ok": true}]}), r#"[1,{"ok":true}]"#);
+    }
+
+    #[test]
+    fn augmentation_preserves_exec_and_wait_definitions() {
+        for name in ["exec", "wait"] {
+            let definition = ToolDefinition {
+                name: name.to_string(),
+                tool_name: ToolName::plain(name),
+                description: "Direct tool.".to_string(),
+                kind: CodeModeToolKind::Function,
+                input_schema: Some(json!({"type": "string"})),
+                output_schema: None,
+            };
+            assert_eq!(augment_tool_definition(definition.clone()), definition);
+        }
     }
 }

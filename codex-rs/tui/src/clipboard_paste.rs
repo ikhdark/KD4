@@ -1,3 +1,5 @@
+use std::io::BufWriter;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use tempfile::Builder;
@@ -95,26 +97,24 @@ fn read_clipboard_image() -> Result<image::DynamicImage, PasteImageError> {
 
 fn encode_image_as_png(
     dyn_img: image::DynamicImage,
-) -> Result<(Vec<u8>, PastedImageInfo), PasteImageError> {
-    let mut png: Vec<u8> = Vec::new();
+    file: &mut std::fs::File,
+) -> Result<PastedImageInfo, PasteImageError> {
     {
-        let span =
-            tracing::debug_span!("encode_image", byte_length = tracing::field::Empty).entered();
-        let mut cursor = std::io::Cursor::new(&mut png);
+        let _span = tracing::debug_span!("encode_image").entered();
+        let mut writer = BufWriter::new(file);
         dyn_img
-            .write_to(&mut cursor, image::ImageFormat::Png)
+            .write_to(&mut writer, image::ImageFormat::Png)
             .map_err(|e| PasteImageError::EncodeFailed(e.to_string()))?;
-        span.record("byte_length", png.len());
+        writer
+            .flush()
+            .map_err(|e| PasteImageError::IoError(e.to_string()))?;
     }
 
-    Ok((
-        png,
-        PastedImageInfo {
-            width: dyn_img.width(),
-            height: dyn_img.height(),
-            encoded_format: EncodedImageFormat::Png,
-        },
-    ))
+    Ok(PastedImageInfo {
+        width: dyn_img.width(),
+        height: dyn_img.height(),
+        encoded_format: EncodedImageFormat::Png,
+    })
 }
 
 /// Read, encode and persist on a blocking worker, retaining cancellation cleanup until attachment.
@@ -130,7 +130,6 @@ pub(crate) async fn paste_image_to_temp_png(
         };
         #[cfg(not(test))]
         let image = read_clipboard_image()?;
-        let (png, info) = encode_image_as_png(image)?;
         let mut builder = Builder::new();
         builder.prefix("codex-clipboard-").suffix(".png");
         #[cfg(test)]
@@ -140,15 +139,9 @@ pub(crate) async fn paste_image_to_temp_png(
         };
         #[cfg(not(test))]
         let tmp = builder.tempfile();
-        let tmp = tmp.map_err(|e| PasteImageError::IoError(e.to_string()))?;
-        std::fs::write(tmp.path(), &png).map_err(|e| PasteImageError::IoError(e.to_string()))?;
-        // Prepare a cleanup owner before keep() so even a cancelled caller leaves no orphan.
-        let cleanup = tempfile::TempPath::try_from_path(tmp.path().to_path_buf())
-            .map_err(|e| PasteImageError::IoError(e.to_string()))?;
-        let (_file, _path) = tmp
-            .keep()
-            .map_err(|e| PasteImageError::IoError(e.error.to_string()))?;
-        Ok((cleanup, info))
+        let mut tmp = tmp.map_err(|e| PasteImageError::IoError(e.to_string()))?;
+        let info = encode_image_as_png(image, tmp.as_file_mut())?;
+        Ok((tmp.into_temp_path(), info))
     })
     .await
     .map_err(|e| PasteImageError::IoError(format!("clipboard image worker failed: {e}")))?
@@ -189,7 +182,7 @@ pub fn normalize_pasted_path(pasted: &str) -> Option<PathBuf> {
     }
 
     // shell-escaped single path â†’ unescaped
-    let parts: Vec<String> = shlex::Shlex::new(pasted).collect();
+    let parts = shlex::split(pasted)?;
     if parts.len() == 1 {
         let part = parts.into_iter().next()?;
         if let Some(path) = normalize_windows_path(&part) {
@@ -252,6 +245,35 @@ mod pasted_search_query_tests {
 #[cfg(test)]
 mod pasted_paths_tests {
     use super::*;
+
+    #[test]
+    fn malformed_suffix_does_not_accept_valid_prefix() {
+        assert_eq!(normalize_pasted_path("/tmp/good.png \""), None);
+        assert_eq!(normalize_pasted_path("/tmp/good.png \\"), None);
+    }
+
+    #[tokio::test]
+    async fn persisted_png_preserves_pixels_and_cleans_up() {
+        let directory = tempfile::tempdir().expect("directory");
+        let (path, info) = paste_image_to_temp_png(
+            Some(Box::new(|| {
+                Ok(image::DynamicImage::ImageRgba8(
+                    image::RgbaImage::from_pixel(2, 3, image::Rgba([12, 34, 56, 255])),
+                ))
+            })),
+            Some(directory.path().to_path_buf()),
+        )
+        .await
+        .expect("persist image");
+        let decoded = image::open(&path).expect("decode PNG").to_rgba8();
+        assert_eq!(decoded.dimensions(), (2, 3));
+        assert!(decoded.pixels().all(|pixel| pixel.0 == [12, 34, 56, 255]));
+        assert_eq!((info.width, info.height), (2, 3));
+        assert_eq!(info.encoded_format, EncodedImageFormat::Png);
+        let saved_path = path.to_path_buf();
+        drop(path);
+        assert!(!saved_path.exists());
+    }
 
     #[test]
     fn normalize_file_url_windows() {

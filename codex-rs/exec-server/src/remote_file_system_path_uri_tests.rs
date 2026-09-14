@@ -1,5 +1,7 @@
 #![allow(clippy::expect_used)]
 
+use codex_exec_server_protocol::JSONRPCError;
+use codex_exec_server_protocol::JSONRPCErrorError;
 use codex_exec_server_protocol::JSONRPCMessage;
 use codex_exec_server_protocol::JSONRPCResponse;
 use codex_protocol::models::PermissionProfile;
@@ -34,8 +36,14 @@ use crate::protocol::InitializeResponse;
 
 #[tokio::test]
 async fn remote_file_system_sends_path_and_sandbox_cwd_uris_without_native_conversion() {
+    timeout(Duration::from_secs(10), assert_remote_path_uris())
+        .await
+        .expect("complete remote path exchange should finish");
+}
+
+async fn assert_remote_path_uris() {
     let (websocket_url, captured_params, server) =
-        record_read_file_params(/*expected_requests*/ 2).await;
+        record_read_file_params(/*expected_requests*/ 2, None).await;
     let file_system = RemoteFileSystem::new(LazyRemoteExecServerClient::new(
         ExecServerTransportParams::websocket_url(
             websocket_url,
@@ -47,6 +55,7 @@ async fn remote_file_system_sends_path_and_sandbox_cwd_uris_without_native_conve
         PathUri::parse("file://server/share/src/main.rs").expect("valid UNC URI"),
     ];
     let sandbox_cwd = non_native_cwd();
+    assert!(sandbox_cwd.to_abs_path().is_err(), "cwd must be non-native");
     let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
         path: FileSystemPath::Special {
             value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
@@ -82,8 +91,46 @@ async fn remote_file_system_sends_path_and_sandbox_cwd_uris_without_native_conve
     server.await.expect("recording server should succeed");
 }
 
+#[tokio::test]
+async fn remote_file_system_preserves_server_error_categories() {
+    timeout(Duration::from_secs(10), async {
+        for (code, expected_kind) in [
+            (-32600, io::ErrorKind::InvalidInput),
+            (-32602, io::ErrorKind::InvalidInput),
+            (-32004, io::ErrorKind::NotFound),
+            (-32603, io::ErrorKind::Other),
+        ] {
+            let (url, captured_params, server) = record_read_file_params(1, Some(code)).await;
+            let file_system = RemoteFileSystem::new(LazyRemoteExecServerClient::new(
+                ExecServerTransportParams::websocket_url(
+                    url,
+                    DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT,
+                ),
+            ));
+            let path = non_native_cwd();
+            let error = file_system
+                .read_file(&path, None)
+                .await
+                .expect_err("server rejection");
+            assert_eq!(error.kind(), expected_kind, "server code {code}");
+            assert_eq!(error.to_string(), "rejected by test server");
+            assert_eq!(
+                captured_params.await.expect("captured request"),
+                vec![FsReadFileParams {
+                    path,
+                    sandbox: None,
+                }]
+            );
+            server.await.expect("recording server should succeed");
+        }
+    })
+    .await
+    .expect("complete remote error exchange should finish");
+}
+
 async fn record_read_file_params(
     expected_requests: usize,
+    error_code: Option<i64>,
 ) -> (
     String,
     oneshot::Receiver<Vec<FsReadFileParams>>,
@@ -113,17 +160,24 @@ async fn record_read_file_params(
                 serde_json::from_value(request.params.expect("fs/readFile params should exist"))
                     .expect("fs/readFile params should deserialize");
             captured_params.push(params);
-            write_jsonrpc_websocket(
-                &mut websocket,
-                JSONRPCMessage::Response(JSONRPCResponse {
+            let response = match error_code {
+                Some(code) => JSONRPCMessage::Error(JSONRPCError {
+                    id: request.id,
+                    error: JSONRPCErrorError {
+                        code,
+                        message: "rejected by test server".to_string(),
+                        data: None,
+                    },
+                }),
+                None => JSONRPCMessage::Response(JSONRPCResponse {
                     id: request.id,
                     result: serde_json::to_value(FsReadFileResponse {
                         data_base64: String::new(),
                     })
                     .expect("fs/readFile response should serialize"),
                 }),
-            )
-            .await;
+            };
+            write_jsonrpc_websocket(&mut websocket, response).await;
         }
         captured_params_tx
             .send(captured_params)

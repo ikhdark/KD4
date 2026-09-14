@@ -17,7 +17,7 @@ pub struct ResolvedReviewRequest {
 
 const UNCOMMITTED_PROMPT: &str = "Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings.";
 
-const BASE_BRANCH_PROMPT: &str = "Review the code changes against the base branch '{{base_branch}}'. The merge base commit for this comparison is {{merge_base_sha}}. Run `git diff {{merge_base_sha}}` to inspect the changes relative to {{base_branch}}. Provide prioritized, actionable findings.";
+const BASE_BRANCH_PROMPT: &str = "Review the code changes against the base branch '{{base_branch}}'. The merge base commit for this comparison is {{merge_base_sha}}. Run `git diff {{merge_base_sha}}` to inspect tracked changes relative to {{base_branch}}, including staged and unstaged edits. Provide prioritized, actionable findings.";
 static BASE_BRANCH_PROMPT_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
     Template::parse(BASE_BRANCH_PROMPT)
         .unwrap_or_else(|err| panic!("base branch review prompt must parse: {err}"))

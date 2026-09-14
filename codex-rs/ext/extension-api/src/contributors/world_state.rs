@@ -21,8 +21,13 @@ pub struct WorldStateContributionInput<'a> {
 
 /// What the harness knows about the previous value of one extension-owned section.
 pub enum PreviousWorldStateSection<'a> {
+    /// No reusable section baseline is available, including when required retained context is missing.
+    /// Render any current state the model needs without relying on an earlier value.
     Absent,
+    /// Prior section context exists, but its exact comparison value is unavailable.
+    /// Render an authoritative replacement or clearing update instead of a baseline-dependent delta.
     Unknown,
+    /// The host has an accepted comparison snapshot and any required retained-context evidence.
     Known(&'a Value),
 }
 
@@ -83,6 +88,11 @@ pub struct WorldStateSectionContribution {
 }
 
 impl WorldStateSectionContribution {
+    /// Captures one current state and its renderer.
+    ///
+    /// `render_diff` must describe `snapshot`. Capture the resolved data needed for rendering;
+    /// later mutations of extension state must not change which current state this contribution
+    /// renders. The host may render a contribution more than once.
     pub fn new(
         id: &'static str,
         snapshot: Value,
@@ -111,6 +121,10 @@ impl WorldStateSectionContribution {
     }
 
     /// Requires a matching model-visible fragment whenever a persisted snapshot is reused.
+    ///
+    /// A match must establish that retained context supports reusing the comparison baseline.
+    /// Recognizing an older fragment's envelope alone is insufficient when its contents no longer
+    /// support that baseline. Use the legacy matcher for compatibility cleanup instead.
     pub fn with_retained_fragment_matcher(
         mut self,
         matcher: impl Fn(&str, &str) -> bool + Send + Sync + 'static,
@@ -127,6 +141,12 @@ impl WorldStateSectionContribution {
         &self.snapshot
     }
 
+    /// Renders the captured snapshot relative to the host's available baseline.
+    ///
+    /// `None` means no model-visible update is needed; the host accepts the current snapshot even
+    /// though it emits no fragment. Use it only when that snapshot needs no new context, such as an
+    /// unchanged known value or an initially empty section. It must not mean rendering failed or
+    /// delivery should be deferred. An unavailable baseline cannot support an ordinary delta.
     pub fn render_diff(
         &self,
         previous: PreviousWorldStateSection<'_>,

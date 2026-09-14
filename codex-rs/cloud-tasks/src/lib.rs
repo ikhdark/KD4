@@ -495,7 +495,10 @@ fn format_task_status_lines(
             meta_parts.push(id.to_string());
         }
     }
-    let when = format_relative_time(now, task.updated_at);
+    let when = task
+        .updated_at
+        .map(|updated_at| format_relative_time(now, updated_at))
+        .unwrap_or_else(|| "unknown".to_string());
     meta_parts.push(if colorize {
         when.as_str()
             .if_supports_color(Stream::Stdout, |t| t.dimmed())
@@ -2432,7 +2435,7 @@ mod tests {
             id: TaskId("task_1".to_string()),
             title: "Example task".to_string(),
             status: TaskStatus::Ready,
-            updated_at: now,
+            updated_at: Some(now),
             environment_id: Some("env-1".to_string()),
             environment_label: Some("Env".to_string()),
             summary: DiffSummary {
@@ -2461,7 +2464,7 @@ mod tests {
             id: TaskId("task_2".to_string()),
             title: "No diff task".to_string(),
             status: TaskStatus::Pending,
-            updated_at: now,
+            updated_at: None,
             environment_id: Some("env-2".to_string()),
             environment_label: None,
             summary: DiffSummary::default(),
@@ -2473,7 +2476,7 @@ mod tests {
             lines,
             vec![
                 "[PENDING] No diff task".to_string(),
-                "env-2  •  0s ago".to_string(),
+                "env-2  •  unknown".to_string(),
                 "no diff".to_string(),
             ]
         );
@@ -2487,7 +2490,7 @@ mod tests {
                 id: TaskId("task_1/a?b#c% d\u{00e9}".to_string()),
                 title: "Example task".to_string(),
                 status: TaskStatus::Ready,
-                updated_at: now,
+                updated_at: Some(now),
                 environment_id: Some("env-1".to_string()),
                 environment_label: Some("Env".to_string()),
                 summary: DiffSummary {
@@ -2502,7 +2505,7 @@ mod tests {
                 id: TaskId("task_2".to_string()),
                 title: "No diff task".to_string(),
                 status: TaskStatus::Pending,
-                updated_at: now,
+                updated_at: Some(now),
                 environment_id: Some("env-2".to_string()),
                 environment_label: None,
                 summary: DiffSummary::default(),

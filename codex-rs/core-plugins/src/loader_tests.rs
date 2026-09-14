@@ -258,10 +258,10 @@ enabled = true
 }
 
 #[test]
-fn curated_plugin_cache_version_shortens_full_git_sha() {
+fn curated_plugin_cache_version_preserves_full_git_sha() {
     assert_eq!(
         curated_plugin_cache_version("0123456789abcdef0123456789abcdef01234567"),
-        "01234567"
+        "0123456789abcdef0123456789abcdef01234567"
     );
 }
 
@@ -374,6 +374,18 @@ fn load_plugin_hooks_discovers_default_hooks_file() {
 
     assert_eq!(warnings, Vec::<String>::new());
     assert_sources(&sources, &["hooks/hooks.json"]);
+}
+
+#[test]
+fn load_plugin_hooks_empty_declaration_disables_default_file() {
+    let (_tmp, root) = plugin_root();
+    write_hook_file(&root, "hooks/hooks.json", "PreToolUse", "echo default");
+    write_manifest(&root, r#"{"name":"demo-plugin"}"#);
+    assert_sources(&load_sources(&root).0, &["hooks/hooks.json"]);
+    write_manifest(&root, r#"{"name":"demo-plugin","hooks":[]}"#);
+    let (sources, warnings) = load_sources(&root);
+    assert!(warnings.is_empty());
+    assert!(sources.is_empty());
 }
 
 #[test]
@@ -503,11 +515,11 @@ fn load_plugin_hooks_supports_inline_manifest_hook_list() {
 fn materialize_git_subdir_uses_sparse_checkout() {
     let codex_home = tempfile::tempdir().expect("create codex home");
     let repo = tempfile::tempdir().expect("create git repo");
-    let plugin_dir = repo.path().join("plugins/toolkit");
+    let plugin_dir = repo.path().join("plugins/a[1]");
     fs::create_dir_all(&plugin_dir).expect("create plugin directory");
-    fs::create_dir_all(repo.path().join("plugins/other")).expect("create other plugin");
+    fs::create_dir_all(repo.path().join("plugins/a1")).expect("create other plugin");
     fs::write(plugin_dir.join("marker.txt"), "toolkit").expect("write plugin marker");
-    fs::write(repo.path().join("plugins/other/marker.txt"), "other").expect("write other marker");
+    fs::write(repo.path().join("plugins/a1/marker.txt"), "other").expect("write other marker");
     fs::write(repo.path().join("root.txt"), "root").expect("write root marker");
 
     run_git(&["init"], Some(repo.path())).expect("init git repo");
@@ -524,7 +536,7 @@ fn materialize_git_subdir_uses_sparse_checkout() {
         codex_home.path(),
         &MarketplacePluginSource::Git {
             url: repo.path().display().to_string(),
-            path: Some("plugins/toolkit".to_string()),
+            path: Some("plugins/a[1]".to_string()),
             ref_name: None,
             sha: None,
         },
@@ -535,7 +547,10 @@ fn materialize_git_subdir_uses_sparse_checkout() {
         plugin_dir.file_name(),
         materialized.path.as_path().file_name()
     );
-    assert!(materialized.path.as_path().join("marker.txt").is_file());
+    assert_eq!(
+        fs::read_to_string(materialized.path.as_path().join("marker.txt")).unwrap(),
+        "toolkit"
+    );
     let checkout_root = materialized
         .path
         .as_path()
@@ -543,7 +558,7 @@ fn materialize_git_subdir_uses_sparse_checkout() {
         .and_then(Path::parent)
         .expect("materialized path should be nested under checkout root");
     assert!(!checkout_root.join("root.txt").exists());
-    assert!(!checkout_root.join("plugins/other/marker.txt").exists());
+    assert!(!checkout_root.join("plugins/a1/marker.txt").exists());
 }
 
 #[test]
@@ -670,4 +685,74 @@ fn capability_loaders_yield_for_filesystem_discovery_and_preserve_invalid_manife
             mcp_contents
         );
     });
+}
+
+#[test]
+fn materialize_git_selectors_are_revisions_and_sha_takes_precedence() {
+    let home = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    write_file(&repo.path().join("release"), "tracked file");
+    write_file(&repo.path().join("marker"), "initial");
+    for args in [
+        vec!["init"],
+        vec!["config", "user.email", "test@example.com"],
+        vec!["config", "user.name", "Test"],
+        vec!["add", "."],
+        vec!["commit", "-m", "initial"],
+        vec!["tag", "initial"],
+    ] {
+        run_git(&args, Some(repo.path())).unwrap();
+    }
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let sha = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    write_file(&repo.path().join("marker"), "latest");
+    run_git(&["commit", "-am", "latest"], Some(repo.path())).unwrap();
+    for selector in ["release", "--detach"] {
+        let result = materialize_marketplace_plugin_source(
+            home.path(),
+            &MarketplacePluginSource::Git {
+                url: repo.path().display().to_string(),
+                path: None,
+                ref_name: Some(selector.to_string()),
+                sha: None,
+            },
+        );
+        assert!(
+            result.is_err(),
+            "{selector} must not be interpreted as a file or option"
+        );
+    }
+    let materialized = materialize_marketplace_plugin_source(
+        home.path(),
+        &MarketplacePluginSource::Git {
+            url: repo.path().display().to_string(),
+            path: None,
+            ref_name: Some("missing-ref".to_string()),
+            sha: Some(sha),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(materialized.path.join("marker")).unwrap(),
+        "initial"
+    );
+    let by_ref = materialize_marketplace_plugin_source(
+        home.path(),
+        &MarketplacePluginSource::Git {
+            url: repo.path().display().to_string(),
+            path: None,
+            ref_name: Some("initial".to_string()),
+            sha: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(by_ref.path.join("marker")).unwrap(),
+        "initial"
+    );
 }

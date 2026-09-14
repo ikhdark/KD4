@@ -7,13 +7,13 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::anyhow;
+#[cfg(not(unix))]
 use portable_pty::MasterPty;
 use portable_pty::PtySize;
 use portable_pty::SlavePty;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-use tokio::sync::watch;
 use tokio::task::AbortHandle;
 use tokio::task::JoinHandle;
 
@@ -56,6 +56,70 @@ pub(crate) trait ChildTerminator: Send + Sync {
     fn kill(&mut self) -> io::Result<()>;
 }
 
+// Numeric group control is valid only while the owned root cannot be reaped.
+#[cfg(unix)]
+pub(crate) struct ProcessGroupControl {
+    pid: u32,
+    active: StdMutex<bool>,
+}
+
+#[cfg(unix)]
+impl ProcessGroupControl {
+    pub(crate) fn new(pid: u32) -> Self {
+        Self {
+            pid,
+            active: StdMutex::new(true),
+        }
+    }
+
+    pub(crate) fn signal(&self, signal: ProcessSignal) -> io::Result<()> {
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*active {
+            return Ok(());
+        }
+        match signal {
+            ProcessSignal::Interrupt => crate::process_group::interrupt_process_group(self.pid),
+        }
+    }
+
+    pub(crate) fn kill(&self) -> io::Result<()> {
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *active {
+            crate::process_group::kill_process_group(self.pid)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) async fn disarm_after_exit(&self) {
+        // Only the backend waiter owns/reaps the child. WNOWAIT protects its identity
+        // until all in-flight signals finish and future signals have been disabled.
+        let mut warned = false;
+        loop {
+            match crate::process_group::wait_for_exit_without_reaping(self.pid).await {
+                Ok(()) => break,
+                Err(error) => {
+                    if !warned {
+                        log::warn!("failed to observe child exit without reaping: {error}");
+                        warned = true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+        *self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalSize {
     pub rows: u16,
@@ -80,7 +144,10 @@ impl From<TerminalSize> for PtySize {
 }
 
 pub(crate) enum PtyMasterHandle {
+    #[cfg(not(unix))]
     Resizable(Box<dyn MasterPty + Send>),
+    #[cfg(unix)]
+    Owned(std::fs::File),
 }
 
 pub struct PtyHandles {
@@ -182,7 +249,26 @@ impl ProcessHandle {
                 .map_err(|_| anyhow!("failed to lock PTY handles"))?;
             if let Some(handles) = handles.as_ref() {
                 return match &handles._master {
+                    #[cfg(not(unix))]
                     PtyMasterHandle::Resizable(master) => master.resize(size.into()),
+                    #[cfg(unix)]
+                    PtyMasterHandle::Owned(master) => {
+                        use std::os::fd::AsRawFd;
+                        let size = libc::winsize {
+                            ws_row: size.rows,
+                            ws_col: size.cols,
+                            ws_xpixel: 0,
+                            ws_ypixel: 0,
+                        };
+                        // SAFETY: master owns the descriptor and size is live winsize storage.
+                        if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ as _, &size) }
+                            == -1
+                        {
+                            Err(io::Error::last_os_error().into())
+                        } else {
+                            Ok(())
+                        }
+                    }
                 };
             }
         }
@@ -198,7 +284,8 @@ impl ProcessHandle {
         }
     }
 
-    /// Close the child's stdin channel.
+    /// Drop this handle's stdin sender. EOF follows queued input only after all
+    /// sender clones returned by `writer_sender` have also been dropped.
     pub fn close_stdin(&self) {
         if let Ok(mut writer_tx) = self.writer_tx.lock() {
             writer_tx.take();
@@ -215,9 +302,21 @@ impl ProcessHandle {
         if let Ok(mut killer_opt) = self.killer.lock() {
             killer_opt.take();
         }
-        if let Ok(mut handles) = self._pty_handles.lock() {
-            handles.take();
+        self.release_pty_handles();
+    }
+
+    fn release_pty_handles(&self) {
+        let handles = self._pty_handles.lock().ok().and_then(|mut h| h.take());
+        #[cfg(windows)]
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            // ClosePseudoConsole can wait for output to drain. Leave the async
+            // executor free to run the reader (or complete its cancellation).
+            if let Some(handles) = handles {
+                runtime.spawn_blocking(move || drop(handles));
+            }
+            return;
         }
+        drop(handles);
     }
 
     /// Attempts to kill the child while leaving the reader/writer tasks alive
@@ -287,9 +386,7 @@ impl ProcessHandle {
             // status. Dropping its handle detaches it instead of cancelling it.
             h.take();
         }
-        if let Ok(mut handles) = self._pty_handles.lock() {
-            handles.take();
-        }
+        self.release_pty_handles();
         if let Ok(mut resizer) = self.resizer.lock() {
             resizer.take();
         }
@@ -493,6 +590,155 @@ mod tests {
         );
         session.finish();
     }
+    async fn collect_split_output(mut output_rx: mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+        let mut collected = Vec::new();
+        while let Some(chunk) = output_rx.recv().await {
+            collected.extend_from_slice(&chunk);
+        }
+        collected
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn driver_backed_process_can_expose_split_stdout_and_stderr() -> anyhow::Result<()> {
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let (stdout_tx, stdout_driver_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
+        let (stderr_tx, stderr_driver_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
+
+        let spawned = spawn_from_driver(ProcessDriver {
+            writer_tx,
+            stdout_rx: stdout_driver_rx.into(),
+            stderr_rx: Some(stderr_driver_rx.into()),
+            exit_rx,
+            terminator: None,
+            writer_handle: None,
+            resizer: None,
+        });
+
+        let SpawnedProcess {
+            session: _session,
+            stdout_rx,
+            stderr_rx,
+            exit_rx,
+        } = spawned;
+        let stdout_task = tokio::spawn(async move { collect_split_output(stdout_rx).await });
+        let stderr_task = tokio::spawn(async move { collect_split_output(stderr_rx).await });
+
+        stdout_tx.send(b"driver-out".to_vec())?;
+        stderr_tx.send(b"driver-err".to_vec())?;
+        drop(stdout_tx);
+        drop(stderr_tx);
+        exit_tx.send(0).expect("send exit code");
+
+        let timeout = tokio::time::Duration::from_secs(2);
+        let code = tokio::time::timeout(timeout, exit_rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for driver exit"))?
+            .unwrap_or(-1);
+        let stdout = tokio::time::timeout(timeout, stdout_task)
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting to drain driver stdout"))??;
+        let stderr = tokio::time::timeout(timeout, stderr_task)
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting to drain driver stderr"))??;
+
+        assert_eq!(stdout, b"driver-out".to_vec());
+        assert_eq!(stderr, b"driver-err".to_vec());
+        assert_eq!(code, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn driver_backed_process_can_resize_via_resizer_hook() -> anyhow::Result<()> {
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let (_stdout_tx, stdout_driver_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
+        let (size_tx, size_rx) = tokio::sync::oneshot::channel::<TerminalSize>();
+
+        let size_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(size_tx)));
+        let spawned = spawn_from_driver(ProcessDriver {
+            writer_tx,
+            stdout_rx: stdout_driver_rx.into(),
+            stderr_rx: None,
+            exit_rx,
+            terminator: None,
+            writer_handle: None,
+            resizer: Some(Box::new(move |size| {
+                if let Ok(mut guard) = size_tx.lock()
+                    && let Some(size_tx) = guard.take()
+                {
+                    let _ = size_tx.send(size);
+                }
+                Ok(())
+            })),
+        });
+
+        spawned.session.resize(TerminalSize {
+            rows: 40,
+            cols: 120,
+        })?;
+        exit_tx.send(0).expect("send exit code");
+
+        let resized = tokio::time::timeout(tokio::time::Duration::from_secs(2), size_rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for resize"))?
+            .expect("receive resized terminal size");
+        assert_eq!(
+            resized,
+            TerminalSize {
+                rows: 40,
+                cols: 120
+            }
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn driver_backed_process_drains_output_that_arrives_after_exit_signal()
+    -> anyhow::Result<()> {
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let (stdout_tx, stdout_driver_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
+
+        let spawned = spawn_from_driver(ProcessDriver {
+            writer_tx,
+            stdout_rx: stdout_driver_rx.into(),
+            stderr_rx: None,
+            exit_rx,
+            terminator: None,
+            writer_handle: None,
+            resizer: None,
+        });
+
+        let SpawnedProcess {
+            session: _session,
+            stdout_rx,
+            stderr_rx: _stderr_rx,
+            exit_rx,
+        } = spawned;
+        let stdout_task = tokio::spawn(async move { collect_split_output(stdout_rx).await });
+
+        exit_tx.send(0).expect("send exit code");
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        stdout_tx.send(b"tail".to_vec())?;
+        drop(stdout_tx);
+
+        let timeout = tokio::time::Duration::from_secs(2);
+        let code = tokio::time::timeout(timeout, exit_rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for driver exit"))?
+            .unwrap_or(-1);
+        let stdout = tokio::time::timeout(timeout, stdout_task)
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting to drain driver stdout"))??;
+
+        assert_eq!(stdout, b"tail".to_vec());
+        assert_eq!(code, 0);
+
+        Ok(())
+    }
 }
 
 /// Adapts a closure into a `ChildTerminator` implementation.
@@ -513,7 +759,8 @@ impl ChildTerminator for ClosureTerminator {
     }
 }
 
-/// Combine split stdout/stderr receivers into a single broadcast receiver.
+/// Combine split stdout/stderr receivers into a lossy broadcast convenience receiver.
+/// Slow consumers may lag and lose chunks; retain split receivers for exact byte delivery.
 pub fn combine_output_receivers(
     mut stdout_rx: mpsc::Receiver<Vec<u8>>,
     mut stderr_rx: mpsc::Receiver<Vec<u8>>,
@@ -618,47 +865,29 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
 
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(256);
     let (stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(256);
-    let (exit_seen_tx, exit_seen_rx) = watch::channel(false);
-    let spawn_stream_reader =
-        |mut output_rx: ProcessOutputReceiver,
-         output_tx: mpsc::Sender<Vec<u8>>,
-         mut exit_seen_rx: watch::Receiver<bool>| {
-            tokio::spawn(async move {
-                loop {
-                    let recv_result = if *exit_seen_rx.borrow() {
-                        // Once exit has been observed, we no longer want a timer here. Some
-                        // backends publish the exit code before their final stdout/stderr bytes
-                        // have been forwarded through the broadcast channel, so a fixed grace
-                        // period can still drop the tail of the stream under load.
-                        //
-                        // Instead, keep waiting until the driver closes the broadcast sender.
-                        // That makes the shutdown contract explicit: the backend is responsible
-                        // for dropping its sender when it has truly finished forwarding output.
-                        output_rx.recv().await
-                    } else {
-                        tokio::select! {
-                            _ = exit_seen_rx.changed() => {
-                                continue;
-                            }
-                            result = output_rx.recv() => result,
+    let spawn_stream_reader = |mut output_rx: ProcessOutputReceiver,
+                               output_tx: mpsc::Sender<Vec<u8>>| {
+        tokio::spawn(async move {
+            // Drivers must close their output senders after forwarding the final bytes,
+            // which can arrive after their exit notification.
+            loop {
+                let recv_result = output_rx.recv().await;
+                match recv_result {
+                    Ok(chunk) => {
+                        if output_tx.send(chunk).await.is_err() {
+                            break;
                         }
-                    };
-                    match recv_result {
-                        Ok(chunk) => {
-                            if output_tx.send(chunk).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(ProcessOutputRecvError::Lagged) => continue,
-                        Err(ProcessOutputRecvError::Closed) => break,
                     }
+                    Err(ProcessOutputRecvError::Lagged) => continue,
+                    Err(ProcessOutputRecvError::Closed) => break,
                 }
-            })
-        };
-    let reader_handle = spawn_stream_reader(stdout_driver_rx, stdout_tx, exit_seen_rx.clone());
+            }
+        })
+    };
+    let reader_handle = spawn_stream_reader(stdout_driver_rx, stdout_tx);
     let stderr_reader_handle = stderr_driver_rx
         .take()
-        .map(|rx| spawn_stream_reader(rx, stderr_tx, exit_seen_rx));
+        .map(|rx| spawn_stream_reader(rx, stderr_tx));
 
     let writer_handle = writer_handle.unwrap_or_else(|| tokio::spawn(async {}));
 
@@ -670,7 +899,6 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
     let wait_handle = tokio::spawn(async move {
         let code = exit_rx.await.unwrap_or(-1);
         publish_exit_status(&wait_exit_status, &wait_exit_code, code);
-        let _ = exit_seen_tx.send(true);
         let _ = exit_tx.send(code);
     });
 

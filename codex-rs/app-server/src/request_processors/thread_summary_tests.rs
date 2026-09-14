@@ -40,6 +40,15 @@ fn extract_conversation_summary_prefers_plain_user_messages() -> Result<()> {
         }),
     ];
 
+    let items = head[1..]
+        .iter()
+        .map(|item| serde_json::from_value(item.clone()).map(RolloutItem::ResponseItem))
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    assert_eq!(
+        super::super::thread_processor::preview_from_rollout_items(&items),
+        "Count to 5"
+    );
+
     let session_meta = serde_json::from_value::<SessionMeta>(head[0].clone())?;
 
     let summary = extract_conversation_summary(

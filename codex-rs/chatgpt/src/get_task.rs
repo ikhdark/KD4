@@ -37,6 +37,10 @@ pub struct OutputDiff {
 }
 
 pub(crate) async fn get_task(config: &Config, task_id: String) -> anyhow::Result<GetTaskResponse> {
+    anyhow::ensure!(
+        !matches!(task_id.as_str(), "" | "." | ".."),
+        "Task ID must not be empty or a URL dot segment"
+    );
     let auth_manager =
         AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
     let auth = auth_manager
@@ -101,5 +105,34 @@ mod tests {
         assert_eq!(requests[0].url.query(), None);
         assert_eq!(requests[0].url.fragment(), None);
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn get_task_rejects_empty_and_dot_segments_before_requesting() {
+        let home = tempfile::tempdir().expect("Codex home");
+        let mut config = ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .fallback_cwd(Some(home.path().to_path_buf()))
+            .build()
+            .await
+            .expect("config");
+        let server = MockServer::start().await;
+        config.chatgpt_base_url = server.uri();
+        for task_id in ["", ".", ".."] {
+            let error = get_task(&config, task_id.to_string())
+                .await
+                .expect_err("invalid ID");
+            assert_eq!(
+                error.to_string(),
+                "Task ID must not be empty or a URL dot segment"
+            );
+        }
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty()
+        );
     }
 }

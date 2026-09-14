@@ -3,11 +3,32 @@ use crate::mcp_types::McpServerTransportConfig;
 use regex_lite::Regex;
 use serde::Deserialize;
 
-#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(untagged)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpServerIdentity {
     Command { command: String },
     Url { url: String },
+}
+
+impl<'de> Deserialize<'de> for McpServerIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Keep legacy extra-field tolerance, but never discard another identity.
+        #[derive(Deserialize)]
+        struct RawIdentity {
+            command: Option<String>,
+            url: Option<String>,
+        }
+        let raw = RawIdentity::deserialize(deserializer)?;
+        match (raw.command, raw.url) {
+            (Some(command), None) => Ok(Self::Command { command }),
+            (None, Some(url)) => Ok(Self::Url { url }),
+            _ => Err(serde::de::Error::custom(
+                "MCP identity must specify exactly one of command or url",
+            )),
+        }
+    }
 }
 
 /// String matching operations available to managed MCP server matchers.

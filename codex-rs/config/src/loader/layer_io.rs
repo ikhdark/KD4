@@ -77,6 +77,7 @@ pub(super) async fn read_config_from_path(
     match fs.read_file_text(&path_uri, /*sandbox*/ None).await {
         Ok(contents) => match toml::from_str::<TomlValue>(&contents) {
             Ok(value) => {
+                let value = super::migrate_config_toml(value, path.as_path())?;
                 if strict_config {
                     validate_config_toml_strictly(path, &contents, &value)?;
                 }

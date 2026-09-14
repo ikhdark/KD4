@@ -67,7 +67,14 @@ pub(crate) fn external_agent_config_migration_groups(
             .map(|details| details.sessions.len())
             .sum::<usize>();
         groups.push(ExternalAgentConfigMigrationGroupModel {
-            label: format!("Chat sessions ({session_count})"),
+            label: if chat_sessions
+                .iter()
+                .any(|idx| items[*idx].details.is_none())
+            {
+                "Chat sessions".to_string()
+            } else {
+                format!("Chat sessions ({session_count})")
+            },
             description: "Last 30 days of chats",
             item_indices: chat_sessions,
         });

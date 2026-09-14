@@ -147,7 +147,7 @@ pub(crate) fn append_inference_completion(
         inference_call_id: inference_call_id.to_string(),
         response_id: Some(response_id.to_string()),
         upstream_request_id: None,
-        response_payload,
+        response_payload: Some(response_payload),
     })?;
     Ok(())
 }
@@ -186,7 +186,7 @@ pub(crate) fn append_completed_inference(
             inference_call_id: inference_id.to_string(),
             response_id: Some(format!("resp-{inference_id}")),
             upstream_request_id: None,
-            response_payload: response,
+            response_payload: Some(response),
         },
     )?;
     Ok(())

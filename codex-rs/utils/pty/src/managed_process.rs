@@ -83,15 +83,56 @@ pub struct ManagedRootProcess {
     job: crate::win::JobObject,
 }
 
+#[derive(Debug)]
+struct AdmissionCapacityExhausted;
+
+impl std::fmt::Display for AdmissionCapacityExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "managed root process limit reached ({MANAGED_ROOT_LIMIT})"
+        )
+    }
+}
+
+impl std::error::Error for AdmissionCapacityExhausted {}
+
+fn reclaimable_reservation(
+    result: io::Result<ManagedRootProcess>,
+) -> io::Result<Option<ManagedRootProcess>> {
+    match result {
+        Ok(root) => Ok(Some(root)),
+        Err(error)
+            if error
+                .get_ref()
+                .is_some_and(<dyn std::error::Error + Send + Sync>::is::<AdmissionCapacityExhausted>) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[test]
+fn reservation_failure_classification_preserves_native_errors() {
+    assert!(matches!(
+        reclaimable_reservation(Err(io::Error::other(AdmissionCapacityExhausted))),
+        Ok(None)
+    ));
+    let error = match reclaimable_reservation(Err(io::Error::from_raw_os_error(5))) {
+        Err(error) => error,
+        Ok(_) => panic!("native allocation failure must not trigger capacity reclamation"),
+    };
+    assert_eq!(error.raw_os_error(), Some(5));
+}
+
 impl ManagedRootProcess {
     /// Reserve one of the process-wide managed-root slots before spawning.
     pub fn reserve() -> io::Result<Self> {
         let mut current = MANAGED_ROOT_COUNT.load(Ordering::Acquire);
         loop {
             if current >= MANAGED_ROOT_LIMIT {
-                return Err(io::Error::other(format!(
-                    "managed root process limit reached ({MANAGED_ROOT_LIMIT})"
-                )));
+                return Err(io::Error::other(AdmissionCapacityExhausted));
             }
             match MANAGED_ROOT_COUNT.compare_exchange_weak(
                 current,
@@ -145,12 +186,8 @@ impl ManagedRootProcess {
     }
 
     async fn reserve_with_reclaim_timeout(reclaim_timeout: Duration) -> io::Result<Self> {
-        match Self::reserve_on_worker().await {
-            Ok(root) => return Ok(root),
-            Err(error) if MANAGED_ROOT_COUNT.load(Ordering::Acquire) < MANAGED_ROOT_LIMIT => {
-                return Err(error);
-            }
-            Err(_) => {}
+        if let Some(root) = reclaimable_reservation(Self::reserve_on_worker().await)? {
+            return Ok(root);
         }
 
         let reclaim = async {
@@ -161,7 +198,7 @@ impl ManagedRootProcess {
                 .map_err(|error| {
                     io::Error::other(format!("admission reclaimer closed: {error}"))
                 })?;
-            if let Ok(root) = Self::reserve_on_worker().await {
+            if let Some(root) = reclaimable_reservation(Self::reserve_on_worker().await)? {
                 return Ok(root);
             }
 
@@ -179,12 +216,12 @@ impl ManagedRootProcess {
             for reclaimer in &reclaimers {
                 (reclaimer.retire_zero_lease_mcp_generations)().await;
             }
-            if let Ok(root) = Self::reserve_on_worker().await {
+            if let Some(root) = reclaimable_reservation(Self::reserve_on_worker().await)? {
                 return Ok(root);
             }
             for reclaimer in reclaimers {
                 (reclaimer.evict_one_eligible_task)().await;
-                if let Ok(root) = Self::reserve_on_worker().await {
+                if let Some(root) = reclaimable_reservation(Self::reserve_on_worker().await)? {
                     return Ok(root);
                 }
             }

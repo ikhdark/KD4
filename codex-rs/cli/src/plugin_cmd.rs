@@ -218,7 +218,7 @@ pub async fn run_plugin_list(
         codex_home.as_path(),
         &plugins_input,
         &outcome.errors,
-        /*marketplace_name*/ None,
+        args.marketplace_name.as_deref(),
     )?;
 
     let marketplaces = outcome
@@ -349,6 +349,9 @@ impl JsonPluginListOutput {
         for marketplace in marketplaces {
             let marketplace_source = marketplace_sources.get(&marketplace.name).cloned();
             for plugin in marketplace.plugins {
+                if !include_available && !plugin.installed {
+                    continue;
+                }
                 let entry = JsonPluginListEntry::from_configured_plugin(
                     &marketplace.name,
                     marketplace_source.clone(),
@@ -679,7 +682,7 @@ fn find_marketplace_for_plugin(
         &outcome.errors,
         Some(marketplace_name),
     )?;
-    let matches = outcome
+    let mut matches = outcome
         .marketplaces
         .into_iter()
         .filter(|marketplace| marketplace.name == marketplace_name)
@@ -688,13 +691,14 @@ fn find_marketplace_for_plugin(
                 .plugins
                 .iter()
                 .any(|plugin| plugin.name == plugin_name)
-        })
-        .collect::<Vec<_>>();
+        });
 
-    match matches.as_slice() {
-        [] => bail!("plugin `{plugin_name}` was not found in marketplace `{marketplace_name}`"),
-        [marketplace] => Ok(marketplace.clone()),
-        _ => bail!(
+    match (matches.next(), matches.next()) {
+        (None, _) => {
+            bail!("plugin `{plugin_name}` was not found in marketplace `{marketplace_name}`")
+        }
+        (Some(marketplace), None) => Ok(marketplace),
+        (Some(_), Some(_)) => bail!(
             "plugin `{plugin_name}` in marketplace `{marketplace_name}` matched multiple marketplace roots"
         ),
     }

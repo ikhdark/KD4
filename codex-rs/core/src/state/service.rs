@@ -299,6 +299,7 @@ impl SessionServices {
         runtime
     }
 
+    #[expect(clippy::expect_used, reason = "The private publication semaphore is never closed")]
     pub(crate) async fn shutdown_mcp_managers(&self) {
         // Refresh checks this token under the same publication semaphore before
         // installing its manager. No new generation can escape the shutdown drain.

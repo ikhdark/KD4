@@ -7,8 +7,6 @@ use codex_protocol::ThreadId;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
-use rmcp::model::ErrorData;
-use rmcp::model::RequestId;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -49,18 +47,42 @@ pub(crate) async fn handle_patch_approval_request(
     changes: HashMap<PathBuf, FileChange>,
     outgoing: Arc<OutgoingMessageSender>,
     codex: Arc<CodexThread>,
-    request_id: RequestId,
     tool_call_id: String,
     event_id: String,
     thread_id: ThreadId,
     cancellation: tokio_util::sync::CancellationToken,
 ) {
     let approval_id = call_id.clone();
+    if !outgoing.supports_form_elicitation() {
+        let _ = codex
+            .submit(Op::PatchApproval {
+                id: approval_id,
+                decision: ReviewDecision::Denied,
+            })
+            .await;
+        return;
+    }
     let mut message_lines = Vec::new();
     if let Some(r) = &reason {
         message_lines.push(r.clone());
     }
     message_lines.push("Allow Codex to apply proposed code changes?".to_string());
+
+    let mut paths = changes.keys().collect::<Vec<_>>();
+    paths.sort();
+    for path in paths.iter().take(20) {
+        message_lines.push(format!("- {}", path.display()));
+    }
+    if paths.len() > 20 {
+        message_lines.push(format!(
+            "... and {} more files (see codex_changes).",
+            paths.len() - 20
+        ));
+    }
+    message_lines.push(match &grant_root {
+        Some(root) => format!("Requested write grant: {}", root.display()),
+        None => "Scope: these proposed changes only.".to_string(),
+    });
 
     let params = PatchApprovalElicitRequestParams {
         message: message_lines.join("\n"),
@@ -80,17 +102,33 @@ pub(crate) async fn handle_patch_approval_request(
             let message = format!("Failed to serialize PatchApprovalElicitRequestParams: {err}");
             error!("{message}");
 
-            outgoing
-                .send_error(request_id.clone(), ErrorData::invalid_params(message, None))
+            let _ = codex
+                .submit(Op::PatchApproval {
+                    id: approval_id,
+                    decision: ReviewDecision::Denied,
+                })
                 .await;
 
             return;
         }
     };
 
-    let pending = outgoing
+    let pending = match outgoing
         .send_request("elicitation/create", Some(params_json))
-        .await;
+        .await
+    {
+        Ok(pending) => pending,
+        Err(err) => {
+            error!("failed to request patch approval: {err:?}");
+            let _ = codex
+                .submit(Op::PatchApproval {
+                    id: approval_id,
+                    decision: ReviewDecision::Denied,
+                })
+                .await;
+            return;
+        }
+    };
 
     // Listen for the response on a separate task so we don't block the main agent loop.
     {

@@ -1780,6 +1780,60 @@ async fn thread_goal_set_preserves_budget_limited_same_objective() -> Result<()>
     assert_eq!(replacement.goal.tokens_used, 0);
     assert_eq!(replacement.goal.time_used_seconds, 0);
 
+    let previous_goal = state_db
+        .thread_goals()
+        .get_thread_goal(persisted_id)
+        .await?
+        .unwrap();
+    let invalid_id = mcp
+        .send_raw_request(
+            "thread/goal/set",
+            Some(json!({
+                "threadId": thread.id, "replace": true,
+            })),
+        )
+        .await?;
+    let error = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(invalid_id)),
+    )
+    .await??;
+    assert_eq!(error.error.code, -32600);
+    assert_eq!(
+        state_db
+            .thread_goals()
+            .get_thread_goal(persisted_id)
+            .await?,
+        Some(previous_goal.clone())
+    );
+    let atomic_id = mcp
+        .send_raw_request(
+            "thread/goal/set",
+            Some(json!({
+                "threadId": thread.id, "replace": true,
+                "objective": "start a different goal", "status": "paused",
+            })),
+        )
+        .await?;
+    let atomic_resp = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(atomic_id)),
+    )
+    .await??;
+    let atomic: ThreadGoalSetResponse = to_response(atomic_resp)?;
+    assert_ne!(
+        state_db
+            .thread_goals()
+            .get_thread_goal(persisted_id)
+            .await?
+            .unwrap()
+            .goal_id,
+        previous_goal.goal_id
+    );
+    assert_eq!(atomic.goal.objective, "start a different goal");
+    assert_eq!(atomic.goal.status, ThreadGoalStatus::Paused);
+    assert_eq!(atomic.goal.token_budget, None);
+
     let clear_id = mcp
         .send_raw_request("thread/goal/clear", Some(json!({"threadId": thread.id})))
         .await?;
@@ -2388,6 +2442,15 @@ async fn thread_resume_token_usage_replay_ignores_stale_interrupted_tail_turn() 
                 message: "Still running".to_string(),
                 phase: None,
                 memory_citation: None,
+            }))?,
+        })
+        .to_string(),
+        json!({
+            "timestamp": meta_rfc3339,
+            "type": "event_msg",
+            "payload": serde_json::to_value(EventMsg::TokenCount(TokenCountEvent {
+                info: None,
+                rate_limits: None,
             }))?,
         })
         .to_string(),

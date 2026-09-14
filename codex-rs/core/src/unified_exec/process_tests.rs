@@ -814,21 +814,22 @@ async fn stalled_stdin_acknowledgement_is_not_replayed_and_preserves_unconfirmed
         assert_eq!(writes.load(Ordering::Acquire), 1);
         assert_eq!(acknowledgements.load(Ordering::Acquire), 0);
         assert_eq!(termination.calls.load(Ordering::Acquire), 1);
-        let store = manager.process_store.lock().await;
-        if termination_fails {
-            assert!(error.contains("process termination was not confirmed"));
-            assert!(!process.has_exited());
-            assert!(
-                store
-                    .processes
-                    .get(&process_id)
-                    .is_some_and(|entry| Arc::ptr_eq(&entry.process, &process))
-            );
-        } else {
-            assert!(process.has_exited());
-            assert!(!store.processes.contains_key(&process_id));
+        {
+            let store = manager.process_store.lock().await;
+            if termination_fails {
+                assert!(error.contains("process termination was not confirmed"));
+                assert!(!process.has_exited());
+                assert!(
+                    store
+                        .processes
+                        .get(&process_id)
+                        .is_some_and(|entry| Arc::ptr_eq(&entry.process, &process))
+                );
+            } else {
+                assert!(process.has_exited());
+                assert!(!store.processes.contains_key(&process_id));
+            }
         }
-        drop(store);
         // A cancelled acknowledgement cannot later complete or replay the write.
         tokio::time::advance(Duration::from_secs(60)).await;
         assert_eq!(writes.load(Ordering::Acquire), 1);

@@ -58,7 +58,7 @@ pub(crate) fn accepted_line_counts_from_unified_diff(unified_diff: &str) -> Acce
 pub fn accepted_line_fingerprints_from_unified_diff(
     unified_diff: &str,
 ) -> AcceptedLineFingerprintSummary {
-    let mut current_path: Option<String> = None;
+    let mut current_path_hash: Option<String> = None;
     let mut in_hunk = false;
     let mut accepted_added_lines = 0;
     let mut accepted_deleted_lines = 0;
@@ -66,7 +66,7 @@ pub fn accepted_line_fingerprints_from_unified_diff(
 
     for line in unified_diff.lines() {
         if line.starts_with("diff --git ") {
-            current_path = None;
+            current_path_hash = None;
             in_hunk = false;
             continue;
         }
@@ -77,21 +77,22 @@ pub fn accepted_line_fingerprints_from_unified_diff(
         }
 
         if !in_hunk && let Some(path) = line.strip_prefix("+++ ") {
-            current_path = normalize_diff_path(path);
+            current_path_hash =
+                normalize_diff_path(path).map(|path| fingerprint_hash_bytes("path", &path));
             continue;
         }
 
-        if !in_hunk && line.starts_with("--- ") {
+        if !in_hunk {
             continue;
         }
 
         if let Some(added_line) = line.strip_prefix('+') {
             accepted_added_lines += 1;
-            if let Some(path) = current_path.as_deref()
+            if let Some(path_hash) = current_path_hash.as_ref()
                 && let Some(normalized_line) = normalize_effective_line(added_line)
             {
                 line_fingerprints.push(AcceptedLineFingerprint {
-                    path_hash: fingerprint_hash("path", path),
+                    path_hash: path_hash.clone(),
                     line_hash: fingerprint_hash("line", &normalized_line),
                 });
             }
@@ -111,11 +112,15 @@ pub fn accepted_line_fingerprints_from_unified_diff(
 }
 
 pub fn fingerprint_hash(domain: &str, value: &str) -> String {
+    fingerprint_hash_bytes(domain, value.as_bytes())
+}
+
+fn fingerprint_hash_bytes(domain: &str, value: &[u8]) -> String {
     let mut hasher = sha1::Sha1::new();
     hasher.update(b"file-line-v1\0");
     hasher.update(domain.as_bytes());
     hasher.update(b"\0");
-    hasher.update(value.as_bytes());
+    hasher.update(value);
     format!("{:x}", hasher.finalize())
 }
 
@@ -165,17 +170,25 @@ pub async fn accepted_line_repo_hash_for_cwd(cwd: &Path) -> Option<String> {
         })
 }
 
-fn normalize_diff_path(path: &str) -> Option<String> {
-    let path = path.trim();
-    if path == "/dev/null" {
+fn normalize_diff_path(path: &str) -> Option<Vec<u8>> {
+    let path = if let Some(quoted) = path
+        .strip_prefix('"')
+        .and_then(|path| path.strip_suffix('"'))
+    {
+        codex_git_utils::unescape_c_bytes(quoted)
+    } else {
+        // Git may terminate an unquoted path with a tab; spaces are filename data.
+        path.split('\t').next()?.as_bytes().to_vec()
+    };
+    if path == b"/dev/null" {
         return None;
     }
 
     Some(
-        path.strip_prefix("b/")
-            .or_else(|| path.strip_prefix("a/"))
-            .unwrap_or(path)
-            .to_string(),
+        path.strip_prefix(b"b/")
+            .or_else(|| path.strip_prefix(b"a/"))
+            .unwrap_or(&path)
+            .to_vec(),
     )
 }
 
@@ -196,6 +209,43 @@ fn normalize_effective_line(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fingerprints_decode_git_paths_and_preserve_filename_spaces() {
+        for (header, path) in [
+            (r#""b/src/\303\251.rs""#, "src/é.rs"),
+            ("b/src/é.rs", "src/é.rs"),
+            (r#""b/src/a\tb\"c\\d.rs""#, "src/a\tb\"c\\d.rs"),
+            ("b/ spaced.rs \t", " spaced.rs "),
+        ] {
+            let diff =
+                format!("diff --git ignored\n+++ {header}\n@@ -0,0 +1 @@\n+let value = 1;\n");
+            let summary = accepted_line_fingerprints_from_unified_diff(&diff);
+            assert_eq!(
+                summary.line_fingerprints,
+                vec![AcceptedLineFingerprint {
+                    path_hash: fingerprint_hash("path", path),
+                    line_hash: fingerprint_hash("line", "let value = 1;"),
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn both_parsers_ignore_changes_outside_hunks() {
+        let diff = "diff --git a/a b/a\n+++ b/a\n+ignore this\n-ignore this too\n@@ -1 +1 @@\n-old value\n+new value\ndiff --git a/b b/b\n+ignore again\n";
+        let summary = accepted_line_fingerprints_from_unified_diff(diff);
+        assert_eq!(summary.accepted_added_lines, 1);
+        assert_eq!(summary.accepted_deleted_lines, 1);
+        assert_eq!(summary.line_fingerprints.len(), 1);
+        assert_eq!(
+            accepted_line_counts_from_unified_diff(diff),
+            AcceptedLineCounts {
+                accepted_added_lines: 1,
+                accepted_deleted_lines: 1,
+            }
+        );
+    }
 
     #[test]
     fn parses_counts_and_effective_added_fingerprints() {

@@ -15,6 +15,20 @@ from scripts.check_blob_size import ChangedBlob
 
 
 class CheckBlobSizeTest(unittest.TestCase):
+    def test_size_only_diff_includes_type_changes_without_numstat(self):
+        def git(*args):
+            self.assertIn("--name-only", args)
+            self.assertIn("--diff-filter=AMT", args)
+            self.assertNotIn("--numstat", args)
+            return "file\nwith-newline\0"
+
+        self.assertEqual(
+            check_blob_size.get_changed_paths(
+                "BASE", "HEAD", include_kind=False, run_git_func=git
+            ),
+            [check_blob_size.ChangedPath("file\nwith-newline", False)],
+        )
+
     def test_run_git_is_anchored_at_repo_root(self) -> None:
         with mock.patch.object(check_blob_size.subprocess, "run") as run:
             run.return_value.stdout = "ok\n"
@@ -92,8 +106,9 @@ class CheckBlobSizeTest(unittest.TestCase):
     def test_explicit_paths_with_kind_preserve_paths_missing_from_diff(self) -> None:
         def fake_git(*args: str, input_text: str | None = None) -> str:
             if args[:2] == ("diff", "--numstat"):
-                self.assertNotIn("a.txt", args)
-                self.assertNotIn("b.bin", args)
+                self.assertEqual(
+                    args[args.index("--") + 1 :], (":(literal)a.txt", ":(literal)b.bin")
+                )
                 return "-\t-\tb.bin\0"
             if args[:3] == (
                 "cat-file",
@@ -124,8 +139,11 @@ class CheckBlobSizeTest(unittest.TestCase):
     def test_explicit_paths_with_kind_do_not_expand_git_command_line(self) -> None:
         paths = [f"generated/path-{index:05d}.bin" for index in range(10_000)]
 
+        observed = []
+
         def fake_git(*args: str, input_text: str | None = None) -> str:
-            self.assertLess(len(args), 10)
+            self.assertLess(sum(len(arg) * 2 + 3 for arg in args), 8300)
+            observed.extend(args[args.index("--") + 1 :])
             self.assertIsNone(input_text)
             return ""
 
@@ -137,6 +155,7 @@ class CheckBlobSizeTest(unittest.TestCase):
             run_git_func=fake_git,
         )
 
+        self.assertEqual(observed, [f":(literal){path}" for path in paths])
         self.assertEqual(len(changed), len(paths))
         self.assertFalse(any(path.is_binary for path in changed))
 

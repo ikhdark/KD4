@@ -809,7 +809,7 @@ fn strip_tracked_root<'a>(path: &'a Path, root: &Path) -> Option<&'a Path> {
                 return None;
             }
         }
-        return Some(components.as_path());
+        Some(components.as_path())
     }
     #[cfg(not(windows))]
     None

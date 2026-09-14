@@ -843,25 +843,23 @@ impl PluginRequestProcessor {
             Some(self.effective_plugins_changed_callback()),
         );
 
-        let (mut data, marketplace_load_errors) = self
-            .load_local_installed_and_suggested_plugins(
+        let (local, remote) = tokio::join!(
+            self.load_local_installed_and_suggested_plugins(
                 plugins_manager.clone(),
                 &config,
                 &plugins_input,
                 roots,
                 install_suggestion_plugin_names,
-            )
-            .await?;
-
-        data.extend(
+            ),
             self.load_remote_installed_plugins(
                 plugins_manager,
                 &plugins_input,
                 &remote_installed_plugin_visible_marketplaces,
                 auth.as_ref(),
-            )
-            .await,
+            ),
         );
+        let (mut data, marketplace_load_errors) = local?;
+        data.extend(remote);
         filter_openai_curated_installed_conflicts(
             &mut data,
             config.features.enabled(Feature::RemotePlugin),
@@ -1501,6 +1499,7 @@ impl PluginRequestProcessor {
                 return Err(Self::plugin_install_error(err));
             }
         };
+        self.on_effective_plugins_changed();
         let config = match self.load_latest_config(config_cwd).await {
             Ok(config) => config,
             Err(err) => {
@@ -1510,8 +1509,6 @@ impl PluginRequestProcessor {
                 config
             }
         };
-
-        self.on_effective_plugins_changed();
 
         let plugin_mcp_servers = load_plugin_mcp_servers(
             result.installed_path.as_path(),
@@ -1723,6 +1720,8 @@ impl PluginRequestProcessor {
                 let all_connectors = connectors::list_cached_all_connectors(&config, &[])
                     .await
                     .unwrap_or_default();
+                // This helper already supplies summaries (including install URLs)
+                // for authoritative IDs missing from the cached directory.
                 connectors::connectors_for_plugin_apps(all_connectors, &plugin_apps)
                     .into_iter()
                     .map(|connector| {
@@ -1970,15 +1969,7 @@ impl PluginRequestProcessor {
             .uninstall_plugin(plugin_id)
             .await
             .map_err(Self::plugin_uninstall_error)?;
-        match self.load_latest_config(/*fallback_cwd*/ None).await {
-            Ok(_) => self.on_effective_plugins_changed(),
-            Err(err) => {
-                warn!(
-                    "failed to reload config after plugin uninstall, clearing plugin-related caches only: {err:?}"
-                );
-                self.clear_plugin_related_caches();
-            }
-        }
+        self.on_effective_plugins_changed();
         Ok(PluginUninstallResponse {})
     }
 

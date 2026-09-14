@@ -280,8 +280,8 @@ impl AuthModeWidget {
             _ => return,
         }
         *sign_in_state = SignInState::PickMode;
-        drop(sign_in_state);
         self.set_error(/*message*/ None);
+        drop(sign_in_state);
         self.request_frame.schedule_frame();
     }
 
@@ -499,7 +499,12 @@ impl AuthModeWidget {
             .render(area, buf);
     }
 
-    fn render_continue_in_browser(&self, area: Rect, buf: &mut Buffer) {
+    fn render_continue_in_browser(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        state: &ContinueInBrowserState,
+    ) {
         let mut spans = vec!["  ".into()];
         if self.animations_enabled && !self.animations_suppressed.get() {
             // Schedule a follow-up frame to keep the shimmer animation going.
@@ -514,10 +519,7 @@ impl AuthModeWidget {
         }
         let mut lines = vec![spans.into(), "".into()];
 
-        let sign_in_state = self.sign_in_state.read().unwrap();
-        let auth_url = if let SignInState::ChatGptContinueInBrowser(state) = &*sign_in_state
-            && !state.auth_url.is_empty()
-        {
+        let auth_url = if !state.auth_url.is_empty() {
             lines.push("  If the link doesn't open automatically, open the following link to authenticate:".into());
             lines.push("".into());
             lines.push(Line::from(vec![
@@ -658,7 +660,7 @@ impl AuthModeWidget {
         let content_line: Line = if state.value.is_empty() {
             vec!["Paste or type your API key".dim()].into()
         } else {
-            Line::from(state.value.clone())
+            Line::from("*".repeat(state.value.chars().count()))
         };
         Paragraph::new(content_line)
             .wrap(Wrap { trim: false })
@@ -786,9 +788,10 @@ impl AuthModeWidget {
             self.disallow_api_login();
             return;
         }
-        self.set_error(/*message*/ None);
+        self.cancel_active_attempt();
         let prefill_from_env = read_openai_api_key_from_env();
         let mut guard = self.sign_in_state.write().unwrap();
+        self.set_error(/*message*/ None);
         match &mut *guard {
             SignInState::ApiKeyEntry(state) => {
                 if state.value.is_empty() {
@@ -823,6 +826,9 @@ impl AuthModeWidget {
             let SignInState::ApiKeyEntry(input) = &mut *state else {
                 return;
             };
+            if input.pending_request_id.is_some() {
+                return;
+            }
             input.pending_request_id = Some(request_id);
         }
         self.set_error(/*message*/ None);
@@ -887,6 +893,7 @@ impl AuthModeWidget {
 
     /// Kicks off the ChatGPT auth flow and keeps the UI state consistent with the attempt.
     fn start_chatgpt_login(&mut self) {
+        self.cancel_active_attempt();
         // If we're already authenticated with ChatGPT, don't start a new login –
         // just proceed to the success message flow.
         if self.handle_existing_chatgpt_login() {
@@ -959,6 +966,7 @@ impl AuthModeWidget {
     }
 
     fn start_device_code_login(&mut self) {
+        self.cancel_active_attempt();
         if self.handle_existing_chatgpt_login() {
             return;
         }
@@ -1050,8 +1058,8 @@ impl WidgetRef for AuthModeWidget {
                 .wrap(Wrap { trim: false })
                 .render(area, buf);
             }
-            SignInState::ChatGptContinueInBrowser(_) => {
-                self.render_continue_in_browser(area, buf);
+            SignInState::ChatGptContinueInBrowser(state) => {
+                self.render_continue_in_browser(area, buf, state);
             }
             SignInState::ChatGptDeviceCode(state) => {
                 headless_chatgpt_login::render_device_code_login(self, area, buf, state);
@@ -1112,7 +1120,16 @@ mod tests {
         use tokio_tungstenite::tungstenite::Message;
 
         for response_error in [false, true] {
-            for replacement in ["current", "cancel", "api-key"] {
+            for replacement in [
+                "current",
+                "cancel",
+                "api-key",
+                "ready-api-key",
+                "ready-device-cancel",
+            ] {
+                if response_error && replacement.starts_with("ready-") {
+                    continue;
+                }
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let endpoint = format!("ws://{}", listener.local_addr().unwrap());
                 let (arrived_tx, mut arrived_rx) = mpsc::channel(1);
@@ -1210,7 +1227,11 @@ mod tests {
                 let area = Rect::new(0, 0, 64, 4);
                 let mut buffer = Buffer::empty(area);
                 widget.render_ref(area, &mut buffer);
-                let rendered: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+                let rendered: String = buffer
+                    .content
+                    .iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect();
                 assert!(rendered.contains("Preparing browser sign-in..."));
                 assert!(rendered.contains("to cancel"));
 
@@ -1222,7 +1243,7 @@ mod tests {
                     }
                     _ => {}
                 }
-                if replacement != "current" {
+                if matches!(replacement, "cancel" | "api-key") {
                     // Consume input's redraw so the next one witnesses the old reply's handling.
                     tokio::time::timeout(Duration::from_secs(2), draw_rx.recv())
                         .await
@@ -1235,13 +1256,26 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 assert_eq!(widget.get_step_state(), StepState::InProgress);
-                if replacement == "api-key" {
+                if replacement == "ready-api-key" {
+                    widget.handle_key_event(key(KeyCode::Char('3')));
+                    widget.handle_paste("sk-new-test".to_string());
+                } else if replacement == "ready-device-cancel" {
+                    *widget.sign_in_state.write().unwrap() =
+                        SignInState::ChatGptDeviceCode(ContinueWithDeviceCodeState::ready(
+                            "request-1".to_string(),
+                            "browser-login".to_string(),
+                            "https://chatgpt.com/device".to_string(),
+                            "ABCD-EFGH".to_string(),
+                        ));
+                    widget.handle_key_event(key(KeyCode::Esc));
+                }
+                if matches!(replacement, "api-key" | "ready-api-key") {
                     assert!(matches!(
                         &*widget.sign_in_state.read().unwrap(),
                         SignInState::ApiKeyEntry(input) if input.value == "sk-new-test"
                     ));
                     assert_eq!(widget.error_message(), None);
-                } else if replacement == "cancel" {
+                } else if matches!(replacement, "cancel" | "ready-device-cancel") {
                     assert!(matches!(
                         &*widget.sign_in_state.read().unwrap(),
                         SignInState::PickMode
@@ -1310,7 +1344,7 @@ mod tests {
         use tokio_tungstenite::tungstenite::Message;
 
         for stale_error in [false, true] {
-            for replacement in ["cancel", "edit", "resubmit"] {
+            for replacement in ["cancel", "edit"] {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let endpoint = format!("ws://{}", listener.local_addr().unwrap());
                 let (arrived_tx, mut arrived_rx) = mpsc::channel(2);
@@ -1391,6 +1425,8 @@ mod tests {
                 widget.handle_paste("sk-old-test".to_string());
                 widget.handle_key_event(key(KeyCode::Enter));
                 assert_eq!(arrived_rx.recv().await.as_deref(), Some("sk-old-test"));
+                // Repeated Enter must not enqueue a second credential write.
+                widget.handle_key_event(key(KeyCode::Enter));
                 tokio::time::timeout(Duration::from_secs(2), draw_rx.recv())
                     .await
                     .unwrap()
@@ -1402,7 +1438,6 @@ mod tests {
                         widget.handle_paste("sk-new-test".to_string());
                     }
                     "edit" => widget.handle_paste("-edited".to_string()),
-                    "resubmit" => widget.handle_key_event(key(KeyCode::Enter)),
                     _ => unreachable!(),
                 }
                 let expected_key = match replacement {
@@ -1430,13 +1465,11 @@ mod tests {
                 );
                 assert_eq!(widget.get_step_state(), StepState::InProgress);
 
-                if replacement != "resubmit" {
-                    widget.handle_key_event(key(KeyCode::Enter));
-                    tokio::time::timeout(Duration::from_secs(2), draw_rx.recv())
-                        .await
-                        .unwrap()
-                        .unwrap();
-                }
+                widget.handle_key_event(key(KeyCode::Enter));
+                tokio::time::timeout(Duration::from_secs(2), draw_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(arrived_rx.recv().await.as_deref(), Some(expected_key));
                 release_tx.send(()).await.unwrap();
                 tokio::time::timeout(Duration::from_secs(2), draw_rx.recv())
@@ -1580,7 +1613,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_active_attempt_notifies_device_code_login() {
+    async fn cancel_active_attempt_resets_device_code_login_state() {
         let (widget, _tmp) = widget_forced_chatgpt().await;
         *widget.error.write().unwrap() = Some("still logging in".to_string());
         *widget.sign_in_state.write().unwrap() =
@@ -1633,11 +1666,37 @@ mod tests {
         // Render into a narrow buffer so the URL wraps across multiple rows.
         let area = Rect::new(0, 0, 30, 20);
         let mut buf = Buffer::empty(area);
-        widget.render_continue_in_browser(area, &mut buf);
+        widget.render_ref(area, &mut buf);
 
         // Every character of the URL should be present as an OSC 8 cell.
         let found = collect_osc8_chars(&buf, area, url);
         assert_eq!(found, url, "OSC 8 hyperlink should cover the full URL");
+    }
+
+    #[tokio::test]
+    async fn api_key_render_masks_typed_and_environment_credentials() {
+        let (widget, _tmp) = widget_forced_chatgpt().await;
+        for prepopulated_from_env in [false, true] {
+            let secret = "sk-private-test-secret";
+            *widget.sign_in_state.write().unwrap() = SignInState::ApiKeyEntry(ApiKeyInputState {
+                value: secret.to_string(),
+                prepopulated_from_env,
+                pending_request_id: None,
+            });
+            let area = Rect::new(0, 0, 80, 30);
+            let mut buf = Buffer::empty(area);
+            widget.render_ref(area, &mut buf);
+            let text: String = buf
+                .content
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect();
+            assert!(text.contains(&"*".repeat(secret.len())));
+            assert!(!text.contains(secret));
+            assert!(
+                matches!(&*widget.sign_in_state.read().unwrap(), SignInState::ApiKeyEntry(input) if input.value == secret)
+            );
+        }
     }
 
     #[test]

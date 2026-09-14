@@ -60,7 +60,8 @@ pub(crate) fn apply_ide_context_to_user_input(
 }
 
 pub(crate) fn has_prompt_context(context: &IdeContext) -> bool {
-    render_prompt_context(context).is_some()
+    // Either field emits a nonempty section even when its contents must be omitted.
+    context.active_file.is_some() || !context.open_tabs.is_empty()
 }
 
 pub(crate) fn extract_prompt_request_with_offset(message: &str) -> (&str, usize) {
@@ -96,42 +97,59 @@ fn prefixed_text_input(prefix: String, text: String, text_elements: Vec<TextElem
 
 fn render_prompt_context(context: &IdeContext) -> Option<String> {
     let mut ide_context_section = String::new();
+    // Bound metadata before repeating paths or allocating formatted lines. Reserve space for
+    // the omission notice so the final aggregate budget does not hide why ranges stopped.
+    const OMITTED_RANGES: &str = "[Additional selection ranges omitted.]\n";
+    let mut metadata_budget = ModelContextBudget::default();
+    metadata_budget.try_take_bytes(OMITTED_RANGES.len());
 
     if let Some(active_file) = &context.active_file {
-        ide_context_section.push_str(&format!(
-            "\n## Active file: {}\n",
-            active_file.descriptor.path
-        ));
-    }
-
-    if let Some(active_file) = &context.active_file {
-        let selected_ranges = if active_file.selections.is_empty() {
+        let path = active_file.descriptor.path.as_str();
+        let path = if metadata_budget
+            .try_take_bytes(path.len().saturating_add("\n## Active file: \n".len()))
+        {
+            path
+        } else {
+            "[Active file path omitted: exceeds context budget.]"
+        };
+        ide_context_section.push_str(&format!("\n## Active file: {path}\n"));
+        let mut selected_ranges = if active_file.selections.is_empty() {
             std::slice::from_ref(&active_file.selection)
         } else {
             active_file.selections.as_slice()
         }
         .iter()
         .filter(|range| range.start != range.end)
-        .collect::<Vec<_>>();
+        .peekable();
 
-        if !selected_ranges.is_empty()
-            && (active_file.active_selection_content.is_empty() || selected_ranges.len() > 1)
+        let first_range = selected_ranges.next();
+        let multiple_ranges = selected_ranges.peek().is_some();
+        if first_range.is_some()
+            && (active_file.active_selection_content.is_empty() || multiple_ranges)
         {
-            if selected_ranges.len() == 1 {
+            if !multiple_ranges {
                 ide_context_section.push_str("\n## Active selection range:\n");
             } else {
                 ide_context_section.push_str("\n## Active selection ranges:\n");
             }
-            for range in selected_ranges {
+            for range in first_range.into_iter().chain(selected_ranges) {
                 // Render ranges as 1-based positions for the prompt.
                 let start_line = u64::from(range.start.line) + 1;
                 let start_column = u64::from(range.start.character) + 1;
                 let end_line = u64::from(range.end.line) + 1;
                 let end_column = u64::from(range.end.character) + 1;
-                ide_context_section.push_str(&format!(
-                    "- {}: line {start_line}, column {start_column} to line {end_line}, column {end_column}\n",
-                    active_file.descriptor.path
-                ));
+                let positions = format!(
+                    ": line {start_line}, column {start_column} to line {end_line}, column {end_column}\n"
+                );
+                if !metadata_budget
+                    .try_take_bytes(path.len().saturating_add(positions.len()).saturating_add(2))
+                {
+                    ide_context_section.push_str(OMITTED_RANGES);
+                    break;
+                }
+                ide_context_section.push_str("- ");
+                ide_context_section.push_str(path);
+                ide_context_section.push_str(&positions);
             }
         }
     }
@@ -160,11 +178,16 @@ fn render_prompt_context(context: &IdeContext) -> Option<String> {
                 break;
             }
 
-            let tab_line = format!("- {}: {}\n", tab.label, tab.path);
-            if rendered_tab_chars + tab_line.len() > MAX_OPEN_TABS_CHARS {
+            let tab_line_len = tab
+                .label
+                .len()
+                .saturating_add(tab.path.len())
+                .saturating_add(5);
+            if tab_line_len > MAX_OPEN_TABS_CHARS - rendered_tab_chars {
                 break;
             }
 
+            let tab_line = format!("- {}: {}\n", tab.label, tab.path);
             ide_context_section.push_str(&tab_line);
             rendered_tabs += 1;
             rendered_tab_chars += tab_line.len();
@@ -458,5 +481,20 @@ mod tests {
 
         let rendered = render_prompt_context(&context).expect("rendered IDE context");
         assert!(rendered.len() <= 40_000);
+        assert!(rendered.contains("[Active file path omitted: exceeds context budget.]"));
+        assert!(!rendered.contains(&huge_path));
+
+        let mut context = context;
+        let active = context.active_file.as_mut().unwrap();
+        active.descriptor.path = "src/lib.rs".into();
+        active.selections = vec![active.selection.clone(); 10_000];
+        context.open_tabs = vec![descriptor("oversized tab", &huge_path)];
+        let rendered = render_prompt_context(&context).expect("rendered IDE context");
+        assert!(rendered.len() <= 40_000);
+        assert!(rendered.contains("- src/lib.rs: line 1, column 1 to line 2, column 2\n"));
+        assert!(rendered.contains("[Additional selection ranges omitted.]"));
+        assert!(rendered.contains("[1 open tabs omitted.]"));
+        assert!(!rendered.contains(&huge_path));
+        assert!(has_prompt_context(&context));
     }
 }

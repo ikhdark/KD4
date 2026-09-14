@@ -11,7 +11,11 @@ pub trait ExtensionEventSink: Send + Sync {
     fn emit(&self, event: Event);
 
     /// Queue a thread-scoped event without treating its callback correlation id
-    /// as a thread id. Existing sinks retain their original delivery behavior.
+    /// as a thread id.
+    ///
+    /// The default discards `thread_id` and delegates to `emit`. Sinks that need
+    /// this argument for routing, including shared multi-thread sinks, must
+    /// override this method. Thread-bound sinks can retain the default.
     fn emit_for_thread(&self, _thread_id: ThreadId, event: Event) {
         self.emit(event);
     }

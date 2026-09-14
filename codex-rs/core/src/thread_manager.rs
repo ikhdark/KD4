@@ -709,6 +709,7 @@ impl ThreadManager {
     pub(crate) fn with_models_provider_for_tests(
         auth: CodexAuth,
         provider: ModelProviderInfo,
+        user_instructions_provider: Arc<dyn UserInstructionsProvider>,
     ) -> Self {
         set_thread_manager_test_mode_for_tests(/*enabled*/ true);
         let codex_home = std::env::temp_dir().join(format!(
@@ -722,6 +723,7 @@ impl ThreadManager {
             provider,
             codex_home.clone(),
             Arc::new(EnvironmentManager::default_for_tests()),
+            user_instructions_provider,
         );
         manager._test_codex_home_guard = Some(TempCodexHomeGuard { path: codex_home });
         manager
@@ -734,6 +736,7 @@ impl ThreadManager {
         provider: ModelProviderInfo,
         codex_home: PathBuf,
         environment_manager: Arc<EnvironmentManager>,
+        user_instructions_provider: Arc<dyn UserInstructionsProvider>,
     ) -> Self {
         Self::with_models_provider_home_and_state_for_tests(
             auth,
@@ -741,6 +744,7 @@ impl ThreadManager {
             codex_home,
             environment_manager,
             /*state_db*/ None,
+            user_instructions_provider,
         )
     }
 
@@ -750,6 +754,7 @@ impl ThreadManager {
         codex_home: PathBuf,
         environment_manager: Arc<EnvironmentManager>,
         state_db: Option<StateDbHandle>,
+        user_instructions_provider: Arc<dyn UserInstructionsProvider>,
     ) -> Self {
         set_thread_manager_test_mode_for_tests(/*enabled*/ true);
         let auth_manager = AuthManager::from_auth_for_testing(auth);
@@ -802,9 +807,7 @@ impl ThreadManager {
                 mcp_manager,
                 code_mode_session_provider: Arc::new(InProcessCodeModeSessionProvider),
                 extensions: empty_extension_registry(),
-                user_instructions_provider: Arc::new(
-                    crate::test_support::EmptyUserInstructionsProvider,
-                ),
+                user_instructions_provider,
                 thread_store,
                 agent_graph_store,
                 attestation_provider: None,

@@ -87,7 +87,10 @@ impl ClientTracker {
 
     pub(crate) async fn shutdown(&mut self) {
         self.shutdown_token.cancel();
+        self.close_all_clients().await;
+    }
 
+    pub(super) async fn close_all_clients(&mut self) {
         while let Some(client_key) = self.clients.keys().next().cloned() {
             let _ = self.close_client(&client_key).await;
         }
@@ -244,17 +247,15 @@ impl ClientTracker {
                     return Ok(());
                 }
 
-                let server_event_tx = self.server_event_tx.clone();
-                tokio::spawn(async move {
-                    let server_envelope = QueuedServerEnvelope {
-                        event: ServerEvent::Pong {
-                            status: PongStatus::Unknown,
-                        },
-                        client_id,
-                        stream_id,
-                        write_complete_tx: None,
-                    };
-                    let _ = server_event_tx.send(server_envelope).await;
+                // Unknown heartbeats are best effort. Waiting here would prevent the
+                // reader from handling ACKs that free outbound capacity.
+                let _ = self.server_event_tx.try_send(QueuedServerEnvelope {
+                    event: ServerEvent::Pong {
+                        status: PongStatus::Unknown,
+                    },
+                    client_id,
+                    stream_id,
+                    write_complete_tx: None,
                 });
                 Ok(())
             }
@@ -508,6 +509,53 @@ mod tests {
             method: "initialized".to_string(),
             params: None,
         })
+    }
+
+    #[tokio::test]
+    async fn unknown_pings_drop_when_output_is_full() {
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(1);
+        let (transport_event_tx, _transport_event_rx) = mpsc::channel(1);
+        let mut tracker = ClientTracker::new(
+            server_event_tx,
+            transport_event_tx,
+            &CancellationToken::new(),
+        );
+        let ping = ClientEnvelope {
+            client_id: ClientId("unknown".to_string()),
+            stream_id: Some(StreamId("stream".to_string())),
+            seq_id: None,
+            cursor: None,
+            event: ClientEvent::Ping,
+        };
+        timeout(Duration::from_secs(1), async {
+            for _ in 0..100 {
+                tracker
+                    .handle_message(ping.clone())
+                    .await
+                    .expect("ping should not block");
+            }
+        })
+        .await
+        .expect("full queue must not block the reader");
+        let pong = server_event_rx
+            .recv()
+            .await
+            .expect("first pong should be queued");
+        assert_eq!(pong.client_id, ping.client_id);
+        assert_eq!(Some(pong.stream_id), ping.stream_id);
+        assert!(matches!(
+            pong.event,
+            ServerEvent::Pong {
+                status: PongStatus::Unknown
+            }
+        ));
+        drop(tracker);
+        assert!(
+            timeout(Duration::from_secs(1), server_event_rx.recv())
+                .await
+                .expect("no detached senders should remain")
+                .is_none()
+        );
     }
 
     #[tokio::test]

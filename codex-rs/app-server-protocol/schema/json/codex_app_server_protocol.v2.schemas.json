@@ -257,6 +257,7 @@
     "AdditionalFileSystemPermissions": {
       "properties": {
         "entries": {
+          "description": "When present, replaces legacy `read` and `write`, including when empty.",
           "items": {
             "$ref": "#/definitions/V2FileSystemSandboxEntry"
           },
@@ -4286,17 +4287,6 @@
             }
           ]
         },
-        "approvals_reviewer": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ApprovalsReviewer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "[UNSTABLE] Optional default for where approval requests are routed for review."
-        },
         "compact_prompt": {
           "type": [
             "string",
@@ -5546,6 +5536,7 @@
           "type": "string"
         },
         "willRetry": {
+          "description": "Whether the server will retry automatically. When true, the turn remains active; clients should not initiate a duplicate retry for this notification.",
           "type": "boolean"
         }
       },
@@ -15861,6 +15852,10 @@
             "string",
             "null"
           ]
+        },
+        "replace": {
+          "description": "Replace the goal atomically, resetting usage and its identity. Requires an objective.",
+          "type": "boolean"
         },
         "status": {
           "anyOf": [

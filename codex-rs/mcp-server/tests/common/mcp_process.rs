@@ -40,7 +40,7 @@ pub struct McpProcess {
     /// not a guarantee. See the `kill_on_drop` documentation for details.
     #[allow(dead_code)]
     process: Child,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     stdout: Option<BufReader<ChildStdout>>,
 }
 
@@ -106,13 +106,28 @@ impl McpProcess {
         Ok(Self {
             next_request_id: AtomicI64::new(0),
             process,
-            stdin,
+            stdin: Some(stdin),
             stdout: Some(stdout),
         })
     }
 
     pub fn close_stdout(&mut self) {
         drop(self.stdout.take());
+    }
+
+    pub fn close_stdin(&mut self) {
+        drop(self.stdin.take());
+    }
+
+    pub async fn send_raw_frame(&mut self, frame: &str) -> anyhow::Result<()> {
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("stdin is closed"))?;
+        stdin.write_all(frame.as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await?;
+        Ok(())
     }
 
     pub async fn send_ping_request(&mut self) -> anyhow::Result<i64> {
@@ -227,7 +242,7 @@ impl McpProcess {
         .await
     }
 
-    async fn send_request(
+    pub async fn send_request(
         &mut self,
         method: &str,
         params: Option<serde_json::Value>,
@@ -275,13 +290,11 @@ impl McpProcess {
     ) -> anyhow::Result<()> {
         eprintln!("writing message to stdin: {message:?}");
         let payload = serde_json::to_string(&message)?;
-        self.stdin.write_all(payload.as_bytes()).await?;
-        self.stdin.write_all(b"\n").await?;
-        self.stdin.flush().await?;
+        self.send_raw_frame(&payload).await?;
         Ok(())
     }
 
-    async fn read_jsonrpc_message(
+    pub async fn read_jsonrpc_message(
         &mut self,
     ) -> anyhow::Result<JsonRpcMessage<CustomRequest, serde_json::Value, CustomNotification>> {
         let mut line = String::new();

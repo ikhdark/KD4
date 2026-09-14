@@ -18,6 +18,77 @@ from scripts import check_kd4_features
 
 
 class CheckKd4FeaturesTest(unittest.TestCase):
+    def test_same_named_other_class_cannot_supply_selected_test_body(self):
+        source = self.repo_root / "tests/test_feature.py"
+        source.write_text(
+            "import unittest\nclass FeatureRegistrationTest(unittest.TestCase):\n    def test_feature_is_live(self):\n        pass\nclass Other(unittest.TestCase):\n    def test_feature_is_live(self):\n        self.assertEqual(1 + 1, 2)\n"
+        )
+        result = check_kd4_features.validate_manifest(
+            self.write_manifest(self.valid_evidence()), repo_root=self.repo_root
+        )
+        self.assertFalse(result.ok)
+        self.assertIn(
+            "vacuous-runtime-verification",
+            {finding.code for finding in result.findings},
+        )
+
+    def test_documented_unittest_result_is_exactly_observed(self):
+        source = self.repo_root / "tests/test_feature.py"
+        source.write_text(
+            source.read_text().replace(
+                "        self.assertEqual",
+                '        """Prove the registered behavior."""\n        self.assertEqual',
+            )
+        )
+        outcomes = []
+        code = check_kd4_features.execute_runtime_verification(
+            self.write_manifest(self.valid_evidence()),
+            repo_root=self.repo_root,
+            feature_id=None,
+            quiet=True,
+            outcomes=outcomes,
+        )
+        self.assertEqual(code, 0, outcomes)
+        self.assertEqual(
+            outcomes[0]["test_identities"],
+            ["tests.test_feature.FeatureRegistrationTest.test_feature_is_live"],
+        )
+
+    def test_malformed_field_types_produce_findings(self):
+        for old, new, expected in [
+            ('status = "enabled"', "status = []", "invalid-status"),
+            (
+                'capability_kind = "runtime"',
+                "capability_kind = {}",
+                "invalid-capability-kind",
+            ),
+            ("config_keys = []", "config_keys = [42]", "invalid-config-keys"),
+        ]:
+            with self.subTest(field=old):
+                manifest = self.write_manifest(self.valid_evidence())
+                manifest.write_text(manifest.read_text().replace(old, new))
+                result = check_kd4_features.validate_manifest(
+                    manifest, repo_root=self.repo_root
+                )
+                self.assertFalse(result.ok)
+                self.assertIn(expected, {finding.code for finding in result.findings})
+
+    def test_commented_schema_constant_cannot_mask_runtime_version(self):
+        (self.repo_root / "src/schema.rs").write_text(
+            "// pub const CONTRACT_SCHEMA_VERSION: u64 = 12;\npub const CONTRACT_SCHEMA_VERSION: u64 = 13;\n"
+        )
+        manifest = self.write_manifest(
+            'contract_schema_version = 12\ncontract_schema_source = "src/schema.rs"\ncontract_schema_symbol = "CONTRACT_SCHEMA_VERSION"\n'
+            + self.valid_evidence()
+        )
+        result = check_kd4_features.validate_manifest(
+            manifest, repo_root=self.repo_root
+        )
+        self.assertFalse(result.ok)
+        self.assertIn(
+            "contract-schema-drift", {finding.code for finding in result.findings}
+        )
+
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
@@ -402,6 +473,7 @@ class CheckKd4FeaturesTest(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
+            timeout=30,
         )
         self.assertEqual(process.returncode, 0, process.stderr)
         payload = json.loads(process.stdout)
@@ -544,7 +616,8 @@ class CheckKd4FeaturesTest(unittest.TestCase):
             )
 
         self.assertEqual(exit_code, 0, output.getvalue())
-        self.assertIn("KD4 RUNTIME VERIFICATION [feature]", output.getvalue())
+        self.assertEqual(output.getvalue().count("KD4 RUNTIME VERIFICATION:"), 1)
+        self.assertIn("KD4 TEST RESULT [feature]: passed", output.getvalue())
 
     def test_default_cli_rejects_unimported_registration(self) -> None:
         (self.repo_root / "src" / "registry.py").write_text(

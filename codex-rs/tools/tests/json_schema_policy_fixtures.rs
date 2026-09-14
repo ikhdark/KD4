@@ -119,8 +119,27 @@ fn json_schema_policy_fixtures_convert_to_responses_tools() {
 }
 
 #[test]
-fn json_schema_policy_oversized_golden_schema_triggers_compaction() {
-    let fixture: FixtureFile = load_fixture(OVERSIZED_NOTION_CREATE_PAGE_SCHEMA_PATH);
+fn json_schema_policy_oversized_golden_schema_rejects_not_and_compacts_supported_subset() {
+    let mut fixture: FixtureFile = load_fixture(OVERSIZED_NOTION_CREATE_PAGE_SCHEMA_PATH);
+    let fixture_tool = fixture
+        .tools
+        .first_mut()
+        .expect("oversized fixture should contain a tool");
+    assert_eq!(
+        codex_tools::parse_tool_input_schema(&fixture_tool.input_schema)
+            .unwrap_err()
+            .to_string(),
+        "unsupported tool input schema assertion: not"
+    );
+    // Exercise compaction separately on the supported portion of the fixture.
+    assert_eq!(
+        fixture_tool
+            .input_schema
+            .as_object_mut()
+            .unwrap()
+            .remove("not"),
+        Some(json!({"required": ["children", "markdown"]}))
+    );
     let fixture_tool = fixture
         .tools
         .first()
@@ -137,21 +156,15 @@ fn json_schema_policy_oversized_golden_schema_triggers_compaction() {
         "compaction should reduce schema size from {input_bytes} bytes"
     );
 
-    let absent_pointers = [
-        ("/description", "drop root description"),
-        ("/properties/parent/description", "drop nested descriptions"),
-    ];
-    for (pointer, message) in absent_pointers {
-        assert!(
-            parameters.pointer(pointer).is_none(),
-            "oversized schema should {message}"
-        );
-    }
+    assert!(parameters.pointer("/description").is_none());
 
     let expected_values = [
         (
             "/properties/parent",
-            json!({"$ref": "#/$defs/parent"}),
+            json!({
+                "$ref": "#/$defs/parent",
+                "description": "Request body field. Parent reference controlling whether the page is standalone or a row under a data source."
+            }),
             "retain local parent validation",
         ),
         (

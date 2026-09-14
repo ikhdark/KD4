@@ -1,3 +1,4 @@
+use codex_api::AuthError;
 use codex_api::AuthProvider;
 use http::HeaderMap;
 use http::HeaderValue;
@@ -30,19 +31,40 @@ impl BearerAuthProvider {
 
 impl AuthProvider for BearerAuthProvider {
     fn add_auth_headers(&self, headers: &mut HeaderMap) {
-        if let Some(token) = self.token.as_ref()
-            && let Ok(header) = HeaderValue::from_str(&format!("Bearer {token}"))
-        {
-            let _ = headers.insert(http::header::AUTHORIZATION, header);
+        let _ = self.try_add_auth_headers(headers);
+    }
+
+    fn try_add_auth_headers(&self, headers: &mut HeaderMap) -> Result<(), AuthError> {
+        let authorization = self
+            .token
+            .as_ref()
+            .map(|token| {
+                let mut value =
+                    HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
+                        AuthError::Build("invalid bearer authorization header".to_string())
+                    })?;
+                value.set_sensitive(true);
+                Ok::<_, AuthError>(value)
+            })
+            .transpose()?;
+        let account = self
+            .account_id
+            .as_ref()
+            .map(|account| {
+                HeaderValue::from_str(account)
+                    .map_err(|_| AuthError::Build("invalid account header".to_string()))
+            })
+            .transpose()?;
+        if let Some(value) = authorization {
+            headers.insert(http::header::AUTHORIZATION, value);
         }
-        if let Some(account_id) = self.account_id.as_ref()
-            && let Ok(header) = HeaderValue::from_str(account_id)
-        {
-            let _ = headers.insert("ChatGPT-Account-ID", header);
+        if let Some(value) = account {
+            headers.insert("ChatGPT-Account-ID", value);
         }
         if self.is_fedramp_account {
-            let _ = headers.insert("X-OpenAI-Fedramp", HeaderValue::from_static("true"));
+            headers.insert("X-OpenAI-Fedramp", HeaderValue::from_static("true"));
         }
+        Ok(())
     }
 }
 
@@ -81,6 +103,7 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("Bearer access-token")
         );
+        assert!(headers[http::header::AUTHORIZATION].is_sensitive());
         assert_eq!(
             headers
                 .get("ChatGPT-Account-ID")
@@ -105,6 +128,32 @@ mod tests {
                 .get("X-OpenAI-Fedramp")
                 .and_then(|value| value.to_str().ok()),
             Some("true")
+        );
+    }
+    #[tokio::test]
+    async fn malformed_credentials_reject_request_dispatch() {
+        for auth in [
+            BearerAuthProvider::for_test(Some("bad\nsecret"), None),
+            BearerAuthProvider::for_test(Some("token"), Some("bad\naccount")),
+        ] {
+            let request = codex_http_client::Request::new(
+                http::Method::GET,
+                "https://example.com".to_string(),
+            );
+            assert!(matches!(
+                auth.apply_auth(request).await,
+                Err(AuthError::Build(_))
+            ));
+        }
+        let request =
+            codex_http_client::Request::new(http::Method::GET, "https://example.com".to_string());
+        assert!(
+            BearerAuthProvider::default()
+                .apply_auth(request)
+                .await
+                .unwrap()
+                .headers
+                .is_empty()
         );
     }
 }

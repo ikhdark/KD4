@@ -13,7 +13,8 @@ use tracing::debug;
 /// Low-cardinality sink for SQLite startup and fallback telemetry.
 ///
 /// Implementations should absorb delivery failures locally. Database behavior
-/// must not depend on whether telemetry export succeeds.
+/// must not depend on whether telemetry export succeeds. Callbacks must not
+/// block on I/O or emit events recursively into the SQLite logging sink.
 pub trait DbTelemetry: Send + Sync + 'static {
     fn counter(&self, name: &str, inc: i64, tags: &[(&str, &str)]);
     fn record_duration(&self, name: &str, duration: Duration, tags: &[(&str, &str)]);
@@ -203,7 +204,7 @@ fn classify_sqlite_code(code: &str) -> &'static str {
         Some(6) => "locked",
         Some(8) => "readonly",
         Some(10) => "io",
-        Some(11) => "corrupt",
+        Some(11 | 26) => "corrupt",
         Some(13) => "full",
         Some(14) => "cantopen",
         Some(17) => "schema",
@@ -221,6 +222,7 @@ mod tests {
     fn classifies_extended_sqlite_codes() {
         assert_eq!(classify_sqlite_code("5"), "busy");
         assert_eq!(classify_sqlite_code("6"), "locked");
+        assert_eq!(classify_sqlite_code("26"), "corrupt");
         assert_eq!(classify_sqlite_code("2067"), "constraint");
     }
 }

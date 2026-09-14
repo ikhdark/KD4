@@ -8,13 +8,12 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::test_support::test_path_buf;
 use pretty_assertions::assert_eq;
-use std::path::PathBuf;
 
 #[test]
 fn renders_sandbox_mode_text() {
     assert_eq!(
         sandbox_text(SandboxMode::WorkspaceWrite, NetworkAccess::Restricted),
-        "Filesystem sandboxing defines which files can be read or written. `sandbox_mode` is `workspace-write`: The sandbox permits reading files, and editing files in `cwd` and `writable_roots`. Editing files in other directories requires approval. Network access is restricted."
+        "Filesystem sandboxing defines which files can be read or written. `sandbox_mode` is `workspace-write`: The sandbox permits reading files subject to the denied-read rules below, and editing files only in the listed writable roots subject to their exclusions. Do not assume all of `cwd` is writable. Writes outside this scope require permission under the active approval policy. Network access is restricted."
     );
 
     assert_eq!(
@@ -57,16 +56,26 @@ fn builds_permissions_with_network_access_override() {
 
 #[test]
 fn builds_permissions_from_profile() {
-    let cwd = PathBuf::from("/tmp");
+    let cwd = test_path_buf("/tmp");
     let writable_root =
         AbsolutePathBuf::from_absolute_path(cwd.join("repo")).expect("absolute path");
+    let excluded =
+        AbsolutePathBuf::from_absolute_path(cwd.join("repo/private")).expect("absolute path");
     let permission_profile = PermissionProfile::from_runtime_permissions(
-        &FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
-            path: FileSystemPath::Path {
-                path: writable_root.clone(),
+        &FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: writable_root.clone(),
+                },
+                access: FileSystemAccessMode::Write,
             },
-            access: FileSystemAccessMode::Write,
-        }]),
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: excluded.clone(),
+                },
+                access: FileSystemAccessMode::Read,
+            },
+        ]),
         NetworkSandboxPolicy::Enabled,
     );
 
@@ -83,6 +92,13 @@ fn builds_permissions_from_profile() {
     assert!(text.contains("`sandbox_mode` is `workspace-write`"));
     assert!(text.contains("Network access is enabled."));
     assert!(text.contains(writable_root.to_string_lossy().as_ref()));
+    assert!(text.contains(&format!(
+        "Read-only subtree: `{}`",
+        excluded.to_string_lossy()
+    )));
+    assert!(text.contains("Protected metadata: `.git` directly under this root"));
+    assert!(text.contains("Do not assume all of `cwd` is writable."));
+    assert!(!text.contains("editing files in `cwd` and `writable_roots`"));
 }
 
 #[test]
@@ -155,6 +171,16 @@ fn includes_request_rule_instructions_for_on_request() {
     assert!(text.contains("prefix_rule"));
     assert!(text.contains("Approved command prefixes"));
     assert!(text.contains(r#"["git", "pull"]"#));
+    assert!(text.contains("A network error alone does not establish that escalation will help."));
+    assert!(
+        text.contains("Obtain consent for destructive actions not covered by the user's request.")
+    );
+    assert!(text.contains("Consent alone does not require sandbox escalation"));
+    assert!(text.contains("Retry the whole command only when safe to repeat"));
+    assert!(text.contains(
+        "otherwise resume the failed portion with its required inputs and working directory"
+    ));
+    assert!(text.contains("Use the returned result to avoid replaying completed effects"));
 }
 
 #[test]
@@ -197,6 +223,8 @@ fn includes_request_permission_rule_instructions_for_on_request_when_enabled() {
     let text = instructions.body();
     assert!(text.contains("with_additional_permissions"));
     assert!(text.contains("additional_permissions"));
+    assert!(text.contains("Propose only narrowly scoped reusable prefixes."));
+    assert!(text.contains("Never provide `prefix_rule` for interpreter-only prefixes, destructive commands, heredocs, or herestrings."));
 }
 
 #[test]
@@ -600,6 +628,29 @@ fn dynamic_permission_lists_are_deterministically_bounded() {
     assert_eq!(
         rendered.last().map(String::as_str),
         Some(PERMISSION_LIST_TRUNCATED_MARKER)
+    );
+    assert_eq!(
+        rendered.first().map(String::as_str),
+        Some(format!("- path `/very/long/permission/path/000/{}`", "x".repeat(80)).as_str())
+    );
+}
+
+#[test]
+fn permission_list_formats_only_the_visible_prefix_and_one_lookahead() {
+    let mut formatted = 0;
+    let rendered = bounded_permission_entries((0..1_000).map(|index| {
+        formatted += 1;
+        format!("- {index}")
+    }));
+    assert_eq!(formatted, MAX_PERMISSION_LIST_ENTRIES + 1);
+    let mut expected = (0..MAX_PERMISSION_LIST_ENTRIES - 1)
+        .map(|index| format!("- {index}"))
+        .collect::<Vec<_>>();
+    expected.push(PERMISSION_LIST_TRUNCATED_MARKER.to_string());
+    assert_eq!(rendered, expected);
+    assert_eq!(
+        bounded_permission_entries(["- only".to_string()]),
+        vec!["- only"]
     );
 }
 

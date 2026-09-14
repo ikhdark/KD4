@@ -61,6 +61,7 @@ pub(super) enum ShellEscapePolicy {
 pub(super) struct QueuedUserMessage {
     pub(super) user_message: UserMessage,
     pub(super) action: QueuedInputAction,
+    pub(super) shell_escape_policy: ShellEscapePolicy,
     pub(super) pending_pastes: Vec<(String, String)>,
 }
 
@@ -69,6 +70,7 @@ impl QueuedUserMessage {
         Self {
             user_message,
             action,
+            shell_escape_policy: ShellEscapePolicy::Allow,
             pending_pastes: Vec::new(),
         }
     }
@@ -109,6 +111,7 @@ pub(crate) struct ThreadInputState {
     pub(super) queued_user_messages: VecDeque<QueuedUserMessage>,
     pub(super) queued_user_message_history_records: VecDeque<UserMessageHistoryRecord>,
     pub(super) user_turn_pending_start: bool,
+    pub(super) submit_pending_steers_after_interrupt: bool,
     pub(super) current_collaboration_mode: CollaborationMode,
     pub(super) active_collaboration_mask: Option<CollaborationModeMask>,
     pub(super) agent_turn_running: bool,

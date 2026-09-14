@@ -465,6 +465,9 @@ fn terminal_output_failure_preserves_screen_state_and_aborts_migration() -> std:
             assert!(tui.is_alt_screen_active());
             let fullscreen = tui.terminal.viewport_area;
             assert_eq!(fullscreen.y, 0);
+            tui.enter_alt_screen().expect("repeated entry is harmless");
+            assert_eq!(tui.terminal.viewport_area, fullscreen);
+            tui.set_alt_screen_enabled(false);
             let failed_exit = {
                 let _output = ReadOnlyStdout::install(&file).expect("read-only stdout");
                 tui.leave_alt_screen()
@@ -479,6 +482,8 @@ fn terminal_output_failure_preserves_screen_state_and_aborts_migration() -> std:
                 .expect("restored output permits retry");
             assert!(!tui.is_alt_screen_active());
             assert_eq!(tui.terminal.viewport_area, inline);
+
+            tui.set_alt_screen_enabled(true);
 
             let (mut app, mut app_events, mut operations) = Box::pin(make_test_app_with_channels()).await;
             let failed_overlay = {

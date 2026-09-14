@@ -43,21 +43,27 @@ pub async fn apply_diff_from_task(
         Some(turn) => turn,
         None => anyhow::bail!("No diff turn found"),
     };
-    let output_diff = diff_turn.output_items.iter().find_map(|item| match item {
-        OutputItem::Pr(PrOutputItem { output_diff }) => Some(output_diff),
-        _ => None,
-    });
+    let output_diff = diff_turn
+        .output_items
+        .into_iter()
+        .find_map(|item| match item {
+            OutputItem::Pr(PrOutputItem { output_diff }) => Some(output_diff),
+            _ => None,
+        });
     match output_diff {
-        Some(output_diff) => apply_diff(&output_diff.diff, cwd).await,
+        Some(output_diff) => apply_diff(output_diff.diff, cwd).await,
         None => anyhow::bail!("No PR output item found"),
     }
 }
 
-async fn apply_diff(diff: &str, cwd: Option<PathBuf>) -> anyhow::Result<()> {
-    let cwd = cwd.unwrap_or(std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()));
+async fn apply_diff(diff: String, cwd: Option<PathBuf>) -> anyhow::Result<()> {
+    let cwd = match cwd {
+        Some(cwd) => cwd,
+        None => std::env::current_dir()?,
+    };
     let req = ApplyGitRequest {
         cwd,
-        diff: diff.to_string(),
+        diff,
         revert: false,
         preflight: false,
     };

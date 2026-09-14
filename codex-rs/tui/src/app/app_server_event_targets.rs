@@ -235,6 +235,54 @@ mod tests {
     }
 
     #[test]
+    fn malformed_notification_thread_ids_are_not_global() {
+        let notification = ServerNotification::Warning(WarningNotification {
+            thread_id: Some("malformed".to_string()),
+            message: "warning".to_string(),
+        });
+        assert_eq!(
+            server_notification_thread_target(&notification),
+            ServerNotificationThreadTarget::InvalidThreadId("malformed".to_string())
+        );
+    }
+
+    #[test]
+    fn duplicate_question_ids_are_rejected_before_routing() {
+        let question = codex_app_server_protocol::ToolRequestUserInputQuestion {
+            id: "choice".to_string(),
+            header: "Choice".to_string(),
+            question: "Which choice?".to_string(),
+            is_other: false,
+            is_secret: false,
+            options: None,
+        };
+        let thread_id = ThreadId::new();
+        let mut request = codex_app_server_protocol::ServerRequest::ToolRequestUserInput {
+            request_id: codex_app_server_protocol::RequestId::Integer(1),
+            params: codex_app_server_protocol::ToolRequestUserInputParams {
+                thread_id: thread_id.to_string(),
+                turn_id: "turn".to_string(),
+                item_id: "item".to_string(),
+                questions: vec![question.clone(), question],
+                auto_resolution_ms: None,
+            },
+        };
+        assert_eq!(
+            super::server_request_thread_id(&request),
+            Err("duplicate user-input question id `choice`".to_string())
+        );
+        if let codex_app_server_protocol::ServerRequest::ToolRequestUserInput { params, .. } =
+            &mut request
+        {
+            params.questions[1].id = "distinct".to_string();
+        }
+        assert_eq!(
+            super::server_request_thread_id(&request),
+            Ok(Some(thread_id))
+        );
+    }
+
+    #[test]
     fn warning_notifications_without_threads_are_global() {
         let notification = ServerNotification::Warning(WarningNotification {
             thread_id: None,

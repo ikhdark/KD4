@@ -511,7 +511,8 @@ pub(super) fn selected_command_completion(
     command: &CommandItem,
 ) -> Option<String> {
     let selected_command_text = format!("/{}", command.command());
-    (!first_line.trim_start().starts_with(&selected_command_text))
+    parse_slash_name(first_line.trim_start())
+        .is_none_or(|(name, _, _)| name != command.command())
         .then(|| format!("{selected_command_text} "))
 }
 
@@ -619,6 +620,13 @@ mod tests {
 
     fn composer_with_draft_tail(prefix: &str, draft: &str) -> ChatComposer {
         composer_with_text_at_cursor(&format!("{prefix}{draft}"), prefix.len())
+    }
+
+    #[test]
+    fn slash_completion_corrects_a_longer_command_token() {
+        let mut composer = composer_with_text_at_cursor("/modelx", "/mo".len());
+        assert_eq!(press(&mut composer, KeyCode::Tab), InputResult::None);
+        assert_eq!(composer.draft.textarea.text(), "/model ");
     }
 
     #[test]

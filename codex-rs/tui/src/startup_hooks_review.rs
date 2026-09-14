@@ -50,20 +50,9 @@ enum StartupHooksReviewSelection {
 pub(crate) async fn load_startup_hooks_review_entry(
     request_handle: AppServerRequestHandle,
     cwd: PathBuf,
-) -> HooksListEntry {
-    let response = match fetch_hooks_list(request_handle, cwd.clone()).await {
-        Ok(response) => response,
-        Err(err) => {
-            tracing::warn!("failed to load startup hook review state: {err:#}");
-            return HooksListEntry {
-                cwd,
-                hooks: Vec::new(),
-                warnings: Vec::new(),
-                errors: Vec::new(),
-            };
-        }
-    };
-    hooks_list_entry_for_cwd(response, &cwd)
+) -> Result<HooksListEntry> {
+    let response = fetch_hooks_list(request_handle, cwd.clone()).await?;
+    Ok(hooks_list_entry_for_cwd(response, &cwd))
 }
 
 pub(crate) async fn maybe_run_startup_hooks_review(
@@ -253,7 +242,10 @@ fn selection_view_params(
         items: vec![
             selection_item("Review hooks", trusting_all),
             selection_item("Trust all and continue", trusting_all),
-            selection_item("Continue without trusting (hooks won't run)", trusting_all),
+            selection_item(
+                "Continue without trusting new or changed hooks",
+                trusting_all,
+            ),
         ],
         header: Box::new(header),
         ..Default::default()
@@ -362,6 +354,13 @@ mod tests {
                 let initialized = socket.next().await.unwrap().unwrap();
                 let initialized: serde_json::Value = serde_json::from_str(initialized.to_text().unwrap()).unwrap();
                 assert_eq!(initialized["method"], "initialized");
+                let request = socket.next().await.unwrap().unwrap();
+                let request: serde_json::Value = serde_json::from_str(request.to_text().unwrap()).unwrap();
+                assert_eq!(request["method"], "hooks/list");
+                socket.send(Message::Text(serde_json::json!({
+                    "id": request["id"],
+                    "error": {"code": -32000, "message": "hook inspection unavailable"}
+                }).to_string().into())).await.unwrap();
                 for attempt in 0..2 {
                     let request = socket.next().await.unwrap().unwrap();
                     let request: serde_json::Value = serde_json::from_str(request.to_text().unwrap()).unwrap();
@@ -390,6 +389,11 @@ mod tests {
                 experimental_api: true, mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: Vec::new(), channel_capacity: 8,
             }).await.unwrap();
+            let load_error = super::load_startup_hooks_review_entry(
+                AppServerRequestHandle::Remote(client.request_handle()),
+                entry().cwd,
+            ).await.unwrap_err();
+            assert!(format!("{load_error:#}").contains("hook inspection unavailable"));
             let (events_tx, events_rx) = mpsc::channel(16);
             let (paint_tx, mut paint_rx) = mpsc::unbounded_channel();
             let width = Arc::new(AtomicU16::new(80));

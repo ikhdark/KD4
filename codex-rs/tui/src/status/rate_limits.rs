@@ -217,8 +217,15 @@ pub(crate) fn compose_rate_limit_data_many(
     let mut stale = false;
 
     for snapshot in snapshots {
-        stale |= now.signed_duration_since(snapshot.captured_at)
-            > ChronoDuration::minutes(RATE_LIMIT_STALE_THRESHOLD_MINUTES);
+        let credit_row = snapshot.credits.as_ref().and_then(credit_status_row);
+        let has_snapshot_values =
+            snapshot.primary.is_some() || snapshot.secondary.is_some() || credit_row.is_some();
+        if !has_snapshot_values && snapshot.individual_limit.is_none() {
+            continue;
+        }
+        stale |= has_snapshot_values
+            && now.signed_duration_since(snapshot.captured_at)
+                > ChronoDuration::minutes(RATE_LIMIT_STALE_THRESHOLD_MINUTES);
         stale |= snapshot
             .individual_limit
             .as_ref()
@@ -307,9 +314,7 @@ pub(crate) fn compose_rate_limit_data_many(
             });
         }
 
-        if let Some(credits) = snapshot.credits.as_ref()
-            && let Some(row) = credit_status_row(credits)
-        {
+        if let Some(row) = credit_row {
             rows.push(row);
         }
         if let Some(individual_limit) = snapshot.individual_limit.as_ref() {
@@ -571,5 +576,53 @@ mod tests {
                 "Secondary usage limit".to_string(),
             ]
         );
+    }
+    #[test]
+    fn empty_named_limit_does_not_create_available_heading() {
+        let now = Local::now();
+        let empty = RateLimitSnapshotDisplay {
+            limit_name: "other".to_string(),
+            captured_at: now,
+            primary: None,
+            secondary: None,
+            credits: None,
+            individual_limit: None,
+        };
+        assert!(matches!(
+            compose_rate_limit_data_many(&[empty], now),
+            StatusRateLimitData::Unavailable
+        ));
+    }
+
+    #[test]
+    fn empty_old_snapshot_does_not_make_available_values_stale() {
+        let now = Local::now();
+        let empty = RateLimitSnapshotDisplay {
+            limit_name: "other".to_string(),
+            captured_at: now - chrono::Duration::days(1),
+            primary: None,
+            secondary: None,
+            credits: None,
+            individual_limit: None,
+        };
+        let fresh = RateLimitSnapshotDisplay {
+            limit_name: "codex".to_string(),
+            captured_at: now,
+            primary: Some(window(25.0)),
+            ..empty.clone()
+        };
+        let rows = match compose_rate_limit_data_many(&[empty, fresh], now) {
+            StatusRateLimitData::Available(rows) => rows,
+            other => panic!("expected fresh available limits, got {other:?}"),
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "5h limit");
+        assert!(matches!(
+            rows[0].value,
+            super::StatusRateLimitValue::Window {
+                percent_used: 25.0,
+                ..
+            }
+        ));
     }
 }

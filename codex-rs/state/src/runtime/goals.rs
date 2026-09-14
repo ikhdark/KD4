@@ -613,6 +613,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn goal_reads_known_milliseconds_without_legacy_inference() {
+        let runtime = test_runtime().await;
+        let thread_id = test_thread_id();
+        runtime
+            .thread_goals()
+            .replace_thread_goal(
+                thread_id,
+                "timestamp contract",
+                crate::ThreadGoalStatus::Active,
+                None,
+            )
+            .await
+            .expect("create goal");
+        sqlx::query(
+            "UPDATE thread_goals SET created_at_ms = 1000, updated_at_ms = -1 WHERE thread_id = ?",
+        )
+        .bind(thread_id.to_string())
+        .execute(runtime.thread_goals().pool.as_ref())
+        .await
+        .expect("stored millisecond values");
+        let goal = runtime
+            .thread_goals()
+            .get_thread_goal(thread_id)
+            .await
+            .expect("read goal")
+            .expect("goal");
+        assert_eq!(
+            goal.created_at,
+            DateTime::<Utc>::from_timestamp(1, 0).expect("timestamp")
+        );
+        assert_eq!(
+            goal.updated_at,
+            DateTime::<Utc>::from_timestamp(-1, 999_000_000).expect("timestamp")
+        );
+    }
+
+    #[tokio::test]
     async fn replace_update_and_get_thread_goal() {
         let runtime = test_runtime().await;
         let thread_id = test_thread_id();

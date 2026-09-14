@@ -52,6 +52,12 @@ pub struct JsonSchema {
     #[serde(rename = "enum", skip_serializing_if = "Option::is_none")]
     pub enum_values: Option<Vec<JsonValue>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    #[serde(rename = "minLength", skip_serializing_if = "Option::is_none")]
+    pub min_length: Option<u64>,
+    #[serde(rename = "maxLength", skip_serializing_if = "Option::is_none")]
+    pub max_length: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub minimum: Option<Number>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub maximum: Option<Number>,
@@ -202,23 +208,74 @@ impl From<JsonSchema> for AdditionalProperties {
 
 /// Parse the tool `input_schema` or return an error for invalid schema.
 pub fn parse_tool_input_schema(input_schema: &JsonValue) -> Result<JsonSchema, serde_json::Error> {
-    let mut input_schema = prepare_tool_input_schema(input_schema);
-    compact_large_tool_schema(&mut input_schema);
-    deserialize_tool_input_schema(input_schema)
+    let mut schema = deserialize_tool_input_schema(prepare_tool_input_schema(input_schema)?)?;
+    compact_large_tool_schema(&mut schema);
+    Ok(schema)
 }
 
 /// Parse a trusted tool `input_schema` without running large-schema compaction.
 pub fn parse_tool_input_schema_without_compaction(
     input_schema: &JsonValue,
 ) -> Result<JsonSchema, serde_json::Error> {
-    deserialize_tool_input_schema(prepare_tool_input_schema(input_schema))
+    deserialize_tool_input_schema(prepare_tool_input_schema(input_schema)?)
 }
 
-fn prepare_tool_input_schema(input_schema: &JsonValue) -> JsonValue {
+fn prepare_tool_input_schema(input_schema: &JsonValue) -> Result<JsonValue, serde_json::Error> {
     let mut input_schema = input_schema.clone();
     sanitize_json_schema(&mut input_schema);
     prune_unreachable_definitions(&mut input_schema);
-    input_schema
+    reject_unsupported_assertions(&input_schema)?;
+    Ok(input_schema)
+}
+
+fn reject_unsupported_assertions(value: &JsonValue) -> Result<(), serde_json::Error> {
+    match value {
+        JsonValue::Array(values) => {
+            for value in values {
+                reject_unsupported_assertions(value)?;
+            }
+        }
+        JsonValue::Object(map) => {
+            for key in [
+                "not",
+                "if",
+                "then",
+                "else",
+                "prefixItems",
+                "additionalItems",
+                "contains",
+                "minContains",
+                "maxContains",
+                "uniqueItems",
+                "minProperties",
+                "maxProperties",
+                "patternProperties",
+                "propertyNames",
+                "dependencies",
+                "dependentRequired",
+                "dependentSchemas",
+                "unevaluatedItems",
+                "unevaluatedProperties",
+                "$dynamicRef",
+                "$recursiveRef",
+            ] {
+                if map.contains_key(key) {
+                    return Err(<serde_json::Error as serde::de::Error>::custom(format!(
+                        "unsupported tool input schema assertion: {key}"
+                    )));
+                }
+            }
+            let mut result = Ok(());
+            for_each_schema_child(map, DefinitionTraversal::Include, &mut |child| {
+                if result.is_ok() {
+                    result = reject_unsupported_assertions(child);
+                }
+            });
+            result?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn deserialize_tool_input_schema(input_schema: JsonValue) -> Result<JsonSchema, serde_json::Error> {
@@ -241,7 +298,7 @@ const MAX_COMPACT_TOOL_SCHEMA_BYTES: usize = 5_000;
 /// after schema sanitization/pruning and removes only non-validation metadata.
 /// It is deliberately best-effort: validation keywords and reachable schema
 /// structure take precedence over the compact byte target.
-fn compact_large_tool_schema(value: &mut JsonValue) {
+fn compact_large_tool_schema(value: &mut JsonSchema) {
     for pass in LARGE_SCHEMA_COMPACTION_PASSES {
         if compact_schema_fits_budget(value) {
             break;
@@ -250,7 +307,7 @@ fn compact_large_tool_schema(value: &mut JsonValue) {
     }
 }
 
-type LargeSchemaCompactionPass = fn(&mut JsonValue);
+type LargeSchemaCompactionPass = fn(&mut JsonSchema);
 
 const MAX_COMPACT_SCHEMA_DESCRIPTION_BYTES: usize = 512;
 const SCHEMA_DESCRIPTION_TRUNCATION_MARKER: &str = " [... truncated ...]";
@@ -259,15 +316,8 @@ const LARGE_SCHEMA_COMPACTION_PASSES: &[LargeSchemaCompactionPass] = &[
     truncate_long_schema_descriptions,
 ];
 
-fn compact_schema_fits_budget(value: &JsonValue) -> bool {
-    compact_normalized_schema_len(value) <= MAX_COMPACT_TOOL_SCHEMA_BYTES
-}
-
-fn compact_normalized_schema_len(value: &JsonValue) -> usize {
-    serde_json::from_value::<JsonSchema>(value.clone())
-        .and_then(|schema| serde_json::to_vec(&schema))
-        .map(|json| json.len())
-        .unwrap_or(0)
+fn compact_schema_fits_budget(value: &JsonSchema) -> bool {
+    serde_json::to_vec(value).is_ok_and(|json| json.len() <= MAX_COMPACT_TOOL_SCHEMA_BYTES)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,71 +364,44 @@ fn for_each_schema_child(
     }
 }
 
-fn strip_root_schema_description(value: &mut JsonValue) {
-    if let JsonValue::Object(map) = value {
-        map.remove("description");
-    }
+fn strip_root_schema_description(value: &mut JsonSchema) {
+    value.description = None;
 }
 
-fn truncate_long_schema_descriptions(value: &mut JsonValue) {
-    match value {
-        JsonValue::Array(values) => {
-            for value in values {
-                truncate_long_schema_descriptions(value);
-            }
-        }
-        JsonValue::Object(map) => {
-            if let Some(JsonValue::String(description)) = map.get_mut("description")
-                && description.len() > MAX_COMPACT_SCHEMA_DESCRIPTION_BYTES
-            {
-                let prefix_budget = MAX_COMPACT_SCHEMA_DESCRIPTION_BYTES
-                    .saturating_sub(SCHEMA_DESCRIPTION_TRUNCATION_MARKER.len());
-                description.truncate(description.floor_char_boundary(prefix_budget));
-                description.push_str(SCHEMA_DESCRIPTION_TRUNCATION_MARKER);
-            }
-            for_each_schema_child_mut(map, DefinitionTraversal::Include, &mut |value| {
-                truncate_long_schema_descriptions(value);
-            });
-        }
-        _ => {}
-    }
-}
-
-fn for_each_schema_child_mut(
-    map: &mut serde_json::Map<String, JsonValue>,
-    definition_traversal: DefinitionTraversal,
-    visitor: &mut impl FnMut(&mut JsonValue),
-) {
-    if let Some(properties) = map.get_mut("properties")
-        && let Some(properties_map) = properties.as_object_mut()
+fn truncate_long_schema_descriptions(schema: &mut JsonSchema) {
+    if let Some(description) = &mut schema.description
+        && description.len() > MAX_COMPACT_SCHEMA_DESCRIPTION_BYTES
     {
-        for value in properties_map.values_mut() {
-            visitor(value);
-        }
+        let prefix_budget = MAX_COMPACT_SCHEMA_DESCRIPTION_BYTES
+            .saturating_sub(SCHEMA_DESCRIPTION_TRUNCATION_MARKER.len());
+        description.truncate(description.floor_char_boundary(prefix_budget));
+        description.push_str(SCHEMA_DESCRIPTION_TRUNCATION_MARKER);
     }
-
-    for key in SCHEMA_CHILD_KEYS {
-        if let Some(value) = map.get_mut(key) {
-            visitor(value);
-        }
-    }
-
-    if let Some(additional_properties) = map.get_mut("additionalProperties")
-        && !matches!(additional_properties, JsonValue::Bool(_))
+    for table in [
+        &mut schema.properties,
+        &mut schema.defs,
+        &mut schema.definitions,
+    ]
+    .into_iter()
+    .flatten()
     {
-        visitor(additional_properties);
-    }
-
-    if definition_traversal == DefinitionTraversal::Include {
-        for key in DEFINITION_TABLE_KEYS {
-            if let Some(definitions) = map.get_mut(key)
-                && let Some(definitions_map) = definitions.as_object_mut()
-            {
-                for value in definitions_map.values_mut() {
-                    visitor(value);
-                }
-            }
+        for child in table.values_mut() {
+            truncate_long_schema_descriptions(child);
         }
+    }
+    for variants in [&mut schema.any_of, &mut schema.one_of, &mut schema.all_of]
+        .into_iter()
+        .flatten()
+    {
+        for child in variants {
+            truncate_long_schema_descriptions(child);
+        }
+    }
+    if let Some(items) = &mut schema.items {
+        truncate_long_schema_descriptions(items);
+    }
+    if let Some(AdditionalProperties::Schema(child)) = &mut schema.additional_properties {
+        truncate_long_schema_descriptions(child);
     }
 }
 
@@ -396,13 +419,14 @@ fn has_composition_keyword(map: &serde_json::Map<String, JsonValue>) -> bool {
 /// - Collapses `const` into single-value `enum`.
 /// - Fills required child fields for object/array schema types, including
 ///   nullable unions, with permissive defaults when absent.
-/// - Coerces object schemas with no recognized schema hints into `{}`.
+/// - Preserves supported annotations on untyped schemas.
 fn sanitize_json_schema(value: &mut JsonValue) {
     match value {
-        JsonValue::Bool(_) => {
-            // JSON Schema boolean form: true/false. Coerce to an accept-all string.
-            *value = json!({ "type": "string" });
+        JsonValue::Bool(true) => {
+            *value = json!({});
         }
+        // A false schema cannot be represented; leave it for deserialization to reject.
+        JsonValue::Bool(false) => {}
         JsonValue::Array(values) => {
             for value in values {
                 sanitize_json_schema(value);
@@ -437,13 +461,28 @@ fn sanitize_json_schema(value: &mut JsonValue) {
             }
 
             if let Some(const_value) = map.remove("const") {
-                map.insert("enum".to_string(), JsonValue::Array(vec![const_value]));
+                if map.contains_key("enum") {
+                    let constraint = json!({"enum": [const_value]});
+                    match map.entry("allOf").or_insert_with(|| json!([])) {
+                        JsonValue::Array(variants) => variants.push(constraint),
+                        // Optional schema fields treat null as absent during deserialization.
+                        value @ JsonValue::Null => *value = json!([constraint]),
+                        // Leave malformed composition for deserialization to reject.
+                        _ => {}
+                    }
+                } else {
+                    map.insert("enum".to_string(), JsonValue::Array(vec![const_value]));
+                }
             }
 
             let mut schema_types = normalized_schema_types(map);
 
-            if schema_types.is_empty() && (map.contains_key("$ref") || has_composition_keyword(map))
+            if schema_types.is_empty()
+                && (map.contains_key("$ref")
+                    || has_composition_keyword(map)
+                    || map.contains_key("enum"))
             {
+                map.remove("type");
                 return;
             }
 
@@ -455,7 +494,7 @@ fn sanitize_json_schema(value: &mut JsonValue) {
                     schema_types.push(JsonSchemaPrimitiveType::Object);
                 } else if map.contains_key("items") || map.contains_key("prefixItems") {
                     schema_types.push(JsonSchemaPrimitiveType::Array);
-                } else if map.contains_key("enum") || map.contains_key("format") {
+                } else if map.contains_key("format") {
                     schema_types.push(JsonSchemaPrimitiveType::String);
                 } else if map.contains_key("minimum")
                     || map.contains_key("maximum")
@@ -465,7 +504,7 @@ fn sanitize_json_schema(value: &mut JsonValue) {
                 {
                     schema_types.push(JsonSchemaPrimitiveType::Number);
                 } else {
-                    map.clear();
+                    map.remove("type");
                     return;
                 }
             }
@@ -512,7 +551,7 @@ fn ensure_default_children_for_schema_types(
     }
 
     if schema_types.contains(&JsonSchemaPrimitiveType::Array) && !map.contains_key("items") {
-        map.insert("items".to_string(), json!({ "type": "string" }));
+        map.insert("items".to_string(), json!({}));
     }
 }
 
@@ -525,7 +564,16 @@ struct DefinitionPointer {
 /// Prune unused root definition entries to avoid sending tokens for definitions
 /// the tool schema never references.
 fn prune_unreachable_definitions(value: &mut JsonValue) {
-    let reachable = collect_reachable_definitions(value);
+    if !DEFINITION_TABLE_KEYS
+        .iter()
+        .any(|key| value.get(key).is_some())
+    {
+        return;
+    }
+    let Some(reachable) = collect_reachable_definitions(value) else {
+        // An unhandled local reference is not proof that definitions are unused.
+        return;
+    };
     let JsonValue::Object(map) = value else {
         return;
     };
@@ -556,67 +604,50 @@ fn prune_schema_table(
     }
 }
 
-fn collect_reachable_definitions(value: &JsonValue) -> BTreeSet<DefinitionPointer> {
+fn collect_reachable_definitions(value: &JsonValue) -> Option<BTreeSet<DefinitionPointer>> {
     let mut reachable = BTreeSet::new();
     let mut pending = Vec::new();
-
-    collect_refs_outside_definitions(value, &mut pending);
-
+    if !collect_refs(value, &mut pending, DefinitionTraversal::Skip) {
+        return None;
+    }
     while let Some(pointer) = pending.pop() {
         if !reachable.insert(pointer.clone()) {
             continue;
         }
-
-        if let Some(definition) = definition_for_pointer(value, &pointer) {
-            collect_refs(definition, &mut pending);
+        if let Some(definition) = definition_for_pointer(value, &pointer)
+            && !collect_refs(definition, &mut pending, DefinitionTraversal::Include)
+        {
+            return None;
         }
     }
-
-    reachable
+    Some(reachable)
 }
 
-fn collect_refs_outside_definitions(value: &JsonValue, refs: &mut Vec<DefinitionPointer>) {
-    match value {
-        JsonValue::Array(values) => {
-            for value in values {
-                collect_refs_outside_definitions(value, refs);
-            }
-        }
-        JsonValue::Object(map) => {
-            collect_ref_from_map(map, refs);
-            for_each_schema_child(map, DefinitionTraversal::Skip, &mut |value| {
-                collect_refs_outside_definitions(value, refs);
-            });
-        }
-        _ => {}
-    }
-}
-
-fn collect_refs(value: &JsonValue, refs: &mut Vec<DefinitionPointer>) {
-    match value {
-        JsonValue::Array(values) => {
-            for value in values {
-                collect_refs(value, refs);
-            }
-        }
-        JsonValue::Object(map) => {
-            collect_ref_from_map(map, refs);
-            for value in map.values() {
-                collect_refs(value, refs);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn collect_ref_from_map(
-    map: &serde_json::Map<String, JsonValue>,
+/// Returns false when local reachability cannot be determined by this walker.
+fn collect_refs(
+    value: &JsonValue,
     refs: &mut Vec<DefinitionPointer>,
-) {
-    if let Some(JsonValue::String(schema_ref)) = map.get("$ref")
-        && let Some(pointer) = parse_local_definition_ref(schema_ref)
-    {
-        refs.push(pointer);
+    definition_traversal: DefinitionTraversal,
+) -> bool {
+    match value {
+        JsonValue::Array(values) => values
+            .iter()
+            .all(|value| collect_refs(value, refs, definition_traversal)),
+        JsonValue::Object(map) => {
+            if let Some(JsonValue::String(schema_ref)) = map.get("$ref") {
+                if let Some(pointer) = parse_local_definition_ref(schema_ref) {
+                    refs.push(pointer);
+                } else if schema_ref.starts_with('#') {
+                    return false;
+                }
+            }
+            let mut complete = true;
+            for_each_schema_child(map, definition_traversal, &mut |child| {
+                complete &= collect_refs(child, refs, definition_traversal);
+            });
+            complete
+        }
+        _ => true,
     }
 }
 

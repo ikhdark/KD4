@@ -203,7 +203,11 @@ fn apply_event_msg(metadata: &mut ThreadMetadata, event: &EventMsg) {
             apply_user_message(metadata, user);
         }
         EventMsg::ItemCompleted(event) => {
-            if let TurnItem::UserMessage(user) = &event.item {
+            if let TurnItem::UserMessage(user) = &event.item
+                && (metadata.first_user_message.is_none()
+                    || metadata.preview.is_none()
+                    || metadata.title.is_empty())
+            {
                 apply_user_message(metadata, &user.as_legacy_user_message_event());
             }
         }
@@ -225,11 +229,13 @@ fn apply_event_msg(metadata: &mut ThreadMetadata, event: &EventMsg) {
 fn apply_response_item(_metadata: &mut ThreadMetadata, _item: &ResponseItem) {}
 
 fn apply_user_message(metadata: &mut ThreadMetadata, user: &UserMessageEvent) {
-    let preview = user_message_preview(user);
-    if metadata.first_user_message.is_none() {
-        metadata.first_user_message = preview.clone();
+    if metadata.first_user_message.is_none() || metadata.preview.is_none() {
+        let preview = user_message_preview(user);
+        if metadata.first_user_message.is_none() {
+            metadata.first_user_message = preview.clone();
+        }
+        set_preview_if_empty(metadata, preview);
     }
-    set_preview_if_empty(metadata, preview);
     if metadata.title.is_empty() {
         let title = strip_user_message_prefix(user.message.as_str());
         if !title.is_empty() {

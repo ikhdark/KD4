@@ -144,7 +144,7 @@ fn activity_summary(item: &ThreadItem) -> Option<String> {
             return bounded_summary(&format!("$ {command}"));
         }
         ThreadItem::FileChange { changes, .. } => {
-            return bounded_summary(&format!("Updated {} file(s)", changes.len()));
+            return bounded_summary(&format!("File changes: {}", changes.len()));
         }
         ThreadItem::McpToolCall { server, tool, .. } => {
             return bounded_summary(&format!("MCP {server}/{tool}"));
@@ -160,11 +160,11 @@ fn activity_summary(item: &ThreadItem) -> Option<String> {
         }
         ThreadItem::CollabAgentToolCall { tool, .. } => {
             let action = match tool {
-                CollabAgentTool::SpawnAgent => "Spawned an agent",
-                CollabAgentTool::SendInput => "Sent input to an agent",
-                CollabAgentTool::ResumeAgent => "Resumed an agent",
-                CollabAgentTool::Wait => "Waited for an agent",
-                CollabAgentTool::CloseAgent => "Closed an agent",
+                CollabAgentTool::SpawnAgent => "Agent spawning",
+                CollabAgentTool::SendInput => "Agent input",
+                CollabAgentTool::ResumeAgent => "Agent resuming",
+                CollabAgentTool::Wait => "Agent wait",
+                CollabAgentTool::CloseAgent => "Agent closing",
             };
             return Some(action.to_string());
         }
@@ -183,12 +183,12 @@ fn activity_summary(item: &ThreadItem) -> Option<String> {
         }
         ThreadItem::ImageView { path, .. } => {
             let path = path.render_for_ui();
-            return bounded_summary(&format!("Viewed {path}"));
+            return bounded_summary(&format!("Image view: {path}"));
         }
-        ThreadItem::ImageGeneration(_) => return Some("Generated an image".to_string()),
+        ThreadItem::ImageGeneration(_) => return Some("Image generation".to_string()),
         ThreadItem::EnteredReviewMode { .. } => return Some("Entered review mode".to_string()),
         ThreadItem::ExitedReviewMode { .. } => return Some("Exited review mode".to_string()),
-        ThreadItem::ContextCompaction { .. } => return Some("Compacted context".to_string()),
+        ThreadItem::ContextCompaction { .. } => return Some("Context compaction".to_string()),
         ThreadItem::UserMessage { .. }
         | ThreadItem::HookPrompt { .. }
         | ThreadItem::Sleep { .. } => return None,

@@ -5,6 +5,7 @@
 //! after creation.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,6 +43,7 @@ pub struct CodexAppsToolsCacheKey {
     pub(crate) chatgpt_user_id: Option<String>,
     pub(crate) is_workspace_account: bool,
     pub(crate) chatgpt_base_url: String,
+    pub(crate) mcp_endpoint: String,
     pub(crate) product_sku: String,
 }
 
@@ -56,9 +58,33 @@ pub fn codex_apps_tools_cache_key(
         chatgpt_user_id: auth.and_then(CodexAuth::get_chatgpt_user_id),
         is_workspace_account: auth.is_some_and(CodexAuth::is_workspace_account),
         chatgpt_base_url: canonicalize_chatgpt_base_url(chatgpt_base_url),
+        mcp_endpoint: crate::mcp::codex_apps_mcp_url_for_base_url(chatgpt_base_url),
         product_sku: apps_mcp_product_sku
             .unwrap_or(DEFAULT_CODEX_APPS_MCP_PRODUCT_SKU)
             .to_string(),
+    }
+}
+
+impl CodexAppsToolsCacheKey {
+    pub(crate) fn for_server(mut self, config: &codex_config::McpServerConfig) -> Self {
+        if let codex_config::McpServerTransportConfig::StreamableHttp {
+            url, http_headers, ..
+        } = &config.transport
+        {
+            self.mcp_endpoint = url::Url::parse(url)
+                .map(|url| url.to_string())
+                .unwrap_or_else(|_| url.clone());
+            self.product_sku = http_headers
+                .as_ref()
+                .and_then(|headers| {
+                    headers
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("X-OpenAI-Product-Sku"))
+                })
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default();
+        }
+        self
     }
 }
 
@@ -123,12 +149,13 @@ static SHARED_CODEX_APPS_TOOLS_CACHE: LazyLock<CodexAppsToolsCache> =
 /// One authoritative Codex Apps tools snapshot.
 ///
 /// Disk-seeded snapshots have no `published_at` value and are treated as
-/// startup data. A successful live fetch publishes the tools and timestamp
-/// atomically so derived callers cannot retain an older projection.
+/// startup data. A successful live fetch publishes tools, timestamp, and content
+/// revision atomically, including when its awaiting caller has been cancelled.
 #[derive(Clone)]
 pub struct CodexAppsToolsSnapshot {
     tools: Vec<ToolInfo>,
     published_at: Option<Instant>,
+    content_revision: u64,
 }
 
 impl CodexAppsToolsSnapshot {
@@ -156,6 +183,15 @@ pub(crate) struct CodexAppsToolsCacheContext {
 }
 
 impl CodexAppsToolsCacheContext {
+    pub(crate) fn current_snapshot(&self) -> Option<Arc<CodexAppsToolsSnapshot>> {
+        self.entry.current_snapshot.load_full()
+    }
+
+    pub(crate) fn content_revision(&self) -> u64 {
+        self.current_snapshot()
+            .map_or(0, |snapshot| snapshot.content_revision)
+    }
+
     pub(crate) fn tools_cache_path(&self) -> PathBuf {
         self.entry
             .identity
@@ -193,6 +229,7 @@ impl CodexAppsToolsCacheContext {
         }
     }
 
+    #[expect(clippy::expect_used, reason = "A panicked publication worker may have partially committed a generation; do not return fabricated success")]
     pub(crate) async fn publish_if_newest_accepted(
         &self,
         ticket: CodexAppsToolsFetchTicket,
@@ -228,11 +265,21 @@ impl CodexAppsToolsCacheContext {
         }
 
         *last_accepted_generation = ticket.generation;
+        let previous = self.current_snapshot();
+        let content_revision = previous
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.content_revision)
+            + u64::from(
+                previous
+                    .as_ref()
+                    .is_none_or(|snapshot| snapshot.tools != tools),
+            );
         self.entry
             .current_snapshot
             .store(Some(Arc::new(CodexAppsToolsSnapshot {
                 tools: tools.clone(),
                 published_at: Some(Instant::now()),
+                content_revision,
             })));
         persist_codex_apps_cache(self, server_info, &tools);
         emit_duration(
@@ -250,6 +297,7 @@ impl CodexAppsToolsCacheContext {
             .store(Some(Arc::new(CodexAppsToolsSnapshot {
                 tools,
                 published_at: None,
+                content_revision: self.content_revision() + 1,
             })));
     }
 }
@@ -276,15 +324,15 @@ impl CodexAppsToolsCache {
         &self,
         codex_home: PathBuf,
         auth_key: CodexAppsToolsCacheKey,
-    ) -> Option<CodexAppsToolsSnapshot> {
+    ) -> Option<Arc<CodexAppsToolsSnapshot>> {
         self.context(codex_home, auth_key)
             .await
             .entry
             .current_snapshot
             .load_full()
-            .map(|snapshot| snapshot.as_ref().clone())
     }
 
+    #[expect(clippy::expect_used, reason = "A panicked initialization worker cannot provide the shared cache identity required by callers")]
     pub(crate) async fn context(
         &self,
         codex_home: PathBuf,
@@ -345,6 +393,7 @@ impl CodexAppsToolsCacheEntry {
             Arc::new(CodexAppsToolsSnapshot {
                 tools,
                 published_at: None,
+                content_revision: 0,
             })
         });
         Self {
@@ -391,6 +440,7 @@ fn write_cached_codex_apps_tools_for_test(
         .store(Some(Arc::new(CodexAppsToolsSnapshot {
             tools: tools.to_vec(),
             published_at: Some(Instant::now()),
+            content_revision: cache_context.content_revision() + 1,
         })));
     persist_codex_apps_cache(cache_context, server_info, tools);
 }
@@ -467,7 +517,10 @@ fn write_codex_apps_cache_file(
             )
         })?;
     }
-    std::fs::write(cache_path, bytes).with_context(|| {
+    let parent = cache_path.parent().context("cache path has no parent")?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(&bytes)?;
+    temporary.persist(cache_path).with_context(|| {
         format!(
             "failed to write Codex Apps {cache_name} cache `{}`",
             cache_path.display()

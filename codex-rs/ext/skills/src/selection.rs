@@ -23,7 +23,7 @@ pub(crate) fn collect_explicit_skill_mentions(
     inputs: &[UserInput],
     catalog: &SkillCatalog,
 ) -> Vec<SkillCatalogEntry> {
-    let catalog = CanonicalSkillCatalog::new(catalog);
+    let catalog = std::cell::LazyCell::new(|| CanonicalSkillCatalog::new(catalog));
     let mut selected = Vec::new();
     let mut seen = HashSet::new();
     let mut blocked_plain_names = HashSet::new();

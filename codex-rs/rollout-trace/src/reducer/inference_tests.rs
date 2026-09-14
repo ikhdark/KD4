@@ -156,3 +156,62 @@ fn late_cancelled_inference_preserves_turn_end_status() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn late_cancelled_response_does_not_contaminate_new_incremental_context() -> anyhow::Result<()> {
+    use crate::reducer::test_support::append_inference_completion;
+    let temp = TempDir::new()?;
+    let writer = create_started_writer(&temp)?;
+    start_turn(&writer, "old-turn")?;
+    let old_request = writer.write_json_payload(
+        RawPayloadKind::InferenceRequest,
+        &json!({"input": [message("user", "old")]}),
+    )?;
+    append_inference_start(&writer, "old", "old-turn", old_request)?;
+    writer.append(RawTraceEventPayload::CodexTurnEnded {
+        codex_turn_id: "old-turn".to_string(),
+        status: ExecutionStatus::Cancelled,
+    })?;
+    start_turn(&writer, "new-turn")?;
+    let request = writer.write_json_payload(
+        RawPayloadKind::InferenceRequest,
+        &json!({"input": [message("user", "new")]}),
+    )?;
+    append_inference_start(&writer, "new", "new-turn", request)?;
+    let response = writer.write_json_payload(
+        RawPayloadKind::InferenceResponse,
+        &json!({"output_items": [message("assistant", "new answer")]}),
+    )?;
+    append_inference_completion(&writer, "new", "new-response", response)?;
+    let partial = writer.write_json_payload(
+        RawPayloadKind::InferenceResponse,
+        &json!({"output_items": [message("assistant", "old partial")]}),
+    )?;
+    writer.append(RawTraceEventPayload::InferenceCancelled {
+        inference_call_id: "old".to_string(),
+        upstream_request_id: None,
+        reason: "cancelled".to_string(),
+        partial_response_payload: Some(partial),
+    })?;
+    let followup = writer.write_json_payload(
+        RawPayloadKind::InferenceRequest,
+        &json!({"previous_response_id": "new-response", "input": [message("user", "continue")]}),
+    )?;
+    append_inference_start(&writer, "followup", "new-turn", followup)?;
+    let rollout = replay_bundle(temp.path())?;
+    let old = &rollout.inference_calls["old"];
+    let new = &rollout.inference_calls["new"];
+    let followup = &rollout.inference_calls["followup"].request_item_ids;
+    assert_eq!(old.execution.status, ExecutionStatus::Cancelled);
+    assert_eq!(old.response_item_ids.len(), 1);
+    assert_eq!(followup.len(), 3);
+    assert_eq!(
+        followup[..2],
+        [
+            new.request_item_ids[0].clone(),
+            new.response_item_ids[0].clone()
+        ]
+    );
+    assert!(!followup.contains(&old.response_item_ids[0]));
+    Ok(())
+}

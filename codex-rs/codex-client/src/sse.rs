@@ -11,6 +11,8 @@ use tokio::time::timeout;
 /// Parsing errors and idle timeouts are sent as `Err(StreamError)` before the
 /// task exits. Clean end-of-stream closes the output channel without an error;
 /// protocol-specific completion requirements belong in the typed consumer.
+/// The timeout measures time without a complete event, including comment-only
+/// heartbeats or partial events. Dropping the receiver stops the producer.
 pub fn sse_stream(
     stream: ByteStream,
     idle_timeout: Duration,
@@ -22,9 +24,13 @@ pub fn sse_stream(
             .eventsource();
 
         loop {
-            match timeout(idle_timeout, stream.next()).await {
+            let next = tokio::select! {
+                _ = tx.closed() => return,
+                next = timeout(idle_timeout, stream.next()) => next,
+            };
+            match next {
                 Ok(Some(Ok(ev))) => {
-                    if tx.send(Ok(ev.data.clone())).await.is_err() {
+                    if tx.send(Ok(ev.data)).await.is_err() {
                         return;
                     }
                 }

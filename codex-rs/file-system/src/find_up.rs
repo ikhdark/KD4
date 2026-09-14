@@ -11,7 +11,7 @@ const MAX_CONCURRENT_PROBES: usize = 8;
 /// Controls how an upward marker search handles metadata errors other than `NotFound`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FindUpErrorPolicy {
-    /// Return the first error in lexical search order.
+    /// Return the first error in ancestor and caller-provided marker order.
     Propagate,
     /// Treat errors as missing markers and continue searching.
     Ignore,
@@ -19,9 +19,8 @@ pub enum FindUpErrorPolicy {
 
 /// Finds the nearest ancestor containing one of the provided marker names.
 ///
-/// Marker paths are probed in lexical order from `start` toward the filesystem root. A bounded
-/// number of ordinary metadata calls are kept in flight so remote filesystems can pipeline them
-/// without requiring a batch protocol operation.
+/// Searches ancestors from `start` toward the root and markers in caller-provided order.
+/// Results and propagated errors retain that order, with at most eight metadata probes in flight.
 pub async fn find_nearest_ancestor_with_markers(
     file_system: &dyn ExecutorFileSystem,
     start: &PathUri,

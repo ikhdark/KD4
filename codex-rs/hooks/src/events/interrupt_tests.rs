@@ -61,6 +61,7 @@ fn other_failures_use_standard_errors() {
     for (exit_code, stdout, expected) in [
         (Some(0), "aloha", "Interrupt hook returned non-JSON stdout"),
         (Some(2), "", "hook exited with code 2"),
+        (None, "", "hook exited without a status code"),
     ] {
         assert_failed(stdout, exit_code, expected);
     }
@@ -79,9 +80,35 @@ fn parse(
 ) -> crate::engine::dispatcher::ParsedHandler<InterruptHandlerData> {
     parse_completed(
         &handler(),
-        run_result(exit_code, stdout, "ignored"),
+        run_result(exit_code, stdout, ""),
         Some("turn-1".to_string()),
     )
+}
+
+#[test]
+fn nonzero_exit_preserves_stderr() {
+    let parsed = parse_completed(
+        &handler(),
+        run_result(Some(2), "", "  could not notify watcher\n"),
+        None,
+    );
+    assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
+    assert_eq!(
+        parsed.completed.run.entries,
+        vec![error("could not notify watcher")]
+    );
+}
+
+#[test]
+fn runner_error_takes_precedence_over_successful_output() {
+    let mut result = run_result(Some(0), r#"{"systemMessage":"success"}"#, "");
+    result.error = Some("runner timed out".into());
+    let parsed = parse_completed(&handler(), result, None);
+    assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
+    assert_eq!(
+        parsed.completed.run.entries,
+        vec![error("runner timed out")]
+    );
 }
 
 fn warning(text: &str) -> HookOutputEntry {

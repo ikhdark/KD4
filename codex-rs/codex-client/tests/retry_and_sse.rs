@@ -4,6 +4,7 @@ use codex_client::RetryOn;
 use codex_client::RetryPolicy;
 use codex_client::TransportError;
 use codex_client::backoff;
+use codex_client::capped_backoff;
 use codex_client::run_with_retry;
 use codex_client::run_with_retry_non_idempotent;
 use codex_client::sse_stream;
@@ -42,6 +43,102 @@ fn backoff_saturates_large_public_inputs() {
     let oversized_base = Duration::from_secs(u64::MAX / 1_000 + 1);
     let base_delay = backoff(oversized_base, 1);
     assert!(base_delay > Duration::from_secs(60));
+}
+
+#[test]
+fn capped_backoff_preserves_growth_below_the_ceiling() {
+    let base = Duration::from_millis(100);
+    let maximum = Duration::from_secs(2);
+    assert_eq!(capped_backoff(base, 0, maximum), base);
+    for (retry, minimum, upper) in [(1, 90, 110), (2, 180, 220)] {
+        let delay = capped_backoff(base, retry, maximum);
+        assert!((Duration::from_millis(minimum)..Duration::from_millis(upper)).contains(&delay));
+    }
+    assert_eq!(capped_backoff(base, u64::MAX, maximum), maximum);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ordinary_retry_recovers_pre_dispatch_failures_and_honors_policy() {
+    for (enabled, max_retries, expected_attempts) in [(true, 2, 2), (false, 2, 1), (true, 0, 1)] {
+        let mut policy = retry_policy(max_retries);
+        policy.retry_on.retry_transport = enabled;
+        let attempts = Arc::new(AtomicU64::new(0));
+        let attempts_for_op = attempts.clone();
+        let result = run_with_retry(policy, request, move |_request, attempt| {
+            let attempts = attempts_for_op.clone();
+            async move {
+                assert_eq!(attempts.fetch_add(1, Ordering::Relaxed), attempt);
+                if attempt == 0 {
+                    Err(TransportError::PreDispatch(
+                        "temporary auth failure".to_string(),
+                    ))
+                } else {
+                    Ok("recovered")
+                }
+            }
+        })
+        .await;
+        if expected_attempts == 2 {
+            assert_eq!(result.unwrap(), "recovered");
+        } else {
+            assert!(
+                matches!(result, Err(TransportError::PreDispatch(message)) if message == "temporary auth failure")
+            );
+        }
+        assert_eq!(attempts.load(Ordering::Relaxed), expected_attempts);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn connection_retry_honors_policy_and_non_idempotent_replay_boundary() {
+    use codex_http_client::HttpTransport;
+
+    for (enabled, max_retries, non_idempotent, expected_attempts) in [
+        (true, 1, false, 2),
+        (false, 1, false, 1),
+        (true, 0, false, 1),
+        (true, 1, true, 1),
+    ] {
+        let unavailable_server = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = unavailable_server.local_addr().unwrap();
+        drop(unavailable_server);
+        let transport = codex_http_client::ReqwestTransport::from_http_client(
+            codex_http_client::HttpClientBuilder::new()
+                // Windows can delay a refused connection beyond the request deadline.
+                // Bound the connector first so the transport reports a connection error.
+                .connect_timeout(Duration::from_millis(100))
+                .build_direct()
+                .unwrap(),
+        );
+        let mut initial_request = Request::new(Method::GET, format!("http://{address}/"));
+        initial_request.timeout = Some(Duration::from_secs(2));
+        let error = transport.execute(initial_request).await.unwrap_err();
+        assert!(
+            matches!(error, TransportError::Connection(_)),
+            "expected a connection error, got {error:?}"
+        );
+
+        let pending_error = std::sync::Mutex::new(Some(error));
+        let attempts = AtomicU64::new(0);
+        let op = |_request, attempt| {
+            assert_eq!(attempts.fetch_add(1, Ordering::Relaxed), attempt);
+            let error = pending_error.lock().unwrap().take();
+            async move { error.map_or(Ok("recovered"), Err) }
+        };
+        let mut policy = retry_policy(max_retries);
+        policy.retry_on.retry_transport = enabled;
+        let result = if non_idempotent {
+            run_with_retry_non_idempotent(policy, request, op).await
+        } else {
+            run_with_retry(policy, request, op).await
+        };
+        assert_eq!(attempts.load(Ordering::Relaxed), expected_attempts);
+        if expected_attempts == 2 {
+            assert_eq!(result.unwrap(), "recovered");
+        } else {
+            assert!(matches!(result, Err(TransportError::Connection(_))));
+        }
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -204,4 +301,48 @@ async fn clean_sse_eof_closes_the_output_channel() {
     sse_stream(stream, Duration::from_secs(1), tx);
 
     assert!(rx.recv().await.is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sse_forwards_complete_event_data() {
+    let stream: ByteStream = Box::pin(futures::stream::iter([Ok(
+        b"data: first\ndata: second\n\ndata: last\n\n"
+            .to_vec()
+            .into(),
+    )]));
+    let (tx, mut rx) = mpsc::channel(1);
+    sse_stream(stream, Duration::from_secs(60), tx);
+    assert_eq!(rx.recv().await.unwrap().unwrap(), "first\nsecond");
+    assert_eq!(rx.recv().await.unwrap().unwrap(), "last");
+    assert!(rx.recv().await.is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropping_sse_receiver_releases_idle_input() {
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.take().unwrap().send(()).ok();
+        }
+    }
+
+    let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+    let guard = DropSignal(Some(dropped_tx));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let mut started_tx = Some(started_tx);
+    let stream: ByteStream = Box::pin(futures::stream::poll_fn(move |_cx| {
+        let _keep_alive = &guard;
+        if let Some(tx) = started_tx.take() {
+            tx.send(()).unwrap();
+        }
+        std::task::Poll::Pending
+    }));
+    let (tx, rx) = mpsc::channel(1);
+    sse_stream(stream, Duration::from_secs(60), tx);
+    started_rx.await.unwrap();
+    drop(rx);
+    tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+        .await
+        .expect("receiver closure must release input before the idle timeout")
+        .expect("input must be dropped");
 }

@@ -876,6 +876,7 @@ mod tests {
         writer_tx
             .try_send(vec![b'x'])
             .expect("pre-fill driver stdin queue");
+        let writer_probe = writer_tx.clone();
         let (stdout_tx, stdout_rx) = tokio::sync::broadcast::channel(1);
         let (stderr_tx, stderr_rx) = tokio::sync::broadcast::channel(1);
         drop(stdout_tx);
@@ -928,6 +929,19 @@ mod tests {
             })
             .await
             .expect("queue stdin write");
+        timeout(Duration::from_secs(1), async {
+            // ProcessHandle and this probe own two senders. The third belongs
+            // to handle_process_write while its send waits on the full driver.
+            while writer_probe.strong_count() < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stdin worker must reach the blocked driver before kill");
+        assert!(matches!(
+            write_response_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
         let (kill_response_tx, kill_response_rx) = oneshot::channel();
         control_tx
             .send(ProcessControlRequest {
@@ -937,12 +951,6 @@ mod tests {
             .await
             .expect("queue kill control");
 
-        assert!(
-            timeout(Duration::from_millis(100), &mut write_response_rx)
-                .await
-                .is_err(),
-            "backpressured write should remain pending",
-        );
         timeout(Duration::from_secs(1), kill_response_rx)
             .await
             .expect("kill response timed out")

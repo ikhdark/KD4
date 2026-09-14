@@ -88,10 +88,34 @@ pub(super) fn scoped_rollout_path(
 }
 
 pub(super) fn rollout_path_is_archived(codex_home: &Path, path: &Path) -> bool {
-    path.starts_with(codex_home.join(ARCHIVED_SESSIONS_SUBDIR))
-        || path
-            .components()
-            .any(|component| component.as_os_str() == OsStr::new(ARCHIVED_SESSIONS_SUBDIR))
+    if path.starts_with(codex_home.join(codex_rollout::SESSIONS_SUBDIR)) {
+        return false;
+    }
+    if path.starts_with(codex_home.join(ARCHIVED_SESSIONS_SUBDIR)) {
+        return true;
+    }
+    // Explicit external paths (including Windows verbatim paths) use the collection
+    // layout next to the rollout, never an arbitrary ancestor of the caller's home.
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if parent.file_name() == Some(OsStr::new(ARCHIVED_SESSIONS_SUBDIR)) {
+        return true;
+    }
+    let mut directory = parent;
+    for width in [2, 2, 4] {
+        let Some(name) = directory.file_name().and_then(OsStr::to_str) else {
+            return false;
+        };
+        if name.len() != width || !name.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+        let Some(parent) = directory.parent() else {
+            return false;
+        };
+        directory = parent;
+    }
+    directory.file_name() == Some(OsStr::new(ARCHIVED_SESSIONS_SUBDIR))
 }
 
 pub(super) struct ResolvedRolloutPath {
@@ -359,6 +383,27 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[test]
+    fn archived_location_depends_on_the_collection_not_arbitrary_ancestors() {
+        let home = Path::new("archive/archived_sessions/nested-home");
+        assert!(!rollout_path_is_archived(
+            home,
+            &home.join("sessions/2025/01/03/rollout.jsonl")
+        ));
+        assert!(!rollout_path_is_archived(
+            Path::new("other-home"),
+            &home.join("sessions/2025/01/03/rollout.jsonl")
+        ));
+        assert!(rollout_path_is_archived(
+            Path::new("other-home"),
+            Path::new("external/archived_sessions/rollout.jsonl")
+        ));
+        assert!(rollout_path_is_archived(
+            Path::new("other-home"),
+            Path::new("external/archived_sessions/2025/01/03/rollout.jsonl")
+        ));
+    }
 
     #[test]
     fn rollout_lookup_failures_are_internal_store_errors() {

@@ -10,7 +10,6 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Duration;
 
 use codex_app_server_protocol::DESKTOP_CLIENT_NAME;
@@ -124,7 +123,14 @@ pub(super) async fn local_publish_check(target_path: PathBuf) -> DoctorCheck {
     ];
     push_path_detail(&mut details, "current executable", current_exe.as_deref());
 
-    match file_sha256(&target_path) {
+    match tokio::task::spawn_blocking({
+        let target_path = target_path.clone();
+        move || file_sha256(&target_path)
+    })
+    .await
+    .map_err(|err| err.to_string())
+    .and_then(|result| result)
+    {
         Ok(hash) => details.push(format!("target sha256: {hash}")),
         Err(err) => details.push(format!("target sha256: <unavailable: {err}>")),
     }
@@ -164,18 +170,12 @@ pub(super) async fn local_publish_check(target_path: PathBuf) -> DoctorCheck {
     if let Some(repo_root) = source_repo_root() {
         details.push(format!("source repo root: {}", repo_root.display()));
         details.push(format!(
-            "source HEAD: {}",
-            git_output(&repo_root, &["rev-parse", "--short", "HEAD"])
-        ));
-        details.push(format!(
-            "source dirty files: {}",
-            git_status_count(&repo_root)
-                .map(|count| count.to_string())
-                .unwrap_or_else(|| "<unavailable>".to_string())
+            "detected checkout HEAD: {}",
+            git_output(&repo_root, &["rev-parse", "--short", "HEAD"]).await
         ));
     } else {
         details.push("source repo root: <not detected>".to_string());
-        details.push("source HEAD: <not detected>".to_string());
+        details.push("detected checkout HEAD: <not detected>".to_string());
     }
 
     if !target_path.is_file() {
@@ -210,7 +210,7 @@ pub(super) async fn local_publish_check(target_path: PathBuf) -> DoctorCheck {
                 .expected("a bounded, successful codex --version response")
                 .field("target version"),
         )
-        .remediation("Rebuild the local target before publishing it.");
+        .remediation("Inspect the target version probe error and verify that the selected executable can run.");
     }
 
     if !current_is_target {
@@ -332,13 +332,19 @@ pub(super) async fn desktop_runtime_chain_check(
         }
     };
     push_desktop_runtime_receipt_details(&mut details, &receipt);
-    if let Err(err) = validate_desktop_runtime_receipt(
-        &receipt,
-        &processes,
-        &target_path,
-        std::process::id(),
-        &expected_codex_home,
-    ) {
+    let validation = tokio::task::spawn_blocking(move || {
+        validate_desktop_runtime_receipt(
+            &receipt,
+            &processes,
+            &target_path,
+            std::process::id(),
+            &expected_codex_home,
+        )
+    })
+    .await
+    .map_err(|err| err.to_string())
+    .and_then(|result| result);
+    if let Err(err) = validation {
         details.push(format!("desktop runtime receipt status: {err}"));
         return DoctorCheck::new(
             "desktop.runtime_chain",
@@ -366,53 +372,28 @@ pub(super) async fn desktop_runtime_chain_check(
 /// installs without that layout usually resolve rg from PATH. A warning here
 /// means features that depend on file search may degrade even when the CLI
 /// launches.
-pub(super) fn search_check() -> DoctorCheck {
+pub(super) async fn search_check() -> DoctorCheck {
     let current_exe = env::current_exe().ok();
     let install_context = doctor_install_context(current_exe.as_deref());
     let rg_command = install_context.rg_command();
     let provider = search_provider(&install_context);
+    search_check_for_command(&rg_command, provider).await
+}
+
+async fn search_check_for_command(rg_command: &Path, provider: &str) -> DoctorCheck {
     let mut details = vec![
         format!("search command: {}", rg_command.display()),
         format!("search provider: {provider}"),
     ];
 
-    let status = if rg_command.components().count() > 1 {
-        match std::fs::metadata(&rg_command) {
-            Ok(metadata) if metadata.is_file() => {
-                details.push("search command readiness: file exists".to_string());
-                CheckStatus::Ok
-            }
-            Ok(_) => {
-                details.push("search command readiness: path is not a file".to_string());
-                CheckStatus::Warning
-            }
-            Err(err) => {
-                details.push(format!("search command readiness: {err}"));
-                CheckStatus::Warning
-            }
+    let status = match command_version_lines(rg_command).await {
+        Ok(lines) => {
+            details.push(format!("search command readiness: {}", lines[0]));
+            CheckStatus::Ok
         }
-    } else {
-        match Command::new(&rg_command).arg("--version").output() {
-            Ok(output) if output.status.success() => {
-                let version = String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .next()
-                    .unwrap_or("rg version unknown")
-                    .to_string();
-                details.push(format!("search command readiness: {version}"));
-                CheckStatus::Ok
-            }
-            Ok(output) => {
-                details.push(format!(
-                    "search command readiness: exited with status {}",
-                    output.status
-                ));
-                CheckStatus::Warning
-            }
-            Err(err) => {
-                details.push(format!("search command readiness: {err}"));
-                CheckStatus::Warning
-            }
+        Err(err) => {
+            details.push(format!("search command readiness: {err}"));
+            CheckStatus::Warning
         }
     };
 
@@ -463,8 +444,15 @@ fn search_provider(context: &InstallContext) -> &'static str {
 fn same_path(left: &Path, right: &Path) -> bool {
     let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
     let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
-    left.to_string_lossy()
-        .eq_ignore_ascii_case(&right.to_string_lossy())
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
 }
 
 fn file_sha256(path: &Path) -> Result<String, String> {
@@ -543,12 +531,14 @@ fn source_repo_root() -> Option<PathBuf> {
     None
 }
 
-fn git_output(repo_root: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+async fn git_output(repo_root: &Path, args: &[&str]) -> String {
+    let mut command = tokio::process::Command::new("git");
+    command
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .arg("-C")
         .arg(repo_root)
-        .args(args)
-        .output();
+        .args(args);
+    let output = command_output_with_timeout(command, Duration::from_secs(2)).await;
     match output {
         Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
             .lines()
@@ -560,21 +550,6 @@ fn git_output(repo_root: &Path, args: &[&str]) -> String {
         Ok(output) => format!("<unavailable: exit {}>", output.status),
         Err(err) => format!("<unavailable: {err}>"),
     }
-}
-
-fn git_status_count(repo_root: &Path) -> Option<usize> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["status", "--porcelain=v1", "-uall"])
-        .output()
-        .ok()?;
-    output.status.success().then(|| {
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .count()
-    })
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -659,6 +634,15 @@ fn push_desktop_runtime_receipt_details(
 
 const MAX_DESKTOP_PROCESS_EVIDENCE: usize = 20;
 
+fn desktop_process_filter(target_path: &Path) -> String {
+    let name = target_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let name = name.replace('\\', "\\\\").replace('\'', "\\'");
+    format!("Name='codex.exe' OR Name='{name}'")
+}
+
 async fn desktop_process_probe(
     target_path: &Path,
 ) -> Result<Vec<self::DesktopProcessEvidence>, String> {
@@ -668,7 +652,7 @@ async fn desktop_process_probe(
             "-NoProfile",
             "-Command",
             r#"
-Get-CimInstance Win32_Process -Filter "Name='codex.exe'" -OperationTimeoutSec 2 -ErrorAction Stop |
+Get-CimInstance Win32_Process -Filter $env:CODEX_DOCTOR_PROCESS_FILTER -OperationTimeoutSec 2 -ErrorAction Stop |
     Where-Object { $_.ProcessId -ne [uint32]$env:CODEX_DOCTOR_CURRENT_PID } |
     ForEach-Object {
         [pscustomobject]@{
@@ -679,7 +663,8 @@ Get-CimInstance Win32_Process -Filter "Name='codex.exe'" -OperationTimeoutSec 2 
     }
 "#,
         ])
-        .env("CODEX_DOCTOR_CURRENT_PID", std::process::id().to_string());
+        .env("CODEX_DOCTOR_CURRENT_PID", std::process::id().to_string())
+        .env("CODEX_DOCTOR_PROCESS_FILTER", desktop_process_filter(target_path));
     let output = command_output_with_timeout(command, Duration::from_secs(5)).await?;
     if !output.status.success() {
         return Err(format!("PowerShell exited with {}", output.status));
@@ -698,21 +683,17 @@ fn prioritize_desktop_processes(
     mut processes: Vec<DesktopProcessEvidence>,
     target_path: &Path,
 ) -> Vec<DesktopProcessEvidence> {
-    processes.sort_by_key(|process| {
+    processes.sort_by_cached_key(|process| {
+        let matches_target = process
+            .path
+            .as_deref()
+            .is_some_and(|path| same_path(path, target_path));
         std::cmp::Reverse((
-            process.is_app_server
-                && process
-                    .path
-                    .as_deref()
-                    .is_some_and(|path| same_path(path, target_path)),
+            process.is_app_server && matches_target,
             process.is_app_server,
-            process
-                .path
-                .as_deref()
-                .is_some_and(|path| same_path(path, target_path)),
+            matches_target,
         ))
     });
-    processes.truncate(MAX_DESKTOP_PROCESS_EVIDENCE);
     processes
 }
 
@@ -745,19 +726,25 @@ fn push_desktop_process_details(
         "matching local app-server processes: {matching_count}"
     ));
     if show_details {
-        details.extend(processes.iter().enumerate().map(|(index, process)| {
-            format!(
-                "codex process #{}: pid={} path={} app-server={}",
-                index + 1,
-                process.pid,
-                process
-                    .path
-                    .as_deref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "<unavailable>".to_string()),
-                process.is_app_server,
-            )
-        }));
+        details.extend(
+            processes
+                .iter()
+                .take(MAX_DESKTOP_PROCESS_EVIDENCE)
+                .enumerate()
+                .map(|(index, process)| {
+                    format!(
+                        "codex process #{}: pid={} path={} app-server={}",
+                        index + 1,
+                        process.pid,
+                        process
+                            .path
+                            .as_deref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "<unavailable>".to_string()),
+                        process.is_app_server,
+                    )
+                }),
+        );
     }
 }
 
@@ -786,6 +773,56 @@ mod tests {
             build_profile: build.profile.to_string(),
             build_built: build.built.to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn bundled_search_must_execute_successfully() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("rg.exe");
+        std::fs::write(&path, "not an executable").unwrap();
+        let check = search_check_for_command(&path, "bundled").await;
+        assert_eq!(check.status, CheckStatus::Warning);
+        assert_eq!(check.summary, "search command could not be verified");
+    }
+
+    #[test]
+    fn receipt_validation_uses_all_matching_processes_beyond_display_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("kd4.exe");
+        let home = temp.path().join("home");
+        let receipt = matching_receipt(target.clone(), home.clone(), 21);
+        let processes = (1..=21)
+            .map(|pid| DesktopProcessEvidence {
+                pid,
+                path: Some(target.clone()),
+                is_app_server: true,
+            })
+            .collect();
+        let processes = prioritize_desktop_processes(processes, &target);
+        assert_eq!(
+            validate_desktop_runtime_receipt(&receipt, &processes, &target, 99, &home),
+            Ok(())
+        );
+        let mut details = Vec::new();
+        push_desktop_process_details(
+            &mut details,
+            &processes,
+            matching_desktop_app_servers(&processes, &target, 99).len(),
+            true,
+        );
+        assert!(details.contains(&"candidate codex processes: 21".to_string()));
+        assert!(details.contains(&"matching local app-server processes: 21".to_string()));
+        assert_eq!(
+            details
+                .iter()
+                .filter(|line| line.starts_with("codex process #"))
+                .count(),
+            20
+        );
+        assert_eq!(
+            desktop_process_filter(&target),
+            "Name='codex.exe' OR Name='kd4.exe'"
+        );
     }
 
     #[test]
@@ -848,6 +885,7 @@ mod tests {
         assert_eq!(check.summary, "local publish target is missing");
     }
 
+    #[cfg(windows)]
     #[tokio::test]
     async fn command_probe_timeout_is_bounded() {
         let mut command = {
@@ -918,7 +956,7 @@ mod tests {
 
         let prioritized = prioritize_desktop_processes(processes, &target);
 
-        assert_eq!(prioritized.len(), MAX_DESKTOP_PROCESS_EVIDENCE);
+        assert_eq!(prioritized.len(), MAX_DESKTOP_PROCESS_EVIDENCE + 1);
         assert_eq!(prioritized[0].pid, 42);
         assert_eq!(
             matching_desktop_app_servers(&prioritized, &target, 99)[0].pid,

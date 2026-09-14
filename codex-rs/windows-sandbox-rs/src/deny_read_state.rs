@@ -213,7 +213,7 @@ mod tests {
         assert!(!has_deny(&new, &sid)?);
         // SAFETY: the owned SID matches the persisted principal string.
         unsafe {
-            sync_persistent_deny_read_acls(home.path(), &principal, &[old.clone()], sid.as_ptr())?;
+            sync_persistent_deny_read_acls(home.path(), &principal, std::slice::from_ref(&old), sid.as_ptr())?;
         }
         assert!(has_deny(&old, &sid)?);
         let state_path = sandbox_dir(home.path()).join(DENY_READ_ACL_STATE_FILE);
@@ -243,7 +243,7 @@ mod tests {
                 sync_persistent_deny_read_acls(
                     home.path(),
                     &principal,
-                    &[new.clone()],
+                    std::slice::from_ref(&new),
                     sid.as_ptr(),
                 )
             }
@@ -260,7 +260,7 @@ mod tests {
         // SAFETY: sid retains the valid principal SID while the synchronous reconciler applies the
         // new paths.
         unsafe {
-            sync_persistent_deny_read_acls(home.path(), &principal, &[new.clone()], sid.as_ptr())?;
+            sync_persistent_deny_read_acls(home.path(), &principal, std::slice::from_ref(&new), sid.as_ptr())?;
         }
         assert!(!has_deny(&old, &sid)?);
         assert!(has_deny(&new, &sid)?);
@@ -366,7 +366,7 @@ mod tests {
                 sync_persistent_deny_read_acls(
                     home.path(),
                     &principal,
-                    &[secret.clone()],
+                    std::slice::from_ref(&secret),
                     sid.as_ptr(),
                 )?;
                 if !write_first {
@@ -442,7 +442,7 @@ mod tests {
             sync_persistent_deny_read_acls(
                 home.path(),
                 &principal,
-                &[secret.clone()],
+                std::slice::from_ref(&secret),
                 sid.as_ptr(),
             )?;
             // External native policy edits may combine unrelated rights. The
@@ -520,7 +520,7 @@ mod tests {
                 sync_persistent_deny_read_acls(
                     home.path(),
                     &principal,
-                    &[old.clone()],
+                    std::slice::from_ref(&old),
                     sid.as_ptr(),
                 )?;
             }

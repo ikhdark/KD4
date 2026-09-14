@@ -74,7 +74,7 @@ pub async fn reset_git_repository(root: &Path) -> anyhow::Result<()> {
 /// Ensures `root` has a usable git baseline repository.
 ///
 /// Existing usable `.git/` metadata is preserved. Missing or unusable metadata is replaced with a
-/// fresh one-commit baseline.
+/// fresh empty baseline, so existing files remain pending until an explicit reset acknowledges them.
 pub async fn ensure_git_baseline_repository(root: &Path) -> anyhow::Result<()> {
     let root = root.to_path_buf();
     task::spawn_blocking(move || {
@@ -86,7 +86,11 @@ pub async fn ensure_git_baseline_repository(root: &Path) -> anyhow::Result<()> {
         {
             return Ok(());
         }
-        reset_git_repository_sync(&root)
+        remove_git_metadata(&root)?;
+        let repo = gix::init(&root).context("init empty git baseline")?;
+        let tree_id = repo.write_object(Tree::default())?.detach();
+        commit_tree(&repo, BASELINE_COMMIT_MESSAGE, tree_id)?;
+        write_index_from_head(&root)
     })
     .await?
 }
@@ -139,6 +143,10 @@ fn commit_current_tree(repo: &gix::Repository, message: &str) -> anyhow::Result<
         .workdir()
         .context("git baseline repo must have a worktree")?;
     let tree_id = write_tree(repo, root)?;
+    commit_tree(repo, message, tree_id)
+}
+
+fn commit_tree(repo: &gix::Repository, message: &str, tree_id: ObjectId) -> anyhow::Result<()> {
     let signature = codex_signature();
     let mut time = gix::date::parse::TimeBuf::default();
     let signature_ref = signature.to_ref(&mut time);
@@ -554,9 +562,18 @@ mod tests {
             .expect("ensure repo");
 
         let diff = diff_since_latest_init(&root).await.expect("diff");
-        assert!(!diff.has_changes());
-        assert_eq!(git_stdout(&root, &["status", "--porcelain"]), "");
-        assert_eq!(git_stdout(&root, &["ls-files"]), "MEMORY.md\n");
+        assert_eq!(
+            diff.changes,
+            vec![GitBaselineChange {
+                status: GitBaselineChangeStatus::Added,
+                path: "MEMORY.md".to_string(),
+            }]
+        );
+        assert_eq!(
+            git_stdout(&root, &["status", "--porcelain"]),
+            "?? MEMORY.md\n"
+        );
+        assert_eq!(git_stdout(&root, &["ls-files"]), "");
     }
 
     #[tokio::test]

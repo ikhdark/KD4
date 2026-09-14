@@ -56,27 +56,27 @@ pub(crate) fn find_loaded_subagent_threads_for_primary(
         threads_by_id.insert(thread_id, thread);
     }
 
-    let mut included = HashSet::new();
-    let mut pending = vec![primary_thread_id];
-    while let Some(parent_thread_id) = pending.pop() {
-        for (thread_id, thread) in &threads_by_id {
-            if included.contains(thread_id) {
-                continue;
-            }
-
-            let Some(source_parent_thread_id) = thread_spawn_parent_thread_id(&thread.source)
-            else {
-                continue;
-            };
-
-            if source_parent_thread_id != parent_thread_id {
-                continue;
-            }
-
-            included.insert(*thread_id);
-            pending.push(*thread_id);
+    let mut children_by_parent: HashMap<ThreadId, Vec<ThreadId>> = HashMap::new();
+    for (thread_id, thread) in &threads_by_id {
+        if let Some(parent_id) = thread_spawn_parent_thread_id(&thread.source) {
+            children_by_parent
+                .entry(parent_id)
+                .or_default()
+                .push(*thread_id);
         }
     }
+    let mut included = HashSet::from([primary_thread_id]);
+    let mut pending = vec![primary_thread_id];
+    while let Some(parent_thread_id) = pending.pop() {
+        if let Some(children) = children_by_parent.remove(&parent_thread_id) {
+            for thread_id in children {
+                if included.insert(thread_id) {
+                    pending.push(thread_id);
+                }
+            }
+        }
+    }
+    included.remove(&primary_thread_id);
 
     let mut loaded_threads: Vec<LoadedSubagentThread> = included
         .into_iter()

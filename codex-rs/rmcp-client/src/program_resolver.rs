@@ -29,7 +29,10 @@ pub fn resolve(
     cwd: &Path,
 ) -> std::io::Result<OsString> {
     // Extract PATH from environment for search locations
-    let search_path = env.get(std::ffi::OsStr::new("PATH"));
+    let search_path = env
+        .iter()
+        .find(|(key, _)| crate::utils::env_keys_equal(key, std::ffi::OsStr::new("PATH")))
+        .map(|(_, value)| value);
 
     // Attempt resolution via which crate
     match which::which_in(&program, search_path, cwd) {
@@ -136,7 +139,7 @@ mod tests {
 
             // Build a clean environment with the temp dir in the PATH.
             let mut extra_env = HashMap::new();
-            extra_env.insert(OsString::from("PATH"), Self::build_path_env_var(dir_path));
+            extra_env.insert(OsString::from("pAtH"), Self::build_path_env_var(dir_path));
 
             extra_env.insert(OsString::from("PATHEXT"), Self::ensure_cmd_extension());
 

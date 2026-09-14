@@ -5,7 +5,8 @@ Before writing:
 
 1. Check whether `AGENTS.md` already exists in the current working directory.
    - If it exists, do not overwrite or modify it.
-   - Report that initialization was skipped because the file already exists.
+   - Report that initialization was skipped because the file already exists,
+     and stop before inspecting the repository.
 
 2. Inspect the repository to gather project-specific evidence. Check relevant
    sources such as:
@@ -19,6 +20,15 @@ Before writing:
    - existing nested `AGENTS.md` files;
    - a representative sample of recent Git commits when determining commit
      conventions.
+
+Start with available repository context, root documentation, and manifests.
+Inspect additional sources only to resolve a specific missing or conflicting
+rule. Stop when the supported sections can be written accurately; do not
+enumerate the entire repository.
+
+Verify commands against repository scripts, configuration, or documentation.
+Do not install dependencies or run builds, tests, or linters solely to validate
+this guide. Reuse unchanged evidence during the final review.
 
 Do not invent commands, directory layouts, naming rules, coverage requirements,
 pull request policies, or other conventions.

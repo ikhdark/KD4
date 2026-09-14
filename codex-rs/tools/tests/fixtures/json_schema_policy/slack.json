@@ -62,14 +62,16 @@
         {
           "pointer": "/$defs/SlackTs/description",
           "value": "Slack timestamp string."
+        },
+        {
+          "pointer": "/$defs/SlackTs/pattern",
+          "value": "^[0-9]+[.][0-9]+$"
         }
       ],
       "expected_pruned": [
         "/$defs/UnusedPayload"
       ],
-      "expected_dropped_fields": [
-        "/$defs/SlackTs/pattern"
-      ]
+      "expected_dropped_fields": []
     }
   ]
 }

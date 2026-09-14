@@ -32,20 +32,64 @@ STABLE_SCHEMA_BUNDLE = (
 IGNORED_SCHEMA_ANNOTATIONS = frozenset(
     {"$schema", "description", "title", "default", "examples"}
 )
-ADDITIVE_SCHEMA_MAPS = frozenset({"definitions", "properties"})
+SCHEMA_MAPS = frozenset(
+    {"definitions", "$defs", "properties", "patternProperties", "dependentSchemas"}
+)
+SCHEMA_VALUES = frozenset(
+    {
+        "items",
+        "additionalItems",
+        "additionalProperties",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+        "propertyNames",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    }
+)
+SCHEMA_ARRAYS = frozenset({"oneOf", "anyOf", "allOf", "prefixItems"})
 
 
-def _is_additive_schema_map(path: str) -> bool:
-    """Return whether new keys at ``path`` are additive schema entries.
+def _child_role(role: str, key: str, path: str) -> str:
+    if role == "bundle-definitions" and key in {"v1", "v2"}:
+        return "additive-map"
+    if role in {"map", "additive-map", "bundle-definitions"}:
+        return "schema"
+    if role != "schema":
+        return "data"
+    if key == "definitions" and path == "$":
+        return "bundle-definitions"
+    if key in {"definitions", "$defs", "properties"}:
+        return "additive-map"
+    if key in SCHEMA_MAPS:
+        return "map"
+    if key in SCHEMA_VALUES:
+        return "schema"
+    if key in SCHEMA_ARRAYS:
+        return "schema-array"
+    return "data"
 
-    The stable bundle namespaces definitions by protocol version, so both
-    ``$/definitions`` and ``$/definitions/v2`` are definition maps.
-    """
-    parts = path.split("/")
-    parent_key = parts[-1]
-    return parent_key in ADDITIVE_SCHEMA_MAPS or (
-        len(parts) == 3 and parts[0] == "$" and parts[1] == "definitions"
-    )
+
+def _without_annotations(value: object, role: str, path: str) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _without_annotations(
+                child, _child_role(role, key, path), f"{path}/{key}"
+            )
+            for key, child in value.items()
+            if role != "schema" or key not in IGNORED_SCHEMA_ANNOTATIONS
+        }
+    if isinstance(value, list):
+        return [
+            _without_annotations(
+                child, "schema" if role in {"schema", "schema-array"} else "data", path
+            )
+            for child in value
+        ]
+    return value
 
 
 def repo_root() -> Path:
@@ -167,6 +211,8 @@ def stable_schema_compatibility_issues(
     baseline: object,
     current: object,
     path: str = "$",
+    *,
+    _role: str = "schema",
 ) -> list[str]:
     """Return stable-schema changes that can break generated clients.
 
@@ -181,14 +227,19 @@ def stable_schema_compatibility_issues(
         issues: list[str] = []
         for key, baseline_value in baseline.items():
             child_path = f"{path}/{key}"
-            if key in IGNORED_SCHEMA_ANNOTATIONS:
+            if _role == "schema" and key in IGNORED_SCHEMA_ANNOTATIONS:
                 continue
             if key not in current:
                 issues.append(f"{child_path}:removed")
                 continue
             current_value = current[key]
-            if key in {"required", "enum", "oneOf", "anyOf", "allOf"}:
-                if _canonical_json(baseline_value) != _canonical_json(current_value):
+            child_role = _child_role(_role, key, path)
+            if _role == "schema" and key in {"required", "enum", *SCHEMA_ARRAYS}:
+                if _canonical_json(
+                    _without_annotations(baseline_value, child_role, child_path)
+                ) != _canonical_json(
+                    _without_annotations(current_value, child_role, child_path)
+                ):
                     issues.append(f"{child_path}:changed")
                 continue
             issues.extend(
@@ -196,16 +247,22 @@ def stable_schema_compatibility_issues(
                     baseline_value,
                     current_value,
                     child_path,
+                    _role=child_role,
                 )
             )
         for key in current.keys() - baseline.keys():
-            if key in IGNORED_SCHEMA_ANNOTATIONS or _is_additive_schema_map(path):
+            if (_role == "schema" and key in IGNORED_SCHEMA_ANNOTATIONS) or _role in {
+                "additive-map",
+                "bundle-definitions",
+            }:
                 continue
             issues.append(f"{path}/{key}:added")
         return issues
     if isinstance(baseline, list):
         assert isinstance(current, list)
-        if _canonical_json(baseline) != _canonical_json(current):
+        if _canonical_json(
+            _without_annotations(baseline, _role, path)
+        ) != _canonical_json(_without_annotations(current, _role, path)):
             return [f"{path}:changed"]
         return []
     if baseline != current:
@@ -343,39 +400,36 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else:
                     generated_changed = regenerate_schemas(root, args.owner)
             else:
-                changed = schema_inputs_changed(root, args.baseline)
-                state = "changed" if changed else "unchanged"
-                print(
-                    f"App-server schema inputs are {state} relative to {args.baseline}; "
-                    "running a check-only freshness proof."
-                )
+                print("Running a check-only app-server schema freshness proof.")
             protocol_code = run_protocol_check(root)
+            if protocol_code != 0:
+                if args.mode != "force":
+                    print(
+                        "Freshness failed without modifying generated output. "
+                        "Use `just app-server-schema-regenerate <owner>` in the serialized "
+                        "generation lane.",
+                        file=sys.stderr,
+                    )
+                return protocol_code
+            stable_lane = "--experimental" not in generator_args
+            if stable_lane:
+                compatibility_code = run_stable_compatibility_check(
+                    root,
+                    args.compatibility_baseline,
+                    args.allow_stable_break,
+                )
+                if compatibility_code != 0:
+                    return compatibility_code
+            else:
+                print(
+                    "Skipping stable compatibility comparison for experimental schemas."
+                )
+            consumer_code = run_python_sdk_contract_check(root)
+            if consumer_code != 0:
+                return consumer_code
     except GenerationLockError as error:
         print(str(error), file=sys.stderr)
         return 2
-    if protocol_code != 0:
-        if args.mode != "force":
-            print(
-                "Freshness failed without modifying generated output. "
-                "Use `just app-server-schema-regenerate <owner>` in the serialized "
-                "generation lane.",
-                file=sys.stderr,
-            )
-        return protocol_code
-    stable_lane = "--experimental" not in generator_args
-    if stable_lane:
-        compatibility_code = run_stable_compatibility_check(
-            root,
-            args.compatibility_baseline,
-            args.allow_stable_break,
-        )
-        if compatibility_code != 0:
-            return compatibility_code
-    else:
-        print("Skipping stable compatibility comparison for experimental schemas.")
-    consumer_code = run_python_sdk_contract_check(root)
-    if consumer_code != 0:
-        return consumer_code
     if generated_changed:
         print("Schema regeneration changed generated outputs; review and include them.")
         if args.mode != "force":

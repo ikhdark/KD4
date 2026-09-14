@@ -271,9 +271,10 @@ function Add-CargoWatchExecTargetDir {
     )
 
     if ([string]::IsNullOrWhiteSpace($ExecCommand)) {
-        return $ExecCommand
+        throw "Cargo watch exec requires a command."
     }
-    $separatorIndex = $ExecCommand.IndexOf(" -- ", [StringComparison]::Ordinal)
+    $separator = [regex]::Match($ExecCommand, "\s--(?=\s|$)")
+    $separatorIndex = if ($separator.Success) { $separator.Index } else { -1 }
     $cargoCommand = if ($separatorIndex -ge 0) {
         $ExecCommand.Substring(0, $separatorIndex)
     }
@@ -301,6 +302,7 @@ function Add-CargoWatchExecTargetDir {
     }
 
     $watchBuildCommands = @(
+        "b", "c", "t", "r", "d", "clean", "rustdoc", "package", "install", "publish",
         "bench",
         "build",
         "check",
@@ -314,7 +316,7 @@ function Add-CargoWatchExecTargetDir {
     )
     $firstToken = ($ExecCommand.Trim() -split "\s+", 2)[0]
     if ($firstToken -notin $watchBuildCommands) {
-        return $ExecCommand
+        throw "Unsupported Cargo watch exec command in a reserved lane."
     }
 
     $targetArgument = "--target-dir $(Format-CargoWatchExecTargetDir -TargetDir $TargetDir)"
@@ -332,6 +334,7 @@ function Add-CargoWatchTargetDirArgument {
     )
 
     $updated = [System.Collections.Generic.List[string]]::new()
+    $hasExec = $false
     for ($i = 0; $i -lt $CommandArgs.Count; $i++) {
         $arg = $CommandArgs[$i]
         [void]$updated.Add($arg)
@@ -340,7 +343,11 @@ function Add-CargoWatchTargetDirArgument {
             continue
         }
         if ($arg -eq "--") {
-            return $CommandArgs
+            if ($i + 1 -lt $CommandArgs.Count) {
+                throw "Cargo watch positional commands cannot enforce a reserved target; use --exec/-x."
+            }
+            [void]$updated.RemoveAt($updated.Count - 1)
+            break
         }
         if (
             $arg -eq "-s" -or
@@ -350,13 +357,16 @@ function Add-CargoWatchTargetDirArgument {
             throw "Cargo watch --shell/-s is not allowed inside a reserved lane; use --exec/-x so --target-dir can be enforced."
         }
         if ($arg -eq "-x" -or $arg -eq "--exec") {
+            $hasExec = $true
             $i++
+            if ($i -ge $CommandArgs.Count) { throw "Cargo watch --exec/-x requires a command." }
             if ($i -lt $CommandArgs.Count) {
                 [void]$updated.Add((Add-CargoWatchExecTargetDir -ExecCommand $CommandArgs[$i] -TargetDir $TargetDir))
             }
             continue
         }
         if ($arg.StartsWith("--exec=", [StringComparison]::Ordinal)) {
+            $hasExec = $true
             $exec = $arg.Substring("--exec=".Length)
             [void]$updated.RemoveAt($updated.Count - 1)
             [void]$updated.Add("--exec=$(Add-CargoWatchExecTargetDir -ExecCommand $exec -TargetDir $TargetDir)")
@@ -364,13 +374,11 @@ function Add-CargoWatchTargetDirArgument {
         }
     }
 
-    $hasExec = @($CommandArgs | Where-Object {
-            $_ -eq "-x" -or $_ -eq "--exec" -or $_.StartsWith("--exec=", [StringComparison]::Ordinal)
-        }).Count -gt 0
     if (-not $hasExec) {
         [void]$updated.Add("-x")
         [void]$updated.Add((Add-CargoWatchExecTargetDir -ExecCommand "check" -TargetDir $TargetDir))
     }
+    if ($CommandArgs[-1] -eq "--") { [void]$updated.Add("--") }
     return @($updated)
 }
 
@@ -428,6 +436,7 @@ function Add-CargoTargetDirArgument {
     }
 
     $buildCommands = @(
+        "b", "c", "t", "r", "d", "clean", "rustdoc", "package", "install", "publish",
         "bench",
         "build",
         "check",
@@ -448,7 +457,7 @@ function Add-CargoTargetDirArgument {
         if ($nextestCommandIndex -ge $CommandArgs.Count) {
             return $CommandArgs
         }
-        if ($CommandArgs[$nextestCommandIndex] -notin @("archive", "run")) {
+        if ($CommandArgs[$nextestCommandIndex] -notin @("archive", "run", "list")) {
             return $CommandArgs
         }
         if (Test-CargoTargetDirArgumentPresent -CommandArgs $CommandArgs -StartIndex ($nextestCommandIndex + 1) -TargetDir $TargetDir) {
@@ -461,7 +470,10 @@ function Add-CargoTargetDirArgument {
         )
     }
     if ($subcommand -notin $buildCommands) {
-        return $CommandArgs
+        if ($subcommand -in @("add", "remove", "rm", "fetch", "fmt", "generate-lockfile", "locate-project", "login", "logout", "metadata", "new", "init", "owner", "search", "tree", "update", "vendor", "verify-project", "version", "help", "report", "read-manifest", "uninstall", "info")) {
+            return $CommandArgs
+        }
+        throw "Unsupported Cargo command '$subcommand' in a reserved lane; use an explicit build command."
     }
     if (Test-CargoTargetDirArgumentPresent -CommandArgs $CommandArgs -StartIndex ($subcommandIndex + 1) -TargetDir $TargetDir) {
         return $CommandArgs

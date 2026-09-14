@@ -1,19 +1,17 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use codex_git_utils::RepositoryContext;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_rollout::RolloutConfig;
 use codex_rollout::RolloutRecorder;
 use codex_rollout::RolloutRecorderParams;
-use codex_rollout::persisted_rollout_items;
 use tracing::warn;
 
 use super::LocalThreadStore;
 use super::create_thread;
-use crate::AppendThreadItemsParams;
 use crate::CreateThreadParams;
 use crate::ReadThreadParams;
 use crate::ResumeThreadParams;
@@ -56,57 +54,66 @@ pub(super) async fn create_thread_with_repository_context(
 pub(super) async fn resume_thread(
     store: &LocalThreadStore,
     params: ResumeThreadParams,
-) -> ThreadStoreResult<()> {
+) -> ThreadStoreResult<Arc<Vec<RolloutItem>>> {
     store.ensure_live_recorder_absent(params.thread_id).await?;
-    let history_mode = if let Some(history) = params.history.as_deref() {
-        canonical_history_mode_from_rollout_items(history)
-    } else if let Some(rollout_path) = params.rollout_path.as_ref() {
-        super::read_thread::read_thread_by_rollout_path(
-            store,
-            rollout_path.clone(),
-            params.include_archived,
-            /*include_history*/ false,
-        )
-        .await?
-        .history_mode
-    } else {
-        super::read_thread::read_thread(
-            store,
-            ReadThreadParams {
-                thread_id: params.thread_id,
-                include_archived: params.include_archived,
-                include_history: false,
-            },
-        )
-        .await?
-        .history_mode
-    };
-    reject_paginated_history_mode(history_mode)?;
-    let rollout_path = match (params.rollout_path, params.history) {
-        (Some(rollout_path), _history) => rollout_path,
-        (None, history) => {
-            let thread = super::read_thread::read_thread(
-                store,
-                ReadThreadParams {
-                    thread_id: params.thread_id,
-                    include_archived: params.include_archived,
-                    include_history: history.is_none(),
-                },
-            )
-            .await?;
-            thread
-                .rollout_path
-                .ok_or_else(|| ThreadStoreError::Internal {
-                    message: format!("thread {} does not have a rollout path", params.thread_id),
-                })?
-        }
-    };
     let cwd = params
         .metadata
         .cwd
         .clone()
         .ok_or_else(|| ThreadStoreError::InvalidRequest {
             message: "local thread store requires a cwd".to_string(),
+        })?;
+    let thread = if let Some(rollout_path) = params.rollout_path {
+        super::read_thread::read_thread_by_rollout_path(
+            store,
+            rollout_path,
+            params.include_archived,
+            params.history.is_none(),
+        )
+        .await?
+    } else {
+        super::read_thread::read_thread(
+            store,
+            ReadThreadParams {
+                thread_id: params.thread_id,
+                include_archived: params.include_archived,
+                include_history: params.history.is_none(),
+            },
+        )
+        .await?
+    };
+    if thread.thread_id != params.thread_id {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: "resume rollout belongs to a different thread".to_string(),
+        });
+    }
+    let history_mode = thread.history_mode;
+    reject_paginated_history_mode(history_mode)?;
+    let history = match params.history {
+        Some(history) => history,
+        None => Arc::new(
+            thread
+                .history
+                .ok_or_else(|| ThreadStoreError::Internal {
+                    message: format!("failed to load history for thread {}", params.thread_id),
+                })?
+                .items,
+        ),
+    };
+    reject_paginated_history_mode(canonical_history_mode_from_rollout_items(&history))?;
+    if let Some(RolloutItem::SessionMeta(meta)) = history
+        .iter()
+        .find(|item| matches!(item, RolloutItem::SessionMeta(_)))
+        && meta.meta.id != params.thread_id
+    {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: "resume history belongs to a different thread".to_string(),
+        });
+    }
+    let rollout_path = thread
+        .rollout_path
+        .ok_or_else(|| ThreadStoreError::Internal {
+            message: format!("thread {} does not have a rollout path", params.thread_id),
         })?;
     let config = RolloutConfig {
         codex_home: store.config.codex_home.clone(),
@@ -122,26 +129,8 @@ pub(super) async fn resume_thread(
         })?;
     store
         .insert_live_recorder(params.thread_id, recorder, history_mode)
-        .await
-}
-
-#[tracing::instrument(
-    level = "trace",
-    skip_all,
-    fields(item_count = params.items.len())
-)]
-pub(super) async fn append_items(
-    store: &LocalThreadStore,
-    params: AppendThreadItemsParams,
-) -> ThreadStoreResult<()> {
-    append_items_with_flush(store, params, true).await
-}
-
-pub(super) async fn append_items_ordered(
-    store: &LocalThreadStore,
-    params: AppendThreadItemsParams,
-) -> ThreadStoreResult<()> {
-    append_items_with_flush(store, params, false).await
+        .await?;
+    Ok(history)
 }
 
 pub(super) async fn append_persisted_items(
@@ -158,18 +147,6 @@ pub(super) async fn append_persisted_items_ordered(
     items: &[RolloutItem],
 ) -> ThreadStoreResult<()> {
     append_persisted_items_with_flush(store, thread_id, items, false).await
-}
-
-async fn append_items_with_flush(
-    store: &LocalThreadStore,
-    params: AppendThreadItemsParams,
-    flush: bool,
-) -> ThreadStoreResult<()> {
-    // LocalThreadStore rejects paginated threads before opening a writer.
-    let persisted_items =
-        persisted_rollout_items(params.items.as_slice(), ThreadHistoryMode::Legacy);
-    append_persisted_items_with_flush(store, params.thread_id, persisted_items.as_slice(), flush)
-        .await
 }
 
 async fn append_persisted_items_with_flush(

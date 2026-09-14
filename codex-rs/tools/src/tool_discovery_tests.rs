@@ -15,6 +15,13 @@ fn discoverable_tool_enums_use_expected_wire_names() {
             "action_type": "install",
         })
     );
+    assert_eq!(
+        json!({
+            "tool_type": DiscoverableToolType::Plugin,
+            "action_type": DiscoverableToolAction::Enable,
+        }),
+        json!({"tool_type": "plugin", "action_type": "enable"})
+    );
 }
 
 #[test]
@@ -48,6 +55,15 @@ fn filter_request_plugin_install_discoverable_tools_for_codex_tui_omits_plugins(
         })),
     ];
 
+    for client in [None, Some("codex-desktop")] {
+        assert_eq!(
+            filter_request_plugin_install_discoverable_tools_for_client(
+                discoverable_tools.clone(),
+                client,
+            ),
+            discoverable_tools,
+        );
+    }
     assert_eq!(
         filter_request_plugin_install_discoverable_tools_for_client(
             discoverable_tools,

@@ -89,7 +89,7 @@ WHERE threads.id = ?
             .bind(id.to_string())
             .fetch_optional(self.pool.as_ref())
             .await?;
-        Ok(row.and_then(|row| row.try_get("memory_mode").ok()))
+        Ok(row.map(|row| row.try_get("memory_mode")).transpose()?)
     }
 
     pub async fn set_thread_preview_if_empty(
@@ -400,7 +400,8 @@ ON CONFLICT(child_thread_id) DO NOTHING
         }
         let row = builder.build().fetch_optional(self.pool.as_ref()).await?;
         Ok(row
-            .and_then(|r| r.try_get::<String, _>("rollout_path").ok())
+            .map(|r| r.try_get::<String, _>("rollout_path"))
+            .transpose()?
             .map(PathBuf::from))
     }
 
@@ -1038,19 +1039,19 @@ ON CONFLICT(id) DO UPDATE SET
             true,
         )
         .await?;
+        if let Some(memory_mode) = extract_memory_mode(builder.id, items) {
+            sqlx::query("UPDATE threads SET memory_mode = ? WHERE id = ?")
+                .bind(memory_mode)
+                .bind(builder.id.to_string())
+                .execute(&mut *transaction)
+                .await?;
+        }
         transaction.commit().await?;
         self.insert_thread_spawn_edge_from_source_if_absent(metadata.id, metadata.source.as_str())
             .await?;
         if let Some(parent_thread_id) = builder.parent_thread_id {
             self.insert_thread_spawn_edge_if_absent(parent_thread_id, builder.id)
                 .await?;
-        }
-        if let Some(memory_mode) = extract_memory_mode(items)
-            && let Err(err) = self
-                .set_thread_memory_mode(builder.id, memory_mode.as_str())
-                .await
-        {
-            return Err(err);
         }
         Ok(())
     }
@@ -1214,28 +1215,27 @@ WHERE parent_thread_id IN (SELECT value FROM json_each(?))
         .await?;
         primary_statement_count += 1;
 
-        let mut rows_affected = 0;
-        for thread_id_string in &thread_id_strings {
-            rows_affected += sqlx::query("DELETE FROM threads WHERE id = ?")
-                .bind(thread_id_string)
+        let rows_affected =
+            sqlx::query("DELETE FROM threads WHERE id IN (SELECT value FROM json_each(?))")
+                .bind(&thread_ids_json)
                 .execute(&mut *tx)
                 .await?
                 .rows_affected();
-            primary_statement_count += 1;
-        }
+        primary_statement_count += 1;
         tx.commit().await?;
 
-        for (thread_id, thread_id_string) in thread_ids.iter().zip(&thread_id_strings) {
-            if let Err(err) = sqlx::query("DELETE FROM logs WHERE thread_id = ?")
-                .bind(thread_id_string)
+        if let Err(err) =
+            sqlx::query("DELETE FROM logs WHERE thread_id IN (SELECT value FROM json_each(?))")
+                .bind(&thread_ids_json)
                 .execute(self.logs_pool.as_ref())
                 .await
-            {
-                warn!("failed to remove logs for deleted thread {thread_id}: {err}");
-            }
-            if let Err(err) = self.memories.delete_thread_memory(*thread_id).await {
-                warn!("failed to remove memories for deleted thread {thread_id}: {err}");
-            }
+        {
+            warn!("failed to remove logs for deleted threads: {err}");
+        }
+        if let Err(err) = self.memories.delete_threads_memory(&thread_ids_json).await {
+            warn!("failed to remove memories for deleted threads: {err}");
+        }
+        for thread_id in thread_ids {
             if let Err(err) = self.thread_goals.delete_thread_goal(*thread_id).await {
                 warn!("failed to remove goal for deleted thread {thread_id}: {err}");
             }
@@ -1405,10 +1405,13 @@ SELECT
     );
 }
 
-pub(super) fn extract_memory_mode(items: &[RolloutItem]) -> Option<String> {
+pub(super) fn extract_memory_mode(thread_id: ThreadId, items: &[RolloutItem]) -> Option<String> {
     items.iter().rev().find_map(|item| match item {
-        RolloutItem::SessionMeta(meta_line) => meta_line.meta.memory_mode.clone(),
-        RolloutItem::ResponseItem(_)
+        RolloutItem::SessionMeta(meta_line) if meta_line.meta.id == thread_id => {
+            meta_line.meta.memory_mode.clone()
+        }
+        RolloutItem::SessionMeta(_)
+        | RolloutItem::ResponseItem(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::ToolManifest(_)
@@ -1604,6 +1607,39 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn builder_timestamps_round_trip_with_millisecond_and_archive_precision() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let runtime = StateRuntime::init(home.path().to_path_buf(), "test-provider".into()).await?;
+        let thread_id = ThreadId::new();
+        let timestamp = DateTime::<Utc>::from_timestamp(1, 123_456_789).expect("timestamp");
+        let mut builder = ThreadMetadataBuilder::new(
+            thread_id,
+            home.path().join("rollout.jsonl"),
+            timestamp,
+            SessionSource::Cli,
+        );
+        builder.cwd = home.path().to_path_buf();
+        builder.updated_at = Some(timestamp);
+        builder.recency_at = Some(timestamp);
+        builder.archived_at = Some(timestamp);
+        let metadata = builder.build("test-provider");
+        assert_eq!(metadata.created_at.timestamp_millis(), 1_123);
+        assert_eq!(metadata.updated_at.timestamp_millis(), 1_123);
+        assert_eq!(metadata.recency_at.timestamp_millis(), 1_123);
+        assert_eq!(
+            metadata.archived_at.expect("archived").timestamp_millis(),
+            1_000
+        );
+        runtime.upsert_thread(&metadata).await?;
+        let stored = runtime.get_thread(thread_id).await?.expect("stored thread");
+        assert_eq!(stored.created_at, metadata.created_at);
+        assert_eq!(stored.updated_at, metadata.updated_at);
+        assert_eq!(stored.recency_at, metadata.recency_at);
+        assert_eq!(stored.archived_at, metadata.archived_at);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn rollout_and_archive_updates_preserve_concurrent_metadata_writes() -> Result<()> {
@@ -1835,7 +1871,7 @@ mod tests {
             .await?;
 
         assert_eq!(rows, 1);
-        assert_eq!(primary_statement_count, 7);
+        assert_eq!(primary_statement_count, 6);
         assert!(runtime.get_thread(thread_id).await?.is_none());
         let dynamic_tool_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM thread_dynamic_tools WHERE thread_id = ?")
@@ -2459,7 +2495,8 @@ END
 
     #[tokio::test]
     async fn apply_rollout_items_restores_memory_mode_from_session_meta() {
-        let codex_home = unique_temp_dir();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let codex_home = temp.path().to_path_buf();
         let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
             .await
             .expect("state db should initialize");
@@ -2478,7 +2515,7 @@ END
             metadata.created_at,
             SessionSource::Cli,
         );
-        let items = vec![RolloutItem::SessionMeta(SessionMetaLine {
+        let mut items = vec![RolloutItem::SessionMeta(SessionMetaLine {
             meta: SessionMeta {
                 session_id: thread_id.into(),
                 id: thread_id,
@@ -2513,11 +2550,57 @@ END
             .await
             .expect("apply_rollout_items should succeed");
 
+        let mut foreign = items[0].clone();
+        let RolloutItem::SessionMeta(ref mut session) = foreign else {
+            unreachable!()
+        };
+        session.meta.id = ThreadId::new();
+        session.meta.memory_mode = Some("disabled".to_string());
+        items.push(foreign);
+        runtime
+            .apply_rollout_items(&builder, &items, None, None)
+            .await
+            .expect("foreign metadata ignored");
+
         let memory_mode = runtime
             .get_thread_memory_mode(thread_id)
             .await
             .expect("memory mode should load");
         assert_eq!(memory_mode.as_deref(), Some("polluted"));
+        let before = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("thread before failure")
+            .expect("thread exists");
+        sqlx::query("CREATE TRIGGER reject_memory_mode BEFORE UPDATE OF memory_mode ON threads BEGIN SELECT RAISE(ABORT, 'injected mode failure'); END")
+            .execute(runtime.pool.as_ref()).await.expect("install failure trigger");
+        let result = runtime
+            .apply_rollout_items(
+                &builder,
+                &items,
+                None,
+                Some(before.updated_at + chrono::Duration::seconds(10)),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(
+            runtime
+                .get_thread(thread_id)
+                .await
+                .expect("thread after failure")
+                .expect("thread exists")
+                .updated_at,
+            before.updated_at
+        );
+        assert_eq!(
+            runtime
+                .get_thread_memory_mode(thread_id)
+                .await
+                .expect("mode after failure")
+                .as_deref(),
+            Some("polluted")
+        );
+        runtime.close().await;
     }
 
     #[tokio::test]

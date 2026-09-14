@@ -432,6 +432,8 @@ pub struct ThreadResumeParams {
     pub exclude_turns: bool,
     /// When present, include a `thread/turns/list` page in the resume response
     /// so clients can bootstrap recent turns without a second request.
+    /// Set `excludeTurns: true` to avoid also populating the full `thread.turns` list;
+    /// requesting a page does not implicitly exclude that list.
     #[experimental("thread/resume.initialTurnsPage")]
     #[ts(optional = nullable)]
     pub initial_turns_page: Option<ThreadResumeInitialTurnsPageParams>,
@@ -846,6 +848,9 @@ impl From<codex_protocol::protocol::ThreadGoal> for ThreadGoal {
 #[ts(export_to = "v2/")]
 pub struct ThreadGoalSetParams {
     pub thread_id: String,
+    /// Replace the goal atomically, resetting usage and its identity. Requires an objective.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace: bool,
     #[ts(optional = nullable)]
     pub objective: Option<String>,
     #[ts(optional = nullable)]

@@ -117,7 +117,7 @@ fn render_debug_config_lines(
     let requirements_toml = stack.requirements_toml();
 
     lines.push("".into());
-    lines.push("Requirements:".bold().into());
+    lines.push("Requirements: (selected constraints)".bold().into());
     let mut requirement_lines = Vec::new();
 
     if let Some(policies) = requirements_toml.allowed_approval_policies.as_ref() {
@@ -296,7 +296,7 @@ fn render_debug_config_lines(
     }
 
     if requirement_lines.is_empty() {
-        lines.push("  <none>".dim().into());
+        lines.push("  <none in this view>".dim().into());
     } else {
         lines.extend(requirement_lines);
     }
@@ -391,6 +391,17 @@ fn flatten_toml_key_values(
             let mut entries = table.iter().collect::<Vec<_>>();
             entries.sort_by_key(|(key, _)| key.as_str());
             for (key, child) in entries {
+                let key = if !key.is_empty()
+                    && key
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+                {
+                    key.to_string()
+                } else {
+                    serde_json::json!(key)
+                        .to_string()
+                        .replace('\u{7f}', "\\u007f")
+                };
                 let next_prefix = if let Some(prefix) = prefix {
                     format!("{prefix}.{key}")
                 } else {
@@ -552,6 +563,7 @@ fn format_network_unix_socket_permission(
 
 #[cfg(test)]
 mod tests {
+    use super::flatten_toml_key_values;
     use super::render_debug_config_lines;
     use super::sandbox_mode_is_allowed_by_permissions;
     use super::session_all_proxy_url;
@@ -628,6 +640,31 @@ mod tests {
     }
 
     #[test]
+    fn flattened_keys_preserve_literal_dots_quotes_and_control_characters() {
+        let config: TomlValue = toml::from_str(
+            r#"
+[projects."a.b\"c\nd"]
+trust_level = "trusted"
+[projects.a.b]
+trust_level = "untrusted"
+"#,
+        )
+        .unwrap();
+        let mut pairs = Vec::new();
+        flatten_toml_key_values(&config, None, &mut pairs);
+        assert_eq!(
+            pairs
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "projects.a.b.trust_level",
+                "projects.\"a.b\\\"c\\nd\".trust_level"
+            ]
+        );
+    }
+
+    #[test]
     fn debug_config_output_lists_all_layers_including_disabled() {
         let system_file = absolute_path("C:\\etc\\codex\\config.toml");
         let project_folder = absolute_path("C:\\repo\\.codex");
@@ -656,8 +693,7 @@ mod tests {
         assert!(rendered.contains("(enabled)"));
         assert!(rendered.contains("(disabled)"));
         assert!(rendered.contains("reason: project is untrusted"));
-        assert!(rendered.contains("Requirements:"));
-        assert!(rendered.contains("  <none>"));
+        assert!(rendered.contains("Requirements: (selected constraints)\n  <none in this view>"));
     }
 
     #[test]

@@ -590,7 +590,7 @@ struct OAuthPersistenceState {
     store_mode: OAuthCredentialsStoreMode,
     keyring_backend_kind: AuthKeyringBackendKind,
     operation_lock: Arc<Mutex<()>>,
-    last_credentials: Mutex<Option<StoredOAuthTokens>>,
+    last_credentials: Arc<Mutex<Option<StoredOAuthTokens>>>,
     executor: OAuthPersistenceExecutor,
 }
 
@@ -609,17 +609,28 @@ impl OAuthPersistenceState {
             store_mode,
             keyring_backend_kind,
             operation_lock: Arc::new(Mutex::new(())),
-            last_credentials: Mutex::new(initial_credentials),
+            last_credentials: Arc::new(Mutex::new(initial_credentials)),
             executor,
         }
     }
 
+    #[cfg(test)]
     async fn persist_if_needed(
         &self,
         client_id: String,
         maybe_credentials: Option<OAuthTokenResponse>,
     ) -> Result<()> {
         let operation_guard = Arc::clone(&self.operation_lock).lock_owned().await;
+        self.persist_with_guard(client_id, maybe_credentials, operation_guard)
+            .await
+    }
+
+    async fn persist_with_guard(
+        &self,
+        client_id: String,
+        maybe_credentials: Option<OAuthTokenResponse>,
+        operation_guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<()> {
         match maybe_credentials {
             Some(credentials) => {
                 let previous = self.last_credentials.lock().await.clone();
@@ -640,19 +651,24 @@ impl OAuthPersistenceState {
                     token_response: new_token_response,
                     expires_at,
                 };
-                if previous.as_ref() != Some(&stored) {
-                    let _operation_guard = self
-                        .execute(
-                            OAuthPersistenceOperation::Save {
-                                server_name: self.server_name.clone(),
-                                tokens: Box::new(stored.clone()),
-                                store_mode: self.store_mode,
-                                keyring_backend_kind: self.keyring_backend_kind,
-                            },
-                            operation_guard,
-                        )
-                        .await?;
-                    *self.last_credentials.lock().await = Some(stored);
+                if !same_token
+                    || !previous.as_ref().is_some_and(|previous| {
+                        previous.server_name == stored.server_name
+                            && previous.url == stored.url
+                            && previous.client_id == stored.client_id
+                            && previous.expires_at == stored.expires_at
+                    })
+                {
+                    self.execute(
+                        OAuthPersistenceOperation::Save {
+                            server_name: self.server_name.clone(),
+                            tokens: Box::new(stored),
+                            store_mode: self.store_mode,
+                            keyring_backend_kind: self.keyring_backend_kind,
+                        },
+                        operation_guard,
+                    )
+                    .await?;
                 }
             }
             None => {
@@ -669,7 +685,7 @@ impl OAuthPersistenceState {
                         )
                         .await
                     {
-                        Ok(_operation_guard) => *self.last_credentials.lock().await = None,
+                        Ok(()) => {}
                         Err(error) => warn!(
                             "failed to remove OAuth tokens for server {}: {error}",
                             self.server_name
@@ -686,16 +702,22 @@ impl OAuthPersistenceState {
         &self,
         operation: OAuthPersistenceOperation,
         operation_guard: tokio::sync::OwnedMutexGuard<()>,
-    ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+    ) -> Result<()> {
         let executor = Arc::clone(&self.executor);
-        let (operation_guard, result) = tokio::task::spawn_blocking(move || {
-            let result = executor(operation);
-            (operation_guard, result)
+        let last_credentials = Arc::clone(&self.last_credentials);
+        tokio::task::spawn_blocking(move || {
+            let _operation_guard = operation_guard;
+            let next_credentials = match &operation {
+                OAuthPersistenceOperation::Save { tokens, .. } => Some(*tokens.clone()),
+                OAuthPersistenceOperation::Delete { .. } => None,
+            };
+            executor(operation)?;
+            // The durable write and bookkeeping share ownership even if the waiter is dropped.
+            *last_credentials.blocking_lock() = next_credentials;
+            Ok(())
         })
         .await
-        .context("OAuth credential persistence task failed")?;
-        result?;
-        Ok(operation_guard)
+        .context("OAuth credential persistence task failed")?
     }
 }
 
@@ -733,6 +755,9 @@ impl OAuthPersistor {
         reason = "AuthorizationManager async access must be serialized through its mutex"
     )]
     pub(crate) async fn persist_if_needed(&self) -> Result<()> {
+        let operation_guard = Arc::clone(&self.inner.persistence.operation_lock)
+            .lock_owned()
+            .await;
         let (client_id, maybe_credentials) = {
             let manager = self.inner.authorization_manager.clone();
             let guard = manager.lock().await;
@@ -741,7 +766,7 @@ impl OAuthPersistor {
 
         self.inner
             .persistence
-            .persist_if_needed(client_id, maybe_credentials)
+            .persist_with_guard(client_id, maybe_credentials, operation_guard)
             .await
     }
 
@@ -805,7 +830,7 @@ fn load_oauth_tokens_from_file(
 
     let key = compute_store_key(server_name, url)?;
 
-    for entry in store.values() {
+    for entry in store.get(&key).into_iter().chain(store.values()) {
         let entry_key = compute_store_key(&entry.server_name, &entry.server_url)?;
         if entry_key != key {
             continue;
@@ -877,6 +902,7 @@ fn save_oauth_tokens_to_file_with_lock_held(
         scopes,
     };
 
+    remove_fallback_identity(&mut store, &key)?;
     store.insert(key, entry);
     write_fallback_file(codex_home, &store)
 }
@@ -888,12 +914,34 @@ fn delete_oauth_tokens_from_file(codex_home: &Path, key: &str) -> Result<bool> {
         None => return Ok(false),
     };
 
-    let removed = store.remove(key).is_some();
+    let removed = remove_fallback_identity(&mut store, key)?;
 
     if removed {
         write_fallback_file(codex_home, &store)?;
     }
 
+    Ok(removed)
+}
+
+// Legacy files may store a credential under an alias. Mutations must remove
+// every identity accepted by the loader, including plaintext secure-save cleanup.
+fn remove_fallback_identity(store: &mut FallbackFile, key: &str) -> Result<bool> {
+    let aliases = store
+        .iter()
+        .map(|(stored_key, entry)| {
+            Ok((
+                stored_key.clone(),
+                stored_key == key
+                    || compute_store_key(&entry.server_name, &entry.server_url)? == key,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut removed = false;
+    for (alias, matches) in aliases {
+        if matches {
+            removed |= store.remove(&alias).is_some();
+        }
+    }
     Ok(removed)
 }
 
@@ -1165,7 +1213,11 @@ mod tests {
         let tokens = sample_tokens();
         let expected = tokens.clone();
         let key = super::compute_store_key(&tokens.server_name, &tokens.url)?;
-        store.set_error(&key, KeyringError::Invalid("error".into(), "load".into()));
+        store.set_error(
+            KEYRING_SERVICE,
+            &key,
+            KeyringError::Invalid("error".into(), "load".into()),
+        );
 
         super::save_oauth_tokens_to_file(env.path(), &tokens)?;
 
@@ -1200,7 +1252,9 @@ mod tests {
 
         let fallback_path = super::fallback_file_path(env.path());
         assert!(!fallback_path.exists(), "fallback file should be removed");
-        let stored = store.saved_value(&key).expect("value saved to keyring");
+        let stored = store
+            .saved_value(KEYRING_SERVICE, &key)
+            .expect("value saved to keyring");
         assert_eq!(serde_json::from_str::<StoredOAuthTokens>(&stored)?, tokens);
         Ok(())
     }
@@ -1223,7 +1277,7 @@ mod tests {
             &tokens,
         )?;
 
-        assert!(store.saved_value(&key).is_some());
+        assert!(store.saved_value(KEYRING_SERVICE, &key).is_some());
         assert_eq!(std::fs::read(fallback_path)?, malformed_plaintext);
         Ok(())
     }
@@ -1234,7 +1288,11 @@ mod tests {
         let store = MockKeyringStore::default();
         let tokens = sample_tokens();
         let key = super::compute_store_key(&tokens.server_name, &tokens.url)?;
-        store.set_error(&key, KeyringError::Invalid("error".into(), "save".into()));
+        store.set_error(
+            KEYRING_SERVICE,
+            &key,
+            KeyringError::Invalid("error".into(), "save".into()),
+        );
 
         super::save_oauth_tokens_with_keyring_with_fallback_to_file(
             &store,
@@ -1257,7 +1315,7 @@ mod tests {
             entry.access_token,
             tokens.token_response.0.access_token().secret().as_str()
         );
-        assert!(store.saved_value(&key).is_none());
+        assert!(store.saved_value(KEYRING_SERVICE, &key).is_none());
         Ok(())
     }
 
@@ -1289,7 +1347,7 @@ mod tests {
             .get(&SecretScope::Global, &secret_name)?
             .expect("tokens should be saved to encrypted storage");
         assert_eq!(serde_json::from_str::<StoredOAuthTokens>(&stored)?, tokens);
-        assert_eq!(store.saved_value(&key), Some(serialized));
+        assert_eq!(store.saved_value(KEYRING_SERVICE, &key), Some(serialized));
         assert!(env.path().join("secrets").join("mcp_oauth.age").exists());
         assert!(!env.path().join("secrets").join("local.age").exists());
         assert!(!super::fallback_file_path(env.path()).exists());
@@ -1350,6 +1408,7 @@ mod tests {
         let env = TempCodexHome::new();
         let store = MockKeyringStore::default();
         store.set_error(
+            KEYRING_SERVICE,
             &compute_keyring_account(env.path()),
             KeyringError::Invalid("error".into(), "save".into()),
         );
@@ -1405,7 +1464,7 @@ mod tests {
         let secret_name = super::compute_secret_name(&tokens.server_name, &tokens.url)?;
         assert!(removed);
         assert!(backend.get(&SecretScope::Global, &secret_name)?.is_none());
-        assert!(store.saved_value(&key).is_none());
+        assert!(store.saved_value(KEYRING_SERVICE, &key).is_none());
         assert!(!super::fallback_file_path(env.path()).exists());
         Ok(())
     }
@@ -1429,7 +1488,7 @@ mod tests {
             &tokens.url,
         )?;
         assert!(removed);
-        assert!(!store.contains(&key));
+        assert!(!store.contains(KEYRING_SERVICE, &key));
         assert!(!super::fallback_file_path(env.path()).exists());
         Ok(())
     }
@@ -1442,18 +1501,18 @@ mod tests {
         let serialized = serde_json::to_string(&tokens)?;
         let key = super::compute_store_key(&tokens.server_name, &tokens.url)?;
         store.save(KEYRING_SERVICE, &key, &serialized)?;
-        assert!(store.contains(&key));
+        assert!(store.contains(KEYRING_SERVICE, &key));
 
         let removed = super::delete_oauth_tokens_from_keyring_and_file(
             &store,
             env.path(),
-            OAuthCredentialsStoreMode::Auto,
+            OAuthCredentialsStoreMode::File,
             AuthKeyringBackendKind::Direct,
             &tokens.server_name,
             &tokens.url,
         )?;
         assert!(removed);
-        assert!(!store.contains(&key));
+        assert!(!store.contains(KEYRING_SERVICE, &key));
         assert!(!super::fallback_file_path(env.path()).exists());
         Ok(())
     }
@@ -1464,7 +1523,11 @@ mod tests {
         let store = MockKeyringStore::default();
         let tokens = sample_tokens();
         let key = super::compute_store_key(&tokens.server_name, &tokens.url)?;
-        store.set_error(&key, KeyringError::Invalid("error".into(), "delete".into()));
+        store.set_error(
+            KEYRING_SERVICE,
+            &key,
+            KeyringError::Invalid("error".into(), "delete".into()),
+        );
         super::save_oauth_tokens_to_file(env.path(), &tokens).unwrap();
 
         let result = super::delete_oauth_tokens_from_keyring_and_file(
@@ -1477,6 +1540,171 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(super::fallback_file_path(env.path()).exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[expect(clippy::await_holding_invalid_type, reason = "Holds write ordering while replacing credentials to prove persistence samples after admission")]
+    async fn persistence_samples_credentials_after_acquiring_write_order() -> Result<()> {
+        use rmcp::transport::auth::AuthorizationMetadata;
+        use rmcp::transport::auth::CredentialStore;
+        use rmcp::transport::auth::InMemoryCredentialStore;
+        use rmcp::transport::auth::StoredCredentials;
+        let home = tempfile::tempdir()?;
+        let tokens = sample_tokens();
+        let store = InMemoryCredentialStore::new();
+        store
+            .save(StoredCredentials::new(
+                tokens.client_id.clone(),
+                Some(tokens.token_response.0.clone()),
+                vec![],
+                None,
+            ))
+            .await?;
+        let mut manager = AuthorizationManager::new(&tokens.url).await?;
+        let mut metadata = AuthorizationMetadata::default();
+        metadata.authorization_endpoint = "https://example.test/authorize".into();
+        metadata.token_endpoint = "https://example.test/token".into();
+        manager.set_metadata(metadata);
+        manager.configure_client_id(&tokens.client_id)?;
+        manager.set_credential_store(store.clone());
+        let persistor = OAuthPersistor::new(
+            tokens.server_name.clone(),
+            tokens.url.clone(),
+            home.path().to_path_buf(),
+            Arc::new(Mutex::new(manager)),
+            OAuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::Direct,
+            None,
+        );
+        let guard = persistor.inner.persistence.operation_lock.lock().await;
+        let pending = persistor.persist_if_needed();
+        tokio::pin!(pending);
+        assert!(futures::poll!(&mut pending).is_pending());
+        let mut fresh = tokens.token_response.0;
+        fresh.set_access_token(AccessToken::new("new-access-token".into()));
+        store
+            .save(StoredCredentials::new(
+                tokens.client_id,
+                Some(fresh),
+                vec![],
+                None,
+            ))
+            .await?;
+        drop(guard);
+        pending.await?;
+        let saved = load_oauth_tokens(
+            home.path(),
+            &tokens.server_name,
+            &tokens.url,
+            OAuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::Direct,
+        )?
+        .unwrap();
+        assert_eq!(
+            saved.token_response.0.access_token().secret(),
+            "new-access-token"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_save_commits_bookkeeping_before_the_next_delete() -> Result<()> {
+        let tokens = sample_tokens();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered = std::sync::Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release = std::sync::Mutex::new(release_rx);
+        let saves = Arc::new(AtomicUsize::new(0));
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let saved = saves.clone();
+        let deleted = deletes.clone();
+        let state = Arc::new(OAuthPersistenceState::new(
+            tokens.server_name.clone(),
+            tokens.url.clone(),
+            OAuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::Direct,
+            None,
+            Arc::new(move |operation| {
+                match operation {
+                    OAuthPersistenceOperation::Save { .. } => {
+                        entered.lock().unwrap().take().unwrap().send(()).unwrap();
+                        release
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(5))?;
+                        saved.fetch_add(1, Ordering::SeqCst);
+                    }
+                    OAuthPersistenceOperation::Delete { .. } => {
+                        deleted.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                Ok(())
+            }),
+        ));
+        let saving = tokio::spawn({
+            let state = state.clone();
+            async move {
+                state
+                    .persist_if_needed(tokens.client_id, Some(tokens.token_response.0))
+                    .await
+            }
+        });
+        entered_rx.await?;
+        saving.abort();
+        assert!(saving.await.unwrap_err().is_cancelled());
+        release_tx.send(())?;
+        state.persist_if_needed(String::new(), None).await?;
+        assert_eq!(saves.load(Ordering::SeqCst), 1);
+        assert_eq!(deletes.load(Ordering::SeqCst), 1);
+        assert!(state.last_credentials.lock().await.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_aliases_are_removed_on_save_and_delete() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let mut tokens = sample_tokens();
+        save_oauth_tokens_to_file(home.path(), &tokens)?;
+        let key = compute_store_key(&tokens.server_name, &tokens.url)?;
+        let mut store = read_fallback_file_unlocked(home.path())?.unwrap();
+        let entry = store.remove(&key).unwrap();
+        store.insert("legacy-key".into(), entry.clone());
+        write_fallback_file(home.path(), &store)?;
+        assert!(
+            load_oauth_tokens(
+                home.path(),
+                &tokens.server_name,
+                &tokens.url,
+                OAuthCredentialsStoreMode::File,
+                AuthKeyringBackendKind::Direct
+            )?
+            .is_some()
+        );
+        tokens.client_id = "updated-client".into();
+        save_oauth_tokens_to_file(home.path(), &tokens)?;
+        let mut store = read_fallback_file_unlocked(home.path())?.unwrap();
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get(&key).unwrap().client_id, "updated-client");
+        store.insert("another-alias".into(), entry);
+        write_fallback_file(home.path(), &store)?;
+        assert!(delete_oauth_tokens(
+            home.path(),
+            &tokens.server_name,
+            &tokens.url,
+            OAuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::Direct
+        )?);
+        assert!(
+            load_oauth_tokens(
+                home.path(),
+                &tokens.server_name,
+                &tokens.url,
+                OAuthCredentialsStoreMode::File,
+                AuthKeyringBackendKind::Direct
+            )?
+            .is_none()
+        );
         Ok(())
     }
 

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-from collections import OrderedDict
 import hashlib
 import heapq
 import json
@@ -14,7 +13,6 @@ import re
 import stat
 import sys
 import tempfile
-import threading
 import tomllib
 import unicodedata
 
@@ -63,8 +61,6 @@ INVARIANT_KINDS = frozenset({"semantic", "compatibility"})
 TARGET_PREFIXES = ("owner:", "path:", "config:", "generated:", "contract:")
 MAX_QUERY_RELATIONSHIPS = 64
 MAX_SLICE_RELATIONSHIPS = 32
-MAX_SNAPSHOT_CACHE_ENTRIES = 256
-MAX_SNAPSHOT_CACHE_BYTES = 8 * 1024 * 1024
 ARCHITECTURE_FACETS = (
     "control_and_data_flow",
     "callers_and_consumers",
@@ -383,13 +379,13 @@ def load_and_validate(
     declared_owner_ids = {
         owner.get("id") for owner in owners if isinstance(owner.get("id"), str)
     }
-    selected_owner_ids = declared_owner_ids if not owner_ids else set(owner_ids)
+    selected_owner_ids = declared_owner_ids if owner_ids is None else set(owner_ids)
     unknown_owner_ids = sorted(selected_owner_ids - declared_owner_ids)
     if unknown_owner_ids:
         errors.append(f"unknown owner ids: {', '.join(unknown_owner_ids)}")
     seen_ids: set[str] = set()
     phrases: dict[str, list[dict]] = {}
-    symbols: dict[str, list[tuple[dict, dict]]] = {}
+    symbols: dict[tuple[Path, str], list[tuple[dict, dict]]] = {}
     for owner in owners:
         owner_id = owner.get("id", "")
         validate_owner_paths = owner_id in selected_owner_ids
@@ -399,7 +395,8 @@ def load_and_validate(
         for phrase in [*owner.get("aliases", []), *owner.get("phrases", [])]:
             phrases.setdefault(normalize(phrase), []).append(owner)
         for entry in owner.get("primary_entries", []):
-            symbols.setdefault(entry.get("symbol", ""), []).append((owner, entry))
+            identity = (Path(entry.get("path", "")), entry.get("symbol", ""))
+            symbols.setdefault(identity, []).append((owner, entry))
         if validate_owner_paths:
             for index, entry in enumerate(owner.get("primary_entries", [])):
                 validate_symbol(owner_id, f"primary_entries[{index}]", entry)
@@ -552,13 +549,15 @@ def load_and_validate(
                         f"phrase collision without explicit ambiguity: {phrase!r}"
                     )
                     break
-    for symbol, candidates in symbols.items():
+    for (path, symbol), candidates in symbols.items():
         if (
             symbol
             and len(candidates) > 1
             and any(not entry.get("ambiguous", False) for _, entry in candidates)
         ):
-            errors.append(f"entry symbol is not explicitly ambiguous: {symbol!r}")
+            errors.append(
+                f"entry symbol is not explicitly ambiguous: {path.as_posix()}::{symbol}"
+            )
     if errors:
         raise ValueError(
             "routing_manifest_invalid:\n"
@@ -611,11 +610,6 @@ def _supporting_source_digest(manifest: dict, root: Path) -> str:
             digest.update(b"unreadable")
         digest.update(b"\0")
     return digest.hexdigest()
-
-
-_snapshot_cache: OrderedDict[tuple[str, int, int, int, int, int], bytes] = OrderedDict()
-_snapshot_cache_bytes = 0
-_snapshot_cache_lock = threading.Lock()
 
 
 def _metadata_change_token(path: Path, observation: os.stat_result) -> int | None:
@@ -674,35 +668,14 @@ def _snapshot_file_signature(path: Path) -> tuple[str, int, int, int, int, int] 
 
 
 def _read_snapshot_file(path: Path) -> tuple[bytes | None, int, int]:
-    """Read a stable regular file, reusing only an identity-keyed observation."""
-    global _snapshot_cache_bytes
+    """Read a stable regular file without trusting metadata across calls."""
     reads = 0
     bytes_read = 0
 
     before = _snapshot_file_signature(path)
     if before is None:
         return None, reads, bytes_read
-    with _snapshot_cache_lock:
-        cached = _snapshot_cache.get(before)
-    if cached is not None:
-        # Windows change timestamps can share a filesystem clock tick with a
-        # same-size rewrite whose write timestamp is restored. Re-read before
-        # trusting the metadata-keyed entry so the cache never returns stale
-        # source bytes; an equal payload still avoids downstream reprocessing.
-        try:
-            reads += 1
-            observed_contents = path.read_bytes()
-            bytes_read += len(observed_contents)
-        except OSError:
-            return None, reads, bytes_read
-        if _snapshot_file_signature(path) == before and observed_contents == cached:
-            with _snapshot_cache_lock:
-                if before in _snapshot_cache:
-                    _snapshot_cache.move_to_end(before)
-            return cached, reads, bytes_read
-        contents = observed_contents
-    else:
-        contents = None
+    contents = None
     for _ in range(2):
         if contents is None:
             try:
@@ -721,19 +694,6 @@ def _read_snapshot_file(path: Path) -> tuple[bytes | None, int, int]:
     else:
         raise OSError(f"file changed while snapshotting: {path}")
     assert contents is not None
-    if len(contents) <= MAX_SNAPSHOT_CACHE_BYTES:
-        with _snapshot_cache_lock:
-            previous = _snapshot_cache.pop(before, None)
-            if previous is not None:
-                _snapshot_cache_bytes -= len(previous)
-            _snapshot_cache[before] = contents
-            _snapshot_cache_bytes += len(contents)
-            while (
-                len(_snapshot_cache) > MAX_SNAPSHOT_CACHE_ENTRIES
-                or _snapshot_cache_bytes > MAX_SNAPSHOT_CACHE_BYTES
-            ):
-                _, evicted = _snapshot_cache.popitem(last=False)
-                _snapshot_cache_bytes -= len(evicted)
     return contents, reads, bytes_read
 
 
@@ -918,7 +878,8 @@ def load_architecture_index(
         return None
     candidate["repository_revision"] = (
         repository_revision(root, digest, _manifest_projection_from_graph(candidate))
-        if refresh_sources else None
+        if refresh_sources
+        else None
     )
     return candidate
 
@@ -1120,7 +1081,7 @@ def _slice_source_snapshot(
             digest.update(b"\0missing-or-not-a-file\0")
             continue
         digest.update(b"\0file\0")
-        digest.update(contents)
+        digest.update(hashlib.sha256(contents).digest())
     return digest.hexdigest(), files_read, bytes_read
 
 
@@ -1141,7 +1102,12 @@ def architecture_slice(
         )
     if graph is None:
         graph = _query_graph(
-            manifest, digest, root, owner_ids, max_relationships=None, refresh_sources=False
+            manifest,
+            digest,
+            root,
+            owner_ids,
+            max_relationships=None,
+            refresh_sources=False,
         )
         selected = {owner["id"]: owner for owner in manifest["owners"]}
     else:
@@ -1253,6 +1219,8 @@ def architecture_slice(
             facets["invariants"].append(
                 {
                     "kind": "invariant",
+                    "invariant_kind": invariant["kind"],
+                    "statement": invariant["statement"],
                     "source": f"owner:{owner_id}",
                     "target": f"contract:{invariant['id']}",
                     "evidence": ", ".join(
@@ -1317,7 +1285,11 @@ def architecture_slice(
     )
     test_facet = output["tests_and_contracts"]
     test_facet["representative_scenario"] = next(
-        (item for item in test_facet["relationships"] if item.get("behavioral_contracts")),
+        (
+            item
+            for item in test_facet["relationships"]
+            if item.get("behavioral_contracts")
+        ),
         None,
     )
     test_facet["focused_validation"] = [
@@ -1327,7 +1299,7 @@ def architecture_slice(
         if validation.get("role") == "focused_tests"
     ]
     return {
-        "snapshot": f"slice-v2:{','.join(selected_ids)}:manifest:{digest}:sources:{source_snapshot}",
+        "snapshot": f"slice-v3:{','.join(selected_ids)}:manifest:{digest}:sources:{source_snapshot}",
         "freshness_scope": "selected owners and their incoming/outgoing relationship evidence",
         **output,
         "truncated": graph["status"] != "complete" or omitted_relationships > 0,
@@ -1534,7 +1506,7 @@ def main() -> int:
             return 1
     if args.command == "list":
         try:
-            manifest, _ = load_and_validate(args.manifest, root)
+            manifest, _ = load_and_validate(args.manifest, root, owner_ids=[])
             print(json.dumps(owner_catalog(manifest), indent=2, sort_keys=True))
             return 0
         except (OSError, ValueError, tomllib.TOMLDecodeError) as error:
@@ -1545,7 +1517,10 @@ def main() -> int:
             manifest_bytes = args.manifest.read_bytes()
             digest = hashlib.sha256(manifest_bytes).hexdigest()
             cached_graph = load_architecture_index(
-                args.architecture_index, digest, root, refresh_sources=args.command != "slice"
+                args.architecture_index,
+                digest,
+                root,
+                refresh_sources=args.command != "slice",
             )
             if cached_graph is None:
                 manifest, digest = load_and_validate(

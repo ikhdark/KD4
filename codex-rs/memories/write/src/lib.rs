@@ -55,14 +55,8 @@ mod prompt_blocks {
 Memory extensions (under {{ memory_extensions_root }}/):
 
 - <extension_name>/instructions.md
-  - Source-specific guidance for interpreting additional memory signals. If an
-    extension folder exists, you must read its instructions.md to determine how to use this memory
-    source.
+  - Source-specific guidance for interpreting additional memory signals.
 
-If the user has any memory extensions, you MUST read the instructions for each extension to
-determine how to use the memory source. If the workspace diff shows deleted extension resource files,
-remove stale memories derived only from those resources. If it has no extension folders, continue
-with the standard memory inputs only.
 "#;
 
     pub(super) const EXTENSIONS_PRIMARY_INPUTS: &str = r#"
@@ -70,11 +64,10 @@ Optional source-specific inputs:
 Under `{{ memory_extensions_root }}/`:
 
 - `<extension_name>/instructions.md`
-  - If extension folders exist, read each instructions.md first and follow it when interpreting
-    that extension's memory source.
+  - Read each present extension's instructions.md once per consolidation, before interpreting
+    that source. For extension-resource deletions shown in the workspace diff, remove memories
+    supported only by those resources. With no extension folders, use only the standard inputs.
 
-If the workspace diff shows deleted memory extension resources, use that extension-specific deletion
-signal to remove stale memories derived only from those resources.
 "#;
 }
 

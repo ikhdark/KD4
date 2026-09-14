@@ -24,6 +24,8 @@ Use full escalation only when sandboxed additional permissions cannot satisfy th
 - Include `justification` as a short question asking for approval.
 - Optionally include `prefix_rule` to suggest a reusable allow rule.
 
+Propose only narrowly scoped reusable prefixes. Never provide `prefix_rule` for interpreter-only prefixes, destructive commands, heredocs, or herestrings.
+
 ## Command segmentation reminder
 
 The command string is split into independent command segments at shell control operators, including pipes (`|`), logical operators (`&&`, `||`), command separators (`;`), and subshell boundaries (`(...)`, `$()`).

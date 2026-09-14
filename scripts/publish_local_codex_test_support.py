@@ -147,6 +147,11 @@ class PublishLocalCodexTestBase(unittest.TestCase):
         return env
 
     def expected_windows_rusty_v8_target(self) -> str:
+        if not hasattr(self, "_rusty_v8_target"):
+            self._rusty_v8_target = self._resolve_windows_rusty_v8_target()
+        return self._rusty_v8_target
+
+    def _resolve_windows_rusty_v8_target(self) -> str:
         rustc = shutil.which("rustc")
         if rustc is not None:
             result = subprocess.run(
@@ -155,6 +160,7 @@ class PublishLocalCodexTestBase(unittest.TestCase):
                 encoding="utf-8",
                 capture_output=True,
                 check=False,
+                timeout=15,
             )
             if result.returncode == 0:
                 for line in result.stdout.splitlines():
@@ -210,13 +216,23 @@ class PublishLocalCodexTestBase(unittest.TestCase):
         *args: str,
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        # Preserve explicitly supplied fixture dates, but discard ambient Git controls.
+        git_environment = {
+            key: value
+            for key, value in (os.environ if env is None else env).items()
+            if not key.upper().startswith("GIT_")
+        }
+        if env is not None:
+            for name in ("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"):
+                if name in env:
+                    git_environment[name] = env[name]
         result = subprocess.run(
             ["git", "-C", str(self.repo_root), *args],
             text=True,
             capture_output=True,
             check=False,
             timeout=30,
-            env=env,
+            env=git_environment,
         )
         if result.returncode != 0:
             self.fail(f"git {' '.join(args)} failed:\n{result.stderr}")
@@ -441,6 +457,7 @@ class PublishLocalCodexTestBase(unittest.TestCase):
         self,
         *args: str,
         env: dict[str, str] | None = None,
+        observe_commands: dict[str, Path] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         publish_args = list(self.publish_args(args))
         if "-SourceCodeModeHostExe" not in publish_args:
@@ -483,16 +500,30 @@ class PublishLocalCodexTestBase(unittest.TestCase):
                 argument_path("-SourceCommandRunnerExe", self.source_command_runner),
             )
             publish_args.extend(["-SourceBundleManifest", str(manifest_path)])
+        invocation = ["-File", str(SCRIPT), *publish_args]
+        if observe_commands:
+            commands = [
+                f"Set-PSBreakpoint -Command {ps_single_quote(name)} -Action {{ "
+                f"[IO.File]::WriteAllText({ps_single_quote(marker)}, 'invoked') }} | Out-Null"
+                for name, marker in observe_commands.items()
+            ]
+            parameters = []
+            index = 0
+            while index < len(publish_args):
+                name = publish_args[index].removeprefix("-")
+                index += 1
+                value = "$true"
+                if index < len(publish_args) and not publish_args[index].startswith(
+                    "-"
+                ):
+                    value = ps_single_quote(publish_args[index])
+                    index += 1
+                parameters.append(f"{ps_single_quote(name)} = {value}")
+            commands.append("$publishParameters = @{ " + "; ".join(parameters) + " }")
+            commands.append(f"& {ps_single_quote(SCRIPT)} @publishParameters")
+            invocation = ["-Command", "\n".join(commands)]
         return subprocess.run(
-            [
-                self.shell,
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(SCRIPT),
-                *publish_args,
-            ],
+            [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass", *invocation],
             text=True,
             capture_output=True,
             check=False,

@@ -161,36 +161,26 @@ fn compute_desc_col(
             / FIXED_LEFT_COLUMN_DENOMINATOR)
             .clamp(1, max_desc_col),
         ColumnWidthMode::AutoVisible | ColumnWidthMode::AutoAllRows => {
-            let max_name_width = match column_width.mode {
-                ColumnWidthMode::AutoVisible => rows_all
-                    .iter()
-                    .enumerate()
-                    .skip(start_idx)
-                    .take(visible_items)
-                    .map(|(_, row)| {
-                        let mut spans = row.name_prefix_spans.clone();
-                        spans.push(row.name.clone().into());
-                        if row.disabled_reason.is_some() {
-                            spans.push(" (disabled)".dim());
-                        }
-                        Line::from(spans).width()
-                    })
-                    .max()
-                    .unwrap_or(0),
-                ColumnWidthMode::AutoAllRows => rows_all
-                    .iter()
-                    .map(|row| {
-                        let mut spans = row.name_prefix_spans.clone();
-                        spans.push(row.name.clone().into());
-                        if row.disabled_reason.is_some() {
-                            spans.push(" (disabled)".dim());
-                        }
-                        Line::from(spans).width()
-                    })
-                    .max()
-                    .unwrap_or(0),
-                ColumnWidthMode::Fixed => 0,
+            let (start, count) = if column_width.mode == ColumnWidthMode::AutoVisible {
+                (start_idx, visible_items)
+            } else {
+                (0, rows_all.len())
             };
+            let max_name_width = rows_all
+                .iter()
+                .skip(start)
+                .take(count)
+                .map(|row| {
+                    row.name_prefix_spans.iter().map(Span::width).sum::<usize>()
+                        + UnicodeWidthStr::width(row.name.as_str())
+                        + usize::from(row.disabled_reason.is_some()) * " (disabled)".len()
+                        + row
+                            .display_shortcut
+                            .map(|key| Span::from(key).width() + 3)
+                            .unwrap_or(0)
+                })
+                .max()
+                .unwrap_or(0);
 
             column_width
                 .name_column_width
@@ -437,45 +427,50 @@ fn build_full_line(row: &GenericDisplayRow, desc_col: usize) -> Line<'static> {
 
     // Enforce single-line name: allow at most desc_col - 2 cells for name,
     // reserving two spaces before the description column.
-    let name_prefix_width = Line::from(row.name_prefix_spans.clone()).width();
+    let name_prefix_width = row.name_prefix_spans.iter().map(Span::width).sum::<usize>();
+    let shortcut_width = row
+        .display_shortcut
+        .map(|key| Span::from(key).width() + 3)
+        .unwrap_or(0);
     let name_limit = combined_description
         .as_ref()
-        .map(|_| desc_col.saturating_sub(2).saturating_sub(name_prefix_width))
+        .map(|_| {
+            desc_col
+                .saturating_sub(2)
+                .saturating_sub(name_prefix_width)
+                .saturating_sub(shortcut_width)
+        })
         .unwrap_or(usize::MAX);
 
-    let mut name_spans: Vec<Span> = Vec::with_capacity(row.name.len());
+    let mut name_spans: Vec<Span> = Vec::new();
     let mut used_width = 0usize;
     let mut truncated = false;
-
-    if let Some(idxs) = row.match_indices.as_ref() {
-        let mut idx_iter = idxs.iter().peekable();
-        for (char_idx, ch) in row.name.chars().enumerate() {
-            let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
-            let next_width = used_width.saturating_add(ch_w);
-            if next_width > name_limit {
-                truncated = true;
-                break;
-            }
-            used_width = next_width;
-
-            if idx_iter.peek().is_some_and(|next| **next == char_idx) {
-                idx_iter.next();
-                name_spans.push(ch.to_string().bold());
-            } else {
-                name_spans.push(ch.to_string().into());
-            }
+    let mut run_start = 0;
+    let mut run_bold = false;
+    let mut end = 0;
+    let mut matches = row.match_indices.iter().flatten().copied().peekable();
+    for (char_idx, (byte_idx, ch)) in row.name.char_indices().enumerate() {
+        let next_width = used_width.saturating_add(UnicodeWidthChar::width(ch).unwrap_or(0));
+        if next_width > name_limit {
+            truncated = true;
+            break;
         }
-    } else {
-        for ch in row.name.chars() {
-            let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
-            let next_width = used_width.saturating_add(ch_w);
-            if next_width > name_limit {
-                truncated = true;
-                break;
-            }
-            used_width = next_width;
-            name_spans.push(ch.to_string().into());
+        let bold = matches.peek() == Some(&char_idx);
+        if bold {
+            matches.next();
         }
+        if byte_idx > run_start && bold != run_bold {
+            let span = Span::from(row.name[run_start..byte_idx].to_string());
+            name_spans.push(if run_bold { span.bold() } else { span });
+            run_start = byte_idx;
+        }
+        run_bold = bold;
+        used_width = next_width;
+        end = byte_idx + ch.len_utf8();
+    }
+    if end > run_start {
+        let span = Span::from(row.name[run_start..end].to_string());
+        name_spans.push(if run_bold { span.bold() } else { span });
     }
 
     if truncated {
@@ -488,7 +483,8 @@ fn build_full_line(row: &GenericDisplayRow, desc_col: usize) -> Line<'static> {
         name_spans.push(" (disabled)".dim());
     }
 
-    let this_name_width = name_prefix_width + Line::from(name_spans.clone()).width();
+    let this_name_width =
+        name_prefix_width + name_spans.iter().map(Span::width).sum::<usize>() + shortcut_width;
     let mut full_spans: Vec<Span> = row.name_prefix_spans.clone();
     full_spans.extend(name_spans);
     if let Some(display_shortcut) = row.display_shortcut {
@@ -841,6 +837,44 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use ratatui::style::Modifier;
+
+    #[test]
+    fn grouped_highlights_preserve_unicode_character_indices() {
+        let row = GenericDisplayRow {
+            name: "aé中z".to_string(),
+            match_indices: Some(vec![1, 2]),
+            ..Default::default()
+        };
+        let line = build_full_line(&row, 30);
+        assert_eq!(line.to_string(), "aé中z");
+        assert_eq!(line.spans.len(), 3);
+        assert_eq!(line.spans[1].content, "é中");
+        assert!(line.spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert!(!line.spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(!line.spans[2].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn shortcut_is_included_in_description_alignment() {
+        let row = GenericDisplayRow {
+            name: "Alpha".to_string(),
+            description: Some("Description".to_string()),
+            display_shortcut: Some(crate::key_hint::plain(crossterm::event::KeyCode::Char('x'))),
+            ..Default::default()
+        };
+        let desc_col = compute_desc_col(
+            std::slice::from_ref(&row),
+            0,
+            1,
+            80,
+            ColumnWidthConfig::default(),
+        );
+        assert_eq!(desc_col, 11);
+        assert_eq!(
+            build_full_line(&row, desc_col).to_string(),
+            "Alpha (x)  Description"
+        );
+    }
 
     #[test]
     fn oversized_option_reserves_visible_rows_without_height_wraparound() {

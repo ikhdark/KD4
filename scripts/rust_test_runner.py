@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -1090,8 +1091,9 @@ def guard_generic_recipe_args(
             package_spec = token.split("=", 1)[1]
         elif token.startswith("-p") and token != "-p":
             package_spec = token[2:]
-        if package_spec == "codex-core" or (
-            package_spec is not None and package_spec.startswith("codex-core@")
+        if token in {"--workspace", "--all"} or (
+            package_spec is not None
+            and fnmatch.fnmatchcase("codex-core", package_spec.split("@", 1)[0])
         ):
             owner = f"{recipe} cannot" if recipe else "generic Rust test recipes cannot"
             raise RunnerError(
@@ -1215,6 +1217,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             no_fail_fast = no_fail_fast or "--no-fail-fast" in owned
 
         manifest = Manifest.load(args.manifest)
+        if args.command == "list-targets":
+            for name in manifest.targets:
+                print(f"target\t{name}")
+            for name in manifest.gates:
+                print(f"gate\t{name}")
+            return 0
         metadata = load_metadata()
         runner = RustTestRunner(
             manifest,
@@ -1227,11 +1235,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(
                 f"validated Rust test manifest version {manifest.version}: {args.manifest}"
             )
-        elif args.command == "list-targets":
-            for name in manifest.targets:
-                print(f"target\t{name}")
-            for name in manifest.gates:
-                print(f"gate\t{name}")
         elif args.command == "plan":
             print(json.dumps(runner.plan(args.name), indent=2))
         elif args.command == "run-target":

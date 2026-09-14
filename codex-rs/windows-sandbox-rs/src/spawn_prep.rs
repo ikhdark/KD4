@@ -860,7 +860,7 @@ mod tests {
                     workspace.path(),
                     &HashMap::new(),
                     &[],
-                    &[protected.clone()],
+                    std::slice::from_ref(&protected),
                     super::LegacyAclSids {
                         readonly_sid: None,
                         readonly_sid_str: None,

@@ -127,7 +127,7 @@ pub fn normalize_repo_scopes(
     repo_root: &Path,
     scopes: &[RepoScope],
 ) -> StoreResult<Vec<RepoScope>> {
-    let canonical_root = repository_identity(repo_root)?.canonical_root;
+    let canonical_root = std::fs::canonicalize(repo_root)?;
     let mut normalized = Vec::with_capacity(scopes.len());
     let mut seen = HashSet::with_capacity(scopes.len());
 
@@ -150,9 +150,34 @@ pub fn normalize_repo_scopes(
 }
 
 pub fn normalize_repo_path(repo_root: &Path, path: &str) -> StoreResult<String> {
-    let canonical_root = repository_identity(repo_root)?.canonical_root;
+    let canonical_root = std::fs::canonicalize(repo_root)?;
     let normalized = normalize_lexically(path)?;
     canonical_relative_identity(&canonical_root, &normalized)
+}
+
+/// Observation identifies the final directory entry, including an escaping or broken link.
+/// Its parent still must resolve inside the repository; authorization uses the target-aware API.
+pub(crate) fn normalize_observed_path(canonical_root: &Path, path: &str) -> StoreResult<String> {
+    let normalized = normalize_lexically(path)?;
+    if normalized == "." {
+        return Ok(normalized);
+    }
+    let relative = Path::new(&normalized);
+    let parent = relative
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let parent = match parent {
+        Some(parent) => canonical_relative_identity(canonical_root, &parent.to_string_lossy())?,
+        None => ".".to_string(),
+    };
+    let name = relative
+        .file_name()
+        .ok_or_else(|| StoreError::InvalidScope(normalized.clone()))?;
+    Ok(if parent == "." {
+        name.to_string_lossy().into_owned()
+    } else {
+        relative_path_identity(&Path::new(&parent).join(name))
+    })
 }
 
 fn normalize_lexically(path: &str) -> StoreResult<String> {

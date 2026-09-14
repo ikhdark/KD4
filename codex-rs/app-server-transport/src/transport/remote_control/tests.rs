@@ -836,7 +836,7 @@ async fn remote_control_transport_manages_virtual_clients_and_routes_messages() 
     );
 
     shutdown_token.cancel();
-    let _ = remote_task.await;
+    remote_task.await.expect("remote control task should join");
 }
 
 #[tokio::test]
@@ -941,7 +941,7 @@ async fn remote_control_transport_reconnects_after_disconnect() {
     }
 
     shutdown_token.cancel();
-    let _ = remote_task.await;
+    remote_task.await.expect("remote control task should join");
 }
 
 #[tokio::test]
@@ -1030,7 +1030,7 @@ async fn remote_control_transport_refreshes_server_token_after_websocket_unautho
     );
 
     shutdown_token.cancel();
-    let _ = remote_task.await;
+    remote_task.await.expect("remote control task should join");
 }
 
 #[tokio::test]
@@ -1296,7 +1296,7 @@ async fn remote_control_handle_enable_disable_stops_and_restarts_connections() {
         .expect("second websocket should close");
 
     shutdown_token.cancel();
-    let _ = remote_task.await;
+    remote_task.await.expect("remote control task should join");
 }
 
 #[tokio::test]
@@ -1481,7 +1481,7 @@ async fn remote_control_transport_clears_outgoing_buffer_when_backend_acks() {
     );
 
     shutdown_token.cancel();
-    let _ = remote_task.await;
+    remote_task.await.expect("remote control task should join");
 }
 
 #[tokio::test]
@@ -1713,7 +1713,7 @@ async fn remote_control_http_mode_enrolls_before_connecting() {
     );
 
     shutdown_token.cancel();
-    let _ = remote_task.await;
+    remote_task.await.expect("remote control task should join");
 }
 
 #[tokio::test]
@@ -1836,7 +1836,7 @@ async fn remote_control_http_mode_refreshes_persisted_enrollment_before_connecti
     );
 
     shutdown_token.cancel();
-    let _ = remote_task.await;
+    remote_task.await.expect("remote control task should join");
 }
 
 #[tokio::test]
@@ -1920,7 +1920,7 @@ async fn remote_control_stdio_mode_waits_for_client_name_before_connecting() {
     );
 
     shutdown_token.cancel();
-    let _ = remote_task.await;
+    remote_task.await.expect("remote control task should join");
 }
 
 #[tokio::test]
@@ -2021,11 +2021,25 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
     );
 
     shutdown_token.cancel();
-    let _ = remote_task.await;
+    remote_task.await.expect("remote control task should join");
 }
 
 #[tokio::test]
 async fn persisted_enable_does_not_follow_auth_to_an_account_without_a_preference() {
+    persisted_enable_account_change(true, false).await;
+}
+
+#[tokio::test]
+async fn live_connection_stops_when_account_changes() {
+    persisted_enable_account_change(false, false).await;
+}
+
+#[tokio::test]
+async fn durable_preference_keeps_its_account_through_logout() {
+    persisted_enable_account_change(false, true).await;
+}
+
+async fn persisted_enable_account_change(close_socket: bool, logout_first: bool) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("listener should bind");
@@ -2111,6 +2125,28 @@ async fn persisted_enable_does_not_follow_auth_to_an_account_without_a_preferenc
     let (_handshake_request, mut websocket) =
         accept_remote_control_backend_connection(&listener).await;
 
+    if logout_first {
+        save_auth(
+            codex_home.path(),
+            &AuthDotJson {
+                auth_mode: Some(AuthMode::ApiKey),
+                openai_api_key: Some("test-key".to_string()),
+                tokens: None,
+                ..remote_control_auth_dot_json(None)
+            },
+            AuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+        )
+        .expect("API key auth should save");
+        auth_manager.reload().await;
+        let closed = timeout(Duration::from_secs(2), websocket.next())
+            .await
+            .expect("logout should stop the live socket");
+        assert!(matches!(
+            closed,
+            None | Some(Err(_)) | Some(Ok(tungstenite::Message::Close(_)))
+        ));
+    }
     save_auth(
         codex_home.path(),
         &remote_control_auth_dot_json(Some("account_b")),
@@ -2118,11 +2154,13 @@ async fn persisted_enable_does_not_follow_auth_to_an_account_without_a_preferenc
         AuthKeyringBackendKind::default(),
     )
     .expect("account B auth should save");
+    if close_socket {
+        websocket
+            .close(None)
+            .await
+            .expect("backend websocket should close");
+    }
     auth_manager.reload().await;
-    websocket
-        .close(None)
-        .await
-        .expect("backend websocket should close");
 
     let mut desired_state_rx = remote_handle.desired_state_tx.subscribe();
     timeout(
@@ -2148,7 +2186,7 @@ async fn persisted_enable_does_not_follow_auth_to_an_account_without_a_preferenc
     );
 
     shutdown_token.cancel();
-    let _ = remote_task.await;
+    remote_task.await.expect("remote control task should join");
 }
 
 #[tokio::test]
@@ -2276,7 +2314,7 @@ async fn remote_control_http_mode_reenrolls_when_refresh_reports_stale_enrollmen
     );
 
     shutdown_token.cancel();
-    let _ = remote_task.await;
+    remote_task.await.expect("remote control task should join");
 }
 
 #[tokio::test]
@@ -2428,7 +2466,7 @@ async fn remote_control_http_mode_reenrolls_after_explicit_missing_server_404() 
     );
 
     shutdown_token.cancel();
-    let _ = remote_task.await;
+    remote_task.await.expect("remote control task should join");
 }
 
 #[tokio::test]
@@ -2553,7 +2591,7 @@ async fn remote_control_http_mode_preserves_stale_enrollment_when_reenrollment_f
     );
 
     shutdown_token.cancel();
-    let _ = remote_task.await;
+    remote_task.await.expect("remote control task should join");
 }
 
 #[tokio::test]
@@ -2689,7 +2727,7 @@ async fn remote_control_http_mode_preserves_enrollment_after_generic_websocket_4
     .await;
 
     shutdown_token.cancel();
-    let _ = remote_task.await;
+    remote_task.await.expect("remote control task should join");
 }
 
 #[derive(Debug)]
@@ -2732,60 +2770,76 @@ struct CapturedWebSocketRequest {
 }
 
 async fn accept_remote_control_connection(listener: &TcpListener) -> WebSocketStream<TcpStream> {
-    let (stream, _) = timeout(Duration::from_secs(5), listener.accept())
-        .await
-        .expect("remote control should connect in time")
-        .expect("listener accept should succeed");
-    accept_async(stream)
-        .await
-        .expect("websocket handshake should succeed")
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (stream, _) = timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("remote control should connect in time")
+            .expect("listener accept should succeed");
+        accept_async(stream)
+            .await
+            .expect("websocket handshake should succeed")
+    })
+    .await
+    .expect("test exchange should finish in time")
 }
 
 async fn accept_http_request(listener: &TcpListener) -> CapturedHttpRequest {
-    let (stream, _) = timeout(Duration::from_secs(5), listener.accept())
-        .await
-        .expect("HTTP request should arrive in time")
-        .expect("listener accept should succeed");
-    let mut reader = BufReader::new(stream);
-
-    let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
-        .await
-        .expect("request line should read");
-    let request_line = request_line.trim_end_matches("\r\n").to_string();
-
-    let mut headers = CapturedHttpHeaders::default();
-    loop {
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (stream, _) = timeout(Duration::from_secs(5), listener.accept())
             .await
-            .expect("header line should read");
-        if line == "\r\n" {
-            break;
+            .expect("HTTP request should arrive in time")
+            .expect("listener accept should succeed");
+        let mut reader = BufReader::new(stream);
+
+        let mut request_line = String::new();
+        assert_ne!(
+            reader
+                .read_line(&mut request_line)
+                .await
+                .expect("request line should read"),
+            0,
+            "unexpected EOF reading HTTP request"
+        );
+        let request_line = request_line.trim_end_matches("\r\n").to_string();
+
+        let mut headers = CapturedHttpHeaders::default();
+        loop {
+            let mut line = String::new();
+            assert_ne!(
+                reader
+                    .read_line(&mut line)
+                    .await
+                    .expect("header line should read"),
+                0,
+                "unexpected EOF reading HTTP request"
+            );
+            if line == "\r\n" {
+                break;
+            }
+            let line = line.trim_end_matches("\r\n");
+            let (name, value) = line.split_once(':').expect("header should contain colon");
+            headers.append(name.to_ascii_lowercase(), value.trim().to_string());
         }
-        let line = line.trim_end_matches("\r\n");
-        let (name, value) = line.split_once(':').expect("header should contain colon");
-        headers.append(name.to_ascii_lowercase(), value.trim().to_string());
-    }
 
-    let content_length = headers
-        .get("content-length")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0);
-    let mut body = vec![0; content_length];
-    reader
-        .read_exact(&mut body)
-        .await
-        .expect("request body should read");
+        let content_length = headers
+            .get("content-length")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = vec![0; content_length];
+        reader
+            .read_exact(&mut body)
+            .await
+            .expect("request body should read");
 
-    CapturedHttpRequest {
-        stream: reader.into_inner(),
-        request_line,
-        headers,
-        body: String::from_utf8(body).expect("body should be utf-8"),
-    }
+        CapturedHttpRequest {
+            stream: reader.into_inner(),
+            request_line,
+            headers,
+            body: String::from_utf8(body).expect("body should be utf-8"),
+        }
+    })
+    .await
+    .expect("test exchange should finish in time")
 }
 
 async fn respond_with_json(mut stream: TcpStream, body: serde_json::Value) {
@@ -2829,46 +2883,50 @@ async fn respond_with_status_and_headers(
 async fn accept_remote_control_backend_connection(
     listener: &TcpListener,
 ) -> (CapturedWebSocketRequest, WebSocketStream<TcpStream>) {
-    let (stream, _) = timeout(Duration::from_secs(5), listener.accept())
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (stream, _) = timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("websocket request should arrive in time")
+            .expect("listener accept should succeed");
+        let captured_request = Arc::new(std::sync::Mutex::new(None::<CapturedWebSocketRequest>));
+        let captured_request_for_callback = captured_request.clone();
+        let websocket = accept_hdr_async(
+            stream,
+            move |request: &tungstenite::handshake::server::Request,
+                  response: tungstenite::handshake::server::Response| {
+                let headers = request
+                    .headers()
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.as_str().to_ascii_lowercase(),
+                            value
+                                .to_str()
+                                .expect("header should be valid utf-8")
+                                .to_string(),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                *captured_request_for_callback
+                    .lock()
+                    .expect("capture lock should acquire") = Some(CapturedWebSocketRequest {
+                    path: request.uri().path().to_string(),
+                    headers,
+                });
+                Ok(response)
+            },
+        )
         .await
-        .expect("websocket request should arrive in time")
-        .expect("listener accept should succeed");
-    let captured_request = Arc::new(std::sync::Mutex::new(None::<CapturedWebSocketRequest>));
-    let captured_request_for_callback = captured_request.clone();
-    let websocket = accept_hdr_async(
-        stream,
-        move |request: &tungstenite::handshake::server::Request,
-              response: tungstenite::handshake::server::Response| {
-            let headers = request
-                .headers()
-                .iter()
-                .map(|(name, value)| {
-                    (
-                        name.as_str().to_ascii_lowercase(),
-                        value
-                            .to_str()
-                            .expect("header should be valid utf-8")
-                            .to_string(),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>();
-            *captured_request_for_callback
-                .lock()
-                .expect("capture lock should acquire") = Some(CapturedWebSocketRequest {
-                path: request.uri().path().to_string(),
-                headers,
-            });
-            Ok(response)
-        },
-    )
+        .expect("websocket handshake should succeed");
+        let captured_request = captured_request
+            .lock()
+            .expect("capture lock should acquire")
+            .clone()
+            .expect("websocket request should be captured");
+        (captured_request, websocket)
+    })
     .await
-    .expect("websocket handshake should succeed");
-    let captured_request = captured_request
-        .lock()
-        .expect("capture lock should acquire")
-        .clone()
-        .expect("websocket request should be captured");
-    (captured_request, websocket)
+    .expect("test exchange should finish in time")
 }
 
 async fn send_client_event(

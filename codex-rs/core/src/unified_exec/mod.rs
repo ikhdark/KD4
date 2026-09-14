@@ -156,12 +156,14 @@ pub(crate) struct PendingSpawnRegistration {
 }
 
 #[cfg(test)]
+type PendingSpawnRetirementObserver = (
+    oneshot::Sender<Vec<Weak<UnifiedExecProcess>>>,
+    oneshot::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+#[cfg(test)]
 thread_local! {
-    static PENDING_SPAWN_RETIREMENT_OBSERVER: std::cell::RefCell<Option<(
-        oneshot::Sender<Vec<Weak<UnifiedExecProcess>>>,
-        oneshot::Sender<()>,
-        std::sync::mpsc::Receiver<()>,
-    )>> = const { std::cell::RefCell::new(None) };
+    static PENDING_SPAWN_RETIREMENT_OBSERVER: std::cell::RefCell<Option<PendingSpawnRetirementObserver>> = const { std::cell::RefCell::new(None) };
 }
 
 impl PendingSpawnRegistration {

@@ -121,11 +121,29 @@ impl ConfigLayerSource {
     }
 }
 
-/// Compares [ConfigLayerSource] by precedence, so `A < B` means settings from
-/// layer `A` will be overridden by settings from layer `B`.
-impl PartialOrd for ConfigLayerSource {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.precedence().cmp(&other.precedence()))
+#[cfg(test)]
+mod precedence_tests {
+    use super::ConfigLayerSource;
+    use codex_utils_absolute_path::test_support::PathBufExt;
+    use codex_utils_absolute_path::test_support::test_path_buf;
+
+    #[test]
+    fn precedence_preserves_order_between_distinct_project_layers() {
+        let first = ConfigLayerSource::Project {
+            dot_codex_folder: test_path_buf("/z/.codex").abs(),
+        };
+        let second = ConfigLayerSource::Project {
+            dot_codex_folder: test_path_buf("/a/.codex").abs(),
+        };
+        assert_ne!(first, second);
+        assert_eq!(first.precedence(), second.precedence());
+        let mut layers = vec![
+            ConfigLayerSource::SessionFlags,
+            first.clone(),
+            second.clone(),
+        ];
+        layers.sort_by_key(ConfigLayerSource::precedence);
+        assert_eq!(layers, vec![first, second, ConfigLayerSource::SessionFlags]);
     }
 }
 

@@ -4,6 +4,7 @@
     "AdditionalFileSystemPermissions": {
       "properties": {
         "entries": {
+          "description": "When present, replaces legacy `read` and `write`, including when empty.",
           "items": {
             "$ref": "#/definitions/V2FileSystemSandboxEntry"
           },

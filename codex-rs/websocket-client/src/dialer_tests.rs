@@ -39,264 +39,304 @@ use crate::WebSocketTlsMode;
 
 #[tokio::test]
 async fn public_connector_uses_factory_and_exposes_stream_and_sink() {
-    let (target_addr, target_task) = start_echo_websocket_server(/*acceptor*/ None).await;
-    let request = format!("ws://localhost:{}/v1/responses", target_addr.port())
-        .into_client_request()
-        .expect("websocket request should build");
-    let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
-    let connector = WebSocketConnector::new(&factory).expect("connector should build");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (target_addr, target_task) = start_echo_websocket_server(/*acceptor*/ None).await;
+        let request = format!("ws://localhost:{}/v1/responses", target_addr.port())
+            .into_client_request()
+            .expect("websocket request should build");
+        let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+        let connector = WebSocketConnector::new(&factory).expect("connector should build");
 
-    let (mut websocket, _) = connector
-        .connect(request, WebSocketConfig::default())
-        .await
-        .expect("websocket handshake should succeed");
-    assert!(!websocket_tcp_nodelay(&websocket));
-    let expected = Message::Text("hello".into());
-    websocket
-        .send(expected.clone())
-        .await
-        .expect("websocket should send");
-    let actual = websocket
-        .next()
-        .await
-        .expect("websocket should receive a message")
-        .expect("websocket message should be valid");
-    assert_eq!(actual, expected);
+        let (mut websocket, _) = connector
+            .connect(request, WebSocketConfig::default())
+            .await
+            .expect("websocket handshake should succeed");
+        assert!(!websocket_tcp_nodelay(&websocket));
+        let expected = Message::Text("hello".into());
+        websocket
+            .send(expected.clone())
+            .await
+            .expect("websocket should send");
+        let actual = websocket
+            .next()
+            .await
+            .expect("websocket should receive a message")
+            .expect("websocket message should be valid");
+        assert_eq!(actual, expected);
 
-    target_task.await.expect("target task should finish");
+        target_task.await.expect("target task should finish");
+    })
+    .await
+    .expect("WebSocket scenario timed out");
 }
 
 #[tokio::test]
 async fn public_connector_enables_tcp_nodelay_when_requested() {
-    let (target_addr, target_task) = start_echo_websocket_server(/*acceptor*/ None).await;
-    let request = format!("ws://localhost:{}/v1/responses", target_addr.port())
-        .into_client_request()
-        .expect("websocket request should build");
-    let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
-    let connector = WebSocketConnector::new(&factory)
-        .expect("connector should build")
-        .with_tcp_nodelay();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (target_addr, target_task) = start_echo_websocket_server(/*acceptor*/ None).await;
+        let request = format!("ws://localhost:{}/v1/responses", target_addr.port())
+            .into_client_request()
+            .expect("websocket request should build");
+        let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+        let connector = WebSocketConnector::new(&factory)
+            .expect("connector should build")
+            .with_tcp_nodelay();
 
-    let (mut websocket, _) = connector
-        .connect(request, WebSocketConfig::default())
-        .await
-        .expect("websocket handshake should succeed");
-    assert!(websocket_tcp_nodelay(&websocket));
-    let expected = Message::Text("latency-sensitive".into());
-    websocket
-        .send(expected.clone())
-        .await
-        .expect("websocket should send");
-    assert_eq!(
-        websocket
-            .next()
+        let (mut websocket, _) = connector
+            .connect(request, WebSocketConfig::default())
             .await
-            .expect("websocket should receive a message")
-            .expect("websocket message should be valid"),
-        expected
-    );
+            .expect("websocket handshake should succeed");
+        assert!(websocket_tcp_nodelay(&websocket));
+        let expected = Message::Text("latency-sensitive".into());
+        websocket
+            .send(expected.clone())
+            .await
+            .expect("websocket should send");
+        assert_eq!(
+            websocket
+                .next()
+                .await
+                .expect("websocket should receive a message")
+                .expect("websocket message should be valid"),
+            expected
+        );
 
-    target_task.await.expect("target task should finish");
+        target_task.await.expect("target task should finish");
+    })
+    .await
+    .expect("WebSocket scenario timed out");
 }
 
 #[tokio::test]
 async fn tungstenite_default_tls_mode_ignores_invalid_custom_ca_in_a_subprocess() {
-    let (target_addr, target_task) = start_echo_websocket_server(/*acceptor*/ None).await;
-    let target_url = format!("ws://127.0.0.1:{}/v1/responses", target_addr.port());
-    let executable = std::env::current_exe().expect("test executable should be available");
-    let output = tokio::task::spawn_blocking(move || {
-        let mut command = Command::new(executable);
-        command.args([
-            "--exact",
-            "dialer::tests::tungstenite_default_tls_mode_subprocess_probe",
-            "--nocapture",
-        ]);
-        for key in [
-            "HTTP_PROXY",
-            "http_proxy",
-            "HTTPS_PROXY",
-            "https_proxy",
-            "ALL_PROXY",
-            "all_proxy",
-            "NO_PROXY",
-            "no_proxy",
-            "SSL_CERT_FILE",
-        ] {
-            command.env_remove(key);
-        }
-        command
-            .env(
-                "CODEX_CA_CERTIFICATE",
-                "/codex-websocket-client-nonexistent-custom-ca.pem",
-            )
-            .env("CODEX_WEBSOCKET_DEFAULT_TLS_PROBE_URL", target_url)
-            .output()
-            .expect("WebSocket default-TLS subprocess should run")
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (target_addr, target_task) = start_echo_websocket_server(/*acceptor*/ None).await;
+        let target_url = format!("ws://127.0.0.1:{}/v1/responses", target_addr.port());
+        let executable = std::env::current_exe().expect("test executable should be available");
+        let output = {
+            let mut command = Command::new(executable);
+            command.args([
+                "--exact",
+                "dialer::tests::tungstenite_default_tls_mode_subprocess_probe",
+                "--nocapture",
+            ]);
+            for key in [
+                "HTTP_PROXY",
+                "http_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+                "NO_PROXY",
+                "no_proxy",
+                "SSL_CERT_FILE",
+            ] {
+                command.env_remove(key);
+            }
+            command
+                .env(
+                    "CODEX_CA_CERTIFICATE",
+                    "/codex-websocket-client-nonexistent-custom-ca.pem",
+                )
+                .env("CODEX_WEBSOCKET_DEFAULT_TLS_PROBE_URL", target_url);
+            run_probe(command).await
+        };
+
+        assert!(
+            output.status.success(),
+            "WebSocket default-TLS subprocess failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        target_task.await.expect("target task should finish");
     })
     .await
-    .expect("WebSocket default-TLS subprocess should join");
-
-    assert!(
-        output.status.success(),
-        "WebSocket default-TLS subprocess failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    target_task.await.expect("target task should finish");
+    .expect("WebSocket scenario timed out");
 }
 
 #[tokio::test]
 async fn tungstenite_default_tls_mode_subprocess_probe() {
-    let Ok(url) = std::env::var("CODEX_WEBSOCKET_DEFAULT_TLS_PROBE_URL") else {
-        return;
-    };
-    let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
-    assert!(
-        WebSocketConnector::new(&factory).is_err(),
-        "explicit Codex TLS should reject the invalid custom CA"
-    );
-    let connector =
-        WebSocketConnector::new_with_tls_mode(&factory, WebSocketTlsMode::TungsteniteDefault)
-            .expect("Tungstenite-default TLS should ignore custom CA configuration");
-    let request = url
-        .into_client_request()
-        .expect("websocket request should build");
-    let (mut websocket, _) = connector
-        .connect(request, WebSocketConfig::default())
-        .await
-        .expect("WebSocket should connect without constructing Codex TLS");
-    let expected = Message::Text("Tungstenite default TLS".into());
-    websocket
-        .send(expected.clone())
-        .await
-        .expect("WebSocket should send");
-    assert_eq!(
-        websocket
-            .next()
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let Ok(url) = std::env::var("CODEX_WEBSOCKET_DEFAULT_TLS_PROBE_URL") else {
+            return;
+        };
+        let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+        assert!(
+            WebSocketConnector::new(&factory).is_err(),
+            "explicit Codex TLS should reject the invalid custom CA"
+        );
+        let connector =
+            WebSocketConnector::new_with_tls_mode(&factory, WebSocketTlsMode::TungsteniteDefault)
+                .expect("Tungstenite-default TLS should ignore custom CA configuration");
+        let request = url
+            .into_client_request()
+            .expect("websocket request should build");
+        let (mut websocket, _) = connector
+            .connect(request, WebSocketConfig::default())
             .await
-            .expect("WebSocket should receive a message")
-            .expect("WebSocket message should be valid"),
-        expected
-    );
+            .expect("WebSocket should connect without constructing Codex TLS");
+        let expected = Message::Text("Tungstenite default TLS".into());
+        websocket
+            .send(expected.clone())
+            .await
+            .expect("WebSocket should send");
+        assert_eq!(
+            websocket
+                .next()
+                .await
+                .expect("WebSocket should receive a message")
+                .expect("WebSocket message should be valid"),
+            expected
+        );
+    })
+    .await
+    .expect("WebSocket scenario timed out");
 }
 
 #[tokio::test]
 async fn direct_route_connects_secure_websocket() {
-    let (tls_config, acceptor, _) = test_tls_configs();
-    let (target_addr, target_task) = start_tls_websocket_server(acceptor).await;
-    let request = format!("wss://localhost:{}/v1/responses", target_addr.port())
-        .into_client_request()
-        .expect("websocket request should build");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (tls_config, acceptor, _) = test_tls_configs();
+        let (target_addr, target_task) = start_tls_websocket_server(acceptor).await;
+        let request = format!("wss://localhost:{}/v1/responses", target_addr.port())
+            .into_client_request()
+            .expect("websocket request should build");
 
-    let (inner, _) = connect(
-        request,
-        WebSocketConfig::default(),
-        Some(tls_config),
-        OutboundProxyRoute::Direct,
-        TcpNodelay::Enabled,
-    )
+        let (inner, _) = connect(
+            request,
+            WebSocketConfig::default(),
+            Some(tls_config),
+            OutboundProxyRoute::Direct,
+            TcpNodelay::Enabled,
+        )
+        .await
+        .expect("direct websocket handshake should succeed");
+        drop(WebSocketConnection { inner });
+
+        target_task.await.expect("target task should finish");
+    })
     .await
-    .expect("direct websocket handshake should succeed");
-    drop(WebSocketConnection { inner });
-
-    target_task.await.expect("target task should finish");
+    .expect("WebSocket scenario timed out");
 }
 
 #[tokio::test]
 async fn http_proxy_tunnels_secure_websocket_before_handshake() {
-    assert_proxy_tunnels_secure_websocket(/*proxy_tls*/ false).await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        assert_proxy_tunnels_secure_websocket(/*proxy_tls*/ false).await;
+    })
+    .await
+    .expect("WebSocket scenario timed out");
 }
 
 #[tokio::test]
 async fn https_proxy_tunnels_secure_websocket_before_handshake() {
-    assert_proxy_tunnels_secure_websocket(/*proxy_tls*/ true).await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        assert_proxy_tunnels_secure_websocket(/*proxy_tls*/ true).await;
+    })
+    .await
+    .expect("WebSocket scenario timed out");
 }
 
 #[tokio::test]
 async fn environment_proxy_route_honors_no_proxy_in_a_subprocess() {
-    assert_no_proxy_subprocess(
-        "127.0.0.1",
-        /*expect_proxy*/ false,
-        /*proxy_tls*/ false,
-    )
-    .await;
-    assert_no_proxy_subprocess(
-        "unrelated.example",
-        /*expect_proxy*/ true,
-        /*proxy_tls*/ false,
-    )
-    .await;
-    assert_no_proxy_subprocess(
-        "unrelated.example",
-        /*expect_proxy*/ true,
-        /*proxy_tls*/ true,
-    )
-    .await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        assert_no_proxy_subprocess(
+            "localhost",
+            /*expect_proxy*/ false,
+            /*proxy_tls*/ true,
+        )
+        .await;
+        assert_no_proxy_subprocess(
+            "127.0.0.1",
+            /*expect_proxy*/ false,
+            /*proxy_tls*/ false,
+        )
+        .await;
+        assert_no_proxy_subprocess(
+            "unrelated.example",
+            /*expect_proxy*/ true,
+            /*proxy_tls*/ false,
+        )
+        .await;
+        assert_no_proxy_subprocess(
+            "unrelated.example",
+            /*expect_proxy*/ true,
+            /*proxy_tls*/ true,
+        )
+        .await;
+    })
+    .await
+    .expect("WebSocket scenario timed out");
 }
 
 #[tokio::test]
 async fn no_proxy_subprocess_probe() {
-    let Ok(url) = std::env::var("CODEX_WEBSOCKET_NO_PROXY_PROBE_URL") else {
-        return;
-    };
-    let proxy_url = std::env::var("CODEX_WEBSOCKET_NO_PROXY_PROBE_PROXY")
-        .expect("parent test should provide a proxy URL");
-    let no_proxy = std::env::var("NO_PROXY").expect("parent test should provide a no-proxy value");
-    let request = url
-        .into_client_request()
-        .expect("websocket request should build");
-    let tls_config =
-        if let Ok(certificate_hex) = std::env::var("CODEX_WEBSOCKET_NO_PROXY_PROBE_CA_DER") {
-            ensure_rustls_crypto_provider();
-            assert_eq!(
-                certificate_hex.len() % 2,
-                0,
-                "encoded certificate should contain complete bytes"
-            );
-            let certificate = (0..certificate_hex.len())
-                .step_by(2)
-                .map(|index| {
-                    u8::from_str_radix(&certificate_hex[index..index + 2], 16)
-                        .expect("encoded certificate should contain hexadecimal bytes")
-                })
-                .collect::<Vec<_>>();
-            let mut roots = RootCertStore::empty();
-            roots
-                .add(CertificateDer::from(certificate))
-                .expect("proxy certificate should be trusted");
-            Arc::new(
-                ClientConfig::builder()
-                    .with_root_certificates(roots)
-                    .with_no_client_auth(),
-            )
-        } else {
-            test_tls_configs().0
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let Ok(url) = std::env::var("CODEX_WEBSOCKET_NO_PROXY_PROBE_URL") else {
+            return;
         };
-    let (inner, _) = connect(
-        request,
-        WebSocketConfig::default(),
-        Some(tls_config),
-        OutboundProxyRoute::Proxy {
-            url: proxy_url,
-            no_proxy: Some(no_proxy),
-        },
-        TcpNodelay::Enabled,
-    )
-    .await
-    .expect("websocket handshake should succeed");
-    let mut websocket = WebSocketConnection { inner };
-    websocket
-        .send(Message::Text("probe".into()))
+        let proxy_url = std::env::var("CODEX_WEBSOCKET_NO_PROXY_PROBE_PROXY")
+            .expect("parent test should provide a proxy URL");
+        let no_proxy =
+            std::env::var("NO_PROXY").expect("parent test should provide a no-proxy value");
+        let request = url
+            .into_client_request()
+            .expect("websocket request should build");
+        let tls_config =
+            if let Ok(certificate_hex) = std::env::var("CODEX_WEBSOCKET_NO_PROXY_PROBE_CA_DER") {
+                ensure_rustls_crypto_provider();
+                assert_eq!(
+                    certificate_hex.len() % 2,
+                    0,
+                    "encoded certificate should contain complete bytes"
+                );
+                let certificate = (0..certificate_hex.len())
+                    .step_by(2)
+                    .map(|index| {
+                        u8::from_str_radix(&certificate_hex[index..index + 2], 16)
+                            .expect("encoded certificate should contain hexadecimal bytes")
+                    })
+                    .collect::<Vec<_>>();
+                let mut roots = RootCertStore::empty();
+                roots
+                    .add(CertificateDer::from(certificate))
+                    .expect("proxy certificate should be trusted");
+                Arc::new(
+                    ClientConfig::builder()
+                        .with_root_certificates(roots)
+                        .with_no_client_auth(),
+                )
+            } else {
+                test_tls_configs().0
+            };
+        let (inner, _) = connect(
+            request,
+            WebSocketConfig::default(),
+            Some(tls_config),
+            OutboundProxyRoute::Proxy {
+                url: proxy_url,
+                no_proxy: Some(no_proxy),
+            },
+            TcpNodelay::Enabled,
+        )
         .await
-        .expect("probe should send");
-    assert_eq!(
+        .expect("websocket handshake should succeed");
+        let mut websocket = WebSocketConnection { inner };
         websocket
-            .next()
+            .send(Message::Text("probe".into()))
             .await
-            .expect("probe should receive a message")
-            .expect("probe message should be valid"),
-        Message::Text("probe".into())
-    );
+            .expect("probe should send");
+        assert_eq!(
+            websocket
+                .next()
+                .await
+                .expect("probe should receive a message")
+                .expect("probe message should be valid"),
+            Message::Text("probe".into())
+        );
+    })
+    .await
+    .expect("WebSocket scenario timed out");
 }
 
 #[test]
@@ -359,27 +399,31 @@ async fn happy_eyeballs_does_not_wait_for_stalled_preferred_family() {
 
 #[tokio::test]
 async fn routed_tcp_connections_only_enable_nodelay_when_requested() {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("listener should bind");
-    let address = listener
-        .local_addr()
-        .expect("listener should have an address")
-        .to_string();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have an address")
+            .to_string();
 
-    let default_stream = connect_tcp(address.clone(), TcpNodelay::Default)
-        .await
-        .expect("default TCP connection should succeed");
-    assert!(!default_stream.nodelay().expect("TCP_NODELAY should read"));
+        let default_stream = connect_tcp(address.clone(), TcpNodelay::Default)
+            .await
+            .expect("default TCP connection should succeed");
+        assert!(!default_stream.nodelay().expect("TCP_NODELAY should read"));
 
-    let low_latency_stream = connect_tcp(address, TcpNodelay::Enabled)
-        .await
-        .expect("low-latency TCP connection should succeed");
-    assert!(
-        low_latency_stream
-            .nodelay()
-            .expect("TCP_NODELAY should read")
-    );
+        let low_latency_stream = connect_tcp(address, TcpNodelay::Enabled)
+            .await
+            .expect("low-latency TCP connection should succeed");
+        assert!(
+            low_latency_stream
+                .nodelay()
+                .expect("TCP_NODELAY should read")
+        );
+    })
+    .await
+    .expect("WebSocket scenario timed out");
 }
 
 fn websocket_tcp_nodelay(websocket: &WebSocketConnection) -> bool {
@@ -489,7 +533,7 @@ async fn assert_no_proxy_subprocess(no_proxy: &str, expect_proxy: bool, proxy_tl
     );
     let proxy_url = format!("{proxy_scheme}://localhost:{}", proxy_addr.port());
     let no_proxy = no_proxy.to_string();
-    let output = tokio::task::spawn_blocking(move || {
+    let output = {
         let mut command = Command::new(executable);
         command.args([
             "--exact",
@@ -529,12 +573,8 @@ async fn assert_no_proxy_subprocess(no_proxy: &str, expect_proxy: bool, proxy_tl
                 .collect::<String>();
             command.env("CODEX_WEBSOCKET_NO_PROXY_PROBE_CA_DER", certificate_hex);
         }
-        command
-            .output()
-            .expect("WebSocket no-proxy subprocess should run")
-    })
-    .await
-    .expect("WebSocket no-proxy subprocess should join");
+        run_probe(command).await
+    };
     assert!(
         output.status.success(),
         "WebSocket no-proxy subprocess failed\nstdout:\n{}\nstderr:\n{}",
@@ -550,6 +590,69 @@ async fn assert_no_proxy_subprocess(no_proxy: &str, expect_proxy: bool, proxy_tl
         let expected_request_line =
             format!("CONNECT {target_host}:{} HTTP/1.1", target_addr.port());
         assert_eq!(request.lines().next(), Some(expected_request_line.as_str()));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn happy_eyeballs_advances_immediately_after_failure() {
+    let failed: SocketAddr = "[2001:db8::1]:443".parse().expect("IPv6 address");
+    let reachable: SocketAddr = "127.0.0.1:443".parse().expect("IPv4 address");
+    let result = tokio::time::timeout(
+        Duration::from_millis(1),
+        connect_happy_eyeballs(vec![failed, reachable], |address| async move {
+            if address == failed {
+                Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+            } else {
+                Ok(address)
+            }
+        }),
+    )
+    .await
+    .expect("failure must bypass the stagger")
+    .expect("alternate address connects");
+    assert_eq!(result, reachable);
+}
+
+async fn run_probe(command: Command) -> std::process::Output {
+    use std::process::Stdio;
+    let mut command = tokio::process::Command::from(command);
+    command
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("start WebSocket probe");
+    let mut stdout = child.stdout.take().expect("probe stdout");
+    let mut stderr = child.stderr.take().expect("probe stderr");
+    let stdout = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout
+            .read_to_end(&mut bytes)
+            .await
+            .expect("read probe stdout");
+        bytes
+    });
+    let stderr = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stderr
+            .read_to_end(&mut bytes)
+            .await
+            .expect("read probe stderr");
+        bytes
+    });
+    let status = match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+        Ok(status) => status.expect("wait for WebSocket probe"),
+        Err(_) => {
+            child
+                .kill()
+                .await
+                .expect("kill and reap timed-out WebSocket probe");
+            panic!("WebSocket probe timed out");
+        }
+    };
+    std::process::Output {
+        status,
+        stdout: stdout.await.expect("stdout reader"),
+        stderr: stderr.await.expect("stderr reader"),
     }
 }
 

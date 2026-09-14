@@ -124,6 +124,51 @@ waiting_policy = "yield_after"
         .expect("removed waiting_policy should be rejected");
 
     assert_eq!(error.path, path);
+    // FeatureToml's untagged enum reports a shape error at the outer boundary.
+    // Check the inner diagnostic too, so another failure cannot satisfy this
+    // regression merely by rejecting the whole feature block.
+    assert!(error.message.contains("FeatureToml"), "{error:?}");
+    let feature_error = toml::from_str::<codex_features::CodeModeConfigToml>(
+        "enabled = true\nwaiting_policy = 'yield_after'\n",
+    )
+    .expect_err("removed field must fail in the structured feature config");
+    assert!(feature_error.to_string().contains("waiting_policy"));
+    assert_eq!(
+        config_error_from_ignored_toml_fields::<ConfigToml>(
+            path,
+            "[features.code_mode]\nenabled = true\n"
+        ),
+        None
+    );
+}
+
+#[test]
+fn strict_permission_profile_reports_unknown_fixed_field() {
+    let path = Path::new("/tmp/config.toml");
+    let valid = "[permissions.dev.network]\nenabled = true\n";
+    assert_eq!(
+        config_error_from_ignored_toml_fields::<ConfigToml>(path, valid),
+        None
+    );
+    for (invalid, unknown_path) in [
+        (
+            format!("{valid}unknown_network_setting = true\n"),
+            "permissions.dev.network.unknown_network_setting",
+        ),
+        (
+            "[permissions.dev]\nunknown_profile_setting = true\n".to_string(),
+            "permissions.dev.unknown_profile_setting",
+        ),
+    ] {
+        let error = config_error_from_ignored_toml_fields::<ConfigToml>(path, &invalid)
+            .expect("unknown permission setting");
+        assert_eq!(
+            error.message,
+            format!("unknown configuration field `{unknown_path}`")
+        );
+        // Ordinary parsing remains permissive; strict validation owns diagnostics.
+        let _: ConfigToml = toml::from_str(&invalid).expect("ordinary config parsing");
+    }
 }
 
 #[test]
@@ -139,4 +184,24 @@ collapsed = true"#;
     let error = config_error_from_ignored_toml_fields::<ConfigToml>(path, contents);
 
     assert_eq!(error, None);
+}
+
+#[test]
+fn strict_config_keeps_first_unknown_but_finishes_type_validation() {
+    let path = Path::new("/tmp/config.toml");
+    let contents = "first_unknown = true\nsecond_unknown = false\n";
+    let error = config_error_from_ignored_toml_fields::<ConfigToml>(path, contents).unwrap();
+    assert_eq!(error.message, "unknown configuration field `first_unknown`");
+    let value = toml::from_str(contents).unwrap();
+    assert_eq!(
+        ignored_toml_value_field::<ConfigToml>(value),
+        Some("first_unknown".to_string())
+    );
+    let invalid = format!("{contents}model_context_window = 'wide'\n");
+    let error = config_error_from_ignored_toml_fields::<ConfigToml>(path, &invalid).unwrap();
+    assert_eq!(error.message, "invalid type: string \"wide\", expected i64");
+    assert_eq!(
+        ignored_toml_value_field::<ConfigToml>(toml::from_str(&invalid).unwrap()),
+        None
+    );
 }

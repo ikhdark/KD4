@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report which Codex binary a VS Code-style shell is likely to run."""
+"""Report Codex resolution for this process and optional extension inventory."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ def desktop_target() -> str | None:
     publish_dir = os.environ.get("CODEX_LOCAL_PUBLISH_DIR")
     if publish_dir:
         return str(Path(publish_dir) / "codex.exe")
-    return str(Path.home() / "Desktop" / "LOCAL-KD" / "codex.exe")
+    return str(Path.home() / "Desktop" / "LOCAL-KD" / "bin" / "codex.exe")
 
 
 def extension_candidates(limit: int = 8) -> list[str]:
@@ -71,52 +71,61 @@ def extension_candidates(limit: int = 8) -> list[str]:
                     return matches
                 if name not in names:
                     continue
-                child = Path(directory) / name
-                if "codex" in child.as_posix().lower():
-                    matches.append(str(child))
+                matches.append(str(Path(directory) / name))
     return matches
 
 
-def build_probes(run_codex: bool) -> list[BinaryProbe]:
+def build_probes(run_codex: bool, *, path_only: bool = False) -> list[BinaryProbe]:
+    versions: dict[Path, str | None] = {}
+
+    def version(path: str | None) -> str | None:
+        if not run_codex or not path:
+            return None
+        key = Path(path).resolve()
+        if key not in versions:
+            versions[key] = run_version(path, enabled=True)
+        return versions[key]
+
     path_codex = shutil.which("codex")
-    target = desktop_target()
     probes = [
         BinaryProbe(
             "path-codex",
             path_codex,
             bool(path_codex),
-            run_version(path_codex, enabled=run_codex),
+            version(path_codex),
         ),
+    ]
+    if path_only:
+        return probes
+    target = desktop_target()
+    probes.append(
         BinaryProbe(
             "desktop-local-target",
             target,
             bool(target and Path(target).exists()),
-            run_version(target, enabled=run_codex),
-        ),
-    ]
+            version(target),
+        )
+    )
     for candidate in extension_candidates():
         probes.append(
             BinaryProbe(
                 "vscode-extension-candidate",
                 candidate,
                 Path(candidate).exists(),
-                run_version(candidate, enabled=run_codex),
+                version(candidate),
             )
         )
     return probes
 
 
 def print_probes(probes: Sequence[BinaryProbe]) -> None:
-    print("VS Code Codex runtime proof")
+    print("Observed Codex resolution for this process")
     for probe in probes:
         status = "exists" if probe.exists else "missing"
         version = f" version={probe.version}" if probe.version else ""
         print(f"- {probe.label}: {status} path={probe.path or '<none>'}{version}")
-    path_probe = next((probe for probe in probes if probe.label == "path-codex"), None)
-    if path_probe and path_probe.path:
-        print("Use the PATH Codex above as the VS Code integrated-terminal target.")
     print(
-        "If VS Code launches an extension-bundled binary, update the extension target or PATH and rerun this proof."
+        "Extension candidates are inventory, not proof of the active extension runtime."
     )
 
 
@@ -136,7 +145,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    probes = build_probes(run_codex=not args.no_run_codex)
+    probes = build_probes(
+        run_codex=not args.no_run_codex, path_only=bool(args.expected_binary)
+    )
     if args.json:
         print(json.dumps({"probes": [asdict(probe) for probe in probes]}, indent=2))
     else:

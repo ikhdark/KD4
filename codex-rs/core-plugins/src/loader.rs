@@ -7,9 +7,8 @@ use crate::manifest::PluginManifestMcpServers;
 use crate::manifest::PluginManifestPaths;
 use crate::manifest::load_plugin_manifest;
 use crate::marketplace::MarketplacePluginSource;
-use crate::marketplace::find_marketplace_plugin;
 use crate::marketplace::list_marketplaces_with_home;
-use crate::marketplace::load_marketplace;
+use crate::marketplace::load_marketplace_with_declared_names;
 use crate::marketplace_policy::configured_plugins_from_stack;
 use crate::npm_source::materialize_npm_plugin_source;
 use crate::remote::REMOTE_GLOBAL_MARKETPLACE_NAME;
@@ -61,7 +60,6 @@ const DEFAULT_HOOKS_CONFIG_FILE: &str = "hooks/hooks.json";
 const DEFAULT_MCP_CONFIG_FILE: &str = ".mcp.json";
 const DEFAULT_APP_CONFIG_FILE: &str = ".app.json";
 const CONFIG_TOML_FILE: &str = "config.toml";
-const CURATED_PLUGIN_CACHE_VERSION_SHA_PREFIX_LEN: usize = 8;
 
 /// Hook declarations and warnings resolved without loading other plugin capabilities.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -319,11 +317,17 @@ pub fn refresh_curated_plugin_cache(
     let mut plugin_sources = HashMap::<String, AbsolutePathBuf>::new();
 
     for curated_marketplace_path in curated_marketplace_paths {
-        let curated_marketplace = load_marketplace(&curated_marketplace_path).map_err(|err| {
-            format!("failed to load curated marketplace for cache refresh: {err}")
-        })?;
+        let (curated_marketplace, declared_names) =
+            load_marketplace_with_declared_names(&curated_marketplace_path).map_err(|err| {
+                format!("failed to load curated marketplace for cache refresh: {err}")
+            })?;
         let marketplace_name = curated_marketplace.name;
         loaded_marketplace_names.insert(marketplace_name.clone());
+        marketplace_plugin_keys.extend(
+            declared_names
+                .into_iter()
+                .map(|name| format!("{name}@{marketplace_name}")),
+        );
 
         for plugin in curated_marketplace.plugins {
             let plugin_id =
@@ -335,7 +339,6 @@ pub fn refresh_curated_plugin_cache(
                     }
                 })?;
             let plugin_key = plugin_id.as_key();
-            marketplace_plugin_keys.insert(plugin_key.clone());
             if plugin_sources.contains_key(&plugin_key) {
                 warn!(
                     plugin = %plugin.name,
@@ -422,11 +425,9 @@ fn curated_marketplace_paths_for_cache_refresh(
 }
 
 pub fn curated_plugin_cache_version(plugin_version: &str) -> String {
-    if is_full_git_sha(plugin_version) {
-        plugin_version[..CURATED_PLUGIN_CACHE_VERSION_SHA_PREFIX_LEN].to_string()
-    } else {
-        plugin_version.to_string()
-    }
+    // Existing abbreviated directories remain readable and are replaced by the normal
+    // versioned install transaction on the next refresh.
+    plugin_version.to_string()
 }
 
 #[cfg(test)]
@@ -552,36 +553,35 @@ fn refresh_non_curated_plugin_cache_with_mode(
                 continue;
             }
 
-            let manifest_fallback = find_marketplace_plugin(&marketplace.path, &plugin.name)
-                .map(|resolved| {
-                    resolved
-                        .manifest_fallback
-                        .contents_if_has_metadata()
-                        .map(str::to_string)
-                })
-                .unwrap_or_else(|err| {
-                    warn!(
-                        plugin = plugin.name,
-                        marketplace = marketplace.name,
-                        error = %err,
-                        "failed to resolve marketplace plugin manifest fallback during cache refresh"
-                    );
-                    None
-                });
+            let manifest_fallback = plugin
+                .manifest_fallback
+                .as_ref()
+                .and_then(|fallback| fallback.contents_if_has_metadata())
+                .map(str::to_string);
             plugin_sources.insert(plugin_key, (plugin.source, manifest_fallback));
         }
     }
 
     let mut cache_refreshed = false;
-    let mut refresh_errors = Vec::new();
+    let mut refresh_errors = marketplace_outcome
+        .errors
+        .into_iter()
+        .map(|error| NonCuratedCacheRefreshError {
+            marketplace_name: error.path.display().to_string(),
+            message: format!(
+                "failed to discover marketplace {}: {}",
+                error.path.display(),
+                error.message
+            ),
+        })
+        .collect::<Vec<_>>();
     for plugin_id in configured_non_curated_plugin_ids {
         let plugin_key = plugin_id.as_key();
         let Some((source, manifest_fallback_contents)) = plugin_sources.get(&plugin_key).cloned()
         else {
             warn!(
-                plugin = plugin_id.plugin_name(),
-                marketplace = plugin_id.marketplace_name(),
-                "configured non-curated plugin no longer exists in discovered marketplaces during cache refresh"
+                plugin = plugin_key,
+                "configured plugin has no usable source in discovered marketplaces"
             );
             continue;
         };
@@ -649,10 +649,6 @@ fn collapse_non_curated_cache_refresh(
             .collect::<Vec<_>>()
             .join("; "))
     }
-}
-
-fn is_full_git_sha(value: &str) -> bool {
-    value.len() == 40 && value.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 fn configured_plugins_from_user_config_value(
@@ -847,26 +843,28 @@ async fn load_plugin(
             loaded_plugin.manifest_name = Some(manifest.display_name().to_string());
             loaded_plugin.manifest_description = manifest.description.clone();
             loaded_plugin.skill_roots = skill_roots;
-            let resolved_skills = load_plugin_skills(
-                &plugin_root,
-                &loaded_plugin_id,
-                &manifest,
-                *restriction_product,
-                skill_config_rules,
-                *plugin_skill_snapshots,
-            )
-            .await;
-            let has_enabled_skills = resolved_skills.has_enabled_skills();
+            let (inventory, mcp_servers, apps) = tokio::join!(
+                load_plugin_skill_inventory_from_roots(
+                    &plugin_root,
+                    &loaded_plugin_id,
+                    &manifest,
+                    loaded_plugin.skill_roots.clone(),
+                    *restriction_product,
+                    *plugin_skill_snapshots,
+                ),
+                load_plugin_mcp_servers_from_manifest(
+                    plugin_root.as_path(),
+                    manifest_paths,
+                    Some(&plugin.mcp_servers),
+                ),
+                load_plugin_apps_from_manifest(plugin_root.as_path(), manifest_paths),
+            );
+            let resolved_skills = inventory.resolve(skill_config_rules);
+            loaded_plugin.has_enabled_skills = resolved_skills.has_enabled_skills();
             loaded_plugin.disabled_skill_paths = resolved_skills.disabled_skill_paths;
-            loaded_plugin.has_enabled_skills = has_enabled_skills;
-            loaded_plugin.mcp_servers = load_plugin_mcp_servers_from_manifest(
-                plugin_root.as_path(),
-                manifest_paths,
-                Some(&plugin.mcp_servers),
-            )
-            .await;
+            loaded_plugin.mcp_servers = mcp_servers;
+            loaded_plugin.apps = apps;
             loaded_plugin.tool_exposure = manifest.tool_exposure.clone();
-            loaded_plugin.apps = load_plugin_apps(plugin_root.as_path()).await;
         }
         PluginLoadScope::HooksOnly => {}
     }
@@ -999,6 +997,25 @@ pub(crate) async fn load_plugin_skill_inventory(
             };
         }
     };
+    load_plugin_skill_inventory_from_roots(
+        plugin_root,
+        plugin_id,
+        manifest,
+        roots,
+        restriction_product,
+        plugin_skill_snapshots,
+    )
+    .await
+}
+
+async fn load_plugin_skill_inventory_from_roots(
+    plugin_root: &AbsolutePathBuf,
+    plugin_id: &PluginId,
+    manifest: &PluginManifest,
+    roots: Vec<AbsolutePathBuf>,
+    restriction_product: Option<Product>,
+    plugin_skill_snapshots: Option<&PluginSkillSnapshots>,
+) -> PluginSkillInventory {
     let roots = roots
         .into_iter()
         .map(|path| SkillRoot {
@@ -1554,7 +1571,26 @@ fn clone_git_plugin_source(
     sparse_checkout_path: Option<&str>,
     destination: &Path,
 ) -> Result<(), String> {
+    let target = sha.or(ref_name);
+    if target.is_some_and(|target| target.starts_with('-')) {
+        return Err("Git plugin selector must not start with '-'".to_string());
+    }
     if let Some(sparse_checkout_path) = sparse_checkout_path {
+        // Normalize platform separators before escaping literal path components.
+        let sparse_checkout_path = Path::new(sparse_checkout_path)
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        // Non-cone sparse checkout consumes gitignore patterns, not literal paths.
+        let mut pattern = String::from("/");
+        for ch in sparse_checkout_path.chars() {
+            if matches!(ch, '\\' | '*' | '?' | '[' | ']' | '!' | '#' | ' ') {
+                pattern.push('\\');
+            }
+            pattern.push(ch);
+        }
+        pattern.push('/');
         run_git(
             &[
                 "clone",
@@ -1567,23 +1603,20 @@ fn clone_git_plugin_source(
             /*cwd*/ None,
         )?;
         run_git(
-            &[
-                "sparse-checkout",
-                "set",
-                "--no-cone",
-                "--",
-                sparse_checkout_path,
-            ],
+            &["sparse-checkout", "set", "--no-cone", "--", &pattern],
             Some(destination),
         )?;
     } else {
-        run_git(
-            &["clone", url, destination.to_string_lossy().as_ref()],
-            /*cwd*/ None,
-        )?;
+        let destination = destination.to_string_lossy();
+        let mut args = vec!["clone"];
+        if target.is_some() {
+            args.push("--no-checkout");
+        }
+        args.extend([url, destination.as_ref()]);
+        run_git(&args, /*cwd*/ None)?;
     }
-    if let Some(target) = sha.or(ref_name) {
-        run_git(&["checkout", target], Some(destination))?;
+    if let Some(target) = target {
+        run_git(&["checkout", target, "--"], Some(destination))?;
     } else if sparse_checkout_path.is_some() {
         run_git(&["checkout"], Some(destination))?;
     }
@@ -1598,9 +1631,11 @@ fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<(), String> {
         command.current_dir(cwd);
     }
 
-    let output = command
-        .output()
-        .map_err(|err| format!("failed to run git {}: {err}", args.join(" ")))?;
+    let output = crate::startup_sync::run_git_command_with_timeout(
+        &mut command,
+        &format!("git {}", args.join(" ")),
+        std::time::Duration::from_secs(120),
+    )?;
     if output.status.success() {
         return Ok(());
     }

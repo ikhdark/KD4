@@ -22,6 +22,7 @@ doctest = false
 workspace = true
 
 [dependencies]
+futures = { workspace = true }
 anyhow = { workspace = true }
 ansi-to-tui = { workspace = true }
 arboard = { workspace = true }
@@ -88,7 +89,7 @@ ratatui-macros = { workspace = true }
 regex-lite = { workspace = true }
 rmcp = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true, features = ["preserve_order"] }
+serde_json = { workspace = true, features = ["preserve_order", "raw_value"] }
 sha2 = { workspace = true }
 sha1 = { workspace = true }
 shlex = { workspace = true }
@@ -145,7 +146,6 @@ codex-utils-cargo-bin = { workspace = true }
 codex-utils-pty = { workspace = true }
 assert_matches = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
-futures = { workspace = true }
 http = { workspace = true }
 insta = { workspace = true }
 pretty_assertions = { workspace = true }

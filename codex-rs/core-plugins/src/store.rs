@@ -597,6 +597,11 @@ fn plugin_version_for_install_manifest(
 }
 
 pub fn validate_plugin_version_segment(plugin_version: &str) -> Result<(), String> {
+    if plugin_version.eq_ignore_ascii_case(REMOTE_PLUGIN_INSTALL_METADATA_FILE) {
+        return Err(
+            "invalid plugin version: reserved remote install metadata filename".to_string(),
+        );
+    }
     if plugin_version.is_empty() {
         return Err("invalid plugin version: must not be empty".to_string());
     }
@@ -699,19 +704,22 @@ fn replace_plugin_root_atomically(
     fs::create_dir_all(parent)
         .map_err(|err| PluginStoreError::io("failed to create plugin cache directory", err))?;
 
-    let Some(plugin_dir_name) = target_root.file_name() else {
-        return Err(PluginStoreError::Invalid(format!(
-            "plugin cache path has no directory name: {}",
-            target_root.display()
-        )));
-    };
     let staged_dir = tempfile::Builder::new()
         .prefix("plugin-install-")
         .tempdir_in(parent)
         .map_err(|err| {
             PluginStoreError::io("failed to create temporary plugin cache directory", err)
         })?;
-    let staged_root = staged_dir.path().join(plugin_dir_name);
+    let canonical_source = fs::canonicalize(source)
+        .map_err(|err| PluginStoreError::io("failed to resolve plugin source", err))?;
+    let canonical_staging = fs::canonicalize(staged_dir.path())
+        .map_err(|err| PluginStoreError::io("failed to resolve plugin staging directory", err))?;
+    if canonical_staging.starts_with(&canonical_source) {
+        return Err(PluginStoreError::Invalid(
+            "plugin source contains its installation staging directory".to_string(),
+        ));
+    }
+    let staged_root = staged_dir.path().join("new-plugin-root");
     let staged_version_root = staged_root.join(plugin_version);
     copy_dir_recursive(source, &staged_version_root)?;
     if let InstallManifest::Fallback(contents) = manifest {
@@ -822,7 +830,9 @@ fn select_active_plugin_version(
 fn compare_plugin_versions(left: &str, right: &str) -> Ordering {
     match (Version::parse(left), Version::parse(right)) {
         (Ok(left), Ok(right)) => left.cmp(&right),
-        _ => left.cmp(right),
+        (Ok(_), Err(_)) => Ordering::Greater,
+        (Err(_), Ok(_)) => Ordering::Less,
+        (Err(_), Err(_)) => left.cmp(right),
     }
 }
 
@@ -846,6 +856,11 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<(), PluginStoreErr
         } else if file_type.is_file() {
             fs::copy(&source_path, &target_path)
                 .map_err(|err| PluginStoreError::io("failed to copy plugin file", err))?;
+        } else {
+            return Err(PluginStoreError::Invalid(format!(
+                "unsupported plugin source entry type: {}",
+                source_path.display()
+            )));
         }
     }
 

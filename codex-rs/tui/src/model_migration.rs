@@ -160,7 +160,7 @@ pub(crate) async fn run_model_migration_prompt(
                 }
             }
         } else {
-            screen.accept();
+            screen.finish_with(ModelMigrationOutcome::Exit);
             break;
         }
     }

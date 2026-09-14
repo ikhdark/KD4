@@ -1,7 +1,11 @@
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
+use std::time::Instant;
 use std::time::SystemTime;
+use tokio::sync::Mutex;
 
 use codex_protocol::ThreadId;
 use codex_protocol::items::HookPromptFragment;
@@ -19,6 +23,7 @@ const HOOK_OUTPUT_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const HOOK_OUTPUT_ACTIVE_GRACE: Duration = Duration::from_secs(60 * 60);
 const HOOK_OUTPUT_MAX_FILES: usize = 512;
 const HOOK_OUTPUT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+static LAST_GLOBAL_PRUNE: LazyLock<Arc<Mutex<Option<Instant>>>> = LazyLock::new(Arc::default);
 
 #[derive(Clone, Copy)]
 struct SpillRetentionPolicy {
@@ -37,7 +42,6 @@ const SPILL_RETENTION_POLICY: SpillRetentionPolicy = SpillRetentionPolicy {
 
 struct SpillFile {
     path: PathBuf,
-    thread_dir: PathBuf,
     modified: SystemTime,
     len: u64,
 }
@@ -45,6 +49,7 @@ struct SpillFile {
 #[derive(Clone)]
 pub(crate) struct HookOutputSpiller {
     output_dir: AbsolutePathBuf,
+    last_prune: Arc<Mutex<Option<Instant>>>,
 }
 
 impl HookOutputSpiller {
@@ -52,16 +57,24 @@ impl HookOutputSpiller {
         Self {
             output_dir: AbsolutePathBuf::resolve_path_against_base(std::env::temp_dir(), "/")
                 .join(HOOK_OUTPUTS_DIR),
+            last_prune: Arc::clone(&LAST_GLOBAL_PRUNE),
         }
     }
 
-    /// Keeps hook text within the model-visible hook-output budget.
+    /// Keeps each hook text within the model-visible per-fragment budget.
     ///
     /// Oversized text is written in full under the OS temp directory at
     /// `<temp_dir>/hook_outputs/<thread_id>/`
     /// and replaced with the same head/tail preview style used for other truncated
     /// output, plus a path back to the preserved full text.
     pub(crate) async fn maybe_spill_text(&self, thread_id: ThreadId, text: String) -> String {
+        if approx_token_count(&text) > HOOK_OUTPUT_TOKEN_LIMIT {
+            self.prune_crash_leftovers(None).await;
+        }
+        self.spill_text(thread_id, text).await
+    }
+
+    async fn spill_text(&self, thread_id: ThreadId, text: String) -> String {
         if approx_token_count(&text) <= HOOK_OUTPUT_TOKEN_LIMIT {
             return text;
         }
@@ -88,11 +101,18 @@ impl HookOutputSpiller {
             );
         }
 
-        self.prune_crash_leftovers(Some(path.as_ref())).await;
         spilled_hook_output_preview(&text, &path)
     }
 
+    #[expect(clippy::await_holding_invalid_type, reason = "The try-lock prevents concurrent asynchronous pruning even when a prune exceeds the throttle interval")]
     async fn prune_crash_leftovers(&self, protected_path: Option<&Path>) {
+        let Ok(mut last_prune) = self.last_prune.try_lock() else {
+            return;
+        };
+        if last_prune.is_some_and(|last| last.elapsed() < Duration::from_secs(60)) {
+            return;
+        }
+        *last_prune = Some(Instant::now());
         if let Err(err) = prune_crash_leftovers_at(
             self.output_dir.as_ref(),
             protected_path,
@@ -113,9 +133,15 @@ impl HookOutputSpiller {
         thread_id: ThreadId,
         texts: Vec<String>,
     ) -> Vec<String> {
+        if texts
+            .iter()
+            .any(|text| approx_token_count(text) > HOOK_OUTPUT_TOKEN_LIMIT)
+        {
+            self.prune_crash_leftovers(None).await;
+        }
         let mut spilled = Vec::with_capacity(texts.len());
         for text in texts {
-            spilled.push(self.maybe_spill_text(thread_id, text).await);
+            spilled.push(self.spill_text(thread_id, text).await);
         }
         spilled
     }
@@ -125,10 +151,16 @@ impl HookOutputSpiller {
         thread_id: ThreadId,
         fragments: Vec<HookPromptFragment>,
     ) -> Vec<HookPromptFragment> {
+        if fragments
+            .iter()
+            .any(|fragment| approx_token_count(&fragment.text) > HOOK_OUTPUT_TOKEN_LIMIT)
+        {
+            self.prune_crash_leftovers(None).await;
+        }
         let mut spilled = Vec::with_capacity(fragments.len());
         for fragment in fragments {
             spilled.push(HookPromptFragment {
-                text: self.maybe_spill_text(thread_id, fragment.text).await,
+                text: self.spill_text(thread_id, fragment.text).await,
                 hook_run_id: fragment.hook_run_id,
             });
         }
@@ -180,14 +212,17 @@ async fn collect_spill_files(output_dir: &Path) -> std::io::Result<Vec<SpillFile
     };
     let mut files = Vec::new();
 
-    while let Some(thread_entry) = thread_dirs.next_entry().await? {
-        if !thread_entry.file_type().await?.is_dir() {
+    while let Some(thread_entry) = ignore_disappeared(thread_dirs.next_entry().await)?.flatten() {
+        if !ignore_disappeared(thread_entry.file_type().await)?.is_some_and(|kind| kind.is_dir()) {
             continue;
         }
         let thread_dir = thread_entry.path();
-        let mut thread_files = fs::read_dir(&thread_dir).await?;
-        while let Some(file_entry) = thread_files.next_entry().await? {
-            if !file_entry.file_type().await?.is_file()
+        let Some(mut thread_files) = ignore_disappeared(fs::read_dir(&thread_dir).await)? else {
+            continue;
+        };
+        while let Some(file_entry) = ignore_disappeared(thread_files.next_entry().await)?.flatten()
+        {
+            if !ignore_disappeared(file_entry.file_type().await)?.is_some_and(|kind| kind.is_file())
                 || file_entry
                     .path()
                     .extension()
@@ -196,10 +231,11 @@ async fn collect_spill_files(output_dir: &Path) -> std::io::Result<Vec<SpillFile
             {
                 continue;
             }
-            let metadata = file_entry.metadata().await?;
+            let Some(metadata) = ignore_disappeared(file_entry.metadata().await)? else {
+                continue;
+            };
             files.push(SpillFile {
                 path: file_entry.path(),
-                thread_dir: thread_dir.clone(),
                 modified: metadata.modified()?,
                 len: metadata.len(),
             });
@@ -207,6 +243,14 @@ async fn collect_spill_files(output_dir: &Path) -> std::io::Result<Vec<SpillFile
     }
 
     Ok(files)
+}
+
+fn ignore_disappeared<T>(result: std::io::Result<T>) -> std::io::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 fn age_at(now: SystemTime, modified: SystemTime) -> Duration {
@@ -219,10 +263,8 @@ fn is_protected(file: &SpillFile, protected_path: Option<&Path>) -> bool {
 
 async fn remove_spill_file(file: &SpillFile) -> bool {
     match fs::remove_file(&file.path).await {
-        Ok(()) => {
-            let _ = fs::remove_dir(&file.thread_dir).await;
-            true
-        }
+        // Keep directories stable while another writer is between mkdir and write.
+        Ok(()) => true,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
         Err(err) => {
             warn!(
@@ -246,8 +288,11 @@ fn hook_output_path(output_dir: &AbsolutePathBuf, thread_id: ThreadId) -> Absolu
 /// does not let the preview grow past the hook-output limit.
 fn spilled_hook_output_preview(text: &str, path: &AbsolutePathBuf) -> String {
     let footer = format!("\n\nFull hook output saved to: {}", path.display());
+    // The formatter adds a warning and omission marker outside its text budget.
+    let formatting_tokens =
+        approx_token_count(&formatted_truncate_text(text, TruncationPolicy::Tokens(0)));
     let preview_policy = TruncationPolicy::Tokens(
-        HOOK_OUTPUT_TOKEN_LIMIT.saturating_sub(approx_token_count(&footer)),
+        HOOK_OUTPUT_TOKEN_LIMIT.saturating_sub(approx_token_count(&footer) + formatting_tokens + 1),
     );
     format!("{}{footer}", formatted_truncate_text(text, preview_policy))
 }

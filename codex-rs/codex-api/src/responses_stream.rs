@@ -136,17 +136,22 @@ impl ResponsesEventInterpreter {
         &mut self,
         payload: &str,
     ) -> Result<Vec<ResponseEvent>, ResponsesEventError> {
-        // Probe only the discriminator first. Rate-limit frames are the sole variant that
-        // needs the flattened body, so every other frame avoids that deserialization shape
-        // entirely.
+        // Ordinary frames take one JSON pass and never use flattened-field buffering.
+        // A rate-limit frame may contain fields incompatible with the ordinary shape,
+        // so only failed deserialization needs a discriminator-only fallback.
         #[derive(Deserialize)]
         struct EventKindProbe<'a> {
             #[serde(rename = "type", borrow, default)]
             kind: Option<std::borrow::Cow<'a, str>>,
         }
 
-        let probe: EventKindProbe<'_> = serde_json::from_str(payload)?;
-        if probe.kind.as_deref() == Some("codex.rate_limits") {
+        let event = serde_json::from_str::<ResponsesStreamEvent>(payload);
+        let is_rate_limit = match &event {
+            Ok(event) => event.kind == "codex.rate_limits",
+            Err(_) => serde_json::from_str::<EventKindProbe<'_>>(payload)
+                .is_ok_and(|probe| probe.kind.as_deref() == Some("codex.rate_limits")),
+        };
+        if is_rate_limit {
             let event: RateLimitStreamEvent = serde_json::from_str(payload)?;
             return Ok(rate_limit_snapshot_from_event(event.rate_limit)
                 .map(ResponseEvent::RateLimits)
@@ -154,7 +159,7 @@ impl ResponsesEventInterpreter {
                 .collect());
         }
 
-        let event: ResponsesStreamEvent = serde_json::from_str(payload)?;
+        let event = event?;
 
         if let Some(response_turn_state) = event.turn_state()
             && let Some(turn_state) = self.turn_state.as_deref()
@@ -205,13 +210,9 @@ impl From<serde_json::Error> for ResponsesEventError {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct Error {
-    r#type: Option<String>,
     code: Option<String>,
     message: Option<String>,
-    plan_type: Option<String>,
-    resets_at: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -512,19 +513,22 @@ fn process_responses_event(
             ))));
         }
         "response.completed" => {
-            if let Some(response_value) = event.response {
-                let response = serde_json::from_value::<ResponseCompleted>(response_value)
-                    .map_err(|error| {
-                        let message = format!("failed to parse ResponseCompleted: {error}");
-                        debug!("{message}");
-                        ResponsesEventError::Api(ApiError::Stream(message))
-                    })?;
-                return Ok(Some(ResponseEvent::Completed {
-                    response_id: response.id,
-                    token_usage: response.usage.map(Into::into),
-                    end_turn: response.end_turn,
-                }));
-            }
+            let response_value = event.response.ok_or_else(|| {
+                ResponsesEventError::Api(ApiError::Stream(
+                    "response.completed event missing response".into(),
+                ))
+            })?;
+            let response =
+                serde_json::from_value::<ResponseCompleted>(response_value).map_err(|error| {
+                    let message = format!("failed to parse ResponseCompleted: {error}");
+                    debug!("{message}");
+                    ResponsesEventError::Api(ApiError::Stream(message))
+                })?;
+            return Ok(Some(ResponseEvent::Completed {
+                response_id: response.id,
+                token_usage: response.usage.map(Into::into),
+                end_turn: response.end_turn,
+            }));
         }
         "response.output_item.added" => {
             let item = parse_required_response_item("response.output_item.added", event.item)?;

@@ -6,10 +6,13 @@ use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::text::Span;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::color::blend;
+use crate::terminal_palette::StdoutColorLevel;
 use crate::terminal_palette::default_bg;
 use crate::terminal_palette::default_fg;
+use crate::terminal_palette::effective_stdout_color_level;
 
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
@@ -19,20 +22,15 @@ fn elapsed_since_start() -> Duration {
 }
 
 pub(crate) fn shimmer_spans(text: &str) -> Vec<Span<'static>> {
-    let chars: Vec<char> = text.chars().collect();
+    let chars: Vec<&str> = text.graphemes(true).collect();
     if chars.is_empty() {
         return Vec::new();
     }
     // Use time-based sweep synchronized to process start.
     let padding = 10usize;
     let period = chars.len() + padding * 2;
-    let sweep_seconds = 2.0f32;
-    let pos_f =
-        (elapsed_since_start().as_secs_f32() % sweep_seconds) / sweep_seconds * (period as f32);
-    let pos = pos_f as usize;
-    let has_true_color = supports_color::on_cached(supports_color::Stream::Stdout)
-        .map(|level| level.has_16m)
-        .unwrap_or(false);
+    let pos = sweep_position(elapsed_since_start(), period);
+    let has_true_color = effective_stdout_color_level() == StdoutColorLevel::TrueColor;
     let band_half_width = 5.0;
 
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(chars.len());
@@ -76,5 +74,28 @@ fn color_for_level(intensity: f32) -> Style {
         Style::default()
     } else {
         Style::default().add_modifier(Modifier::BOLD)
+    }
+}
+
+fn sweep_position(elapsed: Duration, period: usize) -> usize {
+    let phase = elapsed.as_secs() % 2;
+    ((phase as f64 + elapsed.subsec_nanos() as f64 / 1_000_000_000.0) / 2.0 * period as f64)
+        as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shimmer_keeps_frame_precision_after_long_uptime() {
+        assert_eq!(sweep_position(Duration::from_secs(1 << 24), 1000), 0);
+        assert_eq!(
+            sweep_position(
+                Duration::from_secs(1 << 24) + Duration::from_millis(32),
+                1000
+            ),
+            16
+        );
     }
 }

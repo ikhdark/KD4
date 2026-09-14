@@ -8,6 +8,38 @@ use std::io;
 
 use tokio::process::Child;
 
+/// Observe an owned child's exit while retaining its PID until tree cleanup.
+/// The caller must not concurrently wait on or drop the child.
+#[cfg(unix)]
+pub async fn wait_for_exit_without_reaping(pid: u32) -> io::Result<()> {
+    let pid = checked_process_id(pid)?;
+    loop {
+        // SAFETY: zero is a valid initial siginfo_t representation; waitid writes
+        // only to this live value. WNOWAIT leaves the owned child unreaped.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == -1 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        // SAFETY: successful waitid initializes the child-status fields.
+        if unsafe { info.si_pid() } != 0 {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub fn set_parent_death_signal(parent_pid: libc::pid_t) -> io::Result<()> {
     // SAFETY: PR_SET_PDEATHSIG consumes the scalar SIGTERM argument and does not access caller-

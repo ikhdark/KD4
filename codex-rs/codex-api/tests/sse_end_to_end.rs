@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use bytes::Bytes;
+use codex_api::ApiError;
 use codex_api::AuthProvider;
 use codex_api::Compression;
 use codex_api::Provider;
@@ -80,11 +81,7 @@ fn build_responses_body(events: Vec<Value>) -> String {
             .get("type")
             .and_then(|v| v.as_str())
             .expect("SSE fixture event should have a type");
-        if e.as_object().map(|o| o.len() == 1).unwrap_or(false) {
-            body.push_str(&format!("event: {kind}\n\n"));
-        } else {
-            body.push_str(&format!("event: {kind}\ndata: {e}\n\n"));
-        }
+        body.push_str(&format!("event: {kind}\ndata: {e}\n\n"));
     }
     body
 }
@@ -166,5 +163,130 @@ async fn responses_stream_parses_items_and_completed_end_to_end() -> Result<()> 
         other => panic!("unexpected third event: {other:?}"),
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn responses_stream_preserves_error_identity_with_unrelated_metadata() -> Result<()> {
+    for code in [
+        "context_length_exceeded",
+        "insufficient_quota",
+        "cyber_policy",
+    ] {
+        let body = build_responses_body(vec![serde_json::json!({
+            "type": "response.failed",
+            "response": {"error": {
+                "code": code,
+                "message": "provider rejection",
+                "type": [],
+                "plan_type": {},
+                "resets_at": "unknown"
+            }}
+        })]);
+        let client = ResponsesClient::new(
+            FixtureSseTransport::new(body),
+            provider("openai"),
+            Arc::new(NoAuth),
+        );
+        let mut stream = client
+            .stream(
+                serde_json::json!({}),
+                HeaderMap::new(),
+                Compression::None,
+                None,
+            )
+            .await?;
+        let mut errors = Vec::new();
+        while let Some(event) = stream.next().await {
+            if let Err(error) = event {
+                errors.push(error);
+            }
+        }
+        assert_eq!(errors.len(), 1, "{code}: {errors:?}");
+        match (code, &errors[0]) {
+            ("context_length_exceeded", ApiError::ContextWindowExceeded)
+            | ("insufficient_quota", ApiError::QuotaExceeded) => {}
+            ("cyber_policy", ApiError::CyberPolicy { message }) => {
+                assert_eq!(message, "provider rejection");
+            }
+            _ => panic!("error identity lost for {code}: {errors:?}"),
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn responses_stream_rejects_missing_completion_response_end_to_end() -> Result<()> {
+    let body = build_responses_body(vec![serde_json::json!({"type": "response.completed"})]);
+    let client = ResponsesClient::new(
+        FixtureSseTransport::new(body),
+        provider("openai"),
+        Arc::new(NoAuth),
+    );
+    let mut stream = client
+        .stream(
+            serde_json::json!({}),
+            HeaderMap::new(),
+            Compression::None,
+            None,
+        )
+        .await?;
+    let mut errors = Vec::new();
+    while let Some(event) = stream.next().await {
+        if let Err(error) = event {
+            errors.push(error);
+        }
+    }
+    assert!(matches!(errors.as_slice(), [ApiError::Stream(message)]
+        if message == "response.completed event missing response"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn responses_stream_accepts_unknown_events_and_exceptional_rate_frames() -> Result<()> {
+    let body = build_responses_body(vec![
+        serde_json::json!({"type": "future.event"}),
+        serde_json::json!({
+            "type": "codex.rate_limits",
+            "delta": {"future": "shape"},
+            "metered_limit_name": "custom-limit",
+            "rate_limits": {"secondary": {"used_percent": 42.0}}
+        }),
+        serde_json::json!({"type": "response.output_text.delta", "delta": "hello"}),
+        serde_json::json!({"type": "response.completed", "response": {"id": "done"}}),
+    ]);
+    let client = ResponsesClient::new(
+        FixtureSseTransport::new(body),
+        provider("openai"),
+        Arc::new(NoAuth),
+    );
+    let mut stream = client
+        .stream(
+            serde_json::json!({}),
+            HeaderMap::new(),
+            Compression::None,
+            None,
+        )
+        .await?;
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        let event = event?;
+        // Empty headers intentionally emit the default Codex snapshot.
+        if matches!(&event, ResponseEvent::RateLimits(snapshot)
+            if snapshot.limit_id.as_deref() == Some("codex"))
+        {
+            continue;
+        }
+        events.push(event);
+    }
+    assert_eq!(events.len(), 3);
+    assert!(matches!(&events[0], ResponseEvent::RateLimits(snapshot)
+        if snapshot.limit_id.as_deref() == Some("custom_limit")
+            && snapshot.primary.is_none()
+            && snapshot.secondary.as_ref().is_some_and(|window| window.used_percent == 42.0)));
+    assert!(matches!(&events[1], ResponseEvent::OutputTextDelta(delta) if delta == "hello"));
+    assert!(
+        matches!(&events[2], ResponseEvent::Completed { response_id, .. } if response_id == "done")
+    );
     Ok(())
 }

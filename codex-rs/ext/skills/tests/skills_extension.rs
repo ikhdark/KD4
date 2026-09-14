@@ -107,9 +107,39 @@ async fn installed_extension_uses_host_service_snapshot() -> TestResult {
     let turn_store = ExtensionData::new("turn-1");
     turn_store.insert(HostSkillsSnapshot::new(Arc::clone(&loaded_skills)));
 
+    let provider = codex_skills_extension::provider::HostSkillProvider::new();
+    let request = SkillReadRequest {
+        authority: SkillAuthority::new(SkillSourceKind::Host, "host"),
+        package: SkillPackageId(skill_path_string.clone()),
+        resource: SkillResourceId::new(skill_prompt_path.clone()),
+        host_snapshot: turn_store.get::<HostSkillsSnapshot>(),
+        mcp_resources: None,
+    };
+    assert_eq!(
+        provider.read(request.clone()).await?.contents,
+        DEMO_SKILL_CONTENTS
+    );
+    for authority in [
+        SkillAuthority::new(SkillSourceKind::Executor, "host"),
+        SkillAuthority::new(SkillSourceKind::Host, "foreign"),
+    ] {
+        let mut foreign = request.clone();
+        foreign.authority = authority;
+        assert_eq!(
+            provider.read(foreign).await.unwrap_err().message,
+            "host skill provider cannot read this authority"
+        );
+    }
+    let mut foreign = request;
+    foreign.package = SkillPackageId("different-package".to_string());
+    assert_eq!(
+        provider.read(foreign).await.unwrap_err().message,
+        "host skill resource does not match its package"
+    );
+
     let fragments = registry.turn_input_contributors()[0]
         .contribute(
-            TurnInputContext {
+            &TurnInputContext {
                 turn_id: "turn-1".to_string(),
                 user_input: vec![UserInput::Text {
                     text: "$demo".to_string(),
@@ -254,7 +284,7 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
 
     let fragments = registry.turn_input_contributors()[0]
         .contribute(
-            TurnInputContext {
+            &TurnInputContext {
                 turn_id: "turn-1".to_string(),
                 user_input: vec![UserInput::Text {
                     text: "$lint-fix please".to_string(),
@@ -486,7 +516,7 @@ async fn skills_list_truncates_catalog_descriptions_in_tool_output() -> TestResu
             call_id: "call-1".to_string(),
             tool_name: list_tool.tool_name(),
             model: "gpt-test".to_string(),
-            truncation_policy: TruncationPolicy::Bytes(1_024),
+            truncation_policy: TruncationPolicy::Bytes(2_048),
             source: ToolCallSource::Direct,
             conversation_history: ConversationHistory::default(),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
@@ -524,6 +554,7 @@ async fn skills_read_honors_response_budgets_without_rereading_cached_contents()
             warnings: Vec::new(),
         },
         contents: contents.clone(),
+        returned_resource: None,
         read_calls: Arc::clone(&read_calls),
     });
     let providers = SkillProviders::new().with_orchestrator_provider(provider);
@@ -775,7 +806,7 @@ async fn estimate_thread_context_does_not_populate_orchestrator_cache() -> TestR
 }
 
 #[tokio::test]
-async fn orchestrator_catalog_snapshot_caches_failure() -> TestResult {
+async fn orchestrator_failure_is_retried_only_by_explicit_discovery() -> TestResult {
     let list_calls = Arc::new(AtomicUsize::new(0));
     let providers =
         SkillProviders::new().with_orchestrator_provider(Arc::new(StaticSkillProvider {
@@ -827,7 +858,7 @@ async fn orchestrator_catalog_snapshot_caches_failure() -> TestResult {
     for turn_id in ["turn-1", "turn-2"] {
         let fragments = registry.turn_input_contributors()[0]
             .contribute(
-                TurnInputContext {
+                &TurnInputContext {
                     turn_id: turn_id.to_string(),
                     user_input: vec![UserInput::Text {
                         text: "$first".to_string(),
@@ -844,6 +875,27 @@ async fn orchestrator_catalog_snapshot_caches_failure() -> TestResult {
         assert!(fragments.is_empty());
     }
     assert_eq!(1, list_calls.load(Ordering::Relaxed));
+
+    let tools = registry.tool_contributors()[0].tools(&session_store, &thread_store);
+    let list = tools
+        .iter()
+        .find(|tool| tool.tool_name().name == "list")
+        .ok_or("missing list")?;
+    for _ in 0..2 {
+        let call = skills_tool_call(
+            list.tool_name(),
+            serde_json::json!({"authority": {"kind": "orchestrator"}}),
+            2_048,
+        );
+        let payload = call.payload.clone();
+        let output = list.handle(call).await?;
+        let response = output
+            .post_tool_use_response("call", &payload)
+            .ok_or("missing output")?;
+        assert_eq!(response["skills"][0]["name"], "first");
+        assert_eq!(response["warnings"], serde_json::json!([]));
+    }
+    assert_eq!(2, list_calls.load(Ordering::Relaxed));
 
     Ok(())
 }
@@ -920,7 +972,7 @@ async fn root_qualified_locator_selects_only_the_matching_executor_skill() -> Te
         .await;
     let fragments = registry.turn_input_contributors()[0]
         .contribute(
-            TurnInputContext {
+            &TurnInputContext {
                 turn_id: "turn-1".to_string(),
                 user_input: vec![UserInput::Mention {
                     name: "lint-fix".to_string(),
@@ -996,7 +1048,7 @@ async fn prompt_hidden_skill_can_still_be_invoked() -> TestResult {
 
     let fragments = registry.turn_input_contributors()[0]
         .contribute(
-            TurnInputContext {
+            &TurnInputContext {
                 turn_id: "turn-1".to_string(),
                 user_input: vec![UserInput::Text {
                     text: "$hidden-skill".to_string(),
@@ -1039,6 +1091,7 @@ struct StaticSkillProvider {
 struct ReadContentsProvider {
     catalog: SkillCatalog,
     contents: String,
+    returned_resource: Option<SkillResourceId>,
     read_calls: Arc<AtomicUsize>,
 }
 
@@ -1051,13 +1104,423 @@ impl SkillProvider for ReadContentsProvider {
     fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult> {
         self.read_calls.fetch_add(1, Ordering::Relaxed);
         let contents = self.contents.clone();
-        Box::pin(async move {
-            Ok(SkillReadResult {
-                resource: request.resource,
-                contents,
-            })
-        })
+        let resource = self.returned_resource.clone().unwrap_or(request.resource);
+        Box::pin(async move { Ok(SkillReadResult { resource, contents }) })
     }
+}
+
+async fn start_test_extension(
+    providers: SkillProviders,
+    config: TestConfig,
+) -> (
+    codex_extension_api::ExtensionRegistry<TestConfig>,
+    ExtensionData,
+    ExtensionData,
+) {
+    let mut builder = ExtensionRegistryBuilder::new();
+    install_with_providers(&mut builder, providers, skills_extension_config);
+    let registry = builder.build();
+    let session = ExtensionData::new("session");
+    let thread = ExtensionData::new("thread");
+    registry.thread_lifecycle_contributors()[0]
+        .on_thread_start(ThreadStartInput {
+            config: &config,
+            session_source: &SessionSource::Cli,
+            persistent_thread_state_available: true,
+            environments: &[],
+            session_store: &session,
+            thread_store: &thread,
+        })
+        .await;
+    (registry, session, thread)
+}
+
+fn skills_tool_call(
+    name: codex_extension_api::ToolName,
+    args: serde_json::Value,
+    budget: usize,
+) -> ToolCall {
+    ToolCall {
+        turn_id: "turn-1".to_string(),
+        call_id: "call".to_string(),
+        tool_name: name,
+        model: "gpt-test".to_string(),
+        truncation_policy: TruncationPolicy::Bytes(budget),
+        source: ToolCallSource::Direct,
+        conversation_history: ConversationHistory::default(),
+        turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+        cancellation_token: Default::default(),
+        primary_environment_id: None,
+        environments: Vec::new(),
+        payload: ToolPayload::Function {
+            arguments: args.to_string(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn skills_list_pages_preserve_handles_and_respect_serialized_budget() -> TestResult {
+    let entries: Vec<_> = (0..8)
+        .map(|index| {
+            let mut entry = test_entry(
+                SkillSourceKind::Orchestrator,
+                "codex_apps",
+                &format!("orchestrator/item-{index}"),
+                &format!("skill://orchestrator/item-{index}/SKILL.md"),
+            );
+            entry.description = "long description".repeat(100);
+            entry.short_description = Some("Short description.".to_string());
+            entry
+        })
+        .collect();
+    let expected: Vec<_> = entries
+        .iter()
+        .map(|entry| (entry.id.0.clone(), entry.main_prompt.as_str().to_string()))
+        .collect();
+    let provider = StaticSkillProvider {
+        catalog: SkillCatalog {
+            entries,
+            warnings: vec!["warning".repeat(100)],
+        },
+        read_requests: Default::default(),
+        list_calls: None,
+        fail_first_list: false,
+    };
+    let (registry, session, thread) = start_test_extension(
+        SkillProviders::new().with_orchestrator_provider(Arc::new(provider)),
+        default_config(),
+    )
+    .await;
+    let tools = registry.tool_contributors()[0].tools(&session, &thread);
+    let list = tools
+        .iter()
+        .find(|tool| tool.tool_name().name == "list")
+        .ok_or("missing list")?;
+    let mut cursor = None;
+    let mut found = Vec::new();
+    let mut pages = 0;
+    loop {
+        let call = skills_tool_call(
+            list.tool_name(),
+            serde_json::json!({"authority":{"kind":"orchestrator"}, "cursor":cursor}),
+            600,
+        );
+        let payload = call.payload.clone();
+        let output = list.handle(call).await?;
+        let response = output
+            .post_tool_use_response("call", &payload)
+            .ok_or("missing output")?;
+        assert!(serde_json::to_vec(&response)?.len() <= 600);
+        let skills = response["skills"].as_array().ok_or("missing skills")?;
+        assert!(!skills.is_empty());
+        for skill in skills {
+            assert_eq!(skill["description"], "Short description.");
+            found.push((
+                skill["package"].as_str().ok_or("package")?.to_string(),
+                skill["main_resource"]
+                    .as_str()
+                    .ok_or("resource")?
+                    .to_string(),
+            ));
+        }
+        pages += 1;
+        assert!(pages <= 8, "pagination must advance");
+        cursor = response["next_cursor"].as_str().map(str::to_string);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert!(pages > 1);
+    assert_eq!(found, expected);
+    for args in [
+        serde_json::json!({"authority":{"kind":"orchestrator"},"cursor":"stale:1"}),
+        serde_json::json!({"authority":{"kind":"orchestrator"}}),
+    ] {
+        let result = list
+            .handle(skills_tool_call(list.tool_name(), args, 16))
+            .await;
+        assert!(matches!(result, Err(FunctionCallError::RespondToModel(_))));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn executor_failure_retries_next_turn_and_real_input_populates_snapshot() -> TestResult {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = StaticSkillProvider {
+        catalog: SkillCatalog {
+            entries: vec![test_entry(
+                SkillSourceKind::Executor,
+                "root",
+                "executor/demo",
+                "skill://executor/demo/SKILL.md",
+            )],
+            warnings: Vec::new(),
+        },
+        read_requests: Default::default(),
+        list_calls: Some(calls.clone()),
+        fail_first_list: true,
+    };
+    let mut config = default_config();
+    config.include_instructions = false;
+    let (registry, session, thread) = start_test_extension(
+        SkillProviders::new().with_executor_provider(Arc::new(provider)),
+        config,
+    )
+    .await;
+    let roots = vec![SelectedCapabilityRoot {
+        id: "root".to_string(),
+        location: CapabilityRootLocation::Environment {
+            environment_id: "env".to_string(),
+            path: PathUri::parse("file:///skills/demo")?,
+        },
+    }];
+    let estimate_store = ExtensionData::new("estimate");
+    let estimated = registry.context_contributors()[0]
+        .estimate_world_state(WorldStateContributionInput {
+            thread_id: codex_protocol::ThreadId::new(),
+            turn_id: "estimate",
+            environments: &[],
+            ready_selected_capability_roots: &roots,
+            session_store: &session,
+            thread_store: &thread,
+            turn_store: &estimate_store,
+        })
+        .await;
+    assert_eq!(estimated.len(), 1);
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        0,
+        "hidden estimation must not discover roots"
+    );
+    for (turn_id, expected_calls, expected_fragments) in
+        [("first", 1, 0), ("second", 2, 1), ("third", 2, 1)]
+    {
+        let turn = ExtensionData::new(turn_id);
+        let fragments = registry.turn_input_contributors()[0]
+            .contribute(
+                &TurnInputContext {
+                    turn_id: turn_id.to_string(),
+                    user_input: vec![UserInput::Text {
+                        text: "$demo".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    environments: Vec::new(),
+                    ready_selected_capability_roots: roots.clone(),
+                },
+                &session,
+                &thread,
+                &turn,
+            )
+            .await;
+        assert_eq!(fragments.len(), expected_fragments);
+        if expected_fragments > 0 {
+            assert!(fragments[0].render().contains("Run the formatter."));
+        }
+        registry.context_contributors()[0]
+            .contribute_world_state(WorldStateContributionInput {
+                thread_id: codex_protocol::ThreadId::new(),
+                turn_id,
+                environments: &[],
+                ready_selected_capability_roots: &roots,
+                session_store: &session,
+                thread_store: &thread,
+                turn_store: &turn,
+            })
+            .await;
+        assert_eq!(calls.load(Ordering::Relaxed), expected_calls);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn truncated_instructions_are_visible_and_scalar_metadata_is_escaped() -> TestResult {
+    let mut entry = test_entry(
+        SkillSourceKind::Orchestrator,
+        "codex_apps",
+        "orchestrator/bounded",
+        "skill://orchestrator/bounded/SKILL.md",
+    );
+    entry.name = "bounded<&>".to_string();
+    entry.display_path = Some("skill://orchestrator/<bounded>&/SKILL.md".to_string());
+    let provider = ReadContentsProvider {
+        catalog: SkillCatalog {
+            entries: vec![entry],
+            warnings: Vec::new(),
+        },
+        contents: format!("<body>{}OMITTED_TAIL", "🚀".repeat(3_000)),
+        returned_resource: None,
+        read_calls: Default::default(),
+    };
+    let (registry, session, thread) = start_test_extension(
+        SkillProviders::new().with_orchestrator_provider(Arc::new(provider)),
+        default_config(),
+    )
+    .await;
+    let fragments = registry.turn_input_contributors()[0]
+        .contribute(
+            &TurnInputContext {
+                turn_id: "turn".to_string(),
+                user_input: vec![UserInput::Mention {
+                    name: "bounded<&>".to_string(),
+                    path: "skill://orchestrator/bounded/SKILL.md".to_string(),
+                }],
+                environments: Vec::new(),
+                ready_selected_capability_roots: Vec::new(),
+            },
+            &session,
+            &thread,
+            &ExtensionData::new("turn"),
+        )
+        .await;
+    assert_eq!(fragments.len(), 1);
+    let rendered = fragments[0].render();
+    assert!(rendered.contains("<name>bounded&lt;&amp;&gt;</name>"));
+    assert!(rendered.contains("<path>skill://orchestrator/&lt;bounded&gt;&amp;/SKILL.md</path>"));
+    assert!(rendered.contains("<body>🚀"));
+    assert!(rendered.contains("instructions are incomplete"));
+    assert!(!rendered.contains("OMITTED_TAIL"));
+    let contents = rendered
+        .split("</path>\n")
+        .nth(1)
+        .ok_or("contents")?
+        .strip_suffix("\n</skill>")
+        .ok_or("closing skill")?;
+    assert!(contents.len() <= 8_000);
+    Ok(())
+}
+
+#[tokio::test]
+async fn mismatched_resources_are_rejected_for_injection_and_tools() -> TestResult {
+    for kind in [SkillSourceKind::Host, SkillSourceKind::Orchestrator] {
+        let authority = if kind == SkillSourceKind::Host {
+            "host"
+        } else {
+            "codex_apps"
+        };
+        let provider = ReadContentsProvider {
+            catalog: SkillCatalog {
+                entries: vec![test_entry(
+                    kind.clone(),
+                    authority,
+                    "orchestrator/demo",
+                    "skill://orchestrator/demo/SKILL.md",
+                )],
+                warnings: Vec::new(),
+            },
+            contents: "WRONG_RESOURCE_BODY".to_string(),
+            returned_resource: Some(SkillResourceId::new("wrong")),
+            read_calls: Default::default(),
+        };
+        let providers =
+            SkillProviders::new().with_provider(codex_skills_extension::SkillProviderSource::new(
+                kind.clone(),
+                "test",
+                Arc::new(provider),
+            ));
+        let mut config = default_config();
+        config.include_instructions = false;
+        let (registry, session, thread) = start_test_extension(providers, config).await;
+        let fragments = registry.turn_input_contributors()[0]
+            .contribute(
+                &TurnInputContext {
+                    turn_id: "turn".to_string(),
+                    user_input: vec![UserInput::Text {
+                        text: "$demo".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    environments: Vec::new(),
+                    ready_selected_capability_roots: Vec::new(),
+                },
+                &session,
+                &thread,
+                &ExtensionData::new("turn"),
+            )
+            .await;
+        assert!(
+            fragments.is_empty(),
+            "mismatched contents must never be injected"
+        );
+        if kind == SkillSourceKind::Orchestrator {
+            let tools = registry.tool_contributors()[0].tools(&session, &thread);
+            let read = tools
+                .iter()
+                .find(|tool| tool.tool_name().name == "read")
+                .ok_or("missing read")?;
+            let result = read.handle(skills_tool_call(read.tool_name(), serde_json::json!({
+                "authority":{"kind":"orchestrator"}, "package":"orchestrator/demo", "resource":"skill://orchestrator/demo/SKILL.md"
+            }), 1_024)).await;
+            assert!(
+                matches!(result, Err(FunctionCallError::RespondToModel(message)) if message == "failed to read skill resource")
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversized_catalog_entries_report_omission_and_leave_room_for_later_entries() -> TestResult
+{
+    for include_small in [false, true] {
+        let mut large = test_entry(
+            SkillSourceKind::Orchestrator,
+            "codex_apps",
+            "orchestrator/large",
+            "skill://orchestrator/large/SKILL.md",
+        );
+        large.name = "x".repeat(9_000);
+        let mut entries = vec![large];
+        if include_small {
+            entries.push(test_entry(
+                SkillSourceKind::Orchestrator,
+                "codex_apps",
+                "orchestrator/small",
+                "skill://orchestrator/small/SKILL.md",
+            ));
+        }
+        let provider = StaticSkillProvider {
+            catalog: SkillCatalog {
+                entries,
+                warnings: Vec::new(),
+            },
+            read_requests: Default::default(),
+            list_calls: None,
+            fail_first_list: false,
+        };
+        let (registry, session, thread) = start_test_extension(
+            SkillProviders::new().with_orchestrator_provider(Arc::new(provider)),
+            default_config(),
+        )
+        .await;
+        let fragments = registry.context_contributors()[0]
+            .contribute_thread_context(&session, &thread)
+            .await;
+        assert_eq!(fragments.len(), 1);
+        let text = fragments[0].text();
+        assert!(text.contains("1 additional skill omitted"));
+        assert!(!text.contains(&"x".repeat(9_000)));
+        assert_eq!(
+            text.contains("skill://orchestrator/small/SKILL.md"),
+            include_small
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn batch_catalog_merge_preserves_order_authority_and_first_entry() {
+    let first = test_entry(SkillSourceKind::Host, "host", "same", "first");
+    let mut duplicate = first.clone();
+    duplicate.description = "wrong".to_string();
+    let other = test_entry(SkillSourceKind::Executor, "root", "same", "other");
+    let mut catalog = SkillCatalog::default();
+    catalog.extend_entries([first.clone(), duplicate.clone(), other.clone()]);
+    catalog.extend(SkillCatalog {
+        entries: vec![duplicate],
+        warnings: vec!["warning".to_string()],
+    });
+    assert_eq!(catalog.entries, vec![first, other]);
+    assert_eq!(catalog.warnings, vec!["warning"]);
 }
 
 struct ChannelEventSink(std::sync::mpsc::Sender<Event>);

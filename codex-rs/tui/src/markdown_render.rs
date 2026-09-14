@@ -170,7 +170,11 @@ impl TableCell {
     fn push_annotated(&mut self, mut appended: HyperlinkLine) {
         self.ensure_line();
         if let Some(line) = self.lines.last_mut() {
-            let shift = line.width();
+            let shift = if appended.hyperlinks.is_empty() {
+                0
+            } else {
+                line.width()
+            };
             line.line.spans.append(&mut appended.line.spans);
             line.hyperlinks
                 .extend(appended.hyperlinks.into_iter().map(|mut link| {
@@ -396,7 +400,6 @@ where
     link: Option<LinkState>,
     needs_newline: bool,
     pending_marker_line: bool,
-    in_paragraph: bool,
     in_code_block: bool,
     code_block_lang: Option<String>,
     code_block_buffer: String,
@@ -437,7 +440,6 @@ where
             link: None,
             needs_newline: false,
             pending_marker_line: false,
-            in_paragraph: false,
             in_code_block: false,
             code_block_lang: None,
             code_block_buffer: String::new(),
@@ -576,7 +578,6 @@ where
         }
         self.push_line(Line::default());
         self.needs_newline = false;
-        self.in_paragraph = true;
     }
 
     fn end_paragraph(&mut self) {
@@ -584,7 +585,6 @@ where
             return;
         }
         self.needs_newline = true;
-        self.in_paragraph = false;
         self.pending_marker_line = false;
     }
 
@@ -1087,17 +1087,14 @@ where
 
         let mut spillover_rows: Vec<TableCell> = Vec::with_capacity(4);
         let mut rows: Vec<Vec<TableCell>> = Vec::with_capacity(table_state.rows.len());
-        for (row_idx, row) in table_state.rows.iter().enumerate() {
-            let next_row = table_state.rows.get(row_idx + 1);
-            // pulldown-cmark accepts body rows without pipes, which can turn a following paragraph
-            // into a one-cell table row. For multi-column tables, treat those as spillover text
-            // rendered after the table.
-            if column_count > 1 && Self::is_spillover_row(row, next_row) {
-                if let Some(cell) = row.cells.first().cloned() {
+        let mut pending_rows = std::mem::take(&mut table_state.rows).into_iter().peekable();
+        while let Some(row) = pending_rows.next() {
+            if column_count > 1 && Self::is_spillover_row(&row, pending_rows.peek()) {
+                if let Some(cell) = row.cells.into_iter().next() {
                     spillover_rows.push(cell);
                 }
             } else {
-                rows.push(row.cells.clone());
+                rows.push(row.cells);
             }
         }
 
@@ -1112,8 +1109,7 @@ where
 
         let metrics = Self::collect_table_column_metrics(&header, &rows, column_count);
         let available_width = self.available_table_width(column_count);
-        let widths =
-            self.compute_column_widths(&header, &rows, &table_state.alignments, available_width);
+        let widths = self.compute_column_widths(&metrics, available_width);
         let spillover_lines: Vec<HyperlinkLine> = spillover_rows
             .into_iter()
             .flat_map(|spillover| spillover.lines)
@@ -1228,19 +1224,16 @@ where
     /// Allocate column widths for aligned, row-separated table rendering.
     ///
     /// Each column starts at its natural (max cell content) width, then columns
-    /// are iteratively shrunk one character at a time until the total fits within
+    /// are shrunk in batches until the total fits within
     /// `available_width`. Token-heavy columns surrender excess width before
     /// narrative prose; compact columns are preserved last. Returns `None` when
     /// even the minimum width (3 chars per column) cannot fit.
     fn compute_column_widths(
         &self,
-        header: &[TableCell],
-        rows: &[Vec<TableCell>],
-        alignments: &[Alignment],
+        metrics: &[TableColumnMetrics],
         available_width: Option<usize>,
     ) -> Option<Vec<usize>> {
         let min_column_width = 3usize;
-        let metrics = Self::collect_table_column_metrics(header, rows, alignments.len());
         let mut widths: Vec<usize> = metrics
             .iter()
             .map(|col| col.max_width.max(min_column_width))
@@ -1249,7 +1242,7 @@ where
         let Some(max_width) = available_width else {
             return Some(widths);
         };
-        let minimum_total = alignments.len() * min_column_width;
+        let minimum_total = metrics.len() * min_column_width;
         if max_width < minimum_total {
             return None;
         }
@@ -1258,42 +1251,13 @@ where
             .iter()
             .map(|col| Self::preferred_column_floor(col, min_column_width))
             .collect();
-        let mut floor_total: usize = floors.iter().sum();
-        if floor_total > max_width {
-            // Relax preferred floors in wrapping priority order until the hard width budget fits.
-            while floor_total > max_width {
-                let Some((idx, _)) = floors
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, floor)| **floor > min_column_width)
-                    .min_by_key(|(idx, floor)| {
-                        (
-                            Self::column_shrink_priority(metrics[*idx].kind),
-                            usize::MAX.saturating_sub(**floor),
-                        )
-                    })
-                else {
-                    break;
-                };
-
-                floors[idx] -= 1;
-                floor_total -= 1;
-            }
-        }
-
-        let mut total_width: usize = widths.iter().sum();
-
-        while total_width > max_width {
-            let Some(idx) = Self::next_column_to_shrink(&widths, &floors, &metrics) else {
-                break;
-            };
-            widths[idx] -= 1;
-            total_width -= 1;
-        }
-
-        if total_width > max_width {
-            return None;
-        }
+        Self::shrink_columns(
+            &mut floors,
+            &vec![min_column_width; metrics.len()],
+            metrics,
+            max_width,
+        );
+        Self::shrink_columns(&mut widths, &floors, metrics, max_width);
 
         Some(widths)
     }
@@ -1378,7 +1342,55 @@ where
                 .header_token_width
                 .max(metrics.body_token_width.min(16)),
         };
-        token_target.max(min_column_width).min(metrics.max_width)
+        token_target.min(metrics.max_width).max(min_column_width)
+    }
+
+    // Lower the largest slack together, preserving priority and left-to-right ties.
+    // Binary search makes the work independent of the number of columns removed.
+    fn shrink_columns(
+        widths: &mut [usize],
+        floors: &[usize],
+        metrics: &[TableColumnMetrics],
+        budget: usize,
+    ) {
+        let mut excess = widths.iter().sum::<usize>().saturating_sub(budget);
+        for priority in 0..=2 {
+            if excess == 0 {
+                break;
+            }
+            let indices: Vec<usize> = (0..widths.len())
+                .filter(|&i| Self::column_shrink_priority(metrics[i].kind) == priority)
+                .collect();
+            let mut low = 0;
+            let mut high = indices
+                .iter()
+                .map(|&i| widths[i].saturating_sub(floors[i]))
+                .max()
+                .unwrap_or(0);
+            while low < high {
+                let cap = low + (high - low) / 2;
+                let removed: usize = indices
+                    .iter()
+                    .map(|&i| widths[i].saturating_sub(floors[i]).saturating_sub(cap))
+                    .sum();
+                if removed > excess {
+                    low = cap + 1;
+                } else {
+                    high = cap;
+                }
+            }
+            for &i in &indices {
+                let removed = widths[i].saturating_sub(floors[i]).saturating_sub(low);
+                widths[i] -= removed;
+                excess -= removed;
+            }
+            for i in indices {
+                if excess > 0 && low > 0 && widths[i] - floors[i] == low {
+                    widths[i] -= 1;
+                    excess -= 1;
+                }
+            }
+        }
     }
 
     /// Pick the next column to shrink by one character during width allocation.
@@ -1386,6 +1398,7 @@ where
     /// Priority: TokenHeavy columns are shrunk before Narrative, then Compact.
     /// Within the same kind, the column with the most slack above its floor is
     /// chosen so similarly-shaped columns stay balanced.
+    #[cfg(test)]
     fn next_column_to_shrink(
         widths: &[usize],
         floors: &[usize],
@@ -1641,6 +1654,9 @@ where
     /// HTML, it's a label line followed by HTML content, or a trailing
     /// HTML-intro label line).
     fn is_spillover_row(row: &TableBodyRow, next_row: Option<&TableBodyRow>) -> bool {
+        if row.has_table_pipe_syntax {
+            return false;
+        }
         let Some(first_text) = Self::first_non_empty_only_text(&row.cells) else {
             return false;
         };
@@ -1687,6 +1703,9 @@ where
 
     fn looks_like_html_content(text: &str) -> bool {
         let bytes = text.as_bytes();
+        let Some(last_close) = bytes.iter().rposition(|&byte| byte == b'>') else {
+            return false;
+        };
         for (idx, &byte) in bytes.iter().enumerate() {
             if byte != b'<' {
                 continue;
@@ -1697,11 +1716,7 @@ where
                 tag_start += 1;
             }
 
-            if bytes.get(tag_start).is_some_and(u8::is_ascii_alphabetic)
-                && bytes
-                    .get(tag_start + 1..)
-                    .is_some_and(|suffix| suffix.contains(&b'>'))
-            {
+            if bytes.get(tag_start).is_some_and(u8::is_ascii_alphabetic) && tag_start < last_close {
                 return true;
             }
         }
@@ -1949,7 +1964,11 @@ where
             self.push_line(Line::default());
         }
         if let Some(line) = self.current_line_content.as_mut() {
-            let shift = line.width();
+            let shift = if appended.hyperlinks.is_empty() {
+                0
+            } else {
+                line.width()
+            };
             line.line.spans.append(&mut appended.line.spans);
             line.hyperlinks
                 .extend(appended.hyperlinks.into_iter().map(|mut link| {
@@ -2254,6 +2273,9 @@ fn strip_local_path_prefix<'a>(path_text: &'a str, cwd_text: &str) -> Option<&'a
         return path_text.strip_prefix('/');
     }
 
+    if cwd_text.len() == 3 && cwd_text.as_bytes()[1] == b':' && cwd_text.ends_with('/') {
+        return path_text.strip_prefix(cwd_text);
+    }
     path_text
         .strip_prefix(cwd_text)
         .and_then(|rest| rest.strip_prefix('/'))
@@ -2843,6 +2865,37 @@ mod tests {
     }
 
     #[test]
+    fn key_value_table_keeps_header_links_in_aligned_and_stacked_layouts() {
+        let destination = "https://example.com/header";
+        let markdown = format!(
+            "| [Header]({destination}) | c2 | c3 | c4 | c5 | c6 |\n| --- | --- | --- | --- | --- | --- |\n| value | 2 | 3 | 4 | 5 | 6 |\n"
+        );
+        for width in [22, 12] {
+            let lines = render_markdown_lines_with_width_and_cwd(&markdown, Some(width), None);
+            let header = lines
+                .iter()
+                .find(|line| line.line.to_string().contains("Header"))
+                .unwrap();
+            assert_eq!(header.line.to_string().contains("value"), width == 22);
+            let labels = lines
+                .iter()
+                .flat_map(|line| {
+                    line.hyperlinks.iter().map(|link| {
+                        assert_eq!(link.destination, destination);
+                        line.line
+                            .to_string()
+                            .chars()
+                            .skip(link.columns.start)
+                            .take(link.columns.end - link.columns.start)
+                            .collect::<String>()
+                    })
+                })
+                .collect::<String>();
+            assert_eq!(labels, "Header", "width {width}");
+        }
+    }
+
+    #[test]
     fn does_not_annotate_code_or_non_web_markdown_links() {
         let markdown = "`https://example.com/inline`\n\n```text\nhttps://example.com/block\n```\n\n[mail](mailto:test@example.com)\n\n[https://example.com/label](mailto:test@example.com)\n\n| Target |\n| --- |\n| [https://example.com/table-label](mailto:test@example.com) |";
         let lines = render_markdown_lines_with_width_and_cwd(
@@ -2860,7 +2913,7 @@ mod tests {
         let target = "https://target.example/path";
         let code_url = "https://code.example/not-a-link";
         let markdown = format!(
-            "| URL | Code | Label |\n| --- | --- | --- |\n| {destination} | `{code_url}` | [https://shown.example]({target}) |\n"
+            "| {destination} | `{code_url}` | [https://shown.example]({target}) |\n| --- | --- | --- |\n"
         );
         let lines = render_markdown_lines_with_width_and_cwd(
             &markdown,
@@ -2876,5 +2929,45 @@ mod tests {
         assert!(destinations.contains(&target));
         assert!(!destinations.contains(&code_url));
         assert!(!destinations.contains(&"https://shown.example"));
+    }
+    #[test]
+    fn explicit_html_cells_remain_in_the_table() {
+        for text in ["<div>value</div>", "HTML block:"] {
+            let row = make_body_row(vec![make_cell(text), make_cell("")], true);
+            assert!(!W::is_spillover_row(&row, None));
+        }
+        assert!(!W::looks_like_html_content(&"<tag".repeat(1000)));
+        assert!(W::looks_like_html_content("prefix <tag>"));
+        assert_eq!(
+            strip_local_path_prefix("C:/folder/file.rs", "C:/"),
+            Some("folder/file.rs")
+        );
+        assert_eq!(strip_local_path_prefix("D:/file.rs", "C:/"), None);
+        let metrics = W::collect_table_column_metrics(&[make_cell("x")], &[], 1);
+        assert_eq!(W::preferred_column_floor(&metrics[0], 3), 3);
+    }
+
+    #[test]
+    fn batched_width_allocation_matches_greedy_priorities_and_ties() {
+        let metrics = W::collect_table_column_metrics(
+            &[make_cell("ID"), make_cell("Name"), make_cell("Description")],
+            &[],
+            3,
+        );
+        let floors = [3, 5, 3];
+        for widths in [[1000, 1000, 900], [6, 9, 7], [3, 5, 3]] {
+            for budget in [11, 12, 15, 100, 3000] {
+                let mut expected = widths;
+                while expected.iter().sum::<usize>() > budget {
+                    let Some(i) = W::next_column_to_shrink(&expected, &floors, &metrics) else {
+                        break;
+                    };
+                    expected[i] -= 1;
+                }
+                let mut actual = widths;
+                W::shrink_columns(&mut actual, &floors, &metrics, budget);
+                assert_eq!(actual, expected);
+            }
+        }
     }
 }

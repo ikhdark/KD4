@@ -1841,11 +1841,14 @@ server_notification_definitions! {
     #[delivery(required)]
     /// EXPERIMENTAL - proposed plan streaming deltas for plan items.
     PlanDelta => "item/plan/delta" (v2::PlanDeltaNotification),
+    #[delivery(required)]
     /// Stream base64-encoded stdout/stderr chunks for a running `command/exec` session.
     CommandExecOutputDelta => "command/exec/outputDelta" (v2::CommandExecOutputDeltaNotification),
+    #[delivery(required)]
     /// Stream base64-encoded stdout/stderr chunks for a running `process/spawn` session.
     #[experimental("process/outputDelta")]
     ProcessOutputDelta => "process/outputDelta" (v2::ProcessOutputDeltaNotification),
+    #[delivery(required)]
     /// Final exit notification for a `process/spawn` session.
     #[experimental("process/exited")]
     ProcessExited => "process/exited" (v2::ProcessExitedNotification),
@@ -2335,6 +2338,7 @@ mod tests {
             request_id: request_id(),
             params: v2::ThreadGoalSetParams {
                 thread_id: "goal-thread".to_string(),
+                replace: false,
                 objective: Some("ship it".to_string()),
                 status: None,
                 token_budget: None,
@@ -3869,6 +3873,7 @@ mod tests {
             params: v2::ThreadGoalSetParams {
                 thread_id: "thr_123".to_string(),
                 objective: Some("ship goal mode".to_string()),
+                replace: false,
                 status: Some(v2::ThreadGoalStatus::Active),
                 token_budget: Some(Some(10_000)),
             },

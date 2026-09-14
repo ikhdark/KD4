@@ -53,9 +53,10 @@ impl AttachmentState {
     }
 
     pub(super) fn set_remote_image_urls(&mut self, urls: Vec<String>, textarea: &mut TextArea) {
+        let increasing = urls.len() > self.remote_image_urls.len();
         self.remote_image_urls = urls;
         self.selected_remote_image_index = None;
-        self.relabel_local_images(textarea);
+        self.relabel_local_images_in_order(textarea, increasing);
     }
 
     pub(super) fn remote_image_urls(&self) -> Vec<String> {
@@ -223,7 +224,18 @@ impl AttachmentState {
     }
 
     pub(super) fn relabel_local_images(&mut self, textarea: &mut TextArea) {
-        for (index, image) in self.local_images.iter_mut().enumerate() {
+        self.relabel_local_images_in_order(textarea, false);
+    }
+
+    fn relabel_local_images_in_order(&mut self, textarea: &mut TextArea, reverse: bool) {
+        // Renaming upward must start at the end so a new label cannot shadow an old one.
+        for offset in 0..self.local_images.len() {
+            let index = if reverse {
+                self.local_images.len() - offset - 1
+            } else {
+                offset
+            };
+            let image = &mut self.local_images[index];
             let expected = local_image_label_text(self.remote_image_urls.len() + index + 1);
             if image.placeholder == expected {
                 continue;

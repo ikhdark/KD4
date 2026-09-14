@@ -111,3 +111,66 @@ fn tool<'a>(
         model_visible: true,
     }
 }
+
+#[test]
+fn projection_keeps_any_callable_tool_and_later_names_in_either_order() {
+    let config = ConfigLayerStack::new(
+        Vec::new(),
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .unwrap();
+    let path =
+        codex_config::AbsolutePathBuf::try_from(std::env::temp_dir().join("config.toml")).unwrap();
+    let config = config.with_user_config(
+        &path,
+        codex_config::TomlValue::try_from(serde_json::json!({
+            "apps": {"drive": {"tools": {"blocked": {"enabled": false}}}}
+        }))
+        .unwrap(),
+    );
+    for hidden in [false, true] {
+        for reverse in [false, true] {
+            let mut tools = [
+                tool(Some("drive"), None, "allowed"),
+                ConnectorRuntimeTool {
+                    model_visible: !hidden,
+                    ..tool(
+                        Some("drive"),
+                        Some(" Drive "),
+                        if hidden { "hidden" } else { "blocked" },
+                    )
+                },
+            ];
+            if reverse {
+                tools.reverse();
+            }
+            assert_eq!(
+                installed_connector_runtime(&config, tools),
+                vec![InstalledConnectorRuntime {
+                    id: "drive".to_string(),
+                    runtime_name: Some("Drive".to_string()),
+                    enabled: true,
+                    callable: true,
+                }]
+            );
+        }
+    }
+    assert_eq!(
+        installed_connector_runtime(&config, [tool(Some("drive"), None, "blocked")])[0].callable,
+        false
+    );
+}
+
+#[test]
+fn synthetic_marker_requires_boolean_true() {
+    for (metadata, expected) in [
+        (None, false),
+        (Some(serde_json::json!({})), false),
+        (Some(serde_json::json!({"synthetic_link": true})), true),
+        (Some(serde_json::json!({"synthetic_link": false})), false),
+        (Some(serde_json::json!({"synthetic_link": "true"})), false),
+    ] {
+        assert_eq!(connector_tool_is_synthetic(metadata.as_ref()), expected);
+    }
+}

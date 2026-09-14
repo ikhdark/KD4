@@ -227,10 +227,6 @@ impl HistoryCell for UnifiedExecProcessesCell {
     fn raw_lines(&self) -> Vec<Line<'static>> {
         plain_lines(self.display_lines(u16::MAX))
     }
-
-    fn desired_height(&self, width: u16) -> u16 {
-        self.display_lines(width).len() as u16
-    }
 }
 
 pub(crate) fn new_unified_exec_processes_output(

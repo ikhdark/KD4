@@ -7,7 +7,7 @@ use ratatui::text::Span;
 
 const TAG_WIDTH: usize = "Plugin".len();
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Selection {
     File(PathBuf),
     Tool {
@@ -49,7 +49,7 @@ impl MentionType {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Candidate {
     pub(super) display_name: String,
     pub(super) description: Option<String>,

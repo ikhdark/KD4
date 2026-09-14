@@ -64,6 +64,7 @@ use codex_protocol::protocol::WebSearchBeginEvent;
 use codex_protocol::protocol::WebSearchEndEvent;
 #[cfg(test)]
 use codex_protocol::review_format::REVIEW_FALLBACK_MESSAGE;
+use indexmap::IndexSet;
 use std::collections::HashMap;
 use tracing::warn;
 use uuid::Uuid;
@@ -83,8 +84,8 @@ use codex_protocol::protocol::PatchApplyStatus as CorePatchApplyStatus;
 
 /// Convert persisted [`RolloutItem`] entries into a sequence of [`Turn`] values.
 ///
-/// When available, this uses `TurnContext.turn_id` as the canonical turn id so
-/// resumed/rebuilt thread history preserves the original turn identifiers.
+/// Explicit lifecycle events preserve the original turn identifiers; legacy
+/// histories without those boundaries receive deterministic rollout-based IDs.
 pub fn build_turns_from_rollout_items(items: &[RolloutItem]) -> Vec<Turn> {
     let mut builder = ThreadHistoryBuilder::new();
     for item in items {
@@ -161,84 +162,52 @@ impl ThreadHistoryTurnChange {
     }
 }
 
-/// Coalesces per-rollout-item changes into an end-of-batch view. It preserves
-/// first-change order while replacing repeated item/turn snapshots with their
-/// latest value, and drops accumulated changes for turns removed by rollback.
+/// Track positions while reducing a batch, then copy each final snapshot once.
+/// Ordered sets preserve first-change order; rollback removes invalid positions.
 #[derive(Default)]
 struct ThreadHistoryChangeAccumulator {
-    changed_items: Vec<Option<ThreadHistoryItemChange>>,
-    changed_item_indexes: HashMap<(String, String), usize>,
-    changed_turns: Vec<Option<ThreadHistoryTurnChange>>,
-    changed_turn_indexes: HashMap<String, usize>,
-    removed_turn_ids: Vec<String>,
-    removed_turn_indexes: HashMap<String, usize>,
+    changed_items: IndexSet<(usize, usize)>,
+    changed_turns: IndexSet<usize>,
+    removed_turn_ids: IndexSet<String>,
 }
 
 impl ThreadHistoryChangeAccumulator {
-    fn push(&mut self, changes: ThreadHistoryChangeSet) {
-        for turn_id in changes.removed_turn_ids {
-            self.push_removed_turn_id(turn_id);
-        }
-        for item_change in changes.changed_items {
-            self.push_item_change(item_change);
-        }
-        for turn_change in changes.changed_turns {
-            self.push_turn_change(turn_change);
-        }
-    }
-
-    fn finish(self) -> ThreadHistoryChangeSet {
-        ThreadHistoryChangeSet {
-            changed_items: self.changed_items.into_iter().flatten().collect(),
-            changed_turns: self.changed_turns.into_iter().flatten().collect(),
-            removed_turn_ids: self.removed_turn_ids,
-        }
-    }
-
-    fn push_item_change(&mut self, change: ThreadHistoryItemChange) {
-        let key = (change.turn_id.clone(), change.item.id().to_string());
-        if let Some(index) = self.changed_item_indexes.get(&key).copied() {
-            self.changed_items[index] = Some(change);
-            return;
-        }
-
-        self.changed_item_indexes
-            .insert(key, self.changed_items.len());
-        self.changed_items.push(Some(change));
-    }
-
-    fn push_turn_change(&mut self, change: ThreadHistoryTurnChange) {
-        if let Some(index) = self.changed_turn_indexes.get(&change.turn_id).copied() {
-            self.changed_turns[index] = Some(change);
-            return;
-        }
-
-        self.changed_turn_indexes
-            .insert(change.turn_id.clone(), self.changed_turns.len());
-        self.changed_turns.push(Some(change));
-    }
-
-    fn push_removed_turn_id(&mut self, turn_id: String) {
-        if !self.removed_turn_indexes.contains_key(&turn_id) {
-            self.removed_turn_indexes
-                .insert(turn_id.clone(), self.removed_turn_ids.len());
-            self.removed_turn_ids.push(turn_id.clone());
-        }
-
-        if let Some(index) = self.changed_turn_indexes.remove(&turn_id) {
-            self.changed_turns[index] = None;
-        }
-
-        let removed_item_keys: Vec<(String, String)> = self
-            .changed_item_indexes
-            .keys()
-            .filter(|(item_turn_id, _)| item_turn_id == &turn_id)
-            .cloned()
+    #[expect(clippy::expect_used, reason = "The accumulator records live turn positions and rollback removes invalid positions before finishing")]
+    fn finish(self, builder: &ThreadHistoryBuilder) -> ThreadHistoryChangeSet {
+        let changed_items = self
+            .changed_items
+            .into_iter()
+            .map(|(turn_index, item_index)| {
+                let (turn_id, items) = if turn_index == builder.turns.len() {
+                    let turn = builder.current_turn.as_ref().expect("changed current turn");
+                    (&turn.id, &turn.items)
+                } else {
+                    let turn = &builder.turns[turn_index];
+                    (&turn.id, &turn.items)
+                };
+                ThreadHistoryItemChange {
+                    turn_id: turn_id.clone(),
+                    item: items[item_index].clone(),
+                }
+            })
             .collect();
-        for key in removed_item_keys {
-            if let Some(index) = self.changed_item_indexes.remove(&key) {
-                self.changed_items[index] = None;
-            }
+        let changed_turns = self
+            .changed_turns
+            .into_iter()
+            .map(|turn_index| {
+                if turn_index == builder.turns.len() {
+                    ThreadHistoryTurnChange::from_pending_turn(
+                        builder.current_turn.as_ref().expect("changed current turn"),
+                    )
+                } else {
+                    ThreadHistoryTurnChange::from_turn(&builder.turns[turn_index])
+                }
+            })
+            .collect();
+        ThreadHistoryChangeSet {
+            changed_items,
+            changed_turns,
+            removed_turn_ids: self.removed_turn_ids.into_iter().collect(),
         }
     }
 }
@@ -249,7 +218,7 @@ pub struct ThreadHistoryBuilder {
     next_item_index: i64,
     current_rollout_index: usize,
     next_rollout_index: usize,
-    active_change_set: Option<ThreadHistoryChangeSet>,
+    active_change_set: Option<ThreadHistoryChangeAccumulator>,
 }
 
 impl Default for ThreadHistoryBuilder {
@@ -300,8 +269,14 @@ impl ThreadHistoryBuilder {
     /// into the correct turn. Consumers making lifecycle decisions must not treat that retained
     /// presentation snapshot as live state.
     pub fn in_progress_turn_snapshot(&self) -> Option<Turn> {
-        self.active_turn_snapshot()
-            .filter(|turn| turn.status == TurnStatus::InProgress)
+        match self.current_turn.as_ref() {
+            Some(turn) => (turn.status == TurnStatus::InProgress).then(|| Turn::from(turn)),
+            None => self
+                .turns
+                .last()
+                .filter(|turn| turn.status == TurnStatus::InProgress)
+                .cloned(),
+        }
     }
 
     /// Returns the current turn id only while the turn is still in progress.
@@ -463,18 +438,21 @@ impl ThreadHistoryBuilder {
         &mut self,
         items: &[RolloutItem],
     ) -> ThreadHistoryChangeSet {
-        let mut accumulator = ThreadHistoryChangeAccumulator::default();
-        for item in items {
-            accumulator.push(self.handle_rollout_item_with_changes(item));
-        }
-        accumulator.finish()
+        self.collect_changes(|builder| {
+            for item in items {
+                builder.handle_rollout_item(item);
+            }
+        })
     }
 
     fn collect_changes(&mut self, handle: impl FnOnce(&mut Self)) -> ThreadHistoryChangeSet {
         debug_assert!(self.active_change_set.is_none());
-        self.active_change_set = Some(ThreadHistoryChangeSet::default());
+        self.active_change_set = Some(ThreadHistoryChangeAccumulator::default());
         handle(self);
-        self.active_change_set.take().unwrap_or_default()
+        self.active_change_set
+            .take()
+            .unwrap_or_default()
+            .finish(self)
     }
 
     fn handle_response_item(&mut self, item: &codex_protocol::models::ResponseItem) {
@@ -546,29 +524,17 @@ impl ThreadHistoryBuilder {
             return;
         }
 
-        // If the last item is a reasoning item, add the new text to the summary.
-        let existing_item_change = {
-            let tracking_changes = self.is_tracking_changes();
+        let updated_index = {
             let turn = self.ensure_turn();
             if let Some(ThreadItem::Reasoning { summary, .. }) = turn.items.last_mut() {
                 summary.push(payload.text.clone());
-                let changed_item = if tracking_changes {
-                    turn.items
-                        .last()
-                        .cloned()
-                        .map(|item| (turn.id.clone(), item))
-                } else {
-                    None
-                };
-                Some(changed_item)
+                Some(turn.items.len() - 1)
             } else {
                 None
             }
         };
-        if let Some(changed_item) = existing_item_change {
-            if let Some((turn_id, item)) = changed_item {
-                self.record_changed_item(turn_id, item);
-            }
+        if let Some(item_index) = updated_index {
+            self.record_changed_item(self.turns.len(), item_index);
             return;
         }
 
@@ -586,29 +552,17 @@ impl ThreadHistoryBuilder {
             return;
         }
 
-        // If the last item is a reasoning item, add the new text to the content.
-        let existing_item_change = {
-            let tracking_changes = self.is_tracking_changes();
+        let updated_index = {
             let turn = self.ensure_turn();
             if let Some(ThreadItem::Reasoning { content, .. }) = turn.items.last_mut() {
                 content.push(payload.text.clone());
-                let changed_item = if tracking_changes {
-                    turn.items
-                        .last()
-                        .cloned()
-                        .map(|item| (turn.id.clone(), item))
-                } else {
-                    None
-                };
-                Some(changed_item)
+                Some(turn.items.len() - 1)
             } else {
                 None
             }
         };
-        if let Some(changed_item) = existing_item_change {
-            if let Some((turn_id, item)) = changed_item {
-                self.record_changed_item(turn_id, item);
-            }
+        if let Some(item_index) = updated_index {
+            self.record_changed_item(self.turns.len(), item_index);
             return;
         }
 
@@ -1046,11 +1000,15 @@ impl ThreadHistoryBuilder {
         // event cannot represent (for example, a failed wait with no receivers).
         // A terminal snapshot also covers waits reconciled by TurnAborted.
         if self.current_turn.as_ref().is_some_and(|turn| {
-            turn.items.iter().any(|item| matches!(
-                item,
-                ThreadItem::CollabAgentToolCall { id, tool: CollabAgentTool::Wait, status, .. }
-                    if id == &payload.call_id && *status != CollabAgentToolCallStatus::InProgress
-            ))
+            turn.item_indexes
+                .get(&payload.call_id)
+                .is_some_and(|&index| {
+                    matches!(
+                        &turn.items[index],
+                        ThreadItem::CollabAgentToolCall { tool: CollabAgentTool::Wait, status, .. }
+                            if *status != CollabAgentToolCallStatus::InProgress
+                    )
+                })
         }) {
             return;
         }
@@ -1223,7 +1181,7 @@ impl ThreadHistoryBuilder {
         if !current_turn_matches && !self.turns.iter().any(|turn| turn.id == turn_id) {
             self.finish_current_turn();
             let turn = self.new_turn(Some(turn_id.to_string()));
-            self.record_changed_pending_turn(&turn);
+            self.record_changed_turn(self.turns.len());
             self.current_turn = Some(turn);
         }
         self.upsert_item_in_turn_id(turn_id, item);
@@ -1233,20 +1191,14 @@ impl ThreadHistoryBuilder {
         if !payload.affects_turn_status() {
             return;
         }
-        let tracking_changes = self.is_tracking_changes();
-        let changed_turn = if let Some(turn) = self.current_turn.as_mut() {
+        if let Some(turn) = self.current_turn.as_mut() {
             turn.status = TurnStatus::Failed;
             turn.error = Some(V2TurnError {
                 message: payload.message.clone(),
                 codex_error_info: payload.codex_error_info.clone().map(Into::into),
                 additional_details: None,
             });
-            tracking_changes.then(|| ThreadHistoryTurnChange::from_pending_turn(turn))
-        } else {
-            None
-        };
-        if let Some(changed_turn) = changed_turn {
-            self.record_changed_turn(changed_turn);
+            self.record_changed_turn(self.turns.len());
         }
     }
 
@@ -1263,53 +1215,57 @@ impl ThreadHistoryBuilder {
             turn.duration_ms = payload.duration_ms;
             turn.timing = payload.timing.clone();
             turn.surfaced_result = None;
-            ThreadHistoryTurnChange::from_pending_turn(turn)
         };
         if let Some(turn_id) = payload.turn_id.as_deref() {
             // Prefer an exact ID match so we interrupt the turn explicitly targeted by the event.
             if let Some(turn) = self.current_turn.as_mut().filter(|turn| turn.id == turn_id) {
-                let changed_turn = apply_abort(turn);
+                apply_abort(turn);
                 let aborted_turn_id = turn.id.clone();
-                self.record_changed_turn(changed_turn);
+                self.record_changed_turn(self.turns.len());
                 self.fail_running_wait_items(&aborted_turn_id);
                 return;
             }
 
-            if let Some(turn) = self.turns.iter_mut().find(|turn| turn.id == turn_id) {
+            if let Some(turn_index) = self.turns.iter().position(|turn| turn.id == turn_id) {
+                let turn = &mut self.turns[turn_index];
                 turn.status = abort_status.clone();
                 turn.completed_at = payload.completed_at;
                 turn.duration_ms = payload.duration_ms;
                 turn.timing = payload.timing.clone();
                 turn.surfaced_result = None;
-                let changed_turn = ThreadHistoryTurnChange::from_turn(turn);
                 let aborted_turn_id = turn.id.clone();
-                self.record_changed_turn(changed_turn);
+                self.record_changed_turn(turn_index);
                 self.fail_running_wait_items(&aborted_turn_id);
                 return;
             }
         }
 
-        // If the event has no ID (or refers to an unknown turn), fall back to the active turn.
-        if let Some(turn) = self.current_turn.as_mut() {
-            let changed_turn = apply_abort(turn);
+        // Legacy events may lack an ID or explicit turn boundaries. An unknown
+        // target must never interrupt a different explicitly opened turn.
+        if let Some(turn) = self
+            .current_turn
+            .as_mut()
+            .filter(|turn| payload.turn_id.is_none() || !turn.opened_explicitly)
+        {
+            apply_abort(turn);
             let aborted_turn_id = turn.id.clone();
-            self.record_changed_turn(changed_turn);
+            self.record_changed_turn(self.turns.len());
             self.fail_running_wait_items(&aborted_turn_id);
         }
     }
 
     fn fail_running_wait_items(&mut self, turn_id: &str) {
         let tracking_changes = self.is_tracking_changes();
-        let items = if let Some(turn) = self.current_turn.as_mut().filter(|turn| turn.id == turn_id)
-        {
-            &mut turn.items
-        } else if let Some(turn) = self.turns.iter_mut().find(|turn| turn.id == turn_id) {
-            &mut turn.items
-        } else {
-            return;
-        };
+        let (turn_index, items) =
+            if let Some(turn) = self.current_turn.as_mut().filter(|turn| turn.id == turn_id) {
+                (self.turns.len(), &mut turn.items)
+            } else if let Some(index) = self.turns.iter().position(|turn| turn.id == turn_id) {
+                (index, &mut self.turns[index].items)
+            } else {
+                return;
+            };
         let mut changed_items = Vec::new();
-        for item in items {
+        for (index, item) in items.iter_mut().enumerate() {
             if let ThreadItem::CollabAgentToolCall {
                 tool: CollabAgentTool::Wait,
                 status,
@@ -1319,12 +1275,12 @@ impl ThreadHistoryBuilder {
             {
                 *status = CollabAgentToolCallStatus::Failed;
                 if tracking_changes {
-                    changed_items.push(item.clone());
+                    changed_items.push(index);
                 }
             }
         }
-        for item in changed_items {
-            self.record_changed_item(turn_id.to_string(), item);
+        for index in changed_items {
+            self.record_changed_item(turn_index, index);
         }
     }
 
@@ -1335,7 +1291,7 @@ impl ThreadHistoryBuilder {
             .with_status(TurnStatus::InProgress)
             .with_started_at(payload.started_at)
             .opened_explicitly();
-        self.record_changed_pending_turn(&turn);
+        self.record_changed_turn(self.turns.len());
         self.current_turn = Some(turn);
     }
 
@@ -1356,7 +1312,6 @@ impl ThreadHistoryBuilder {
             turn.duration_ms = payload.duration_ms;
             turn.timing = payload.timing.clone();
             turn.surfaced_result = payload.surfaced_result.clone();
-            ThreadHistoryTurnChange::from_pending_turn(turn)
         };
 
         // Prefer an exact ID match from the active turn and then close it.
@@ -1365,17 +1320,18 @@ impl ThreadHistoryBuilder {
             .as_mut()
             .filter(|turn| turn.id == payload.turn_id)
         {
-            let changed_turn = apply_completion(current_turn);
-            self.record_changed_turn(changed_turn);
+            apply_completion(current_turn);
+            self.record_changed_turn(self.turns.len());
             self.finish_current_turn();
             return;
         }
 
-        if let Some(turn) = self
+        if let Some(turn_index) = self
             .turns
-            .iter_mut()
-            .find(|turn| turn.id == payload.turn_id)
+            .iter()
+            .position(|turn| turn.id == payload.turn_id)
         {
+            let turn = &mut self.turns[turn_index];
             if let Some(error) = terminal_error.as_ref() {
                 turn.status = TurnStatus::Failed;
                 turn.error = Some(error.clone());
@@ -1386,8 +1342,7 @@ impl ThreadHistoryBuilder {
             turn.duration_ms = payload.duration_ms;
             turn.timing = payload.timing.clone();
             turn.surfaced_result = payload.surfaced_result.clone();
-            let changed_turn = ThreadHistoryTurnChange::from_turn(turn);
-            self.record_changed_turn(changed_turn);
+            self.record_changed_turn(turn_index);
             return;
         }
 
@@ -1400,8 +1355,8 @@ impl ThreadHistoryBuilder {
             .as_mut()
             .filter(|turn| !turn.opened_explicitly)
         {
-            let changed_turn = apply_completion(current_turn);
-            self.record_changed_turn(changed_turn);
+            apply_completion(current_turn);
+            self.record_changed_turn(self.turns.len());
             self.finish_current_turn();
         }
     }
@@ -1413,19 +1368,18 @@ impl ThreadHistoryBuilder {
             .filter(|turn| turn.id == payload.turn_id)
         {
             turn.reasoning_policy_history = Some(payload.clone());
-            let changed_turn = ThreadHistoryTurnChange::from_pending_turn(turn);
-            self.record_changed_turn(changed_turn);
+            self.record_changed_turn(self.turns.len());
             return;
         }
 
-        if let Some(turn) = self
+        if let Some(turn_index) = self
             .turns
-            .iter_mut()
-            .find(|turn| turn.id == payload.turn_id)
+            .iter()
+            .position(|turn| turn.id == payload.turn_id)
         {
+            let turn = &mut self.turns[turn_index];
             turn.reasoning_policy_history = Some(payload.clone());
-            let changed_turn = ThreadHistoryTurnChange::from_turn(turn);
-            self.record_changed_turn(changed_turn);
+            self.record_changed_turn(turn_index);
             return;
         }
 
@@ -1448,17 +1402,20 @@ impl ThreadHistoryBuilder {
         self.finish_current_turn();
 
         let n = usize::try_from(payload.num_turns).unwrap_or(usize::MAX);
-        let removed_turn_ids = if n >= self.turns.len() {
-            self.turns.iter().map(|turn| turn.id.clone()).collect()
-        } else if n == 0 {
-            Vec::new()
-        } else {
-            self.turns[self.turns.len() - n..]
-                .iter()
-                .map(|turn| turn.id.clone())
-                .collect()
-        };
-        self.record_removed_turn_ids(removed_turn_ids);
+        let retained_len = self.turns.len().saturating_sub(n);
+        if let Some(changes) = self.active_change_set.as_mut() {
+            changes.removed_turn_ids.extend(
+                self.turns[retained_len..]
+                    .iter()
+                    .map(|turn| turn.id.clone()),
+            );
+            changes
+                .changed_items
+                .retain(|(turn_index, _)| *turn_index < retained_len);
+            changes
+                .changed_turns
+                .retain(|turn_index| *turn_index < retained_len);
+        }
 
         if n >= self.turns.len() {
             self.turns.clear();
@@ -1473,6 +1430,9 @@ impl ThreadHistoryBuilder {
     fn finish_current_turn(&mut self) {
         if let Some(turn) = self.current_turn.take() {
             if turn.items.is_empty() && !turn.opened_explicitly && !turn.saw_compaction {
+                if let Some(changes) = self.active_change_set.as_mut() {
+                    changes.changed_turns.shift_remove(&self.turns.len());
+                }
                 return;
             }
             self.turns.push(Turn::from(turn));
@@ -1490,6 +1450,7 @@ impl ThreadHistoryBuilder {
         PendingTurn {
             id,
             items: Vec::new(),
+            item_indexes: HashMap::new(),
             error: None,
             status: TurnStatus::Completed,
             started_at: None,
@@ -1507,7 +1468,7 @@ impl ThreadHistoryBuilder {
     fn ensure_turn(&mut self) -> &mut PendingTurn {
         if self.current_turn.is_none() {
             let turn = self.new_turn(/*id*/ None);
-            self.record_changed_pending_turn(&turn);
+            self.record_changed_turn(self.turns.len());
             self.current_turn = Some(turn);
         }
 
@@ -1519,89 +1480,48 @@ impl ThreadHistoryBuilder {
     }
 
     fn push_item_in_current_turn(&mut self, item: ThreadItem) {
-        let tracking_changes = self.is_tracking_changes();
-        let changed_item = {
-            let turn = self.ensure_turn();
-            let changed_item = tracking_changes.then(|| (turn.id.clone(), item.clone()));
-            turn.items.push(item);
-            changed_item
-        };
-        if let Some((turn_id, item)) = changed_item {
-            self.record_changed_item(turn_id, item);
-        }
+        let turn = self.ensure_turn();
+        let index = turn.items.len();
+        turn.item_indexes
+            .entry(item.id().to_string())
+            .or_insert(index);
+        turn.items.push(item);
+        self.record_changed_item(self.turns.len(), index);
     }
 
     fn upsert_item_in_turn_id(&mut self, turn_id: &str, item: ThreadItem) {
-        let tracking_changes = self.is_tracking_changes();
-        if let Some(turn) = self.current_turn.as_mut()
-            && turn.id == turn_id
-        {
-            let changed_item = {
-                let item = upsert_turn_item(&mut turn.items, item);
-                tracking_changes.then(|| (turn.id.clone(), item.clone()))
-            };
-            if let Some((turn_id, item)) = changed_item {
-                self.record_changed_item(turn_id, item);
-            }
-            return;
+        if let Some(turn) = self.current_turn.as_mut().filter(|turn| turn.id == turn_id) {
+            let index = turn.upsert_item(item);
+            self.record_changed_item(self.turns.len(), index);
+        } else if let Some(turn_index) = self.turns.iter().position(|turn| turn.id == turn_id) {
+            let index = upsert_turn_item(&mut self.turns[turn_index].items, item);
+            self.record_changed_item(turn_index, index);
+        } else {
+            warn!(
+                item_id = item.id(),
+                "dropping turn-scoped item for unknown turn id `{turn_id}`"
+            );
         }
-
-        if let Some(turn) = self.turns.iter_mut().find(|turn| turn.id == turn_id) {
-            let changed_item = {
-                let item = upsert_turn_item(&mut turn.items, item);
-                tracking_changes.then(|| (turn.id.clone(), item.clone()))
-            };
-            if let Some((turn_id, item)) = changed_item {
-                self.record_changed_item(turn_id, item);
-            }
-            return;
-        }
-
-        warn!(
-            item_id = item.id(),
-            "dropping turn-scoped item for unknown turn id `{turn_id}`"
-        );
     }
 
     fn upsert_item_in_current_turn(&mut self, item: ThreadItem) {
-        let tracking_changes = self.is_tracking_changes();
-        let changed_item = {
-            let turn = self.ensure_turn();
-            let item = upsert_turn_item(&mut turn.items, item);
-            tracking_changes.then(|| (turn.id.clone(), item.clone()))
-        };
-        if let Some((turn_id, item)) = changed_item {
-            self.record_changed_item(turn_id, item);
-        }
+        let index = self.ensure_turn().upsert_item(item);
+        self.record_changed_item(self.turns.len(), index);
     }
 
     fn is_tracking_changes(&self) -> bool {
         self.active_change_set.is_some()
     }
 
-    fn record_changed_item(&mut self, turn_id: String, item: ThreadItem) {
-        if let Some(change_set) = self.active_change_set.as_mut() {
-            change_set
-                .changed_items
-                .push(ThreadHistoryItemChange { turn_id, item });
+    fn record_changed_item(&mut self, turn_index: usize, item_index: usize) {
+        if let Some(changes) = self.active_change_set.as_mut() {
+            changes.changed_items.insert((turn_index, item_index));
         }
     }
 
-    fn record_changed_pending_turn(&mut self, turn: &PendingTurn) {
-        if self.is_tracking_changes() {
-            self.record_changed_turn(ThreadHistoryTurnChange::from_pending_turn(turn));
-        }
-    }
-
-    fn record_changed_turn(&mut self, turn: ThreadHistoryTurnChange) {
-        if let Some(change_set) = self.active_change_set.as_mut() {
-            change_set.changed_turns.push(turn);
-        }
-    }
-
-    fn record_removed_turn_ids(&mut self, removed_turn_ids: Vec<String>) {
-        if let Some(change_set) = self.active_change_set.as_mut() {
-            change_set.removed_turn_ids.extend(removed_turn_ids);
+    fn record_changed_turn(&mut self, turn_index: usize) {
+        if let Some(changes) = self.active_change_set.as_mut() {
+            changes.changed_turns.insert(turn_index);
         }
     }
 
@@ -1659,22 +1579,59 @@ fn convert_dynamic_tool_content_items(
         .collect()
 }
 
-fn upsert_turn_item(items: &mut Vec<ThreadItem>, item: ThreadItem) -> &ThreadItem {
+fn replace_turn_item(existing: &mut ThreadItem, mut item: ThreadItem) {
+    // Legacy command events cannot express these relationships. Their updates
+    // must not erase identities already supplied by a first-class item event.
+    if let (
+        ThreadItem::CommandExecution {
+            parent_call_id,
+            parent_cell_id,
+            runtime_tool_call_id,
+            execution_id,
+            ..
+        },
+        ThreadItem::CommandExecution {
+            parent_call_id: previous_parent,
+            parent_cell_id: previous_cell,
+            runtime_tool_call_id: previous_runtime,
+            execution_id: previous_execution,
+            ..
+        },
+    ) = (&mut item, &mut *existing)
+    {
+        if parent_call_id.is_none() {
+            *parent_call_id = previous_parent.take();
+        }
+        if parent_cell_id.is_none() {
+            *parent_cell_id = previous_cell.take();
+        }
+        if runtime_tool_call_id.is_none() {
+            *runtime_tool_call_id = previous_runtime.take();
+        }
+        if execution_id.is_none() {
+            *execution_id = previous_execution.take();
+        }
+    }
+    *existing = item;
+}
+
+fn upsert_turn_item(items: &mut Vec<ThreadItem>, item: ThreadItem) -> usize {
     if let Some(existing_item_index) = items
         .iter()
         .position(|existing_item| existing_item.id() == item.id())
     {
-        items[existing_item_index] = item;
-        return &items[existing_item_index];
+        replace_turn_item(&mut items[existing_item_index], item);
+        return existing_item_index;
     }
     let inserted_item_index = items.len();
     items.push(item);
-    &items[inserted_item_index]
+    inserted_item_index
 }
 
 struct PendingTurn {
     id: String,
     items: Vec<ThreadItem>,
+    item_indexes: HashMap<String, usize>,
     error: Option<TurnError>,
     status: TurnStatus,
     started_at: Option<i64>,
@@ -1694,6 +1651,18 @@ struct PendingTurn {
 }
 
 impl PendingTurn {
+    fn upsert_item(&mut self, item: ThreadItem) -> usize {
+        if let Some(&index) = self.item_indexes.get(item.id()) {
+            replace_turn_item(&mut self.items[index], item);
+            index
+        } else {
+            let index = self.items.len();
+            self.item_indexes.insert(item.id().to_string(), index);
+            self.items.push(item);
+            index
+        }
+    }
+
     fn opened_explicitly(mut self) -> Self {
         self.opened_explicitly = true;
         self
@@ -5341,6 +5310,228 @@ mod tests {
             }
         );
     }
+    #[test]
+    fn unknown_abort_leaves_explicit_turn_and_running_wait_unchanged() {
+        use codex_protocol::items::CollabAgentToolCallStatus as CoreWaitStatus;
+        for reason in [TurnAbortReason::Interrupted, TurnAbortReason::InternalError] {
+            let mut builder = ThreadHistoryBuilder::new();
+            wait_history_test_start_turn(&mut builder, "active");
+            builder.handle_event(&EventMsg::ItemStarted(ItemStartedEvent {
+                thread_id: wait_history_test_thread_id(),
+                turn_id: "active".into(),
+                item: wait_history_test_item("waiting", CoreWaitStatus::InProgress),
+                started_at_ms: 1,
+            }));
+            let before = builder.in_progress_turn_snapshot().expect("active turn");
+            let changes =
+                builder.handle_event_with_changes(&EventMsg::TurnAborted(TurnAbortedEvent {
+                    turn_id: Some("absent".into()),
+                    reason,
+                    completed_at: Some(2),
+                    duration_ms: Some(1000),
+                    timing: None,
+                }));
+            assert_eq!(changes, ThreadHistoryChangeSet::default());
+            assert_eq!(builder.in_progress_turn_snapshot(), Some(before));
+        }
+    }
+
+    #[test]
+    fn batched_reasoning_survives_rollback_and_reused_positions() {
+        let mut builder = ThreadHistoryBuilder::new();
+        let mut events = Vec::new();
+        for (id, fragments) in [
+            ("keep", vec!["first", "second"]),
+            ("remove-1", vec!["discard"]),
+            ("remove-2", vec!["discard too"]),
+            ("replacement", vec!["new", "last"]),
+        ] {
+            if id == "replacement" {
+                events.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+                    ThreadRolledBackEvent { num_turns: 2 },
+                )));
+            }
+            events.push(RolloutItem::EventMsg(EventMsg::TurnStarted(
+                TurnStartedEvent {
+                    turn_id: id.into(),
+                    trace_id: None,
+                    started_at: None,
+                    model_context_window: None,
+                    collaboration_mode_kind: Default::default(),
+                },
+            )));
+            for text in fragments {
+                events.push(RolloutItem::EventMsg(EventMsg::AgentReasoning(
+                    AgentReasoningEvent { text: text.into() },
+                )));
+            }
+        }
+        let changes = builder.handle_rollout_items_with_changes(&events);
+        let expected_items = [
+            ThreadItem::Reasoning {
+                id: "item-1".into(),
+                summary: vec!["first".into(), "second".into()],
+                content: Vec::new(),
+            },
+            ThreadItem::Reasoning {
+                id: "item-2".into(),
+                summary: vec!["new".into(), "last".into()],
+                content: Vec::new(),
+            },
+        ];
+        assert_eq!(changes.removed_turn_ids, vec!["remove-1", "remove-2"]);
+        assert_eq!(
+            changes.changed_items,
+            vec![
+                ThreadHistoryItemChange {
+                    turn_id: "keep".into(),
+                    item: expected_items[0].clone()
+                },
+                ThreadHistoryItemChange {
+                    turn_id: "replacement".into(),
+                    item: expected_items[1].clone()
+                },
+            ]
+        );
+        assert_eq!(
+            changes
+                .changed_turns
+                .iter()
+                .map(|turn| turn.turn_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep", "replacement"]
+        );
+        let turns = builder.finish();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].items, vec![expected_items[0].clone()]);
+        assert_eq!(turns[1].items, vec![expected_items[1].clone()]);
+    }
+
+    #[test]
+    fn indexed_item_updates_preserve_insertion_order() {
+        let mut builder = ThreadHistoryBuilder::new();
+        wait_history_test_start_turn(&mut builder, "active");
+        for id in ["b", "a", "c"] {
+            builder.handle_event(&EventMsg::WebSearchBegin(WebSearchBeginEvent {
+                call_id: id.into(),
+            }));
+        }
+        for id in ["c", "b", "a"] {
+            builder.handle_event(&EventMsg::WebSearchEnd(WebSearchEndEvent {
+                call_id: id.into(),
+                query: format!("result-{id}"),
+                action: CoreWebSearchAction::Search {
+                    query: Some(format!("result-{id}")),
+                    queries: None,
+                },
+            }));
+        }
+        let turns = builder.finish();
+        let expected = ["b", "a", "c"].map(|id| {
+            ThreadItem::WebSearch(WebSearchItem {
+                id: id.into(),
+                query: format!("result-{id}"),
+                action: Some(WebSearchAction::Search {
+                    query: Some(format!("result-{id}")),
+                    queries: None,
+                }),
+            })
+        });
+        assert_eq!(turns[0].items, expected);
+    }
+
+    #[test]
+    fn modern_command_relationships_survive_legacy_updates() {
+        use codex_protocol::items::CommandExecutionItem;
+        use codex_protocol::items::CommandExecutionStatus as CoreCommandStatus;
+        use codex_protocol::protocol::HasLegacyEvent;
+
+        for late_completion in [false, true] {
+            let mut builder = ThreadHistoryBuilder::new();
+            wait_history_test_start_turn(&mut builder, "command-turn");
+            let command = CommandExecutionItem {
+                id: "command".into(),
+                process_id: Some("process".into()),
+                parent_call_id: Some("parent".into()),
+                parent_cell_id: Some("cell".into()),
+                runtime_tool_call_id: Some("runtime".into()),
+                execution_id: Some("execution".into()),
+                command: vec!["echo".into(), "hello".into()],
+                cwd: test_path_buf("/workspace").abs().into(),
+                parsed_cmd: Vec::new(),
+                source: ExecCommandSource::Agent,
+                interaction_input: None,
+                status: CoreCommandStatus::InProgress,
+                stdout: None,
+                stderr: None,
+                aggregated_output: None,
+                exit_code: None,
+                duration: None,
+                formatted_output: None,
+            };
+            let started = EventMsg::ItemStarted(ItemStartedEvent {
+                thread_id: wait_history_test_thread_id(),
+                turn_id: "command-turn".into(),
+                item: CoreTurnItem::CommandExecution(command.clone()),
+                started_at_ms: 1,
+            });
+            builder.handle_event(&started);
+            let before = builder.in_progress_turn_snapshot().unwrap();
+            for legacy in started.as_legacy_events(false) {
+                builder.handle_event(&legacy);
+            }
+            assert_eq!(builder.in_progress_turn_snapshot(), Some(before));
+            let completed = EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id: wait_history_test_thread_id(),
+                turn_id: "command-turn".into(),
+                item: CoreTurnItem::CommandExecution(CommandExecutionItem {
+                    status: CoreCommandStatus::Completed,
+                    stdout: Some("hello".into()),
+                    stderr: Some(String::new()),
+                    aggregated_output: Some("hello".into()),
+                    exit_code: Some(0),
+                    duration: Some(std::time::Duration::from_millis(20)),
+                    formatted_output: Some("hello".into()),
+                    ..command
+                }),
+                completed_at_ms: 2,
+            });
+            if late_completion {
+                wait_history_test_start_turn(&mut builder, "new-turn");
+            }
+            builder.handle_event(&completed);
+            for legacy in completed.as_legacy_events(false) {
+                builder.handle_event(&legacy);
+            }
+            let turns = builder.finish();
+            let ThreadItem::CommandExecution {
+                parent_call_id,
+                parent_cell_id,
+                runtime_tool_call_id,
+                execution_id,
+                status,
+                aggregated_output,
+                exit_code,
+                duration_ms,
+                ..
+            } = &turns[0].items[0]
+            else {
+                panic!("command item");
+            };
+            assert_eq!(parent_call_id.as_deref(), Some("parent"));
+            assert_eq!(parent_cell_id.as_deref(), Some("cell"));
+            assert_eq!(runtime_tool_call_id.as_deref(), Some("runtime"));
+            assert_eq!(execution_id.as_deref(), Some("execution"));
+            assert_eq!(*status, CommandExecutionStatus::Completed);
+            assert_eq!(aggregated_output.as_deref(), Some("hello"));
+            assert_eq!(*exit_code, Some(0));
+            assert_eq!(*duration_ms, Some(20));
+            if late_completion {
+                assert!(turns[1].items.is_empty());
+            }
+        }
+    }
+
     fn wait_history_test_thread_id() -> ThreadId {
         ThreadId::from_string("00000000-0000-7000-8000-000000000081").expect("fixture thread ID")
     }

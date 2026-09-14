@@ -15,28 +15,33 @@ fn mcp_tool(name: &str, description: &str, input_schema: serde_json::Value) -> r
 
 #[test]
 fn parse_mcp_tool_inserts_empty_properties() {
-    let tool = mcp_tool(
-        "no_props",
-        "No properties",
-        serde_json::json!({
-            "type": "object"
-        }),
-    );
+    for input in [
+        serde_json::json!({"type":"object"}),
+        serde_json::json!({"type":"object", "properties":null}),
+    ] {
+        let tool = mcp_tool("no_props", "No properties", input);
 
-    assert_eq!(
-        parse_mcp_tool(&tool).expect("parse MCP tool"),
-        ToolDefinition {
-            name: "no_props".to_string(),
-            description: "No properties".to_string(),
-            input_schema: JsonSchema::object(
-                BTreeMap::new(),
-                /*required*/ None,
-                /*additional_properties*/ None
-            ),
-            output_schema: Some(mcp_call_tool_result_output_schema(serde_json::json!({}))),
-            defer_loading: false,
-        }
-    );
+        assert_eq!(
+            parse_mcp_tool(&tool).expect("parse MCP tool"),
+            ToolDefinition {
+                name: "no_props".to_string(),
+                description: "No properties".to_string(),
+                input_schema: JsonSchema::object(
+                    BTreeMap::new(),
+                    /*required*/ None,
+                    /*additional_properties*/ None
+                ),
+                output_schema: Some(serde_json::json!({
+                    "x-codex-mcp-result":true, "type":"object",
+                    "properties":{
+                        "content":{"type":"array", "items":{"type":"object"}},
+                        "structuredContent":{}, "isError":{"type":"boolean"}, "_meta":{"type":"object"}
+                    }, "required":["content"], "additionalProperties":false
+                })),
+                defer_loading: false,
+            }
+        );
+    }
 }
 
 #[test]

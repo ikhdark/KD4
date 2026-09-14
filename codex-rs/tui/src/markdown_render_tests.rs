@@ -1,4 +1,5 @@
 use pretty_assertions::assert_eq;
+use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
@@ -1764,4 +1765,16 @@ fn table_key_value_fallback_preserves_rich_values_and_themed_labels() {
             .iter()
             .any(|span| span.style.add_modifier.contains(Modifier::UNDERLINED))
     }));
+    assert!(
+        text.lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .any(|span| span.content == "bold" && span.style.add_modifier.contains(Modifier::BOLD))
+    );
+    assert!(
+        text.lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .any(|span| span.content == "code" && span.style.fg == Some(Color::Cyan))
+    );
 }

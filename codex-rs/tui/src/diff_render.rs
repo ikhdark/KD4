@@ -21,7 +21,7 @@
 //! foreground-only styling regardless of theme scope backgrounds.
 //!
 //! **Highlighting strategy for `Update` diffs:** the renderer highlights each
-//! hunk as a single concatenated block rather than line-by-line.  This
+//! hunk's old and new source projections independently. This
 //! preserves syntect's parser state across consecutive lines within a hunk
 //! (important for multi-line strings, block comments, etc.).  Cross-hunk state
 //! is intentionally *not* preserved because hunks are visually separated and
@@ -285,9 +285,8 @@ fn quantize_rgb_to_ansi256(target: (u8, u8, u8)) -> Color {
         .iter()
         .enumerate()
         .skip(16)
-        .min_by(|(_, a), (_, b)| {
-            perceptual_distance(**a, target).total_cmp(&perceptual_distance(**b, target))
-        })
+        .map(|(index, color)| (index, perceptual_distance(*color, target)))
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(index, _)| index as u8);
     match best_index {
         Some(index) => indexed_color(index),
@@ -309,14 +308,38 @@ impl DiffSummary {
 impl Renderable for FileChange {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let mut lines = vec![];
-        render_change(self, &mut lines, area.width as usize, /*lang*/ None);
+        if area.is_empty() {
+            return;
+        }
+        let patch = parsed_patch(self);
+        render_prepared_change(
+            self,
+            patch.as_ref(),
+            &mut lines,
+            area.width as usize,
+            None,
+            current_diff_render_style_context(),
+            area.height as usize,
+        );
         Paragraph::new(lines).render(area, buf);
     }
 
     fn desired_height(&self, width: u16) -> u16 {
-        let mut lines = vec![];
-        render_change(self, &mut lines, width as usize, /*lang*/ None);
-        u16::try_from(lines.len()).unwrap_or(u16::MAX)
+        let patch = parsed_patch(self);
+        let content_width = (width as usize)
+            .saturating_sub(change_line_number_width(self, patch.as_ref()) + 2)
+            .max(1);
+        let mut height = 0usize;
+        visit_change_lines(self, patch.as_ref(), |line| {
+            let remaining = u16::MAX as usize - height;
+            height += line.map_or(1, |(_, _, text)| {
+                plain_text_chunks(text, content_width)
+                    .take(remaining)
+                    .count()
+            });
+            height < u16::MAX as usize
+        });
+        height as u16
     }
 }
 
@@ -324,17 +347,21 @@ impl From<DiffSummary> for Box<dyn Renderable> {
     fn from(val: DiffSummary) -> Self {
         let mut rows: Vec<Box<dyn Renderable>> = vec![];
 
-        for (i, row) in collect_rows(&val.changes).into_iter().enumerate() {
+        let mut changes: Vec<_> = val.changes.into_iter().collect();
+        changes.sort_by(|a, b| a.0.cmp(&b.0));
+        for (i, (source_path, change)) in changes.into_iter().enumerate() {
+            let row = Row::new(&source_path, &change);
             if i > 0 {
                 rows.push(Box::new(RtLine::from("")));
             }
-            let mut path = RtLine::from(display_path_for(&row.path, val.cwd.as_path()));
+            let mut path = RtLine::from(render_row_path(&row, val.cwd.as_path()));
             path.push_span(" ");
-            path.extend(render_line_count_summary(row.added, row.removed));
+            path.extend(render_optional_line_count_summary(row.counts));
+            drop(row);
             rows.push(Box::new(path));
             rows.push(Box::new(RtLine::from("")));
             rows.push(Box::new(InsetRenderable::new(
-                Box::new(row.change) as Box<dyn Renderable>,
+                Box::new(change) as Box<dyn Renderable>,
                 Insets::tlbr(
                     /*top*/ 0, /*left*/ 2, /*bottom*/ 0, /*right*/ 0,
                 ),
@@ -354,41 +381,59 @@ pub(crate) fn create_diff_summary(
     render_changes_block(rows, wrap_cols, cwd)
 }
 
-// Shared row for per-file presentation
-#[derive(Clone)]
-struct Row {
-    path: PathBuf,
-    move_path: Option<PathBuf>,
-    added: usize,
-    removed: usize,
-    change: FileChange,
+// Borrow source content and retain a parsed patch for this summary pass.
+struct Row<'a> {
+    path: &'a Path,
+    move_path: Option<&'a Path>,
+    counts: Option<(usize, usize)>,
+    change: &'a FileChange,
+    patch: Option<diffy::Patch<'a, str>>,
 }
 
-fn collect_rows(changes: &HashMap<PathBuf, FileChange>) -> Vec<Row> {
-    let mut rows: Vec<Row> = Vec::new();
-    for (path, change) in changes.iter() {
-        let (added, removed) = match change {
-            FileChange::Add { content } => (content.lines().count(), 0),
-            FileChange::Delete { content } => (0, content.lines().count()),
-            FileChange::Update { unified_diff, .. } => calculate_add_remove_from_diff(unified_diff),
+impl<'a> Row<'a> {
+    fn new(path: &'a Path, change: &'a FileChange) -> Self {
+        let patch = parsed_patch(change);
+        let counts = match change {
+            FileChange::Add { content } => Some((content.lines().count(), 0)),
+            FileChange::Delete { content } => Some((0, content.lines().count())),
+            FileChange::Update { .. } => patch.as_ref().map(patch_counts),
         };
         let move_path = match change {
-            FileChange::Update {
-                move_path: Some(new),
-                ..
-            } => Some(new.clone()),
+            FileChange::Update { move_path, .. } => move_path.as_deref(),
             _ => None,
         };
-        rows.push(Row {
-            path: path.clone(),
+        Self {
+            path,
             move_path,
-            added,
-            removed,
-            change: change.clone(),
-        });
+            counts,
+            change,
+            patch,
+        }
     }
-    rows.sort_by_key(|r| r.path.clone());
+}
+
+fn collect_rows(changes: &HashMap<PathBuf, FileChange>) -> Vec<Row<'_>> {
+    let mut rows: Vec<_> = changes
+        .iter()
+        .map(|(path, change)| Row::new(path, change))
+        .collect();
+    rows.sort_by(|a, b| a.path.cmp(b.path));
     rows
+}
+
+fn render_row_path(row: &Row<'_>, cwd: &Path) -> Vec<RtSpan<'static>> {
+    let mut spans = vec![display_path_for(row.path, cwd).into()];
+    if let Some(move_path) = row.move_path {
+        spans.push(format!(" → {}", display_path_for(move_path, cwd)).into());
+    }
+    spans
+}
+
+fn render_optional_line_count_summary(counts: Option<(usize, usize)>) -> Vec<RtSpan<'static>> {
+    match counts {
+        Some((added, removed)) => render_line_count_summary(added, removed),
+        None => vec!["(counts unavailable)".dim()],
+    }
 }
 
 fn render_line_count_summary(added: usize, removed: usize) -> Vec<RtSpan<'static>> {
@@ -401,21 +446,13 @@ fn render_line_count_summary(added: usize, removed: usize) -> Vec<RtSpan<'static
     spans
 }
 
-fn render_changes_block(rows: Vec<Row>, wrap_cols: usize, cwd: &Path) -> Vec<RtLine<'static>> {
+fn render_changes_block(rows: Vec<Row<'_>>, wrap_cols: usize, cwd: &Path) -> Vec<RtLine<'static>> {
     let mut out: Vec<RtLine<'static>> = Vec::new();
 
-    let render_path = |row: &Row| -> Vec<RtSpan<'static>> {
-        let mut spans = Vec::new();
-        spans.push(display_path_for(&row.path, cwd).into());
-        if let Some(move_path) = &row.move_path {
-            spans.push(format!(" → {}", display_path_for(move_path, cwd)).into());
-        }
-        spans
-    };
-
-    // Header
-    let total_added: usize = rows.iter().map(|r| r.added).sum();
-    let total_removed: usize = rows.iter().map(|r| r.removed).sum();
+    let style_context = current_diff_render_style_context();
+    let total_counts = rows.iter().try_fold((0, 0), |(a, d), row| {
+        row.counts.map(|(added, removed)| (a + added, d + removed))
+    });
     let file_count = rows.len();
     let noun = if file_count == 1 { "file" } else { "files" };
     let mut header_spans: Vec<RtSpan<'static>> = vec!["• ".dim()];
@@ -427,13 +464,13 @@ fn render_changes_block(rows: Vec<Row>, wrap_cols: usize, cwd: &Path) -> Vec<RtL
         };
         header_spans.push(verb.bold());
         header_spans.push(" ".into());
-        header_spans.extend(render_path(row));
+        header_spans.extend(render_row_path(row, cwd));
         header_spans.push(" ".into());
-        header_spans.extend(render_line_count_summary(row.added, row.removed));
+        header_spans.extend(render_optional_line_count_summary(row.counts));
     } else {
         header_spans.push("Edited".bold());
         header_spans.push(format!(" {file_count} {noun} ").into());
-        header_spans.extend(render_line_count_summary(total_added, total_removed));
+        header_spans.extend(render_optional_line_count_summary(total_counts));
     }
     out.push(RtLine::from(header_spans));
 
@@ -447,18 +484,26 @@ fn render_changes_block(rows: Vec<Row>, wrap_cols: usize, cwd: &Path) -> Vec<RtL
         if !skip_file_header {
             let mut header: Vec<RtSpan<'static>> = Vec::new();
             header.push("  └ ".dim());
-            header.extend(render_path(&r));
+            header.extend(render_row_path(&r, cwd));
             header.push(" ".into());
-            header.extend(render_line_count_summary(r.added, r.removed));
+            header.extend(render_optional_line_count_summary(r.counts));
             out.push(RtLine::from(header));
         }
 
         // For renames, use the destination extension for highlighting — the
         // diff content reflects the new file, not the old one.
-        let lang_path = r.move_path.as_deref().unwrap_or(&r.path);
+        let lang_path = r.move_path.unwrap_or(r.path);
         let lang = detect_lang_for_path(lang_path);
         let mut lines = vec![];
-        render_change(&r.change, &mut lines, wrap_cols - 4, lang.as_deref());
+        render_prepared_change(
+            r.change,
+            r.patch.as_ref(),
+            &mut lines,
+            wrap_cols.saturating_sub(4),
+            lang.as_deref(),
+            style_context,
+            usize::MAX,
+        );
         out.extend(prefix_lines(lines, "    ".into(), "    ".into()));
     }
 
@@ -473,268 +518,394 @@ fn detect_lang_for_path(path: &Path) -> Option<String> {
     Some(ext.to_string())
 }
 
+fn parsed_patch(change: &FileChange) -> Option<diffy::Patch<'_, str>> {
+    match change {
+        FileChange::Update { unified_diff, .. } => diffy::Patch::from_str(unified_diff).ok(),
+        _ => None,
+    }
+}
+
+// A missing line denotes the separator between hunks. Stop when the visitor returns false.
+fn visit_change_lines<'a>(
+    change: &'a FileChange,
+    patch: Option<&'a diffy::Patch<'a, str>>,
+    mut visit: impl FnMut(Option<(usize, DiffLineType, &'a str)>) -> bool,
+) {
+    match change {
+        FileChange::Add { content } | FileChange::Delete { content } => {
+            let kind = if matches!(change, FileChange::Add { .. }) {
+                DiffLineType::Insert
+            } else {
+                DiffLineType::Delete
+            };
+            for (i, text) in content.lines().enumerate() {
+                if !visit(Some((i + 1, kind, text))) {
+                    return;
+                }
+            }
+        }
+        FileChange::Update { .. } => {
+            let Some(patch) = patch else {
+                visit(Some((
+                    1,
+                    DiffLineType::Context,
+                    "diff preview unavailable: invalid unified diff",
+                )));
+                return;
+            };
+            for (i, hunk) in patch.hunks().iter().enumerate() {
+                if i > 0 && !visit(None) {
+                    return;
+                }
+                let mut old = hunk.old_range().start();
+                let mut new = hunk.new_range().start();
+                for line in hunk.lines() {
+                    let (number, kind, text) = match line {
+                        diffy::Line::Insert(text) => {
+                            new += 1;
+                            (new - 1, DiffLineType::Insert, *text)
+                        }
+                        diffy::Line::Delete(text) => {
+                            old += 1;
+                            (old - 1, DiffLineType::Delete, *text)
+                        }
+                        diffy::Line::Context(text) => {
+                            old += 1;
+                            new += 1;
+                            (new - 1, DiffLineType::Context, *text)
+                        }
+                    };
+                    if !visit(Some((number, kind, text.trim_end_matches('\n')))) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn change_line_number_width(change: &FileChange, patch: Option<&diffy::Patch<'_, str>>) -> usize {
+    let mut max_number = 0;
+    visit_change_lines(change, patch, |line| {
+        if let Some((number, _, _)) = line {
+            max_number = max_number.max(number);
+        }
+        true
+    });
+    line_number_width(max_number)
+}
+
+#[cfg(test)]
 fn render_change(
     change: &FileChange,
     out: &mut Vec<RtLine<'static>>,
     width: usize,
     lang: Option<&str>,
 ) {
-    let style_context = current_diff_render_style_context();
+    let patch = parsed_patch(change);
+    render_prepared_change(
+        change,
+        patch.as_ref(),
+        out,
+        width,
+        lang,
+        current_diff_render_style_context(),
+        usize::MAX,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_prepared_change(
+    change: &FileChange,
+    patch: Option<&diffy::Patch<'_, str>>,
+    out: &mut Vec<RtLine<'static>>,
+    width: usize,
+    lang: Option<&str>,
+    style_context: DiffRenderStyleContext,
+    max_rows: usize,
+) {
+    let number_width = change_line_number_width(change, patch);
+    if lang.is_none() || matches!(change, FileChange::Update { .. }) && patch.is_none() {
+        // The unscrolled FileChange view only constructs visible rows.
+        // Separator styling is applied below without syntax parsing.
+        visit_change_lines(change, patch, |line| {
+            if out.len() >= max_rows {
+                return false;
+            }
+            if let Some((number, kind, text)) = line {
+                out.extend(plain_diff_lines(
+                    number,
+                    kind,
+                    text,
+                    width,
+                    number_width,
+                    style_context,
+                    max_rows - out.len(),
+                ));
+            } else {
+                out.push(hunk_separator(number_width, style_context));
+            }
+            out.len() < max_rows
+        });
+        return;
+    }
     match change {
-        FileChange::Add { content } => {
-            // Pre-highlight the entire file content as a whole.
-            let syntax_lines = lang.and_then(|l| highlight_code_to_styled_spans(content, l));
-            let line_number_width = line_number_width(content.lines().count());
-            for (i, raw) in content.lines().enumerate() {
-                let syn = syntax_lines.as_ref().and_then(|sl| sl.get(i));
-                if let Some(spans) = syn {
-                    out.extend(push_wrapped_diff_line_inner_with_theme_and_color_level(
-                        i + 1,
-                        DiffLineType::Insert,
-                        raw,
+        FileChange::Add { content } | FileChange::Delete { content } => {
+            let mut push_line = |number, kind, text: &str, syntax: Option<&[RtSpan<'static>]>| {
+                let remaining = max_rows.saturating_sub(out.len());
+                if remaining == 0 {
+                    return false;
+                }
+                if syntax.is_none() {
+                    out.extend(plain_diff_lines(
+                        number,
+                        kind,
+                        text,
                         width,
-                        line_number_width,
-                        Some(spans),
-                        style_context.theme,
-                        style_context.color_level,
-                        style_context.diff_backgrounds,
+                        number_width,
+                        style_context,
+                        remaining,
                     ));
                 } else {
-                    out.extend(push_wrapped_diff_line_inner_with_theme_and_color_level(
-                        i + 1,
-                        DiffLineType::Insert,
-                        raw,
-                        width,
-                        line_number_width,
-                        /*syntax_spans*/ None,
-                        style_context.theme,
-                        style_context.color_level,
-                        style_context.diff_backgrounds,
-                    ));
+                    out.extend(
+                        push_wrapped_diff_line_inner_with_theme_and_color_level(
+                            number,
+                            kind,
+                            text,
+                            width,
+                            number_width,
+                            syntax,
+                            style_context.theme,
+                            style_context.color_level,
+                            style_context.diff_backgrounds,
+                        )
+                        .into_iter()
+                        .take(remaining),
+                    );
+                }
+                out.len() < max_rows
+            };
+            let syntax =
+                lang.and_then(|language| highlight_code_to_styled_spans(content, language));
+            let kind = if matches!(change, FileChange::Add { .. }) {
+                DiffLineType::Insert
+            } else {
+                DiffLineType::Delete
+            };
+            for (i, text) in content.lines().enumerate() {
+                if !push_line(
+                    i + 1,
+                    kind,
+                    text,
+                    syntax
+                        .as_ref()
+                        .and_then(|lines| lines.get(i))
+                        .map(Vec::as_slice),
+                ) {
+                    break;
                 }
             }
         }
-        FileChange::Delete { content } => {
-            let syntax_lines = lang.and_then(|l| highlight_code_to_styled_spans(content, l));
-            let line_number_width = line_number_width(content.lines().count());
-            for (i, raw) in content.lines().enumerate() {
-                let syn = syntax_lines.as_ref().and_then(|sl| sl.get(i));
-                if let Some(spans) = syn {
-                    out.extend(push_wrapped_diff_line_inner_with_theme_and_color_level(
-                        i + 1,
-                        DiffLineType::Delete,
-                        raw,
-                        width,
-                        line_number_width,
-                        Some(spans),
-                        style_context.theme,
-                        style_context.color_level,
-                        style_context.diff_backgrounds,
-                    ));
-                } else {
-                    out.extend(push_wrapped_diff_line_inner_with_theme_and_color_level(
-                        i + 1,
-                        DiffLineType::Delete,
-                        raw,
-                        width,
-                        line_number_width,
-                        /*syntax_spans*/ None,
-                        style_context.theme,
-                        style_context.color_level,
-                        style_context.diff_backgrounds,
-                    ));
-                }
-            }
-        }
-        FileChange::Update { unified_diff, .. } => {
-            if let Ok(patch) = diffy::Patch::from_str(unified_diff) {
-                let mut max_line_number = 0;
-                let mut total_diff_bytes: usize = 0;
-                let mut total_diff_lines: usize = 0;
-                for h in patch.hunks() {
-                    let mut old_ln = h.old_range().start();
-                    let mut new_ln = h.new_range().start();
-                    for l in h.lines() {
-                        let text = match l {
+        FileChange::Update { .. } => {
+            let Some(patch) = patch else {
+                return;
+            };
+            let (bytes, lines) =
+                patch
+                    .hunks()
+                    .iter()
+                    .flat_map(Hunk::lines)
+                    .fold((0, 0), |(bytes, count), line| {
+                        let text = match line {
                             diffy::Line::Insert(t)
                             | diffy::Line::Delete(t)
                             | diffy::Line::Context(t) => t,
                         };
-                        total_diff_bytes += text.len();
-                        total_diff_lines += 1;
-                        match l {
-                            diffy::Line::Insert(_) => {
-                                max_line_number = max_line_number.max(new_ln);
-                                new_ln += 1;
-                            }
-                            diffy::Line::Delete(_) => {
-                                max_line_number = max_line_number.max(old_ln);
-                                old_ln += 1;
-                            }
-                            diffy::Line::Context(_) => {
-                                max_line_number = max_line_number.max(new_ln);
-                                old_ln += 1;
-                                new_ln += 1;
-                            }
-                        }
-                    }
+                        (bytes + text.len(), count + 1)
+                    });
+            let lang = lang.filter(|_| !exceeds_highlight_limits(bytes, lines));
+            for (i, hunk) in patch.hunks().iter().enumerate() {
+                if out.len() >= max_rows {
+                    break;
                 }
-
-                // Skip per-line syntax highlighting when the patch is too
-                // large — avoids thousands of parser initializations that
-                // would stall rendering on big diffs.
-                let diff_lang = if exceeds_highlight_limits(total_diff_bytes, total_diff_lines) {
-                    None
-                } else {
-                    lang
-                };
-
-                let line_number_width = line_number_width(max_line_number);
-                let mut is_first_hunk = true;
-                for h in patch.hunks() {
-                    if !is_first_hunk {
-                        let spacer = format!("{:width$} ", "", width = line_number_width.max(1));
-                        let spacer_span = RtSpan::styled(
-                            spacer,
-                            style_gutter_for(
-                                DiffLineType::Context,
+                if i > 0 {
+                    out.push(hunk_separator(number_width, style_context));
+                }
+                // Old and new sources need independent parser state.
+                let old_syntax = lang.and_then(|language| {
+                    let text: String = hunk
+                        .lines()
+                        .iter()
+                        .filter_map(|line| match line {
+                            diffy::Line::Delete(t) | diffy::Line::Context(t) => Some(*t),
+                            _ => None,
+                        })
+                        .collect();
+                    highlight_code_to_styled_spans(&text, language)
+                });
+                let new_syntax = lang.and_then(|language| {
+                    let text: String = hunk
+                        .lines()
+                        .iter()
+                        .filter_map(|line| match line {
+                            diffy::Line::Insert(t) | diffy::Line::Context(t) => Some(*t),
+                            _ => None,
+                        })
+                        .collect();
+                    highlight_code_to_styled_spans(&text, language)
+                });
+                let (mut old_index, mut new_index) = (0, 0);
+                for line in hunk.lines() {
+                    if out.len() >= max_rows {
+                        break;
+                    }
+                    let (number, kind, text, syntax) = match line {
+                        diffy::Line::Delete(text) => {
+                            let syntax = old_syntax.as_ref().and_then(|lines| lines.get(old_index));
+                            old_index += 1;
+                            (
+                                hunk.old_range().start() + old_index - 1,
+                                DiffLineType::Delete,
+                                text,
+                                syntax,
+                            )
+                        }
+                        diffy::Line::Insert(text) | diffy::Line::Context(text) => {
+                            let kind = if matches!(line, diffy::Line::Insert(_)) {
+                                DiffLineType::Insert
+                            } else {
+                                old_index += 1;
+                                DiffLineType::Context
+                            };
+                            let syntax = new_syntax.as_ref().and_then(|lines| lines.get(new_index));
+                            new_index += 1;
+                            (hunk.new_range().start() + new_index - 1, kind, text, syntax)
+                        }
+                    };
+                    let remaining = max_rows - out.len();
+                    if let Some(syntax) = syntax {
+                        out.extend(
+                            push_wrapped_diff_line_inner_with_theme_and_color_level(
+                                number,
+                                kind,
+                                text.trim_end_matches('\n'),
+                                width,
+                                number_width,
+                                Some(syntax),
                                 style_context.theme,
                                 style_context.color_level,
-                            ),
+                                style_context.diff_backgrounds,
+                            )
+                            .into_iter()
+                            .take(remaining),
                         );
-                        out.push(RtLine::from(vec![spacer_span, "⋮".dim()]));
-                    }
-                    is_first_hunk = false;
-
-                    // Highlight each hunk as a single block so syntect parser
-                    // state is preserved across consecutive lines.
-                    let hunk_syntax_lines = diff_lang.and_then(|language| {
-                        let hunk_text: String = h
-                            .lines()
-                            .iter()
-                            .map(|line| match line {
-                                diffy::Line::Insert(text)
-                                | diffy::Line::Delete(text)
-                                | diffy::Line::Context(text) => *text,
-                            })
-                            .collect();
-                        let syntax_lines = highlight_code_to_styled_spans(&hunk_text, language)?;
-                        (syntax_lines.len() == h.lines().len()).then_some(syntax_lines)
-                    });
-
-                    let mut old_ln = h.old_range().start();
-                    let mut new_ln = h.new_range().start();
-                    for (line_idx, l) in h.lines().iter().enumerate() {
-                        let syntax_spans = hunk_syntax_lines
-                            .as_ref()
-                            .and_then(|syntax_lines| syntax_lines.get(line_idx));
-                        match l {
-                            diffy::Line::Insert(text) => {
-                                let s = text.trim_end_matches('\n');
-                                if let Some(syn) = syntax_spans {
-                                    out.extend(
-                                        push_wrapped_diff_line_inner_with_theme_and_color_level(
-                                            new_ln,
-                                            DiffLineType::Insert,
-                                            s,
-                                            width,
-                                            line_number_width,
-                                            Some(syn),
-                                            style_context.theme,
-                                            style_context.color_level,
-                                            style_context.diff_backgrounds,
-                                        ),
-                                    );
-                                } else {
-                                    out.extend(
-                                        push_wrapped_diff_line_inner_with_theme_and_color_level(
-                                            new_ln,
-                                            DiffLineType::Insert,
-                                            s,
-                                            width,
-                                            line_number_width,
-                                            /*syntax_spans*/ None,
-                                            style_context.theme,
-                                            style_context.color_level,
-                                            style_context.diff_backgrounds,
-                                        ),
-                                    );
-                                }
-                                new_ln += 1;
-                            }
-                            diffy::Line::Delete(text) => {
-                                let s = text.trim_end_matches('\n');
-                                if let Some(syn) = syntax_spans {
-                                    out.extend(
-                                        push_wrapped_diff_line_inner_with_theme_and_color_level(
-                                            old_ln,
-                                            DiffLineType::Delete,
-                                            s,
-                                            width,
-                                            line_number_width,
-                                            Some(syn),
-                                            style_context.theme,
-                                            style_context.color_level,
-                                            style_context.diff_backgrounds,
-                                        ),
-                                    );
-                                } else {
-                                    out.extend(
-                                        push_wrapped_diff_line_inner_with_theme_and_color_level(
-                                            old_ln,
-                                            DiffLineType::Delete,
-                                            s,
-                                            width,
-                                            line_number_width,
-                                            /*syntax_spans*/ None,
-                                            style_context.theme,
-                                            style_context.color_level,
-                                            style_context.diff_backgrounds,
-                                        ),
-                                    );
-                                }
-                                old_ln += 1;
-                            }
-                            diffy::Line::Context(text) => {
-                                let s = text.trim_end_matches('\n');
-                                if let Some(syn) = syntax_spans {
-                                    out.extend(
-                                        push_wrapped_diff_line_inner_with_theme_and_color_level(
-                                            new_ln,
-                                            DiffLineType::Context,
-                                            s,
-                                            width,
-                                            line_number_width,
-                                            Some(syn),
-                                            style_context.theme,
-                                            style_context.color_level,
-                                            style_context.diff_backgrounds,
-                                        ),
-                                    );
-                                } else {
-                                    out.extend(
-                                        push_wrapped_diff_line_inner_with_theme_and_color_level(
-                                            new_ln,
-                                            DiffLineType::Context,
-                                            s,
-                                            width,
-                                            line_number_width,
-                                            /*syntax_spans*/ None,
-                                            style_context.theme,
-                                            style_context.color_level,
-                                            style_context.diff_backgrounds,
-                                        ),
-                                    );
-                                }
-                                old_ln += 1;
-                                new_ln += 1;
-                            }
-                        }
+                    } else {
+                        out.extend(plain_diff_lines(
+                            number,
+                            kind,
+                            text.trim_end_matches('\n'),
+                            width,
+                            number_width,
+                            style_context,
+                            remaining,
+                        ));
                     }
                 }
             }
         }
     }
+}
+
+fn hunk_separator(number_width: usize, context: DiffRenderStyleContext) -> RtLine<'static> {
+    RtLine::from(vec![
+        RtSpan::styled(
+            format!("{:width$} ", "", width = number_width.max(1)),
+            style_gutter_for(DiffLineType::Context, context.theme, context.color_level),
+        ),
+        "⋮".dim(),
+    ])
+}
+
+// Shared by plain rendering and height measurement; yields borrowed chunks with no styling/allocation.
+fn plain_text_chunks(mut text: &str, max_cols: usize) -> impl Iterator<Item = &str> {
+    let mut first = true;
+    std::iter::from_fn(move || {
+        if text.is_empty() {
+            return if std::mem::take(&mut first) {
+                Some("")
+            } else {
+                None
+            };
+        }
+        first = false;
+        let mut columns = 0;
+        let mut end = 0;
+        for ch in text.chars() {
+            let width = ch.width().unwrap_or(if ch == '\t' { TAB_WIDTH } else { 0 });
+            if columns + width > max_cols {
+                break;
+            }
+            end += ch.len_utf8();
+            columns += width;
+        }
+        if end == 0 {
+            end = text.chars().next()?.len_utf8();
+        }
+        let (chunk, rest) = text.split_at(end);
+        text = rest;
+        Some(chunk)
+    })
+}
+
+fn plain_diff_lines(
+    number: usize,
+    kind: DiffLineType,
+    text: &str,
+    width: usize,
+    number_width: usize,
+    context: DiffRenderStyleContext,
+    max_rows: usize,
+) -> Vec<RtLine<'static>> {
+    let gutter_width = number_width.max(1);
+    let content_width = width.saturating_sub(gutter_width + 2).max(1);
+    let (sign, sign_style, content_style) = match kind {
+        DiffLineType::Insert => (
+            '+',
+            style_sign_add(context.theme, context.color_level, context.diff_backgrounds),
+            style_add(context.theme, context.color_level, context.diff_backgrounds),
+        ),
+        DiffLineType::Delete => (
+            '-',
+            style_sign_del(context.theme, context.color_level, context.diff_backgrounds),
+            style_del(context.theme, context.color_level, context.diff_backgrounds),
+        ),
+        DiffLineType::Context => (' ', style_context(), style_context()),
+    };
+    plain_text_chunks(text, content_width)
+        .take(max_rows)
+        .enumerate()
+        .map(|(i, chunk)| {
+            let gutter_style = style_gutter_for(kind, context.theme, context.color_level);
+            let mut spans = if i == 0 {
+                vec![
+                    RtSpan::styled(format!("{number:>gutter_width$} "), gutter_style),
+                    RtSpan::styled(sign.to_string(), sign_style),
+                ]
+            } else {
+                vec![RtSpan::styled(
+                    format!("{:gutter_width$}  ", ""),
+                    gutter_style,
+                )]
+            };
+            if !chunk.is_empty() {
+                spans.push(RtSpan::styled(
+                    chunk.replace('\t', TAB_REPLACEMENT),
+                    content_style,
+                ));
+            }
+            RtLine::from(spans).style(style_line_bg_for(kind, context.diff_backgrounds))
+        })
+        .collect()
 }
 
 /// Format a path for display relative to the current working directory when
@@ -763,21 +934,16 @@ pub(crate) fn display_path_for(path: &Path, cwd: &Path) -> String {
     chosen.display().to_string()
 }
 
-pub(crate) fn calculate_add_remove_from_diff(diff: &str) -> (usize, usize) {
-    if let Ok(patch) = diffy::Patch::from_str(diff) {
-        patch
-            .hunks()
-            .iter()
-            .flat_map(Hunk::lines)
-            .fold((0, 0), |(a, d), l| match l {
-                diffy::Line::Insert(_) => (a + 1, d),
-                diffy::Line::Delete(_) => (a, d + 1),
-                diffy::Line::Context(_) => (a, d),
-            })
-    } else {
-        // For unparsable diffs, return 0 for both counts.
-        (0, 0)
-    }
+fn patch_counts(patch: &diffy::Patch<'_, str>) -> (usize, usize) {
+    patch
+        .hunks()
+        .iter()
+        .flat_map(Hunk::lines)
+        .fold((0, 0), |(a, d), line| match line {
+            diffy::Line::Insert(_) => (a + 1, d),
+            diffy::Line::Delete(_) => (a, d + 1),
+            diffy::Line::Context(_) => (a, d),
+        })
 }
 
 /// Render a single plain-text (non-syntax-highlighted) diff line, wrapped to
@@ -848,6 +1014,21 @@ fn push_wrapped_diff_line_inner_with_theme_and_color_level(
     color_level: DiffColorLevel,
     diff_backgrounds: ResolvedDiffBackgrounds,
 ) -> Vec<RtLine<'static>> {
+    let Some(syn_spans) = syntax_spans else {
+        return plain_diff_lines(
+            line_number,
+            kind,
+            text,
+            width,
+            line_number_width,
+            DiffRenderStyleContext {
+                theme,
+                color_level,
+                diff_backgrounds,
+            },
+            usize::MAX,
+        );
+    };
     let ln_str = line_number.to_string();
 
     // Reserve a fixed number of spaces (equal to the widest line number plus a
@@ -855,18 +1036,10 @@ fn push_wrapped_diff_line_inner_with_theme_and_color_level(
     let gutter_width = line_number_width.max(1);
     let prefix_cols = gutter_width + 1;
 
-    let (sign_char, sign_style, content_style) = match kind {
-        DiffLineType::Insert => (
-            '+',
-            style_sign_add(theme, color_level, diff_backgrounds),
-            style_add(theme, color_level, diff_backgrounds),
-        ),
-        DiffLineType::Delete => (
-            '-',
-            style_sign_del(theme, color_level, diff_backgrounds),
-            style_del(theme, color_level, diff_backgrounds),
-        ),
-        DiffLineType::Context => (' ', style_context(), style_context()),
+    let (sign_char, sign_style) = match kind {
+        DiffLineType::Insert => ('+', style_sign_add(theme, color_level, diff_backgrounds)),
+        DiffLineType::Delete => ('-', style_sign_del(theme, color_level, diff_backgrounds)),
+        DiffLineType::Context => (' ', style_context()),
     };
 
     let line_bg = style_line_bg_for(kind, diff_backgrounds);
@@ -875,7 +1048,7 @@ fn push_wrapped_diff_line_inner_with_theme_and_color_level(
     // When we have syntax spans, compose them with the diff style for a richer
     // view. The sign character keeps the diff color; content gets syntax colors
     // with an overlay modifier for delete lines (dim).
-    if let Some(syn_spans) = syntax_spans {
+    {
         let gutter = format!("{ln_str:>gutter_width$} ");
         let sign = format!("{sign_char}");
         let styled: Vec<RtSpan<'static>> = syn_spans
@@ -913,30 +1086,8 @@ fn push_wrapped_diff_line_inner_with_theme_and_color_level(
             row_spans.extend(chunk);
             lines.push(RtLine::from(row_spans).style(line_bg));
         }
-        return lines;
+        lines
     }
-
-    let available_content_cols = width.saturating_sub(prefix_cols + 1).max(1);
-    let styled = vec![RtSpan::styled(text.to_string(), content_style)];
-    let wrapped_chunks = wrap_styled_spans(&styled, available_content_cols);
-
-    let mut lines: Vec<RtLine<'static>> = Vec::new();
-    for (i, chunk) in wrapped_chunks.into_iter().enumerate() {
-        let mut row_spans: Vec<RtSpan<'static>> = Vec::new();
-        if i == 0 {
-            let gutter = format!("{ln_str:>gutter_width$} ");
-            let sign = format!("{sign_char}");
-            row_spans.push(RtSpan::styled(gutter, gutter_style));
-            row_spans.push(RtSpan::styled(sign, sign_style));
-        } else {
-            let cont_gutter = format!("{:gutter_width$}  ", "");
-            row_spans.push(RtSpan::styled(cont_gutter, gutter_style));
-        }
-        row_spans.extend(chunk);
-        lines.push(RtLine::from(row_spans).style(line_bg));
-    }
-
-    lines
 }
 
 /// Split styled spans into chunks that fit within `max_cols` display columns.
@@ -1320,6 +1471,103 @@ mod tests {
     use ratatui::widgets::Paragraph;
     use ratatui::widgets::WidgetRef;
     use ratatui::widgets::Wrap;
+
+    #[test]
+    fn invalid_patch_reports_unavailable_instead_of_zero_changes() {
+        let changes = HashMap::from([(
+            PathBuf::from("broken.rs"),
+            FileChange::Update {
+                unified_diff: "not a patch".to_string(),
+                move_path: None,
+            },
+        )]);
+        let text = create_diff_summary(&changes, Path::new("/"), 120)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("counts unavailable"));
+        assert!(text.contains("diff preview unavailable: invalid unified diff"));
+        assert!(!text.contains("+0 -0"));
+    }
+
+    #[test]
+    fn summary_handles_widths_smaller_than_its_indent() {
+        let changes = HashMap::from([(
+            PathBuf::from("a.txt"),
+            FileChange::Add {
+                content: "abc".to_string(),
+            },
+        )]);
+        for width in 0..=4 {
+            let lines = create_diff_summary(&changes, Path::new("/"), width);
+            assert_eq!(lines.len(), 4);
+            assert_eq!(lines[1].to_string(), "    1 +a");
+            assert_eq!(lines[3].to_string(), "       c");
+        }
+    }
+
+    #[test]
+    fn height_and_visible_rendering_share_wrapping_rules() {
+        for text in ["", "abc\n", "abcd\t界🙂\nnext\n", "a\u{301}\t界\n"] {
+            let change = FileChange::Add {
+                content: text.to_string(),
+            };
+            for width in [0, 1, 4, 8, 20] {
+                let mut full = Vec::new();
+                render_change(&change, &mut full, width as usize, None);
+                assert_eq!(change.desired_height(width), full.len() as u16);
+                if width == 0 {
+                    continue;
+                }
+                let area = Rect::new(0, 0, width, 2);
+                let mut actual = Buffer::empty(area);
+                let mut expected = Buffer::empty(area);
+                change.render(area, &mut actual);
+                Paragraph::new(full).render(area, &mut expected);
+                assert_eq!(actual, expected);
+            }
+        }
+        let huge = FileChange::Add {
+            content: "x".repeat(100_000),
+        };
+        assert_eq!(huge.desired_height(4), u16::MAX);
+        let mut rows = Vec::new();
+        render_prepared_change(
+            &huge,
+            None,
+            &mut rows,
+            4,
+            None,
+            current_diff_render_style_context(),
+            2,
+        );
+        assert_eq!(
+            rows.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["1 +x", "   x"]
+        );
+    }
+
+    #[test]
+    fn owned_summary_displays_rename_destination() {
+        let cwd = AbsolutePathBuf::current_dir().unwrap();
+        let summary = DiffSummary::new(
+            HashMap::from([(
+                PathBuf::from("before.txt"),
+                FileChange::Update {
+                    unified_diff: diffy::create_patch("before\n", "after\n").to_string(),
+                    move_path: Some(PathBuf::from("after.txt")),
+                },
+            )]),
+            cwd,
+        );
+        let renderable: Box<dyn Renderable> = summary.into();
+        let area = Rect::new(0, 0, 80, 5);
+        let mut buffer = Buffer::empty(area);
+        renderable.render(area, &mut buffer);
+        let first_row: String = (0..80).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(first_row.starts_with("before.txt → after.txt (+1 -1)"));
+    }
 
     #[test]
     fn oversized_added_file_reserves_height_and_renders_visible_rows() {
@@ -2216,9 +2464,10 @@ mod tests {
 
         let lines = create_diff_summary(&changes, &PathBuf::from("/"), /*wrap_cols*/ 80);
         let has_rgb = lines.iter().any(|line| {
-            line.spans
-                .iter()
-                .any(|s| matches!(s.style.fg, Some(ratatui::style::Color::Rgb(..))))
+            line.spans.iter().any(|s| {
+                s.content.chars().any(char::is_alphabetic)
+                    && matches!(s.style.fg, Some(ratatui::style::Color::Rgb(..)))
+            })
         });
         assert!(
             has_rgb,
@@ -2246,7 +2495,10 @@ mod tests {
                 let rgb_tokens = lines
                     .iter()
                     .flat_map(|line| &line.spans)
-                    .filter(|span| matches!(span.style.fg, Some(ratatui::style::Color::Rgb(..))))
+                    .filter(|span| {
+                        span.content.chars().any(char::is_alphabetic)
+                            && matches!(span.style.fg, Some(ratatui::style::Color::Rgb(..)))
+                    })
                     .map(|span| span.content.to_string())
                     .collect::<Vec<_>>();
                 assert!(
@@ -2274,6 +2526,7 @@ mod tests {
         assert!(lines.iter().all(|line| {
             line.spans
                 .iter()
+                .filter(|span| span.content.chars().any(char::is_alphabetic))
                 .all(|span| !matches!(span.style.fg, Some(ratatui::style::Color::Rgb(..))))
         }));
     }
@@ -2290,9 +2543,10 @@ mod tests {
 
         let lines = create_diff_summary(&changes, &PathBuf::from("/"), /*wrap_cols*/ 80);
         let has_rgb = lines.iter().any(|line| {
-            line.spans
-                .iter()
-                .any(|s| matches!(s.style.fg, Some(ratatui::style::Color::Rgb(..))))
+            line.spans.iter().any(|s| {
+                s.content.chars().any(char::is_alphabetic)
+                    && matches!(s.style.fg, Some(ratatui::style::Color::Rgb(..)))
+            })
         });
         assert!(
             has_rgb,
@@ -2440,56 +2694,48 @@ mod tests {
 
     #[test]
     fn large_update_diff_skips_highlighting() {
-        // Build a patch large enough to exceed MAX_HIGHLIGHT_LINES (10_000).
-        // Without the pre-check this would attempt 10k+ parser initializations.
-        let line_count = 10_500;
-        let original: String = (0..line_count).map(|i| format!("line {i}\n")).collect();
-        let modified: String = (0..line_count)
-            .map(|i| {
-                if i % 2 == 0 {
-                    format!("line {i} changed\n")
-                } else {
-                    format!("line {i}\n")
-                }
-            })
-            .collect();
-        let patch = diffy::create_patch(&original, &modified).to_string();
-
-        let mut changes: HashMap<PathBuf, FileChange> = HashMap::new();
-        changes.insert(
-            PathBuf::from("huge.rs"),
-            FileChange::Update {
-                unified_diff: patch,
-                move_path: None,
-            },
-        );
-
-        // Should complete quickly (no per-line parser init). If guardrails
-        // are bypassed this would be extremely slow.
-        let lines = create_diff_summary(&changes, &PathBuf::from("/"), /*wrap_cols*/ 80);
-
-        // The diff rendered without timing out — the guardrails prevented
-        // thousands of per-line parser initializations.  Verify we actually
-        // got output (the patch is non-empty).
-        assert!(
-            lines.len() > 100,
-            "expected many output lines from large diff, got {}",
-            lines.len(),
-        );
-
-        // No span should contain an RGB foreground color (syntax themes
-        // produce RGB; plain diff styles only use named Color variants).
-        for line in &lines {
-            for span in &line.spans {
-                if let Some(ratatui::style::Color::Rgb(..)) = span.style.fg {
-                    panic!(
-                        "large diff should not have syntax-highlighted spans, \
-                         got RGB color in style {:?} for {:?}",
-                        span.style, span.content,
-                    );
-                }
-            }
+        // Each hunk is small enough to highlight; their aggregate exceeds the limit.
+        let mut patch = "--- a/huge.rs\n+++ b/huge.rs\n".to_string();
+        for i in 0..5_250 {
+            let n = i * 10 + 1;
+            patch.push_str(&format!(
+                "@@ -{n} +{n} @@\n-let value = 1;\n+let value = 2;\n"
+            ));
         }
+        let change = FileChange::Update {
+            unified_diff: patch,
+            move_path: None,
+        };
+        let patch = parsed_patch(&change).expect("valid many-hunk patch");
+        let context = DiffRenderStyleContext {
+            theme: DiffTheme::Light,
+            color_level: DiffColorLevel::TrueColor,
+            diff_backgrounds: resolve_diff_backgrounds_for(
+                DiffTheme::Light,
+                DiffColorLevel::TrueColor,
+                DiffScopeBackgroundRgbs::default(),
+            ),
+        };
+        let mut lines = Vec::new();
+        render_prepared_change(
+            &change,
+            Some(&patch),
+            &mut lines,
+            80,
+            Some("rust"),
+            context,
+            usize::MAX,
+        );
+        let content: Vec<_> = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().skip(2))
+            .collect();
+        assert_eq!(content.len(), 10_500);
+        assert!(
+            content
+                .iter()
+                .all(|span| !matches!(span.style.fg, Some(Color::Rgb(..))))
+        );
     }
 
     #[test]
@@ -2512,9 +2758,10 @@ mod tests {
 
         let lines = create_diff_summary(&changes, &PathBuf::from("/"), /*wrap_cols*/ 80);
         let has_rgb = lines.iter().any(|line| {
-            line.spans
-                .iter()
-                .any(|s| matches!(s.style.fg, Some(ratatui::style::Color::Rgb(..))))
+            line.spans.iter().any(|s| {
+                s.content.chars().any(char::is_alphabetic)
+                    && matches!(s.style.fg, Some(ratatui::style::Color::Rgb(..)))
+            })
         });
         assert!(
             has_rgb,
@@ -2524,7 +2771,7 @@ mod tests {
 
     #[test]
     fn update_diff_preserves_multiline_highlight_state_within_hunk() {
-        let original = "fn demo() {\n    let s = \"hello\";\n}\n";
+        let original = "fn demo() {\n    let s = \"old\nworld\";\n}\n";
         let modified = "fn demo() {\n    let s = \"hello\nworld\";\n}\n";
         let patch = diffy::create_patch(original, modified).to_string();
 

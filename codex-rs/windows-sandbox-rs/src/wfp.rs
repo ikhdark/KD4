@@ -420,6 +420,7 @@ fn add_filter(
     )
 }
 
+#[expect(clippy::too_many_arguments, reason = "Fields map directly to FWPM_FILTER0 for static block and dynamic proxy permit rules")]
 fn add_filter_parts(
     engine: HANDLE,
     key: GUID,

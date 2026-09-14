@@ -132,24 +132,18 @@ fn render_pet_image(
     use image_protocol::ImageProtocol;
 
     let Some(request) = request else {
-        if state.last_protocol.take().is_some_and(is_kitty_protocol) {
+        if state.last_protocol.is_some_and(is_kitty_protocol) {
             write!(writer, "{}", image_protocol::kitty_delete_image(image_id))?;
         }
-        if let Some(area) = state.last_sixel_clear_area.take() {
+        if let Some(area) = state.last_sixel_clear_area {
             queue!(writer, SavePosition)?;
             clear_sixel_area(writer, area)?;
             queue!(writer, RestorePosition)?;
         }
         writer.flush()?;
+        *state = PetImageRenderState::default();
         return Ok(());
     };
-
-    if state.last_protocol.take().is_some_and(is_kitty_protocol)
-        || is_kitty_protocol(request.protocol)
-    {
-        write!(writer, "{}", image_protocol::kitty_delete_image(image_id))?;
-    }
-    state.last_protocol = Some(request.protocol);
 
     let payload = match request.protocol {
         ImageProtocol::Kitty => AmbientPetPayload::Text(
@@ -172,20 +166,22 @@ fn render_pet_image(
         }
     };
 
+    if state.last_protocol.is_some_and(is_kitty_protocol) || is_kitty_protocol(request.protocol) {
+        write!(writer, "{}", image_protocol::kitty_delete_image(image_id))?;
+    }
     queue!(writer, SavePosition)?;
     let current_sixel_clear_area = if matches!(request.protocol, ImageProtocol::Sixel) {
         Some(SixelClearArea::from(&request))
     } else {
         None
     };
-    if let Some(previous_area) = state.last_sixel_clear_area.take()
+    if let Some(previous_area) = state.last_sixel_clear_area
         && Some(previous_area) != current_sixel_clear_area
     {
         clear_sixel_area(writer, previous_area)?;
     }
     if let Some(area) = current_sixel_clear_area {
         clear_sixel_area(writer, area)?;
-        state.last_sixel_clear_area = Some(area);
     }
     queue!(writer, MoveTo(request.x, request.y))?;
     match payload {
@@ -194,6 +190,8 @@ fn render_pet_image(
     }
     queue!(writer, RestorePosition)?;
     writer.flush()?;
+    state.last_protocol = Some(request.protocol);
+    state.last_sixel_clear_area = current_sixel_clear_area;
     Ok(())
 }
 
@@ -314,7 +312,7 @@ mod tests {
         std::fs::write(&frame, b"png").unwrap();
         let sixel_dir = dir.path().join("sixel");
         std::fs::create_dir(&sixel_dir).unwrap();
-        let sixel_frame = sixel_dir.join("frame_h75_v2.six");
+        let sixel_frame = sixel_dir.join("frame_h75_v3.six");
         std::fs::write(&sixel_frame, b"fake-sixel").unwrap();
         let request = AmbientPetDraw {
             frame,
@@ -345,7 +343,7 @@ mod tests {
         std::fs::write(&frame, b"png").unwrap();
         let sixel_dir = dir.path().join("sixel");
         std::fs::create_dir(&sixel_dir).unwrap();
-        let sixel_frame = sixel_dir.join("frame_h75_v2.six");
+        let sixel_frame = sixel_dir.join("frame_h75_v3.six");
         std::fs::write(&sixel_frame, b"fake-sixel").unwrap();
         let request = AmbientPetDraw {
             frame,
@@ -388,12 +386,19 @@ mod tests {
             sixel_dir: PathBuf::new(),
         };
         let mut output = Vec::new();
-        let mut state = PetImageRenderState::default();
+        let previous_area = SixelClearArea::from(&request);
+        let mut state = PetImageRenderState {
+            last_protocol: Some(ImageProtocol::Sixel),
+            last_sixel_clear_area: Some(previous_area),
+        };
 
         let err = render_ambient_pet_image(&mut output, &mut state, Some(request)).unwrap_err();
 
         assert!(matches!(err, PetImageRenderError::Asset(_)));
         assert!(err.source().is_some());
+        assert!(output.is_empty());
+        assert_eq!(state.last_protocol, Some(ImageProtocol::Sixel));
+        assert_eq!(state.last_sixel_clear_area, Some(previous_area));
     }
 
     #[test]
@@ -423,5 +428,6 @@ mod tests {
 
         assert!(matches!(err, PetImageRenderError::Terminal(_)));
         assert!(err.source().is_some());
+        assert_eq!(state.last_protocol, Some(ImageProtocol::Kitty));
     }
 }

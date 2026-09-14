@@ -41,7 +41,7 @@ fn is_dangerous_powershell(command: &[String]) -> bool {
     // best-effort shlex split of the script text, not a full PS parser.
     match parse_powershell_invocation(rest) {
         PowershellInvocation::InlineCommand { script, .. } => shlex_split(script)
-            .map(|tokens| is_dangerous_powershell_words(&tokens))
+            .map(|tokens| is_dangerous_powershell_script_tokens(&tokens))
             .unwrap_or(true),
         PowershellInvocation::Opaque
         | PowershellInvocation::Bare
@@ -50,7 +50,32 @@ fn is_dangerous_powershell(command: &[String]) -> bool {
     }
 }
 
+/// Inspect one command already lowered by the restricted PowerShell AST parser.
 pub(crate) fn is_dangerous_powershell_words(words: &[String]) -> bool {
+    let Some((command, args)) = words.split_first() else {
+        return false;
+    };
+    let command = command.to_ascii_lowercase();
+    if matches!(
+        command.as_str(),
+        "start-process" | "start" | "saps" | "invoke-item" | "ii"
+    ) && args_have_url(args)
+    {
+        return true;
+    }
+    if matches!(
+        command.as_str(),
+        "remove-item" | "ri" | "rm" | "del" | "erase" | "rd" | "rmdir"
+    ) && args
+        .iter()
+        .any(|arg| arg.eq_ignore_ascii_case("-Force") || arg.eq_ignore_ascii_case("-Force:$true"))
+    {
+        return true;
+    }
+    is_direct_gui_launch(words)
+}
+
+fn is_dangerous_powershell_script_tokens(words: &[String]) -> bool {
     let tokens_lc: Vec<String> = words
         .iter()
         .map(|t| t.trim_matches('\'').trim_matches('"').to_ascii_lowercase())
@@ -361,9 +386,40 @@ fn is_browser_executable(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::is_dangerous_command_windows;
+    use super::is_dangerous_powershell_words;
 
     fn vec_str(items: &[&str]) -> Vec<String> {
         items.iter().map(std::string::ToString::to_string).collect()
+    }
+
+    #[test]
+    fn review_regression_structured_arguments_are_not_commands() {
+        let words = |items: &[&str]| {
+            items
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert!(!is_dangerous_powershell_words(&words(&[
+            "Write-Output",
+            "Remove-Item",
+            "-Force"
+        ])));
+        assert!(!is_dangerous_powershell_words(&words(&[
+            "Write-Output",
+            "Start-Process",
+            "https://example.com"
+        ])));
+        assert!(is_dangerous_powershell_words(&words(&[
+            "Remove-Item",
+            "file",
+            "-Force"
+        ])));
+        assert!(is_dangerous_command_windows(&words(&[
+            "powershell.exe",
+            "-Command",
+            "echo hi; Remove-Item file -Force"
+        ])));
     }
 
     #[test]

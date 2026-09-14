@@ -23,7 +23,12 @@ impl WindowsSandboxRequestProcessor {
     pub(crate) async fn windows_sandbox_readiness(
         &self,
     ) -> Result<WindowsSandboxReadinessResponse, JSONRPCErrorError> {
-        Ok(determine_windows_sandbox_readiness(&self.config))
+        let config = self
+            .config_manager
+            .load_latest_config(Some(self.config.cwd.to_path_buf()))
+            .await
+            .map_config_load_error()?;
+        Ok(determine_windows_sandbox_readiness(&config))
     }
 
     pub(crate) async fn windows_sandbox_grant_read_root(
@@ -219,10 +224,12 @@ fn resolve_allowed_windows_sandbox_setup_mode(
 }
 
 fn determine_windows_sandbox_readiness(config: &Config) -> WindowsSandboxReadinessResponse {
+    let level = WindowsSandboxLevel::from_config(config);
     determine_windows_sandbox_readiness_for_platform(
         true,
-        WindowsSandboxLevel::from_config(config),
-        sandbox_setup_is_complete(config.codex_home.as_path()),
+        level,
+        matches!(level, WindowsSandboxLevel::Elevated)
+            && sandbox_setup_is_complete(config.codex_home.as_path()),
     )
 }
 
@@ -269,6 +276,46 @@ mod tests {
     use codex_config::types::WindowsSandboxModeToml;
     use codex_protocol::models::PermissionProfile;
     use codex_protocol::permissions::NetworkSandboxPolicy;
+
+    #[tokio::test]
+    async fn windows_sandbox_readiness_observes_config_changes() {
+        let home = tempfile::tempdir().expect("home");
+        let config = core_test_support::load_default_config_for_test(&home).await;
+        let (outgoing, _receiver) = tokio::sync::mpsc::channel(crate::CHANNEL_CAPACITY);
+        let processor = WindowsSandboxRequestProcessor::new(
+            Arc::new(OutgoingMessageSender::new(
+                outgoing,
+                AnalyticsEventsClient::disabled(),
+            )),
+            Arc::new(config),
+            ConfigManager::without_managed_config_for_tests(home.path().to_path_buf()),
+        );
+        std::fs::write(
+            home.path().join("config.toml"),
+            r#"[windows]
+sandbox = "unelevated"
+"#,
+        )
+        .expect("config");
+        assert_eq!(
+            processor
+                .windows_sandbox_readiness()
+                .await
+                .expect("readiness")
+                .status,
+            WindowsSandboxReadiness::Ready
+        );
+        std::fs::write(home.path().join("config.toml"), "").expect("clear config");
+        processor.config_manager.invalidate_load_cache();
+        assert_eq!(
+            processor
+                .windows_sandbox_readiness()
+                .await
+                .expect("readiness")
+                .status,
+            WindowsSandboxReadiness::NotConfigured
+        );
+    }
 
     #[test]
     fn windows_sandbox_grant_read_root_rejects_external_profile() {

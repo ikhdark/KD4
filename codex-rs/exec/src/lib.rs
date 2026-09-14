@@ -86,10 +86,9 @@ use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::models::ActivePermissionProfile;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::ReviewRequest;
-use codex_protocol::protocol::ReviewTarget;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionConfiguredEvent;
@@ -180,7 +179,6 @@ enum InitialOperation {
         items: Vec<UserInput>,
         output_schema: Option<Value>,
     },
-    Review,
 }
 
 enum StdinPromptBehavior {
@@ -251,6 +249,9 @@ fn exec_stderr_env_filter() -> EnvFilter {
 }
 
 pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
+    if matches!(cli.command, Some(ExecCommand::Review(_))) {
+        anyhow::bail!("review requests are not available through the app-server protocol");
+    }
     if let Err(err) = set_default_originator("codex_exec".to_string()) {
         tracing::warn!(?err, "Failed to set codex exec originator override {err:?}");
     }
@@ -655,23 +656,11 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     let default_effort = config.model_reasoning_effort.clone();
 
     let (initial_operation, prompt_summary) = match (command.as_ref(), prompt, images) {
-        (Some(ExecCommand::Review(review_cli)), _, _) => {
-            let review_request = build_review_request(review_cli)?;
-            let summary = codex_core::review_prompts::user_facing_hint(&review_request.target);
-            (InitialOperation::Review, summary)
+        (Some(ExecCommand::Review(_)), _, _) => {
+            anyhow::bail!("review requests are not available through the app-server protocol");
         }
         (Some(ExecCommand::Resume(args)), root_prompt, imgs) => {
-            let prompt_arg = args
-                .prompt
-                .clone()
-                .or_else(|| {
-                    if args.last {
-                        args.session_id.clone()
-                    } else {
-                        None
-                    }
-                })
-                .or(root_prompt);
+            let prompt_arg = args.prompt.clone().or(root_prompt);
             let prompt_text = resolve_prompt(prompt_arg);
             let mut items: Vec<UserInput> = imgs
                 .into_iter()
@@ -818,6 +807,10 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     // Print the effective configuration and initial request so users can see what Codex
     // is using.
     event_processor.print_config_summary(&config, &prompt_summary, &session_configured);
+    if let Some(error) = event_processor.take_output_error() {
+        let _ = client.shutdown().await;
+        return Err(error.into());
+    }
     info!("Codex initialized with event: {session_configured:?}");
 
     let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
@@ -874,11 +867,6 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             info!("Sent prompt with event ID: {task_id}");
             task_id
         }
-        InitialOperation::Review => {
-            return Err(anyhow::anyhow!(
-                "review requests are not available through the app-server protocol"
-            ));
-        }
     };
     exec_span.record("turn.id", task_id.as_str());
 
@@ -887,6 +875,8 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     // exit with a non-zero status for automation-friendly signaling.
     let mut error_seen = false;
     let mut terminal_notification_seen = false;
+    let mut streamed_final_message_seen = false;
+    let mut delivery_error = None;
     let mut interrupt_channel_open = true;
     let primary_thread_id_for_requests = primary_thread_id.to_string();
     loop {
@@ -925,6 +915,41 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 handle_server_request(&client, request, &mut error_seen).await;
             }
             InProcessServerEvent::ServerNotification(mut notification) => {
+                match prepare_server_notification(
+                    config.ephemeral,
+                    &primary_thread_id_for_requests,
+                    &task_id,
+                    streamed_final_message_seen,
+                    &mut notification,
+                    async |thread_id| {
+                        send_request_with_response::<ThreadReadResponse>(
+                            &client,
+                            ClientRequest::ThreadRead {
+                                request_id: request_ids.next(),
+                                params: ThreadReadParams {
+                                    thread_id,
+                                    include_turns: true,
+                                },
+                            },
+                            "thread/read",
+                        )
+                        .await
+                    },
+                )
+                .await
+                {
+                    Ok(false) => continue,
+                    Ok(true) => {}
+                    Err(message) => {
+                        delivery_error = Some(message);
+                        break;
+                    }
+                }
+                if let ServerNotification::ItemCompleted(payload) = &notification
+                    && let AppServerThreadItem::AgentMessage { phase, .. } = &payload.item
+                {
+                    streamed_final_message_seen = *phase == Some(MessagePhase::FinalAnswer);
+                }
                 if let ServerNotification::Error(payload) = &notification {
                     if payload.thread_id == primary_thread_id_for_requests
                         && payload.turn_id == task_id
@@ -953,19 +978,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     }
                 }
 
-                maybe_backfill_turn_completed_items(
-                    config.ephemeral,
-                    &client,
-                    &mut request_ids,
-                    &mut notification,
-                )
-                .await;
-
-                if should_process_notification(
-                    &notification,
-                    &primary_thread_id_for_requests,
-                    &task_id,
-                ) {
+                {
                     match event_processor.process_server_notification(notification) {
                         CodexStatus::Running => {}
                         CodexStatus::InitiateShutdown => {
@@ -989,11 +1002,17 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 event_processor.process_warning(message);
             }
         }
+        if let Some(error) = event_processor.take_output_error() {
+            delivery_error = Some(format!("failed to deliver exec output: {error}"));
+            break;
+        }
     }
 
-    let event_stream_error = (!terminal_notification_seen).then(|| {
-        "in-process app-server event stream closed before the turn reached a terminal state"
-            .to_string()
+    let event_stream_error = delivery_error.or_else(|| {
+        (!terminal_notification_seen).then(|| {
+            "in-process app-server event stream closed before the turn reached a terminal state"
+                .to_string()
+        })
     });
     if let Some(message) = event_stream_error.as_ref() {
         event_processor.process_event_stream_error(message.clone());
@@ -1237,47 +1256,50 @@ fn should_process_notification(
     }
 }
 
-async fn maybe_backfill_turn_completed_items(
+async fn prepare_server_notification(
     thread_ephemeral: bool,
-    client: &InProcessAppServerClient,
-    request_ids: &mut RequestIdSequencer,
+    thread_id: &str,
+    turn_id: &str,
+    streamed_final_message_seen: bool,
     notification: &mut ServerNotification,
-) {
-    // In-process delivery may drop non-terminal item notifications under backpressure while still
-    // guaranteeing `turn/completed`. Because app-server currently emits that completion with an
-    // empty `turn.items`, exec does one last `thread/read` here so human/json output can recover
-    // the final message and reconcile any still-running items before shutdown.
+    read_thread: impl AsyncFnOnce(String) -> Result<ThreadReadResponse, String>,
+) -> Result<bool, String> {
+    // Filter before opening history: attached agents' completions are not ours to recover.
+    if !should_process_notification(notification, thread_id, turn_id) {
+        return Ok(false);
+    }
     if !should_backfill_turn_completed_items(thread_ephemeral, notification) {
-        return;
+        return Ok(true);
     }
-
     let ServerNotification::TurnCompleted(payload) = notification else {
-        return;
+        return Ok(true);
     };
-
-    let response = send_request_with_response::<ThreadReadResponse>(
-        client,
-        ClientRequest::ThreadRead {
-            request_id: request_ids.next(),
-            params: ThreadReadParams {
-                thread_id: payload.thread_id.clone(),
-                include_turns: true,
-            },
-        },
-        "thread/read",
-    )
-    .await;
-
-    match response {
-        Ok(response) => {
-            if let Some(items) = turn_items_for_thread(&response.thread, &payload.turn.id) {
-                payload.turn.items = items;
+    // Terminal notifications can survive queue pressure that drops item completions.
+    let recovered = read_thread(payload.thread_id.clone())
+        .await
+        .and_then(|response| {
+            turn_items_for_thread(response.thread, &payload.turn.id).ok_or_else(|| {
+                format!(
+                    "thread/read did not contain completed turn {}",
+                    payload.turn.id
+                )
+            })
+        });
+    match recovered {
+        Ok(items) => payload.turn.items = items,
+        Err(error) => {
+            let message = format!("failed to recover completed turn output: {error}");
+            if payload.turn.status == codex_app_server_protocol::TurnStatus::Completed
+                && payload.surfaced_result.is_none()
+                && !streamed_final_message_seen
+            {
+                return Err(message);
             }
-        }
-        Err(err) => {
-            warn!("thread/read failed while backfilling turn items for turn completion: {err}");
+            // Missing tool reconciliation must not invalidate an authoritative final result.
+            warn!("{message}");
         }
     }
+    Ok(true)
 }
 
 /// Returns true only when `exec` can safely recover missing turn items from
@@ -1294,14 +1316,14 @@ fn should_backfill_turn_completed_items(
 }
 
 fn turn_items_for_thread(
-    thread: &AppServerThread,
+    thread: AppServerThread,
     turn_id: &str,
 ) -> Option<Vec<AppServerThreadItem>> {
     thread
         .turns
-        .iter()
+        .into_iter()
         .find(|turn| turn.id == turn_id)
-        .map(|turn| turn.items.clone())
+        .map(|turn| turn.items)
 }
 
 fn all_thread_source_kinds() -> Vec<ThreadSourceKind> {
@@ -1329,20 +1351,40 @@ async fn latest_thread_cwd(thread: &AppServerThread) -> PathBuf {
 }
 
 async fn parse_latest_turn_context_cwd(path: &Path) -> Option<PathBuf> {
-    let text = tokio::fs::read_to_string(path).await.ok()?;
-    for line in text.lines().rev() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(trimmed) else {
-            continue;
-        };
-        if let RolloutItem::TurnContext(item) = rollout_line.item {
-            return Some(item.cwd.into_path_buf());
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncSeekExt;
+
+    let mut file = tokio::fs::File::open(path).await.ok()?;
+    let mut position = file.metadata().await.ok()?.len();
+    let mut chunk = [0_u8; 8192];
+    let mut line = Vec::new();
+    // Read only as far back as the newest valid context, without limiting tail size.
+    while position > 0 {
+        let count = position.min(chunk.len() as u64) as usize;
+        position -= count as u64;
+        file.seek(std::io::SeekFrom::Start(position)).await.ok()?;
+        file.read_exact(&mut chunk[..count]).await.ok()?;
+        for &byte in chunk[..count].iter().rev() {
+            if byte == b'\n' {
+                if let Some(cwd) = cwd_from_reversed_rollout_line(&mut line) {
+                    return Some(cwd);
+                }
+                line.clear();
+            } else {
+                line.push(byte);
+            }
         }
     }
-    None
+    cwd_from_reversed_rollout_line(&mut line)
+}
+
+fn cwd_from_reversed_rollout_line(line: &mut [u8]) -> Option<PathBuf> {
+    line.reverse();
+    let rollout_line = serde_json::from_slice::<RolloutLine>(line).ok()?;
+    match rollout_line.item {
+        RolloutItem::TurnContext(item) => Some(item.cwd.into_path_buf()),
+        _ => None,
+    }
 }
 
 fn cwds_match(current_cwd: &Path, session_cwd: &Path) -> bool {
@@ -1385,8 +1427,12 @@ async fn resolve_resume_thread_id(
             .await
             .map_err(anyhow::Error::msg)?;
             for thread in response.data {
-                let latest_cwd = latest_thread_cwd(&thread).await;
-                if args.all || cwds_match(config.cwd.as_path(), latest_cwd.as_path()) {
+                if args.all
+                    || cwds_match(
+                        config.cwd.as_path(),
+                        latest_thread_cwd(&thread).await.as_path(),
+                    )
+                {
                     return Ok(thread.id);
                 }
                 cwd_filtered_out = true;
@@ -1472,8 +1518,12 @@ async fn resolve_resume_thread_id(
             if thread.name.as_deref() != Some(session_id) {
                 continue;
             }
-            let latest_cwd = latest_thread_cwd(&thread).await;
-            if args.all || cwds_match(config.cwd.as_path(), latest_cwd.as_path()) {
+            if args.all
+                || cwds_match(
+                    config.cwd.as_path(),
+                    latest_thread_cwd(&thread).await.as_path(),
+                )
+            {
                 return Ok(thread.id);
             }
             cwd_filtered_out = true;
@@ -1587,24 +1637,11 @@ async fn reject_server_request(
         .map_err(|err| format!("failed to reject `{method}` server request: {err}"))
 }
 
-fn server_request_method_name(request: &ServerRequest) -> String {
-    serde_json::to_value(request)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("method")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
 async fn handle_server_request(
     client: &InProcessAppServerClient,
     request: ServerRequest,
     error_seen: &mut bool,
 ) {
-    let method = server_request_method_name(&request);
     let handle_result = match request {
         ServerRequest::McpServerElicitationRequest { request_id, .. } => {
             // Exec auto-cancels elicitation instead of surfacing it
@@ -1627,7 +1664,7 @@ async fn handle_server_request(
             reject_server_request(
                 client,
                 request_id,
-                &method,
+                "item/commandExecution/requestApproval",
                 format!(
                     "command execution approval is not supported in exec mode for thread `{}`",
                     params.thread_id
@@ -1639,7 +1676,7 @@ async fn handle_server_request(
             reject_server_request(
                 client,
                 request_id,
-                &method,
+                "item/fileChange/requestApproval",
                 format!(
                     "file change approval is not supported in exec mode for thread `{}`",
                     params.thread_id
@@ -1651,7 +1688,7 @@ async fn handle_server_request(
             reject_server_request(
                 client,
                 request_id,
-                &method,
+                "item/tool/requestUserInput",
                 format!(
                     "request_user_input is not supported in exec mode for thread `{}`",
                     params.thread_id
@@ -1663,7 +1700,7 @@ async fn handle_server_request(
             reject_server_request(
                 client,
                 request_id,
-                &method,
+                "item/tool/call",
                 format!(
                     "dynamic tool calls are not supported in exec mode for thread `{}`",
                     params.thread_id
@@ -1675,7 +1712,7 @@ async fn handle_server_request(
             reject_server_request(
                 client,
                 request_id,
-                &method,
+                "account/chatgptAuthTokens/refresh",
                 "chatgpt auth token refresh is not supported in exec mode".to_string(),
             )
             .await
@@ -1684,7 +1721,7 @@ async fn handle_server_request(
             reject_server_request(
                 client,
                 request_id,
-                &method,
+                "attestation/generate",
                 "attestation generation is not supported in exec mode".to_string(),
             )
             .await
@@ -1694,7 +1731,9 @@ async fn handle_server_request(
                 serde_json::to_value(response)
                     .map_err(|err| format!("failed to serialize current time response: {err}"))
             }) {
-                Ok(response) => resolve_server_request(client, request_id, response, &method).await,
+                Ok(response) => {
+                    resolve_server_request(client, request_id, response, "currentTime/read").await
+                }
                 Err(err) => Err(err),
             }
         }
@@ -1702,7 +1741,7 @@ async fn handle_server_request(
             reject_server_request(
                 client,
                 request_id,
-                &method,
+                "applyPatchApproval",
                 format!(
                     "apply_patch approval is not supported in exec mode for thread `{}`",
                     params.conversation_id
@@ -1714,7 +1753,7 @@ async fn handle_server_request(
             reject_server_request(
                 client,
                 request_id,
-                &method,
+                "execCommandApproval",
                 format!(
                     "exec command approval is not supported in exec mode for thread `{}`",
                     params.conversation_id
@@ -1726,7 +1765,7 @@ async fn handle_server_request(
             reject_server_request(
                 client,
                 request_id,
-                &method,
+                "item/permissions/requestApproval",
                 format!(
                     "permissions approval is not supported in exec mode for thread `{}`",
                     params.thread_id
@@ -1925,36 +1964,6 @@ fn resolve_root_prompt(prompt_arg: Option<String>) -> String {
         }
         maybe_dash => resolve_prompt(maybe_dash),
     }
-}
-
-fn build_review_request(args: &ReviewArgs) -> anyhow::Result<ReviewRequest> {
-    let target = if args.uncommitted {
-        ReviewTarget::UncommittedChanges
-    } else if let Some(branch) = args.base.clone() {
-        ReviewTarget::BaseBranch { branch }
-    } else if let Some(sha) = args.commit.clone() {
-        ReviewTarget::Commit {
-            sha,
-            title: args.commit_title.clone(),
-        }
-    } else if let Some(prompt_arg) = args.prompt.clone() {
-        let prompt = resolve_prompt(Some(prompt_arg)).trim().to_string();
-        if prompt.is_empty() {
-            anyhow::bail!("Review prompt cannot be empty");
-        }
-        ReviewTarget::Custom {
-            instructions: prompt,
-        }
-    } else {
-        anyhow::bail!(
-            "Specify --uncommitted, --base, --commit, or provide custom review instructions"
-        );
-    };
-
-    Ok(ReviewRequest {
-        target,
-        user_facing_hint: None,
-    })
 }
 
 #[cfg(test)]

@@ -43,6 +43,7 @@ pub enum ToolCallOutcome {
     /// The host cancelled the tool before normal completion. Cancellation can
     /// win before the dispatch path accepts the call, so contributors should not
     /// assume a matching start callback exists.
+    /// Cancellation does not prove that the handler never ran or that its effects were rolled back.
     Aborted,
 }
 

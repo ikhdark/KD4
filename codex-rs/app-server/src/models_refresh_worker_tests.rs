@@ -20,17 +20,19 @@ use super::*;
 
 #[derive(Debug)]
 struct TestModelsEndpoint {
+    fail_first_fetch: bool,
     fetch_count: AtomicUsize,
     fetched: Notify,
-    release_second_fetch: Notify,
+    release_fetch: Notify,
 }
 
 impl TestModelsEndpoint {
-    fn new() -> Arc<Self> {
+    fn new(fail_first_fetch: bool) -> Arc<Self> {
         Arc::new(Self {
+            fail_first_fetch,
             fetch_count: AtomicUsize::new(0),
             fetched: Notify::new(),
-            release_second_fetch: Notify::new(),
+            release_fetch: Notify::new(),
         })
     }
 
@@ -62,21 +64,30 @@ impl ModelsEndpointClient for TestModelsEndpoint {
         Box::pin(async move {
             let fetch_index = self.fetch_count.fetch_add(1, Ordering::SeqCst);
             self.fetched.notify_one();
-            if fetch_index == 0 {
+            if fetch_index == 0 && self.fail_first_fetch {
                 return Err(CodexErr::Io(std::io::Error::other("test failure")));
             }
-            if fetch_index == 1 {
-                self.release_second_fetch.notified().await;
+            if fetch_index == usize::from(self.fail_first_fetch) {
+                self.release_fetch.notified().await;
             }
-            Ok((Vec::new(), None))
+            Ok((vec![refreshed_test_model()], None))
         })
     }
+}
+
+fn refreshed_test_model() -> ModelInfo {
+    let mut model = codex_models_manager::bundled_models_response()
+        .expect("bundled catalog")
+        .models
+        .remove(0);
+    model.slug = "fresh-test-model".to_string();
+    model
 }
 
 #[tokio::test(start_paused = true)]
 async fn activity_before_deadline_arms_remaining_delay_and_periodic_refresh() {
     let codex_home = tempdir().expect("temp dir");
-    let endpoint = TestModelsEndpoint::new();
+    let endpoint = TestModelsEndpoint::new(/*fail_first_fetch*/ true);
     let models_manager: SharedModelsManager = Arc::new(OpenAiModelsManager::new(
         codex_home.path().to_path_buf(),
         endpoint.clone(),
@@ -114,7 +125,7 @@ async fn activity_before_deadline_arms_remaining_delay_and_periodic_refresh() {
 #[tokio::test(start_paused = true)]
 async fn activity_after_deadline_refreshes_before_serving_catalog() {
     let codex_home = tempdir().expect("temp dir");
-    let endpoint = TestModelsEndpoint::new();
+    let endpoint = TestModelsEndpoint::new(/*fail_first_fetch*/ false);
     let models_manager: SharedModelsManager = Arc::new(OpenAiModelsManager::new(
         codex_home.path().to_path_buf(),
         endpoint.clone(),
@@ -132,7 +143,13 @@ async fn activity_after_deadline_refreshes_before_serving_catalog() {
     tokio::task::yield_now().await;
     assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 0);
 
-    models_manager.get_remote_models().await;
+    let catalog_read = models_manager.get_remote_models();
+    tokio::pin!(catalog_read);
+    assert!(futures::poll!(&mut catalog_read).is_pending());
+    endpoint.wait_for_fetch_count(1).await;
+    assert!(futures::poll!(&mut catalog_read).is_pending());
+    endpoint.release_fetch.notify_one();
+    assert_eq!(catalog_read.await, vec![refreshed_test_model()]);
     assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 1);
     worker.shutdown_and_wait().await;
 }
@@ -140,7 +157,7 @@ async fn activity_after_deadline_refreshes_before_serving_catalog() {
 #[tokio::test(start_paused = true)]
 async fn shutdown_cancels_and_joins_an_inflight_refresh() {
     let codex_home = tempdir().expect("temp dir");
-    let endpoint = TestModelsEndpoint::new();
+    let endpoint = TestModelsEndpoint::new(/*fail_first_fetch*/ true);
     let models_manager: SharedModelsManager = Arc::new(OpenAiModelsManager::new(
         codex_home.path().to_path_buf(),
         endpoint.clone(),
@@ -164,4 +181,32 @@ async fn shutdown_cancels_and_joins_an_inflight_refresh() {
     worker.shutdown_and_wait().await;
 
     assert!(worker.task.lock().expect("worker task lock").is_none());
+    tokio::time::timeout(Duration::from_secs(1), models_manager.get_remote_models())
+        .await
+        .expect("shutdown must release catalog readers");
+    assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_worker_before_first_poll_releases_catalog_readers() {
+    let codex_home = tempdir().expect("temp dir");
+    let endpoint = TestModelsEndpoint::new(/*fail_first_fetch*/ true);
+    let models_manager: SharedModelsManager = Arc::new(OpenAiModelsManager::new(
+        codex_home.path().to_path_buf(),
+        endpoint.clone(),
+        None,
+        Arc::new(|| "test-provider-identity".to_string()),
+    ));
+    let interval = Duration::from_secs(10);
+    let worker = spawn_with_interval(
+        &models_manager,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        interval,
+    );
+    drop(worker);
+    tokio::time::advance(interval).await;
+    tokio::time::timeout(Duration::from_secs(1), models_manager.get_remote_models())
+        .await
+        .expect("aborting an unpolled worker must release catalog readers");
+    assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 0);
 }

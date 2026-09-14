@@ -47,7 +47,7 @@ impl PersonalAccessTokenAuth {
             .filter(|base_url| !base_url.is_empty())
             .unwrap_or_else(|| PROD_AUTHAPI_BASE_URL.to_string());
         let endpoint = whoami_endpoint(&authapi_base_url);
-        let client = create_default_auth_client(&endpoint, auth_route_config)?;
+        let client = create_default_auth_client(&endpoint, auth_route_config).await?;
         hydrate_personal_access_token(&client, &endpoint, access_token).await
     }
 

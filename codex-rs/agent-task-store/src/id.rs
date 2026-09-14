@@ -41,7 +41,7 @@ macro_rules! uuid_v7_id {
             type Error = StoreError;
 
             fn try_from(value: Uuid) -> Result<Self, Self::Error> {
-                if value.get_version_num() != 7 {
+                if value.get_version_num() != 7 || value.get_variant() != uuid::Variant::RFC4122 {
                     return Err(StoreError::InvalidUuidV7 {
                         kind: stringify!($name),
                         value: value.to_string(),

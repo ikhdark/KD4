@@ -308,14 +308,16 @@ pub(super) fn split_server_envelope_for_transport(
         return Ok(vec![envelope]);
     }
 
-    let ServerEvent::ServerMessage { message } = envelope.event.clone() else {
+    let ServerEvent::ServerMessage { message } = &envelope.event else {
         unreachable!("server message variant checked above");
     };
     let raw = serde_json::to_vec(message.as_ref()).map_err(io::Error::other)?;
     let message_size_bytes = raw.len();
     if message_size_bytes > REMOTE_CONTROL_REASSEMBLED_MAX_BYTES {
-        warn!("dropping remote-control server envelope that exceeds reassembled size limit");
-        return Ok(Vec::new());
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "remote-control server envelope exceeds reassembled size limit",
+        ));
     }
 
     let minimal_segment_count =
@@ -329,8 +331,10 @@ pub(super) fn split_server_envelope_for_transport(
         minimal_chunk,
     )? > REMOTE_CONTROL_SEGMENT_MAX_BYTES
     {
-        warn!("dropping remote-control server envelope that cannot fit within segment size limit");
-        return Ok(Vec::new());
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "remote-control server envelope cannot fit within segment size limit",
+        ));
     }
 
     let mut segment_count = usize::max(
@@ -340,39 +344,34 @@ pub(super) fn split_server_envelope_for_transport(
     loop {
         let chunk_size = usize::max(1, message_size_bytes.div_ceil(segment_count));
         segment_count = message_size_bytes.div_ceil(chunk_size);
-        let segments_fit = raw
+        let segments = raw
             .chunks(chunk_size)
             .enumerate()
-            .all(|(segment_id, chunk)| {
-                serialized_chunk_len(
+            .map(|(segment_id, chunk)| {
+                build_chunk_envelope(
                     &envelope,
                     segment_id,
                     segment_count,
                     message_size_bytes,
                     chunk,
                 )
-                .is_ok_and(|size| size <= REMOTE_CONTROL_SEGMENT_MAX_BYTES)
-            });
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut segments_fit = true;
+        for segment in &segments {
+            if serialized_len(segment)? > REMOTE_CONTROL_SEGMENT_MAX_BYTES {
+                segments_fit = false;
+                break;
+            }
+        }
         if segments_fit {
-            return raw
-                .chunks(chunk_size)
-                .enumerate()
-                .map(|(segment_id, chunk)| {
-                    build_chunk_envelope(
-                        &envelope,
-                        segment_id,
-                        segment_count,
-                        message_size_bytes,
-                        chunk,
-                    )
-                })
-                .collect();
+            return Ok(segments);
         }
         if chunk_size == 1 {
-            warn!(
-                "dropping remote-control server envelope that cannot fit within segment size limit"
-            );
-            return Ok(Vec::new());
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "remote-control server envelope cannot fit within segment size limit",
+            ));
         }
         let next_segment_count = segment_count + 1;
         let next_chunk_size = usize::max(1, message_size_bytes.div_ceil(next_segment_count));

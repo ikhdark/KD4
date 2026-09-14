@@ -4,6 +4,28 @@ use pretty_assertions::assert_eq;
 use std::path::Path;
 
 #[test]
+fn disabling_features_writes_false_instead_of_inheriting() {
+    for feature in codex_features::FEATURES {
+        assert_eq!(
+            build_feature_enabled_edit(feature.key, false),
+            ConfigEdit {
+                key_path: format!("features.{}", feature.key),
+                value: serde_json::json!(false),
+                merge_strategy: MergeStrategy::Replace,
+            }
+        );
+    }
+}
+
+#[test]
+fn trusted_project_edit_escapes_control_characters() {
+    assert_eq!(
+        trusted_project_edit(Path::new("/workspace/team\nproject\tname\u{7f}")).key_path,
+        "projects.\"/workspace/team\\nproject\\tname\\u007f\".trust_level"
+    );
+}
+
+#[test]
 fn app_scoped_key_path_quotes_dotted_app_ids() {
     assert_eq!(
         app_scoped_key_path("plugin.linear", "enabled"),

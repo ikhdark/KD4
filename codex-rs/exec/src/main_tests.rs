@@ -26,14 +26,8 @@ fn top_cli_parses_resume_prompt_after_config_flag() {
     let Some(codex_exec::Command::Resume(args)) = inner.command.as_ref() else {
         panic!("expected resume command");
     };
-    let effective_prompt = args.prompt.clone().or_else(|| {
-        if args.last {
-            args.session_id.clone()
-        } else {
-            None
-        }
-    });
-    assert_eq!(effective_prompt.as_deref(), Some(PROMPT));
+    assert_eq!(args.session_id, None);
+    assert_eq!(args.prompt.as_deref(), Some(PROMPT));
     assert_eq!(inner.config_overrides.raw_overrides.len(), 1);
     assert_eq!(
         inner.config_overrides.raw_overrides[0],

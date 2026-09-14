@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
+from datetime import datetime
 from pathlib import Path
+import re
 import os
 import subprocess
 import tempfile
@@ -74,11 +76,13 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             fake_bin = temp_path / "bin"
             fake_bin.mkdir()
             fake_cargo = fake_bin / "cargo.cmd"
+            calls = temp_path / "cargo-calls.txt"
             fake_cargo.write_text(
                 "\r\n".join(
                     [
                         "@echo off",
                         "echo fake cargo %*",
+                        f'echo invoked>>"{calls}"',
                         "echo cargo progress 1>&2",
                         "echo cargoTargetDirEnv=%CARGO_TARGET_DIR%",
                         "exit /b 0",
@@ -107,7 +111,7 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             self.assertIn(" build --target-dir ", result.stdout)
             self.assertIn("target\\publish-release", result.stdout)
             self.assertNotRegex(result.stdout, r"fake cargo .* check ")
-            self.assertEqual(result.stdout.count("fake cargo "), 1)
+            self.assertEqual(calls.read_text().splitlines(), ["invoked"])
             self.assertIn("cargoTargetDirEnv=", result.stdout)
             self.assertNotIn("inherited-target", result.stdout)
             self.assert_no_publish_temps(install_dir)
@@ -386,7 +390,9 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
                 result.stdout + result.stderr,
             )
 
-    def test_test_run_executes_build_and_doctor_without_publishing(self) -> None:
+    def test_test_run_reuses_cached_build_and_runs_doctor_without_publishing(
+        self,
+    ) -> None:
         self.init_repo_fixture()
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -639,7 +645,11 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             self.assertIn(f"metadata commit={expected_commit}", result.stdout)
             self.assertIn("metadata dirty=false", result.stdout)
             self.assertIn("metadata profile=release", result.stdout)
-            self.assertNotIn("metadata timestamp=unknown", result.stdout)
+            timestamp = re.search(
+                r"^metadata timestamp=(.+)$", result.stdout, re.MULTILINE
+            )
+            self.assertIsNotNone(timestamp, result.stdout)
+            self.assertIsNotNone(datetime.fromisoformat(timestamp.group(1).strip()))
             self.assert_no_publish_temps(install_dir)
 
 

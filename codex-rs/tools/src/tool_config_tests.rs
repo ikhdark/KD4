@@ -144,3 +144,39 @@ fn request_user_input_modes_follow_default_mode_feature() {
         vec![ModeKind::Default, ModeKind::Plan]
     );
 }
+
+#[test]
+fn shell_features_override_model_preferences() {
+    for (model_type, without_unified) in [
+        (ConfigShellToolType::Disabled, ConfigShellToolType::Disabled),
+        (
+            ConfigShellToolType::Default,
+            ConfigShellToolType::ShellCommand,
+        ),
+        (
+            ConfigShellToolType::Local,
+            ConfigShellToolType::ShellCommand,
+        ),
+    ] {
+        let model = model_with_shell_type(model_type);
+        let mut features = shell_features();
+        assert_eq!(
+            shell_type_for_model_and_features(&model, &features),
+            without_unified
+        );
+        features.enable(Feature::UnifiedExec);
+        assert_eq!(
+            shell_type_for_model_and_features(&model, &features),
+            if codex_utils_pty::conpty_supported() {
+                ConfigShellToolType::UnifiedExec
+            } else {
+                ConfigShellToolType::ShellCommand
+            }
+        );
+        features.disable(Feature::ShellTool);
+        assert_eq!(
+            shell_type_for_model_and_features(&model, &features),
+            ConfigShellToolType::Disabled
+        );
+    }
+}

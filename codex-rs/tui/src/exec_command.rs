@@ -16,25 +16,21 @@ pub(crate) fn strip_bash_lc_and_escape(command: &[String]) -> String {
     escape_command(command)
 }
 
+/// Recover argv only from the canonical POSIX encoding used by `escape_command`.
+/// Other command text has no shell identity and must remain intact for display.
 pub(crate) fn split_command_string(command: &str) -> Vec<String> {
     let Some(parts) = shlex::split(command) else {
         return vec![command.to_string()];
     };
     match shlex::try_join(parts.iter().map(String::as_str)) {
-        Ok(round_trip)
-            if round_trip == command
-                || (!command.contains(":\\")
-                    && shlex::split(&round_trip).as_ref() == Some(&parts)) =>
-        {
-            parts
-        }
+        Ok(round_trip) if round_trip == command => parts,
         _ => vec![command.to_string()],
     }
 }
 
 /// If `path` is absolute and inside $HOME, return the part *after* the home
-/// directory; otherwise, return the path as-is. Note if `path` is the homedir,
-/// this will return and empty path.
+/// directory; otherwise, return `None`. If `path` is the home directory,
+/// this returns an empty path.
 pub(crate) fn relativize_to_home<P>(path: P) -> Option<PathBuf>
 where
     P: AsRef<Path>,
@@ -103,5 +99,12 @@ mod tests {
     fn split_command_string_preserves_non_roundtrippable_windows_commands() {
         let command = r#"C:\Program Files\Git\bin\bash.exe -lc "echo hi""#;
         assert_eq!(split_command_string(command), vec![command.to_string()]);
+        for command in [
+            r".\tool.exe .\data.txt",
+            r"\\server\share\tool.exe data",
+            "echo \"hi\"",
+        ] {
+            assert_eq!(split_command_string(command), vec![command.to_string()]);
+        }
     }
 }

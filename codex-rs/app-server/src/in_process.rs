@@ -491,10 +491,16 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
 
         let (writer_tx, mut writer_rx) = mpsc::channel::<QueuedOutgoingMessage>(channel_capacity);
         let outbound_initialized = Arc::new(AtomicBool::new(false));
-        outgoing_message_sender
-            .connection_opened(IN_PROCESS_CONNECTION_ID, Arc::clone(&outbound_initialized))
-            .await;
+        let delivery_failure = tokio_util::sync::CancellationToken::new();
         let outbound_experimental_api_enabled = Arc::new(AtomicBool::new(false));
+        outgoing_message_sender
+            .connection_opened_with_runtime(
+                IN_PROCESS_CONNECTION_ID,
+                Arc::clone(&outbound_initialized),
+                Arc::clone(&outbound_experimental_api_enabled),
+                delivery_failure.clone(),
+            )
+            .await;
         let outbound_opted_out_notification_methods = Arc::new(
             crate::transport::OutboundNotificationOptOuts::new(HashSet::new()),
         );
@@ -564,21 +570,23 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                                         &outbound_initialized,
                                     )
                                     .await;
-                                let opted_out_notification_methods_snapshot =
-                                    session.opted_out_notification_methods();
-                                let experimental_api_enabled =
-                                    session.experimental_api_enabled();
                                 let is_initialized = session.initialized();
-                                if !outbound_opted_out_notification_methods
-                                    .replace(opted_out_notification_methods_snapshot)
-                                {
-                                    warn!("failed to update outbound opted-out notifications");
-                                }
-                                outbound_experimental_api_enabled.store(
-                                    experimental_api_enabled,
-                                    Ordering::Release,
-                                );
                                 if !was_initialized && is_initialized {
+                                    let opted_out_notification_methods_snapshot =
+                                        session.opted_out_notification_methods();
+                                    let experimental_api_enabled =
+                                        session.experimental_api_enabled();
+
+                                    if !outbound_opted_out_notification_methods
+                                        .replace(opted_out_notification_methods_snapshot)
+                                    {
+                                        warn!("failed to update outbound opted-out notifications");
+                                    }
+                                    outbound_experimental_api_enabled.store(
+                                        experimental_api_enabled,
+                                        Ordering::Release,
+                                    );
+
                                     processor
                                         .initialize_processor
                                         .send_initialize_notifications()
@@ -626,7 +634,11 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
         let mut skipped_events = 0usize;
 
         loop {
+            if delivery_failure.is_cancelled() {
+                break;
+            }
             tokio::select! {
+                _ = delivery_failure.cancelled() => break,
                 message = client_rx.recv() => {
                     match message {
                         Some(InProcessClientMessage::Request { request, response_tx }) => {
@@ -754,13 +766,14 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                             }
                         }
                         OutgoingMessage::AppServerNotification(notification) => {
-                            if !forward_server_notification(
-                                &event_tx,
-                                &mut skipped_events,
-                                notification,
-                            )
-                            .await
-                            {
+                            if !tokio::select! {
+                                _ = delivery_failure.cancelled() => false,
+                                delivered = forward_server_notification(
+                                    &event_tx,
+                                    &mut skipped_events,
+                                    notification,
+                                ) => delivered,
+                            } {
                                 break;
                             }
                         }
@@ -912,8 +925,9 @@ mod tests {
             .expect("request should succeed");
         assert!(response.is_object());
 
-        let _parsed: ConfigRequirementsReadResponse =
+        let parsed: ConfigRequirementsReadResponse =
             serde_json::from_value(response).expect("response should match v2 schema");
+        assert_eq!(parsed.requirements, None);
         client
             .shutdown()
             .await
@@ -975,12 +989,76 @@ mod tests {
         })
         .await
         .expect("clamped channel should accept the request before the deadline");
-        let _parsed: ConfigRequirementsReadResponse =
+        let parsed: ConfigRequirementsReadResponse =
             serde_json::from_value(response).expect("response should match v2 schema");
+        assert_eq!(parsed.requirements, None);
         client
             .shutdown()
             .await
             .expect("in-process runtime should shutdown cleanly");
+    }
+
+    #[tokio::test]
+    async fn standalone_process_notifications_wait_for_queue_capacity() {
+        use codex_app_server_protocol::CommandExecOutputDeltaNotification;
+        use codex_app_server_protocol::CommandExecOutputStream;
+        use codex_app_server_protocol::ProcessExitedNotification;
+        use codex_app_server_protocol::ProcessOutputDeltaNotification;
+        use codex_app_server_protocol::ProcessOutputStream;
+
+        let notifications = [
+            ServerNotification::CommandExecOutputDelta(CommandExecOutputDeltaNotification {
+                process_id: "command-1".into(),
+                stream: CommandExecOutputStream::Stdout,
+                delta_base64: "aGVsbG8=".into(),
+                cap_reached: false,
+            }),
+            ServerNotification::ProcessOutputDelta(ProcessOutputDeltaNotification {
+                process_handle: "process-1".into(),
+                stream: ProcessOutputStream::Stderr,
+                delta_base64: "ZXJyb3I=".into(),
+                cap_reached: true,
+            }),
+            ServerNotification::ProcessExited(ProcessExitedNotification {
+                process_handle: "process-1".into(),
+                exit_code: 7,
+                stdout: "hello".into(),
+                stdout_cap_reached: false,
+                stderr: "error".into(),
+                stderr_cap_reached: true,
+            }),
+        ];
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        for expected in notifications {
+            event_tx
+                .send(InProcessServerEvent::Lagged { skipped: 123 })
+                .await
+                .unwrap();
+            let mut skipped = 0;
+            let mut delivery = Box::pin(forward_server_notification(
+                &event_tx,
+                &mut skipped,
+                expected.clone(),
+            ));
+            assert!(
+                futures::poll!(&mut delivery).is_pending(),
+                "output must wait when the queue is full"
+            );
+            assert!(matches!(
+                event_rx.recv().await,
+                Some(InProcessServerEvent::Lagged { skipped: 123 })
+            ));
+            assert!(delivery.await);
+            let Some(InProcessServerEvent::ServerNotification(actual)) = event_rx.recv().await
+            else {
+                panic!("expected standalone notification");
+            };
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            assert_eq!(skipped, 0);
+        }
     }
 
     #[tokio::test]
@@ -1069,6 +1147,63 @@ mod tests {
             .shutdown()
             .await
             .expect("in-process runtime should shutdown cleanly");
+    }
+
+    #[tokio::test]
+    async fn delivery_failure_closes_in_process_runtime_and_settles_waiting_request() {
+        let client = start_test_client_with_capacity(SessionSource::Cli, 1).await;
+        let outgoing = client._test_outgoing.upgrade().expect("runtime sender");
+        outgoing
+            .send_server_notification_to_connection_and_wait(
+                IN_PROCESS_CONNECTION_ID,
+                ServerNotification::ConfigWarning(ConfigWarningNotification {
+                    summary: "fill".to_string(),
+                    details: None,
+                    path: None,
+                    range: None,
+                }),
+            )
+            .await;
+        outgoing
+            .send_server_notification_to_connections(
+                &[IN_PROCESS_CONNECTION_ID],
+                ServerNotification::AgentMessageDelta(AgentMessageDeltaNotification {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    item_id: "item-1".to_string(),
+                    delta: "blocked".to_string(),
+                    memory_citation: None,
+                }),
+            )
+            .await;
+        let sender = client.sender();
+        let request = sender.request(ClientRequest::ConfigRequirementsRead {
+            request_id: RequestId::Integer(99),
+            params: None,
+        });
+        tokio::pin!(request);
+        assert!(
+            futures::poll!(&mut request).is_pending(),
+            "request must be admitted before delivery fails"
+        );
+        outgoing
+            .fail_connection_delivery(IN_PROCESS_CONNECTION_ID)
+            .await;
+        let result = timeout(Duration::from_secs(2), request)
+            .await
+            .expect("request must not hang after delivery failure");
+        assert!(
+            match result {
+                Err(_) => true,
+                Ok(response) => response.is_err(),
+            },
+            "failed runtime cannot return a successful response"
+        );
+        drop(outgoing);
+        timeout(Duration::from_secs(2), client.runtime_handle)
+            .await
+            .expect("runtime must release blocked event delivery")
+            .expect("runtime task");
     }
 
     #[tokio::test]

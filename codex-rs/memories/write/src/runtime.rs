@@ -37,7 +37,6 @@ use codex_state::StateRuntime;
 use codex_terminal_detection::user_agent;
 use futures::StreamExt;
 use std::sync::Arc;
-use std::time::Duration;
 
 pub(crate) struct SpawnedConsolidationAgent {
     pub(crate) thread_id: ThreadId,
@@ -54,10 +53,6 @@ pub(crate) struct StageOneRequestContext {
 }
 
 impl StageOneRequestContext {
-    pub(crate) fn start_timer(&self, name: &str) -> Option<codex_otel::Timer> {
-        self.session_telemetry.start_timer(name, &[]).ok()
-    }
-
     pub(crate) fn counter(&self, name: &str, inc: i64, tags: &[(&str, &str)]) {
         self.session_telemetry.counter(name, inc, tags);
     }
@@ -380,11 +375,8 @@ impl MemoryStartupContext {
             .await
             .unwrap_or(thread);
 
-        tokio::time::timeout(Duration::from_secs(10), thread.shutdown_and_wait())
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!("memory consolidation agent {thread_id} shutdown timed out")
-            })??;
+        // Keep the caller's reset exclusion until the worker can no longer write.
+        thread.shutdown_and_wait().await?;
 
         Ok(())
     }

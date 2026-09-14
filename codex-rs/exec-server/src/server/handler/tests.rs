@@ -49,15 +49,23 @@ fn inherited_path_env() -> HashMap<String, String> {
 }
 
 fn sleep_argv() -> Vec<String> {
-    cmd_argv("ping -n 2 127.0.0.1 >NUL")
+    shell_argv("ping -n 2 127.0.0.1 >NUL", "sleep 1")
 }
 
-fn cmd_argv(script: &str) -> Vec<String> {
-    vec![
-        windows_command_processor(),
-        "/C".to_string(),
-        script.to_string(),
-    ]
+fn shell_argv(windows_script: &str, unix_script: &str) -> Vec<String> {
+    if cfg!(windows) {
+        vec![
+            windows_command_processor(),
+            "/C".to_string(),
+            windows_script.to_string(),
+        ]
+    } else {
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            unix_script.to_string(),
+        ]
+    }
 }
 
 fn windows_command_processor() -> String {
@@ -69,8 +77,11 @@ fn test_runtime_paths() -> ExecServerRuntimePaths {
         .expect("runtime paths")
 }
 
-async fn initialized_handler() -> Arc<ExecServerHandler> {
-    let (outgoing_tx, _outgoing_rx) = mpsc::channel(16);
+async fn initialized_handler() -> (
+    Arc<ExecServerHandler>,
+    mpsc::Receiver<crate::rpc::RpcServerOutboundMessage>,
+) {
+    let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
     let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());
     let handler = Arc::new(ExecServerHandler::new(
         registry,
@@ -86,12 +97,12 @@ async fn initialized_handler() -> Arc<ExecServerHandler> {
         .expect("initialize");
     Uuid::parse_str(&initialize_response.session_id).expect("session id should be a UUID");
     handler.initialized().expect("initialized");
-    handler
+    (handler, outgoing_rx)
 }
 
 #[tokio::test]
 async fn duplicate_process_ids_allow_only_one_successful_start() {
-    let handler = initialized_handler().await;
+    let (handler, _outgoing_rx) = initialized_handler().await;
     let first_handler = Arc::clone(&handler);
     let second_handler = Arc::clone(&handler);
 
@@ -119,29 +130,24 @@ async fn duplicate_process_ids_allow_only_one_successful_start() {
 
 #[tokio::test]
 async fn terminate_reports_false_after_process_exit() {
-    let handler = initialized_handler().await;
+    let (handler, _outgoing_rx) = initialized_handler().await;
     handler
-        .exec(exec_params("proc-1"))
+        .exec(exec_params_with_argv(
+            "proc-1",
+            shell_argv("exit /b 7", "exit 7"),
+        ))
         .await
         .expect("start process");
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-    loop {
-        let response = handler
-            .terminate(TerminateParams {
-                process_id: ProcessId::from("proc-1"),
-            })
-            .await
-            .expect("terminate response");
-        if response == (TerminateResponse { running: false }) {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "process should have exited within 1s"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    let (_, exit_code) = read_process_until_closed(&handler, ProcessId::from("proc-1")).await;
+    assert_eq!(exit_code, Some(7));
+    let response = handler
+        .terminate(TerminateParams {
+            process_id: ProcessId::from("proc-1"),
+        })
+        .await
+        .expect("terminate response");
+    assert_eq!(response, TerminateResponse { running: false });
 
     handler.shutdown().await;
 }
@@ -169,7 +175,7 @@ async fn long_poll_read_fails_after_session_resume() {
     first_handler
         .exec(exec_params_with_argv(
             "proc-long-poll",
-            cmd_argv("ping -n 6 127.0.0.1 >NUL"),
+            shell_argv("ping -n 6 127.0.0.1 >NUL", "sleep 5"),
         ))
         .await
         .expect("start process");
@@ -186,7 +192,16 @@ async fn long_poll_read_fails_after_session_resume() {
             .await
     });
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        first_handler
+            .session()
+            .expect("initialized session")
+            .process()
+            .wait_for_read_wait(),
+    )
+    .await
+    .expect("read should enter its output wait before session resume");
     first_handler.shutdown().await;
 
     let (second_tx, _second_rx) = mpsc::channel(16);
@@ -206,8 +221,9 @@ async fn long_poll_read_fails_after_session_resume() {
         .initialized()
         .expect("initialized second connection");
 
-    let err = read_task
+    let err = tokio::time::timeout(Duration::from_secs(1), read_task)
         .await
+        .expect("read should finish after session resume")
         .expect("read task should join")
         .expect_err("evicted long-poll read should fail");
     assert_eq!(err.code, -32600);
@@ -283,7 +299,10 @@ async fn output_and_exit_are_retained_after_notification_receiver_closes() {
     handler
         .exec(exec_params_with_argv(
             process_id.as_str(),
-            cmd_argv("echo first&& ping -n 2 127.0.0.1 >NUL&& echo second"),
+            shell_argv(
+                "echo first&& ping -n 2 127.0.0.1 >NUL&& echo second",
+                "echo first; sleep 1; echo second",
+            ),
         ))
         .await
         .expect("start process");
@@ -313,15 +332,18 @@ async fn read_process_until_closed(
     let mut after_seq = None;
 
     loop {
-        let response: ReadResponse = handler
-            .exec_read(ReadParams {
+        let response: ReadResponse = tokio::time::timeout_at(
+            deadline,
+            handler.exec_read(ReadParams {
                 process_id: process_id.clone(),
                 after_seq,
                 max_bytes: None,
                 wait_ms: Some(500),
-            })
-            .await
-            .expect("read process");
+            }),
+        )
+        .await
+        .expect("process read should finish within 5s")
+        .expect("read process");
 
         for chunk in response.chunks {
             output.push_str(&String::from_utf8_lossy(&chunk.chunk.into_inner()));

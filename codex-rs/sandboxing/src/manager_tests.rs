@@ -4,7 +4,6 @@ use super::SandboxDirectSpawnTransformRequest;
 use super::SandboxTransformRequest;
 use super::SandboxType;
 use super::SandboxablePreference;
-use super::get_platform_sandbox;
 use super::select_initial;
 use super::transform;
 
@@ -42,22 +41,18 @@ fn danger_full_access_defaults_to_no_sandbox_without_network_requirements() {
 
 #[test]
 fn danger_full_access_uses_platform_sandbox_with_network_requirements() {
-    let expected =
-        get_platform_sandbox(/*windows_sandbox_enabled*/ false).unwrap_or(SandboxType::None);
     let sandbox = select_initial(
         &FileSystemSandboxPolicy::unrestricted(),
         NetworkSandboxPolicy::Enabled,
         SandboxablePreference::Auto,
-        WindowsSandboxLevel::Disabled,
+        WindowsSandboxLevel::Elevated,
         /*has_managed_network_requirements*/ true,
     );
-    assert_eq!(sandbox, expected);
+    assert_eq!(sandbox, SandboxType::WindowsRestrictedToken);
 }
 
 #[test]
 fn restricted_file_system_uses_platform_sandbox_without_managed_network() {
-    let expected =
-        get_platform_sandbox(/*windows_sandbox_enabled*/ false).unwrap_or(SandboxType::None);
     let sandbox = select_initial(
         &FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
             path: FileSystemPath::Special {
@@ -67,10 +62,10 @@ fn restricted_file_system_uses_platform_sandbox_without_managed_network() {
         }]),
         NetworkSandboxPolicy::Enabled,
         SandboxablePreference::Auto,
-        WindowsSandboxLevel::Disabled,
+        WindowsSandboxLevel::Elevated,
         /*has_managed_network_requirements*/ false,
     );
-    assert_eq!(sandbox, expected);
+    assert_eq!(sandbox, SandboxType::WindowsRestrictedToken);
 }
 
 #[test]
@@ -344,7 +339,9 @@ fn transform_for_direct_spawn_windows_materializes_inner_helper() {
                 access: FileSystemAccessMode::Write,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: blocked },
+                path: FileSystemPath::Path {
+                    path: blocked.clone(),
+                },
                 access: FileSystemAccessMode::Deny,
             },
         ]),
@@ -405,11 +402,16 @@ fn transform_for_direct_spawn_windows_materializes_inner_helper() {
             .iter()
             .any(|arg| arg == "--preserve-proxy-settings")
     );
-    assert!(
-        exec_request
-            .command
-            .iter()
-            .any(|arg| arg == "--deny-read-paths-json")
+    let deny_paths = exec_request
+        .command
+        .windows(2)
+        .find(|args| args[0] == "--deny-read-paths-json")
+        .expect("deny-read payload");
+    let deny_paths: Vec<std::path::PathBuf> =
+        serde_json::from_str(&deny_paths[1]).expect("deny paths JSON");
+    assert_eq!(
+        deny_paths,
+        vec![canonicalize(blocked.as_path()).expect("canonical blocked path")]
     );
     assert_eq!(
         exec_request.command[separator_index + 2],
@@ -434,5 +436,40 @@ fn transform_for_direct_spawn_windows_materializes_inner_helper() {
             .and_then(std::path::Path::file_name),
         Some(std::ffi::OsStr::new(".sandbox-bin"))
     );
-    assert!(materialized_helper.exists());
+    assert_eq!(
+        std::fs::read(materialized_helper).expect("materialized helper bytes"),
+        b"helper"
+    );
+}
+
+#[test]
+fn sandbox_preferences_and_disabled_backend_have_distinct_results() {
+    for (pref, level, expected) in [
+        (
+            SandboxablePreference::Require,
+            WindowsSandboxLevel::Elevated,
+            SandboxType::WindowsRestrictedToken,
+        ),
+        (
+            SandboxablePreference::Forbid,
+            WindowsSandboxLevel::Elevated,
+            SandboxType::None,
+        ),
+        (
+            SandboxablePreference::Require,
+            WindowsSandboxLevel::Disabled,
+            SandboxType::None,
+        ),
+    ] {
+        assert_eq!(
+            select_initial(
+                &FileSystemSandboxPolicy::unrestricted(),
+                NetworkSandboxPolicy::Enabled,
+                pref,
+                level,
+                false
+            ),
+            expected
+        );
+    }
 }

@@ -29,7 +29,7 @@ const APPROVAL_MESSAGE_TRUNCATED_MARKER: &str =
     "\n\n[Additional approval instructions were truncated.]";
 const MAX_PERMISSION_LIST_ENTRIES: usize = 64;
 const MAX_PERMISSION_LIST_BYTES: usize = 4_096;
-const PERMISSION_LIST_TRUNCATED_MARKER: &str = "- ... [additional permission entries omitted]";
+const PERMISSION_LIST_TRUNCATED_MARKER: &str = "- ... [additional permission entries omitted; omitted roots or restrictions do not grant permission]";
 
 const SANDBOX_MODE_DANGER_FULL_ACCESS: &str =
     include_str!("../templates/permissions/sandbox_mode/danger_full_access.md");
@@ -303,45 +303,52 @@ fn writable_roots_text(writable_roots: Option<Vec<WritableRoot>>) -> Option<Stri
 
     let roots_list = roots
         .iter()
-        .map(|r| format!("- `{}`", r.root.to_string_lossy()))
-        .collect::<Vec<_>>();
+        .flat_map(|r| {
+            std::iter::once_with(move || format!("- `{}`", r.root.to_string_lossy()))
+                .chain(r.read_only_subpaths.iter().map(|path| {
+                    format!("  - Read-only subtree: `{}`", path.to_string_lossy())
+                }))
+                .chain(r.protected_metadata_names.iter().map(|name| {
+                    format!("  - Protected metadata: `{name}` directly under this root (including descendants); do not create or replace it without an explicit write grant.")
+                }))
+        });
     let roots_list = bounded_permission_entries(roots_list);
     Some(format!(
-        "## Writable roots\nThe sandbox permits writes in these roots:\n{}",
+        "## Writable roots\nThe sandbox permits writes in these roots subject to the exclusions beneath each root. A separately listed, more specific writable root can grant access within an excluded subtree. If entries are omitted, this list is incomplete; do not assume unlisted paths or exclusions are writable.\n{}",
         roots_list.join("\n")
     ))
 }
 
 fn denied_reads_text(file_system_policy: &FileSystemSandboxPolicy, cwd: &Path) -> Option<String> {
-    let mut entries = file_system_policy
+    let entries = file_system_policy
         .get_unreadable_roots_with_cwd(cwd)
         .into_iter()
         .map(|root| format!("- path `{}`", root.to_string_lossy()))
-        .collect::<Vec<_>>();
-    entries.extend(
-        file_system_policy
-            .get_unreadable_globs_with_cwd(cwd)
-            .into_iter()
-            .map(|glob| format!("- glob `{glob}`")),
-    );
+        .chain(
+            file_system_policy
+                .get_unreadable_globs_with_cwd(cwd)
+                .into_iter()
+                .map(|glob| format!("- glob `{glob}`")),
+        );
+    let entries = bounded_permission_entries(entries);
     if entries.is_empty() {
         return None;
     }
 
-    let entries = bounded_permission_entries(entries);
     Some(format!(
         "## Denied filesystem reads\nThe active permission profile denies reading these paths/globs. Do not request escalation or additional permissions to read them; these denials are policy restrictions.\n{}",
         entries.join("\n")
     ))
 }
 
-fn bounded_permission_entries(entries: Vec<String>) -> Vec<String> {
-    let total_entries = entries.len();
+fn bounded_permission_entries(entries: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut rendered = Vec::new();
     let mut rendered_bytes = 0usize;
 
+    let mut omitted = false;
     for entry in entries {
         if rendered.len() == MAX_PERMISSION_LIST_ENTRIES {
+            omitted = true;
             break;
         }
         let separator_bytes = usize::from(!rendered.is_empty());
@@ -349,13 +356,14 @@ fn bounded_permission_entries(entries: Vec<String>) -> Vec<String> {
             .saturating_add(separator_bytes)
             .saturating_add(entry.len());
         if next_bytes > MAX_PERMISSION_LIST_BYTES {
+            omitted = true;
             break;
         }
         rendered_bytes = next_bytes;
         rendered.push(entry);
     }
 
-    if rendered.len() == total_entries {
+    if !omitted {
         return rendered;
     }
 

@@ -65,13 +65,46 @@ impl fmt::Display for RequestId {
 pub type Result = serde_json::Value;
 
 /// Refers to any valid JSON-RPC object that can be decoded off the wire, or encoded to be sent.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema, TS)]
 #[serde(untagged)]
 pub enum JSONRPCMessage {
     Request(JSONRPCRequest),
     Notification(JSONRPCNotification),
     Response(JSONRPCResponse),
     Error(JSONRPCError),
+}
+
+impl<'de> Deserialize<'de> for JSONRPCMessage {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| D::Error::custom("expected RPC object"))?;
+        // Select by reserved-field presence before decoding. Invalid IDs must never
+        // cause a request to fall through to the notification shape.
+        match (
+            object.contains_key("method"),
+            object.contains_key("id"),
+            object.contains_key("result"),
+            object.contains_key("error"),
+        ) {
+            (true, true, false, false) => serde_json::from_value(value).map(Self::Request),
+            (true, false, false, false) => serde_json::from_value(value).map(Self::Notification),
+            (false, true, true, false) => serde_json::from_value(value).map(Self::Response),
+            (false, true, false, true) => serde_json::from_value(value).map(Self::Error),
+            _ => {
+                return Err(D::Error::custom(
+                    "invalid or conflicting RPC envelope fields",
+                ));
+            }
+        }
+        .map_err(D::Error::custom)
+    }
 }
 
 /// A request that expects a response.
@@ -123,6 +156,46 @@ pub struct JSONRPCErrorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wire_decoder_rejects_malformed_and_conflicting_envelopes() {
+        for input in [
+            r#"{"id":{},"method":"example"}"#,
+            r#"{"id":null,"method":"example"}"#,
+            r#"{"id":1,"result":"success","error":{"code":-1,"message":"failure"}}"#,
+            r#"{"method":"example","result":null}"#,
+            r#"{"method":"example","error":null}"#,
+            r#"{"id":1}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<JSONRPCMessage>(input).is_err(),
+                "accepted {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn wire_decoder_preserves_valid_envelopes_and_extension_fields() {
+        for input in [
+            r#"{"id":1,"method":"example","params":null}"#,
+            r#"{"method":"example"}"#,
+            r#"{"id":"request","result":null}"#,
+            r#"{"id":1,"error":{"code":-1,"message":"failure"}}"#,
+        ] {
+            let expected: JSONRPCMessage = serde_json::from_str(input).unwrap();
+            assert_eq!(serde_json::to_value(&expected).unwrap(), {
+                let mut value: serde_json::Value = serde_json::from_str(input).unwrap();
+                value.as_object_mut().unwrap().remove("params");
+                value
+            });
+            let mut extended: serde_json::Value = serde_json::from_str(input).unwrap();
+            extended["extension"] = serde_json::json!(true);
+            assert_eq!(
+                serde_json::from_value::<JSONRPCMessage>(extended).unwrap(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn overloaded_error_has_one_code_and_typed_retryable_data() {

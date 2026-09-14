@@ -5,7 +5,8 @@ use pretty_assertions::assert_eq;
 
 #[test]
 fn reasoning_summary_support_comes_from_model_metadata() {
-    let model = model_info_from_slug("unknown-model");
+    let mut model = model_info_from_slug("unknown-model");
+    model.supports_reasoning_summaries = true;
     let config = ModelsManagerConfig::default();
 
     let updated = with_config_overrides(model.clone(), &config);
@@ -36,6 +37,8 @@ fn base_instruction_override_preserves_catalog_approval_messages() {
 
     let updated = with_config_overrides(model, &config);
 
+    assert_eq!(updated.base_instructions, "override");
+    assert_eq!(updated.get_model_instructions(None), "override");
     assert_eq!(
         updated.model_messages,
         Some(ModelMessages {

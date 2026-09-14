@@ -2,7 +2,6 @@ use std::path::Path;
 
 use anyhow::Context;
 use anyhow::Result;
-use codex_login::CLIENT_ID;
 use codex_login::REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR;
 use predicates::str::contains;
 use pretty_assertions::assert_eq;
@@ -166,12 +165,12 @@ fn login_with_access_token_rejects_invalid_jwt() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn device_login_revokes_existing_auth_before_requesting_new_tokens() -> Result<()> {
+async fn device_login_replaces_existing_auth_only_after_success() -> Result<()> {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/oauth/revoke"))
         .respond_with(ResponseTemplate::new(200))
-        .expect(1)
+        .expect(0)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -244,24 +243,49 @@ async fn device_login_revokes_existing_auth_before_requesting_new_tokens() -> Re
     assert_eq!(
         paths,
         vec![
-            "/oauth/revoke",
             "/api/accounts/deviceauth/usercode",
             "/api/accounts/deviceauth/token",
             "/oauth/token",
         ]
     );
-    assert_eq!(
-        requests[0]
-            .body_json::<Value>()
-            .context("revoke request should be JSON")?,
-        json!({
-            "token": "old-refresh",
-            "token_type_hint": "refresh_token",
-            "client_id": CLIENT_ID,
-        })
-    );
 
     let auth = read_auth_json(codex_home.path())?;
     assert_eq!(auth["tokens"]["refresh_token"], "new-refresh");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_device_login_preserves_existing_auth() -> Result<()> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/accounts/deviceauth/usercode"))
+        .respond_with(ResponseTemplate::new(400))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let codex_home = TempDir::new()?;
+    write_file_auth_config(codex_home.path())?;
+    let original = json!({"OPENAI_API_KEY": "sk-existing"});
+    std::fs::write(
+        codex_home.path().join("auth.json"),
+        serde_json::to_vec(&original)?,
+    )?;
+    codex_command(codex_home.path())?
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .env_remove("CODEX_ACCESS_TOKEN")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("CODEX_API_KEY")
+        .args([
+            "login",
+            "--device-auth",
+            "--experimental_issuer",
+            &server.uri(),
+        ])
+        .timeout(std::time::Duration::from_secs(15))
+        .assert()
+        .failure()
+        .stderr(contains("Error logging in"));
+    assert_eq!(read_auth_json(codex_home.path())?, original);
     Ok(())
 }

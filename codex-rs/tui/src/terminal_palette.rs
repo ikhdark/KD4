@@ -40,7 +40,7 @@ pub fn best_color_for_level(target: (u8, u8, u8), color_level: StdoutColorLevel)
     best_color_for_color_level(target, color_level)
 }
 
-fn effective_stdout_color_level() -> StdoutColorLevel {
+pub(crate) fn effective_stdout_color_level() -> StdoutColorLevel {
     #[cfg(test)]
     if let Some((_, level)) = TEST_TERMINAL_COLORS.get() {
         return level;
@@ -59,7 +59,7 @@ fn stdout_color_level_for_terminal(
     has_wt_session: bool,
     has_force_color_override: bool,
 ) -> StdoutColorLevel {
-    if has_wt_session && !has_force_color_override {
+    if has_wt_session && !has_force_color_override && stdout_level != StdoutColorLevel::Unknown {
         return StdoutColorLevel::TrueColor;
     }
 
@@ -77,16 +77,14 @@ fn best_color_for_color_level(target: (u8, u8, u8), color_level: StdoutColorLeve
     match color_level {
         StdoutColorLevel::TrueColor => rgb_color(target),
         StdoutColorLevel::Ansi256 => xterm_fixed_colors()
-            .min_by(|(_, a), (_, b)| {
-                perceptual_distance(*a, target)
-                    .partial_cmp(&perceptual_distance(*b, target))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .map(|(index, color)| (index, perceptual_distance(color, target)))
+            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map_or_else(Color::default, |(i, _)| indexed_color(i as u8)),
         StdoutColorLevel::Ansi16 | StdoutColorLevel::Unknown => Color::default(),
     }
 }
 
+/// Input-owning startup/resume probes refresh the palette. Rendering never re-probes input.
 pub fn requery_default_colors() {
     imp::requery_default_colors();
 }
@@ -501,6 +499,19 @@ mod tests {
         assert_eq!(
             best_color_for_color_level((12, 34, 56), StdoutColorLevel::Ansi16),
             Color::Reset
+        );
+    }
+
+    #[test]
+    fn windows_terminal_respects_disabled_or_unavailable_color() {
+        assert_eq!(
+            stdout_color_level_for_terminal(
+                StdoutColorLevel::Unknown,
+                TerminalName::WindowsTerminal,
+                true,
+                false,
+            ),
+            StdoutColorLevel::Unknown
         );
     }
 

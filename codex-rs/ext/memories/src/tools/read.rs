@@ -46,7 +46,7 @@ impl ToolExecutor<ToolCall> for ReadTool {
     fn spec(&self) -> ToolSpec {
         memory_function_tool::<ReadArgs, ReadMemoryResponse>(
             READ_TOOL_NAME,
-            "Read a Codex memory file by relative path, optionally starting at a 1-indexed line offset and limiting the number of lines returned.",
+            "Read a Codex memory file by relative path, optionally starting at a 1-indexed line offset and limiting the number of lines returned. Output is also token-limited and may be shorter than the requested line range.",
         )
     }
 

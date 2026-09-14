@@ -74,23 +74,27 @@ async fn request_attestation_header_value_with_timeout(
     thread_id: codex_protocol::ThreadId,
     timeout_duration: Duration,
 ) -> Option<String> {
-    let connection_ids = thread_state_manager
-        .attestation_capable_connections_for_thread(thread_id)
-        .await;
-    if connection_ids.is_empty() {
-        return None;
-    }
-    let (request_id, rx) = outgoing
-        .send_request_to_connections(
-            Some(connection_ids.as_slice()),
-            ServerRequestPayload::AttestationGenerate(AttestationGenerateParams {}),
-            /*thread_id*/ None,
+    let request = async {
+        let connection_ids = thread_state_manager
+            .attestation_capable_connections_for_thread(thread_id)
+            .await;
+        if connection_ids.is_empty() {
+            return None;
+        }
+        Some(
+            outgoing
+                .send_request_to_connections_and_wait(
+                    Some(connection_ids.as_slice()),
+                    ServerRequestPayload::AttestationGenerate(AttestationGenerateParams {}),
+                    /*thread_id*/ None,
+                )
+                .await,
         )
-        .await;
-
-    let result = match timeout(timeout_duration, rx).await {
-        Ok(Ok(Ok(result))) => result,
-        Ok(Ok(Err(err))) => {
+    };
+    let result = match timeout(timeout_duration, request).await {
+        Ok(None) => return None,
+        Ok(Some(Ok(Ok(result)))) => result,
+        Ok(Some(Ok(Err(err)))) => {
             warn!(
                 code = err.code,
                 message = %err.message,
@@ -101,7 +105,7 @@ async fn request_attestation_header_value_with_timeout(
                 /*token*/ None,
             );
         }
-        Ok(Err(err)) => {
+        Ok(Some(Err(err))) => {
             warn!("attestation generation request canceled: {err}");
             return app_server_attestation_header_value(
                 AppServerAttestationStatus::RequestCanceled,
@@ -109,7 +113,6 @@ async fn request_attestation_header_value_with_timeout(
             );
         }
         Err(_) => {
-            let _canceled = outgoing.cancel_request(&request_id).await;
             warn!(
                 timeout_milliseconds = attestation_timeout_milliseconds(timeout_duration),
                 "attestation generation request timed out"
@@ -334,5 +337,61 @@ mod tests {
                 .expect("attestation task should not panic"),
             Some(r#"{"v":1,"s":0,"t":"healthy-token"}"#.to_string())
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attestation_deadline_covers_delivery_and_reply_and_cleans_callbacks() {
+        for saturated in [true, false] {
+            let (tx, mut rx) = mpsc::channel(1);
+            let outgoing = Arc::new(OutgoingMessageSender::new(
+                tx,
+                codex_analytics::AnalyticsEventsClient::disabled(),
+            ));
+            let manager = ThreadStateManager::new();
+            let thread_id = ThreadId::new();
+            let connection = ConnectionId(1);
+            outgoing
+                .connection_opened(connection, Arc::new(AtomicBool::new(true)))
+                .await;
+            manager
+                .connection_initialized(
+                    connection,
+                    ConnectionCapabilities {
+                        request_attestation: true,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(
+                manager
+                    .try_add_connection_to_thread(thread_id, connection)
+                    .await
+            );
+            if saturated {
+                assert!(outgoing.try_send_server_notification(
+                    codex_app_server_protocol::ServerNotification::ThreadClosed(
+                        codex_app_server_protocol::ThreadClosedNotification {
+                            thread_id: "blocker".to_string()
+                        }
+                    )
+                ));
+            }
+            let mut request = Box::pin(request_attestation_header_value_with_timeout(
+                outgoing.clone(),
+                manager,
+                thread_id,
+                ATTESTATION_GENERATE_TIMEOUT,
+            ));
+            assert!(futures::poll!(request.as_mut()).is_pending());
+            assert_eq!(outgoing.pending_callback_count().await, 1);
+            tokio::time::advance(ATTESTATION_GENERATE_TIMEOUT).await;
+            assert_eq!(request.await, Some(r#"{"v":1,"s":1}"#.to_string()));
+            assert_eq!(outgoing.pending_callback_count().await, 0);
+            rx.recv().await.expect("blocker or delivered request");
+            assert!(
+                rx.try_recv().is_err(),
+                "timed out delivery must not enqueue later"
+            );
+        }
     }
 }

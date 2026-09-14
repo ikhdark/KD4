@@ -84,21 +84,16 @@ pub fn mutating_finalizer_hook(argv: Vec<String>) -> Hook {
                     command.arg(notify_payload);
                 }
 
-                command
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .kill_on_drop(true);
-
-                match command.status().await {
-                    Ok(status) if status.success() => HookResult::Success,
-                    Ok(status) => HookResult::FailedAbort(
-                        std::io::Error::other(format!(
-                            "mutating finalizer exited with status {status}"
-                        ))
+                let result =
+                    crate::engine::command_runner::run_finalizer_command(command, 600).await;
+                match (result.exit_code, result.error) {
+                    (Some(0), None) => HookResult::Success,
+                    (exit_code, error) => HookResult::FailedAbort(
+                        std::io::Error::other(error.unwrap_or_else(|| {
+                            format!("mutating finalizer exited with code {exit_code:?}")
+                        }))
                         .into(),
                     ),
-                    Err(err) => HookResult::FailedAbort(err.into()),
                 }
             })
         }),
@@ -144,12 +139,16 @@ mod tests {
         #[cfg(windows)]
         {
             let script = directory.join("delayed-marker.ps1");
+            std::fs::write(directory.join("child.ps1"), concat!(
+                "Set-Content -LiteralPath (Join-Path $PSScriptRoot 'started.txt') -Value started\n",
+                "Start-Sleep -Seconds 2\n",
+                "Set-Content -LiteralPath (Join-Path $PSScriptRoot 'escaped.txt') -Value escaped\n",
+            )).expect("write descendant script");
             std::fs::write(
                 &script,
                 concat!(
-                    "Set-Content -LiteralPath (Join-Path $PSScriptRoot 'started.txt') -Value started\n",
-                    "Start-Sleep -Seconds 2\n",
-                    "Set-Content -LiteralPath (Join-Path $PSScriptRoot 'escaped.txt') -Value escaped\n",
+                    "Start-Process powershell.exe -WindowStyle Hidden -ArgumentList ('-NoProfile -File \"' + (Join-Path $PSScriptRoot 'child.ps1') + '\"')\n",
+                    "Start-Sleep -Seconds 60\n",
                 ),
             )
             .expect("write finalizer test script");
@@ -165,7 +164,8 @@ mod tests {
             vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
-                "touch \"$1/started.txt\"; sleep 2; touch \"$1/escaped.txt\"".to_string(),
+                "(touch \"$1/started.txt\"; sleep 2; touch \"$1/escaped.txt\") & sleep 60"
+                    .to_string(),
                 "codex-hook-test".to_string(),
                 directory.to_string_lossy().into_owned(),
             ]

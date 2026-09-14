@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
@@ -126,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!(
                     "failed to bind to {bind_addr}: {err}. make sure the process has network access"
                 );
-                return Ok(());
+                return Err(err.into());
             }
             Err(err) if err.kind() == ErrorKind::AddrInUse && bind_retries < MAX_BIND_RETRIES => {
                 bind_retries += 1;
@@ -299,11 +298,10 @@ impl ServerHandler for TestToolServer {
                     }
                 };
 
-                let env_snapshot: HashMap<String, String> = std::env::vars().collect();
                 let env_name = args.env_var.as_deref().unwrap_or("MCP_TEST_VALUE");
                 let structured_content = json!({
                     "echo": format!("ECHOING: {}", args.message),
-                    "env": env_snapshot.get(env_name),
+                    "env": std::env::var(env_name).ok(),
                 });
 
                 let mut result = CallToolResult::success(Vec::new());
@@ -481,12 +479,20 @@ async fn arm_post_failure(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[expect(clippy::await_holding_invalid_type, reason = "Fault admission and consumption must remain atomic while reading the admitted request method")]
 async fn fail_mcp_post_when_armed(
     State(state): State<PostFailureState>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
     if request.uri().path() != "/mcp" || request.method() != Method::POST {
+        return next.run(request).await;
+    }
+    // Admission and fault consumption share one lock: rearming cannot change
+    // which fault applies while this admitted request's method is being read.
+    let mut armed_failure = state.armed_failure.lock().await;
+    if armed_failure.is_none() {
+        drop(armed_failure);
         return next.run(request).await;
     }
     let (parts, body) = request.into_parts();
@@ -502,11 +508,12 @@ async fn fail_mcp_post_when_armed(
     let mcp_method = request_mcp_method(&body_bytes);
 
     {
-        let mut armed_failure = state.armed_failure.lock().await;
         if let Some(failure) = armed_failure.as_mut()
             && failure.remaining > 0
             && match failure.target {
-                ArmedFailureTarget::Initialize => !has_session_id,
+                ArmedFailureTarget::Initialize => {
+                    !has_session_id && mcp_method.as_deref() == Some("initialize")
+                }
                 ArmedFailureTarget::InitializedNotification => {
                     has_session_id && mcp_method.as_deref() == Some("notifications/initialized")
                 }
@@ -540,6 +547,7 @@ async fn fail_mcp_post_when_armed(
         }
     }
 
+    drop(armed_failure);
     next.run(Request::from_parts(parts, Body::from(body_bytes)))
         .await
 }
@@ -550,4 +558,68 @@ fn request_mcp_method(body: &[u8]) -> Option<String> {
         .get("method")?
         .as_str()
         .map(ToString::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fault_middleware_preserves_unarmed_bodies_and_matches_initialize_exactly() {
+        let state = PostFailureState::default();
+        let router = Router::new()
+            .route("/mcp", post(|body: String| async move { body }))
+            .route(
+                INITIALIZE_POST_FAILURE_CONTROL_PATH,
+                post(arm_initialize_post_failure),
+            )
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                fail_mcp_post_when_armed,
+            ))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = codex_http_client::HttpClientBuilder::new()
+            .build_direct()
+            .unwrap();
+        let body = "x".repeat(MAX_MCP_POST_BODY_BYTES + 1);
+        let response = client
+            .post(format!("{base}/mcp"))
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), body);
+
+        let response = client
+            .post(format!("{base}{INITIALIZE_POST_FAILURE_CONTROL_PATH}"))
+            .json(&json!({"status": 503, "remaining": 1}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let unrelated = r#"{"method":"tools/list"}"#;
+        let response = client
+            .post(format!("{base}/mcp"))
+            .body(unrelated)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), unrelated);
+        for expected in [StatusCode::SERVICE_UNAVAILABLE, StatusCode::OK] {
+            let response = client
+                .post(format!("{base}/mcp"))
+                .body(r#"{"method":"initialize"}"#)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
 }

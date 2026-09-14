@@ -358,6 +358,7 @@ impl App {
             let feature_key = feature.key();
             let mut feature_edits = Vec::new();
             let mut feature_config = next_config.clone();
+            let mut feature_history_label = None;
             if let Err(err) = feature_config.features.set_enabled(feature, enabled) {
                 tracing::error!(
                     error = %err,
@@ -382,7 +383,7 @@ impl App {
                         serde_json::json!(auto_review_preset.approvals_reviewer.to_string()),
                     ));
                     if previous_approvals_reviewer != auto_review_preset.approvals_reviewer {
-                        permissions_history_label = Some("Approve for me");
+                        feature_history_label = Some("Approve for me");
                     }
                 } else if !effective_enabled {
                     feature_edits.push(crate::config_update::clear_config_value(
@@ -390,10 +391,9 @@ impl App {
                     ));
                     feature_config.approvals_reviewer = ApprovalsReviewer::User;
                     if previous_approvals_reviewer != ApprovalsReviewer::User {
-                        permissions_history_label = Some("Ask for approval");
+                        feature_history_label = Some("Ask for approval");
                     }
                 }
-                approvals_reviewer_override = Some(feature_config.approvals_reviewer);
             }
             if feature == Feature::GuardianApproval && effective_enabled {
                 // The feature flag alone is not enough for the live session.
@@ -433,6 +433,10 @@ impl App {
                 active_permission_profile_override =
                     Some(auto_review_preset.active_permission_profile.clone());
             }
+            if feature == Feature::GuardianApproval {
+                approvals_reviewer_override = Some(feature_config.approvals_reviewer);
+                permissions_history_label = feature_history_label;
+            }
             next_config = feature_config;
             feature_updates_to_apply.push((feature, effective_enabled));
             config_edits.extend(feature_edits);
@@ -440,6 +444,10 @@ impl App {
                 feature_key,
                 effective_enabled,
             ));
+        }
+
+        if config_edits.is_empty() {
+            return;
         }
 
         // Persist first so the live session does not diverge from disk if the
@@ -511,9 +519,9 @@ impl App {
             self.set_approvals_reviewer_in_app_and_widget(self.config.approvals_reviewer);
         }
         if approval_policy_override.is_some() {
-            self.chat_widget.set_approval_policy(AskForApproval::from(
-                self.config.permissions.approval_policy.value(),
-            ));
+            let policy = AskForApproval::from(self.config.permissions.approval_policy.value());
+            self.runtime_approval_policy_override = Some(policy);
+            self.chat_widget.set_approval_policy(policy);
         }
         let permission_profile_override_value = permission_profile_override
             .is_some()
@@ -640,7 +648,6 @@ impl App {
         use_memories: bool,
         generate_memories: bool,
     ) {
-        let previous_generate_memories = self.config.memories.generate_memories;
         if !self
             .update_memory_settings(app_server, use_memories, generate_memories)
             .await
@@ -649,9 +656,8 @@ impl App {
         }
 
         let generate_memories = self.config.memories.generate_memories;
-        if previous_generate_memories == generate_memories {
-            return;
-        }
+        // An explicit submission also retries a previous failed thread update.
+        // The persisted desired setting does not confirm the thread's mode.
 
         let Some(thread_id) = self.current_displayed_thread_id() else {
             return;
@@ -820,6 +826,7 @@ impl App {
                     "Failed to refresh overridden Approve for me settings: {err}"
                 ));
             } else {
+                self.runtime_approval_policy_override = Some(policy);
                 self.chat_widget.set_approval_policy(policy);
             }
         }

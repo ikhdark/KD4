@@ -76,7 +76,11 @@ impl AccountRequestProcessor {
             }
         })
         .await
-        .map_err(|_| internal_error("rate limit reset consume timed out"))?
+        .map_err(|_| {
+            internal_error(
+                "rate limit reset consume timed out; the outcome is unknown. Any retry must use the same idempotencyKey and the same credit selection",
+            )
+        })?
         .map_err(|err| internal_error(format!("failed to consume rate limit reset: {err}")))?;
         let outcome = match response.code {
             BackendConsumeRateLimitResetCreditCode::Reset => {

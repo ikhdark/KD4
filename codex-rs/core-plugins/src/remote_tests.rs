@@ -3,6 +3,53 @@ use codex_http_client::OutboundProxyPolicy;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn recommended_catalog_preserves_status_and_classifies_truncated_bodies() {
+    use std::io::{Read, Write};
+    for status in [200, 503] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let count = stream.read(&mut request).unwrap();
+            assert!(
+                String::from_utf8_lossy(&request[..count])
+                    .starts_with("GET /ps/plugins/suggested?scope=GLOBAL ")
+            );
+            write!(
+                stream,
+                "HTTP/1.1 {status} Test\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{{"
+            )
+            .unwrap();
+        });
+        let config = RemotePluginServiceConfig::new(
+            format!("http://{address}/"),
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        );
+        let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+        let error = fetch_recommended_plugins(&config, Some(&auth))
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(
+            error.error_data().reason,
+            PluginRemoteErrorReason::Transient
+        );
+        match (status, error) {
+            (200, RemotePluginCatalogError::Body { .. }) => {}
+            (503, RemotePluginCatalogError::UnexpectedStatus { status, body, .. }) => {
+                assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
+                assert!(body.contains("failed to read response body"), "{body}");
+            }
+            (_, error) => panic!("unexpected error: {error}"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn remote_marketplace_pagination_rejects_token_cycles() {
     use wiremock::matchers::{method, path, query_param, query_param_is_missing};
 
@@ -295,21 +342,24 @@ fn remote_service_pool_retains_the_effective_proxy_policy() {
 }
 
 #[tokio::test]
-async fn fetch_remote_installed_plugins_reuses_one_client_across_scopes() {
+async fn fetch_remote_installed_plugins_fetches_each_scope_once() {
     let server = wiremock::MockServer::start().await;
-    wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path("/ps/plugins/installed"))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "plugins": [],
-                "pagination": {"next_page_token": null},
-            })),
-        )
-        .expect(3)
-        .mount(&server)
-        .await;
+    for scope in ["GLOBAL", "WORKSPACE", "USER"] {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/ps/plugins/installed"))
+            .and(wiremock::matchers::query_param("scope", scope))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "plugins": [],
+                    "pagination": {"next_page_token": null},
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
     let config = RemotePluginServiceConfig::new(
-        server.uri(),
+        format!("{}/", server.uri()),
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
     );
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();

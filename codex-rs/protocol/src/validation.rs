@@ -139,8 +139,8 @@ fn validate_direct_validation_values(
     argv: &[String],
     covered_paths: &[String],
 ) -> Result<(), String> {
-    if argv.is_empty() || argv.iter().any(|value| value.trim().is_empty()) {
-        return Err("validation argv values must be non-empty".to_string());
+    if argv.first().is_none_or(|value| value.trim().is_empty()) {
+        return Err("validation argv must contain a non-empty executable".to_string());
     }
     if covered_paths.is_empty() || covered_paths.iter().any(|value| value.trim().is_empty()) {
         return Err("validation covered_paths must contain non-empty paths".to_string());
@@ -265,6 +265,18 @@ mod tests {
         ] {
             assert!(serde_json::from_value::<ValidationResult>(value).is_err());
         }
+    }
+
+    #[test]
+    fn validation_result_preserves_empty_and_whitespace_arguments() {
+        let value = json!({
+            "argv": ["validator", "--expected", "", "  "],
+            "coveredPaths": ["src"], "callId": "call-1",
+            "status": "succeeded", "durationMs": 1
+        });
+        let result = serde_json::from_value::<ValidationResult>(value.clone())
+            .expect("empty arguments are valid after the executable");
+        assert_eq!(serde_json::to_value(result).unwrap(), value);
     }
 
     #[test]

@@ -83,7 +83,8 @@ impl LegacyAppPathString {
 
     /// Parses this API string as an absolute path using the convention inferred from its spelling.
     pub fn to_inferred_path_uri(&self) -> Option<PathUri> {
-        PathUri::try_from(self.clone()).ok()
+        self.to_path_uri(self.infer_absolute_path_convention()?)
+            .ok()
     }
 
     /// Renders this API path for display in a user interface.
@@ -92,14 +93,18 @@ impl LegacyAppPathString {
     /// Strings that cannot be interpreted as absolute paths retain their raw
     /// API spelling.
     pub fn render_for_ui(&self) -> String {
-        self.to_inferred_path_uri()
-            .map(|path| path.inferred_native_path_string())
+        self.infer_absolute_path_convention()
+            .and_then(|convention| {
+                let path = self.to_path_uri(convention).ok()?;
+                Self::from_path_uri(&path, convention).ok()
+            })
+            .map(Self::into_string)
             .unwrap_or_else(|| self.0.clone())
     }
 
     /// Parses this API string as a host-native absolute path.
     pub fn to_inferred_abs_path(&self) -> Option<AbsolutePathBuf> {
-        AbsolutePathBuf::try_from(self.clone()).ok()
+        AbsolutePathBuf::from_absolute_path_checked(self.as_str()).ok()
     }
 
     /// Infers the path convention of an absolute API path from its spelling.

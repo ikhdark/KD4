@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use crate::AuthError;
 use crate::AuthProvider;
 use bytes::Bytes;
 use codex_http_client::BuildRouteAwareHttpClientError;
@@ -36,6 +37,12 @@ pub struct UploadedOpenAiFile {
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpenAiFileError {
+    #[error("failed to authenticate OpenAI file request to {url}: {source}")]
+    Auth {
+        url: String,
+        #[source]
+        source: AuthError,
+    },
     #[error(
         "file `{file_name}` is too large: {size_bytes} bytes exceeds the limit of {limit_bytes} bytes"
     )]
@@ -125,7 +132,7 @@ pub async fn delete_openai_file_with_pool(
 ) -> Result<(), OpenAiFileError> {
     let encoded_file_id = percent_encode_path_segment(file_id);
     let delete_url = format!("{}/files/{encoded_file_id}", base_url.trim_end_matches('/'));
-    let response = authorized_request(http_clients, auth, Method::DELETE, &delete_url)
+    let response = authorized_request(http_clients, auth, Method::DELETE, &delete_url)?
         .send()
         .await
         .map_err(|source| request_error(&delete_url, source))?;
@@ -212,7 +219,7 @@ async fn upload_openai_file_with_pool_and_finalize_timeout(
     }
 
     let create_url = format!("{}/files", base_url.trim_end_matches('/'));
-    let create_response = authorized_request(http_clients, auth, Method::POST, &create_url)
+    let create_response = authorized_request(http_clients, auth, Method::POST, &create_url)?
         .json(&serde_json::json!({
             "file_name": file_name.as_str(),
             "file_size": file_size_bytes,
@@ -222,14 +229,15 @@ async fn upload_openai_file_with_pool_and_finalize_timeout(
         .await
         .map_err(|source| request_error(&create_url, source))?;
     let create_status = create_response.status();
-    let create_body = create_response.text().await.unwrap_or_default();
+    let create_body = create_response.text().await;
     if !create_status.is_success() {
         return Err(OpenAiFileError::UnexpectedStatus {
             url: create_url,
             status: create_status,
-            body: create_body,
+            body: create_body.unwrap_or_default(),
         });
     }
+    let create_body = create_body.map_err(|source| request_error(&create_url, source.into()))?;
     let create_payload: CreateFileResponse =
         serde_json::from_str(&create_body).map_err(|source| OpenAiFileError::Decode {
             url: create_url.clone(),
@@ -245,12 +253,12 @@ async fn upload_openai_file_with_pool_and_finalize_timeout(
             .body_stream(contents)
             .send()
             .await
-            .map_err(|source| request_error(&create_payload.upload_url, source.without_url()))?;
+            .map_err(|source| request_error(&create_payload.upload_url, source))?;
         let upload_status = upload_response.status();
         let upload_body = upload_response.text().await.unwrap_or_default();
         if !upload_status.is_success() {
             return Err(OpenAiFileError::UnexpectedStatus {
-                url: create_payload.upload_url.clone(),
+                url: diagnostic_url(&create_payload.upload_url),
                 status: upload_status,
                 body: upload_body,
             });
@@ -259,7 +267,7 @@ async fn upload_openai_file_with_pool_and_finalize_timeout(
         let finalize_url = format!(
             "{}/files/{}/uploaded",
             base_url.trim_end_matches('/'),
-            create_payload.file_id,
+            percent_encode_path_segment(&create_payload.file_id),
         );
         let finalize_deadline = Instant::now() + finalize_timeout;
         loop {
@@ -269,14 +277,19 @@ async fn upload_openai_file_with_pool_and_finalize_timeout(
                     file_id: create_payload.file_id.clone(),
                 })?;
             let finalize_attempt = async {
-                let response = authorized_request(http_clients, auth, Method::POST, &finalize_url)
+                let response = authorized_request(http_clients, auth, Method::POST, &finalize_url)?
                     .timeout(remaining)
                     .json(&serde_json::json!({}))
                     .send()
                     .await
                     .map_err(|source| request_error(&finalize_url, source))?;
                 let status = response.status();
-                let body = response.text().await.unwrap_or_default();
+                let body = response.text().await;
+                let body = if status.is_success() {
+                    body.map_err(|source| request_error(&finalize_url, source.into()))?
+                } else {
+                    body.unwrap_or_default()
+                };
                 Ok::<_, OpenAiFileError>((status, body))
             };
             let (finalize_status, finalize_body) =
@@ -368,14 +381,18 @@ fn authorized_request(
     auth: &dyn AuthProvider,
     method: Method,
     url: &str,
-) -> RouteAwareRequestBuilder {
+) -> Result<RouteAwareRequestBuilder, OpenAiFileError> {
     let mut headers = http::HeaderMap::new();
-    auth.add_auth_headers(&mut headers);
+    auth.try_add_auth_headers(&mut headers)
+        .map_err(|source| OpenAiFileError::Auth {
+            url: diagnostic_url(url),
+            source,
+        })?;
 
-    http_clients
+    Ok(http_clients
         .request(method, url)
         .timeout(OPENAI_FILE_REQUEST_TIMEOUT)
-        .headers(headers)
+        .headers(headers))
 }
 
 pub fn openai_file_http_client_pool(
@@ -388,18 +405,24 @@ pub fn openai_file_http_client_pool(
 }
 
 fn request_error(url: &str, source: RouteAwareRequestError) -> OpenAiFileError {
-    match source {
+    let url = diagnostic_url(url);
+    match source.without_url() {
         RouteAwareRequestError::Route(RouteAwareClientPoolError::Build(source)) => {
-            OpenAiFileError::ClientBuild {
-                url: url.to_string(),
-                source,
-            }
+            OpenAiFileError::ClientBuild { url, source }
         }
-        source => OpenAiFileError::Request {
-            url: url.to_string(),
-            source,
-        },
+        source => OpenAiFileError::Request { url, source },
     }
+}
+
+fn diagnostic_url(value: &str) -> String {
+    let Ok(mut url) = url::Url::parse(value) else {
+        return "<invalid URL>".to_string();
+    };
+    url.set_query(None);
+    url.set_fragment(None);
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.to_string()
 }
 
 #[cfg(test)]
@@ -443,6 +466,191 @@ mod tests {
 
     fn base_url_for(server: &MockServer) -> String {
         format!("{}/backend-api", server.uri())
+    }
+
+    struct ScriptedAuth {
+        results: std::sync::Mutex<std::collections::VecDeque<Result<(), AuthError>>>,
+    }
+
+    impl ScriptedAuth {
+        fn new(results: impl IntoIterator<Item = Result<(), AuthError>>) -> Self {
+            Self {
+                results: std::sync::Mutex::new(results.into_iter().collect()),
+            }
+        }
+    }
+
+    impl AuthProvider for ScriptedAuth {
+        fn add_auth_headers(&self, _headers: &mut http::HeaderMap) {}
+
+        fn try_add_auth_headers(&self, headers: &mut http::HeaderMap) -> Result<(), AuthError> {
+            self.results
+                .lock()
+                .expect("auth results lock")
+                .pop_front()
+                .expect("unexpected authentication attempt")?;
+            ChatGptTestAuth.add_auth_headers(headers);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_auth_failure_prevents_dispatch() {
+        let server = MockServer::start().await;
+        let auth = ScriptedAuth::new([Err(AuthError::Build("invalid token".to_string()))]);
+        let error = upload_openai_file(
+            &base_url_for(&server),
+            &auth,
+            &default_http_client_factory(),
+            "hello.txt".to_string(),
+            5,
+            futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"hello"))]),
+        )
+        .await
+        .expect_err("invalid credentials must prevent file creation");
+
+        let OpenAiFileError::Auth {
+            url,
+            source: AuthError::Build(message),
+        } = error
+        else {
+            panic!("expected auth build error, got {error:?}");
+        };
+        assert_eq!(url, format!("{}/files", base_url_for(&server)));
+        assert_eq!(message, "invalid token");
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_auth_failure_prevents_dispatch() {
+        let server = MockServer::start().await;
+        let auth = ScriptedAuth::new([Err(AuthError::Transient("token unavailable".to_string()))]);
+        let error = delete_openai_file(
+            &base_url_for(&server),
+            &auth,
+            &default_http_client_factory(),
+            "file_123",
+        )
+        .await
+        .expect_err("unavailable credentials must prevent deletion");
+
+        let OpenAiFileError::Auth {
+            url,
+            source: AuthError::Transient(message),
+        } = error
+        else {
+            panic!("expected transient auth error, got {error:?}");
+        };
+        assert_eq!(url, format!("{}/files/file_123", base_url_for(&server)));
+        assert_eq!(message, "token unavailable");
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_auth_failure_rolls_back_and_preserves_auth_errors() {
+        for rollback_succeeds in [true, false] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/backend-api/files"))
+                .and(header("authorization", "Bearer token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "file_id": "file_123",
+                    "upload_url": format!("{}/upload/file_123", server.uri()),
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path("/upload/file_123"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE"))
+                .and(path("/backend-api/files/file_123"))
+                .and(header("authorization", "Bearer token"))
+                .respond_with(ResponseTemplate::new(204))
+                .expect(if rollback_succeeds { 1 } else { 0 })
+                .mount(&server)
+                .await;
+            let auth = ScriptedAuth::new([
+                Ok(()),
+                Err(AuthError::Transient(
+                    "finalize auth unavailable".to_string(),
+                )),
+                if rollback_succeeds {
+                    Ok(())
+                } else {
+                    Err(AuthError::Build("rollback auth invalid".to_string()))
+                },
+            ]);
+            let error = upload_openai_file(
+                &base_url_for(&server),
+                &auth,
+                &default_http_client_factory(),
+                "hello.txt".to_string(),
+                5,
+                futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"hello"))]),
+            )
+            .await
+            .expect_err("finalize authentication must fail");
+            let source = if rollback_succeeds {
+                error
+            } else {
+                let OpenAiFileError::RollbackFailed {
+                    file_id,
+                    source,
+                    rollback,
+                } = error
+                else {
+                    panic!("expected rollback failure, got {error:?}");
+                };
+                assert_eq!(file_id, "file_123");
+                let OpenAiFileError::Auth {
+                    url,
+                    source: AuthError::Build(message),
+                } = *rollback
+                else {
+                    panic!("expected rollback auth error, got {rollback:?}");
+                };
+                assert_eq!(url, format!("{}/files/file_123", base_url_for(&server)));
+                assert_eq!(message, "rollback auth invalid");
+                *source
+            };
+            let OpenAiFileError::Auth {
+                url,
+                source: AuthError::Transient(message),
+            } = source
+            else {
+                panic!("expected finalize auth error, got {source:?}");
+            };
+            assert_eq!(
+                url,
+                format!("{}/files/file_123/uploaded", base_url_for(&server))
+            );
+            assert_eq!(message, "finalize auth unavailable");
+            let requests = server.received_requests().await.expect("requests");
+            assert_eq!(requests.len(), if rollback_succeeds { 3 } else { 2 });
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| !request.url.path().ends_with("/uploaded"))
+            );
+            assert!(!requests[1].headers.contains_key("authorization"));
+            assert!(auth.results.lock().expect("auth results lock").is_empty());
+        }
     }
 
     #[tokio::test]
@@ -671,7 +879,7 @@ mod tests {
             .and(path("/backend-api/files"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "file_id": "file_rollback",
-                "upload_url": format!("{}/upload/file_rollback", server.uri()),
+                "upload_url": format!("{}/upload/file_rollback?sig=private-signature#private-fragment", server.uri().replacen("http://", "http://private-user:private-password@", 1)),
             })))
             .expect(1)
             .mount(&server)
@@ -704,5 +912,196 @@ mod tests {
         .expect_err("the failed upload must be reported");
 
         assert!(error.to_string().contains("500 Internal Server Error"));
+        assert!(!error.to_string().contains("private-"));
+        let OpenAiFileError::UnexpectedStatus { url, status, body } = error else {
+            panic!("expected upload status error");
+        };
+        assert_eq!(url, format!("{}/upload/file_rollback", server.uri()));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, "upload failed");
+    }
+
+    #[tokio::test]
+    async fn required_response_body_failures_preserve_request_or_http_status() {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+
+        for finalize in [false, true] {
+            for status in [200, 503] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("listener");
+                let address = listener.local_addr().expect("address");
+                let base_url = format!("http://{address}");
+                let mut replies = Vec::new();
+                if finalize {
+                    let body = serde_json::json!({"file_id": "file_123", "upload_url": format!("{base_url}/upload")}).to_string();
+                    replies.push(("POST /files", format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())));
+                    replies.push((
+                        "PUT /upload",
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+                    ));
+                }
+                replies.push((if finalize { "POST /files/file_123/uploaded" } else { "POST /files" },
+                    format!("HTTP/1.1 {status} Test\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{{")));
+                if finalize {
+                    replies.push((
+                        "DELETE /files/file_123",
+                        "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".into(),
+                    ));
+                }
+                let server = tokio::spawn(async move {
+                    for (expected_request, reply) in replies {
+                        let (mut connection, _) =
+                            listener.accept().await.expect("request connection");
+                        let mut request = Vec::new();
+                        loop {
+                            let mut buffer = [0; 1024];
+                            let len = connection.read(&mut buffer).await.expect("request bytes");
+                            assert_ne!(len, 0, "request must finish before disconnecting");
+                            request.extend_from_slice(&buffer[..len]);
+                            if let Some(end) =
+                                request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                            {
+                                let headers = String::from_utf8_lossy(&request[..end]);
+                                let body_len = headers
+                                    .lines()
+                                    .find_map(|line| {
+                                        let (name, value) = line.split_once(':')?;
+                                        name.eq_ignore_ascii_case("content-length").then(|| {
+                                            value.trim().parse::<usize>().expect("content length")
+                                        })
+                                    })
+                                    .unwrap_or(0);
+                                if request.len() >= end + 4 + body_len {
+                                    assert_eq!(
+                                        headers.lines().next(),
+                                        Some(format!("{expected_request} HTTP/1.1").as_str())
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        connection
+                            .write_all(reply.as_bytes())
+                            .await
+                            .expect("response bytes");
+                        connection
+                            .shutdown()
+                            .await
+                            .expect("close incomplete response");
+                    }
+                });
+                let error = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    upload_openai_file(
+                        &base_url,
+                        &chatgpt_auth(),
+                        &default_http_client_factory(),
+                        "hello.txt".into(),
+                        5,
+                        futures::stream::iter([Ok(Bytes::from_static(b"hello"))]),
+                    ),
+                )
+                .await
+                .expect("request finishes")
+                .expect_err("truncated body fails");
+                if status == 200 {
+                    assert!(
+                        matches!(error, OpenAiFileError::Request { .. }),
+                        "{error:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(
+                            error,
+                            OpenAiFileError::UnexpectedStatus {
+                                status: StatusCode::SERVICE_UNAVAILABLE,
+                                ..
+                            }
+                        ),
+                        "{error:?}"
+                    );
+                }
+                tokio::time::timeout(Duration::from_secs(1), server)
+                    .await
+                    .expect("all requests including rollback arrived")
+                    .expect("server task");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_finalization_encodes_file_id_as_one_segment() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/backend-api/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "file_id": "file/a?#", "upload_url": format!("{}/upload", server.uri())
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/backend-api/files/file%2Fa%3F%23/uploaded"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "success", "download_url": "https://example.com/download"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let result = upload_openai_file(
+            &base_url_for(&server),
+            &chatgpt_auth(),
+            &default_http_client_factory(),
+            "hello.txt".into(),
+            5,
+            futures::stream::iter([Ok(Bytes::from_static(b"hello"))]),
+        )
+        .await
+        .expect("encoded finalization succeeds");
+        assert_eq!(result.file_id, "file/a?#");
+        assert_eq!(result.download_url, "https://example.com/download");
+    }
+
+    #[tokio::test]
+    async fn upload_request_error_redacts_signed_url_and_rolls_back() {
+        let server = MockServer::start().await;
+        let unused_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = unused_listener.local_addr().expect("address");
+        drop(unused_listener);
+        Mock::given(method("POST")).and(path("/backend-api/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "file_id": "file_rollback", "upload_url": format!("http://private-user:private-password@{address}/upload?sig=private-signature#private-fragment")
+            }))).expect(1).mount(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path("/backend-api/files/file_rollback"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = upload_openai_file(
+            &base_url_for(&server),
+            &chatgpt_auth(),
+            &default_http_client_factory(),
+            "hello.txt".into(),
+            5,
+            futures::stream::iter([Ok(Bytes::from_static(b"hello"))]),
+        )
+        .await
+        .expect_err("upload connection fails");
+        assert!(!error.to_string().contains("private-"));
+        assert!(!format!("{error:?}").contains("private-"));
+        assert!(
+            matches!(error, OpenAiFileError::Request { url, .. } if url == format!("http://{address}/upload"))
+        );
     }
 }

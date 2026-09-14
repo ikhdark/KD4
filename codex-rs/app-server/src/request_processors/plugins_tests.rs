@@ -179,5 +179,46 @@ enabled = true
         );
     }
 
+    // Also assert the asynchronous path: a cache miss is not evidence that the
+    // refreshed consumer actually excludes the removed plugin and its skill.
+    let plugin_outcome = plugins_manager.plugins_for_config(&plugins_input).await;
+    assert!(
+        plugin_outcome
+            .plugins()
+            .iter()
+            .all(|plugin| { plugin.config_name != "sample-plugin@debug" || !plugin.is_active() })
+    );
+    let skills_snapshot = skills_service
+        .snapshot_for_cwd(
+            &skills_input,
+            /*force_reload*/ false,
+            Some(Arc::clone(&LOCAL_FS)),
+        )
+        .await;
+    assert!(
+        skills_snapshot
+            .outcome()
+            .skills
+            .iter()
+            .all(|skill| { skill.name != "sample-plugin:sample-skill" })
+    );
+
     Ok(())
+}
+
+#[test]
+fn authoritative_auth_requirements_survive_missing_catalog_metadata() {
+    let ids = vec![codex_plugin::AppConnectorId("missing".to_string())];
+    let apps = connectors::connectors_for_plugin_apps(Vec::new(), &ids);
+    let summaries = plugin_apps_needing_auth(&apps, &[], &ids, true);
+    assert_eq!(
+        summaries,
+        vec![AppSummary {
+            id: "missing".to_string(),
+            name: "missing".to_string(),
+            description: None,
+            install_url: Some("https://chatgpt.com/apps/missing/missing".to_string()),
+            category: None,
+        }]
+    );
 }

@@ -182,7 +182,8 @@ fn with_user_config_updates_matching_user_layer_without_replacing_active_profile
             file: profile_file.clone(),
             profile: Some("work".to_string()),
         },
-        toml::from_str(r#"approval_policy = "on-request""#).expect("profile config"),
+        toml::from_str("model = 'profile'\napproval_policy = 'on-request'")
+            .expect("profile config"),
     );
     let stack = ConfigLayerStack::new(
         vec![base_layer, profile_layer],
@@ -197,13 +198,23 @@ fn with_user_config_updates_matching_user_layer_without_replacing_active_profile
     );
 
     assert_eq!(updated.get_user_config_file(), Some(&profile_file));
+    let user_layers =
+        updated.get_user_layers(ConfigLayerStackOrdering::LowestPrecedenceFirst, false);
+    assert_eq!(user_layers.len(), 2);
+    assert_eq!(
+        user_layers[0]
+            .config
+            .get("model")
+            .and_then(toml::Value::as_str),
+        Some("updated-base")
+    );
     assert_eq!(
         updated
             .effective_user_config()
             .expect("merged user config")
             .get("model")
             .and_then(toml::Value::as_str),
-        Some("updated-base")
+        Some("profile")
     );
     assert_eq!(
         updated

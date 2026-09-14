@@ -108,6 +108,7 @@ async fn create_codex_apps_tools_cache_context(
                 chatgpt_user_id: chatgpt_user_id.map(ToOwned::to_owned),
                 is_workspace_account: false,
                 chatgpt_base_url: "https://chatgpt.com".to_string(),
+                mcp_endpoint: "https://chatgpt.com/backend-api/apps".to_string(),
                 product_sku: DEFAULT_CODEX_APPS_MCP_PRODUCT_SKU.to_string(),
             },
         )
@@ -234,6 +235,8 @@ async fn manager_lease_keeps_an_adopted_client_live_until_the_final_release() {
     client.release_manager_without_shutdown();
     assert!(cancel_token.is_cancelled());
     assert_eq!(client.manager_owners.load(Ordering::Acquire), 0);
+    client.release_manager_without_shutdown();
+    assert_eq!(client.manager_owners.load(Ordering::Acquire), 0);
 }
 
 #[tokio::test]
@@ -316,6 +319,7 @@ async fn refresh_adopts_an_unchanged_client_without_old_manager_shutdown_cancell
         chatgpt_user_id: None,
         is_workspace_account: false,
         chatgpt_base_url: "https://chatgpt.com".to_string(),
+        mcp_endpoint: "https://chatgpt.com/backend-api/apps".to_string(),
         product_sku: DEFAULT_CODEX_APPS_MCP_PRODUCT_SKU.to_string(),
     };
     previous.client_reuse_context = ClientReuseContext {
@@ -370,6 +374,7 @@ async fn refresh_adopts_an_unchanged_client_without_old_manager_shutdown_cancell
     assert!(Arc::ptr_eq(&client_identity, &adopted.startup_complete));
     assert_eq!(adopted.manager_owners.load(Ordering::Acquire), 2);
 
+    previous.shutdown().await;
     drop(previous);
     assert!(!cancel_token.is_cancelled());
     assert_eq!(adopted.manager_owners.load(Ordering::Acquire), 1);
@@ -416,41 +421,163 @@ async fn aggregate_resource_discovery_skips_servers_without_resources_capability
     assert!(template_pages.results.is_empty());
 }
 
-#[test]
-fn successful_in_place_tool_catalog_refresh_advances_revision() {
+#[tokio::test]
+async fn resource_collections_poll_server_startups_concurrently() {
+    for operation in 0..4 {
+        let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+        let permission_profile = Constrained::allow_any(PermissionProfile::default());
+        let mut manager =
+            McpConnectionManager::new_uninitialized(&approval_policy, &permission_profile, true);
+        for name in ["first", "second"] {
+            manager.clients.insert(
+                name.to_string(),
+                create_ready_async_managed_client_with_resources(Vec::new(), true).await,
+            );
+        }
+        let ready = Arc::new(tokio::sync::Notify::new());
+        // Arrange the dependency in the map's actual iteration order. A serial
+        // readiness loop cannot reach the second startup to release the first.
+        for (index, client) in manager.clients.values_mut().enumerate() {
+            let startup = client.client.clone();
+            let ready = Arc::clone(&ready);
+            client.client = async move {
+                if index == 0 {
+                    ready.notified().await;
+                } else {
+                    ready.notify_one();
+                }
+                startup.await
+            }
+            .boxed()
+            .shared();
+        }
+        let (result_count, errors) = tokio::time::timeout(Duration::from_secs(1), async {
+            match operation {
+                0 => {
+                    let collection = manager.list_all_resources(|_| true).await;
+                    (collection.results.len(), collection.errors)
+                }
+                1 => {
+                    let collection = manager.list_resource_pages(|_| true).await;
+                    (collection.results.len(), collection.errors)
+                }
+                2 => {
+                    let collection = manager.list_all_resource_templates(|_| true).await;
+                    (collection.results.len(), collection.errors)
+                }
+                _ => {
+                    let collection = manager.list_resource_template_pages(|_| true).await;
+                    (collection.results.len(), collection.errors)
+                }
+            }
+        })
+        .await
+        .expect("both startups must be polled without waiting for the first to finish");
+        assert_eq!(result_count, 0);
+        assert_eq!(
+            errors
+                .into_iter()
+                .map(|error| error.server)
+                .collect::<HashSet<_>>(),
+            HashSet::from(["first".to_string(), "second".to_string()])
+        );
+    }
+}
+
+async fn manager_with_shared_apps_cache(
+    context: &CodexAppsToolsCacheContext,
+) -> McpConnectionManager {
     let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     let permission_profile = Constrained::allow_any(PermissionProfile::default());
-    let manager = McpConnectionManager::new_uninitialized(
-        &approval_policy,
-        &permission_profile,
-        /*prefix_mcp_tool_names*/ true,
-    );
-    let tools = vec![create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "search")];
-
-    assert_eq!(manager.tool_catalog_revision(), 0);
-    let returned = manager.finish_tool_catalog_refresh(tools.clone());
-
-    assert_eq!(model_tool_names(&returned), model_tool_names(&tools));
-    assert_eq!(manager.tool_catalog_revision(), 1);
+    let mut manager =
+        McpConnectionManager::new_uninitialized(&approval_policy, &permission_profile, true);
+    let mut client = create_ready_async_managed_client(vec![create_test_tool(
+        CODEX_APPS_MCP_SERVER_NAME,
+        "stale-local",
+    )])
+    .await;
+    client.is_codex_apps_mcp_server = true;
+    client.codex_apps_tools_cache_context = Some(context.clone());
+    manager
+        .clients
+        .insert(CODEX_APPS_MCP_SERVER_NAME.to_string(), client);
+    manager
 }
 
 #[tokio::test]
-async fn aggregate_tool_snapshot_is_shared_until_the_catalog_revision_changes() {
-    let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
-    let permission_profile = Constrained::allow_any(PermissionProfile::default());
-    let manager = McpConnectionManager::new_uninitialized(
-        &approval_policy,
-        &permission_profile,
-        /*prefix_mcp_tool_names*/ true,
-    );
-
-    let first = manager.list_all_tools_snapshot().await;
-    let second = manager.list_all_tools_snapshot().await;
-    assert!(Arc::ptr_eq(&first, &second));
-
-    manager.finish_tool_catalog_refresh(Vec::new());
-    let refreshed = manager.list_all_tools_snapshot().await;
-    assert!(!Arc::ptr_eq(&first, &refreshed));
+async fn shared_publications_update_ready_managers_and_preserve_unchanged_catalogs() {
+    let home = tempdir().expect("home");
+    let context =
+        create_codex_apps_tools_cache_context(home.path().to_path_buf(), None, None).await;
+    let info = create_test_server_info("Apps");
+    let old_tools = vec![create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "old")];
+    context
+        .publish_if_newest_accepted(
+            context.begin_fetch(CodexAppsToolsFetchSource::Startup),
+            &info,
+            old_tools.clone(),
+        )
+        .await;
+    let first = manager_with_shared_apps_cache(&context).await;
+    let second = manager_with_shared_apps_cache(&context).await;
+    let initial_first = first.list_all_tools_snapshot().await;
+    let initial_second = second.list_all_tools_snapshot().await;
+    assert_eq!(initial_first[0].tool.name, "old");
+    assert_eq!(initial_second[0].tool.name, "old");
+    let old_ticket = context.begin_fetch(CodexAppsToolsFetchSource::HardRefresh);
+    let new_tools = vec![create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "new")];
+    context
+        .publish_if_newest_accepted(
+            context.begin_fetch(CodexAppsToolsFetchSource::HardRefresh),
+            &info,
+            new_tools.clone(),
+        )
+        .await;
+    let revision = first.tool_catalog_revision();
+    for manager in [&first, &second] {
+        let current = manager.list_all_tools_snapshot().await;
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].tool.name, "new");
+        assert!(
+            manager
+                .tool_info(CODEX_APPS_MCP_SERVER_NAME, "old")
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            manager
+                .tool_info(CODEX_APPS_MCP_SERVER_NAME, "new")
+                .await
+                .expect("new tool")
+                .tool
+                .name,
+            "new"
+        );
+        // An older publication continuation may still hold an obsolete local vector.
+        manager.clients[CODEX_APPS_MCP_SERVER_NAME]
+            .client()
+            .await
+            .expect("ready")
+            .tools
+            .store(Arc::new(old_tools.clone()));
+    }
+    let current = second.list_all_tools_snapshot().await;
+    assert!(!Arc::ptr_eq(&current, &initial_second));
+    context
+        .publish_if_newest_accepted(old_ticket, &info, old_tools)
+        .await;
+    context
+        .publish_if_newest_accepted(
+            context.begin_fetch(CodexAppsToolsFetchSource::HardRefresh),
+            &info,
+            new_tools,
+        )
+        .await;
+    assert_eq!(first.tool_catalog_revision(), revision);
+    assert!(Arc::ptr_eq(
+        &current,
+        &second.list_all_tools_snapshot().await
+    ));
 }
 
 async fn create_test_manager_with_failed_apps_startup(
@@ -472,6 +599,21 @@ async fn create_test_manager_with_failed_apps_startup(
     )
     .await;
     cache_context.store_current_tools_for_test(cached_tools);
+    let reconnect_context = cache_context.clone();
+    let reconnect_factory = Arc::new(move || {
+        let startup = reconnect_factory();
+        let context = reconnect_context.clone();
+        async move {
+            let mut client = startup.await?;
+            // The production startup publishes the discovered raw catalog
+            // before returning its ready client.
+            context.store_current_tools_for_test(client.tools.load_full().as_ref().clone());
+            client.codex_apps_tools_cache_context = Some(context);
+            Ok(client)
+        }
+        .boxed()
+        .shared()
+    });
     let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     let permission_profile = Constrained::allow_any(PermissionProfile::default());
     let mut manager = McpConnectionManager::new_uninitialized(
@@ -582,12 +724,12 @@ fn tool_with_model_visible_input_schema_masks_file_params() {
             "properties": {
                 "file": {
                     "type": "string",
-                    "description": "Original file payload. This parameter expects an absolute local file path. If you want to upload a file, provide the absolute path to that file here."
+                    "description": "Original file payload. Absolute local path to the file to upload."
                 },
                 "files": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "This parameter expects an absolute local file path. If you want to upload a file, provide the absolute path to that file here."
+                    "description": "Absolute local paths to the files to upload."
                 }
             }
         })
@@ -938,14 +1080,16 @@ fn test_normalize_tools_short_non_duplicated_names() {
 
 #[test]
 fn test_normalize_tools_duplicated_names_skipped() {
-    let tools = vec![
-        create_test_tool("server1", "duplicate_tool"),
-        create_test_tool("server1", "duplicate_tool"),
-    ];
+    let first = create_test_tool("server1", "duplicate_tool");
+    let mut second = first.clone();
+    second.tool.description = Some("second duplicate".into());
+    let tools = vec![first.clone(), second];
 
     let model_tools =
         normalize_tools_for_model_with_prefix(tools, /*prefix_mcp_tool_names*/ true);
 
+    assert_eq!(model_tools.len(), 1);
+    assert_eq!(model_tools[0].tool.description, first.tool.description);
     // Only the first tool should remain, the second is skipped
     assert_eq!(
         model_tool_names(&model_tools),
@@ -1592,6 +1736,7 @@ async fn list_all_tools_reconnects_failed_codex_apps_startup_and_reuses_client()
         .shared()
     });
     let manager = create_test_manager_with_failed_apps_startup(Vec::new(), reconnect_factory).await;
+    let initial_revision = manager.tool_catalog_revision();
 
     // Hold the external startup pending: an immediately ready reconnect may
     // legitimately populate the first catalog before list_all_tools returns.
@@ -1599,7 +1744,7 @@ async fn list_all_tools_reconnects_failed_codex_apps_startup_and_reuses_client()
         .await
         .expect("listing should not wait for the pending reconnect");
     assert!(tools.is_empty());
-    assert_eq!(manager.tool_catalog_revision(), 0);
+    assert_eq!(manager.tool_catalog_revision(), initial_revision);
     tokio::time::timeout(Duration::from_secs(1), reconnect_started.notified())
         .await
         .expect("listing should start the reconnect");
@@ -1607,12 +1752,12 @@ async fn list_all_tools_reconnects_failed_codex_apps_startup_and_reuses_client()
         .await
         .expect("repeated listing should not wait for the pending reconnect");
     assert!(tools.is_empty());
-    assert_eq!(manager.tool_catalog_revision(), 0);
+    assert_eq!(manager.tool_catalog_revision(), initial_revision);
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
     allow_reconnect.notify_one();
 
     tokio::time::timeout(Duration::from_secs(1), async {
-        while manager.tool_catalog_revision() == 0 {
+        while manager.tool_catalog_revision() == initial_revision {
             tokio::task::yield_now().await;
         }
     })
@@ -1628,7 +1773,8 @@ async fn list_all_tools_reconnects_failed_codex_apps_startup_and_reuses_client()
         vec!["drive_search"]
     );
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert_eq!(manager.tool_catalog_revision(), 1);
+    let recovered_revision = manager.tool_catalog_revision();
+    assert!(recovered_revision > initial_revision);
 
     let tools = manager.list_all_tools().await;
     assert_eq!(
@@ -1639,7 +1785,42 @@ async fn list_all_tools_reconnects_failed_codex_apps_startup_and_reuses_client()
         vec!["drive_search"]
     );
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert_eq!(manager.tool_catalog_revision(), 1);
+    assert_eq!(manager.tool_catalog_revision(), recovered_revision);
+}
+
+#[tokio::test]
+async fn invalid_startup_configuration_does_not_schedule_reconnect() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let reconnect_attempts = Arc::clone(&attempts);
+    let reconnect_factory = Arc::new(move || {
+        reconnect_attempts.fetch_add(1, Ordering::SeqCst);
+        futures::future::ready(Err(StartupOutcomeError::InvalidConfiguration {
+            error: "invalid server name".to_string(),
+        }))
+        .boxed()
+        .shared()
+    });
+    let mut manager = create_test_manager_with_failed_apps_startup(
+        vec![create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "cached")],
+        reconnect_factory,
+    )
+    .await;
+    manager
+        .clients
+        .get_mut(CODEX_APPS_MCP_SERVER_NAME)
+        .expect("Apps client")
+        .client = futures::future::ready(Err(StartupOutcomeError::InvalidConfiguration {
+        error: "invalid server name".to_string(),
+    }))
+    .boxed()
+    .shared();
+    for _ in 0..2 {
+        let tools = manager.list_all_tools().await;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].tool.name, "cached");
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -2008,6 +2189,7 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
             chatgpt_user_id: None,
             is_workspace_account: false,
             chatgpt_base_url: "https://chatgpt.com".to_string(),
+            mcp_endpoint: "https://chatgpt.com/backend-api/apps".to_string(),
             product_sku: DEFAULT_CODEX_APPS_MCP_PRODUCT_SKU.to_string(),
         },
         /*prefix_mcp_tool_names*/ true,
@@ -2100,7 +2282,11 @@ fn mcp_init_error_display_prompts_for_github_pat() {
         }),
         auth_state: McpAuthState::Unsupported,
     };
-    let err: StartupOutcomeError = anyhow::anyhow!("OAuth is unsupported").into();
+    let err = StartupOutcomeError::Failed {
+        error: "authentication required".into(),
+        is_authentication_required: true,
+        is_timeout: false,
+    };
 
     let display = mcp_init_error_display(server_name, Some(&entry), &err);
 
@@ -2109,6 +2295,11 @@ fn mcp_init_error_display_prompts_for_github_pat() {
     );
 
     assert_eq!(expected, display);
+    let network_error: StartupOutcomeError = anyhow::anyhow!("connection refused").into();
+    assert_eq!(
+        mcp_init_error_display(server_name, Some(&entry), &network_error),
+        format!("MCP client for `{server_name}` failed to start: {network_error:#}")
+    );
 }
 
 #[test]
@@ -2224,7 +2415,7 @@ fn mcp_init_error_display_includes_startup_timeout_hint() {
     let display = mcp_init_error_display(server_name, /*entry*/ None, &err);
 
     assert_eq!(
-        "MCP client for `slow` timed out after 30 seconds. Add or adjust `startup_timeout_sec` in your config.toml:\n[mcp_servers.slow]\nstartup_timeout_sec = XX",
+        "MCP client for `slow` timed out during startup: MCP startup failed: request timed out. Check `startup_timeout_sec` for initialization and `tool_timeout_sec` for tool discovery.",
         display
     );
 }
@@ -2306,4 +2497,20 @@ async fn shutdown_clients_force_explicit_graceful_failures() {
     .await;
 
     assert_eq!(forced.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn unrelated_namespace_name_pairs_do_not_gain_hash_suffixes() {
+    let tools = normalize_tools_for_model_with_prefix(
+        vec![create_test_tool("a", "bc"), create_test_tool("ab", "c")],
+        true,
+    );
+    assert_eq!(tools.len(), 2);
+    assert_eq!(
+        model_tool_names(&tools),
+        HashSet::from([
+            ToolName::namespaced("mcp__a", "bc"),
+            ToolName::namespaced("mcp__ab", "c")
+        ])
+    );
 }

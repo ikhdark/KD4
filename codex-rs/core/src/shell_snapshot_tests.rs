@@ -567,6 +567,15 @@ async fn cleanup_stale_snapshots_removes_orphans_and_keeps_live() -> Result<()> 
 #[tokio::test]
 async fn cancelled_remote_snapshot_build_terminates_capture_without_publishing_file() -> Result<()>
 {
+    assert_cancelled_remote_snapshot_cleanup(false).await
+}
+
+#[tokio::test]
+async fn cancelled_remote_snapshot_validation_removes_published_file() -> Result<()> {
+    assert_cancelled_remote_snapshot_cleanup(true).await
+}
+
+async fn assert_cancelled_remote_snapshot_cleanup(cancel_validation: bool) -> Result<()> {
     use futures::SinkExt;
     use futures::StreamExt;
     use serde_json::json;
@@ -580,6 +589,10 @@ async fn cancelled_remote_snapshot_build_terminates_capture_without_publishing_f
         let mut read_started = Some(read_started);
         let mut methods = Vec::new();
         let mut process_id = None;
+        let mut process_count = 0;
+        let mut published_path = None;
+        let mut terminated = false;
+        let mut removed = false;
         while let Some(message) = websocket.next().await {
             let request: serde_json::Value = serde_json::from_slice(&message?.into_data())?;
             let method = request["method"].as_str().context("request method")?;
@@ -596,11 +609,24 @@ async fn cancelled_remote_snapshot_build_terminates_capture_without_publishing_f
                 }),
                 "fs/createDirectory" => json!({}),
                 "process/start" => {
+                    process_count += 1;
                     process_id = Some(request["params"]["processId"].clone());
                     json!({"processId": process_id})
                 }
                 "process/read" => {
                     assert_eq!(Some(&request["params"]["processId"]), process_id.as_ref());
+                    if cancel_validation && process_count == 1 {
+                        let raw = b"# Snapshot file\n# Codex Cmd snapshot format: 1\n# exports\nSNAPSHOT_MARKER=retained\n";
+                        let chunk =
+                            serde_json::to_value(codex_exec_server::ByteChunk::from(raw.to_vec()))?;
+                        websocket.send(tokio_tungstenite::tungstenite::Message::Text(
+                            json!({"jsonrpc":"2.0", "id": request["id"], "result": {
+                                "chunks": [{"seq": 1, "stream": "stdout", "chunk": chunk}],
+                                "nextSeq": 2, "exited": true, "exitCode": 0, "closed": true, "failure": null
+                            }}).to_string().into()
+                        )).await?;
+                        continue;
+                    }
                     read_started
                         .take()
                         .expect("one in-flight capture read")
@@ -610,8 +636,22 @@ async fn cancelled_remote_snapshot_build_terminates_capture_without_publishing_f
                     // must cancel this wait and send terminate after its owner is dropped.
                     continue;
                 }
+                "fs/writeFile" if cancel_validation => {
+                    assert!(published_path.is_none(), "publish exactly one snapshot");
+                    published_path = Some(request["params"]["path"].clone());
+                    json!({})
+                }
+                "fs/remove" if cancel_validation => {
+                    assert!(!removed, "remove exactly once");
+                    assert_eq!(Some(&request["params"]["path"]), published_path.as_ref());
+                    assert_eq!(request["params"]["recursive"], false);
+                    removed = true;
+                    json!({})
+                }
                 "process/terminate" => {
+                    assert!(!terminated, "terminate exactly once");
                     assert_eq!(Some(&request["params"]["processId"]), process_id.as_ref());
+                    terminated = true;
                     json!({"running": false})
                 }
                 other => anyhow::bail!(
@@ -625,7 +665,7 @@ async fn cancelled_remote_snapshot_build_terminates_capture_without_publishing_f
                         .into(),
                 ))
                 .await?;
-            if method == "process/terminate" {
+            if terminated && (!cancel_validation || removed) {
                 return Ok::<_, anyhow::Error>(methods);
             }
         }
@@ -676,19 +716,56 @@ async fn cancelled_remote_snapshot_build_terminates_capture_without_publishing_f
     // This is deliberately shorter than SNAPSHOT_TIMEOUT: cancellation must
     // trigger the same cleanup owner immediately, not wait for the normal deadline.
     let methods = timeout(Duration::from_secs(2), peer).await???;
-    assert_eq!(
-        methods,
-        [
-            "initialize",
-            "initialized",
-            "environment/info",
-            "fs/createDirectory",
-            "process/start",
-            "process/read",
-            "process/terminate",
-        ],
-        "actual registered remote capture terminates once without file publication or validation"
-    );
+    if cancel_validation {
+        assert_eq!(
+            &methods[..8],
+            &[
+                "initialize",
+                "initialized",
+                "environment/info",
+                "fs/createDirectory",
+                "process/start",
+                "process/read",
+                "fs/writeFile",
+                "process/start",
+            ]
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| *method == "process/read")
+                .count(),
+            2
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| *method == "fs/remove")
+                .count(),
+            1
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| *method == "process/terminate")
+                .count(),
+            1
+        );
+    } else {
+        assert_eq!(
+            methods,
+            [
+                "initialize",
+                "initialized",
+                "environment/info",
+                "fs/createDirectory",
+                "process/start",
+                "process/read",
+                "process/terminate",
+            ],
+            "actual registered remote capture terminates once without file publication or validation"
+        );
+    }
     assert!(
         !directory.path().join(SNAPSHOT_DIR).exists(),
         "cancelled remote output cannot appear as a local snapshot"

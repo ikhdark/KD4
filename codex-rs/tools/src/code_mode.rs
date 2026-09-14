@@ -29,20 +29,19 @@ pub fn code_mode_tool_search_output_schema() -> serde_json::Value {
 
 /// Augment tool descriptions with code-mode-specific exec samples.
 pub fn augment_tool_spec_for_code_mode(spec: ToolSpec) -> ToolSpec {
+    let description = matches!(&spec, ToolSpec::Function(_) | ToolSpec::Freeform(_))
+        .then(|| augmented_description_for_spec(&spec))
+        .flatten();
     match spec {
         ToolSpec::Function(mut tool) => {
-            let Some(description) =
-                augmented_description_for_spec(&ToolSpec::Function(tool.clone()))
-            else {
+            let Some(description) = description else {
                 return ToolSpec::Function(tool);
             };
             tool.description = description;
             ToolSpec::Function(tool)
         }
         ToolSpec::Freeform(mut tool) => {
-            let Some(description) =
-                augmented_description_for_spec(&ToolSpec::Freeform(tool.clone()))
-            else {
+            let Some(description) = description else {
                 return ToolSpec::Freeform(tool);
             };
             tool.description = description;
@@ -74,7 +73,8 @@ pub fn augment_tool_spec_for_code_mode(spec: ToolSpec) -> ToolSpec {
 }
 
 /// Convert a supported nested tool spec into the code-mode runtime shape,
-/// including the code-mode-specific description sample.
+/// including the code-mode-specific description sample. Namespaces must contain
+/// exactly one callable; use `collect_code_mode_tool_definitions` for catalogs.
 pub fn tool_spec_to_code_mode_tool_definition(spec: &ToolSpec) -> Option<CodeModeToolDefinition> {
     let definition = code_mode_tool_definition_for_spec(spec)?;
     codex_code_mode::is_code_mode_nested_tool(&definition.name)
@@ -142,6 +142,9 @@ fn augmented_description_for_spec(spec: &ToolSpec) -> Option<String> {
 }
 
 fn code_mode_tool_definition_for_spec(spec: &ToolSpec) -> Option<CodeModeToolDefinition> {
+    if matches!(spec, ToolSpec::Namespace(namespace) if namespace.tools.len() != 1) {
+        return None;
+    }
     code_mode_tool_definitions_for_spec(spec).into_iter().next()
 }
 

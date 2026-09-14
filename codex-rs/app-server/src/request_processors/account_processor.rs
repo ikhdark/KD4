@@ -658,10 +658,10 @@ impl AccountRequestProcessor {
                     guard.take();
                 }
                 #[cfg(test)]
-                if let Some(control) = &mut test_control {
-                    if let Some(committing) = control.committing.take() {
-                        let _ = committing.send(());
-                    }
+                if let Some(control) = &mut test_control
+                    && let Some(committing) = control.committing.take()
+                {
+                    let _ = committing.send(());
                 }
                 pending.persist().await
             }.await;
@@ -758,14 +758,6 @@ impl AccountRequestProcessor {
             ));
         }
 
-        // Cancel any active login attempt to avoid persisting managed auth state.
-        {
-            let mut guard = self.active_login.lock().await;
-            if let Some(active) = guard.take() {
-                drop(active);
-            }
-        }
-
         if let Some(expected_workspaces) = self.config.forced_chatgpt_workspace_id.as_deref()
             && !expected_workspaces.contains(&chatgpt_account_id)
         {
@@ -780,6 +772,8 @@ impl AccountRequestProcessor {
             chatgpt_plan_type.as_deref(),
         )
         .map_err(|err| internal_error(format!("failed to set external auth: {err}")))?;
+        // Replace an active login only after the new credentials pass validation.
+        self.cancel_active_login().await;
         self.auth_manager
             .set_external_auth(Arc::new(ExternalAuthBridge::new(
                 Arc::clone(&self.outgoing),
@@ -843,11 +837,8 @@ impl AccountRequestProcessor {
             success,
             error: error_msg,
         };
-        outgoing
-            .send_server_notification(ServerNotification::AccountLoginCompleted(payload_v2))
-            .await;
 
-        if success {
+        let account_updated = if success {
             let auth_manager = thread_manager.auth_manager();
             auth_manager.reload().await;
             config_manager.replace_cloud_config_bundle_loader(
@@ -866,15 +857,22 @@ impl AccountRequestProcessor {
                 auth.clone(),
             )
             .await;
-            let payload_v2 = AccountUpdatedNotification {
+            Some(AccountUpdatedNotification {
                 auth_mode: auth
                     .as_ref()
                     .map(CodexAuth::api_auth_mode)
                     .map(AuthMode::from),
                 plan_type: auth.as_ref().and_then(CodexAuth::account_plan_type),
-            };
+            })
+        } else {
+            None
+        };
+        outgoing
+            .send_server_notification(ServerNotification::AccountLoginCompleted(payload_v2))
+            .await;
+        if let Some(account_updated) = account_updated {
             outgoing
-                .send_server_notification(ServerNotification::AccountUpdated(payload_v2))
+                .send_server_notification(ServerNotification::AccountUpdated(account_updated))
                 .await;
         }
     }
@@ -1319,6 +1317,84 @@ mod tests {
     use codex_backend_client::TokenUsageProfileStats;
     use pretty_assertions::assert_eq;
 
+    #[tokio::test]
+    async fn rejected_external_credentials_preserve_active_login() -> anyhow::Result<()> {
+        use crate::outgoing_message::OutgoingEnvelope;
+        use crate::outgoing_message::OutgoingMessage;
+
+        let server = core_test_support::responses::start_mock_server().await;
+        let catalog = codex_models_manager::bundled_models_response()?;
+        let test = core_test_support::test_codex::test_codex()
+            .with_config(move |config| {
+                config.model_catalog = Some(catalog);
+                config.forced_chatgpt_workspace_id = Some(vec!["allowed".to_string()]);
+            })
+            .build(&server)
+            .await?;
+        let config = Arc::new(test.config.clone());
+        let config_manager =
+            ConfigManager::without_managed_config_for_tests(config.codex_home.to_path_buf());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let processor = AccountRequestProcessor::new(
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy")),
+            Arc::clone(&test.thread_manager),
+            outgoing,
+            config,
+            config_manager,
+        );
+        let cancel = CancellationToken::new();
+        let login_id = Uuid::new_v4();
+        *processor.active_login.lock().await = Some(ActiveLogin::DeviceCode {
+            cancel: cancel.clone(),
+            login_id,
+        });
+        for (workspace, expected_error) in [
+            ("denied", "External auth must use one of workspace(s)"),
+            ("allowed", "failed to set external auth"),
+        ] {
+            processor
+                .login_account(
+                    ConnectionRequestId {
+                        connection_id: ConnectionId(1),
+                        request_id: RequestId::Integer(1),
+                    },
+                    LoginAccountParams::ChatgptAuthTokens {
+                        access_token: String::new(),
+                        chatgpt_account_id: workspace.to_string(),
+                        chatgpt_plan_type: None,
+                    },
+                )
+                .await
+                .expect("request dispatch");
+            let OutgoingEnvelope::ToConnection {
+                message: OutgoingMessage::Error(error),
+                ..
+            } = rx.recv().await.expect("login rejection")
+            else {
+                panic!("expected a rejected login");
+            };
+            assert!(error.error.message.starts_with(expected_error));
+            assert!(!cancel.is_cancelled());
+            assert_eq!(
+                processor
+                    .active_login
+                    .lock()
+                    .await
+                    .as_ref()
+                    .map(ActiveLogin::login_id),
+                Some(login_id)
+            );
+        }
+        processor.cancel_active_login().await;
+        assert!(cancel.is_cancelled());
+        test.codex.shutdown_and_wait().await?;
+        Ok(())
+    }
+
     #[test]
     fn account_token_usage_response_maps_profile_stats_and_daily_buckets() {
         let response = AccountRequestProcessor::account_token_usage_response(TokenUsageProfile {
@@ -1406,6 +1482,10 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(login_port)]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "The held registry lock forces cancellation before ownership transfer and verifies callback cleanup"
+    )]
     async fn cancelled_login_start_closes_callback_before_registry_ownership() -> anyhow::Result<()>
     {
         use tokio::io::AsyncReadExt;

@@ -51,6 +51,27 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
+async fn list_all_mutation_evidence(
+    store: &LocalAgentTaskStore,
+    attempt_id: codex_agent_task_store::AttemptId,
+) -> Result<Vec<MutationEvidence>, StoreError> {
+    let mut evidence = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = store
+            .list_mutation_evidence_page(attempt_id, Some(MAX_MUTATION_EVIDENCE_LIMIT), cursor)
+            .await?;
+        evidence.extend(page.evidence);
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => {
+                evidence.reverse();
+                return Ok(evidence);
+            }
+        }
+    }
+}
+
 const GET_AGENT_TASK_TOOL: &str = "get_agent_task";
 const SUBMIT_AGENT_RECEIPT_TOOL: &str = "submit_agent_receipt";
 const SET_AGENT_GATE_TOOL: &str = "set_agent_gate";
@@ -250,9 +271,7 @@ async fn handle_submit_agent_receipt(
     }
     // Risk derivation and cold-review evidence must cover the complete attempt, including writes
     // that another runtime path finalized before receipt submission.
-    let observed_writes = match store
-        .list_mutation_evidence(binding.attempt_id, Some(MAX_MUTATION_EVIDENCE_LIMIT))
-        .await
+    let observed_writes = match list_all_mutation_evidence(store.as_ref(), binding.attempt_id).await
     {
         Ok(observed_writes) => observed_writes,
         Err(error) => {
@@ -428,13 +447,10 @@ async fn build_evaluation_context(
         .get_agent_task(target_assignment_id, Some(0))
         .await
         .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?;
-    let observed_writes = store
-        .list_mutation_evidence(
-            target.current_attempt.attempt_id,
-            Some(MAX_MUTATION_EVIDENCE_LIMIT),
-        )
-        .await
-        .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?;
+    let observed_writes =
+        list_all_mutation_evidence(store.as_ref(), target.current_attempt.attempt_id)
+            .await
+            .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?;
     let diff = build_attempt_diff(
         store.as_ref(),
         target.current_attempt.attempt_id,

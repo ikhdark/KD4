@@ -127,7 +127,7 @@ where
     if is_windows {
         // Explicit aliases use the lexicographically last spelling so HashMap
         // iteration cannot decide which value a Windows child receives.
-        overrides.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        overrides.sort_unstable_by_key(|(left, _)| *left);
     }
     for (key, val) in overrides {
         if is_windows {

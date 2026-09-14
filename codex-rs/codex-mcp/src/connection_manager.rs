@@ -30,10 +30,10 @@ use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 use crate::mcp::ToolPluginProvenance;
 use crate::rmcp_client::AsyncManagedClient;
 use crate::rmcp_client::CODEX_APPS_REFRESH_DURATION_METRIC;
-use crate::rmcp_client::DEFAULT_STARTUP_TIMEOUT;
 use crate::rmcp_client::MCP_TOOLS_LIST_DURATION_METRIC;
 use crate::rmcp_client::ManagedClient;
 use crate::rmcp_client::StartupOutcomeError;
+use crate::rmcp_client::commit_tool_catalog_refresh;
 use crate::rmcp_client::list_tools_for_client_uncached;
 use crate::runtime::McpRuntimeContext;
 use crate::runtime::emit_duration;
@@ -42,7 +42,6 @@ use crate::server::McpServerMetadata;
 use crate::tools::ToolInfo;
 use crate::tools::filter_tools;
 use crate::tools::normalize_tools_for_model_with_prefix;
-use crate::tools::tool_with_model_visible_input_schema;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -376,9 +375,10 @@ impl McpConnectionManager {
             supports_openai_form_elicitation,
         };
         let reusable_previous_manager = previous_manager.filter(|previous| {
-            previous
-                .client_reuse_context
-                .is_compatible_with(&client_reuse_context)
+            !previous.shutdown_started()
+                && previous
+                    .client_reuse_context
+                    .is_compatible_with(&client_reuse_context)
                 && previous.tool_plugin_provenance.as_ref() == tool_plugin_provenance.as_ref()
         });
         let elicitation_requests = if let Some(previous) = reusable_previous_manager {
@@ -459,11 +459,23 @@ impl McpConnectionManager {
                     McpServerTransportConfig::Stdio { .. } => false,
                 });
             let shares_codex_apps_tools_cache =
-                should_share_codex_apps_tools_cache(&server_name, uses_env_bearer_token);
-            let codex_apps_tools_cache_context = if shares_codex_apps_tools_cache {
+                should_share_codex_apps_tools_cache(&server_name, uses_env_bearer_token)
+                    && configured_config.is_some_and(|config| {
+                        matches!(&config.transport,
+                        McpServerTransportConfig::StreamableHttp { env_http_headers, .. }
+                        if env_http_headers.as_ref().is_none_or(HashMap::is_empty))
+                    });
+            let codex_apps_tools_cache_context = if shares_codex_apps_tools_cache
+                && let Some(configured_config) = configured_config
+            {
                 Some(
                     codex_apps_tools_cache
-                        .context(codex_home.clone(), codex_apps_tools_cache_key.clone())
+                        .context(
+                            codex_home.clone(),
+                            codex_apps_tools_cache_key
+                                .clone()
+                                .for_server(configured_config),
+                        )
                         .await,
                 )
             } else {
@@ -572,12 +584,13 @@ impl McpConnectionManager {
                 match outcome {
                     Ok(_) => summary.ready.push(server_name),
                     Err(StartupOutcomeError::Cancelled) => summary.cancelled.push(server_name),
-                    Err(StartupOutcomeError::Failed { error, .. }) => {
-                        summary.failed.push(McpStartupFailure {
-                            server: server_name,
-                            error,
-                        })
-                    }
+                    Err(
+                        StartupOutcomeError::Failed { error, .. }
+                        | StartupOutcomeError::InvalidConfiguration { error },
+                    ) => summary.failed.push(McpStartupFailure {
+                        server: server_name,
+                        error,
+                    }),
                 }
             }
             let _ = tx_event
@@ -670,6 +683,7 @@ impl McpConnectionManager {
                     chatgpt_user_id: None,
                     is_workspace_account: false,
                     chatgpt_base_url: String::new(),
+                    mcp_endpoint: String::new(),
                     product_sku: String::new(),
                 },
                 client_elicitation_capability: ElicitationCapability::default(),
@@ -689,6 +703,11 @@ impl McpConnectionManager {
     /// generation; this revision covers refreshes that reuse the manager.
     pub fn tool_catalog_revision(&self) -> u64 {
         self.tool_catalog_revision.load(Ordering::Acquire)
+            + self
+                .clients
+                .get(CODEX_APPS_MCP_SERVER_NAME)
+                .and_then(|client| client.codex_apps_tools_cache_context.as_ref())
+                .map_or(0, crate::codex_apps_cache::CodexAppsToolsCacheContext::content_revision)
     }
 
     pub fn shutdown_started(&self) -> bool {
@@ -932,10 +951,8 @@ impl McpConnectionManager {
         let managed_client = self.clients.get(server_name)?;
         managed_client.reconnect_failed_startup().await;
         managed_client
-            .listed_tools()
-            .await?
-            .into_iter()
-            .find(|tool| tool.tool.name == tool_name)
+            .tool_info(tool_name)
+            .await
             .map(|tool| self.with_server_metadata(tool))
     }
 
@@ -990,23 +1007,26 @@ impl McpConnectionManager {
             &[("cache", "miss")],
         );
         let tools = filter_tools(tools, &managed_client.tool_filter);
-        managed_client.tools.store(Arc::new(tools.clone()));
-        let tools = tools.into_iter().map(|mut tool| {
-            tool.tool = tool_with_model_visible_input_schema(&tool.tool);
-            self.with_server_metadata(tool)
-        });
-        let tools = normalize_tools_for_model_with_prefix(tools, self.prefix_mcp_tool_names);
+        if managed_client.codex_apps_tools_cache_context.is_none() {
+            commit_tool_catalog_refresh(
+                &managed_client.tools,
+                &self.tool_catalog_revision,
+                Ok(tools),
+            )?;
+        }
+        let tools = self
+            .list_all_tools_snapshot()
+            .await
+            .iter()
+            .filter(|tool| tool.server_name == CODEX_APPS_MCP_SERVER_NAME)
+            .cloned()
+            .collect();
         emit_duration(
             CODEX_APPS_REFRESH_DURATION_METRIC,
             refresh_start.elapsed(),
             &[("path", "legacy"), ("trigger", "explicit")],
         );
-        Ok(self.finish_tool_catalog_refresh(tools))
-    }
-
-    fn finish_tool_catalog_refresh(&self, tools: Vec<ToolInfo>) -> Vec<ToolInfo> {
-        self.tool_catalog_revision.fetch_add(1, Ordering::AcqRel);
-        tools
+        Ok(tools)
     }
 
     /// Returns resources and sanitized per-server failures from servers
@@ -1026,28 +1046,25 @@ impl McpConnectionManager {
             .filter(|(server_name, _)| include_server(server_name))
         {
             let server_name = server_name.clone();
-            let managed_client = match async_managed_client.client().await {
-                Ok(managed_client) => managed_client,
-                Err(err) => {
-                    let message = if err.is_authentication_required() {
-                        "server requires authentication".to_string()
-                    } else {
-                        format!("server unavailable: {err}")
-                    };
-                    collection
-                        .errors
-                        .push(McpServerCollectionError::new(server_name, message));
-                    continue;
-                }
-            };
-            if !managed_client.server_supports_resources_capability {
-                continue;
-            }
-            let timeout = Some(managed_client.tool_timeout);
-            let client = managed_client.client.clone();
-
+            let async_managed_client = async_managed_client.clone();
             let task_server = server_name.clone();
             let abort_handle = join_set.spawn(async move {
+                let managed_client = match async_managed_client.client().await {
+                    Ok(client) => client,
+                    Err(err) => {
+                        let message = if err.is_authentication_required() {
+                            "server requires authentication".to_string()
+                        } else {
+                            format!("server unavailable: {err}")
+                        };
+                        return (server_name, Err(anyhow!(message)));
+                    }
+                };
+                if !managed_client.server_supports_resources_capability {
+                    return (server_name, Ok(None));
+                }
+                let timeout = Some(managed_client.tool_timeout);
+                let client = managed_client.client.clone();
                 let mut collected: Vec<Resource> = Vec::new();
                 let mut cursor: Option<String> = None;
                 let mut seen_cursors = HashSet::new();
@@ -1089,7 +1106,7 @@ impl McpConnectionManager {
                             }
                             cursor = Some(next);
                         }
-                        None => return (server_name, Ok(collected)),
+                        None => return (server_name, Ok(Some(collected))),
                     }
                 }
             });
@@ -1098,7 +1115,10 @@ impl McpConnectionManager {
 
         while let Some(join_res) = join_set.join_next_with_id().await {
             match join_res {
-                Ok((task_id, (server_name, Ok(resources)))) => {
+                Ok((task_id, (_, Ok(None)))) => {
+                    task_servers.remove(&task_id);
+                }
+                Ok((task_id, (server_name, Ok(Some(resources))))) => {
                     task_servers.remove(&task_id);
                     collection.results.insert(server_name, resources);
                 }
@@ -1143,31 +1163,31 @@ impl McpConnectionManager {
             .filter(|(server_name, _)| include_server(server_name))
         {
             let server_name = server_name.clone();
-            let managed_client = match async_managed_client.client().await {
-                Ok(managed_client) => managed_client,
-                Err(err) => {
-                    let message = if err.is_authentication_required() {
-                        "server requires authentication".to_string()
-                    } else {
-                        format!("server unavailable: {err}")
-                    };
-                    collection
-                        .errors
-                        .push(McpServerCollectionError::new(server_name, message));
-                    continue;
-                }
-            };
-            if !managed_client.server_supports_resources_capability {
-                continue;
-            }
-            let client = managed_client.client.clone();
-            let timeout = Some(managed_client.tool_timeout);
-
+            let async_managed_client = async_managed_client.clone();
             let task_server = server_name.clone();
             let abort_handle = join_set.spawn(async move {
+                let managed_client = match async_managed_client.client().await {
+                    Ok(client) => client,
+                    Err(err) => {
+                        let message = if err.is_authentication_required() {
+                            "server requires authentication".to_string()
+                        } else {
+                            format!("server unavailable: {err}")
+                        };
+                        return (server_name, Err(anyhow!(message)));
+                    }
+                };
+                if !managed_client.server_supports_resources_capability {
+                    return (server_name, Ok(None));
+                }
+                let timeout = Some(managed_client.tool_timeout);
+                let client = managed_client.client.clone();
                 (
                     server_name,
-                    client.list_resources(/*params*/ None, timeout).await,
+                    client
+                        .list_resources(/*params*/ None, timeout)
+                        .await
+                        .map(Some),
                 )
             });
             task_servers.insert(abort_handle.id(), task_server);
@@ -1175,7 +1195,10 @@ impl McpConnectionManager {
 
         while let Some(join_res) = join_set.join_next_with_id().await {
             match join_res {
-                Ok((task_id, (server_name, Ok(page)))) => {
+                Ok((task_id, (_, Ok(None)))) => {
+                    task_servers.remove(&task_id);
+                }
+                Ok((task_id, (server_name, Ok(Some(page))))) => {
                     task_servers.remove(&task_id);
                     collection.results.insert(server_name, page);
                 }
@@ -1220,28 +1243,25 @@ impl McpConnectionManager {
             .filter(|(server_name, _)| include_server(server_name))
         {
             let server_name = server_name.clone();
-            let managed_client = match async_managed_client.client().await {
-                Ok(managed_client) => managed_client,
-                Err(err) => {
-                    let message = if err.is_authentication_required() {
-                        "server requires authentication".to_string()
-                    } else {
-                        format!("server unavailable: {err}")
-                    };
-                    collection
-                        .errors
-                        .push(McpServerCollectionError::new(server_name, message));
-                    continue;
-                }
-            };
-            if !managed_client.server_supports_resources_capability {
-                continue;
-            }
-            let client = managed_client.client.clone();
-            let timeout = Some(managed_client.tool_timeout);
-
+            let async_managed_client = async_managed_client.clone();
             let task_server = server_name.clone();
             let abort_handle = join_set.spawn(async move {
+                let managed_client = match async_managed_client.client().await {
+                    Ok(client) => client,
+                    Err(err) => {
+                        let message = if err.is_authentication_required() {
+                            "server requires authentication".to_string()
+                        } else {
+                            format!("server unavailable: {err}")
+                        };
+                        return (server_name, Err(anyhow!(message)));
+                    }
+                };
+                if !managed_client.server_supports_resources_capability {
+                    return (server_name, Ok(None));
+                }
+                let timeout = Some(managed_client.tool_timeout);
+                let client = managed_client.client.clone();
                 let mut collected: Vec<ResourceTemplate> = Vec::new();
                 let mut cursor: Option<String> = None;
                 let mut seen_cursors = HashSet::new();
@@ -1287,7 +1307,7 @@ impl McpConnectionManager {
                             }
                             cursor = Some(next);
                         }
-                        None => return (server_name, Ok(collected)),
+                        None => return (server_name, Ok(Some(collected))),
                     }
                 }
             });
@@ -1296,7 +1316,10 @@ impl McpConnectionManager {
 
         while let Some(join_res) = join_set.join_next_with_id().await {
             match join_res {
-                Ok((task_id, (server_name, Ok(templates)))) => {
+                Ok((task_id, (_, Ok(None)))) => {
+                    task_servers.remove(&task_id);
+                }
+                Ok((task_id, (server_name, Ok(Some(templates))))) => {
                     task_servers.remove(&task_id);
                     collection.results.insert(server_name, templates);
                 }
@@ -1343,31 +1366,31 @@ impl McpConnectionManager {
             .filter(|(server_name, _)| include_server(server_name))
         {
             let server_name = server_name.clone();
-            let managed_client = match async_managed_client.client().await {
-                Ok(managed_client) => managed_client,
-                Err(err) => {
-                    let message = if err.is_authentication_required() {
-                        "server requires authentication".to_string()
-                    } else {
-                        format!("server unavailable: {err}")
-                    };
-                    collection
-                        .errors
-                        .push(McpServerCollectionError::new(server_name, message));
-                    continue;
-                }
-            };
-            if !managed_client.server_supports_resources_capability {
-                continue;
-            }
-            let client = managed_client.client.clone();
-            let timeout = Some(managed_client.tool_timeout);
-
+            let async_managed_client = async_managed_client.clone();
             let task_server = server_name.clone();
             let abort_handle = join_set.spawn(async move {
+                let managed_client = match async_managed_client.client().await {
+                    Ok(client) => client,
+                    Err(err) => {
+                        let message = if err.is_authentication_required() {
+                            "server requires authentication".to_string()
+                        } else {
+                            format!("server unavailable: {err}")
+                        };
+                        return (server_name, Err(anyhow!(message)));
+                    }
+                };
+                if !managed_client.server_supports_resources_capability {
+                    return (server_name, Ok(None));
+                }
+                let timeout = Some(managed_client.tool_timeout);
+                let client = managed_client.client.clone();
                 (
                     server_name,
-                    client.list_resource_templates(None, timeout).await,
+                    client
+                        .list_resource_templates(None, timeout)
+                        .await
+                        .map(Some),
                 )
             });
             task_servers.insert(abort_handle.id(), task_server);
@@ -1375,7 +1398,10 @@ impl McpConnectionManager {
 
         while let Some(join_res) = join_set.join_next_with_id().await {
             match join_res {
-                Ok((task_id, (server_name, Ok(page)))) => {
+                Ok((task_id, (_, Ok(None)))) => {
+                    task_servers.remove(&task_id);
+                }
+                Ok((task_id, (server_name, Ok(Some(page))))) => {
                     task_servers.remove(&task_id);
                     collection.results.insert(server_name, page);
                 }
@@ -1644,6 +1670,7 @@ fn mcp_init_error_display(
         && url == "https://api.githubcopilot.com/mcp/"
         && bearer_token_env_var.is_none()
         && http_headers.as_ref().map(HashMap::is_empty).unwrap_or(true)
+        && err.is_authentication_required()
     {
         format!(
             "GitHub MCP does not support OAuth. Log in by adding a personal access token (https://github.com/settings/personal-access-tokens) to your environment and config.toml:\n[mcp_servers.{server_name}]\nbearer_token_env_var = CODEX_GITHUB_PERSONAL_ACCESS_TOKEN"
@@ -1653,20 +1680,8 @@ fn mcp_init_error_display(
             "The {server_name} MCP server is not logged in. Run `codex mcp login {server_name}`."
         )
     } else if is_mcp_client_startup_timeout_error(err) {
-        let startup_timeout_secs = match entry {
-            Some(entry) => match entry
-                .config
-                .as_ref()
-                .and_then(|config| config.startup_timeout_sec)
-            {
-                Some(timeout) => timeout,
-                None => DEFAULT_STARTUP_TIMEOUT,
-            },
-            None => DEFAULT_STARTUP_TIMEOUT,
-        }
-        .as_secs();
         format!(
-            "MCP client for `{server_name}` timed out after {startup_timeout_secs} seconds. Add or adjust `startup_timeout_sec` in your config.toml:\n[mcp_servers.{server_name}]\nstartup_timeout_sec = XX"
+            "MCP client for `{server_name}` timed out during startup: {err}. Check `startup_timeout_sec` for initialization and `tool_timeout_sec` for tool discovery."
         )
     } else {
         format!("MCP client for `{server_name}` failed to start: {err:#}")
@@ -1676,7 +1691,8 @@ fn mcp_init_error_display(
 fn startup_outcome_error_message(error: StartupOutcomeError) -> String {
     match error {
         StartupOutcomeError::Cancelled => "MCP startup cancelled".to_string(),
-        StartupOutcomeError::Failed { error, .. } => error,
+        StartupOutcomeError::Failed { error, .. }
+        | StartupOutcomeError::InvalidConfiguration { error } => error,
     }
 }
 

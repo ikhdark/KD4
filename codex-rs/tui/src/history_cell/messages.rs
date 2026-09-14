@@ -35,8 +35,25 @@ fn build_user_message_lines_with_elements(
     style: Style,
     element_style: Style,
 ) -> Vec<Line<'static>> {
-    let mut elements = elements.to_vec();
+    let mut elements: Vec<_> = elements.iter().collect();
     elements.sort_by_key(|e| e.byte_range.start);
+    // All elements share a style. Merge valid overlapping ranges so each byte is emitted once.
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    for element in elements {
+        let start = element.byte_range.start;
+        let end = element.byte_range.end;
+        if start >= end || message.get(start..end).is_none() {
+            continue;
+        }
+        if let Some(last) = ranges.last_mut()
+            && start <= last.end
+        {
+            last.end = last.end.max(end);
+        } else {
+            ranges.push(start..end);
+        }
+    }
+    let mut first_range = 0;
     let mut offset = 0usize;
     let mut raw_lines: Vec<Line<'static>> = Vec::new();
     for line_text in message.split('\n') {
@@ -45,9 +62,15 @@ fn build_user_message_lines_with_elements(
         let mut spans: Vec<Span<'static>> = Vec::new();
         // Track how much of the line we've emitted to interleave plain and styled spans.
         let mut cursor = line_start;
-        for elem in &elements {
-            let start = elem.byte_range.start.max(line_start);
-            let end = elem.byte_range.end.min(line_end);
+        while first_range < ranges.len() && ranges[first_range].end <= line_start {
+            first_range += 1;
+        }
+        for range in &ranges[first_range..] {
+            if range.start >= line_end {
+                break;
+            }
+            let start = range.start.max(cursor);
+            let end = range.end.min(line_end);
             if start >= end {
                 continue;
             }

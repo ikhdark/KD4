@@ -27,15 +27,252 @@ use mcp_test_support::format_with_current_shell;
 // mock model request is sent.
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unsupported_interactive_tools_abort_instead_of_hanging() -> anyhow::Result<()> {
+    use core_test_support::responses::{ev_completed, ev_function_call, ev_response_created, sse};
+    skip_if_no_network!();
+    for (tool, arguments) in [
+        (
+            "request_user_input",
+            json!({"questions":[{"id":"choice","header":"Choice","question":"Which?","options":[{"label":"A","description":"First"},{"label":"B","description":"Second"}]}]}),
+        ),
+        (
+            "request_permissions",
+            json!({"reason":"Need network", "permissions":{"network":{"enabled":true}}}),
+        ),
+    ] {
+        let McpHandle {
+            mut process,
+            server,
+            dir: _dir,
+        } = create_mcp_process(vec![sse(vec![
+            ev_response_created("interactive"),
+            ev_function_call("interactive-call", tool, &arguments.to_string()),
+            ev_completed("interactive"),
+        ])])
+        .await?;
+        let id = process.send_request("tools/call", Some(json!({"name":"codex","arguments":{
+            "prompt":"Use the requested interactive tool", "approval-policy":"on-request",
+            "sandbox":"read-only", "config":{"features.default_mode_request_user_input":true,"features.request_permissions_tool":true}
+        }}))).await?;
+        let response = timeout(
+            DEFAULT_READ_TIMEOUT,
+            process.read_stream_until_response_message(RequestId::Number(id)),
+        )
+        .await??;
+        assert_eq!(response.result["isError"], true);
+        assert_eq!(
+            response.result["content"][0]["text"],
+            format!("{tool} is not supported by the MCP server.")
+        );
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("request recording is disabled"))?
+                .len(),
+            1
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn unsupported_methods_and_malformed_frames_respond_and_keep_transport_usable()
+-> anyhow::Result<()> {
+    let codex_home = TempDir::new()?;
+    let mut process = McpProcess::new(codex_home.path()).await?;
+    for (method, params) in [
+        ("resources/list", json!({})),
+        ("resources/templates/list", json!({})),
+        ("resources/read", json!({"uri":"test://resource"})),
+        ("resources/subscribe", json!({"uri":"test://resource"})),
+        ("resources/unsubscribe", json!({"uri":"test://resource"})),
+        ("prompts/list", json!({})),
+        ("prompts/get", json!({"name":"test"})),
+        ("logging/setLevel", json!({"level":"info"})),
+        (
+            "completion/complete",
+            json!({"ref":{"type":"ref/prompt","name":"test"},"argument":{"name":"query","value":"x"}}),
+        ),
+    ] {
+        let id = process.send_request(method, Some(params)).await?;
+        let response = timeout(DEFAULT_READ_TIMEOUT, process.read_jsonrpc_message()).await??;
+        let rmcp::model::JsonRpcMessage::Error(error) = response else {
+            anyhow::bail!("expected method error for {method}: {response:?}");
+        };
+        assert_eq!(error.id, Some(RequestId::Number(id)));
+        assert_eq!(error.error.code, rmcp::model::ErrorCode::METHOD_NOT_FOUND);
+    }
+    for (frame, code, id) in [
+        ("{", rmcp::model::ErrorCode::PARSE_ERROR, None),
+        (
+            r#"{"jsonrpc":"2.0","id":500,"method":42}"#,
+            rmcp::model::ErrorCode::INVALID_REQUEST,
+            Some(RequestId::Number(500)),
+        ),
+    ] {
+        process.send_raw_frame(frame).await?;
+        let response = timeout(DEFAULT_READ_TIMEOUT, process.read_jsonrpc_message()).await??;
+        let rmcp::model::JsonRpcMessage::Error(error) = response else {
+            anyhow::bail!("expected frame error: {response:?}");
+        };
+        assert_eq!(error.id, id);
+        assert_eq!(error.error.code, code);
+    }
+    let ping = process.send_ping_request().await?;
+    process.close_stdin();
+    let response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        process.read_stream_until_response_message(RequestId::Number(ping)),
+    )
+    .await??;
+    assert_eq!(response.result, json!({}));
+    assert!(
+        timeout(DEFAULT_READ_TIMEOUT, process.wait_for_exit())
+            .await??
+            .success()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn eof_bounds_shutdown_when_stdout_is_open_but_not_drained() -> anyhow::Result<()> {
+    let codex_home = TempDir::new()?;
+    let mut process = McpProcess::new(codex_home.path()).await?;
+    let ping = process.send_ping_request().await?;
+    let response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        process.read_stream_until_response_message(RequestId::Number(ping)),
+    )
+    .await??;
+    assert_eq!(response.result, json!({}));
+    // These responses exceed pipe capacity while fitting in the bounded queue.
+    for _ in 0..64 {
+        process.send_request("tools/list", None).await?;
+    }
+    process.close_stdin();
+    let status = timeout(DEFAULT_READ_TIMEOUT, process.wait_for_exit()).await??;
+    assert!(
+        !status.success(),
+        "undrained stdout must report a timeout: {status}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn initialize_negotiates_unknown_protocol_versions() -> anyhow::Result<()> {
+    let codex_home = TempDir::new()?;
+    let mut process = McpProcess::new(codex_home.path()).await?;
+    let id = process
+        .send_request(
+            "initialize",
+            Some(json!({
+                "protocolVersion":"2099-01-01", "capabilities":{},
+                "clientInfo":{"name":"test","version":"1"},
+            })),
+        )
+        .await?;
+    let response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        process.read_stream_until_response_message(RequestId::Number(id)),
+    )
+    .await??;
+    assert_eq!(response.result["protocolVersion"], "2025-11-25");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn approval_without_form_support_denies_command_and_completes() -> anyhow::Result<()> {
+    skip_if_no_network!();
+    let workdir = TempDir::new()?;
+    let server = create_mock_responses_server(vec![create_shell_command_sse_response(
+        vec![
+            "New-Item".into(),
+            "-ItemType".into(),
+            "File".into(),
+            "denied.txt".into(),
+        ],
+        Some(workdir.path()),
+        Some(10_000),
+        "unsupported-approval",
+    )?])
+    .await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+    let mut process = McpProcess::new(codex_home.path()).await?;
+    let init = process
+        .send_request(
+            "initialize",
+            Some(json!({
+                "protocolVersion":"2025-11-25", "capabilities":{"elicitation":{"url":{}}},
+                "clientInfo":{"name":"url-only","version":"1"},
+            })),
+        )
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        process.read_stream_until_response_message(RequestId::Number(init)),
+    )
+    .await??;
+    let id = process
+        .send_codex_tool_call(CodexToolCallParam {
+            prompt: "Create the file".into(),
+            cwd: Some(workdir.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .await?;
+    let result = timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            match process.read_jsonrpc_message().await? {
+                rmcp::model::JsonRpcMessage::Request(request) => {
+                    anyhow::bail!("unsupported elicitation was sent: {request:?}")
+                }
+                rmcp::model::JsonRpcMessage::Response(response)
+                    if response.id == RequestId::Number(id) =>
+                {
+                    break Ok::<_, anyhow::Error>(response.result);
+                }
+                _ => {}
+            }
+        }
+    })
+    .await??;
+    assert_eq!(
+        result["content"][0]["text"],
+        "required tool `shell_command` blocked"
+    );
+    assert!(!workdir.path().join("denied.txt").exists());
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("request recording is disabled"))?
+            .len(),
+        1
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stdout_failure_shuts_down_with_stdin_still_open() -> anyhow::Result<()> {
     let codex_home = TempDir::new()?;
     let mut mcp_process = McpProcess::new(codex_home.path()).await?;
+    let ping = mcp_process.send_ping_request().await?;
+    let response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp_process.read_stream_until_response_message(RequestId::Number(ping)),
+    )
+    .await??;
+    assert_eq!(response.result, json!({}));
     mcp_process.close_stdout();
     mcp_process.send_ping_request().await?;
 
     let status = timeout(DEFAULT_READ_TIMEOUT, mcp_process.wait_for_exit()).await??;
-    assert!(status.success(), "MCP server exited with {status}");
+    assert!(
+        !status.success(),
+        "a broken stdout must fail the MCP process: {status}"
+    );
     Ok(())
 }
 
@@ -219,16 +456,28 @@ async fn shell_command_approval_triggers_elicitation(approve: bool) -> anyhow::R
             .clone()
             .ok_or_else(|| anyhow::anyhow!("elicitation_request.params must be set"))?,
     )?;
-    assert_eq!(
-        elicitation_request.request.params,
-        Some(create_expected_elicitation_request_params(
-            expected_shell_command,
-            workdir_for_shell_function_call.path(),
-            codex_request_id.to_string(),
-            params.codex_event_id.clone(),
-            params.thread_id,
-        )?)
+    let mut expected_params = create_expected_elicitation_request_params(
+        expected_shell_command,
+        workdir_for_shell_function_call.path(),
+        codex_request_id.to_string(),
+        params.codex_event_id.clone(),
+        params.thread_id,
+    )?;
+    assert!(
+        params.message.starts_with(
+            expected_params["message"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("expected elicitation message is missing"))?
+        )
     );
+    assert!(params.message.contains("\nWorking directory URI:"));
+    assert!(
+        params
+            .message
+            .contains("\nAllowed decisions: [\"approved\"")
+    );
+    expected_params["message"] = json!(params.message);
+    assert_eq!(elicitation_request.request.params, Some(expected_params));
 
     // Accept the `git init` request by responding to the elicitation.
     if approve {
@@ -284,7 +533,10 @@ async fn shell_command_approval_triggers_elicitation(approve: bool) -> anyhow::R
         codex_response
     );
 
-    let requests = server.received_requests().await.unwrap();
+    let requests = server
+        .received_requests()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("request recording is disabled"))?;
     assert_eq!(
         requests.len(),
         if approve { 2 } else { 1 },
@@ -340,8 +592,6 @@ async fn test_codex_tool_passes_base_instructions() {
 }
 
 async fn codex_tool_passes_base_instructions() -> anyhow::Result<()> {
-    #![expect(clippy::unwrap_used)]
-
     let server =
         create_mock_responses_server(vec![create_final_assistant_message_sse_response("Enjoy!")?])
             .await;
@@ -392,7 +642,10 @@ async fn codex_tool_passes_base_instructions() -> anyhow::Result<()> {
         })
     );
 
-    let requests = server.received_requests().await.unwrap();
+    let requests = server
+        .received_requests()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("request recording is disabled"))?;
     let request = requests[0].body_json::<serde_json::Value>()?;
     let instructions = request["instructions"]
         .as_str()

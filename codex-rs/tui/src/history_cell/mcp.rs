@@ -1,6 +1,7 @@
 //! MCP tool-call, inventory, and output history cells.
 
 use super::*;
+use crate::ui_consts::TRANSCRIPT_HINT;
 
 #[derive(Debug)]
 struct CompletedMcpToolCallWithImageOutput {
@@ -26,11 +27,17 @@ fn mcp_auth_status_label(status: McpAuthStatus) -> &'static str {
 #[derive(Debug)]
 pub(crate) struct McpToolCallCell {
     call_id: String,
-    invocation: McpInvocation,
+    invocation: Line<'static>,
     start_time: Instant,
     duration: Option<Duration>,
-    result: Option<Result<codex_protocol::mcp::CallToolResult, String>>,
+    result: Option<Result<McpTextResult, String>>,
     animations_enabled: bool,
+}
+
+#[derive(Debug)]
+struct McpTextResult {
+    content: Vec<String>,
+    is_error: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -48,7 +55,7 @@ impl McpToolCallCell {
     ) -> Self {
         Self {
             call_id,
-            invocation,
+            invocation: format_mcp_invocation(invocation),
             start_time: Instant::now(),
             duration: None,
             result: None,
@@ -68,13 +75,22 @@ impl McpToolCallCell {
         let image_cell = try_new_completed_mcp_tool_call_with_image_output(&result)
             .map(|cell| Box::new(cell) as Box<dyn HistoryCell>);
         self.duration = Some(duration);
-        self.result = Some(result);
+        self.result = Some(result.map(|result| {
+            McpTextResult {
+                is_error: result.is_error.unwrap_or(false),
+                content: result
+                    .content
+                    .iter()
+                    .map(Self::render_content_block)
+                    .collect(),
+            }
+        }));
         image_cell
     }
 
     fn success(&self) -> Option<bool> {
         match self.result.as_ref() {
-            Some(Ok(result)) => Some(!result.is_error.unwrap_or(false)),
+            Some(Ok(result)) => Some(!result.is_error),
             Some(Err(_)) => Some(false),
             None => None,
         }
@@ -86,31 +102,27 @@ impl McpToolCallCell {
         self.result = Some(Err("interrupted".to_string()));
     }
 
-    fn render_content_block(block: &serde_json::Value, width: usize) -> String {
-        let content = match serde_json::from_value::<rmcp::model::Content>(block.clone()) {
+    // Validate once on completion and retain the textual representation used by all views.
+    fn render_content_block(block: &serde_json::Value) -> String {
+        let content = match <rmcp::model::Content as serde::Deserialize>::deserialize(block) {
             Ok(content) => content,
             Err(_) => {
-                return format_and_truncate_tool_result(
-                    &block.to_string(),
-                    TOOL_CALL_MAX_LINES,
-                    width,
-                );
+                return block.to_string();
             }
         };
 
         match content.raw {
-            rmcp::model::RawContent::Text(text) => {
-                format_and_truncate_tool_result(&text.text, TOOL_CALL_MAX_LINES, width)
-            }
+            rmcp::model::RawContent::Text(text) => text.text,
             rmcp::model::RawContent::Image(_) => "<image content>".to_string(),
             rmcp::model::RawContent::Audio(_) => "<audio content>".to_string(),
-            rmcp::model::RawContent::Resource(resource) => {
-                let uri = match resource.resource {
-                    rmcp::model::ResourceContents::TextResourceContents { uri, .. } => uri,
-                    rmcp::model::ResourceContents::BlobResourceContents { uri, .. } => uri,
-                };
-                format!("embedded resource: {uri}")
-            }
+            rmcp::model::RawContent::Resource(resource) => match resource.resource {
+                rmcp::model::ResourceContents::TextResourceContents { uri, text, .. } => {
+                    format!("embedded resource: {uri}\n{text}")
+                }
+                rmcp::model::ResourceContents::BlobResourceContents { uri, .. } => {
+                    format!("embedded resource: {uri}")
+                }
+            },
             rmcp::model::RawContent::ResourceLink(link) => format!("link: {}", link.uri),
         }
     }
@@ -136,7 +148,7 @@ impl HistoryCell for McpToolCallCell {
             "Calling"
         };
 
-        let invocation_line = line_to_static(&format_mcp_invocation(self.invocation.clone()));
+        let invocation_line = &self.invocation;
         let mut compact_spans = vec![bullet.clone(), " ".into(), header_text.bold(), " ".into()];
         let mut compact_header = Line::from(compact_spans.clone());
         let reserved = compact_header.width();
@@ -154,7 +166,7 @@ impl HistoryCell for McpToolCallCell {
             let opts = RtOptions::new((width as usize).saturating_sub(4))
                 .initial_indent("".into())
                 .subsequent_indent("    ".into());
-            let wrapped = adaptive_wrap_line(&invocation_line, opts);
+            let wrapped = adaptive_wrap_line(invocation_line, opts);
             let body_lines: Vec<Line<'static>> = wrapped.iter().map(line_to_static).collect();
             lines.extend(prefix_lines(body_lines, "  └ ".dim(), "    ".into()));
         }
@@ -165,19 +177,23 @@ impl HistoryCell for McpToolCallCell {
 
         if let Some(result) = &self.result {
             match result {
-                Ok(codex_protocol::mcp::CallToolResult { content, .. }) => {
+                Ok(McpTextResult { content, .. }) => {
                     if !content.is_empty() {
                         for block in content {
-                            let text = Self::render_content_block(block, detail_wrap_width);
+                            if detail_lines.len() > TOOL_CALL_MAX_LINES {
+                                break;
+                            }
+                            let text = format_and_truncate_tool_result(
+                                block,
+                                TOOL_CALL_MAX_LINES,
+                                detail_wrap_width,
+                            );
                             for segment in text.split('\n') {
                                 let line = Line::from(segment.to_string().dim());
-                                let wrapped = adaptive_wrap_line(
-                                    &line,
-                                    RtOptions::new(detail_wrap_width)
-                                        .initial_indent("".into())
-                                        .subsequent_indent("    ".into()),
-                                );
-                                detail_lines.extend(wrapped.iter().map(line_to_static));
+                                detail_lines.push(line);
+                                if detail_lines.len() > TOOL_CALL_MAX_LINES {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -186,20 +202,26 @@ impl HistoryCell for McpToolCallCell {
                     let err_text = format_and_truncate_tool_result(
                         &format!("Error: {err}"),
                         TOOL_CALL_MAX_LINES,
-                        width as usize,
+                        detail_wrap_width,
                     );
-                    let err_line = Line::from(err_text.dim());
-                    let wrapped = adaptive_wrap_line(
-                        &err_line,
-                        RtOptions::new(detail_wrap_width)
-                            .initial_indent("".into())
-                            .subsequent_indent("    ".into()),
+                    detail_lines.extend(
+                        err_text
+                            .split('\n')
+                            .map(|line| Line::from(line.to_string().dim())),
                     );
-                    detail_lines.extend(wrapped.iter().map(line_to_static));
                 }
             }
         }
 
+        if detail_lines.len() > TOOL_CALL_MAX_LINES {
+            detail_lines.truncate(TOOL_CALL_MAX_LINES - 1);
+            detail_lines.push(
+                crate::line_truncation::truncate_line_with_ellipsis_if_overflow(
+                    Line::from(format!("… output truncated ({TRANSCRIPT_HINT})").dim()),
+                    detail_wrap_width,
+                ),
+            );
+        }
         if !detail_lines.is_empty() {
             let initial_prefix: Span<'static> = if inline_invocation {
                 "  └ ".dim()
@@ -218,17 +240,13 @@ impl HistoryCell for McpToolCallCell {
         } else {
             "Calling"
         };
-        let mut lines = vec![Line::from(format!(
-            "{header_text} {}",
-            format_mcp_invocation(self.invocation.clone())
-        ))];
+        let mut lines = vec![Line::from(format!("{header_text} {}", self.invocation))];
 
         if let Some(result) = &self.result {
             match result {
-                Ok(codex_protocol::mcp::CallToolResult { content, .. }) => {
+                Ok(McpTextResult { content, .. }) => {
                     for block in content {
-                        let text = Self::render_content_block(block, RAW_TOOL_OUTPUT_WIDTH);
-                        lines.extend(raw_lines_from_source(&text));
+                        lines.extend(raw_lines_from_source(block));
                     }
                 }
                 Err(err) => lines.push(Line::from(format!("Error: {err}"))),
@@ -236,6 +254,10 @@ impl HistoryCell for McpToolCallCell {
         }
 
         lines
+    }
+
+    fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+        adaptive_wrap_lines(self.raw_lines(), RtOptions::new(usize::from(width.max(1))))
     }
 
     fn transcript_animation_tick(&self) -> Option<u64> {
@@ -705,7 +727,7 @@ fn format_mcp_invocation<'a>(invocation: McpInvocation) -> Line<'a> {
         .unwrap_or_default();
 
     let invocation_spans = vec![
-        invocation.server.clone().cyan(),
+        invocation.server.cyan(),
         ".".into(),
         invocation.tool.cyan(),
         "(".into(),

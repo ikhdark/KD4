@@ -18,6 +18,7 @@ use codex_execpolicy::PrefixRule;
 use codex_execpolicy::RuleMatch;
 use codex_execpolicy::RuleRef;
 use codex_execpolicy::blocking_append_allow_prefix_rule;
+use codex_execpolicy::blocking_append_network_rule;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use tempfile::tempdir;
@@ -39,7 +40,7 @@ fn absolute_path(path: &str) -> AbsolutePathBuf {
 }
 
 fn host_absolute_path(segments: &[&str]) -> String {
-    let mut path = PathBuf::from(r"C:\");
+    let mut path = PathBuf::from(if cfg!(windows) { r"C:\" } else { "/" });
     for segment in segments {
         path.push(segment);
     }
@@ -47,7 +48,11 @@ fn host_absolute_path(segments: &[&str]) -> String {
 }
 
 fn host_executable_name(name: &str) -> String {
-    format!("{name}.exe")
+    if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    }
 }
 
 fn starlark_string(value: &str) -> String {
@@ -72,6 +77,154 @@ fn append_allow_prefix_rule_dedupes_existing_rule() -> Result<()> {
         contents,
         r#"prefix_rule(pattern=["python3"], decision="allow")
 "#
+    );
+    Ok(())
+}
+
+#[test]
+fn network_amendments_preserve_latest_decision_after_reload() -> Result<()> {
+    let tmp = tempdir()?;
+    let path = tmp.path().join("default.rules");
+    for decision in [Decision::Forbidden, Decision::Allow, Decision::Forbidden] {
+        blocking_append_network_rule(
+            &path,
+            "example.com",
+            NetworkRuleProtocol::Https,
+            decision,
+            None,
+        )?;
+        let mut parser = PolicyParser::new();
+        parser.parse("default.rules", &fs::read_to_string(&path)?)?;
+        let expected = if decision == Decision::Allow {
+            (tokens(&["example.com"]), Vec::new())
+        } else {
+            (Vec::new(), tokens(&["example.com"]))
+        };
+        assert_eq!(parser.build().compiled_network_domains(), expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn prefix_amendment_rejects_empty_tokens_before_creating_file() -> Result<()> {
+    let tmp = tempdir()?;
+    let path = tmp.path().join("rules/default.rules");
+    for prefix in [tokens(&["git", ""]), tokens(&[" \t", "status"])] {
+        let error = blocking_append_allow_prefix_rule(&path, &prefix).expect_err("invalid token");
+        assert!(error.to_string().contains("tokens cannot be empty"));
+        assert!(!path.parent().unwrap().exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn network_compilation_preserves_last_effective_order_across_protocols() -> Result<()> {
+    let mut parser = PolicyParser::new();
+    parser.parse(
+        "network.rules",
+        r#"
+network_rule(host="a.test", protocol="http", decision="allow")
+network_rule(host="b.test", protocol="http", decision="allow")
+network_rule(host="a.test", protocol="https", decision="deny")
+network_rule(host="c.test", protocol="http", decision="deny")
+network_rule(host="b.test", protocol="https", decision="allow")
+network_rule(host="d.test", protocol="http", decision="allow")
+network_rule(host="a.test", protocol="https", decision="allow")
+network_rule(host="b.test", protocol="https", decision="prompt")
+"#,
+    )?;
+    assert_eq!(
+        parser.build().compiled_network_domains(),
+        (tokens(&["b.test", "d.test", "a.test"]), tokens(&["c.test"]))
+    );
+    Ok(())
+}
+
+#[test]
+fn network_rule_validates_and_canonicalizes_host_identity() -> Result<()> {
+    for invalid in [
+        "example.com:abc",
+        "garbage::host",
+        "[example.com]",
+        "[::1]:65536",
+        "example.com:",
+        "user@example.com",
+        "[::1%]",
+    ] {
+        let mut parser = PolicyParser::new();
+        let source =
+            format!(r#"network_rule(host="{invalid}", protocol="https", decision="allow")"#);
+        assert!(
+            parser.parse("network.rules", &source).is_err(),
+            "accepted {invalid}"
+        );
+    }
+    for (raw, expected) in [
+        ("Example.COM.:443", "example.com"),
+        ("[2001:0DB8:0:0::1]:443", "2001:db8::1"),
+        ("[fe80::1%25ETH0]", "fe80::1%eth0"),
+        ("127.0.0.1:80", "127.0.0.1"),
+    ] {
+        let mut parser = PolicyParser::new();
+        parser.parse(
+            "network.rules",
+            &format!(r#"network_rule(host="{raw}", protocol="https", decision="allow")"#),
+        )?;
+        assert_eq!(
+            parser.build().compiled_network_domains(),
+            (tokens(&[expected]), Vec::new())
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn host_executable_setter_uses_native_identity() -> Result<()> {
+    let mut policy = Policy::empty();
+    policy.add_prefix_rule(&tokens(&["git"]), Decision::Allow)?;
+    let name = if cfg!(windows) { "Git.EXE" } else { "git" };
+    let allowed = host_absolute_path(&["trusted", &host_executable_name("git")]);
+    let denied = host_absolute_path(&["untrusted", &host_executable_name("git")]);
+    policy.set_host_executable_paths(name.to_string(), vec![absolute_path(&allowed)]);
+    let options = MatchOptions {
+        resolve_host_executables: true,
+    };
+    assert_eq!(
+        policy
+            .check_with_options(&tokens(&[&allowed]), &prompt_all, &options)
+            .decision,
+        Decision::Allow
+    );
+    assert_eq!(
+        policy
+            .check_with_options(&tokens(&[&denied]), &prompt_all, &options)
+            .decision,
+        Decision::Prompt
+    );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+#[test]
+fn host_executable_resolution_preserves_unix_case_and_suffix() -> Result<()> {
+    let mut policy = Policy::empty();
+    policy.add_prefix_rule(&tokens(&["git"]), Decision::Allow)?;
+    let options = MatchOptions {
+        resolve_host_executables: true,
+    };
+    for program in ["/usr/bin/GIT", "/usr/bin/git.exe", "/usr/bin/GIT.EXE"] {
+        assert_eq!(
+            policy
+                .check_with_options(&tokens(&[program]), &prompt_all, &options)
+                .decision,
+            Decision::Prompt
+        );
+    }
+    assert_eq!(
+        policy
+            .check_with_options(&tokens(&["/usr/bin/git"]), &prompt_all, &options)
+            .decision,
+        Decision::Allow
     );
     Ok(())
 }
@@ -825,6 +978,23 @@ host_executable(name = "git", paths = ["{allowed_git_literal}"])
 
     let mut parser = PolicyParser::new();
     parser.parse("test.rules", &policy_src)?;
+
+    let policy = parser.build();
+    let options = MatchOptions {
+        resolve_host_executables: true,
+    };
+    assert_eq!(
+        policy
+            .check_with_options(&tokens(&[&allowed_git, "status"]), &prompt_all, &options)
+            .decision,
+        Decision::Allow
+    );
+    assert_eq!(
+        policy
+            .check_with_options(&tokens(&[&other_git, "status"]), &prompt_all, &options)
+            .decision,
+        Decision::Prompt
+    );
 
     Ok(())
 }

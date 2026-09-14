@@ -35,6 +35,19 @@ use std::fmt;
 
 mod rate_limit_resets;
 
+const MAX_DIAGNOSTIC_BODY_BYTES: usize = 8 * 1024;
+
+fn diagnostic_excerpt(body: &str) -> String {
+    if body.len() <= MAX_DIAGNOSTIC_BODY_BYTES {
+        return body.to_owned();
+    }
+    let mut end = MAX_DIAGNOSTIC_BODY_BYTES;
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{} [truncated]", &body[..end])
+}
+
 #[derive(Debug)]
 pub enum RequestError {
     UnexpectedStatus {
@@ -115,7 +128,10 @@ enum PathStyle {
 
 impl PathStyle {
     pub fn from_base_url(base_url: &str) -> Self {
-        if base_url.contains("/backend-api") {
+        if url::Url::parse(base_url).ok().is_some_and(|url| {
+            url.path_segments()
+                .is_some_and(|mut segments| segments.any(|part| part == "backend-api"))
+        }) {
             PathStyle::ChatGptApi
         } else {
             PathStyle::CodexApi
@@ -148,16 +164,16 @@ impl fmt::Debug for Client {
 impl Client {
     pub fn new(base_url: impl Into<String>, http_client_factory: HttpClientFactory) -> Self {
         let mut base_url = base_url.into();
-        // Normalize common ChatGPT hostnames to include /backend-api so we hit the WHAM paths.
-        // Also trim trailing slashes for consistent URL building.
-        while base_url.ends_with('/') {
-            base_url.pop();
-        }
-        if (base_url.starts_with("https://chatgpt.com")
-            || base_url.starts_with("https://chat.openai.com"))
-            && !base_url.contains("/backend-api")
-        {
-            base_url = format!("{base_url}/backend-api");
+        if let Ok(mut parsed) = url::Url::parse(&base_url) {
+            let path = parsed.path().trim_end_matches('/').to_owned();
+            let is_chatgpt = parsed.scheme() == "https"
+                && matches!(parsed.host_str(), Some("chatgpt.com" | "chat.openai.com"));
+            if is_chatgpt && PathStyle::from_base_url(&base_url) == PathStyle::CodexApi {
+                parsed.set_path(&format!("{path}/backend-api"));
+            } else {
+                parsed.set_path(&path);
+            }
+            base_url = parsed.to_string();
         }
         let http = RouteAwareClientPool::with_chatgpt_cloudflare_cookies_without_request_logging(
             http_client_factory,
@@ -205,25 +221,58 @@ impl Client {
         self
     }
 
-    fn headers(&self) -> HeaderMap {
+    fn headers(&self) -> Result<HeaderMap> {
         let mut h = HeaderMap::new();
         if let Some(ua) = &self.user_agent {
             h.insert(USER_AGENT, ua.clone());
         } else {
             h.insert(USER_AGENT, HeaderValue::from_static("codex-cli"));
         }
-        self.auth_provider.add_auth_headers(&mut h);
+        self.auth_provider.try_add_auth_headers(&mut h)?;
         if let Some(acc) = &self.chatgpt_account_id
             && let Ok(name) = HeaderName::from_bytes(b"ChatGPT-Account-Id")
             && let Ok(hv) = HeaderValue::from_str(acc)
         {
             h.insert(name, hv);
         }
-        h
+        Ok(h)
     }
 
     fn request(&self, method: Method, url: &str) -> RouteAwareRequestBuilder {
         self.http.request(method, url)
+    }
+
+    fn endpoint_url(&self, path: &str) -> String {
+        match url::Url::parse(&self.base_url) {
+            Ok(mut url) => {
+                url.set_path(&format!("{}{path}", url.path().trim_end_matches('/')));
+                url.to_string()
+            }
+            Err(_) => format!("{}{path}", self.base_url.trim_end_matches('/')),
+        }
+    }
+
+    fn task_url(&self, task_id: &str, turn_id: Option<&str>) -> Result<String> {
+        anyhow::ensure!(
+            !matches!(task_id, "" | "." | "..")
+                && !turn_id.is_some_and(|id| matches!(id, "" | "." | "..")),
+            "task and turn IDs must be nonempty path segments other than dot segments"
+        );
+        let path = match self.path_style {
+            PathStyle::CodexApi => "/api/codex/tasks",
+            PathStyle::ChatGptApi => "/wham/tasks",
+        };
+        let mut url = url::Url::parse(&self.endpoint_url(path))?;
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|()| anyhow::anyhow!("backend URL cannot contain path segments"))?;
+            segments.push(task_id);
+            if let Some(turn_id) = turn_id {
+                segments.extend(["turns", turn_id, "sibling_turns"]);
+            }
+        }
+        Ok(url.to_string())
     }
 
     async fn exec_request(
@@ -232,19 +281,9 @@ impl Client {
         method: &str,
         url: &str,
     ) -> Result<(String, String)> {
-        let res = req.send().await?;
-        let status = res.status();
-        let ct = res
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let body = res.text().await.unwrap_or_default();
-        if !status.is_success() {
-            anyhow::bail!("{method} {url} failed: {status}; content-type={ct}; body={body}");
-        }
-        Ok((body, ct))
+        self.exec_request_detailed(req, method, url)
+            .await
+            .map_err(anyhow::Error::from)
     }
 
     async fn exec_request_detailed(
@@ -253,7 +292,7 @@ impl Client {
         method: &str,
         url: &str,
     ) -> std::result::Result<(String, String), RequestError> {
-        let res = req.send().await.map_err(anyhow::Error::from)?;
+        let mut res = req.send().await.map_err(anyhow::Error::from)?;
         let status = res.status();
         let content_type = res
             .headers()
@@ -261,8 +300,22 @@ impl Client {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let body = res.text().await.unwrap_or_default();
         if !status.is_success() {
+            let mut bytes = Vec::new();
+            let suffix = loop {
+                match res.chunk().await {
+                    Ok(Some(chunk)) => {
+                        let remaining = MAX_DIAGNOSTIC_BODY_BYTES - bytes.len();
+                        bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                        if chunk.len() > remaining {
+                            break " [truncated]".to_string();
+                        }
+                    }
+                    Ok(None) => break String::new(),
+                    Err(err) => break format!(" [body read failed: {err}]"),
+                }
+            };
+            let body = format!("{}{suffix}", String::from_utf8_lossy(&bytes));
             return Err(RequestError::UnexpectedStatus {
                 method: method.to_string(),
                 url: url.to_string(),
@@ -271,6 +324,7 @@ impl Client {
                 body,
             });
         }
+        let body = res.text().await.map_err(anyhow::Error::from)?;
         Ok((body, content_type))
     }
 
@@ -278,6 +332,7 @@ impl Client {
         match serde_json::from_str::<T>(body) {
             Ok(v) => Ok(v),
             Err(e) => {
+                let body = diagnostic_excerpt(body);
                 anyhow::bail!("Decode error for {url}: {e}; content-type={ct}; body={body}");
             }
         }
@@ -289,15 +344,15 @@ impl Client {
 
     pub async fn get_token_usage_profile(&self) -> Result<TokenUsageProfile> {
         let url = self.token_usage_profile_url();
-        let req = self.request(Method::GET, &url).headers(self.headers());
+        let req = self.request(Method::GET, &url).headers(self.headers()?);
         let (body, ct) = self.exec_request(req, "GET", &url).await?;
         self.decode_json(&url, &ct, &body)
     }
 
     fn token_usage_profile_url(&self) -> String {
         match self.path_style {
-            PathStyle::CodexApi => format!("{}/api/codex/profiles/me", self.base_url),
-            PathStyle::ChatGptApi => format!("{}/wham/profiles/me", self.base_url),
+            PathStyle::CodexApi => self.endpoint_url("/api/codex/profiles/me"),
+            PathStyle::ChatGptApi => self.endpoint_url("/wham/profiles/me"),
         }
     }
 
@@ -308,7 +363,7 @@ impl Client {
         let url = self.send_add_credits_nudge_email_url();
         let req = self
             .request(Method::POST, &url)
-            .headers(self.headers())
+            .headers(self.headers()?)
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
             .json(&SendAddCreditsNudgeEmailRequest { credit_type });
         self.exec_request_detailed(req, "POST", &url).await?;
@@ -323,7 +378,7 @@ impl Client {
         cursor: Option<&str>,
     ) -> Result<PaginatedListTaskListItem> {
         let url = self.list_tasks_url(limit, task_filter, environment_id, cursor)?;
-        let req = self.request(Method::GET, &url).headers(self.headers());
+        let req = self.request(Method::GET, &url).headers(self.headers()?);
         let (body, ct) = self.exec_request(req, "GET", &url).await?;
         self.decode_json::<PaginatedListTaskListItem>(&url, &ct, &body)
     }
@@ -336,8 +391,8 @@ impl Client {
         cursor: Option<&str>,
     ) -> Result<String> {
         let url = match self.path_style {
-            PathStyle::CodexApi => format!("{}/api/codex/tasks/list", self.base_url),
-            PathStyle::ChatGptApi => format!("{}/wham/tasks/list", self.base_url),
+            PathStyle::CodexApi => self.endpoint_url("/api/codex/tasks/list"),
+            PathStyle::ChatGptApi => self.endpoint_url("/wham/tasks/list"),
         };
         if limit.is_none() && task_filter.is_none() && environment_id.is_none() && cursor.is_none()
         {
@@ -371,11 +426,8 @@ impl Client {
         &self,
         task_id: &str,
     ) -> Result<(CodeTaskDetailsResponse, String, String)> {
-        let url = match self.path_style {
-            PathStyle::CodexApi => format!("{}/api/codex/tasks/{}", self.base_url, task_id),
-            PathStyle::ChatGptApi => format!("{}/wham/tasks/{}", self.base_url, task_id),
-        };
-        let req = self.request(Method::GET, &url).headers(self.headers());
+        let url = self.task_url(task_id, None)?;
+        let req = self.request(Method::GET, &url).headers(self.headers()?);
         let (body, ct) = self.exec_request(req, "GET", &url).await?;
         let parsed: CodeTaskDetailsResponse = self.decode_json(&url, &ct, &body)?;
         Ok((parsed, body, ct))
@@ -386,17 +438,8 @@ impl Client {
         task_id: &str,
         turn_id: &str,
     ) -> Result<TurnAttemptsSiblingTurnsResponse> {
-        let url = match self.path_style {
-            PathStyle::CodexApi => format!(
-                "{}/api/codex/tasks/{}/turns/{}/sibling_turns",
-                self.base_url, task_id, turn_id
-            ),
-            PathStyle::ChatGptApi => format!(
-                "{}/wham/tasks/{}/turns/{}/sibling_turns",
-                self.base_url, task_id, turn_id
-            ),
-        };
-        let req = self.request(Method::GET, &url).headers(self.headers());
+        let url = self.task_url(task_id, Some(turn_id))?;
+        let req = self.request(Method::GET, &url).headers(self.headers()?);
         let (body, ct) = self.exec_request(req, "GET", &url).await?;
         self.decode_json::<TurnAttemptsSiblingTurnsResponse>(&url, &ct, &body)
     }
@@ -409,10 +452,10 @@ impl Client {
         &self,
     ) -> std::result::Result<ConfigBundleResponse, RequestError> {
         let url = match self.path_style {
-            PathStyle::CodexApi => format!("{}/api/codex/config/bundle", self.base_url),
-            PathStyle::ChatGptApi => format!("{}/wham/config/bundle", self.base_url),
+            PathStyle::CodexApi => self.endpoint_url("/api/codex/config/bundle"),
+            PathStyle::ChatGptApi => self.endpoint_url("/wham/config/bundle"),
         };
-        let req = self.request(Method::GET, &url).headers(self.headers());
+        let req = self.request(Method::GET, &url).headers(self.headers()?);
         let (body, ct) = self.exec_request_detailed(req, "GET", &url).await?;
         self.decode_json::<ConfigBundleResponse>(&url, &ct, &body)
             .map_err(RequestError::from)
@@ -428,7 +471,7 @@ impl Client {
         let url = self.user_settings_url();
         let req = self
             .request(Method::GET, &url)
-            .headers(self.headers())
+            .headers(self.headers()?)
             .header(
                 CACHE_CONTROL,
                 HeaderValue::from_static("no-cache, no-store"),
@@ -444,7 +487,7 @@ impl Client {
         let url = self.workspace_messages_url();
         let req = self
             .request(Method::GET, &url)
-            .headers(self.headers())
+            .headers(self.headers()?)
             .header(CACHE_CONTROL, HeaderValue::from_static("no-store"));
         let (body, ct) = self.exec_request_detailed(req, "GET", &url).await?;
         self.decode_json::<CodexWorkspaceMessagesResponse>(&url, &ct, &body)
@@ -455,33 +498,30 @@ impl Client {
     /// based on `path_style`. Returns the created task id.
     pub async fn create_task(&self, request_body: serde_json::Value) -> Result<String> {
         let url = match self.path_style {
-            PathStyle::CodexApi => format!("{}/api/codex/tasks", self.base_url),
-            PathStyle::ChatGptApi => format!("{}/wham/tasks", self.base_url),
+            PathStyle::CodexApi => self.endpoint_url("/api/codex/tasks"),
+            PathStyle::ChatGptApi => self.endpoint_url("/wham/tasks"),
         };
         let req = self
             .request(Method::POST, &url)
-            .headers(self.headers())
+            .headers(self.headers()?)
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
             .json(&request_body);
         let (body, ct) = self.exec_request(req, "POST", &url).await?;
         // Extract id from JSON: prefer `task.id`; fallback to top-level `id` when present.
-        match serde_json::from_str::<serde_json::Value>(&body) {
-            Ok(v) => {
-                if let Some(id) = v
-                    .get("task")
-                    .and_then(|t| t.get("id"))
-                    .and_then(|s| s.as_str())
-                {
-                    Ok(id.to_string())
-                } else if let Some(id) = v.get("id").and_then(|s| s.as_str()) {
-                    Ok(id.to_string())
-                } else {
-                    anyhow::bail!(
-                        "POST {url} succeeded but no task id found; content-type={ct}; body={body}"
-                    );
-                }
-            }
-            Err(e) => anyhow::bail!("Decode error for {url}: {e}; content-type={ct}; body={body}"),
+        let v: serde_json::Value = self.decode_json(&url, &ct, &body)?;
+        if let Some(id) = v
+            .get("task")
+            .and_then(|t| t.get("id"))
+            .and_then(|s| s.as_str())
+        {
+            Ok(id.to_string())
+        } else if let Some(id) = v.get("id").and_then(|s| s.as_str()) {
+            Ok(id.to_string())
+        } else {
+            let body = diagnostic_excerpt(&body);
+            anyhow::bail!(
+                "POST {url} succeeded but no task id found; content-type={ct}; body={body}"
+            );
         }
     }
 
@@ -577,30 +617,26 @@ impl Client {
 
     fn send_add_credits_nudge_email_url(&self) -> String {
         match self.path_style {
-            PathStyle::CodexApi => format!(
-                "{}/api/codex/accounts/send_add_credits_nudge_email",
-                self.base_url
-            ),
+            PathStyle::CodexApi => {
+                self.endpoint_url("/api/codex/accounts/send_add_credits_nudge_email")
+            }
             PathStyle::ChatGptApi => {
-                format!(
-                    "{}/wham/accounts/send_add_credits_nudge_email",
-                    self.base_url
-                )
+                self.endpoint_url("/wham/accounts/send_add_credits_nudge_email")
             }
         }
     }
 
     fn workspace_messages_url(&self) -> String {
         match self.path_style {
-            PathStyle::CodexApi => format!("{}/api/codex/workspace-messages", self.base_url),
-            PathStyle::ChatGptApi => format!("{}/wham/workspace-messages", self.base_url),
+            PathStyle::CodexApi => self.endpoint_url("/api/codex/workspace-messages"),
+            PathStyle::ChatGptApi => self.endpoint_url("/wham/workspace-messages"),
         }
     }
 
     fn user_settings_url(&self) -> String {
         match self.path_style {
-            PathStyle::CodexApi => format!("{}/api/codex/settings/user", self.base_url),
-            PathStyle::ChatGptApi => format!("{}/wham/settings/user", self.base_url),
+            PathStyle::CodexApi => self.endpoint_url("/api/codex/settings/user"),
+            PathStyle::ChatGptApi => self.endpoint_url("/wham/settings/user"),
         }
     }
 
@@ -611,7 +647,7 @@ impl Client {
 
         let used_percent = f64::from(snapshot.used_percent);
         let window_minutes = Self::window_minutes_from_seconds(snapshot.limit_window_seconds);
-        let resets_at = Some(i64::from(snapshot.reset_at));
+        let resets_at = Some(snapshot.reset_at);
         Some(RateLimitWindow {
             used_percent,
             window_minutes,
@@ -636,7 +672,7 @@ impl Client {
             limit: details.limit,
             used: details.used,
             remaining_percent: details.remaining_percent,
-            resets_at: i64::from(details.reset_at),
+            resets_at: details.reset_at,
         }
     }
 
@@ -1056,6 +1092,109 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn auth_failures_stop_dispatch_for_all_backend_endpoints() {
+        struct UnavailableAuth {
+            transient: bool,
+        }
+
+        impl codex_api::AuthProvider for UnavailableAuth {
+            fn add_auth_headers(&self, _headers: &mut HeaderMap) {}
+
+            fn try_add_auth_headers(
+                &self,
+                _headers: &mut HeaderMap,
+            ) -> std::result::Result<(), codex_api::AuthError> {
+                Err(if self.transient {
+                    codex_api::AuthError::Transient("credentials unavailable".to_string())
+                } else {
+                    codex_api::AuthError::Build("credentials invalid".to_string())
+                })
+            }
+        }
+
+        let server = MockServer::start().await;
+        for transient in [false, true] {
+            let client = Client::new(
+                server.uri(),
+                HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault),
+            )
+            .with_auth_provider(std::sync::Arc::new(UnavailableAuth { transient }));
+            let mut errors = vec![
+                client
+                    .get_token_usage_profile()
+                    .await
+                    .expect_err("auth failure"),
+                client
+                    .list_tasks(None, None, None, None)
+                    .await
+                    .expect_err("auth failure"),
+                client
+                    .get_task_details("task-a")
+                    .await
+                    .expect_err("auth failure"),
+                client
+                    .list_sibling_turns("task-a", "turn-a")
+                    .await
+                    .expect_err("auth failure"),
+                client
+                    .create_task(serde_json::json!({}))
+                    .await
+                    .expect_err("auth failure"),
+                client
+                    .get_rate_limits_many()
+                    .await
+                    .expect_err("auth failure"),
+                client
+                    .list_rate_limit_reset_credits()
+                    .await
+                    .expect_err("auth failure"),
+                client
+                    .consume_rate_limit_reset_credit("request-a")
+                    .await
+                    .expect_err("auth failure"),
+            ];
+            for error in [
+                client
+                    .send_add_credits_nudge_email(AddCreditsNudgeCreditType::Credits)
+                    .await
+                    .expect_err("auth failure"),
+                client.get_config_bundle().await.expect_err("auth failure"),
+                client.get_user_settings().await.expect_err("auth failure"),
+                client
+                    .list_workspace_messages()
+                    .await
+                    .expect_err("auth failure"),
+            ] {
+                let RequestError::Other(error) = error else {
+                    panic!("auth failure must occur before an HTTP response");
+                };
+                errors.push(error);
+            }
+            for error in errors {
+                let error = error
+                    .downcast_ref::<codex_api::AuthError>()
+                    .expect("preserve the structured auth error");
+                match (transient, error) {
+                    (false, codex_api::AuthError::Build(message)) => {
+                        assert_eq!(message, "credentials invalid");
+                    }
+                    (true, codex_api::AuthError::Transient(message)) => {
+                        assert_eq!(message, "credentials unavailable");
+                    }
+                    _ => panic!("preserve the auth failure variant"),
+                }
+            }
+        }
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("request log")
+                .is_empty()
+        );
+    }
+
     #[test]
     fn authenticated_user_settings_client_uses_active_workspace_headers() {
         let auth = CodexAuth::from_external_chatgpt_tokens(
@@ -1069,7 +1208,7 @@ mod tests {
             &auth,
             HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault),
         );
-        let headers = client.headers();
+        let headers = client.headers().expect("valid auth headers");
 
         assert_eq!(
             [
@@ -1099,6 +1238,7 @@ mod tests {
         assert_eq!(
             first
                 .headers()
+                .expect("valid auth headers")
                 .get("authorization")
                 .and_then(|value| value.to_str().ok()),
             Some("Bearer sk-first")
@@ -1106,6 +1246,7 @@ mod tests {
         assert_eq!(
             second
                 .headers()
+                .expect("valid auth headers")
                 .get("authorization")
                 .and_then(|value| value.to_str().ok()),
             Some("Bearer sk-second")

@@ -102,7 +102,7 @@ impl Service<RoleClient> for ElicitationClientService {
                 let response = self
                     .create_elicitation(Elicitation::Mcp(request.params), context)
                     .await?;
-                // RMCP's typed CreateElicitationResult does not model result-level `_meta`.
+                // Preserve arbitrary JSON metadata, including values outside RMCP's object type.
                 let result = elicitation_response_result(response)?;
                 Ok(ClientResult::CustomResult(result))
             }
@@ -287,14 +287,30 @@ mod tests {
 
     #[test]
     fn elicitation_response_result_serializes_response_meta() {
+        let response = ElicitationResponse {
+            action: ElicitationAction::Accept,
+            content: Some(json!({ "confirmed": true })),
+            meta: Some(json!({ "persist": "always" })),
+        };
+        let typed = rmcp::model::CreateElicitationResult::from(response.clone());
+        let round_trip = ElicitationResponse::from(typed);
+        assert_eq!(round_trip, response);
         let result = rmcp::model::ClientResult::CustomResult(
-            elicitation_response_result(ElicitationResponse {
-                action: ElicitationAction::Accept,
-                content: Some(json!({ "confirmed": true })),
-                meta: Some(json!({ "persist": "always" })),
-            })
-            .expect("elicitation response should serialize"),
+            elicitation_response_result(round_trip).expect("elicitation response should serialize"),
         );
+        for meta in [None, Some(json!("unsupported")), Some(json!([1]))] {
+            let response = ElicitationResponse {
+                meta,
+                ..response.clone()
+            };
+            let typed = rmcp::model::CreateElicitationResult::from(response.clone());
+            assert_eq!(typed.meta, None);
+            assert_eq!(typed.action, response.action);
+            assert_eq!(typed.content, response.content);
+            let wire = serde_json::to_value(elicitation_response_result(response.clone()).unwrap())
+                .unwrap();
+            assert_eq!(wire.get("_meta"), response.meta.as_ref());
+        }
 
         assert_eq!(
             serde_json::to_value(result).expect("client result should serialize"),

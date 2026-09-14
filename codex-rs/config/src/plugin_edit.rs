@@ -67,8 +67,8 @@ pub fn apply_user_plugin_config_edits_blocking(
             PluginConfigEdit::SetEnabled {
                 plugin_key,
                 enabled,
-            } => set_plugin_enabled(&mut doc, &plugin_key, enabled),
-            PluginConfigEdit::Clear { plugin_key } => clear_plugin(&mut doc, &plugin_key),
+            } => set_plugin_enabled(&mut doc, &plugin_key, enabled)?,
+            PluginConfigEdit::Clear { plugin_key } => clear_plugin(&mut doc, &plugin_key)?,
         };
     }
     if !mutated {
@@ -77,78 +77,58 @@ pub fn apply_user_plugin_config_edits_blocking(
     write_atomically(&write_paths.write_path, &doc.to_string())
 }
 
-fn set_plugin_enabled(doc: &mut DocumentMut, plugin_key: &str, enabled: bool) -> bool {
-    let Some(plugins) = ensure_plugins_table(doc) else {
-        return false;
-    };
-    let Some(plugin) = ensure_table_for_write(&mut plugins[plugin_key]) else {
-        return false;
-    };
+fn set_plugin_enabled(
+    doc: &mut DocumentMut,
+    plugin_key: &str,
+    enabled: bool,
+) -> std::io::Result<bool> {
+    let inline = doc.get("plugins").is_some_and(TomlItem::is_inline_table);
+    let plugins = ensure_table_for_write(&mut doc["plugins"])?;
+    let plugin = ensure_table_for_write(plugins.entry(plugin_key).or_insert_with(|| {
+        if inline {
+            TomlItem::Value(toml_edit::InlineTable::new().into())
+        } else {
+            TomlItem::Table(new_implicit_table())
+        }
+    }))?;
     let mut replacement = value(enabled);
     if let Some(existing) = plugin.get("enabled") {
+        if existing.as_bool() == Some(enabled) {
+            return Ok(false);
+        }
         preserve_decor(existing, &mut replacement);
     }
-    plugin["enabled"] = replacement;
-    true
+    plugin.insert("enabled", replacement);
+    Ok(true)
 }
 
-fn clear_plugin(doc: &mut DocumentMut, plugin_key: &str) -> bool {
+fn clear_plugin(doc: &mut DocumentMut, plugin_key: &str) -> std::io::Result<bool> {
     let root = doc.as_table_mut();
     let Some(plugins_item) = root.get_mut("plugins") else {
-        return false;
+        return Ok(false);
     };
-    let Some(plugins) = ensure_table_for_read(plugins_item) else {
-        return false;
+    let plugins = ensure_table_for_write(plugins_item)?;
+    let Some(plugin) = plugins.get(plugin_key) else {
+        return Ok(false);
     };
-    plugins.remove(plugin_key).is_some()
+    if plugin.as_table_like().is_none() {
+        return Err(invalid_plugin_table());
+    }
+    Ok(plugins.remove(plugin_key).is_some())
 }
 
-fn ensure_plugins_table(doc: &mut DocumentMut) -> Option<&mut TomlTable> {
-    let root = doc.as_table_mut();
-    if !root.contains_key("plugins") {
-        root.insert("plugins", TomlItem::Table(new_implicit_table()));
+fn ensure_table_for_write(item: &mut TomlItem) -> std::io::Result<&mut dyn toml_edit::TableLike> {
+    if item.is_none() {
+        *item = TomlItem::Table(new_implicit_table());
     }
-    ensure_table_for_write(root.get_mut("plugins")?)
+    item.as_table_like_mut().ok_or_else(invalid_plugin_table)
 }
 
-fn ensure_table_for_write(item: &mut TomlItem) -> Option<&mut TomlTable> {
-    match item {
-        TomlItem::Table(table) => Some(table),
-        TomlItem::Value(value) => {
-            let table = value
-                .as_inline_table()
-                .map_or_else(new_implicit_table, table_from_inline);
-            *item = TomlItem::Table(table);
-            item.as_table_mut()
-        }
-        TomlItem::None => {
-            *item = TomlItem::Table(new_implicit_table());
-            item.as_table_mut()
-        }
-        _ => None,
-    }
-}
-
-fn ensure_table_for_read(item: &mut TomlItem) -> Option<&mut TomlTable> {
-    match item {
-        TomlItem::Table(_) => {}
-        TomlItem::Value(value) => {
-            let inline = value.as_inline_table()?.clone();
-            *item = TomlItem::Table(table_from_inline(&inline));
-        }
-        _ => return None,
-    }
-    item.as_table_mut()
-}
-
-fn table_from_inline(inline: &toml_edit::InlineTable) -> TomlTable {
-    let mut table = new_implicit_table();
-    for (key, value) in inline.iter() {
-        let mut value = value.clone();
-        value.decor_mut().set_suffix("");
-        table.insert(key, TomlItem::Value(value));
-    }
-    table
+fn invalid_plugin_table() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "plugins and plugin entries must be tables or inline tables",
+    )
 }
 
 fn new_implicit_table() -> TomlTable {
@@ -263,7 +243,179 @@ enabled = true
         assert!(!codex_home.path().join(CONFIG_TOML_FILE).exists());
     }
 
+    #[tokio::test]
+    async fn unchanged_plugin_edits_do_not_write_config() -> std::io::Result<()> {
+        for original in [
+            "plugins = { demo = { enabled = true } } # keep\n",
+            "[plugins.demo]\nenabled = false # keep\n",
+        ] {
+            let home = TempDir::new()?;
+            let path = home.path().join(CONFIG_TOML_FILE);
+            fs::write(&path, original)?;
+            let file = fs::OpenOptions::new().write(true).open(&path)?;
+            file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))?;
+            drop(file);
+            let modified = fs::metadata(&path)?.modified()?;
+            let enabled = read_config(home.path())["plugins"]["demo"]["enabled"]
+                .as_bool()
+                .unwrap();
+
+            apply_user_plugin_config_edits(
+                home.path(),
+                vec![
+                    PluginConfigEdit::SetEnabled {
+                        plugin_key: "demo".into(),
+                        enabled,
+                    },
+                    PluginConfigEdit::Clear {
+                        plugin_key: "missing".into(),
+                    },
+                ],
+            )
+            .await?;
+
+            assert_eq!(fs::read_to_string(&path)?, original);
+            assert_eq!(fs::metadata(&path)?.modified()?, modified);
+        }
+        Ok(())
+    }
+
     fn read_config(codex_home: &Path) -> toml::Value {
         toml::from_str(&fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn repeated_enabled_edits_preserve_file_contents_and_timestamp() -> anyhow::Result<()> {
+        for original in [
+            "[plugins.demo]\nenabled = true # keep\n",
+            "plugins = { demo = { enabled = true, source = 'local' } } # keep\n",
+        ] {
+            let home = TempDir::new()?;
+            let path = home.path().join(CONFIG_TOML_FILE);
+            fs::write(&path, original)?;
+            fs::File::options()
+                .write(true)
+                .open(&path)?
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(86400))?;
+            let timestamp = fs::metadata(&path)?.modified()?;
+            set_user_plugin_enabled(home.path(), "demo".into(), true).await?;
+            assert_eq!(fs::read_to_string(&path)?, original);
+            assert_eq!(fs::metadata(&path)?.modified()?, timestamp);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plugin_edits_reject_malformed_tables_without_persisting_batch() {
+        for contents in [
+            "plugins = 1\n",
+            "plugins = []\n",
+            "[[plugins]]\nenabled = false\n",
+            "[plugins]\n'demo@market' = false\n",
+            "[plugins]\n'demo@market' = []\n",
+            "[[plugins.'demo@market']]\nenabled = false\n",
+        ] {
+            for edit in [
+                PluginConfigEdit::SetEnabled {
+                    plugin_key: "demo@market".to_string(),
+                    enabled: true,
+                },
+                PluginConfigEdit::Clear {
+                    plugin_key: "demo@market".to_string(),
+                },
+            ] {
+                let temp = TempDir::new().unwrap();
+                let path = temp.path().join(CONFIG_TOML_FILE);
+                fs::write(&path, contents).unwrap();
+                let error = apply_user_plugin_config_edits(
+                    temp.path(),
+                    vec![
+                        PluginConfigEdit::SetEnabled {
+                            plugin_key: "valid@market".to_string(),
+                            enabled: true,
+                        },
+                        edit,
+                    ],
+                )
+                .await
+                .expect_err("malformed plugin shape must reject the entire batch");
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                assert_eq!(fs::read_to_string(path).unwrap(), contents);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_edits_preserve_inline_tables_and_comments() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join(CONFIG_TOML_FILE);
+        let contents =
+            "plugins = { 'demo@market' = { enabled = false, source = 'local' } } # keep\n";
+        fs::write(&path, contents).unwrap();
+        set_user_plugin_enabled(temp.path(), "demo@market".to_string(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            contents.replace("false", "true")
+        );
+        assert_eq!(
+            read_config(temp.path())["plugins"]["demo@market"]["enabled"].as_bool(),
+            Some(true)
+        );
+        set_user_plugin_enabled(temp.path(), "added@market".to_string(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_config(temp.path())["plugins"]["added@market"]["enabled"].as_bool(),
+            Some(false)
+        );
+        clear_user_plugin(temp.path(), "demo@market".to_string())
+            .await
+            .unwrap();
+        assert!(
+            read_config(temp.path())["plugins"]
+                .get("demo@market")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_plugin_edits_preserve_fields_and_comments() {
+        for original in [
+            "plugins = { demo = { enabled = false, source = 'local' } } # keep\n",
+            "[plugins]\ndemo = { enabled = false, source = 'local' } # keep\n",
+            "[plugins.demo]\nenabled = false # keep\nsource = 'local'\n",
+        ] {
+            let home = TempDir::new().unwrap();
+            let path = home.path().join(CONFIG_TOML_FILE);
+            fs::write(&path, original).unwrap();
+            set_user_plugin_enabled(home.path(), "demo".into(), true)
+                .await
+                .unwrap();
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                original.replace("false", "true")
+            );
+            assert_eq!(
+                read_config(home.path())["plugins"]["demo"]["enabled"].as_bool(),
+                Some(true)
+            );
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))
+                .unwrap();
+            let modified = fs::metadata(&path).unwrap().modified().unwrap();
+            set_user_plugin_enabled(home.path(), "demo".into(), true)
+                .await
+                .unwrap();
+            assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                original.replace("false", "true")
+            );
+        }
     }
 }

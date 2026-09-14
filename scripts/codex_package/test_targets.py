@@ -34,8 +34,10 @@ class TargetMetadataTest(unittest.TestCase):
         self.assertEqual(SUPPORTED_TARGETS, tuple(sorted(TARGET_SPECS)))
         self.assertEqual(SUPPORTED_VARIANTS, tuple(sorted(PACKAGE_VARIANTS)))
         self.assertEqual(set(BINARY_TARGETS), set(RELEASE_TARGETS))
+        self.assertEqual(set(TARGET_SPECS), set(RELEASE_TARGETS))
+        self.assertEqual(set(NPM_TARGETS), set(RELEASE_TARGETS))
 
-    def test_release_targets_match_windows_installer(self) -> None:
+    def test_installer_mentions_each_declared_release_target(self) -> None:
         install_ps1 = (
             targets.REPO_ROOT / "scripts" / "install" / "install.ps1"
         ).read_text(encoding="utf-8")

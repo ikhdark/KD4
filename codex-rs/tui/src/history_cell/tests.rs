@@ -32,6 +32,141 @@ use codex_protocol::mcp::Tool;
 use rmcp::model::Content;
 
 const SMALL_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+
+#[test]
+fn transcript_height_saturates_instead_of_hiding_large_cells() {
+    let cell = PlainHistoryCell::new(vec![Line::from("x"); usize::from(u16::MAX) + 1]);
+    assert_eq!(cell.desired_transcript_height(80), u16::MAX);
+}
+
+#[test]
+fn user_history_cell_overlapping_and_spanning_elements_preserve_text() {
+    let cell = UserHistoryCell {
+        message: "abcdef\nghij\nαβ".into(),
+        text_elements: vec![
+            TextElement::new((2..10).into(), None),
+            TextElement::new((0..4).into(), None),
+            TextElement::new((1..3).into(), None),
+            TextElement::new((12..13).into(), None), // Invalid UTF-8 endpoint.
+            TextElement::new((14..16).into(), None),
+        ],
+        local_image_paths: vec![],
+        remote_image_urls: vec![],
+    };
+    assert_eq!(
+        render_lines(&cell.display_lines(80)),
+        vec!["", "› abcdef", "  ghij", "  αβ", ""]
+    );
+    let lines = cell.display_lines(80);
+    let styled = lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .filter(|span| span.style.fg == Some(Color::Cyan))
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert_eq!(styled, "abcdefghiβ");
+}
+
+#[test]
+fn completed_mcp_preview_is_bounded_and_transcript_preserves_all_text() {
+    let mut cell = new_active_mcp_tool_call(
+        "many".into(),
+        McpInvocation {
+            server: "s".into(),
+            tool: "t".into(),
+            arguments: None,
+        },
+        false,
+    );
+    let mut content: Vec<_> = (0..20).map(|i| text_block(&format!("block {i}"))).collect();
+    content.push(text_block(&format!("{}\ntail-marker", "row\n".repeat(100))));
+    assert!(
+        cell.complete(
+            Duration::ZERO,
+            Ok(CallToolResult {
+                content,
+                is_error: None,
+                structured_content: None,
+                meta: None
+            })
+        )
+        .is_none()
+    );
+    let preview = cell.display_lines(80);
+    assert_eq!(preview.len(), TOOL_CALL_MAX_LINES + 1);
+    assert!(
+        preview
+            .last()
+            .unwrap()
+            .to_string()
+            .contains("output truncated")
+    );
+    let transcript = render_lines(&cell.transcript_lines(80)).join("\n");
+    assert!(transcript.contains("block 19"));
+    assert!(transcript.ends_with("tail-marker"));
+    assert_eq!(
+        cell.raw_lines()
+            .iter()
+            .filter(|line| line.to_string() == "row")
+            .count(),
+        100
+    );
+    let composite = CompositeHistoryCell::new(vec![Box::new(cell)]);
+    assert!(
+        render_lines(&composite.transcript_lines(80))
+            .join("\n")
+            .ends_with("tail-marker")
+    );
+}
+
+#[test]
+fn completed_mcp_preserves_malformed_content_fallback_and_media_placeholders() {
+    let mut cell = new_active_mcp_tool_call(
+        "media".into(),
+        McpInvocation {
+            server: "s".into(),
+            tool: "t".into(),
+            arguments: None,
+        },
+        false,
+    );
+    let malformed = json!({"type": "image"});
+    assert!(
+        cell.complete(
+            Duration::ZERO,
+            Ok(CallToolResult {
+                content: vec![
+                    malformed.clone(),
+                    json!({"type": "audio", "data": "AAAA", "mimeType": "audio/wav"})
+                ],
+                is_error: Some(true),
+                structured_content: None,
+                meta: None,
+            })
+        )
+        .is_none()
+    );
+    assert_eq!(
+        render_lines(&cell.raw_lines()),
+        vec!["Called s.t()", &malformed.to_string(), "<audio content>"]
+    );
+    assert_eq!(
+        cell.display_lines(80)[0].spans[0].style.fg,
+        Some(Color::Red)
+    );
+}
+
+#[test]
+fn process_summary_height_includes_wrapped_empty_message() {
+    let composite = new_unified_exec_processes_output(vec![]);
+    let cell = &composite.parts[1];
+    let width = 10;
+    let expected = Paragraph::new(Text::from(cell.display_lines(width)))
+        .wrap(Wrap { trim: false })
+        .line_count(width);
+    assert!(expected > cell.display_lines(width).len());
+    assert_eq!(usize::from(cell.desired_height(width)), expected);
+}
 async fn test_config() -> Config {
     let codex_home = std::env::temp_dir();
     ConfigBuilder::default()
@@ -1469,6 +1604,42 @@ fn completed_mcp_tool_call_wrapped_outputs_snapshot() {
 }
 
 #[test]
+fn completed_mcp_preview_bounds_rows_and_cells_without_losing_raw_output() {
+    let text = (0..TOOL_CALL_MAX_LINES + 3)
+        .map(|index| format!("row {index}: 界界界 e\u{301} 👩‍💻"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut cell = new_active_mcp_tool_call(
+        "preview-bounds".into(),
+        McpInvocation {
+            server: "s".into(),
+            tool: "t".into(),
+            arguments: None,
+        },
+        false,
+    );
+    assert!(
+        cell.complete(
+            Duration::ZERO,
+            Ok(CallToolResult {
+                content: vec![text_block(&text)],
+                is_error: None,
+                structured_content: None,
+                meta: None,
+            })
+        )
+        .is_none()
+    );
+    let lines = cell.display_lines(24);
+    assert_eq!(lines.len(), TOOL_CALL_MAX_LINES + 1);
+    assert!(lines.iter().all(|line| line.width() <= 24));
+    let preview = render_lines(&lines).join("\n");
+    assert!(preview.contains("row 0:"));
+    assert!(preview.ends_with('…'));
+    assert!(render_lines(&cell.raw_lines()).join("\n").contains(&text));
+}
+
+#[test]
 fn completed_mcp_tool_call_multiple_outputs_inline_snapshot() {
     let invocation = McpInvocation {
         server: "metrics".into(),
@@ -2272,7 +2443,7 @@ fn reasoning_summary_height_matches_wrapped_rendering_for_url_like_content() {
 }
 
 #[test]
-fn reasoning_summary_block_returns_reasoning_cell_when_feature_disabled() {
+fn reasoning_summary_block_renders_headerless_text() {
     let cell = new_reasoning_summary_block(
         vec!["Detailed reasoning goes here.".to_string()],
         &test_cwd(),
@@ -2280,19 +2451,6 @@ fn reasoning_summary_block_returns_reasoning_cell_when_feature_disabled() {
 
     let rendered = render_transcript(cell.as_ref());
     assert_eq!(rendered, vec!["• Detailed reasoning goes here."]);
-}
-
-#[tokio::test]
-async fn reasoning_summary_block_respects_config_overrides() {
-    let mut config = test_config().await;
-    config.model = Some("gpt-3.5-turbo".to_string());
-    let cell = new_reasoning_summary_block(
-        vec!["**High level reasoning**\n\nDetailed reasoning goes here.".to_string()],
-        &test_cwd(),
-    );
-
-    let rendered_display = render_lines(&cell.display_lines(/*width*/ 80));
-    assert_eq!(rendered_display, vec!["• Detailed reasoning goes here."]);
 }
 
 #[test]
@@ -2617,79 +2775,5 @@ fn agent_markdown_cell_survives_insert_history_rewrap() {
     assert_eq!(
         before, after,
         "word_wrap_lines should not alter lines that already fit within width"
-    );
-}
-
-/// Simulate the consolidation backward-walk logic from `App::handle_event`
-/// to verify it correctly identifies and replaces `AgentMessageCell` runs.
-#[test]
-fn consolidation_walker_replaces_agent_message_cells() {
-    use std::sync::Arc;
-
-    // Build a transcript with: [UserCell, AgentMsg(head), AgentMsg(cont), AgentMsg(cont)]
-    let user = Arc::new(UserHistoryCell {
-        message: "hello".to_string(),
-        text_elements: Vec::new(),
-        local_image_paths: Vec::new(),
-        remote_image_urls: Vec::new(),
-    }) as Arc<dyn HistoryCell>;
-    let head = Arc::new(AgentMessageCell::new(
-        vec![Line::from("line 1")],
-        /*is_first_line*/ true,
-    )) as Arc<dyn HistoryCell>;
-    let cont1 = Arc::new(AgentMessageCell::new(
-        vec![Line::from("line 2")],
-        /*is_first_line*/ false,
-    )) as Arc<dyn HistoryCell>;
-    let cont2 = Arc::new(AgentMessageCell::new(
-        vec![Line::from("line 3")],
-        /*is_first_line*/ false,
-    )) as Arc<dyn HistoryCell>;
-
-    let mut transcript_cells: Vec<Arc<dyn HistoryCell>> = vec![user.clone(), head, cont1, cont2];
-
-    // Run the same consolidation logic as the handler.
-    let source = "line 1\nline 2\nline 3\n".to_string();
-    let end = transcript_cells.len();
-    let mut start = end;
-    while start > 0
-        && transcript_cells[start - 1].is_stream_continuation()
-        && transcript_cells[start - 1]
-            .as_any()
-            .is::<AgentMessageCell>()
-    {
-        start -= 1;
-    }
-    if start > 0
-        && transcript_cells[start - 1]
-            .as_any()
-            .is::<AgentMessageCell>()
-        && !transcript_cells[start - 1].is_stream_continuation()
-    {
-        start -= 1;
-    }
-
-    assert_eq!(
-        start, 1,
-        "should find all 3 agent cells starting at index 1"
-    );
-    assert_eq!(end, 4);
-
-    // Splice.
-    let consolidated: Arc<dyn HistoryCell> = Arc::new(AgentMarkdownCell::new(source, &test_cwd()));
-    transcript_cells.splice(start..end, std::iter::once(consolidated));
-
-    assert_eq!(transcript_cells.len(), 2, "should be [user, consolidated]");
-
-    // Verify first cell is still the user cell.
-    assert!(
-        transcript_cells[0].as_any().is::<UserHistoryCell>(),
-        "first cell should be UserHistoryCell"
-    );
-
-    // Verify second cell is AgentMarkdownCell.
-    assert!(
-        transcript_cells[1].as_any().is::<AgentMarkdownCell>(),
-        "second cell should be AgentMarkdownCell"
     );
 }

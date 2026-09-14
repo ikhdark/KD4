@@ -114,6 +114,9 @@ impl Read for WindowsPipeStream {
         if buf.is_empty() {
             return Ok(0);
         }
+        if Instant::now() >= self.deadline {
+            return Err(timeout_io_error());
+        }
 
         let mut operation = OverlappedOperation::new_read(Arc::clone(&self.handle), buf.len())?;
         let bytes_to_read = operation.as_ref().buffer_len();
@@ -141,6 +144,9 @@ impl Write for WindowsPipeStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(timeout_io_error());
         }
 
         let operation = OverlappedOperation::new_write(Arc::clone(&self.handle), buf)?;
@@ -634,6 +640,76 @@ fn timeout_io_error() -> io::Error {
 mod tests {
     use super::*;
 
+    fn connected_pipe() -> (OwnedHandle, WindowsPipeStream) {
+        use windows_sys::Win32::Foundation::ERROR_PIPE_CONNECTED;
+        use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+        use windows_sys::Win32::System::Pipes::ConnectNamedPipe;
+        use windows_sys::Win32::System::Pipes::CreateNamedPipeW;
+        let path = PathBuf::from(format!(r"\\.\pipe\codex-ide-test-{}", uuid::Uuid::new_v4()));
+        let wide: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: path is NUL terminated; the returned synchronous server handle is owned below.
+        let raw = unsafe {
+            CreateNamedPipeW(
+                wide.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                0,
+                1,
+                4096,
+                4096,
+                0,
+                ptr::null(),
+            )
+        };
+        assert_ne!(raw, INVALID_HANDLE_VALUE, "{}", io::Error::last_os_error());
+        let server = OwnedHandle(raw);
+        let client =
+            WindowsPipeStream::connect(path, Instant::now() + Duration::from_secs(2)).unwrap();
+        // SAFETY: server is live and synchronous; the client already opened its end.
+        let connected = unsafe { ConnectNamedPipe(server.raw(), ptr::null_mut()) };
+        if connected == 0 {
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(ERROR_PIPE_CONNECTED as i32)
+            );
+        }
+        (server, client)
+    }
+
+    #[test]
+    fn expired_deadline_rejects_even_ready_reads_and_writes() {
+        let (server, mut client) = connected_pipe();
+        let mut written = 0;
+        // SAFETY: live synchronous pipe, valid one-byte input and output count.
+        assert_ne!(
+            unsafe {
+                WriteFile(
+                    server.raw(),
+                    b"x".as_ptr(),
+                    1,
+                    &mut written,
+                    ptr::null_mut(),
+                )
+            },
+            0
+        );
+        assert_eq!(written, 1);
+        client.set_deadline(Instant::now());
+        let mut buffer = [0];
+        assert_eq!(
+            client.read(&mut buffer).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            client.write(b"y").unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(client.read(&mut []).unwrap(), 0);
+        assert_eq!(client.write(&[]).unwrap(), 0);
+        client.set_deadline(Instant::now() + Duration::from_secs(2));
+        assert_eq!(client.read(&mut buffer).unwrap(), 1);
+        assert_eq!(&buffer, b"x");
+    }
+
     #[test]
     fn operation_permits_cap_and_release_outstanding_work() {
         let active = Arc::new(AtomicUsize::new(0));
@@ -692,18 +768,50 @@ mod tests {
 
     #[test]
     fn reaper_releases_owned_operation_only_after_terminal_signal() {
-        use windows_sys::Win32::System::Threading::SetEvent;
-
+        let (server, client) = connected_pipe();
         let active = Arc::new(AtomicUsize::new(0));
         let permit = OperationPermit::acquire_from(Arc::clone(&active), 1).expect("permit");
-        let handle = Arc::new(OwnedHandle(NULL_HANDLE));
-        let operation =
+        let handle = client.handle.clone();
+        drop(client);
+        let mut operation =
             OverlappedOperation::new_with_permit(Arc::clone(&handle), b"owned".to_vec(), permit)
                 .expect("operation");
-        let event = operation.as_ref().event_raw();
-        assert_ne!(unsafe { SetEvent(event) }, 0);
+        // SAFETY: the pinned operation retains the buffer and OVERLAPPED through completion.
+        let result = unsafe {
+            ReadFile(
+                handle.raw(),
+                operation.as_mut().buffer_mut_ptr(),
+                5,
+                ptr::null_mut(),
+                operation.as_ref().overlapped_ptr(),
+            )
+        };
+        assert_eq!(result, 0);
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(ERROR_IO_PENDING as i32)
+        );
+        assert!(!pending_operation_is_terminal(operation.as_ref()));
 
         retire_pending_operation(operation);
+        thread::sleep(REAPER_POLL_INTERVAL * 3);
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        assert_eq!(Arc::strong_count(&handle), 2);
+        let mut written = 0;
+        // SAFETY: the server is live and synchronous; writing completes the retained read.
+        assert_ne!(
+            unsafe {
+                WriteFile(
+                    server.raw(),
+                    b"ready".as_ptr(),
+                    5,
+                    &mut written,
+                    ptr::null_mut(),
+                )
+            },
+            0
+        );
+        assert_eq!(written, 5);
         let deadline = Instant::now() + Duration::from_secs(1);
         while active.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));

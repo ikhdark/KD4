@@ -1794,13 +1794,16 @@ async fn streaming_chunks_update_bytes_but_count_as_one_logical_mutation() {
     assert_eq!(after.logical_mutations - before.logical_mutations, 1);
     assert_eq!(after.scans, before.scans);
 
-    let artifact = state.lock().await;
-    let RawOutputArtifact::Stored { path, bytes, .. } = &*artifact else {
-        panic!("expected stored streaming artifact");
+    let path = {
+        let artifact = state.lock().await;
+        let RawOutputArtifact::Stored { path, bytes, .. } = &*artifact else {
+            panic!("expected stored streaming artifact");
+        };
+        assert_eq!(*bytes, 200);
+        path.clone()
     };
-    assert_eq!(*bytes, 200);
     assert_eq!(
-        tokio::fs::read(path).await.expect("retained output"),
+        tokio::fs::read(&path).await.expect("retained output"),
         vec![b'x'; 200]
     );
     let usage = retention_usage_locked_blocking(path.parent().expect("artifact directory"));
@@ -2982,10 +2985,10 @@ async fn cancelled_raw_stream_open_releases_lock_before_returning_writer() {
     .await;
     // Release the original owner even on a failed assertion so a leaking
     // implementation does not leave this scenario's fixture locked.
-    if unlocked.is_err() {
-        if let RawOutputArtifact::Stored { handle, .. } = &*state.lock().await {
-            let _ = handle.unlock();
-        }
+    if unlocked.is_err()
+        && let RawOutputArtifact::Stored { handle, .. } = &*state.lock().await
+    {
+        let _ = handle.unlock();
     }
     assert!(
         unlocked.is_ok(),
@@ -3068,20 +3071,21 @@ fn raw_retention_worker_keeps_ownership_after_caller_and_runtime_cancellation() 
             b"retention survives runtime shutdown\n"
         );
         assert_eq!(retention_mode_for_test(root), RetentionModeKind::Indexed);
-        let registry = lock_retention_registry();
-        let state = registry
-            .roots
-            .get(&normalized_tool_output_root(root))
-            .expect("published root");
-        let RetentionRootMode::Indexed(index) = &state.mode else {
-            panic!("completed index");
-        };
-        assert_eq!(index.records.len(), 1);
-        assert_eq!(
-            index.total_bytes,
-            b"retention survives runtime shutdown\n".len() as u64
-        );
-        drop(registry);
+        {
+            let registry = lock_retention_registry();
+            let state = registry
+                .roots
+                .get(&normalized_tool_output_root(root))
+                .expect("published root");
+            let RetentionRootMode::Indexed(index) = &state.mode else {
+                panic!("completed index");
+            };
+            assert_eq!(index.records.len(), 1);
+            assert_eq!(
+                index.total_bytes,
+                b"retention survives runtime shutdown\n".len() as u64
+            );
+        }
         drop(permit);
         let id = paths[0]
             .file_stem()

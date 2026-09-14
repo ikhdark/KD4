@@ -116,7 +116,11 @@ impl App {
     /// overlay replay continues through the normal deferred-history path.
     pub(super) fn begin_initial_history_replay_buffer(&mut self) {
         if self.overlay.is_none() {
-            self.initial_history_replay_buffer = Some(Default::default());
+            self.initial_history_replay_buffer = Some(InitialHistoryReplayBuffer {
+                render_from_transcript_tail: self.resize_reflow_max_rows().is_some(),
+                transcript_start: self.transcript_cells.len(),
+                ..Default::default()
+            });
         }
     }
 
@@ -130,6 +134,7 @@ impl App {
             self.initial_history_replay_buffer = Some(InitialHistoryReplayBuffer {
                 retained_lines: VecDeque::new(),
                 render_from_transcript_tail: true,
+                transcript_start: self.transcript_cells.len(),
             });
         }
     }
@@ -146,8 +151,12 @@ impl App {
 
         if buffer.retained_lines.is_empty() {
             if buffer.render_from_transcript_tail {
-                let width = tui.terminal.last_known_screen_size.width;
-                let reflowed_lines = self.render_transcript_lines_for_reflow(width).lines;
+                let width = self
+                    .chat_widget
+                    .history_wrap_width(tui.terminal.last_known_screen_size.width);
+                let reflowed_lines = self
+                    .render_transcript_suffix_for_reflow(width, buffer.transcript_start)
+                    .lines;
                 if !reflowed_lines.is_empty() {
                     tui.insert_history_hyperlink_lines_with_wrap_policy(
                         reflowed_lines,
@@ -460,12 +469,20 @@ impl App {
     /// were a new top-level history item. The final row trim happens after separators are restored,
     /// so the returned rows obey the cap exactly.
     pub(super) fn render_transcript_lines_for_reflow(&mut self, width: u16) -> ReflowRenderResult {
+        self.render_transcript_suffix_for_reflow(width, 0)
+    }
+
+    fn render_transcript_suffix_for_reflow(
+        &mut self,
+        width: u16,
+        first_cell: usize,
+    ) -> ReflowRenderResult {
         let row_cap = self.resize_reflow_max_rows();
         let mut cell_displays = VecDeque::new();
         let mut rendered_rows = 0usize;
         let mut start = self.transcript_cells.len();
 
-        while start > 0 {
+        while start > first_cell {
             start -= 1;
             let cell = self.transcript_cells[start].clone();
             let lines = cell
@@ -481,7 +498,7 @@ impl App {
             }
         }
 
-        while start > 0
+        while start > first_cell
             && cell_displays
                 .front()
                 .is_some_and(|display| display.is_stream_continuation)
@@ -497,7 +514,7 @@ impl App {
             });
         }
 
-        let mut has_emitted_history_lines = false;
+        let mut has_emitted_history_lines = first_cell > 0 && self.has_emitted_history_lines;
         let mut reflowed_lines = Vec::new();
         for display in cell_displays {
             if !display.lines.is_empty() && !display.is_stream_continuation {
@@ -515,7 +532,7 @@ impl App {
             let trimmed_line_count = reflowed_lines.len() - max_rows;
             reflowed_lines = reflowed_lines.split_off(trimmed_line_count);
         }
-        self.has_emitted_history_lines = !reflowed_lines.is_empty();
+        self.has_emitted_history_lines = has_emitted_history_lines || !reflowed_lines.is_empty();
 
         ReflowRenderResult {
             lines: reflowed_lines,

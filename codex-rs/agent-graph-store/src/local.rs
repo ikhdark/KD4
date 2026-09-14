@@ -137,7 +137,6 @@ fn internal_error(operation: &'static str, err: impl Into<anyhow::Error>) -> Age
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_state::DirectionalThreadSpawnEdgeStatus;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
 
@@ -167,10 +166,11 @@ mod tests {
     async fn local_store_upserts_and_lists_direct_children_with_status_filters() {
         let fixture = state_runtime().await;
         let state_db = fixture.state_db;
-        let store = LocalAgentGraphStore::new(state_db.clone());
+        let store = LocalAgentGraphStore::new(state_db);
         let parent_thread_id = thread_id(/*suffix*/ 1);
         let first_child_thread_id = thread_id(/*suffix*/ 2);
         let second_child_thread_id = thread_id(/*suffix*/ 3);
+        let replacement_parent_thread_id = thread_id(/*suffix*/ 4);
 
         store
             .upsert_thread_spawn_edge(
@@ -202,14 +202,6 @@ mod tests {
             .list_thread_spawn_children(parent_thread_id, Some(ThreadSpawnEdgeStatus::Open))
             .await
             .expect("open children should load");
-        let state_open_children = state_db
-            .list_thread_spawn_children_with_status(
-                parent_thread_id,
-                DirectionalThreadSpawnEdgeStatus::Open,
-            )
-            .await
-            .expect("state open children should load");
-        assert_eq!(open_children, state_open_children);
         assert_eq!(open_children, vec![first_child_thread_id]);
 
         let closed_children = store
@@ -217,6 +209,37 @@ mod tests {
             .await
             .expect("closed children should load");
         assert_eq!(closed_children, vec![second_child_thread_id]);
+
+        store
+            .upsert_thread_spawn_edge(
+                replacement_parent_thread_id,
+                first_child_thread_id,
+                ThreadSpawnEdgeStatus::Closed,
+            )
+            .await
+            .expect("existing child should move to the new parent and close");
+
+        let old_parent_children = store
+            .list_thread_spawn_children(parent_thread_id, None)
+            .await
+            .expect("old parent's remaining children should load");
+        assert_eq!(old_parent_children, vec![second_child_thread_id]);
+
+        for status_filter in [None, Some(ThreadSpawnEdgeStatus::Closed)] {
+            let replacement_parent_children = store
+                .list_thread_spawn_children(replacement_parent_thread_id, status_filter)
+                .await
+                .expect("replacement parent's children should load");
+            assert_eq!(replacement_parent_children, vec![first_child_thread_id]);
+        }
+        let replacement_parent_open_children = store
+            .list_thread_spawn_children(
+                replacement_parent_thread_id,
+                Some(ThreadSpawnEdgeStatus::Open),
+            )
+            .await
+            .expect("replacement parent's open children should load");
+        assert_eq!(replacement_parent_open_children, Vec::<ThreadId>::new());
     }
 
     #[tokio::test]
@@ -226,6 +249,7 @@ mod tests {
         let store = LocalAgentGraphStore::new(state_db);
         let parent_thread_id = thread_id(/*suffix*/ 10);
         let child_thread_id = thread_id(/*suffix*/ 11);
+        let missing_child_thread_id = thread_id(/*suffix*/ 12);
 
         store
             .upsert_thread_spawn_edge(
@@ -239,6 +263,10 @@ mod tests {
             .set_thread_spawn_edge_status(child_thread_id, ThreadSpawnEdgeStatus::Closed)
             .await
             .expect("child edge should close");
+        store
+            .set_thread_spawn_edge_status(missing_child_thread_id, ThreadSpawnEdgeStatus::Open)
+            .await
+            .expect("updating a missing child should be a successful no-op");
 
         let open_children = store
             .list_thread_spawn_children(parent_thread_id, Some(ThreadSpawnEdgeStatus::Open))
@@ -251,26 +279,80 @@ mod tests {
             .await
             .expect("closed children should load");
         assert_eq!(closed_children, vec![child_thread_id]);
+
+        let all_children = store
+            .list_thread_spawn_children(parent_thread_id, None)
+            .await
+            .expect("all children should load after the missing-child update");
+        assert_eq!(all_children, vec![child_thread_id]);
+        let missing_children = store
+            .list_thread_spawn_children(missing_child_thread_id, None)
+            .await
+            .expect("missing thread should have no children");
+        assert_eq!(missing_children, Vec::<ThreadId>::new());
     }
 
     #[tokio::test]
     async fn local_store_reports_invalid_topology_as_invalid_request() {
         let fixture = state_runtime().await;
         let store = LocalAgentGraphStore::new(fixture.state_db);
-        let thread_id = thread_id(/*suffix*/ 12);
+        let root_thread_id = thread_id(/*suffix*/ 12);
+        let first_child_thread_id = thread_id(/*suffix*/ 13);
+        let second_child_thread_id = thread_id(/*suffix*/ 14);
+        let third_child_thread_id = thread_id(/*suffix*/ 15);
 
         let error = store
-            .upsert_thread_spawn_edge(thread_id, thread_id, ThreadSpawnEdgeStatus::Open)
+            .upsert_thread_spawn_edge(root_thread_id, root_thread_id, ThreadSpawnEdgeStatus::Open)
             .await
             .expect_err("self-parent edge should be rejected");
         assert!(matches!(error, AgentGraphStoreError::InvalidRequest { .. }));
+        let children = store
+            .list_thread_spawn_children(root_thread_id, None)
+            .await
+            .expect("children should load after rejecting self-parenting");
+        assert_eq!(children, Vec::<ThreadId>::new());
+
+        for (parent, child) in [
+            (root_thread_id, first_child_thread_id),
+            (first_child_thread_id, second_child_thread_id),
+            (second_child_thread_id, third_child_thread_id),
+        ] {
+            store
+                .upsert_thread_spawn_edge(parent, child, ThreadSpawnEdgeStatus::Open)
+                .await
+                .expect("acyclic edge should insert");
+        }
+        let error = store
+            .upsert_thread_spawn_edge(
+                third_child_thread_id,
+                first_child_thread_id,
+                ThreadSpawnEdgeStatus::Closed,
+            )
+            .await
+            .expect_err("reparenting to an indirect descendant should be rejected");
+        assert!(matches!(error, AgentGraphStoreError::InvalidRequest { .. }));
+
+        for (parent, expected_children) in [
+            (root_thread_id, vec![first_child_thread_id]),
+            (first_child_thread_id, vec![second_child_thread_id]),
+            (second_child_thread_id, vec![third_child_thread_id]),
+            (third_child_thread_id, vec![]),
+        ] {
+            for status_filter in [None, Some(ThreadSpawnEdgeStatus::Open)] {
+                let children = store
+                    .list_thread_spawn_children(parent, status_filter)
+                    .await
+                    .expect("original relationships should survive rejected reparenting");
+                assert_eq!(children, expected_children);
+            }
+        }
     }
 
     #[tokio::test]
     async fn local_store_lists_descendants_breadth_first_with_status_filters() {
         let fixture = state_runtime().await;
         let state_db = fixture.state_db;
-        let store = LocalAgentGraphStore::new(state_db.clone());
+        let store = LocalAgentGraphStore::new(state_db);
         let root_thread_id = thread_id(/*suffix*/ 20);
         let later_child_thread_id = thread_id(/*suffix*/ 22);
         let earlier_child_thread_id = thread_id(/*suffix*/ 21);
@@ -278,6 +360,8 @@ mod tests {
         let open_grandchild_thread_id = thread_id(/*suffix*/ 24);
         let closed_child_thread_id = thread_id(/*suffix*/ 25);
         let closed_great_grandchild_thread_id = thread_id(/*suffix*/ 26);
+        let unrelated_parent_thread_id = thread_id(/*suffix*/ 27);
+        let unrelated_child_thread_id = thread_id(/*suffix*/ 28);
 
         for (parent_thread_id, child_thread_id, status) in [
             (
@@ -310,6 +394,11 @@ mod tests {
                 closed_great_grandchild_thread_id,
                 ThreadSpawnEdgeStatus::Closed,
             ),
+            (
+                unrelated_parent_thread_id,
+                unrelated_child_thread_id,
+                ThreadSpawnEdgeStatus::Open,
+            ),
         ] {
             store
                 .upsert_thread_spawn_edge(parent_thread_id, child_thread_id, status)
@@ -337,14 +426,6 @@ mod tests {
             .list_thread_spawn_descendants(root_thread_id, Some(ThreadSpawnEdgeStatus::Open))
             .await
             .expect("open descendants should load");
-        let state_open_descendants = state_db
-            .list_thread_spawn_descendants_with_status(
-                root_thread_id,
-                DirectionalThreadSpawnEdgeStatus::Open,
-            )
-            .await
-            .expect("state open descendants should load");
-        assert_eq!(open_descendants, state_open_descendants);
         assert_eq!(
             open_descendants,
             vec![

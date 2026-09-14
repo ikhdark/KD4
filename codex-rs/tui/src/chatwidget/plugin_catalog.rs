@@ -6,6 +6,7 @@ use std::time::Instant;
 use super::ChatWidget;
 use super::plugins::ADD_MARKETPLACE_TAB_ID;
 use super::plugins::ALL_PLUGINS_TAB_ID;
+use super::plugins::PLUGINS_LOADING_VIEW_ID;
 use super::plugins::PLUGINS_SELECTION_VIEW_ID;
 use super::plugins::PluginsCacheState;
 use crate::app_event::AppEvent;
@@ -341,7 +342,7 @@ impl Renderable for PluginDisclosureLine {
 impl ChatWidget {
     pub(super) fn plugins_loading_popup_params(&self) -> SelectionViewParams {
         SelectionViewParams {
-            view_id: Some(PLUGINS_SELECTION_VIEW_ID),
+            view_id: Some(PLUGINS_LOADING_VIEW_ID),
             header: Box::new(DelayedLoadingHeader::new(
                 self.frame_requester.clone(),
                 self.config.animations,
@@ -587,7 +588,7 @@ impl ChatWidget {
         }
     }
 
-    pub(super) fn marketplace_add_error_popup_params(&self) -> SelectionViewParams {
+    pub(super) fn marketplace_add_error_popup_params(&self, err: &str) -> SelectionViewParams {
         let mut header = ColumnRenderable::new();
         header.push(Line::from("Plugins".bold()));
         header.push(Line::from("Failed to add marketplace.".dim()));
@@ -595,9 +596,7 @@ impl ChatWidget {
         let mut items = vec![
             SelectionItem {
                 name: "Marketplace add failed".to_string(),
-                description: Some(
-                    "Failed to add marketplace from the provided source.".to_string(),
-                ),
+                description: Some(err.to_string()),
                 is_disabled: true,
                 ..Default::default()
             },
@@ -613,6 +612,7 @@ impl ChatWidget {
         ];
 
         if let PluginsCacheState::Ready(plugins_response) = self.plugins_cache_for_current_cwd() {
+            let plugins_response = plugins_response.clone();
             let cwd = self.config.cwd.to_path_buf();
             items.push(SelectionItem {
                 name: "Back to plugins".to_string(),
@@ -641,6 +641,7 @@ impl ChatWidget {
         &self,
         marketplace_name: &str,
         marketplace_display_name: &str,
+        err: &str,
     ) -> SelectionViewParams {
         let mut header = ColumnRenderable::new();
         header.push(Line::from("Plugins".bold()));
@@ -651,7 +652,7 @@ impl ChatWidget {
         let mut items = vec![
             SelectionItem {
                 name: "Marketplace removal failed".to_string(),
-                description: Some("Failed to remove the selected marketplace.".to_string()),
+                description: Some(err.to_string()),
                 is_disabled: true,
                 ..Default::default()
             },
@@ -670,6 +671,7 @@ impl ChatWidget {
         ];
 
         if let PluginsCacheState::Ready(plugins_response) = self.plugins_cache_for_current_cwd() {
+            let plugins_response = plugins_response.clone();
             let cwd = self.config.cwd.to_path_buf();
             items.push(SelectionItem {
                 name: "Back to plugins".to_string(),
@@ -1581,19 +1583,14 @@ fn plugin_entries_for_marketplaces<'a>(
 }
 
 fn sort_plugin_entries(entries: &mut [(&PluginMarketplaceEntry, &PluginSummary, String)]) {
-    entries.sort_by(|left, right| {
-        right
-            .1
-            .installed
-            .cmp(&left.1.installed)
-            .then_with(|| {
-                left.2
-                    .to_ascii_lowercase()
-                    .cmp(&right.2.to_ascii_lowercase())
-            })
-            .then_with(|| left.2.cmp(&right.2))
-            .then_with(|| left.1.name.cmp(&right.1.name))
-            .then_with(|| left.1.id.cmp(&right.1.id))
+    entries.sort_by_cached_key(|entry| {
+        (
+            !entry.1.installed,
+            entry.2.to_ascii_lowercase(),
+            entry.2.clone(),
+            entry.1.name.clone(),
+            entry.1.id.clone(),
+        )
     });
 }
 

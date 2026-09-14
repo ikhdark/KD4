@@ -14,6 +14,28 @@ def record(timestamp: str, record_type: str, payload: dict[str, object]) -> str:
 
 
 class FirstUsefulActionAnalysisTest(unittest.TestCase):
+    def test_partial_canonical_milestone_is_not_admitted(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "rollout.jsonl"
+            path.write_text(
+                record("2026-08-17T00:00:00Z", "event_msg", {"type": "task_started"})
+                + "\n"
+                + record(
+                    "2026-08-17T00:00:01Z",
+                    "event_msg",
+                    {
+                        "type": "task_complete",
+                        "timing": {
+                            "schemaVersion": 25,
+                            "milestones": {"firstDomainActionMs": 10},
+                        },
+                    },
+                )
+            )
+            report = analysis.analyze_snapshots([read_rollout_snapshot(path)])
+            self.assertEqual(report["canonicalTurnCount"], 0)
+        self.assertEqual(report["exclusions"]["incompleteCanonicalMilestones"], 1)
+
     def test_module_has_no_standalone_rollout_lookup_cli(self) -> None:
         self.assertFalse(hasattr(analysis, "main"))
 
@@ -138,6 +160,49 @@ class FirstUsefulActionAnalysisTest(unittest.TestCase):
         )
 
     def test_schema_19_field_is_not_treated_as_canonical(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rollout.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        record(
+                            "2026-08-17T00:00:00Z",
+                            "event_msg",
+                            {"type": "task_started"},
+                        ),
+                        record(
+                            "2026-08-17T00:00:00.100Z",
+                            "event_msg",
+                            {"type": "user_message"},
+                        ),
+                        record(
+                            "2026-08-17T00:00:00.500Z",
+                            "response_item",
+                            {"type": "function_call", "name": "exec_command"},
+                        ),
+                        record(
+                            "2026-08-17T00:00:01Z",
+                            "event_msg",
+                            {
+                                "type": "task_complete",
+                                "timing": {
+                                    "schemaVersion": 19,
+                                    "milestones": {
+                                        "firstUsefulActionMs": 320,
+                                        "firstDomainActionMs": 320,
+                                    },
+                                },
+                            },
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            result = analysis.analyze_snapshots([read_rollout_snapshot(path)])
+        self.assertEqual(result["canonicalTurnCount"], 0)
+        self.assertEqual(result["legacyReconstructedTurnCount"], 1)
+
+    def test_useful_tool_classification_excludes_control_and_discovery(self) -> None:
         self.assertFalse(analysis.is_useful_tool("functions.wait_agent"))
         self.assertFalse(analysis.is_useful_tool("functions.exec"))
         self.assertFalse(analysis.is_useful_tool("functions.tool_search"))

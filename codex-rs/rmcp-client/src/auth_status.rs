@@ -14,6 +14,7 @@ use codex_exec_server::HttpResponseBodyStream;
 use codex_http_client::HttpClientBuilder;
 use codex_protocol::protocol::McpAuthStatus;
 use futures::FutureExt;
+use futures::StreamExt;
 use futures::future::BoxFuture;
 use http::HeaderMap;
 use http::HeaderName;
@@ -26,6 +27,7 @@ use tracing::debug;
 
 use crate::oauth::StoredOAuthTokenStatus;
 use crate::oauth::oauth_token_status;
+use crate::oauth_http_client::MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES;
 use crate::oauth_http_client::OAuthHttpClientAdapter;
 use crate::utils::build_default_headers;
 use codex_config::types::AuthKeyringBackendKind;
@@ -93,14 +95,21 @@ impl HttpClient for DiscoveryHttpClient {
                     })
                 })
                 .collect();
-            let body = response
-                .bytes()
-                .await
-                .map_err(|error| ExecServerError::HttpRequest(error.to_string()))?;
+            let mut stream = response.bytes_stream();
+            let mut body = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|error| ExecServerError::HttpRequest(error.to_string()))?;
+                if chunk.len() > MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES - body.len() {
+                    return Err(ExecServerError::HttpRequest(format!(
+                        "OAuth HTTP response body exceeds {MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES} bytes"
+                    )));
+                }
+                body.extend_from_slice(&chunk);
+            }
             Ok(HttpRequestResponse {
                 status,
                 headers,
-                body: body.to_vec().into(),
+                body: body.into(),
             })
         }
         .boxed()
@@ -295,7 +304,7 @@ fn determine_auth_status_from_discovery(
             debug!(
                 "failed to detect OAuth support for MCP server `{server_name}` at {url}: {error:?}"
             );
-            Ok(McpAuthState::Unsupported)
+            Err(error)
         }
     }
 }
@@ -409,6 +418,67 @@ mod tests {
     use std::collections::HashMap;
     use std::ffi::OsString;
     use tokio::task::JoinHandle;
+
+    #[test]
+    fn discovery_failure_remains_distinct_from_unsupported() {
+        let result = determine_auth_status_from_discovery(
+            "server",
+            "https://example.com/mcp",
+            Err(anyhow::anyhow!("discovery transport failed")),
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "discovery transport failed"
+        );
+        assert_eq!(
+            determine_auth_status_from_discovery("server", "https://example.com/mcp", Ok(None))
+                .unwrap(),
+            McpAuthState::Unsupported
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_rejects_oversized_body_before_stream_finishes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/",
+            get(|| async {
+                axum::body::Body::from_stream(
+                    futures::stream::once(async {
+                        Ok::<_, std::io::Error>(vec![b'x'; MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES + 1])
+                    })
+                    .chain(futures::stream::pending()),
+                )
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = DiscoveryHttpClient::new(HeaderMap::new()).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.http_request(HttpRequestParams {
+                method: "GET".into(),
+                url: format!("http://{address}/"),
+                headers: vec![],
+                body: None,
+                timeout_ms: None,
+                redirect_policy: HttpRedirectPolicy::Stop,
+                request_id: "discovery-limit-test".into(),
+                stream_response: false,
+            }),
+        )
+        .await;
+        server.abort();
+        let error = result
+            .expect("must reject without waiting for EOF")
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("exceeds 1048576 bytes"),
+            "{error}"
+        );
+    }
 
     struct TestServer {
         url: String,

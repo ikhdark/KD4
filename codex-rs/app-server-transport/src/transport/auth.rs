@@ -90,7 +90,7 @@ pub struct WebsocketAuthPolicy {
     pub(crate) mode: Option<WebsocketAuthMode>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) enum WebsocketAuthMode {
     CapabilityToken {
         token_sha256: [u8; 32],
@@ -101,6 +101,28 @@ pub(crate) enum WebsocketAuthMode {
         audience: Option<String>,
         max_clock_skew_seconds: i64,
     },
+}
+
+impl std::fmt::Debug for WebsocketAuthMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CapabilityToken { .. } => {
+                f.debug_struct("CapabilityToken").finish_non_exhaustive()
+            }
+            Self::SignedBearerToken {
+                issuer,
+                audience,
+                max_clock_skew_seconds,
+                ..
+            } => f
+                .debug_struct("SignedBearerToken")
+                .field("shared_secret", &"[REDACTED]")
+                .field("issuer", issuer)
+                .field("audience", audience)
+                .field("max_clock_skew_seconds", max_clock_skew_seconds)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -136,11 +158,14 @@ impl WebsocketAuthError {
 
 impl AppServerWebsocketAuthArgs {
     pub fn try_into_settings(self) -> anyhow::Result<AppServerWebsocketAuthSettings> {
-        let normalize = |value: Option<String>| {
-            value.and_then(|value| {
-                let trimmed = value.trim();
-                (!trimmed.is_empty()).then(|| trimmed.to_string())
-            })
+        let normalize = |flag: &str, value: Option<String>| -> anyhow::Result<Option<String>> {
+            value
+                .map(|value| {
+                    let trimmed = value.trim();
+                    anyhow::ensure!(!trimmed.is_empty(), "{flag} must not be blank");
+                    Ok(trimmed.to_string())
+                })
+                .transpose()
         };
 
         let config = match self.ws_auth {
@@ -192,8 +217,8 @@ impl AppServerWebsocketAuthArgs {
                         "--ws-shared-secret-file",
                         shared_secret_file,
                     )?,
-                    issuer: normalize(self.ws_issuer),
-                    audience: normalize(self.ws_audience),
+                    issuer: normalize("--ws-issuer", self.ws_issuer)?,
+                    audience: normalize("--ws-audience", self.ws_audience)?,
                     max_clock_skew_seconds: self
                         .ws_max_clock_skew_seconds
                         .unwrap_or(DEFAULT_MAX_CLOCK_SKEW_SECONDS),
@@ -311,7 +336,13 @@ fn verify_signed_bearer_token(
     max_clock_skew_seconds: i64,
 ) -> Result<(), WebsocketAuthError> {
     let claims = decode_jwt_claims(token, shared_secret)?;
-    validate_jwt_claims(&claims, issuer, audience, max_clock_skew_seconds)
+    validate_jwt_claims(
+        &claims,
+        issuer,
+        audience,
+        max_clock_skew_seconds,
+        OffsetDateTime::now_utc().unix_timestamp(),
+    )
 }
 
 fn decode_jwt_claims(token: &str, shared_secret: &[u8]) -> Result<JwtClaims, WebsocketAuthError> {
@@ -331,9 +362,9 @@ fn validate_jwt_claims(
     issuer: Option<&str>,
     audience: Option<&str>,
     max_clock_skew_seconds: i64,
+    now: i64,
 ) -> Result<(), WebsocketAuthError> {
-    let now = OffsetDateTime::now_utc().unix_timestamp();
-    if now > claims.exp.saturating_add(max_clock_skew_seconds) {
+    if now >= claims.exp.saturating_add(max_clock_skew_seconds) {
         return Err(unauthorized("expired websocket jwt"));
     }
     if let Some(nbf) = claims.nbf
@@ -615,7 +646,7 @@ mod tests {
             ws_auth: Some(WebsocketAuthCliMode::SignedBearerToken),
             ws_shared_secret_file: Some(PathBuf::from("/tmp/secret")),
             ws_issuer: Some(" issuer ".to_string()),
-            ws_audience: Some("   ".to_string()),
+            ws_audience: Some(" audience ".to_string()),
             ..Default::default()
         }
         .try_into_settings()
@@ -628,7 +659,7 @@ mod tests {
                     shared_secret_file: AbsolutePathBuf::from_absolute_path("/tmp/secret")
                         .expect("absolute path"),
                     issuer: Some("issuer".to_string()),
-                    audience: None,
+                    audience: Some("audience".to_string()),
                     max_clock_skew_seconds: DEFAULT_MAX_CLOCK_SKEW_SECONDS,
                 }),
             }
@@ -636,24 +667,83 @@ mod tests {
     }
 
     #[test]
-    fn signed_bearer_token_verification_rejects_tampering() {
+    fn signed_bearer_token_verification_rejects_wrong_signature() {
         let shared_secret = b"0123456789abcdef0123456789abcdef";
         let token = signed_token(
-            shared_secret,
+            b"abcdef0123456789abcdef0123456789",
             json!({
                 "exp": OffsetDateTime::now_utc().unix_timestamp() + 60,
             }),
         );
-        let tampered = token.replace(".eyJleHAi", ".eyJleHBi");
-        let err = verify_signed_bearer_token(
-            &tampered,
-            shared_secret,
-            /*issuer*/ None,
-            /*audience*/ None,
-            /*max_clock_skew_seconds*/ 30,
-        )
-        .expect_err("tampered jwt should fail");
+        let policy = WebsocketAuthPolicy {
+            mode: Some(WebsocketAuthMode::SignedBearerToken {
+                shared_secret: shared_secret.to_vec(),
+                issuer: None,
+                audience: None,
+                max_clock_skew_seconds: 30,
+            }),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let err = authorize_upgrade(&headers, &policy).expect_err("wrong signature must fail");
         assert_eq!(err.status_code(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn signed_bearer_args_reject_blank_claim_restrictions() {
+        for (issuer, audience, flag) in [
+            (Some(" ".to_string()), None, "--ws-issuer"),
+            (None, Some("\t".to_string()), "--ws-audience"),
+        ] {
+            let err = AppServerWebsocketAuthArgs {
+                ws_auth: Some(WebsocketAuthCliMode::SignedBearerToken),
+                ws_shared_secret_file: Some(PathBuf::from("/tmp/secret")),
+                ws_issuer: issuer,
+                ws_audience: audience,
+                ..Default::default()
+            }
+            .try_into_settings()
+            .expect_err("blank restrictions must not disable checks");
+            assert_eq!(err.to_string(), format!("{flag} must not be blank"));
+        }
+    }
+
+    #[test]
+    fn signed_bearer_policy_debug_redacts_secret() {
+        let shared_secret = b"0123456789abcdef0123456789abcdef".to_vec();
+        let policy = WebsocketAuthPolicy {
+            mode: Some(WebsocketAuthMode::SignedBearerToken {
+                shared_secret: shared_secret.clone(),
+                issuer: Some("issuer".into()),
+                audience: Some("audience".into()),
+                max_clock_skew_seconds: 30,
+            }),
+        };
+        let debug = format!("{policy:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(debug.contains("issuer") && debug.contains("audience"));
+        assert!(!debug.contains(&format!("{shared_secret:?}")));
+        assert!(!debug.contains(std::str::from_utf8(&shared_secret).unwrap()));
+    }
+
+    #[test]
+    fn jwt_expiration_rejects_exact_boundary_with_and_without_skew() {
+        let claims = JwtClaims {
+            exp: 100,
+            nbf: None,
+            iss: None,
+            aud: None,
+        };
+        for skew in [0, 30] {
+            validate_jwt_claims(&claims, None, None, skew, 99 + skew).unwrap();
+            for now in [100 + skew, 101 + skew] {
+                let err = validate_jwt_claims(&claims, None, None, skew, now).unwrap_err();
+                assert_eq!(err.message(), "expired websocket jwt");
+            }
+        }
     }
 
     #[test]

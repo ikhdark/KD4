@@ -92,9 +92,8 @@ impl CredentialBroker {
         let matching_credentials = state
             .credentials
             .iter()
-            .filter(|credential| credential.matches_host(&normalized_host))
-            .collect::<Vec<_>>();
-        let Some(credential) = select_credential(headers, &matching_credentials) else {
+            .filter(|credential| credential.matches_host(&normalized_host));
+        let Some(credential) = select_credential(headers, matching_credentials) else {
             return;
         };
         let Some(header_value) = credential
@@ -197,22 +196,18 @@ impl CredentialRecord {
 
 fn select_credential<'a>(
     headers: &HeaderMap,
-    matching_credentials: &[&'a CredentialRecord],
+    matching_credentials: impl Iterator<Item = &'a CredentialRecord>,
 ) -> Option<&'a CredentialRecord> {
-    let dummy_matches = matching_credentials
-        .iter()
-        .copied()
-        .filter(|credential| {
-            credential
-                .provider
-                .request_header(headers)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.contains(&credential.dummy_value))
-        })
-        .collect::<Vec<_>>();
-    match dummy_matches.as_slice() {
-        [credential] => Some(*credential),
-        [] | [_, _, ..] => None,
+    let mut matches = matching_credentials.filter(|credential| {
+        credential
+            .provider
+            .request_matches_credential(headers, &credential.dummy_value)
+    });
+    let credential = matches.next()?;
+    if matches.next().is_some() {
+        None
+    } else {
+        Some(credential)
     }
 }
 

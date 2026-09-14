@@ -233,6 +233,7 @@ impl NetworkProxyBuilder {
             socks_addr,
             socks_enabled: current_cfg.enable_socks5,
             socks5_udp_enabled: current_cfg.enable_socks5_udp,
+            config_update_lock: Arc::new(tokio::sync::Mutex::new(())),
             runtime_settings: Arc::new(RwLock::new(
                 NetworkProxyRuntimeSettings::from_config(&current_cfg, &codex_home).await?,
             )),
@@ -382,6 +383,7 @@ pub struct NetworkProxy {
     socks5_udp_enabled: bool,
     codex_home: AbsolutePathBuf,
     runtime_settings: Arc<RwLock<NetworkProxyRuntimeSettings>>,
+    config_update_lock: Arc<tokio::sync::Mutex<()>>,
     reserved_listeners: Option<Arc<ReservedListeners>>,
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
     environment_proxies: Arc<Mutex<Option<HashMap<String, EnvironmentProxy>>>>,
@@ -663,6 +665,8 @@ impl NetworkProxy {
                 PROXY_ATTRIBUTION_TOKEN_ENV_KEY.to_string(),
                 execution_scope.attribution_token.clone(),
             );
+        } else {
+            env.remove(PROXY_ATTRIBUTION_TOKEN_ENV_KEY);
         }
         let mut loopback_ports = [
             Some(addrs.http_addr),
@@ -777,6 +781,14 @@ impl NetworkProxy {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let proxies = proxies.as_ref().context("network proxy has shut down")?;
             if let Some(proxy) = proxies.get(environment_id) {
+                anyhow::ensure!(
+                    !proxy.http_task.is_finished()
+                        && !proxy
+                            .socks_task
+                            .as_ref()
+                            .is_some_and(JoinHandle::is_finished),
+                    "network proxy listener for environment `{environment_id}` has stopped"
+                );
                 return Ok(proxy.addrs);
             }
         }
@@ -812,6 +824,14 @@ impl NetworkProxy {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let proxies = proxies.as_mut().context("network proxy has shut down")?;
         if let Some(proxy) = proxies.get(environment_id) {
+            anyhow::ensure!(
+                !proxy.http_task.is_finished()
+                    && !proxy
+                        .socks_task
+                        .as_ref()
+                        .is_some_and(JoinHandle::is_finished),
+                "network proxy listener for environment `{environment_id}` has stopped"
+            );
             return Ok(proxy.addrs);
         }
         let environment_id = environment_id.to_string();
@@ -860,7 +880,9 @@ impl NetworkProxy {
         Ok(addrs)
     }
 
+    #[expect(clippy::await_holding_invalid_type, reason = "Keep asynchronous validation and settings publication in one serialized configuration transaction")]
     pub async fn replace_config_state(&self, new_state: ConfigState) -> Result<()> {
+        let _update = self.config_update_lock.lock().await;
         let current_cfg = self.state.current_cfg().await?;
         anyhow::ensure!(
             new_state.config.enabled == current_cfg.enabled,
@@ -1013,18 +1035,21 @@ impl NetworkProxyHandle {
     pub async fn wait(mut self) -> Result<()> {
         // Retain ownership while awaiting so dropping this future still cancels listeners.
         let http_task = self.http_task.as_mut().context("missing http proxy task")?;
-        let http_result = http_task.await;
-        let socks_result = match self.socks_task.as_mut() {
-            Some(task) => Some(task.await),
-            None => None,
+        let (http_finished, result) = match self.socks_task.as_mut() {
+            Some(socks_task) => tokio::select! {
+                result = http_task => (true, result),
+                result = socks_task => (false, result),
+            },
+            None => (true, http_task.await),
         };
-        self.completed = true;
-        abort_environment_proxies(self.environment_proxies.clone()).await;
-        http_result??;
-        if let Some(socks_result) = socks_result {
-            socks_result??;
+        // Do not poll the completed handle again while shutting down its siblings.
+        if http_finished {
+            self.http_task.take();
+        } else {
+            self.socks_task.take();
         }
-        Ok(())
+        self.shutdown().await?;
+        result?
     }
 
     pub async fn shutdown(mut self) -> Result<()> {
@@ -1149,6 +1174,66 @@ mod tests {
         })
         .await
         .expect("all main and environment listener ports must be released");
+    }
+
+    #[tokio::test]
+    async fn wait_observes_either_failed_listener_and_releases_siblings() {
+        for fail_socks in [false, true] {
+            let (handle, addrs) = running_proxy_with_environment().await;
+            if fail_socks {
+                handle.socks_task.as_ref().unwrap().abort();
+            } else {
+                handle.http_task.as_ref().unwrap().abort();
+            }
+            let error = tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait())
+                .await
+                .expect("wait must observe either listener")
+                .unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<tokio::task::JoinError>()
+                    .unwrap()
+                    .is_cancelled()
+            );
+            assert_proxy_listeners_released(addrs).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn preparation_removes_unscoped_attribution_and_rejects_stopped_cached_listener() {
+        let proxy = NetworkProxy::builder()
+            .state(Arc::new(network_proxy_state_for_policy(
+                NetworkProxyConfig::default(),
+            )))
+            .build()
+            .await
+            .unwrap();
+        let handle = proxy.run().await.unwrap();
+        let env = HashMap::from([(
+            PROXY_ATTRIBUTION_TOKEN_ENV_KEY.to_string(),
+            "stale".to_string(),
+        )]);
+        let prepared = proxy.prepare_for_optional_environment(env, None).unwrap();
+        assert!(!prepared.env.contains_key(PROXY_ATTRIBUTION_TOKEN_ENV_KEY));
+        proxy
+            .prepare_for_optional_environment(HashMap::new(), Some("stopped"))
+            .unwrap();
+        let abort = proxy.environment_proxies.lock().unwrap().as_ref().unwrap()["stopped"]
+            .http_task
+            .abort_handle();
+        abort.abort();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !abort.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let error = proxy
+            .prepare_for_optional_environment(HashMap::new(), Some("stopped"))
+            .unwrap_err();
+        assert!(error.to_string().contains("has stopped"));
+        handle.shutdown().await.unwrap();
     }
 
     #[test]

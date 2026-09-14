@@ -4,7 +4,6 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::Result;
-use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use tempfile::TempDir;
 use tokio::io::AsyncBufReadExt;
@@ -48,7 +47,7 @@ foo = "bar"
 }
 
 #[test]
-fn local_exec_server_ignores_invalid_config_without_strict_config() -> Result<()> {
+fn local_exec_server_reports_invalid_config_and_continues_without_strict_config() -> Result<()> {
     let codex_home = TempDir::new()?;
     std::fs::write(codex_home.path().join("config.toml"), "not valid toml = [")?;
 
@@ -56,7 +55,7 @@ fn local_exec_server_ignores_invalid_config_without_strict_config() -> Result<()
     cmd.args(["exec-server", "--listen", "stdio"])
         .assert()
         .success()
-        .stderr(contains("not valid toml").not());
+        .stderr(contains("Could not load exec-server telemetry configuration; continuing with default logging and no configured telemetry:"));
 
     Ok(())
 }

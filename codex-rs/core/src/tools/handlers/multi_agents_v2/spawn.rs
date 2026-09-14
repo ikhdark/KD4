@@ -1174,6 +1174,7 @@ impl Drop for WorktreeProcessGroup {
     }
 }
 
+#[expect(clippy::expect_used, reason = "Successful spawn creates both handles configured with Stdio::piped")]
 async fn run_worktree_git(
     mut command: Command,
     input: Option<&[u8]>,

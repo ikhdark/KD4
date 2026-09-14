@@ -33,6 +33,10 @@ static MEMORY_EXTENSIONS_PRIMARY_INPUTS_TEMPLATE: LazyLock<Template> = LazyLock:
 });
 
 /// Builds the consolidation subagent prompt for a specific memory root.
+///
+/// These embedded templates have fixed placeholder sets, all supplied below. Render errors
+/// indicate a template/caller mismatch in the binary, not invalid runtime path values.
+/// The prompt tests exercise both extension branches to protect that invariant.
 pub fn build_consolidation_prompt(memory_root: &Path) -> String {
     let memory_extensions_root = memory_extensions_root(memory_root);
     let memory_extensions_exist = memory_extensions_root.is_dir();

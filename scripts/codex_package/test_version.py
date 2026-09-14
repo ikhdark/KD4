@@ -70,6 +70,14 @@ class VersionDiscoveryTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "workspace.package"):
                 version.read_workspace_version(cargo_toml)
 
+    def test_rejects_blank_workspace_version(self) -> None:
+        for value in ["", "   "]:
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temp_dir:
+                manifest = Path(temp_dir) / "Cargo.toml"
+                manifest.write_text(f'[workspace.package]\nversion = "{value}"\n')
+                with self.assertRaisesRegex(RuntimeError, "workspace.package"):
+                    version.read_workspace_version(manifest)
+
     def test_caches_manifest_reads_by_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             cargo_toml = Path(temp_dir) / "Cargo.toml"

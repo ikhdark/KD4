@@ -141,6 +141,12 @@ async fn control_socket_acceptor_upgrades_and_forwards_websocket_text_messages_a
     assert_eq!(pong, WebSocketMessage::Pong(Bytes::from_static(b"check")));
 
     websocket.close(None).await.expect("close should send");
+    let close_reply = timeout(Duration::from_secs(1), websocket.next())
+        .await
+        .expect("close reply should arrive")
+        .expect("close reply frame")
+        .expect("close reply must be valid");
+    assert_eq!(close_reply, WebSocketMessage::Close(None));
     let closed = timeout(Duration::from_secs(1), transport_event_rx.recv())
         .await
         .expect("connection closed event should arrive")
@@ -153,7 +159,10 @@ async fn control_socket_acceptor_upgrades_and_forwards_websocket_text_messages_a
     ));
 
     shutdown_token.cancel();
-    accept_handle.await.expect("acceptor should join");
+    timeout(Duration::from_secs(1), accept_handle)
+        .await
+        .expect("acceptor should finish")
+        .expect("acceptor should join");
     assert_socket_path_removed(socket_path.as_path()).await;
 }
 
@@ -189,7 +198,10 @@ async fn control_socket_acceptor_preserves_an_active_listener() {
     assert_eq!(response.status().as_u16(), 101);
     websocket.close(None).await.expect("close client");
     shutdown_token.cancel();
-    accept_handle.await.expect("acceptor should join");
+    timeout(Duration::from_secs(1), accept_handle)
+        .await
+        .expect("acceptor should finish")
+        .expect("acceptor should join");
     assert_socket_path_removed(socket_path.as_path()).await;
 }
 
@@ -265,10 +277,107 @@ async fn app_server_startup_lock_serializes_waiters() {
     );
 
     drop(first_lock);
-    second_lock
+    timeout(Duration::from_secs(1), second_lock)
         .await
+        .expect("released startup lock must become available")
         .expect("second startup lock task should join")
         .expect("second startup lock should succeed");
+}
+
+#[tokio::test]
+async fn control_socket_shutdown_releases_established_connection() {
+    timeout(Duration::from_secs(3), async {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let socket_path = test_socket_path(temp_dir.path());
+        let (events_tx, mut events_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let shutdown = CancellationToken::new();
+        let acceptor = start_control_socket_acceptor(socket_path.clone(), events_tx, shutdown.clone()).await.unwrap();
+        let stream = connect_to_socket(socket_path.as_path()).await.unwrap();
+        let (mut client, _) = client_async("ws://localhost/rpc", stream).await.unwrap();
+        let (connection_id, writer) = match events_rx.recv().await.unwrap() {
+            TransportEvent::ConnectionOpened { connection_id, writer, .. } => (connection_id, writer),
+            event => panic!("expected registration: {event:?}"),
+        };
+        shutdown.cancel();
+        acceptor.await.unwrap();
+        assert!(writer.is_closed(), "acceptor must await writer cleanup");
+        assert!(matches!(events_rx.recv().await, Some(TransportEvent::ConnectionClosed { connection_id: id }) if id == connection_id));
+        assert!(events_rx.recv().await.is_none(), "exactly one close event is owed");
+        assert!(matches!(client.next().await, None | Some(Err(_))), "shutdown must release the socket");
+        assert_socket_path_removed(socket_path.as_path()).await;
+    }).await.expect("established session shutdown must finish");
+}
+
+#[tokio::test]
+async fn control_socket_incomplete_handshake_expires() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let socket_path = test_socket_path(temp_dir.path());
+    let (events_tx, mut events_rx) = mpsc::channel(CHANNEL_CAPACITY);
+    let shutdown = CancellationToken::new();
+    let acceptor = start_control_socket_acceptor(socket_path.clone(), events_tx, shutdown.clone())
+        .await
+        .unwrap();
+    let mut stream = connect_to_socket(socket_path.as_path()).await.unwrap();
+    stream.write_all(b"GET /rpc HTTP/1.1\r\n").await.unwrap();
+    let mut byte = [0];
+    assert!(
+        timeout(Duration::from_millis(100), stream.read(&mut byte))
+            .await
+            .is_err()
+    );
+    tokio::time::pause();
+    tokio::time::advance(super::unix_socket::CONTROL_SOCKET_HANDSHAKE_TIMEOUT).await;
+    tokio::time::resume();
+    let result = timeout(Duration::from_secs(1), stream.read(&mut byte))
+        .await
+        .expect("partial handshake must expire");
+    assert!(
+        matches!(result, Ok(0) | Err(_)),
+        "expired socket must close"
+    );
+    assert!(
+        matches!(events_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+        "incomplete handshake must not register"
+    );
+    shutdown.cancel();
+    timeout(Duration::from_secs(1), acceptor)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_socket_path_removed(socket_path.as_path()).await;
+}
+
+#[test]
+fn cancelled_startup_lock_wait_does_not_hold_runtime_open() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let lock_path = test_startup_lock_path(temp_dir.path());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let first_lock = runtime
+        .block_on(acquire_app_server_startup_lock(lock_path.clone()))
+        .unwrap();
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let timed_out = runtime.block_on(async {
+            timeout(
+                Duration::from_millis(100),
+                acquire_app_server_startup_lock(lock_path),
+            )
+            .await
+            .is_err()
+        });
+        drop(runtime);
+        let _ = finished_tx.send(timed_out);
+    });
+    let finished = finished_rx.recv_timeout(Duration::from_secs(2));
+    // Release the lock before asserting, so even the old blocking implementation
+    // can finish its native worker instead of stranding this test process.
+    drop(first_lock);
+    waiter.join().unwrap();
+    assert_eq!(
+        finished.expect("cancelled waiter must release its runtime while lock is held"),
+        true
+    );
 }
 
 fn absolute_path(path: &str) -> AbsolutePathBuf {

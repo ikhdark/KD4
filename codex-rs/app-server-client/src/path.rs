@@ -32,6 +32,9 @@ impl AppServerPath {
             .collect()
     }
 
+    /// Appends a relative child path using the base path's separator convention.
+    /// Does not normalize `.` or `..`, enforce containment, or replace the base
+    /// when given an absolute path. The caller must supply a relative child.
     pub fn join(&self, segment: impl AsRef<str>) -> Self {
         let is_windows = is_windows_absolute_path(&self.0);
         let (path, separator) = if is_windows {

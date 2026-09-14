@@ -10,6 +10,7 @@ use codex_code_mode_protocol::CodeModeSessionDelegate;
 use codex_code_mode_protocol::RuntimeResponse;
 use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::host::DelegateRequest;
+use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SessionId;
 use pretty_assertions::assert_eq;
@@ -21,6 +22,268 @@ use tokio_util::sync::CancellationToken;
 
 use super::HostPeer;
 use super::MAX_PENDING_DELEGATE_CALLS;
+
+#[tokio::test]
+async fn revoked_callback_after_cell_closure_does_not_recreate_route() {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(4);
+        let peer = Arc::new(HostPeer::new(outgoing_tx));
+        let session = session_id("closed-session");
+        let delegate = crate::delegate::RemoteDelegate::new(session.clone(), Arc::clone(&peer));
+        let cell = CellId::new("closed-cell".to_string());
+        let cancellation = CancellationToken::new();
+        // Construct before closure, but first poll only after cleanup.
+        let late_call = delegate.notify(
+            "late-call".to_string(),
+            cell.clone(),
+            "must not dispatch".to_string(),
+            cancellation.clone(),
+        );
+        let (response_tx, response_rx) = oneshot::channel();
+        let permits = Arc::new(Semaphore::new(1));
+        let initial = peer.start_cell(
+            session.clone(),
+            RequestId::new(1),
+            StartedCell::new(cell.clone(), response_rx),
+            Arc::clone(&permits)
+                .try_acquire_owned()
+                .expect("cell permit"),
+        );
+        response_tx
+            .send(RuntimeResponse::Result {
+                cell_id: cell.clone(),
+                content_items: Vec::new(),
+                error_text: None,
+            })
+            .expect("response receiver");
+        initial.await.expect("initial response");
+        outgoing_rx.recv().await.expect("initial frame");
+        cancellation.cancel();
+        delegate.cell_closed(&cell);
+        peer.wait_for_session_cells(&session).await;
+        outgoing_rx.recv().await.expect("closed frame");
+
+        assert_eq!(
+            late_call.await,
+            Err("code mode delegate request cancelled".to_string())
+        );
+        assert!(peer.cell_routes.lock().expect("routes").is_empty());
+        assert!(peer.pending.lock().expect("pending delegates").is_empty());
+        assert_eq!(
+            peer.delegate_permits.available_permits(),
+            MAX_PENDING_DELEGATE_CALLS
+        );
+        assert_eq!(permits.available_permits(), 1);
+        assert!(matches!(
+            outgoing_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        peer.wait_for_session_cells(&session).await;
+        assert!(!peer.is_disconnected());
+    })
+    .await
+    .expect("closed route cleanup must finish");
+}
+
+#[tokio::test]
+async fn early_closure_wait_releases_route_and_permit_on_disconnect() {
+    let (outgoing_tx, mut outgoing_rx) = mpsc::channel(4);
+    let peer = Arc::new(HostPeer::new(outgoing_tx));
+    let cell = CellId::new("early-closed".to_string());
+    let key = (session_id("session-1"), cell.clone());
+    let (_response_tx, response_rx) = oneshot::channel();
+    let (initial_tx, mut initial_rx) = oneshot::channel();
+    let permits = Arc::new(Semaphore::new(1));
+    let (messages_tx, messages_rx) = mpsc::channel(1);
+    assert!(messages_tx.try_send(super::CellMessage::Closed).is_ok());
+    peer.cell_routes
+        .lock()
+        .expect("routes")
+        .insert(key.clone(), super::CellRoute::Active(messages_tx));
+    let mut forwarding = Box::pin(super::drive_cell(
+        Arc::clone(&peer),
+        key,
+        RequestId::new(1),
+        StartedCell::new(cell, response_rx),
+        messages_rx,
+        initial_tx,
+        Arc::clone(&permits).try_acquire_owned().expect("permit"),
+    ));
+    // This poll consumes Closed and reaches the unresolved initial response.
+    assert!(
+        forwarding
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    assert_eq!(permits.available_permits(), 0);
+    peer.disconnect();
+    tokio::time::timeout(Duration::from_secs(1), forwarding)
+        .await
+        .expect("disconnect must stop forwarding");
+    assert!(peer.cell_routes.lock().expect("routes").is_empty());
+    assert_eq!(permits.available_permits(), 1);
+    assert_eq!(initial_rx.try_recv(), Err(TryRecvError::Closed));
+    assert!(matches!(
+        outgoing_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn outgoing_overflow_records_failure() {
+    let (outgoing_tx, _outgoing_rx) = mpsc::channel(1);
+    let peer = HostPeer::new(outgoing_tx);
+    let message = || HostToClient::CancelDelegateRequest {
+        id: codex_code_mode_protocol::host::DelegateRequestId::new(1),
+    };
+    assert!(peer.send(message()).is_ok());
+    assert!(peer.send(message()).is_err());
+    assert!(peer.is_disconnected());
+    assert_eq!(
+        peer.failure(),
+        Some("code-mode host outgoing queue is full".to_string())
+    );
+}
+
+#[test]
+fn cell_queue_overflow_records_failure() {
+    let (outgoing_tx, _outgoing_rx) = mpsc::channel(1);
+    let peer = HostPeer::new(outgoing_tx);
+    let cell = CellId::new("pending-cell".to_string());
+    let key = (session_id("session-1"), cell.clone());
+    for index in 0..super::CELL_MESSAGE_CAPACITY {
+        let (dispatched_tx, _dispatched_rx) = oneshot::channel();
+        assert!(
+            peer.route_cell_message(
+                key.clone(),
+                super::CellMessage::Delegate {
+                    id: codex_code_mode_protocol::host::DelegateRequestId::new(index as i64),
+                    request: Box::new(DelegateRequest::Notify {
+                        call_id: format!("call-{index}"),
+                        cell_id: cell.clone().into(),
+                        text: "buffered".to_string(),
+                    }),
+                    dispatched_tx,
+                },
+                None
+            )
+            .is_ok()
+        );
+    }
+    assert!(!peer.is_disconnected());
+    peer.close_cell(key.0, cell);
+    assert!(peer.is_disconnected());
+    assert_eq!(
+        peer.failure(),
+        Some("code-mode cell message queue is full".to_string())
+    );
+}
+
+#[tokio::test]
+async fn activation_preserves_buffered_delegate_order() {
+    use codex_code_mode_protocol::host::DelegateResponse;
+    use codex_code_mode_protocol::host::FramedReader;
+    use codex_code_mode_protocol::host::FramedWriter;
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(4);
+        let peer = Arc::new(HostPeer::new(outgoing_tx));
+        let cell = CellId::new("cell-1".to_string());
+        let mut calls = Vec::new();
+        let (_response_tx, response_rx) = oneshot::channel();
+        let mut response_rx = Some(response_rx);
+        for index in 0..3 {
+            if index == 2 {
+                let _initial = peer.start_cell(
+                    session_id("session-1"),
+                    RequestId::new(1),
+                    StartedCell::new(cell.clone(), response_rx.take().expect("initial receiver")),
+                    Arc::new(Semaphore::new(1))
+                        .try_acquire_owned()
+                        .expect("permit"),
+                );
+            }
+            let mut call = Box::pin(peer.call(
+                session_id("session-1"),
+                DelegateRequest::Notify {
+                    call_id: format!("call-{index}"),
+                    cell_id: cell.clone().into(),
+                    text: index.to_string(),
+                },
+                CancellationToken::new(),
+            ));
+            assert!(
+                call.as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            calls.push(call);
+        }
+        for index in 0..3 {
+            let frame = outgoing_rx.recv().await.expect("delegate frame");
+            let mut bytes = Vec::new();
+            FramedWriter::new(&mut bytes)
+                .write_frame(&frame)
+                .await
+                .expect("encode");
+            let Some(HostToClient::DelegateRequest { id, request, .. }) =
+                FramedReader::new(bytes.as_slice())
+                    .read()
+                    .await
+                    .expect("decode")
+            else {
+                panic!("expected delegate request");
+            };
+            assert_eq!(
+                request,
+                DelegateRequest::Notify {
+                    call_id: format!("call-{index}"),
+                    cell_id: cell.clone().into(),
+                    text: index.to_string(),
+                }
+            );
+            peer.complete(id, Ok(DelegateResponse::NotificationDelivered {}))
+                .await;
+        }
+        for call in calls {
+            assert_eq!(call.await, Ok(DelegateResponse::NotificationDelivered {}));
+        }
+        assert!(!peer.is_disconnected());
+        peer.disconnect();
+    })
+    .await
+    .expect("ordered delegates must complete");
+}
+
+#[test]
+fn route_rechecks_revocation_before_buffering() {
+    let (outgoing_tx, _outgoing_rx) = mpsc::channel(1);
+    let peer = HostPeer::new(outgoing_tx);
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let (dispatched_tx, _dispatched_rx) = oneshot::channel();
+    let cell = CellId::new("closed-cell".to_string());
+    let result = peer.route_cell_message(
+        (session_id("session-1"), cell.clone()),
+        super::CellMessage::Delegate {
+            id: codex_code_mode_protocol::host::DelegateRequestId::new(1),
+            request: Box::new(DelegateRequest::Notify {
+                call_id: "late".to_string(),
+                cell_id: cell.into(),
+                text: "late".to_string(),
+            }),
+            dispatched_tx,
+        },
+        Some(&cancellation),
+    );
+    assert_eq!(
+        result,
+        Err("code mode delegate request cancelled".to_string())
+    );
+    assert!(peer.cell_routes.lock().expect("routes").is_empty());
+    assert!(!peer.is_disconnected());
+}
 
 fn session_id(value: &str) -> SessionId {
     SessionId::new(value).expect("session ID")

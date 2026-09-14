@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::config::NetworkMode;
 use crate::config::NetworkProxyConfig;
 use crate::reasons::REASON_METHOD_NOT_ALLOWED;
 use crate::reasons::REASON_MITM_HOOK_DENIED;
@@ -124,14 +125,12 @@ fn github_write_hook() -> crate::mitm_hook::MitmHookConfig {
 
 fn policy_ctx(
     app_state: Arc<NetworkProxyState>,
-    mode: NetworkMode,
     target_host: &str,
     target_port: u16,
 ) -> MitmPolicyContext {
     MitmPolicyContext {
         target_host: target_host.to_string(),
         target_port,
-        mode,
         app_state,
     }
 }
@@ -139,16 +138,15 @@ fn policy_ctx(
 #[tokio::test]
 async fn mitm_policy_blocks_disallowed_method_and_records_telemetry() {
     let app_state = Arc::new(network_proxy_state_for_policy({
-        let mut network = NetworkProxyConfig::default();
+        let mut network = NetworkProxyConfig {
+            allow_local_binding: true,
+            mode: NetworkMode::Limited,
+            ..NetworkProxyConfig::default()
+        };
         network.set_allowed_domains(vec!["example.com".to_string()]);
         network
     }));
-    let ctx = policy_ctx(
-        app_state.clone(),
-        NetworkMode::Limited,
-        "example.com",
-        /*target_port*/ 443,
-    );
+    let ctx = policy_ctx(app_state.clone(), "example.com", /*target_port*/ 443);
     let req = Request::builder()
         .method(Method::POST)
         .uri("/v1/responses?api_key=secret")
@@ -178,16 +176,14 @@ async fn mitm_policy_blocks_disallowed_method_and_records_telemetry() {
 #[tokio::test]
 async fn mitm_policy_rejects_host_mismatch() {
     let app_state = Arc::new(network_proxy_state_for_policy({
-        let mut network = NetworkProxyConfig::default();
+        let mut network = NetworkProxyConfig {
+            allow_local_binding: true,
+            ..NetworkProxyConfig::default()
+        };
         network.set_allowed_domains(vec!["example.com".to_string()]);
         network
     }));
-    let ctx = policy_ctx(
-        app_state.clone(),
-        NetworkMode::Full,
-        "example.com",
-        /*target_port*/ 443,
-    );
+    let ctx = policy_ctx(app_state.clone(), "example.com", /*target_port*/ 443);
     let req = Request::builder()
         .method(Method::GET)
         .uri("/")
@@ -207,17 +203,15 @@ async fn mitm_policy_rejects_host_mismatch() {
 #[tokio::test]
 async fn mitm_policy_rechecks_local_private_target_after_connect() {
     let app_state = Arc::new(network_proxy_state_for_policy({
-        let mut network = NetworkProxyConfig::default();
+        let mut network = NetworkProxyConfig {
+            allow_local_binding: true,
+            ..NetworkProxyConfig::default()
+        };
         network.set_allowed_domains(vec!["example.com".to_string()]);
         network.allow_local_binding = false;
         network
     }));
-    let ctx = policy_ctx(
-        app_state.clone(),
-        NetworkMode::Full,
-        "10.0.0.1",
-        /*target_port*/ 443,
-    );
+    let ctx = policy_ctx(app_state.clone(), "10.0.0.1", /*target_port*/ 443);
     let req = Request::builder()
         .method(Method::GET)
         .uri("/health?token=secret")
@@ -248,6 +242,7 @@ async fn mitm_policy_allows_matching_hooked_write_in_full_mode() {
     hook.actions.inject_request_headers[0].secret_file =
         Some(secret_file.path().display().to_string());
     let mut network = NetworkProxyConfig {
+        allow_local_binding: true,
         mitm: true,
         mitm_hooks: vec![hook],
         mode: NetworkMode::Full,
@@ -257,7 +252,6 @@ async fn mitm_policy_allows_matching_hooked_write_in_full_mode() {
     let app_state = Arc::new(network_proxy_state_for_policy(network));
     let ctx = policy_ctx(
         app_state.clone(),
-        NetworkMode::Full,
         "api.github.com",
         /*target_port*/ 443,
     );
@@ -270,10 +264,18 @@ async fn mitm_policy_allows_matching_hooked_write_in_full_mode() {
 
     let decision = evaluate_mitm_policy(&req, &ctx).await.unwrap();
 
-    assert!(
-        matches!(decision, MitmPolicyDecision::Allow { .. }),
-        "matching hook should bypass method clamp"
-    );
+    let MitmPolicyDecision::Allow {
+        hook_actions: Some(actions),
+    } = decision
+    else {
+        panic!("matching hook must return injection actions");
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert("authorization", HeaderValue::from_static("Bearer original"));
+    apply_mitm_hook_actions(&mut headers, Some(&actions));
+    assert_eq!(headers["authorization"], "Bearer ghp-secret");
+    assert!(headers["authorization"].is_sensitive());
+    assert!(!format!("{headers:?}").contains("ghp-secret"));
     assert_eq!(app_state.blocked_snapshot().await.unwrap().len(), 0);
 }
 
@@ -282,6 +284,7 @@ async fn mitm_policy_blocks_matching_hooked_write_in_limited_mode() {
     let mut hook = github_write_hook();
     hook.actions.inject_request_headers.clear();
     let mut network = NetworkProxyConfig {
+        allow_local_binding: true,
         mitm: true,
         mitm_hooks: vec![hook],
         mode: NetworkMode::Limited,
@@ -291,7 +294,6 @@ async fn mitm_policy_blocks_matching_hooked_write_in_limited_mode() {
     let app_state = Arc::new(network_proxy_state_for_policy(network));
     let ctx = policy_ctx(
         app_state.clone(),
-        NetworkMode::Limited,
         "api.github.com",
         /*target_port*/ 443,
     );
@@ -330,6 +332,7 @@ async fn mitm_policy_blocks_hook_miss_for_hooked_host_and_records_telemetry_in_f
     hook.actions.inject_request_headers[0].secret_file =
         Some(secret_file.path().display().to_string());
     let mut network = NetworkProxyConfig {
+        allow_local_binding: true,
         mitm: true,
         mitm_hooks: vec![hook],
         mode: NetworkMode::Full,
@@ -339,7 +342,6 @@ async fn mitm_policy_blocks_hook_miss_for_hooked_host_and_records_telemetry_in_f
     let app_state = Arc::new(network_proxy_state_for_policy(network));
     let ctx = policy_ctx(
         app_state.clone(),
-        NetworkMode::Full,
         "api.github.com",
         /*target_port*/ 443,
     );
@@ -403,4 +405,60 @@ fn apply_mitm_hook_actions_replaces_authorization_header() {
         headers.get("x-request-id"),
         Some(&HeaderValue::from_static("req_123"))
     );
+}
+
+#[tokio::test]
+async fn tls_prefix_detection_bounds_stalled_completion() {
+    let (mut writer, reader) = tokio::io::duplex(16);
+    writer.write_all(&[0x16]).await.unwrap();
+    let result = timeout(
+        TLS_PREFIX_COMPLETION_TIMEOUT + Duration::from_secs(2),
+        peek_tls_prefix(TestStream::new(reader)),
+    )
+    .await
+    .expect("prefix parser must terminate");
+    let Err(error) = result else {
+        panic!("partial TLS prefix must fail closed");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("TLS prefix completion timed out")
+    );
+}
+
+#[tokio::test]
+async fn mitm_policy_enforces_mode_and_explicit_denial_after_connect() {
+    let mut network = NetworkProxyConfig {
+        allow_local_binding: true,
+        ..NetworkProxyConfig::default()
+    };
+    network.set_allowed_domains(vec!["example.com".to_string()]);
+    let state = Arc::new(network_proxy_state_for_policy(network));
+    let ctx = policy_ctx(state.clone(), "example.com", 443);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/")
+        .header(HOST, "example.com")
+        .body(Body::empty())
+        .unwrap();
+    assert!(matches!(
+        evaluate_mitm_policy(&req, &ctx).await.unwrap(),
+        MitmPolicyDecision::Allow { .. }
+    ));
+    state.set_network_mode(NetworkMode::Limited).await.unwrap();
+    let MitmPolicyDecision::Block(response) = evaluate_mitm_policy(&req, &ctx).await.unwrap()
+    else {
+        panic!("live limited mode must block POST");
+    };
+    assert_eq!(
+        response.headers()["x-proxy-error"],
+        "blocked-by-method-policy"
+    );
+    state.add_denied_domain("example.com").await.unwrap();
+    let MitmPolicyDecision::Block(response) = evaluate_mitm_policy(&req, &ctx).await.unwrap()
+    else {
+        panic!("live deny must win");
+    };
+    assert_eq!(response.headers()["x-proxy-error"], "blocked-by-denylist");
 }

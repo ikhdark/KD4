@@ -542,16 +542,6 @@ impl RemoteControlHandle {
         if let Err(err) = &pairing_response {
             match err.kind() {
                 io::ErrorKind::NotFound => {
-                    self.load_or_enroll_pairing_server(
-                        http_clients,
-                        &mut current_enrollment,
-                        &mut auth,
-                        &installation_id,
-                        &status.server_name,
-                        app_server_client_name,
-                        RemoteControlEnrollmentSelection::ReplaceExisting,
-                    )
-                    .await?;
                     return Err(pairing_unavailable_error());
                 }
                 io::ErrorKind::PermissionDenied => {
@@ -715,6 +705,7 @@ impl RemoteControlHandle {
         http_clients: RemoteControlHttpClientSource<'_>,
         params: RemoteControlPairingStatusParams,
     ) -> io::Result<RemoteControlPairingStatusResponse> {
+        let status_code = remote_control_pairing_status_code(&params)?;
         let mut auth = load_remote_control_auth(&self.auth_manager)
             .await
             .map_err(|_| pairing_unavailable_error())?;
@@ -757,7 +748,6 @@ impl RemoteControlHandle {
             }
             refresh_result?;
         }
-        let status_code = remote_control_pairing_status_code(&params)?;
         let pairing_status_request =
             || protocol::RemoteControlPairingStatusRequest::from(status_code.clone());
         let pairing_status_response = match pairing_status_request_with_source(
@@ -1091,6 +1081,7 @@ fn same_remote_control_enrollment(
     // A refresh rotates only the bearer. Pairing remains current while the same persisted server
     // record is still selected for the current account.
     left.account_id == right.account_id
+        && left.remote_control_target == right.remote_control_target
         && left.server_id == right.server_id
         && left.environment_id == right.environment_id
 }

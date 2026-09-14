@@ -96,7 +96,7 @@ async fn exec_output_logging_and_projection_materialize_response_once() {
         repair_notice: None,
     };
     crate::tools::context::ExecCommandToolOutput::reset_response_materialization_count();
-    let result = AnyToolResult {
+    let mut result = AnyToolResult {
         call_id: call_id.to_string(),
         payload: invocation.payload.clone(),
         result: Box::new(output),
@@ -114,12 +114,13 @@ async fn exec_output_logging_and_projection_materialize_response_once() {
     assert!(
         prepare_model_projection(
             &invocation,
-            &result,
+            &mut result,
             /*parsed_function_arguments*/ None,
             /*source_dependencies_override*/ None,
             /*force_inline_carrier*/ false,
             /*track_for_admission*/ true,
         )
+        .await
         .is_some()
     );
     assert_eq!(
@@ -144,7 +145,7 @@ async fn small_admission_only_output_stays_inline_without_an_artifact() {
             ToolName::plain(codex_code_mode::PUBLIC_TOOL_NAME),
         )
     };
-    let result = AnyToolResult {
+    let mut result = AnyToolResult {
         call_id: call_id.to_string(),
         payload: invocation.payload.clone(),
         result: Box::new(crate::tools::context::FunctionToolOutput::from_text(
@@ -158,12 +159,13 @@ async fn small_admission_only_output_stays_inline_without_an_artifact() {
 
     let projection_input = prepare_model_projection(
         &invocation,
-        &result,
+        &mut result,
         /*parsed_function_arguments*/ None,
         /*source_dependencies_override*/ None,
         /*force_inline_carrier*/ false,
         /*track_for_admission*/ true,
     )
+    .await
     .expect("direct code-mode output should be admitted");
     assert_eq!(
         projection_input.materialization,
@@ -190,11 +192,11 @@ async fn small_admission_only_output_stays_inline_without_an_artifact() {
 async fn consumed_code_mode_registry_output_becomes_a_recoverable_receipt() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
     let call_id = "registry-discovery";
+    let registry_input = "text(ALL_TOOLS.find(tool => tool.name === 'exec_command').description);";
     let raw_registry_output = "ALL_TOOLS registry description ".repeat(600);
     let invocation = ToolInvocation {
         payload: ToolPayload::Custom {
-            input: "text(ALL_TOOLS.find(tool => tool.name === 'exec_command').description);"
-                .to_string(),
+            input: registry_input.to_string(),
         },
         ..test_invocation(
             Arc::new(session),
@@ -203,7 +205,7 @@ async fn consumed_code_mode_registry_output_becomes_a_recoverable_receipt() {
             ToolName::plain(codex_code_mode::PUBLIC_TOOL_NAME),
         )
     };
-    let result = AnyToolResult {
+    let mut result = AnyToolResult {
         call_id: call_id.to_string(),
         payload: invocation.payload.clone(),
         result: Box::new(crate::tools::context::FunctionToolOutput::from_text(
@@ -217,12 +219,13 @@ async fn consumed_code_mode_registry_output_becomes_a_recoverable_receipt() {
 
     let projection_input = prepare_model_projection(
         &invocation,
-        &result,
+        &mut result,
         /*parsed_function_arguments*/ None,
         /*source_dependencies_override*/ None,
         /*force_inline_carrier*/ false,
         /*track_for_admission*/ true,
     )
+    .await
     .expect("direct code-mode output should be admitted");
     assert_eq!(
         projection_input.materialization,
@@ -247,7 +250,7 @@ async fn consumed_code_mode_registry_output_becomes_a_recoverable_receipt() {
             call_id: call_id.to_string(),
             name: codex_code_mode::PUBLIC_TOOL_NAME.to_string(),
             namespace: None,
-            input: "text(ALL_TOOLS);".to_string(),
+            input: registry_input.to_string(),
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::from(first_response),
@@ -265,8 +268,80 @@ async fn consumed_code_mode_registry_output_becomes_a_recoverable_receipt() {
         },
     ));
 
-    let later_exposure = history.project(canonical);
+    let consumed_exposure = history.project(Arc::clone(&canonical));
+    assert!(consumed_exposure.substitutions.is_empty());
+    assert_eq!(consumed_exposure.items, canonical);
+
+    let fresh_call_id = "fresh-code-mode-output";
+    let fresh_input = "text('x '.repeat(6000));";
+    let fresh_output = "x ".repeat(6_000);
+    let raw_tokens = approx_token_count(&raw_registry_output);
+    let fresh_tokens = approx_token_count(&fresh_output);
+    assert_eq!(fresh_tokens, 6_000);
+    // Each result fits the shared 10,000-token budget; together they require a receipt.
+    assert!(raw_tokens <= 10_000);
+    assert!(fresh_tokens <= 10_000);
+    assert!(raw_tokens + fresh_tokens > 10_000);
+    let fresh_invocation = ToolInvocation {
+        call_id: fresh_call_id.to_string(),
+        payload: ToolPayload::Custom {
+            input: fresh_input.to_string(),
+        },
+        ..invocation.clone()
+    };
+    let mut fresh_result = AnyToolResult {
+        call_id: fresh_call_id.to_string(),
+        payload: fresh_invocation.payload.clone(),
+        result: Box::new(crate::tools::context::FunctionToolOutput::from_text(
+            fresh_output.clone(),
+            Some(true),
+        )),
+        model_projection: None,
+        source_dependencies: None,
+        code_mode_feedback: Vec::new(),
+    };
+    let fresh_projection_input = prepare_model_projection(
+        &fresh_invocation,
+        &mut fresh_result,
+        /*parsed_function_arguments*/ None,
+        /*source_dependencies_override*/ None,
+        /*force_inline_carrier*/ false,
+        /*track_for_admission*/ true,
+    )
+    .await
+    .expect("fresh code-mode output should be admitted");
+    let fresh_projection = project_model_output(fresh_projection_input)
+        .await
+        .expect("fresh code-mode admission projection");
+    let fresh_response = fresh_projection.response();
+    assert_eq!(
+        history_output_text(&fresh_response).as_deref(),
+        Some(fresh_output.as_str())
+    );
+    history.register(
+        fresh_projection
+            .candidate
+            .expect("fresh completed-tool history candidate"),
+    );
+    let fresh_response = ResponseItem::from(fresh_response);
+    let mut pressured_canonical = canonical.to_vec();
+    pressured_canonical.extend([
+        ResponseItem::CustomToolCall {
+            id: None,
+            status: Some("completed".to_string()),
+            call_id: fresh_call_id.to_string(),
+            name: codex_code_mode::PUBLIC_TOOL_NAME.to_string(),
+            namespace: None,
+            input: fresh_input.to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        fresh_response.clone(),
+    ]);
+
+    let later_exposure = history.project(Arc::from(pressured_canonical));
     assert_eq!(later_exposure.substitutions.len(), 1);
+    assert_eq!(later_exposure.substitutions[0].call_id, call_id);
+    assert!(later_exposure.items.contains(&fresh_response));
     assert!(
         later_exposure
             .items
@@ -294,7 +369,7 @@ async fn yielded_code_mode_output_keeps_its_live_handle_inline() {
             ToolName::plain(codex_code_mode::PUBLIC_TOOL_NAME),
         )
     };
-    let result = AnyToolResult {
+    let mut result = AnyToolResult {
         call_id: "live-cell".to_string(),
         payload: invocation.payload.clone(),
         result: Box::new(
@@ -312,12 +387,13 @@ async fn yielded_code_mode_output_keeps_its_live_handle_inline() {
     assert!(
         prepare_model_projection(
             &invocation,
-            &result,
+            &mut result,
             /*parsed_function_arguments*/ None,
             /*source_dependencies_override*/ None,
             /*force_inline_carrier*/ false,
             /*track_for_admission*/ true,
         )
+        .await
         .is_none()
     );
 }
@@ -620,7 +696,7 @@ fn model_projection_parts(rendered: &str) -> (Value, &str) {
 
 #[tokio::test]
 async fn projection_source_dependency_decision_records_reuse_and_fallback() {
-    let timing = TurnTimingState::default();
+    let timing = Arc::new(TurnTimingState::default());
     let expected =
         std::collections::BTreeSet::from([crate::tool_history::SourceDependencyV1::new(
             std::path::Path::new("src"),
@@ -633,6 +709,7 @@ async fn projection_source_dependency_decision_records_reuse_and_fallback() {
             precomputed_projection_source_dependencies(),
             || panic!("precomputed dependencies must skip fallback analysis"),
         )
+        .await
     })
     .await;
     assert_eq!(carried, expected);
@@ -646,7 +723,8 @@ async fn projection_source_dependency_decision_records_reuse_and_fallback() {
         /*authoritative_override*/ None,
         /*precomputed*/ None,
         || fallback_expected.clone(),
-    );
+    )
+    .await;
     assert_eq!(fallback, fallback_expected);
     let rewritten_expected =
         std::collections::BTreeSet::from([crate::tool_history::SourceDependencyV1::new(
@@ -658,7 +736,8 @@ async fn projection_source_dependency_decision_records_reuse_and_fallback() {
         Some(rewritten_expected.clone()),
         Some(expected.clone()),
         || panic!("final rewritten dependencies must override pre-hook analysis"),
-    );
+    )
+    .await;
     assert_eq!(rewritten, rewritten_expected);
     let counters = timing.complete_snapshot().protocol_timing().counters;
     assert_eq!(counters.projection_source_dependencies_reuse_count, 1);
@@ -3106,6 +3185,74 @@ fn post_tool_feedback_survives_code_mode_projection() {
         );
         assert_eq!(result.code_mode_result(), original);
     }
+}
+
+#[tokio::test]
+async fn normal_and_synthetic_projections_record_source_dependency_decisions() -> anyhow::Result<()>
+{
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let timing = Arc::clone(&turn.turn_timing_state);
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let tool_name = ToolName::plain("source_dependency_tool");
+    let registry = ToolRegistry::from_tools([Arc::new(LifecycleTestHandler {
+        tool_name: tool_name.clone(),
+        result: LifecycleTestResult::RequiredArtifact,
+    }) as Arc<dyn CoreToolRuntime>]);
+    let dependencies =
+        std::collections::BTreeSet::from([crate::tool_history::SourceDependencyV1::new(
+            std::path::Path::new("src"),
+            true,
+        )]);
+    let terminal_outcome = admitted_tool_dispatch_state();
+    let result = with_precomputed_projection_source_dependencies(
+        Some(dependencies.clone()),
+        registry.dispatch_any_with_terminal_outcome(
+            test_invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "normal-source-dependencies",
+                tool_name.clone(),
+            ),
+            Arc::clone(&terminal_outcome),
+        ),
+    )
+    .await?;
+    assert!(terminal_outcome.is_terminal());
+    assert!(result.success_for_logging());
+    let projection = result.model_projection.as_ref().expect("normal projection");
+    assert_eq!(projection.source_dependencies, dependencies);
+    assert_eq!(
+        projection.canonical_bytes,
+        "fully received result".len() as u64
+    );
+
+    let invocation = test_invocation(session, turn, "synthetic-source-dependencies", tool_name);
+    let mut synthetic = AnyToolResult {
+        call_id: invocation.call_id.clone(),
+        payload: invocation.payload.clone(),
+        result: Box::new(RequiredArtifactOutput(
+            crate::tools::context::FunctionToolOutput::from_text(
+                "synthetic failure".to_string(),
+                Some(false),
+            ),
+        )),
+        model_projection: None,
+        source_dependencies: None,
+        code_mode_feedback: Vec::new(),
+    };
+    install_synthetic_terminal_projection(&invocation, &mut synthetic).await;
+    let projection = synthetic
+        .model_projection
+        .as_ref()
+        .expect("synthetic projection");
+    assert_eq!(projection.canonical_bytes, "synthetic failure".len() as u64);
+    assert!(!synthetic.success_for_logging());
+    assert_eq!(synthetic.outcome_for_logging(), ToolOutputOutcome::Failure);
+    let counters = timing.complete_snapshot().protocol_timing().counters;
+    assert_eq!(counters.projection_source_dependencies_reuse_count, 1);
+    assert_eq!(counters.projection_source_dependencies_fallback_count, 1);
+    Ok(())
 }
 
 #[tokio::test]

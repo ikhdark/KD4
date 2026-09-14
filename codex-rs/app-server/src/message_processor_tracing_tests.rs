@@ -92,6 +92,134 @@ fn logging_contract_notification_metadata_is_bounded_and_omits_params() {
     assert!(!format!("{metadata:?}").contains("notification secret"));
 }
 
+#[test]
+#[serial(app_server_tracing)]
+fn external_import_records_committed_change_after_disconnect_with_full_queue() -> Result<()> {
+    run_current_thread_test_with_stack(
+        "external_import_records_committed_change_after_disconnect_with_full_queue",
+        async {
+            use crate::outgoing_message::ConnectionRequestId;
+            use codex_app_server_protocol::AppListUpdatedNotification;
+            use codex_app_server_protocol::ExternalAgentConfigMigrationItemType;
+            use codex_app_server_protocol::ServerNotification;
+            use std::time::Duration;
+
+            let server = create_mock_responses_server_repeating_assistant("Done").await;
+            let mut harness = TracingHarness::new_with_features(
+                server,
+                Arc::new(codex_config::NoopThreadConfigLoader),
+                false,
+                true,
+            )
+            .await?;
+            let repo = TempDir::new()?;
+            std::fs::create_dir(repo.path().join(".git"))?;
+            std::fs::create_dir(repo.path().join(".claude"))?;
+            let source = repo.path().join(".claude").join("settings.json");
+            let target = repo.path().join(".codex").join("config.toml");
+            std::fs::write(&source, r#"{"env":{"IMPORT_COMPLETION_TEST":"saved"}}"#)?;
+
+            while harness.processor.outgoing.try_send_server_notification(
+                ServerNotification::AppListUpdated(AppListUpdatedNotification { data: Vec::new() }),
+            ) {}
+            let request_id = ConnectionRequestId {
+                connection_id: TEST_CONNECTION_ID,
+                request_id: RequestId::Integer(430_001),
+            };
+            harness
+                .processor
+                .process_request(
+                    TEST_CONNECTION_ID,
+                    request_from_client_request(ClientRequest::ExternalAgentConfigImport {
+                        request_id: request_id.request_id.clone(),
+                        params: serde_json::from_value(json!({
+                            "migrationItems": [{
+                                "itemType": "CONFIG",
+                                "description": "Import project environment",
+                                "cwd": repo.path(),
+                            }],
+                        }))?,
+                    }),
+                    &AppServerTransport::Stdio,
+                    Arc::clone(&harness.session),
+                )
+                .await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if !harness
+                        .processor
+                        .outgoing
+                        .lock_request_contexts_for_test()
+                        .await
+                        .contains_key(&request_id)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("import must reach its blocked response after the write");
+            let config: toml::Value = toml::from_str(&std::fs::read_to_string(&target)?)?;
+            assert_eq!(
+                config["shell_environment_policy"]["set"]["IMPORT_COMPLETION_TEST"].as_str(),
+                Some("saved")
+            );
+            assert!(
+                harness
+                    .processor
+                    .external_agent_config_processor
+                    .read_import_histories()
+                    .await
+                    .expect("read persisted import history")
+                    .data
+                    .is_empty(),
+                "completion must still be pending at the blocked response"
+            );
+
+            // Use the dispatcher's actual cancellation boundary and leave the
+            // outgoing queue full: neither disconnect nor delivery can own completion.
+            harness.session.rpc_gate.shutdown().await;
+            let history = tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    let history = harness
+                        .processor
+                        .external_agent_config_processor
+                        .read_import_histories()
+                        .await
+                        .expect("read persisted import history");
+                    if !history.data.is_empty() {
+                        break history.data;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("committed import must finalize despite a disconnected, blocked recipient");
+            assert_eq!(history.len(), 1);
+            assert!(history[0].failures.is_empty());
+            assert_eq!(history[0].successes.len(), 1);
+            let success = &history[0].successes[0];
+            assert_eq!(
+                success.item_type,
+                ExternalAgentConfigMigrationItemType::Config
+            );
+            assert_eq!(success.source.as_deref(), source.to_str());
+            assert_eq!(success.target.as_deref(), target.to_str());
+            let background_tasks = harness.processor.thread_processor.background_tasks.clone();
+            background_tasks.close();
+            tokio::time::timeout(Duration::from_secs(7), background_tasks.wait())
+                .await
+                .expect(
+                    "completion delivery must release the tracked task while the queue is full",
+                );
+            harness.outgoing_rx.close();
+            harness.shutdown().await;
+            Ok(())
+        },
+    )
+}
+
 struct SerializationProbe<'a>(&'a AtomicUsize);
 
 impl Serialize for SerializationProbe<'_> {
@@ -366,7 +494,9 @@ async fn build_test_config(
         codex_home,
         server_uri,
         &feature_flags,
-        /*auto_compact_limit*/ if enable_collab { 1_000_000 } else { 8_192 },
+        // Cancellation scenarios need room for the complete projected tool prompt.
+        /*auto_compact_limit*/
+        1_000_000,
         Some(false),
         "mock_provider",
         "compact",
@@ -488,6 +618,79 @@ where
         Ok(result) => result,
         Err(_) => Err(anyhow::anyhow!("{name} thread panicked")),
     }
+}
+
+#[test]
+#[serial(app_server_tracing)]
+fn connection_close_cancels_mcp_request_config_load_without_late_response() -> Result<()> {
+    run_current_thread_test_with_stack(
+        "connection_close_cancels_mcp_request_config_load_without_late_response",
+        async {
+            use codex_app_server_protocol::ListMcpServerStatusParams;
+            use codex_app_server_protocol::McpResourceReadParams;
+            use std::time::Duration;
+
+            for request in [
+                ClientRequest::McpServerStatusList {
+                    request_id: RequestId::Integer(40_002),
+                    params: ListMcpServerStatusParams {
+                        cursor: None,
+                        limit: None,
+                        detail: None,
+                        thread_id: None,
+                    },
+                },
+                ClientRequest::McpResourceRead {
+                    request_id: RequestId::Integer(40_003),
+                    params: McpResourceReadParams {
+                        thread_id: None,
+                        server: "pending-server".to_string(),
+                        uri: "test://resource".to_string(),
+                    },
+                },
+            ] {
+                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+                let loader = Arc::new(BlockingThreadConfigLoader {
+                    entered: StdMutex::new(Some(entered_tx)),
+                    dropped: StdMutex::new(Some(dropped_tx)),
+                });
+                let mut harness = TracingHarness::new_with_thread_config_loader(loader).await?;
+                harness
+                    .processor
+                    .process_request(
+                        TEST_CONNECTION_ID,
+                        request_from_client_request(request),
+                        &AppServerTransport::Stdio,
+                        Arc::clone(&harness.session),
+                    )
+                    .await;
+                tokio::time::timeout(Duration::from_secs(5), entered_rx)
+                    .await
+                    .expect("MCP request must start loading its configuration")?;
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    harness
+                        .processor
+                        .connection_closed(TEST_CONNECTION_ID, &harness.session),
+                )
+                .await
+                .expect("disconnect must cancel the MCP request");
+                tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+                    .await
+                    .expect("disconnect must drop the pending processor work")?;
+                assert_eq!(harness.session.rpc_gate.inflight_count(), 0);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), harness.outgoing_rx.recv())
+                        .await
+                        .is_err(),
+                    "cancelled MCP request must not emit a late response"
+                );
+                harness.shutdown().await;
+            }
+            Ok(())
+        },
+    )
 }
 
 #[test]
@@ -900,8 +1103,9 @@ async fn read_response<T: serde::de::DeserializeOwned>(
     outgoing_rx: &mut mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
     request_id: i64,
 ) -> T {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), outgoing_rx.recv())
+        let envelope = tokio::time::timeout_at(deadline, outgoing_rx.recv())
             .await
             .expect("timed out waiting for response")
             .expect("outgoing channel closed");
@@ -938,8 +1142,9 @@ async fn read_response<T: serde::de::DeserializeOwned>(
 async fn read_thread_started_notification(
     outgoing_rx: &mut mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
 ) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), outgoing_rx.recv())
+        let envelope = tokio::time::timeout_at(deadline, outgoing_rx.recv())
             .await
             .expect("timed out waiting for thread/started notification")
             .expect("outgoing channel closed");
@@ -993,10 +1198,10 @@ where
             .force_flush()
             .expect("force flush should succeed");
         let spans = tracing.exporter.get_finished_spans().expect("span export");
-        last_spans = spans.clone();
         if predicate(&spans) {
             return spans;
         }
+        last_spans = spans;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
@@ -1195,6 +1400,333 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
 
 #[test]
 #[serial(app_server_tracing)]
+fn turn_start_overlapping_requests_submit_once() -> Result<()> {
+    run_current_thread_test_with_stack("turn_start_overlapping_requests_submit_once", async {
+        use crate::outgoing_message::ConnectionRequestId;
+        use std::time::Duration;
+
+        let server = MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/responses"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        app_test_support::create_final_assistant_message_sse_response("Done")?,
+                    )
+                    .set_delay(Duration::from_secs(60)),
+            )
+            .mount(&server)
+            .await;
+        let mut harness = TracingHarness::new_with_server_and_thread_config_loader(
+            server,
+            Arc::new(codex_config::NoopThreadConfigLoader),
+            false,
+        )
+        .await?;
+        let first = harness.start_thread(2, None).await.thread.id;
+        let params = |thread_id: String, context: &str| TurnStartParams {
+            thread_id,
+            input: vec![UserInput::Text {
+                text: "continue".to_string(),
+                text_elements: Vec::new(),
+            }],
+            additional_context: Some(indexmap::IndexMap::from([(
+                "review".to_string(),
+                codex_app_server_protocol::AdditionalContextEntry {
+                    value: context.to_string(),
+                    kind: codex_app_server_protocol::AdditionalContextKind::Untrusted,
+                },
+            )])),
+            ..Default::default()
+        };
+        let request_id = |id| ConnectionRequestId {
+            connection_id: TEST_CONNECTION_ID,
+            request_id: RequestId::Integer(id),
+        };
+        let processor = &harness.processor.turn_processor;
+        let (left, right) = tokio::join!(
+            processor.turn_start(
+                request_id(4),
+                params(first.clone(), "first context"),
+                None,
+                None,
+                false
+            ),
+            processor.turn_start(
+                request_id(5),
+                params(first, "first context"),
+                None,
+                None,
+                false
+            ),
+        );
+        assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+        let error = match (left, right) {
+            (Err(error), Ok(_)) | (Ok(_), Err(error)) => error,
+            _ => unreachable!("exactly one request must be admitted"),
+        };
+        assert!(matches!(
+            error.data.as_ref().unwrap()["reason"].as_str(),
+            Some("activeTurnInProgress" | "identicalTaskInFlight")
+        ));
+
+        let requests = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let requests = harness._server.received_requests().await.unwrap();
+                if !requests.is_empty() {
+                    break requests;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the accepted turn must reach the model");
+        assert_eq!(
+            requests.len(),
+            1,
+            "the rejected start must not submit model input"
+        );
+        let inputs = requests
+            .iter()
+            .map(|request| request.body_json::<serde_json::Value>().unwrap()["input"].to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            inputs
+                .iter()
+                .filter(|input| input.contains("first context"))
+                .count(),
+            1
+        );
+        harness.shutdown().await;
+        Ok(())
+    })
+}
+
+#[test]
+#[serial(app_server_tracing)]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Holding real metadata locks exercises cancellation and ownership ordering before releasing blocked work"
+)]
+fn turn_start_submits_after_rpc_cancellation_during_metadata_lookup() -> Result<()> {
+    run_current_thread_test_with_stack(
+        "turn_start_submits_after_rpc_cancellation_during_metadata_lookup",
+        async {
+            use crate::outgoing_message::OutgoingEnvelope;
+            use crate::outgoing_message::OutgoingMessage;
+            use codex_app_server_protocol::ServerNotification;
+            use codex_app_server_protocol::TurnStatus;
+            use std::time::Duration;
+
+            let mut harness = TracingHarness::new().await?;
+            let thread_id = harness.start_thread(2, None).await.thread.id;
+            let parsed = ThreadId::from_string(&thread_id)?;
+            let manager = harness
+                .processor
+                .thread_processor
+                .thread_state_manager
+                .clone();
+            let state = manager.thread_state(parsed).await;
+            // Register the request before blocking its metadata lookup. Holding
+            // thread state keeps the handler from admitting the turn too early.
+            let state_guard = state.lock().await;
+            harness
+                .processor
+                .process_request(
+                    TEST_CONNECTION_ID,
+                    request_from_client_request(ClientRequest::TurnStart {
+                        request_id: RequestId::Integer(3),
+                        params: TurnStartParams {
+                            thread_id: thread_id.clone(),
+                            input: vec![UserInput::Text {
+                                text: "finish the admitted turn".to_string(),
+                                text_elements: Vec::new(),
+                            }],
+                            ..Default::default()
+                        },
+                    }),
+                    &AppServerTransport::Stdio,
+                    Arc::clone(&harness.session),
+                )
+                .await;
+            let outgoing = Arc::clone(&harness.processor.outgoing);
+            let trace_guard = outgoing.lock_request_contexts_for_test().await;
+            drop(state_guard);
+            let turn_id = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(turn_id) = manager.pending_turn_start_for_test(parsed).await {
+                        break turn_id;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("turn must be admitted before cancellation");
+            assert!(
+                harness
+                    ._server
+                    .received_requests()
+                    .await
+                    .expect("request log")
+                    .is_empty()
+            );
+
+            // This is the handler cancellation boundary used by disconnect.
+            // Keep the listener live so it can observe the accepted turn finish.
+            tokio::time::timeout(Duration::from_secs(5), harness.session.rpc_gate.shutdown())
+                .await
+                .expect("the caller must stop while metadata remains blocked");
+            drop(trace_guard);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let message = match harness.outgoing_rx.recv().await.expect("outgoing open") {
+                        OutgoingEnvelope::Broadcast { message }
+                        | OutgoingEnvelope::ToConnection { message, .. } => message,
+                    };
+                    if let OutgoingMessage::AppServerNotification(
+                        ServerNotification::TurnCompleted(completed),
+                    ) = message
+                    {
+                        assert_eq!(completed.thread_id, thread_id);
+                        assert_eq!(completed.turn.id, turn_id);
+                        assert_eq!(
+                            completed.turn.status,
+                            TurnStatus::Completed,
+                            "admitted turn failed: {:?}",
+                            completed.turn.error
+                        );
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("the admitted turn must complete after its caller is dropped");
+            assert_eq!(manager.pending_turn_start_for_test(parsed).await, None);
+            let requests = harness
+                ._server
+                .received_requests()
+                .await
+                .expect("request log");
+            assert_eq!(
+                requests.len(),
+                1,
+                "the accepted input must submit exactly once"
+            );
+            let body = requests[0].body_json::<serde_json::Value>()?;
+            assert!(
+                body["input"]
+                    .to_string()
+                    .contains("finish the admitted turn")
+            );
+            harness.shutdown().await;
+            Ok(())
+        },
+    )
+}
+
+#[test]
+#[serial(app_server_tracing)]
+fn bug_create_uses_thread_directory_and_accepts_reasoning_before_answer() -> Result<()> {
+    run_current_thread_test_with_stack(
+        "bug_create_uses_thread_directory_and_accepts_reasoning_before_answer",
+        async {
+            use core_test_support::responses;
+            use sqlx::Row;
+            use std::time::Duration;
+
+            let output = json!({
+                "summary": "The save button fails", "severity": null,
+                "failureMechanism": null, "affectedComponents": [],
+                "statedCause": null, "requiredRepair": null,
+            })
+            .to_string();
+            let server =
+                create_mock_responses_server_sequence_unchecked(vec![responses::sse(vec![
+                    responses::ev_reasoning_item("reasoning-1", &["Inspect report"], &[]),
+                    responses::ev_assistant_message("answer-1", &output),
+                    responses::ev_completed("classification-1"),
+                ])])
+                .await;
+            let mut harness = TracingHarness::new_with_server_and_thread_config_loader(
+                server,
+                Arc::new(codex_config::NoopThreadConfigLoader),
+                false,
+            )
+            .await?;
+            let directory = TempDir::new()?;
+            let cwd = directory.path().to_string_lossy().into_owned();
+            let started: ThreadStartResponse = harness
+                .request(
+                    ClientRequest::ThreadStart {
+                        request_id: RequestId::Integer(2),
+                        params: ThreadStartParams {
+                            cwd: Some(cwd.clone()),
+                            ephemeral: Some(true),
+                            ..Default::default()
+                        },
+                    },
+                    None,
+                )
+                .await;
+            read_thread_started_notification(&mut harness.outgoing_rx).await;
+            let report: codex_app_server_protocol::BugCreateResponse = harness
+                .request(
+                    ClientRequest::BugCreate {
+                        request_id: RequestId::Integer(3),
+                        params: codex_app_server_protocol::BugCreateParams {
+                            thread_id: started.thread.id.clone(),
+                            raw_text: "The save button fails".to_string(),
+                        },
+                    },
+                    None,
+                )
+                .await;
+            assert!(report.durable_save_result);
+            let thread = harness
+                .processor
+                .thread_manager
+                .get_thread(ThreadId::from_string(&started.thread.id)?)
+                .await?;
+            let options = sqlx::sqlite::SqliteConnectOptions::new().filename(
+                thread
+                    .config()
+                    .await
+                    .sqlite_home
+                    .join(codex_state::BUGS_DB_FILENAME),
+            );
+            let database = sqlx::SqlitePool::connect_with(options).await?;
+            let row = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let row = sqlx::query("SELECT status, summary, cwd, thread_id, failure_category FROM bugs WHERE id = ?")
+                        .bind(report.id).fetch_one(&database).await.unwrap();
+                    if row.get::<String, _>("status") == "classified"
+                        || row.get::<Option<String>, _>("failure_category").is_some() {
+                        break row;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.expect("classifier must finish");
+            assert_eq!(row.get::<String, _>("status"), "classified");
+            assert_eq!(row.get::<String, _>("summary"), "The save button fails");
+            assert_eq!(
+                std::path::PathBuf::from(row.get::<String, _>("cwd")),
+                directory.path()
+            );
+            assert_eq!(row.get::<String, _>("thread_id"), started.thread.id);
+            database.close().await;
+            harness.shutdown().await;
+            Ok(())
+        },
+    )
+}
+
+#[test]
+#[serial(app_server_tracing)]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Holding real metadata locks exercises cancellation and ownership ordering before releasing blocked work"
+)]
 fn rollback_request_cancellation_releases_reservation_before_retry() -> Result<()> {
     run_current_thread_test_with_stack(
         "rollback_request_cancellation_releases_reservation_before_retry",
@@ -1726,6 +2258,7 @@ fn archive_cleanup_survives_origin_disconnect_after_store_commit() -> Result<()>
                     },
                 ))
                 .await;
+            let approval_id = approval_id.expect("approval request admitted");
             assert_eq!(
                 outgoing.pending_requests_for_thread(thread_id).await.len(),
                 1
@@ -2130,6 +2663,7 @@ fn delete_cleanup_survives_origin_disconnect_after_store_commit() -> Result<()> 
                     },
                 ))
                 .await;
+            let approval_id = approval_id.expect("approval request admitted");
             assert_eq!(
                 outgoing.pending_requests_for_thread(thread_id).await.len(),
                 1
@@ -2664,10 +3198,11 @@ mod resume_listener_generation_rpc_tests {
             original_rollout,
             "stale resume must not rewrite durable history"
         );
-        let contexts = outgoing.lock_request_contexts_for_test().await;
-        assert!(!contexts.contains_key(&stale_id));
-        assert!(!contexts.contains_key(&replacement_id));
-        drop(contexts);
+        {
+            let contexts = outgoing.lock_request_contexts_for_test().await;
+            assert!(!contexts.contains_key(&stale_id));
+            assert!(!contexts.contains_key(&replacement_id));
+        }
         harness.shutdown().await;
         Ok(())
     }
@@ -3403,18 +3938,19 @@ mod process_exec_control_rpc_tests {
                     observed.exited.is_none(),
                     "disconnected client receives no exit notification"
                 );
-                let contexts = harness
-                    .processor
-                    .outgoing
-                    .lock_request_contexts_for_test()
-                    .await;
-                assert!(
-                    contexts
-                        .keys()
-                        .all(|id| id.connection_id != TEST_CONNECTION_ID),
-                    "disconnect must clear request contexts"
-                );
-                drop(contexts);
+                {
+                    let contexts = harness
+                        .processor
+                        .outgoing
+                        .lock_request_contexts_for_test()
+                        .await;
+                    assert!(
+                        contexts
+                            .keys()
+                            .all(|id| id.connection_id != TEST_CONNECTION_ID),
+                        "disconnect must clear request contexts"
+                    );
+                }
                 assert!(
                     !dir.path().join("received.bin").exists(),
                     "disconnect never releases stdin"
@@ -3425,6 +3961,10 @@ mod process_exec_control_rpc_tests {
         )
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Holding real metadata locks exercises cancellation and ownership ordering before releasing blocked work"
+    )]
     async fn disconnect_terminates_before_metadata_cleanup(publish_spawn: bool) -> Result<()> {
         use tokio::io::AsyncBufReadExt;
         let mut harness = TracingHarness::new().await?;
@@ -3806,13 +4346,13 @@ mod command_exec_control_rpc_tests {
         assert!(
             attempted
                 .keys()
-                .any(|id| replies.get(id).is_some_and(|reply| reply.is_ok())),
+                .any(|id| replies.get(id).is_some_and(Result::is_ok)),
             "real driver must accept earlier writes"
         );
         assert!(
             attempted
                 .keys()
-                .any(|id| replies.get(id).is_some_and(|reply| reply.is_err())),
+                .any(|id| replies.get(id).is_some_and(Result::is_err)),
             "normal RPC must reject writes once owner capacity is full"
         );
         assert_eq!(
@@ -4072,18 +4612,19 @@ mod command_exec_control_rpc_tests {
                         "cancelled write {id} must not emit a late reply"
                     );
                 }
-                let contexts = harness
-                    .processor
-                    .outgoing
-                    .lock_request_contexts_for_test()
-                    .await;
-                assert!(
-                    contexts
-                        .keys()
-                        .all(|id| id.connection_id != TEST_CONNECTION_ID),
-                    "disconnect must clear request contexts"
-                );
-                drop(contexts);
+                {
+                    let contexts = harness
+                        .processor
+                        .outgoing
+                        .lock_request_contexts_for_test()
+                        .await;
+                    assert!(
+                        contexts
+                            .keys()
+                            .all(|id| id.connection_id != TEST_CONNECTION_ID),
+                        "disconnect must clear request contexts"
+                    );
+                }
                 assert!(
                     !dir.path().join("received.bin").exists(),
                     "disconnect kills the gated child without releasing stdin"
@@ -4097,6 +4638,10 @@ mod command_exec_control_rpc_tests {
 
 #[test]
 #[serial(app_server_tracing)]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Holding real metadata locks exercises cancellation and ownership ordering before releasing blocked work"
+)]
 fn interrupt_request_cancellation_releases_reservation_before_terminal() -> Result<()> {
     run_current_thread_test_with_stack(
         "interrupt_request_cancellation_releases_reservation_before_terminal",
@@ -4797,6 +5342,159 @@ fn acknowledged_goal_set_finishes_runtime_update_after_rpc_gate_cancellation() -
             })
             .await
             .expect("normal goal runtime must reach the model provider");
+            harness.shutdown().await;
+            Ok(())
+        },
+    )
+}
+
+#[test]
+#[serial(app_server_tracing)]
+fn committed_import_finishes_after_rpc_cancellation_during_response_delivery() -> Result<()> {
+    run_current_thread_test_with_stack(
+        "committed_import_finishes_after_rpc_cancellation_during_response_delivery",
+        async {
+            use crate::outgoing_message::OutgoingEnvelope;
+            use crate::outgoing_message::OutgoingMessage;
+            use codex_app_server_protocol::ClientResponsePayload;
+            use codex_app_server_protocol::ExternalAgentConfigImportResponse;
+            use codex_app_server_protocol::ServerNotification;
+            use codex_app_server_protocol::SkillsListParams;
+            use codex_app_server_protocol::SkillsListResponse;
+            use std::time::Duration;
+
+            let mut harness = TracingHarness::new_with_features(
+                MockServer::start().await,
+                Arc::new(codex_config::NoopThreadConfigLoader),
+                false,
+                true,
+            )
+            .await?;
+            let project = TempDir::new()?;
+            std::fs::create_dir(project.path().join(".git"))?;
+            let source = project.path().join(".claude/skills/import-proof");
+            std::fs::create_dir_all(&source)?;
+            let skill = "---\nname: import-proof\ndescription: Imported skill proof\n---\nUse this imported skill.\n";
+            std::fs::write(source.join("SKILL.md"), skill)?;
+            let target = project.path().join(".agents/skills/import-proof/SKILL.md");
+            let skills_params = SkillsListParams {
+                cwds: vec![project.path().to_path_buf()],
+                force_reload: false,
+            };
+            let before: SkillsListResponse = harness
+                .request(
+                    ClientRequest::SkillsList {
+                        request_id: RequestId::Integer(429_000),
+                        params: skills_params.clone(),
+                    },
+                    None,
+                )
+                .await;
+            assert_eq!(before.data.len(), 1);
+            assert!(before.data[0].errors.is_empty());
+            assert!(
+                before.data[0]
+                    .skills
+                    .iter()
+                    .all(|skill| skill.name != "import-proof")
+            );
+
+            while harness.processor.outgoing.try_send_server_notification(
+                ServerNotification::AppListUpdated(
+                    codex_app_server_protocol::AppListUpdatedNotification { data: Vec::new() },
+                ),
+            ) {}
+            assert_eq!(harness.outgoing_rx.capacity(), 0);
+            harness
+                .processor
+                .process_request(
+                    TEST_CONNECTION_ID,
+                    request_from_client_request(ClientRequest::ExternalAgentConfigImport {
+                        request_id: RequestId::Integer(429_001),
+                        params: serde_json::from_value(json!({
+                            "migrationItems": [{
+                                "itemType": "SKILLS",
+                                "description": "Import skill",
+                                "cwd": project.path(),
+                            }],
+                        }))?,
+                    }),
+                    &AppServerTransport::Stdio,
+                    Arc::clone(&harness.session),
+                )
+                .await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !target.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("import must commit while response delivery is blocked");
+            assert_eq!(std::fs::read_to_string(&target)?, skill);
+            assert_eq!(harness.outgoing_rx.capacity(), 0);
+            // This is the dispatcher's actual disconnect cancellation boundary.
+            harness.session.rpc_gate.shutdown().await;
+
+            let response: ExternalAgentConfigImportResponse = tokio::time::timeout(
+                Duration::from_secs(5),
+                read_response(&mut harness.outgoing_rx, 429_001),
+            )
+            .await
+            .expect("the import owner must survive cancellation at response delivery");
+            let completed = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let OutgoingEnvelope::Broadcast {
+                        message:
+                            OutgoingMessage::AppServerNotification(
+                                ServerNotification::ExternalAgentConfigImportCompleted(completed),
+                            ),
+                    } = harness
+                        .outgoing_rx
+                        .recv()
+                        .await
+                        .expect("outgoing channel must remain open until import completes")
+                    {
+                        break completed;
+                    }
+                }
+            })
+            .await
+            .expect("committed import must publish completion after cancellation");
+            assert_eq!(completed.import_id, response.import_id);
+            assert_eq!(completed.item_type_results.len(), 1);
+            assert_eq!(completed.item_type_results[0].successes.len(), 1);
+            assert!(completed.item_type_results[0].failures.is_empty());
+            let histories = harness
+                .processor
+                .external_agent_config_processor
+                .read_import_histories()
+                .await
+                .expect("read durable import history");
+            let history = histories
+                .data
+                .iter()
+                .find(|entry| entry.import_id == response.import_id)
+                .expect("completion must be recoverable after disconnect");
+            assert_eq!(history.successes, completed.item_type_results[0].successes);
+            assert!(history.failures.is_empty());
+
+            let Some(ClientResponsePayload::SkillsList(after)) = harness
+                .processor
+                .catalog_processor
+                .skills_list(skills_params)
+                .await
+                .expect("read refreshed skills")
+            else {
+                anyhow::bail!("expected skills list response");
+            };
+            assert_eq!(after.data.len(), 1);
+            assert!(after.data[0].errors.is_empty());
+            assert!(
+                after.data[0]
+                    .skills
+                    .iter()
+                    .any(|skill| skill.name == "import-proof")
+            );
             harness.shutdown().await;
             Ok(())
         },

@@ -90,6 +90,7 @@ pub fn strip_proposed_plan_blocks(text: &str) -> String {
     out
 }
 
+/// Returns the contents of the last proposed-plan block, or None when no block is present.
 pub fn extract_proposed_plan_text(text: &str) -> Option<String> {
     let mut parser = ProposedPlanParser::new();
     let mut plan_text = String::new();
@@ -116,6 +117,32 @@ pub fn extract_proposed_plan_text(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn long_unicode_whitespace_preserves_tag_detection_and_exact_fallback() {
+        let padding = "\u{2003}".repeat(32_768);
+        let mut parser = ProposedPlanParser::new();
+        let source =
+            format!("{padding}<proposed_plan>{padding}\nstep\n{padding}</proposed_plan>{padding}");
+        let out = collect_chunks(&mut parser, &[&source]);
+        assert_eq!(out.visible_text, "");
+        assert_eq!(
+            out.extracted,
+            vec![
+                ProposedPlanSegment::ProposedPlanStart,
+                ProposedPlanSegment::ProposedPlanDelta("step\n".into()),
+                ProposedPlanSegment::ProposedPlanEnd,
+            ]
+        );
+        // Reuse after finish, including a tag-looking line invalidated by trailing text.
+        let source = format!("{padding}<proposed_plan>{padding}extra\n{padding}");
+        let out = collect_chunks(&mut parser, &[&padding, &source[padding.len()..]]);
+        assert_eq!(out.visible_text, source);
+        assert!(
+            out.extracted
+                .iter()
+                .all(|segment| matches!(segment, ProposedPlanSegment::Normal(_)))
+        );
+    }
     use super::ProposedPlanParser;
     use super::ProposedPlanSegment;
     use super::extract_proposed_plan_text;

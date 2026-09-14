@@ -28,6 +28,7 @@ async fn atomic_mcp_refresh_commits_without_thread_submissions() {
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         Arc::new(EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let first = manager
         .start_thread(config.clone())

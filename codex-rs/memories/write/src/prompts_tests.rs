@@ -80,7 +80,7 @@ fn build_consolidation_prompt_points_to_workspace_diff_and_extension_tree() {
         "Memory extensions (under {}/):",
         memory_extensions_root.display()
     )));
-    assert!(prompt.contains("workspace diff shows deleted extension resource files"));
+    assert!(prompt.contains("extension-resource deletions shown in the workspace diff"));
     assert!(
         prompt.len() <= 16_000,
         "consolidation prompt grew to {} bytes",
@@ -89,4 +89,13 @@ fn build_consolidation_prompt_points_to_workspace_diff_and_extension_tree() {
     assert!(prompt.contains("three most recent"));
     assert!(prompt.contains("distinct dates"));
     assert!(prompt.contains("Creating no skill is the default"));
+}
+
+#[test]
+fn consolidation_without_extensions_retains_standard_input_contract() {
+    let dir = tempdir().unwrap();
+    let prompt = build_consolidation_prompt(dir.path());
+    assert!(prompt.contains("phase2_workspace_diff.md"));
+    assert!(prompt.contains("raw_memories.md"));
+    assert!(!prompt.contains("<extension_name>"));
 }

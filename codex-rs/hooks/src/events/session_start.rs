@@ -182,14 +182,16 @@ pub(crate) async fn run(
     let stop_reason = results
         .iter()
         .find_map(|result| result.data.stop_reason.clone());
-    let additional_contexts = common::flatten_additional_contexts(
-        results
-            .iter()
-            .map(|result| result.data.additional_contexts_for_model.as_slice()),
-    );
 
+    let mut additional_contexts = Vec::new();
     ContextInjectingHookOutcome {
-        hook_events: results.into_iter().map(|result| result.completed).collect(),
+        hook_events: results
+            .into_iter()
+            .map(|result| {
+                additional_contexts.extend(result.data.additional_contexts_for_model);
+                result.completed
+            })
+            .collect(),
         should_stop,
         stop_reason,
         additional_contexts,

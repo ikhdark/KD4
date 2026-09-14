@@ -563,10 +563,10 @@ mod tests {
         let codex_home_path = codex_home.path().to_path_buf();
         let cli_overrides = vec![(
             "sandbox_mode".to_string(),
-            TomlValue::String("workspace-write".to_string()),
+            TomlValue::String("danger-full-access".to_string()),
         )];
 
-        let workspace_write_config = build_debug_sandbox_config(
+        let full_access_config = build_debug_sandbox_config(
             cli_overrides.clone(),
             ConfigOverrides::default(),
             Some(codex_home_path.clone()),
@@ -600,18 +600,14 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(
-            workspace_write_config
-                .permissions
-                .file_system_sandbox_policy(),
+        assert_ne!(
+            full_access_config.permissions.file_system_sandbox_policy(),
             read_only_config.permissions.file_system_sandbox_policy(),
-            "workspace-write downgrades to read-only when the Windows sandbox is disabled"
+            "explicit full access must differ from fallback read-only"
         );
         assert_eq!(
             config.permissions.file_system_sandbox_policy(),
-            workspace_write_config
-                .permissions
-                .file_system_sandbox_policy(),
+            full_access_config.permissions.file_system_sandbox_policy(),
         );
 
         Ok(())
@@ -700,8 +696,20 @@ mod tests {
         let private = docs.join("private");
         write_permissions_profile_config(&codex_home, &docs, &private)?;
 
+        let ambient = vec![(
+            "default_permissions".to_string(),
+            TomlValue::String(":workspace".to_string()),
+        )];
+        let ambient_config = build_debug_sandbox_config(
+            ambient.clone(),
+            ConfigOverrides::default(),
+            Some(codex_home.path().to_path_buf()),
+            ManagedRequirementsMode::Include,
+            false,
+        )
+        .await?;
         let config = load_debug_sandbox_config_with_codex_home(
-            Vec::new(),
+            ambient,
             DebugSandboxConfigOptions {
                 sandbox_state: Default::default(),
                 permissions_profile: Some("limited-read-test".to_string()),
@@ -726,6 +734,10 @@ mod tests {
         )
         .await?;
 
+        assert_ne!(
+            ambient_config.permissions.file_system_sandbox_policy(),
+            expected.permissions.file_system_sandbox_policy()
+        );
         assert_eq!(
             config.permissions.file_system_sandbox_policy(),
             expected.permissions.file_system_sandbox_policy()

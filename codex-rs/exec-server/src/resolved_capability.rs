@@ -161,7 +161,9 @@ impl EnvironmentManager {
             let ready = if *already_ready {
                 true
             } else if environment.startup_finished() {
-                environment.wait_until_ready().await.is_ok()
+                // A completed startup can still have failed transiently or be
+                // recovering. Resolution must not initiate or await a reconnect.
+                matches!(environment.readiness_result(), Some(Ok(())))
             } else {
                 Environment::start_connecting_for_use(environment);
                 false

@@ -128,8 +128,7 @@ mod tests {
 
     #[test]
     fn workspace_write_summary_still_includes_network_access() {
-        let root = "C:\\repo";
-        let writable_root = AbsolutePathBuf::try_from(root).unwrap();
+        let writable_root = AbsolutePathBuf::try_from(std::env::current_dir().unwrap()).unwrap();
         let summary = summarize_sandbox_policy(&SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![writable_root.clone()],
             network_access: true,
@@ -147,9 +146,10 @@ mod tests {
 
     #[test]
     fn permission_profile_summary_uses_runtime_workspace_roots_and_hides_internal_writes() {
-        let cwd = AbsolutePathBuf::try_from("C:\\repo").unwrap();
-        let extra_root = AbsolutePathBuf::try_from("C:\\repo-extra").unwrap();
-        let hidden_root = AbsolutePathBuf::try_from("C:\\Users\\test\\.codex\\memories").unwrap();
+        let base = std::env::current_dir().unwrap();
+        let cwd = AbsolutePathBuf::try_from(base.join("repo")).unwrap();
+        let extra_root = AbsolutePathBuf::try_from(base.join("repo-extra")).unwrap();
+        let hidden_root = AbsolutePathBuf::try_from(base.join(".codex/memories")).unwrap();
         let profile = PermissionProfile::workspace_write_with(
             std::slice::from_ref(&hidden_root),
             NetworkSandboxPolicy::Restricted,

@@ -32,6 +32,7 @@ async fn run_main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut input = Vec::new();
     io::stdin().read_to_end(&mut input).await?;
     let request: FsHelperRequest = serde_json::from_slice(&input)?;
+    drop(input);
     let response = match run_direct_request(request).await {
         Ok(payload) => FsHelperResponse::Ok(payload),
         Err(error) => FsHelperResponse::Error(error),

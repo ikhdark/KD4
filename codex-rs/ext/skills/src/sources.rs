@@ -114,13 +114,17 @@ impl SkillProviders {
         &self,
         query: SkillListQuery,
     ) -> SkillProviderResult<SkillCatalog> {
+        self.list_kind(query, SkillSourceKind::Orchestrator).await
+    }
+
+    async fn list_kind(
+        &self,
+        query: SkillListQuery,
+        kind: SkillSourceKind,
+    ) -> SkillProviderResult<SkillCatalog> {
         let mut catalog = SkillCatalog::default();
 
-        for source in self
-            .sources
-            .iter()
-            .filter(|source| source.kind == SkillSourceKind::Orchestrator)
-        {
+        for source in self.sources.iter().filter(|source| source.kind == kind) {
             let source_catalog = source.provider.list(query.clone()).await.map_err(|err| {
                 SkillProviderError::new(format!(
                     "{} skills unavailable: {}",
@@ -133,9 +137,11 @@ impl SkillProviders {
         Ok(catalog)
     }
 
-    pub(crate) async fn list_executor_for_turn(&self, query: SkillListQuery) -> SkillCatalog {
-        self.list_matching(&query, |source| source.kind == SkillSourceKind::Executor)
-            .await
+    pub(crate) async fn list_executor_for_turn(
+        &self,
+        query: SkillListQuery,
+    ) -> SkillProviderResult<SkillCatalog> {
+        self.list_kind(query, SkillSourceKind::Executor).await
     }
 
     async fn list_matching(
@@ -167,7 +173,14 @@ impl SkillProviders {
             .filter(|source| source.owns_kind(&request.authority.kind))
         {
             match source.provider.read(request.clone()).await {
-                Ok(result) => return Ok(result),
+                Ok(result) => {
+                    if result.resource != request.resource {
+                        return Err(SkillProviderError::new(
+                            "skill provider returned a different resource",
+                        ));
+                    }
+                    return Ok(result);
+                }
                 Err(err) => last_error = Some(err),
             }
         }

@@ -49,7 +49,7 @@ an SDK, schema, package, installed binary, or Codex Desktop.
 Update it in the same change whenever the repository materially changes.
 
 <!-- BEGIN TRACKED PATH SNAPSHOT -->
-Tracked repository path snapshot: `count=6099 sha256=00b3ced50bea33f04a6c97ed2a98b9bcadecd55cd17ebb9e3468c49a68b9fe89`.
+Tracked repository path snapshot: `count=4973 sha256=491f4e96faa3c14d0e14744bd19c91cc4769a0f1ceadb6421533071a05ba9934`.
 <!-- END TRACKED PATH SNAPSHOT -->
 
 Every repository file or directory add, delete, move, or rename also requires
@@ -84,30 +84,31 @@ map remains useful.
 ## How to use this map
 
 1. Read the root `AGENTS.md`.
-2. Query the smallest named owner slice before reading the broad map. Run
+2. For a clear local task, reuse known owner paths, current evidence, and the
+   closest owner instructions. When ownership or a relevant relationship is
+   unresolved, query the smallest named owner slice before reading the broad map:
    `python scripts/source_owners.py slice --owner <owner-id>
 --focus "<task description>" --max-relationships 32`.
-3. Confirm that the slice is untruncated, has zero omitted relationships and
-   material unknowns, and covers control/data flow, callers/consumers,
+3. Resolve material unknowns. Expand truncated or omitted relationships when
+   they could affect the requested change; unrelated omissions do not require
+   broader discovery. Establish the applicable control/data flow, callers/consumers,
    configuration/gates, registration/entrypoints, tests/contracts, generated
    artifacts, and invariants. A facet may be explicitly `not_applicable` with a
-   reason; an absent facet is insufficient evidence.
+   reason; an absent applicable facet is insufficient evidence.
 4. Read the exact evidence locations for the relationships you will change.
    Relationships are ranked within each facet by structural role, task-focus
    overlap, provenance, and directness; start with the first relationship in
    each applicable facet before expanding.
    Treat `exact` and `declared` provenance as grounded; heuristic evidence may
    guide discovery but cannot close it.
-5. Stop broad discovery once this bounded source closure is established. Reopen
-   it if the repository snapshot changes or implementation contradicts a
-   declared relationship.
-6. Use this broad map only when no owner matches, the slice reports an unknown,
+5. Stop broad discovery once these task-relevant relationships are established.
+   Reuse ownership evidence until changes affect its source locations,
+   dependencies, registrations, contracts, or instruction scope. Refresh it when
+   implementation contradicts the evidence or a concurrent change cannot be
+   shown to be independent.
+6. Use this broad map only when no owner matches, the slice leaves a material unknown,
    or a new cross-cutting boundary must be placed. Return to the applicable
    policy file for its exact validation and completion gate.
-
-For a clear crate-local or script-local task, use the closest owner instructions
-directly. Use this map when the route crosses boundaries or when a new boundary
-must be placed.
 
 `architecture_index.json` is the machine-readable, manifest-keyed relationship
 graph generated from `source_owners.toml`. `just source-owners-check` rejects a
@@ -415,7 +416,7 @@ remain required.
 | Changed surface                              | Smallest owning proof                                                                                                                                                            |
 | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Source map or structural inventory           | `python -m unittest scripts.test_source_map_check` and `just source-map-check`                                                                                                   |
-| Source-owner manifest or architecture index  | `python -m unittest scripts.test_source_owners` and `just source-owners-check`                                                                                                   |
+| Source-owner manifest or architecture index  | `just source-owners-check` (freshness and representative relationship tests)                                                                                                     |
 | Root or Python maintenance scripts           | closest `python -m unittest scripts.test_<name>` plus syntax/lint appropriate to the script                                                                                      |
 | KD4 audit, evaluation, or measurement script | closest matching `python -m unittest scripts.test_<name>` plus only the fixture/freshness check owned by the changed surface                                                     |
 | Named Rust test runner or manifest           | `python -m unittest scripts.test_rust_test_runner` and `just core-test-manifest-check`                                                                                           |
@@ -495,7 +496,7 @@ This map owns cross-cutting navigation and structural inventory.
 | Dependency or build-system change                    | owning manifest -> lock state -> workspace/recipe consumers -> focused build/test/package proof                                                                                                                                             |
 | New top-level area or package                        | add the owner and policy boundary -> update the machine-checked inventory in this file -> add routing/validation -> run `just source-map-check`                                                                                             |
 
-<!-- BEGIN KD4 SOURCE OWNERS schema=2 manifest_sha256=970064dd145368343bb8a85a1c55dd1b1c452df24acc19f7db563ee4b0e99708 -->
+<!-- BEGIN KD4 SOURCE OWNERS schema=2 manifest_sha256=da7a4cd9da9e872f5c317ecc7800c0730d10a77758b4d7deccf4602696ce3f93 -->
 ### Managed KD4 source-owner index
 
 This table is generated by `scripts/source_owners.py`; edit `source_owners.toml`, not this block.
@@ -508,11 +509,11 @@ This table is generated by `scripts/source_owners.py`; edit `source_owners.toml`
 | `app-server-test-client-handshake` | `codex-rs/app-server-test-client` | `codex-rs/app-server-test-client/src/main.rs::main` | `control_flow:calls` -> `path:codex-rs/app-server-test-client/src/lib.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/cli/src/main.rs`<br>`configuration:reads_config` -> `path:codex-rs/app-server-test-client/src/lib.rs`<br>+3 more | `semantic:app-server-test-client-handshake-behavior`<br>`compatibility:app-server-test-client-handshake-compatibility` | `initialize-handshake` |
 | `cli-entrypoints` | `codex-rs/cli` | `codex-rs/cli/src/main.rs::main` | `control_flow:calls` -> `owner:app-server-runtime`<br>`runtime_registration:registers` -> `path:codex-rs/cli/src/main.rs` | `semantic:subcommand-dispatch` | `cli-focused` |
 | `code-mode-protocol-contracts` | `codex-rs/code-mode-protocol` | `codex-rs/code-mode-protocol/src/lib.rs::build_exec_tool_description` | `callers_consumers:consumed_by` -> `path:codex-rs/code-mode-host`<br>`control_flow:calls` -> `path:codex-rs/code-mode-protocol/src/description.rs`<br>`runtime_registration:registers` -> `path:codex-rs/code-mode-protocol/src/lib.rs`<br>+1 more | `compatibility:code-mode-description-contract` | `code-mode-protocol-focused` |
-| `core-agent-runtime` | `codex-rs/core/src`<br>`codex-rs/core/tests`<br>`codex-rs/core/benches` | `codex-rs/core/src/session/mod.rs::Codex` | `callers_consumers:consumed_by` -> `owner:app-server-runtime`<br>`configuration:gated_by` -> `owner:feature-registry`<br>`tests_contracts:validated_by` -> `path:codex-rs/core/tests` | `semantic:registered-tool-routing` | `core-focused` |
-| `feature-registry` | `codex-rs/features` | `codex-rs/features/src/lib.rs::Feature` | `callers_consumers:consumed_by` -> `owner:core-agent-runtime` | `compatibility:feature-key-compatibility` | `features-focused` |
+| `core-agent-runtime` | `codex-rs/core/src`<br>`codex-rs/core/tests`<br>`codex-rs/core/benches` | `codex-rs/core/src/session/mod.rs::Codex` | `callers_consumers:consumed_by` -> `owner:app-server-runtime`<br>`configuration:gated_by` -> `owner:feature-registry`<br>`tests_contracts:validated_by` -> `path:codex-rs/core/tests`<br>+1 more | `semantic:registered-tool-routing` | `core-focused` |
+| `feature-registry` | `codex-rs/features` | `codex-rs/features/src/lib.rs::Feature` | `callers_consumers:consumed_by` -> `owner:core-agent-runtime`<br>`runtime_registration:registers` -> `path:codex-rs/features/src/lib.rs` | `compatibility:feature-key-compatibility` | `features-focused` |
 | `kd4-capability-manifest` | `kd4_features.toml`<br>`scripts/check_kd4_features.py` | `scripts/check_kd4_features.py::validate_manifest` | `configuration:reads_config` -> `config:kd4_features.toml`<br>`callers_consumers:consumed_by` -> `path:scripts/kd4_perf_snapshot.py`<br>`runtime_registration:registers` -> `path:justfile`<br>+1 more | `semantic:capability-evidence-reachability` | `kd4-capability-manifest-focused` |
 | `model-catalog-runtime` | `codex-rs/models-manager` | `codex-rs/models-manager/src/manager.rs::ModelsManager` | `callers_consumers:consumed_by` -> `owner:core-agent-runtime`<br>`control_flow:calls` -> `path:codex-rs/models-manager/src/model_info.rs`<br>`runtime_registration:constructs` -> `path:codex-rs/models-manager/src/manager.rs`<br>+1 more | `semantic:model-instruction-resolution` | `models-manager-focused` |
-| `planning-architecture-runtime` | `codex-rs/core/src/plan_store.rs`<br>`codex-rs/core/src/tools/handlers/plan.rs`<br>`codex-rs/core/src/tools/handlers/plan_tests.rs`<br>`codex-rs/core/src/tools/spec_plan.rs`<br>`codex-rs/core/src/session/reasoning_governor.rs` | `codex-rs/core/src/tools/handlers/plan.rs::PlanHandler`<br>`codex-rs/core/src/plan_store.rs::PlanStore` | `callers_consumers:consumed_by` -> `path:codex-rs/core/src/session/reasoning_governor.rs`<br>`runtime_registration:registers` -> `path:codex-rs/core/src/tools/spec_plan.rs`<br>`tests_contracts:validated_by` -> `path:codex-rs/core/src/tools/handlers/plan_tests.rs` | `semantic:session-plan-update` | `planning-focused` |
+| `planning-architecture-runtime` | `codex-rs/core/src/plan_store.rs`<br>`codex-rs/core/src/tools/handlers/plan.rs`<br>`codex-rs/core/src/tools/handlers/plan_tests.rs`<br>`codex-rs/core/src/tools/spec_plan.rs`<br>`codex-rs/core/src/session/reasoning_governor.rs` | `codex-rs/core/src/tools/handlers/plan.rs::PlanHandler`<br>`codex-rs/core/src/plan_store.rs::PlanStore` | `callers_consumers:consumed_by` -> `path:codex-rs/core/src/session/reasoning_governor.rs`<br>`runtime_registration:registers` -> `path:codex-rs/core/src/tools/spec_plan.rs`<br>`tests_contracts:validated_by` -> `path:codex-rs/core/src/tools/handlers/plan_tests.rs`<br>+1 more | `semantic:session-plan-update` | `planning-focused` |
 | `plugin-manifest-namespace` | `codex-rs/plugin/src/namespace.rs`<br>`codex-rs/plugin/src/lib.rs`<br>`codex-rs/plugin/Cargo.toml` | `codex-rs/plugin/src/namespace.rs::plugin_namespace_for_root_uri`<br>`codex-rs/plugin/src/namespace.rs::plugin_namespace_for_skill_path` | `control_flow:calls` -> `path:codex-rs/plugin/src/namespace.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/core-skills/src/loader/namespace.rs`<br>`callers_consumers:calls` -> `path:codex-rs/file-system/src/lib.rs`<br>+2 more | `semantic:plugin-manifest-namespace-behavior`<br>`compatibility:plugin-manifest-namespace-compatibility` | `plugin-namespace` |
 | `remote-plugin-lifecycle` | `codex-rs/core-plugins/src/remote.rs`<br>`codex-rs/core-plugins/src/remote_tests.rs`<br>`codex-rs/core-plugins/src/remote` | `codex-rs/core-plugins/src/remote.rs::install_remote_plugin`<br>`codex-rs/core-plugins/src/remote.rs::uninstall_remote_plugin`<br>`codex-rs/core-plugins/src/remote/share.rs::save_remote_plugin_share` | `control_flow:calls` -> `path:codex-rs/core-plugins/src/remote.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/app-server/src/request_processors/plugins.rs`<br>`runtime_registration:registers` -> `path:codex-rs/core-plugins/src/lib.rs`<br>+3 more | `semantic:remote-plugin-lifecycle-request-and-cache`<br>`semantic:remote-plugin-lifecycle-share-requests`<br>`compatibility:remote-plugin-lifecycle-compatibility` | `remote-plugin-install`<br>`remote-plugin-uninstall`<br>`remote-plugin-skill`<br>`remote-plugin-share`<br>`remote-plugin-share-targets`<br>`remote-plugin-share-delete` |
 | `repository-context-discovery` | `codex-rs/core/src/git_workspace.rs`<br>`codex-rs/core/src/agents_md.rs` | `codex-rs/core/src/git_workspace.rs::GitWorkspaceCache`<br>`codex-rs/core/src/agents_md.rs::load_project_instructions` | `control_flow:calls` -> `path:codex-rs/core/src/agents_md.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/core/src/session/mod.rs`<br>`runtime_registration:constructs` -> `path:codex-rs/core/src/git_workspace.rs`<br>+1 more | `semantic:snapshot-scoped-discovery` | `repository-context-focused` |

@@ -65,6 +65,7 @@ pub struct AdditionalFileSystemPermissions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub glob_scan_max_depth: Option<NonZeroUsize>,
+    /// When present, replaces legacy `read` and `write`, including when empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub entries: Option<Vec<FileSystemSandboxEntry>>,
@@ -296,6 +297,8 @@ impl From<CoreRequestPermissionProfile> for RequestPermissionProfile {
 impl TryFrom<RequestPermissionProfile> for CoreRequestPermissionProfile {
     type Error = io::Error;
 
+    /// Resolves relative paths against the process working directory. Thread-scoped
+    /// callers must use `RequestPermissionProfile::into_core_with_cwd` instead.
     fn try_from(value: RequestPermissionProfile) -> Result<Self, Self::Error> {
         Ok(Self {
             network: value.network.map(CoreNetworkPermissions::from),

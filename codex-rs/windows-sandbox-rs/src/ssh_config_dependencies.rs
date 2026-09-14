@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -12,7 +13,7 @@ const SSH_PROFILE_PATH_DIRECTIVES: &[&str] = &[
     "userknownhostsfile",
 ];
 
-pub(crate) fn ssh_config_dependency_paths(user_profile: &Path) -> Vec<PathBuf> {
+pub(crate) fn ssh_config_dependency_paths(user_profile: &Path) -> io::Result<Vec<PathBuf>> {
     let ssh_dir = user_profile.join(".ssh");
     let mut paths = vec![ssh_dir.join("config")];
     visit_config(
@@ -22,8 +23,8 @@ pub(crate) fn ssh_config_dependency_paths(user_profile: &Path) -> Vec<PathBuf> {
         &mut HashSet::new(),
         &mut paths,
         /*depth*/ 0,
-    );
-    paths
+    )?;
+    Ok(paths)
 }
 
 fn visit_config(
@@ -33,25 +34,29 @@ fn visit_config(
     visited: &mut HashSet<PathBuf>,
     paths: &mut Vec<PathBuf>,
     depth: usize,
-) {
-    if depth == 32 {
-        return;
-    }
+) -> io::Result<()> {
     let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     if !visited.insert(key) {
-        return;
+        return Ok(());
     }
-
-    let Ok(contents) = std::fs::read_to_string(path) else {
-        return;
+    if depth >= 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SSH config include depth exceeds the discovery limit",
+        ));
+    }
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if depth == 0 && err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
     };
     for (key, args) in contents.lines().filter_map(directive) {
         match key.to_ascii_lowercase().as_str() {
             "include" => {
                 for arg in args {
-                    for include in include_paths(&arg, user_profile, ssh_dir) {
+                    for include in include_paths(&arg, user_profile, ssh_dir)? {
                         paths.push(include.clone());
-                        visit_config(&include, user_profile, ssh_dir, visited, paths, depth + 1);
+                        visit_config(&include, user_profile, ssh_dir, visited, paths, depth + 1)?;
                     }
                 }
             }
@@ -67,17 +72,19 @@ fn visit_config(
             _ => {}
         }
     }
+    Ok(())
 }
 
-fn include_paths(arg: &str, user_profile: &Path, ssh_dir: &Path) -> Vec<PathBuf> {
+fn include_paths(arg: &str, user_profile: &Path, ssh_dir: &Path) -> io::Result<Vec<PathBuf>> {
     let Some(pattern_path) = profile_path_arg(arg, user_profile, Some(ssh_dir)) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let pattern = pattern_path.to_string_lossy().replace('\\', "/");
-    let Ok(paths) = glob::glob(&pattern) else {
-        return Vec::new();
-    };
-    paths.filter_map(Result::ok).collect()
+    let paths =
+        glob::glob(&pattern).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    paths
+        .map(|path| path.map_err(io::Error::from))
+        .collect()
 }
 
 fn directive(line: &str) -> Option<(String, Vec<String>)> {
@@ -213,7 +220,7 @@ Host devbox
                 home.join(".agent/socket"),
                 home.join(".revoked/keys"),
             ],
-            slash_paths(ssh_config_dependency_paths(home))
+            slash_paths(ssh_config_dependency_paths(home).expect("discover dependencies"))
         );
     }
 
@@ -236,7 +243,56 @@ Host devbox
                 ssh_dir.join("conf.d/devbox.conf"),
                 home.join(".included/devbox-cert.pub"),
             ],
-            slash_paths(ssh_config_dependency_paths(home))
+            slash_paths(ssh_config_dependency_paths(home).expect("discover dependencies"))
+        );
+    }
+
+    #[test]
+    fn absent_config_and_include_cycles_are_complete() {
+        let tmp = TempDir::new().expect("tempdir");
+        let home = tmp.path();
+        let config = home.join(".ssh/config");
+        assert_eq!(
+            ssh_config_dependency_paths(home).expect("absent config is normal"),
+            vec![config.clone()]
+        );
+        fs::create_dir_all(home.join(".ssh")).expect("create .ssh");
+        fs::write(&config, "Include config\nIdentityFile ~/.keys/key\n")
+            .expect("write cyclic config");
+        assert_eq!(
+            slash_paths(ssh_config_dependency_paths(home).expect("cycle is complete")),
+            slash_paths(vec![config.clone(), config, home.join(".keys/key")])
+        );
+    }
+
+    #[test]
+    fn incomplete_config_discovery_returns_an_error() {
+        let tmp = TempDir::new().expect("tempdir");
+        let home = tmp.path();
+        let config = home.join(".ssh/config");
+        fs::create_dir_all(&config).expect("make config unreadable as a file");
+        assert!(ssh_config_dependency_paths(home).is_err());
+        fs::remove_dir(&config).expect("remove config directory");
+        fs::write(&config, "Include [\n").expect("write invalid glob");
+        assert_eq!(
+            ssh_config_dependency_paths(home)
+                .expect_err("invalid glob must fail")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        fs::write(&config, "Include config1\n").expect("write include root");
+        for depth in 1..=32 {
+            fs::write(
+                home.join(format!(".ssh/config{depth}")),
+                format!("Include config{}\n", depth + 1),
+            )
+            .expect("write deep include");
+        }
+        assert_eq!(
+            ssh_config_dependency_paths(home)
+                .expect_err("depth limit must fail")
+                .kind(),
+            std::io::ErrorKind::InvalidData
         );
     }
 

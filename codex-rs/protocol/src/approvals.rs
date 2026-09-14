@@ -1,6 +1,5 @@
 use crate::mcp::RequestId;
 use crate::models::AdditionalPermissionProfile;
-use crate::models::PermissionProfile;
 use crate::parse_command::ParsedCommand;
 use crate::protocol::FileChange;
 use crate::protocol::ReviewDecision;
@@ -15,21 +14,6 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use ts_rs::TS;
-
-/// Fully resolved permissions for rerunning an intercepted child process.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedPermissionProfile {
-    pub permission_profile: PermissionProfile,
-}
-
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EscalationPermissions {
-    /// Permissions to merge with the active turn permissions.
-    AdditionalPermissionProfile(AdditionalPermissionProfile),
-    /// Fully resolved permissions that should replace the active turn permissions.
-    ResolvedPermissionProfile(ResolvedPermissionProfile),
-}
 
 /// Proposed execpolicy change to allow commands starting with this prefix.
 ///

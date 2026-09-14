@@ -7,6 +7,7 @@ use crate::fragments::AvailableSkillsInstructions;
 
 const MAX_AVAILABLE_SKILLS_BYTES: usize = 8_000;
 const MAX_MAIN_PROMPT_BYTES: usize = 8_000;
+const INCOMPLETE_INSTRUCTIONS_NOTICE: &str = "\n\n[This skill's instructions are incomplete because the context limit was reached. The omitted portion has not been loaded. Read the remaining instructions through the owning provider.]";
 const MAX_CATALOG_SKILL_DESCRIPTION_CHARS: usize = 1_024;
 const TRUNCATED_SKILL_DESCRIPTION_SUFFIX: &str = "...";
 pub(crate) const MAX_SKILL_NAME_BYTES: usize = 256;
@@ -34,17 +35,29 @@ pub(crate) fn available_skills_fragment(
             .as_deref()
             .unwrap_or(entry.description.as_str());
         let description = truncate_catalog_skill_description(description);
-        let line = render_skill_line(entry, description.as_ref());
-        let next_bytes = total_bytes.saturating_add(line.len());
+        let locator_kind = match &entry.authority.kind {
+            SkillSourceKind::Host => "file",
+            SkillSourceKind::Executor => "environment resource",
+            SkillSourceKind::Orchestrator => "orchestrator resource",
+            SkillSourceKind::Custom(_) => "custom resource",
+        };
+        let line_bytes = entry
+            .name
+            .len()
+            .saturating_add(entry.rendered_path().len())
+            .saturating_add(locator_kind.len())
+            .saturating_add(description.len())
+            .saturating_add(if description.is_empty() { 8 } else { 9 });
+        let next_bytes = total_bytes.saturating_add(line_bytes);
         if next_bytes > MAX_AVAILABLE_SKILLS_BYTES {
             omitted = omitted.saturating_add(1);
             continue;
         }
         total_bytes = next_bytes;
-        skill_lines.push(line);
+        skill_lines.push(render_skill_line(entry, description.as_ref(), locator_kind));
     }
 
-    if skill_lines.is_empty() {
+    if skill_lines.is_empty() && omitted == 0 {
         return None;
     }
     if omitted > 0 {
@@ -77,13 +90,7 @@ pub(crate) fn truncate_catalog_skill_description(description: &str) -> Cow<'_, s
     Cow::Owned(truncated)
 }
 
-fn render_skill_line(entry: &SkillCatalogEntry, description: &str) -> String {
-    let locator_kind = match &entry.authority.kind {
-        SkillSourceKind::Host => "file",
-        SkillSourceKind::Executor => "environment resource",
-        SkillSourceKind::Orchestrator => "orchestrator resource",
-        SkillSourceKind::Custom(_) => "custom resource",
-    };
+fn render_skill_line(entry: &SkillCatalogEntry, description: &str, locator_kind: &str) -> String {
     let name = entry.name.as_str();
     let path = entry.rendered_path();
     if description.is_empty() {
@@ -94,7 +101,15 @@ fn render_skill_line(entry: &SkillCatalogEntry, description: &str) -> String {
 }
 
 pub(crate) fn truncate_main_prompt_contents(contents: &str) -> (String, bool) {
-    truncate_utf8_to_bytes(contents, MAX_MAIN_PROMPT_BYTES)
+    if contents.len() <= MAX_MAIN_PROMPT_BYTES {
+        return (contents.to_string(), false);
+    }
+    let (mut prefix, _) = truncate_utf8_to_bytes(
+        contents,
+        MAX_MAIN_PROMPT_BYTES - INCOMPLETE_INSTRUCTIONS_NOTICE.len(),
+    );
+    prefix.push_str(INCOMPLETE_INSTRUCTIONS_NOTICE);
+    (prefix, true)
 }
 
 pub(crate) fn truncate_utf8_to_bytes(contents: &str, max_bytes: usize) -> (String, bool) {

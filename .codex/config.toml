@@ -1,5 +1,5 @@
 approval_policy = "never"
-model_auto_compact_token_limit = 127000
+model_auto_compact_token_limit = 116000
 model_auto_compact_token_limit_scope = "total"
 
 sandbox_mode = "danger-full-access"

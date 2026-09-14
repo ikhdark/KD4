@@ -8,7 +8,6 @@ use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::MCP_TOOL_CODEX_APPS_META_KEY;
 use codex_mcp::McpConnectionManager;
 use codex_mcp::ToolInfo;
-use codex_mcp::codex_apps_tools_cache_key;
 use codex_mcp::compute_auth_statuses;
 use codex_mcp::effective_mcp_servers;
 use codex_mcp::host_owned_codex_apps_enabled;
@@ -56,19 +55,15 @@ impl AppsRequestProcessor {
 
             let mcp_manager = self.thread_manager.mcp_manager();
             let mcp_config = mcp_manager.runtime_config(&config).await;
-            let mut mcp_servers = effective_mcp_servers(&mcp_config, auth.as_ref());
-            mcp_servers.retain(|name, _| name == CODEX_APPS_MCP_SERVER_NAME);
-            let cache_key = codex_apps_tools_cache_key(
-                auth.as_ref(),
-                &mcp_config.chatgpt_base_url,
-                mcp_config.apps_mcp_product_sku.as_deref(),
-            );
+            let cache_key = mcp_config.codex_apps_tools_cache_key(auth.as_ref());
             let previous_tools = mcp_manager
                 .codex_apps_tools_cache()
                 .current_tools(config.codex_home.to_path_buf(), cache_key.clone())
                 .await;
             let tools = if force_refresh && runtime_enabled {
                 let refresh_result = async {
+                    let mut mcp_servers = effective_mcp_servers(&mcp_config, auth.as_ref());
+                    mcp_servers.retain(|name, _| name == CODEX_APPS_MCP_SERVER_NAME);
                     anyhow::ensure!(
                         !mcp_servers.is_empty(),
                         "host-owned MCP server '{CODEX_APPS_MCP_SERVER_NAME}' is not enabled"

@@ -218,3 +218,91 @@ async fn append_entry_trims_history_to_soft_cap() {
     assert_eq!(pruned_len, long_entry_len);
     assert!(pruned_len <= soft_cap_bytes.max(long_entry_len));
 }
+
+#[tokio::test]
+async fn compaction_invalidates_old_offsets_and_preserves_newest_oversized_entry() {
+    let home = TempDir::new().unwrap();
+    let mut config = HistoryConfig::new(home.path(), &History::default());
+    append_entry("first", "session", &config).await.unwrap();
+    append_entry("second", "session", &config).await.unwrap();
+    let (old_id, _) = history_metadata(&config).await;
+    assert_eq!(lookup(old_id, 1, &config).unwrap().text, "second");
+    config.max_bytes = Some(1);
+    append_entry("newest", "session", &config).await.unwrap();
+    let (new_id, count) = history_metadata(&config).await;
+    assert_ne!(new_id, old_id);
+    assert_eq!(count, 1);
+    assert_eq!(lookup(old_id, 0, &config), None);
+    assert_eq!(lookup(new_id, 0, &config).unwrap().text, "newest");
+}
+
+#[tokio::test]
+async fn append_recovers_incomplete_suffix() {
+    let home = TempDir::new().unwrap();
+    let config = HistoryConfig::new(home.path(), &History::default());
+    append_entry("complete", "session", &config).await.unwrap();
+    let (id, _) = history_metadata(&config).await;
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(history_filepath(&config))
+        .unwrap();
+    file.write_all(&vec![b'x'; HISTORY_READ_BUFFER_SIZE + 10])
+        .unwrap();
+    drop(file);
+    append_entry("recovered", "session", &config).await.unwrap();
+    assert_eq!(history_metadata(&config).await, (id, 2));
+    assert_eq!(lookup(id, 0, &config).unwrap().text, "complete");
+    assert_eq!(lookup(id, 1, &config).unwrap().text, "recovered");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn waiting_writer_reopens_after_compaction() {
+    let home = TempDir::new().unwrap();
+    let config = HistoryConfig::new(home.path(), &History::default());
+    append_entry("old", "session", &config).await.unwrap();
+    append_entry("retained", "session", &config).await.unwrap();
+    let path = history_filepath(&config);
+    let retained_len = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .last()
+        .unwrap()
+        .len() as u64
+        + 1;
+    let mut locked = open_locked_history(&path, true).unwrap();
+    let writer_config = config.clone();
+    let writer =
+        tokio::spawn(async move { append_entry("waiting", "session", &writer_config).await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    enforce_history_limit(&mut locked, &path, Some(1), retained_len).unwrap();
+    drop(locked);
+    writer.await.unwrap().unwrap();
+    let (id, count) = history_metadata(&config).await;
+    assert_eq!(count, 2);
+    assert_eq!(lookup(id, 0, &config).unwrap().text, "retained");
+    assert_eq!(lookup(id, 1, &config).unwrap().text, "waiting");
+}
+
+#[tokio::test]
+async fn failed_compaction_publication_preserves_original() {
+    let home = TempDir::new().unwrap();
+    let config = HistoryConfig::new(home.path(), &History::default());
+    append_entry("first", "session", &config).await.unwrap();
+    append_entry("newest", "session", &config).await.unwrap();
+    let path = history_filepath(&config);
+    let original = std::fs::read(&path).unwrap();
+    let newest_len = original
+        .split_inclusive(|byte| *byte == b'\n')
+        .next_back()
+        .unwrap()
+        .len() as u64;
+    let mut locked = open_locked_history(&path, true).unwrap();
+    let invalid_destination = home.path().join("directory");
+    std::fs::create_dir(&invalid_destination).unwrap();
+    assert!(enforce_history_limit(&mut locked, &invalid_destination, Some(1), newest_len).is_err());
+    drop(locked);
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    let (id, count) = history_metadata(&config).await;
+    assert_eq!(count, 2);
+    assert_eq!(lookup(id, 1, &config).unwrap().text, "newest");
+}

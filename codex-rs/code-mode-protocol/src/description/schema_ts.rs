@@ -37,6 +37,8 @@ impl RenderBudget {
 
 type Rendered = Result<String, ()>;
 
+const NESTED_RESOURCE_UNKNOWN: &str = "unknown /* schema projection incomplete: nested $id resource not projected; consult JSON Schema */";
+
 fn render_json_schema_to_typescript_inner(
     schema: &JsonValue,
     root: &JsonValue,
@@ -55,6 +57,11 @@ fn render_json_schema_to_typescript_inner(
 }
 
 fn render_schema(schema: &JsonValue, root: &JsonValue, budget: &mut RenderBudget) -> Rendered {
+    // A nested resource has its own reference identity. Until resource resolution
+    // is supported, never resolve its fragments against the enclosing document.
+    if !std::ptr::eq(schema, root) && schema.get("$id").and_then(JsonValue::as_str).is_some() {
+        return Ok(NESTED_RESOURCE_UNKNOWN.to_string());
+    }
     match schema {
         JsonValue::Bool(true) => Ok("unknown".to_string()),
         JsonValue::Bool(false) => Ok("never".to_string()),
@@ -180,18 +187,32 @@ fn render_schema(schema: &JsonValue, root: &JsonValue, budget: &mut RenderBudget
                         )?);
                     }
                 }
-            } else if map.contains_key("properties")
-                || map.contains_key("additionalProperties")
-                || map.contains_key("required")
-            {
-                base = Some(render_json_schema_object(map, root, budget)?);
-            } else if map.contains_key("items") || map.contains_key("prefixItems") {
-                base = Some(render_json_schema_array(map, root, budget)?);
+            } else {
+                let has_object = [
+                    "properties",
+                    "additionalProperties",
+                    "required",
+                    "patternProperties",
+                ]
+                .iter()
+                .any(|key| map.contains_key(*key));
+                let has_array = ["items", "prefixItems", "minItems", "maxItems"]
+                    .iter()
+                    .any(|key| map.contains_key(*key));
+                if has_object || has_array {
+                    // Applicator keywords constrain only their own instance type.
+                    // Retain the other JSON types, including inside compositions.
+                    let object = render_json_schema_object(map, root, budget)?;
+                    let array = render_json_schema_array(map, root, budget)?;
+                    base = Some(format!(
+                        "string | number | boolean | null | {array} | {object}"
+                    ));
+                }
             }
             if let Some(base) = base {
                 constraints.insert(0, base);
             }
-            Ok(match constraints.len() {
+            let rendered = match constraints.len() {
                 0 => "unknown".to_string(),
                 1 if !map.contains_key("allOf") => constraints.remove(0),
                 _ => constraints
@@ -199,7 +220,8 @@ fn render_schema(schema: &JsonValue, root: &JsonValue, budget: &mut RenderBudget
                     .map(|part| format!("({part})"))
                     .collect::<Vec<_>>()
                     .join(" & "),
-            })
+            };
+            annotate_schema_constraints(rendered, map, budget)
         }
         _ => Ok("unknown".to_string()),
     }
@@ -210,23 +232,81 @@ fn render_local_schema_ref(
     root: &JsonValue,
     budget: &mut RenderBudget,
 ) -> Rendered {
+    budget.spend(reference.len())?;
     let Some(pointer) = reference.strip_prefix('#') else {
         return Ok("unknown /* external $ref not projected */".to_string());
     };
-    let Some(target) = (if pointer.is_empty() {
-        Some(root)
-    } else {
-        root.pointer(pointer)
-    }) else {
-        return Ok("unknown /* unresolved $ref */".to_string());
+    let Some(pointer) = decode_schema_fragment(pointer) else {
+        return Ok("unknown /* invalid $ref URI fragment */".to_string());
     };
-    budget.spend(reference.len())?;
-    if !budget.active_refs.insert(reference.to_string()) {
+    if !pointer.is_empty() && !pointer.starts_with('/') {
+        return Ok("unknown /* unresolved $ref */".to_string());
+    }
+    let mut target = root;
+    // Walk one escaped token at a time so pointers cannot skip over a resource
+    // boundary into a descendant that no longer contains the ancestor's $id.
+    for token in pointer.split('/').skip(1) {
+        budget.nodes = budget.nodes.checked_sub(1).ok_or(())?;
+        if !std::ptr::eq(target, root) && target.get("$id").and_then(JsonValue::as_str).is_some() {
+            return Ok(NESTED_RESOURCE_UNKNOWN.to_string());
+        }
+        let Some(next) = target.pointer(&format!("/{token}")) else {
+            return Ok("unknown /* unresolved $ref */".to_string());
+        };
+        target = next;
+    }
+    if !budget.active_refs.insert(pointer.clone()) {
         return Ok("unknown /* recursive $ref */".to_string());
     }
     let rendered = render_json_schema_to_typescript_inner(target, root, budget);
-    budget.active_refs.remove(reference);
+    budget.active_refs.remove(&pointer);
     rendered
+}
+
+fn decode_schema_fragment(fragment: &str) -> Option<String> {
+    let mut decoded = Vec::with_capacity(fragment.len());
+    let mut bytes = fragment.bytes();
+    while let Some(byte) = bytes.next() {
+        decoded.push(if byte == b'%' {
+            let high = char::from(bytes.next()?).to_digit(16)?;
+            let low = char::from(bytes.next()?).to_digit(16)?;
+            (high * 16 + low) as u8
+        } else {
+            byte
+        });
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn annotate_schema_constraints(
+    rendered: String,
+    map: &serde_json::Map<String, JsonValue>,
+    budget: &mut RenderBudget,
+) -> Rendered {
+    let mut annotations = Vec::new();
+    for keyword in ["pattern", "minLength", "maxLength", "format"] {
+        if let Some(value) = map.get(keyword) {
+            let value = render_bounded_literal(value, budget)?
+                .replace("*/", "* /")
+                .replace(['\n', '\r'], " ");
+            annotations.push(format!("{keyword}: {value}"));
+        }
+    }
+    if map.contains_key("oneOf") {
+        annotations.push("oneOf: exactly one branch must match; consult JSON Schema".to_string());
+    }
+    for keyword in ["not", "if", "then", "else", "$dynamicRef", "$recursiveRef"] {
+        if map.contains_key(keyword) {
+            annotations.push(format!(
+                "unprojected keyword: {keyword}; consult JSON Schema"
+            ));
+        }
+    }
+    Ok(if annotations.is_empty() {
+        rendered
+    } else {
+        format!("{rendered} /* {} */", annotations.join("; "))
+    })
 }
 
 fn render_json_schema_type_keyword(
@@ -401,8 +481,9 @@ fn render_json_schema_object(
         if required.contains(name) && value == &JsonValue::Bool(false) {
             return Ok("never".to_string());
         }
-        if multiline {
-            if let Some(description) = value.get("description").and_then(JsonValue::as_str) {
+        if multiline
+            && let Some(description) = value.get("description").and_then(JsonValue::as_str)
+        {
                 budget.spend(description.len())?;
                 for description_line in description
                     .lines()
@@ -411,7 +492,6 @@ fn render_json_schema_object(
                 {
                     lines.push(format!("// {description_line}"));
                 }
-            }
         }
         budget.spend(name.len().saturating_mul(6))?;
         let property_name = render_json_schema_property_name(name);
@@ -442,7 +522,7 @@ fn render_json_schema_object(
         }
     }
     if lines.is_empty() {
-        return Ok("{}".to_string());
+        return Ok("Record<string, never>".to_string());
     }
     Ok(if multiline {
         format!("{{\n  {}\n}}", lines.join("\n  "))
@@ -460,6 +540,7 @@ fn render_json_schema_property_name(name: &str) -> String {
 }
 
 fn render_bounded_literal(value: &JsonValue, budget: &mut RenderBudget) -> Rendered {
+    bound_literal_traversal(value, budget)?;
     // Stop serialization before a large literal is copied, without reserving the
     // whole output allowance for each ordinary enum member.
     let mut writer = BoundedLiteralWriter {
@@ -469,6 +550,25 @@ fn render_bounded_literal(value: &JsonValue, budget: &mut RenderBudget) -> Rende
     serde_json::to_writer(&mut writer, value).map_err(|_| ())?;
     budget.spend(writer.bytes.len().max(1))?;
     String::from_utf8(writer.bytes).map_err(|_| ())
+}
+
+fn bound_literal_traversal(value: &JsonValue, budget: &mut RenderBudget) -> Result<(), ()> {
+    budget.nodes = budget.nodes.checked_sub(1).ok_or(())?;
+    if budget.depth >= 64 {
+        return Err(());
+    }
+    budget.depth += 1;
+    let result = match value {
+        JsonValue::Array(values) => values
+            .iter()
+            .try_for_each(|value| bound_literal_traversal(value, budget)),
+        JsonValue::Object(values) => values
+            .values()
+            .try_for_each(|value| bound_literal_traversal(value, budget)),
+        _ => Ok(()),
+    };
+    budget.depth -= 1;
+    result
 }
 
 struct BoundedLiteralWriter {
@@ -505,7 +605,14 @@ mod tests {
                     "properties": {"id": {"type": "string"}}, "required": ["id"],
                     (keyword): [{"required": ["left"]}, {"required": ["right"]}]
                 })),
-                "({ id: string; }) & ({ left: unknown; [key: string]: unknown; } | { right: unknown; [key: string]: unknown; })",
+                format!(
+                    "({{ id: string; }}) & (string | number | boolean | null | unknown[] | {{ left: unknown; [key: string]: unknown; }} | string | number | boolean | null | unknown[] | {{ right: unknown; [key: string]: unknown; }}){}",
+                    if keyword == "oneOf" {
+                        " /* oneOf: exactly one branch must match; consult JSON Schema */"
+                    } else {
+                        ""
+                    }
+                ),
                 "{keyword} must retain id on both alternatives"
             );
         }
@@ -564,6 +671,30 @@ mod tests {
             "{ first: string; second: string; }"
         );
         for (schema, expected) in [
+            (
+                json!({"$defs": {"a/b~c": {"type": "boolean"}}, "$ref": "#/%24defs/a%7E1b%7E0c"}),
+                "boolean",
+            ),
+            (
+                json!({"$defs": {"é": {"type": "string"}}, "$ref": "#/$defs/%C3%A9"}),
+                "string",
+            ),
+            (
+                json!({"$defs": {"a b": {"$ref": "#/$defs/a%20b"}}, "$ref": "#/$defs/a b"}),
+                "unknown /* recursive $ref */",
+            ),
+            (
+                json!({"$ref": "#/%FF"}),
+                "unknown /* invalid $ref URI fragment */",
+            ),
+            (
+                json!({"$ref": "#/%2"}),
+                "unknown /* invalid $ref URI fragment */",
+            ),
+            (
+                json!({"$ref": "#/%GG"}),
+                "unknown /* invalid $ref URI fragment */",
+            ),
             (json!({"$ref": "#"}), "unknown /* recursive $ref */"),
             (
                 json!({"$defs": {"a": {"$ref": "#/$defs/b"}, "b": {"$ref": "#/$defs/a"}}, "$ref": "#/$defs/a"}),

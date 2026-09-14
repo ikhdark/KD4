@@ -9,12 +9,29 @@ from scripts import check_duplicate_deps
 class CheckDuplicateDepsTest(unittest.TestCase):
     def test_empty_duplicate_report_passes(self) -> None:
         def runner(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(
+                args,
+                (
+                    [
+                        "cargo",
+                        "tree",
+                        "-d",
+                        "-p",
+                        "codex-cli",
+                        "--target",
+                        "x86_64-pc-windows-msvc",
+                    ],
+                ),
+            )
             return subprocess.CompletedProcess(
                 args=[], returncode=0, stdout="", stderr=""
             )
 
         self.assertEqual(
-            check_duplicate_deps.check_duplicate_deps([], runner=runner), 0
+            check_duplicate_deps.check_duplicate_deps(
+                ["--target", "x86_64-pc-windows-msvc"], runner=runner
+            ),
+            0,
         )
 
     def test_duplicate_report_fails(self) -> None:

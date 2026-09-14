@@ -204,16 +204,19 @@ def declared_non_rust_manifests(markdown: str) -> list[tuple[int, str]]:
     )
 
 
-def repository_source_inventory(repo_root: Path) -> tuple[set[str], set[str]]:
+def repository_source_inventory(
+    repo_root: Path, *, include_untracked: bool = True
+) -> tuple[set[str], set[str]]:
     args = [
         "git",
         "ls-files",
         "-t",
         "--cached",
-        "--others",
         "--exclude-standard",
         "-z",
     ]
+    if include_untracked:
+        args.append("--others")
     result = subprocess.run(
         args,
         cwd=repo_root,
@@ -403,16 +406,6 @@ def check_source_map(
         return 1
 
     failed = False
-    for line_number, owner in owners:
-        if owner_has_source(owner, tracked_sources):
-            continue
-        print(
-            f"{source_map}:{line_number}: declared owner has no repository source: "
-            f"{owner}",
-            file=sys.stderr,
-        )
-        failed = True
-
     inventories = (
         (
             "top-level ownership",
@@ -471,7 +464,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     try:
         with source_map_lock(root, f"source-map-check:{os.getpid()}"):
-            source_paths, tracked_source_paths = repository_source_inventory(root)
+            source_paths, tracked_source_paths = repository_source_inventory(
+                root, include_untracked=False
+            )
             sync_tracked_path_snapshot(
                 args.source_map,
                 repo_root=root,

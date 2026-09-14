@@ -30,6 +30,7 @@ use rmcp::model::JsonRpcError;
 use rmcp::model::JsonRpcNotification;
 use rmcp::model::JsonRpcRequest;
 use rmcp::model::JsonRpcResponse;
+use rmcp::model::ProtocolVersion;
 use rmcp::model::RequestId;
 use rmcp::model::ServerCapabilities;
 use serde_json::json;
@@ -170,26 +171,33 @@ impl MessageProcessor {
             ClientRequest::PingRequest(_params) => {
                 self.handle_ping(request_id).await;
             }
-            ClientRequest::ListResourcesRequest(params) => {
-                self.handle_list_resources(params.params);
+            ClientRequest::ListResourcesRequest(_) => {
+                self.handle_unsupported_request(request_id, "resources/list")
+                    .await;
             }
-            ClientRequest::ListResourceTemplatesRequest(params) => {
-                self.handle_list_resource_templates(params.params);
+            ClientRequest::ListResourceTemplatesRequest(_) => {
+                self.handle_unsupported_request(request_id, "resources/templates/list")
+                    .await;
             }
-            ClientRequest::ReadResourceRequest(params) => {
-                self.handle_read_resource(params.params);
+            ClientRequest::ReadResourceRequest(_) => {
+                self.handle_unsupported_request(request_id, "resources/read")
+                    .await;
             }
-            ClientRequest::SubscribeRequest(params) => {
-                self.handle_subscribe(params.params);
+            ClientRequest::SubscribeRequest(_) => {
+                self.handle_unsupported_request(request_id, "resources/subscribe")
+                    .await;
             }
-            ClientRequest::UnsubscribeRequest(params) => {
-                self.handle_unsubscribe(params.params);
+            ClientRequest::UnsubscribeRequest(_) => {
+                self.handle_unsupported_request(request_id, "resources/unsubscribe")
+                    .await;
             }
-            ClientRequest::ListPromptsRequest(params) => {
-                self.handle_list_prompts(params.params);
+            ClientRequest::ListPromptsRequest(_) => {
+                self.handle_unsupported_request(request_id, "prompts/list")
+                    .await;
             }
-            ClientRequest::GetPromptRequest(params) => {
-                self.handle_get_prompt(params.params);
+            ClientRequest::GetPromptRequest(_) => {
+                self.handle_unsupported_request(request_id, "prompts/get")
+                    .await;
             }
             ClientRequest::ListToolsRequest(params) => {
                 self.handle_list_tools(request_id, params.params).await;
@@ -197,11 +205,13 @@ impl MessageProcessor {
             ClientRequest::CallToolRequest(params) => {
                 self.handle_call_tool(request_id, params.params).await;
             }
-            ClientRequest::SetLevelRequest(params) => {
-                self.handle_set_level(params.params);
+            ClientRequest::SetLevelRequest(_) => {
+                self.handle_unsupported_request(request_id, "logging/setLevel")
+                    .await;
             }
-            ClientRequest::CompleteRequest(params) => {
-                self.handle_complete(params.params);
+            ClientRequest::CompleteRequest(_) => {
+                self.handle_unsupported_request(request_id, "completion/complete")
+                    .await;
             }
             ClientRequest::GetTaskInfoRequest(_) => {
                 self.handle_unsupported_request(request_id, "tasks/get_info")
@@ -291,8 +301,7 @@ impl MessageProcessor {
         let elicitation = params.capabilities.elicitation.as_ref();
         self.outgoing.set_elicitation_capabilities(
             elicitation
-                .and_then(|capability| capability.form.as_ref())
-                .is_some(),
+                .is_some_and(|capability| capability.form.is_some() || capability.url.is_none()),
             elicitation
                 .and_then(|capability| capability.url.as_ref())
                 .is_some(),
@@ -332,8 +341,20 @@ impl MessageProcessor {
             .enable_tools()
             .enable_tool_list_changed()
             .build();
+        let protocol_version = if [
+            ProtocolVersion::V_2024_11_05,
+            ProtocolVersion::V_2025_03_26,
+            ProtocolVersion::V_2025_06_18,
+            ProtocolVersion::V_2025_11_25,
+        ]
+        .contains(&params.protocol_version)
+        {
+            params.protocol_version
+        } else {
+            ProtocolVersion::V_2025_11_25
+        };
         let result = InitializeResult::new(capabilities)
-            .with_protocol_version(params.protocol_version.clone())
+            .with_protocol_version(protocol_version)
             .with_server_info(server_info);
         let mut result_value = match serde_json::to_value(result) {
             Ok(value) => value,
@@ -362,34 +383,6 @@ impl MessageProcessor {
     async fn handle_ping(&self, id: RequestId) {
         tracing::info!("ping");
         self.outgoing.send_response(id, json!({})).await;
-    }
-
-    fn handle_list_resources(&self, _params: Option<rmcp::model::PaginatedRequestParams>) {
-        tracing::info!("resources/list");
-    }
-
-    fn handle_list_resource_templates(&self, _params: Option<rmcp::model::PaginatedRequestParams>) {
-        tracing::info!("resources/templates/list");
-    }
-
-    fn handle_read_resource(&self, _params: rmcp::model::ReadResourceRequestParams) {
-        tracing::info!("resources/read");
-    }
-
-    fn handle_subscribe(&self, _params: rmcp::model::SubscribeRequestParams) {
-        tracing::info!("resources/subscribe");
-    }
-
-    fn handle_unsubscribe(&self, _params: rmcp::model::UnsubscribeRequestParams) {
-        tracing::info!("resources/unsubscribe");
-    }
-
-    fn handle_list_prompts(&self, _params: Option<rmcp::model::PaginatedRequestParams>) {
-        tracing::info!("prompts/list");
-    }
-
-    fn handle_get_prompt(&self, _params: rmcp::model::GetPromptRequestParams) {
-        tracing::info!("prompts/get");
     }
 
     async fn handle_list_tools(
@@ -437,18 +430,9 @@ impl MessageProcessor {
         arguments: Option<rmcp::model::JsonObject>,
     ) {
         let arguments = arguments.map(serde_json::Value::Object);
-        let (initial_prompt, config): (String, Config) = match arguments {
+        let tool_cfg = match arguments {
             Some(json_val) => match serde_json::from_value::<CodexToolCallParam>(json_val) {
-                Ok(tool_cfg) => match tool_cfg.into_config(self.arg0_paths.clone()).await {
-                    Ok(cfg) => cfg,
-                    Err(e) => {
-                        let result = CallToolResult::error(vec![rmcp::model::Content::text(
-                            format!("Failed to load Codex configuration from overrides: {e}"),
-                        )]);
-                        self.outgoing.send_response(id, result).await;
-                        return;
-                    }
-                },
+                Ok(tool_cfg) => tool_cfg,
                 Err(e) => {
                     let result = CallToolResult::error(vec![rmcp::model::Content::text(format!(
                         "Failed to parse configuration for Codex tool: {e}"
@@ -466,6 +450,17 @@ impl MessageProcessor {
             }
         };
 
+        let request = RunningRequest {
+            thread_id: None,
+            turn_id: id.to_string(),
+            cancellation: CancellationToken::new(),
+        };
+        self.running_requests_id_to_codex_uuid
+            .lock()
+            .await
+            .insert(id.clone(), request.clone());
+        let arg0_paths = self.arg0_paths.clone();
+
         // Clone outgoing and server to move into async task.
         let outgoing = self.outgoing.clone();
         let thread_manager = self.thread_manager.clone();
@@ -474,13 +469,26 @@ impl MessageProcessor {
         // Spawn an async task to handle the Codex session so that we do not
         // block the synchronous message-processing loop.
         self.tool_tasks.spawn(async move {
-            // Run the Codex session and stream events back to the client.
+            let prepared = tokio::select! {
+                biased;
+                _ = request.cancellation.cancelled() => Err("Codex request cancelled during startup.".to_string()),
+                result = tool_cfg.into_config(arg0_paths) => result.map_err(|e| format!("Failed to load Codex configuration from overrides: {e}")),
+            };
+            let (initial_prompt, config) = match prepared {
+                Ok(prepared) => prepared,
+                Err(message) => {
+                    outgoing.send_response(id.clone(), CallToolResult::error(vec![rmcp::model::Content::text(message)])).await;
+                    running_requests_id_to_codex_uuid.lock().await.remove(&id);
+                    return;
+                }
+            };
             crate::codex_tool_runner::run_codex_tool_session(
                 id,
                 initial_prompt,
                 config,
                 outgoing,
                 thread_manager,
+                request,
                 running_requests_id_to_codex_uuid,
             )
             .await;
@@ -510,10 +518,10 @@ impl MessageProcessor {
             },
             None => {
                 tracing::error!(
-                    "Missing arguments for codex-reply tool-call; the `thread_id` and `prompt` fields are required."
+                    "Missing arguments for codex-reply tool-call; the `threadId` (or `conversationId`) and `prompt` fields are required."
                 );
                 let result = CallToolResult::error(vec![rmcp::model::Content::text(
-                    "Missing arguments for codex-reply tool-call; the `thread_id` and `prompt` fields are required.",
+                    "Missing arguments for codex-reply tool-call; the `threadId` (or `conversationId`) and `prompt` fields are required.",
                 )]);
                 self.outgoing.send_response(request_id, result).await;
                 return;
@@ -550,6 +558,30 @@ impl MessageProcessor {
             }
         };
 
+        // A core turn may already be complete while its runner is still draining
+        // the shared event queue. Keep exclusive ownership until that runner exits.
+        let request = RunningRequest {
+            thread_id: Some(thread_id),
+            turn_id: codex.reserve_turn_id(),
+            cancellation: CancellationToken::new(),
+        };
+        {
+            let mut requests = running_requests_id_to_codex_uuid.lock().await;
+            if requests
+                .values()
+                .any(|request| request.thread_id == Some(thread_id))
+            {
+                drop(requests);
+                self.tool_tasks.spawn(async move {
+                    outgoing.send_response(request_id, crate::codex_tool_runner::create_call_tool_result_with_thread_id(
+                        thread_id, "A Codex request is still running for this thread; wait for its response before replying.".to_string(), Some(true),
+                    )).await;
+                });
+                return;
+            }
+            requests.insert(request_id.clone(), request.clone());
+        }
+
         // Spawn the long-running reply handler.
         let prompt = codex_tool_call_reply_param.prompt.clone();
         self.tool_tasks.spawn({
@@ -563,19 +595,12 @@ impl MessageProcessor {
                     outgoing,
                     request_id,
                     prompt,
+                    request,
                     running_requests_id_to_codex_uuid,
                 )
                 .await;
             }
         });
-    }
-
-    fn handle_set_level(&self, _params: rmcp::model::SetLevelRequestParams) {
-        tracing::info!("logging/setLevel");
-    }
-
-    fn handle_complete(&self, _params: rmcp::model::CompleteRequestParams) {
-        tracing::info!("completion/complete");
     }
 
     async fn handle_unsupported_request(&self, id: RequestId, method: &str) {
@@ -613,7 +638,9 @@ impl MessageProcessor {
         };
         // Preserve cancellation while the normal turn-start admission is pending.
         request.cancellation.cancel();
-        let thread_id = request.thread_id;
+        let Some(thread_id) = request.thread_id else {
+            return;
+        };
         tracing::info!("thread_id: {thread_id}");
 
         // Obtain the Codex thread from the server.
@@ -628,11 +655,7 @@ impl MessageProcessor {
         // Core checks this identity while claiming the active turn's terminal
         // transition, so completion/new-turn races cannot redirect cancellation.
         codex_arc.interrupt_turn_if_active(&request.turn_id).await;
-        // unregister the id so we don't keep it in the map
-        self.running_requests_id_to_codex_uuid
-            .lock()
-            .await
-            .remove(&request_id);
+        // The runner retains event ownership until it has sent the final response.
     }
 
     fn handle_progress_notification(&self, _params: rmcp::model::ProgressNotificationParam) {
@@ -657,6 +680,93 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    async fn test_processor() -> anyhow::Result<(
+        tempfile::TempDir,
+        MessageProcessor,
+        tokio::sync::mpsc::Receiver<crate::outgoing_message::OutgoingMessage>,
+    )> {
+        let home = tempfile::TempDir::new()?;
+        let config = codex_core::config::ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await?;
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let processor = MessageProcessor::new(
+            OutgoingMessageSender::new(tx),
+            Arg0DispatchPaths::default(),
+            Arc::new(config),
+            Arc::new(EnvironmentManager::default_for_tests()),
+            None,
+            "test".into(),
+        )
+        .await;
+        Ok((home, processor, rx))
+    }
+
+    #[tokio::test]
+    async fn initialize_recognizes_legacy_and_explicit_form_capabilities() -> anyhow::Result<()> {
+        for (capabilities, expected) in [
+            (json!({}), false),
+            (json!({"elicitation":{}}), true),
+            (json!({"elicitation":{"url":{}}}), false),
+            (json!({"elicitation":{"form":{}}}), true),
+        ] {
+            let (_home, mut processor, mut rx) = test_processor().await?;
+            processor
+                .process_request(serde_json::from_value(json!({
+                    "jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
+                        "protocolVersion":"2025-03-26", "capabilities":capabilities,
+                        "clientInfo":{"name":"test","version":"1"}
+                    }
+                }))?)
+                .await;
+            let Some(crate::outgoing_message::OutgoingMessage::Response(response)) =
+                rx.recv().await
+            else {
+                panic!("expected initialize response");
+            };
+            assert_eq!(response.result["protocolVersion"], "2025-03-26");
+            assert_eq!(processor.outgoing.supports_form_elicitation(), expected);
+            processor.shutdown().await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_worker_start_is_not_lost() -> anyhow::Result<()> {
+        let (_home, mut processor, mut rx) = test_processor().await?;
+        processor
+            .process_request(serde_json::from_value(json!({
+                "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                "params":{"name":"codex", "arguments":{"prompt":"must not start"}}
+            }))?)
+            .await;
+        processor
+            .process_notification(serde_json::from_value(json!({
+                "jsonrpc":"2.0", "method":"notifications/cancelled", "params":{"requestId":1}
+            }))?)
+            .await;
+        let response = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await?;
+        let Some(crate::outgoing_message::OutgoingMessage::Response(response)) = response else {
+            panic!("cancelled startup must respond without session events");
+        };
+        assert_eq!(response.id, RequestId::Number(1));
+        assert_eq!(response.result["isError"], true);
+        assert_eq!(
+            response.result["content"][0]["text"],
+            "Codex request cancelled during startup."
+        );
+        assert!(
+            processor
+                .running_requests_id_to_codex_uuid
+                .lock()
+                .await
+                .is_empty()
+        );
+        processor.shutdown().await;
+        Ok(())
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn stale_mcp_cancellation_leaves_newer_turn_running() -> anyhow::Result<()> {
@@ -733,32 +843,87 @@ mod tests {
         processor
             .process_request(reply(102, "second prompt")?)
             .await;
-        tokio::time::timeout(Duration::from_secs(60), server.wait_for_request_count(2)).await?;
-        assert_eq!(test.codex.agent_status().await, AgentStatus::Running);
+        drop(output_permit);
+        let responses = tokio::time::timeout(Duration::from_secs(60), async {
+            let mut responses = HashMap::new();
+            while responses.len() < 2 {
+                if let Some(crate::outgoing_message::OutgoingMessage::Response(response)) =
+                    rx.recv().await
+                {
+                    responses.insert(response.id, response.result);
+                }
+            }
+            responses
+        })
+        .await?;
+        assert_eq!(
+            responses[&RequestId::Number(101)]["content"][0]["text"],
+            "first complete"
+        );
+        assert_eq!(responses[&RequestId::Number(102)]["isError"], true);
+        assert!(
+            responses[&RequestId::Number(102)]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("still running")
+        );
+        assert_eq!(server.requests().await.len(), 1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while processor
+                .running_requests_id_to_codex_uuid
+                .lock()
+                .await
+                .contains_key(&RequestId::Number(101))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
 
+        processor
+            .process_request(reply(103, "second prompt")?)
+            .await;
+        tokio::time::timeout(Duration::from_secs(60), server.wait_for_request_count(2)).await?;
         processor
             .process_notification(serde_json::from_value(json!({
                 "jsonrpc": "2.0", "method": "notifications/cancelled",
                 "params": { "requestId": 101 },
             }))?)
             .await;
-        assert_eq!(
-            test.codex.agent_status().await,
-            AgentStatus::Running,
-            "cancelling the completed first turn must leave the gated second turn active"
+        assert_eq!(test.codex.agent_status().await, AgentStatus::Running);
+        assert!(
+            processor
+                .running_requests_id_to_codex_uuid
+                .lock()
+                .await
+                .contains_key(&RequestId::Number(103))
         );
-        {
-            let requests = processor.running_requests_id_to_codex_uuid.lock().await;
-            assert!(!requests.contains_key(&RequestId::Number(101)));
-            assert!(requests.contains_key(&RequestId::Number(102)));
-        }
-        // An overlapping reply must not be admitted as steering for the turn
-        // owned by request 102, which would give 103 authority to cancel it.
         processor
-            .process_request(reply(103, "overlapping prompt")?)
+            .process_request(reply(104, "overlapping prompt")?)
             .await;
-        drop(output_permit);
         let rejected = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if let Some(crate::outgoing_message::OutgoingMessage::Response(response)) =
+                    rx.recv().await
+                    && response.id == RequestId::Number(104)
+                {
+                    break response.result;
+                }
+            }
+        })
+        .await?;
+        assert_eq!(rejected["isError"], true);
+        assert!(
+            rejected["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("still running")
+        );
+        assert_eq!(server.requests().await.len(), 2);
+        second_gate
+            .send(())
+            .expect("the newer model response must still be waiting");
+        let outcome = tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 if let Some(crate::outgoing_message::OutgoingMessage::Response(response)) =
                     rx.recv().await
@@ -769,33 +934,10 @@ mod tests {
             }
         })
         .await?;
-        assert_eq!(rejected["isError"], json!(true));
-        assert!(
-            rejected["content"][0]["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("a turn is already active"))
-        );
-        assert_eq!(server.requests().await.len(), 2);
-        assert_eq!(test.codex.agent_status().await, AgentStatus::Running);
-        second_gate
-            .send(())
-            .expect("the newer model response must still be waiting");
-        let outcome = tokio::time::timeout(Duration::from_secs(60), async {
-            loop {
-                let status = test.codex.agent_status().await;
-                if status != AgentStatus::Running {
-                    break status;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
+        assert_eq!(outcome["content"][0]["text"], "second complete");
+        assert_ne!(outcome["isError"], true);
         processor.shutdown().await;
         server.shutdown().await;
-        assert_eq!(
-            outcome?,
-            AgentStatus::Completed(Some("second complete".into()))
-        );
         Ok(())
     }
 

@@ -15,7 +15,9 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 
 pub use crate::command_safety::PowershellDirectArgvCandidate;
 
+use crate::command_safety::PowershellInvocation;
 use crate::command_safety::PowershellResolutionState;
+use crate::command_safety::parse_powershell_invocation;
 use crate::command_safety::try_parse_powershell_ast_analysis;
 
 use crate::command_safety::try_parse_powershell_ast_analysis_with_resolution;
@@ -40,7 +42,11 @@ pub fn prefix_powershell_script_with_utf8(command: &[String]) -> Vec<String> {
     };
 
     let mut command = command.to_vec();
-    command[extracted.script_index] = script;
+    command[extracted.script_index] = format!(
+        "{}{}",
+        &command[extracted.script_index][..extracted.script_offset],
+        script
+    );
     command
 }
 
@@ -48,6 +54,7 @@ struct ExtractedPowershellCommand<'a> {
     shell: &'a str,
     script: &'a str,
     script_index: usize,
+    script_offset: usize,
     no_profile: bool,
 }
 
@@ -92,7 +99,7 @@ pub fn is_trusted_powershell_executable(executable: &str) -> bool {
 fn extract_powershell_command_details(
     command: &[String],
 ) -> Option<ExtractedPowershellCommand<'_>> {
-    if command.len() < 3 {
+    if command.len() < 2 {
         return None;
     }
 
@@ -104,32 +111,19 @@ fn extract_powershell_command_details(
         return None;
     }
 
-    let mut no_profile = false;
-    let mut i = 1usize;
-    while i < command.len() {
-        let flag = &command[i];
-        match flag.to_ascii_lowercase().as_str() {
-            "-nologo" => i += 1,
-            "-noprofile" => {
-                no_profile = true;
-                i += 1;
-            }
-            "-command" | "-c" => {
-                let script_index = i + 1;
-                if script_index + 1 != command.len() {
-                    return None;
-                }
-                return Some(ExtractedPowershellCommand {
-                    shell,
-                    script: &command[script_index],
-                    script_index,
-                    no_profile,
-                });
-            }
-            _ => return None,
-        }
-    }
-    None
+    let PowershellInvocation::InlineCommand { script, no_profile } =
+        parse_powershell_invocation(&command[1..])
+    else {
+        return None;
+    };
+    let script_index = command.len() - 1;
+    Some(ExtractedPowershellCommand {
+        shell,
+        script,
+        script_index,
+        script_offset: command[script_index].len() - script.len(),
+        no_profile,
+    })
 }
 
 /// Parse the script body from a top-level PowerShell wrapper into argv-like commands.
@@ -256,8 +250,9 @@ fn env_value_ignore_ascii_case<'a>(
     env: &'a HashMap<String, String>,
     name: &str,
 ) -> Option<&'a str> {
-    env.iter()
-        .find_map(|(key, value)| key.eq_ignore_ascii_case(name).then_some(value.as_str()))
+    let mut values = env.iter().filter(|(key, _)| key.eq_ignore_ascii_case(name));
+    let (_, value) = values.next()?;
+    values.next().is_none().then_some(value.as_str())
 }
 
 fn resolve_direct_exe(command_name: &str, path: &str) -> Option<PathBuf> {
@@ -345,27 +340,14 @@ pub fn try_find_powershell_executable_blocking() -> Option<AbsolutePathBuf> {
 /// has installed pwsh.exe, it may not be available in the system PATH, in which
 /// case we attempt to locate it via other means.
 pub fn try_find_pwsh_executable_blocking() -> Option<AbsolutePathBuf> {
-    if let Some(ps_home) = std::process::Command::new("cmd")
-        .args(["/C", "pwsh", "-NoProfile", "-Command", "$PSHOME"])
-        .output()
-        .ok()
-        .and_then(|out| {
-            if !out.status.success() {
-                return None;
-            }
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let trimmed = stdout.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        })
-    {
-        let candidate = AbsolutePathBuf::resolve_path_against_base("pwsh.exe", &ps_home);
-
-        if is_powershellish_executable_available(candidate.as_path()) {
-            return Some(candidate);
-        }
-    }
-
-    try_find_powershellish_executable_in_path(&["pwsh.exe"])
+    try_find_powershellish_executable_in_path(&["pwsh.exe"]).or_else(|| {
+        let program_files = std::env::var_os("ProgramFiles")?;
+        let candidate = PathBuf::from(program_files).join("PowerShell/7/pwsh.exe");
+        candidate
+            .is_file()
+            .then(|| AbsolutePathBuf::from_absolute_path(candidate).ok())
+            .flatten()
+    })
 }
 
 fn try_find_powershellish_executable_in_path(candidates: &[&str]) -> Option<AbsolutePathBuf> {
@@ -373,10 +355,6 @@ fn try_find_powershellish_executable_in_path(candidates: &[&str]) -> Option<Abso
         let Ok(resolved_path) = which::which(candidate) else {
             continue;
         };
-
-        if !is_powershellish_executable_available(&resolved_path) {
-            continue;
-        }
 
         let Ok(abs_path) = AbsolutePathBuf::from_absolute_path(resolved_path) else {
             continue;
@@ -386,15 +364,6 @@ fn try_find_powershellish_executable_in_path(candidates: &[&str]) -> Option<Abso
     }
 
     None
-}
-
-fn is_powershellish_executable_available(powershell_or_pwsh_exe: &std::path::Path) -> bool {
-    // This test works for both powershell.exe and pwsh.exe.
-    std::process::Command::new(powershell_or_pwsh_exe)
-        .args(["-NoLogo", "-NoProfile", "-Command", "Write-Output ok"])
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -417,6 +386,54 @@ mod tests {
     use super::resolve_direct_exe;
 
     use super::try_find_pwsh_executable_blocking;
+
+    #[test]
+    fn review_regression_envelopes_share_extraction_and_utf8_rewriting() {
+        let inline = vec!["pwsh".to_string(), "-Command:Write-Output hi".to_string()];
+        assert_eq!(
+            extract_powershell_command(&inline),
+            Some(("pwsh", "Write-Output hi"))
+        );
+        assert_eq!(
+            prefix_powershell_script_with_utf8(&inline),
+            vec![
+                "pwsh".to_string(),
+                format!("-Command:{UTF8_OUTPUT_PREFIX}Write-Output hi")
+            ]
+        );
+        for flag in ["-Command", "/Command", "-c", "-Command:", "/Command:"] {
+            let mut command = vec![
+                "pwsh".to_string(),
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+            ];
+            if flag.ends_with(':') {
+                command.push(format!("{flag}Write-Output hi"));
+            } else {
+                command.extend([flag.to_string(), "Write-Output hi".to_string()]);
+            }
+            assert_eq!(
+                extract_powershell_command(&command),
+                Some(("pwsh", "Write-Output hi"))
+            );
+            let prefixed = prefix_powershell_script_with_utf8(&command);
+            let expected = format!("{UTF8_OUTPUT_PREFIX}Write-Output hi");
+            assert_eq!(
+                extract_powershell_command(&prefixed),
+                Some(("pwsh", expected.as_str()))
+            );
+            assert_eq!(prefix_powershell_script_with_utf8(&prefixed), prefixed);
+        }
+    }
+
+    #[test]
+    fn review_regression_resolution_rejects_ambiguous_environment_keys() {
+        let env = HashMap::from([
+            ("PATH".to_string(), "one".to_string()),
+            ("Path".to_string(), "two".to_string()),
+        ]);
+        assert_eq!(super::env_value_ignore_ascii_case(&env, "PATH"), None);
+    }
 
     #[test]
     fn direct_resolution_accepts_rooted_local_exe_but_rejects_relative_and_unc_paths() {

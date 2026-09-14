@@ -32,34 +32,42 @@ impl IdeContextState {
 
 impl ChatWidget {
     pub(super) fn handle_ide_command(&mut self) {
-        if self.ide_context.is_enabled() {
-            self.ide_context.disable();
-            self.sync_ide_context_status_indicator();
-            self.add_info_message("IDE context is off.".to_string(), /*hint*/ None);
-        } else {
-            self.ide_context.enable();
-            self.add_ide_context_status_message();
-        }
+        self.handle_ide_command_args("");
     }
 
     pub(super) fn handle_ide_command_args(&mut self, args: &str) {
-        match args.to_ascii_lowercase().as_str() {
-            "" => self.handle_ide_command(),
+        self.handle_ide_command_args_with_fetch(args, |cwd| {
+            crate::ide_context::fetch_ide_context(cwd).map_err(|err| err.user_facing_hint())
+        });
+    }
+
+    pub(super) fn handle_ide_command_args_with_fetch(
+        &mut self,
+        args: &str,
+        fetch: impl FnOnce(&std::path::Path) -> Result<crate::ide_context::IdeContext, String>,
+    ) {
+        let args = args.to_ascii_lowercase();
+        let args = if args.is_empty() {
+            if self.ide_context.is_enabled() {
+                "off"
+            } else {
+                "on"
+            }
+        } else {
+            args.as_str()
+        };
+        match args {
             "on" => {
                 self.ide_context.enable();
-                self.add_ide_context_status_message();
+                self.add_ide_context_status_message(true, fetch);
             }
             "off" => {
                 self.ide_context.disable();
                 self.sync_ide_context_status_indicator();
-                self.add_info_message("IDE context is off.".to_string(), /*hint*/ None);
+                self.add_info_message("IDE context is off.".to_string(), None);
             }
-            "status" => {
-                self.add_ide_context_status_message();
-            }
-            _ => {
-                self.add_error_message("Usage: /ide [on|off|status]".to_string());
-            }
+            "status" => self.add_ide_context_status_message(false, fetch),
+            _ => self.add_error_message("Usage: /ide [on|off|status]".to_string()),
         }
     }
 
@@ -88,14 +96,18 @@ impl ChatWidget {
         }
     }
 
-    fn add_ide_context_status_message(&mut self) {
+    fn add_ide_context_status_message(
+        &mut self,
+        initial_enablement: bool,
+        fetch: impl FnOnce(&std::path::Path) -> Result<crate::ide_context::IdeContext, String>,
+    ) {
         if !self.ide_context.is_enabled() {
             self.sync_ide_context_status_indicator();
             self.add_info_message("IDE context is off.".to_string(), /*hint*/ None);
             return;
         }
 
-        match crate::ide_context::fetch_ide_context(&self.config.cwd) {
+        match fetch(self.config.cwd.as_path()) {
             Ok(context) => {
                 self.ide_context.mark_available();
                 self.sync_ide_context_status_indicator();
@@ -115,11 +127,18 @@ impl ChatWidget {
                 }
             }
             Err(err) => {
-                self.ide_context.disable();
+                if initial_enablement {
+                    self.ide_context.disable();
+                }
                 self.sync_ide_context_status_indicator();
                 self.add_info_message(
-                    "IDE context could not be enabled.".to_string(),
-                    Some(err.user_facing_hint()),
+                    if initial_enablement {
+                        "IDE context could not be enabled."
+                    } else {
+                        "IDE context is on, but currently unavailable."
+                    }
+                    .to_string(),
+                    Some(err),
                 );
             }
         }

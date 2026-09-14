@@ -7837,6 +7837,12 @@ class ThreadGoalSetParams(BaseModel):
         populate_by_name=True,
     )
     objective: str | None = None
+    replace: Annotated[
+        bool | None,
+        Field(
+            description="Replace the goal atomically, resetting usage and its identity. Requires an objective."
+        ),
+    ] = None
     status: ThreadGoalStatus | None = None
     thread_id: Annotated[str, Field(alias="threadId")]
     token_budget: Annotated[int | None, Field(alias="tokenBudget")] = None
@@ -8866,7 +8872,12 @@ class AdditionalFileSystemPermissions(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
-    entries: list[V2FileSystemSandboxEntry] | None = None
+    entries: Annotated[
+        list[V2FileSystemSandboxEntry] | None,
+        Field(
+            description="When present, replaces legacy `read` and `write`, including when empty."
+        ),
+    ] = None
     glob_scan_max_depth: Annotated[int | None, Field(alias="globScanMaxDepth", ge=1)] = None
     read: Annotated[
         list[LegacyAppPathString] | None,
@@ -9072,12 +9083,6 @@ class Config(BaseModel):
     )
     analytics: AnalyticsConfig | None = None
     approval_policy: AskForApproval | None = None
-    approvals_reviewer: Annotated[
-        ApprovalsReviewer | None,
-        Field(
-            description="[UNSTABLE] Optional default for where approval requests are routed for review."
-        ),
-    ] = None
     compact_prompt: str | None = None
     desktop: dict[str, Any] | None = None
     developer_instructions: str | None = None
@@ -9153,7 +9158,13 @@ class ErrorNotification(BaseModel):
     error: TurnError
     thread_id: Annotated[str, Field(alias="threadId")]
     turn_id: Annotated[str, Field(alias="turnId")]
-    will_retry: Annotated[bool, Field(alias="willRetry")]
+    will_retry: Annotated[
+        bool,
+        Field(
+            alias="willRetry",
+            description="Whether the server will retry automatically. When true, the turn remains active; clients should not initiate a duplicate retry for this notification.",
+        ),
+    ]
 
 
 class ExternalAgentConfigImportCompletedNotification(BaseModel):

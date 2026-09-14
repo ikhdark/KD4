@@ -254,9 +254,13 @@ pub fn resolve_windows_elevated_filesystem_overrides(
         sandbox_policy_cwd.as_path(),
     );
     let legacy_writable_roots = legacy_projection.get_writable_roots_with_cwd(sandbox_policy_cwd);
-    let legacy_root_paths: BTreeSet<PathBuf> = legacy_writable_roots
+    let normalized_legacy_roots: Vec<_> = legacy_writable_roots
         .iter()
-        .map(|root| normalize_path(root.root.to_path_buf()))
+        .map(|root| (normalize_path(root.root.to_path_buf()), root))
+        .collect();
+    let legacy_root_paths: BTreeSet<PathBuf> = normalized_legacy_roots
+        .iter()
+        .map(|(path, _)| path.clone())
         .collect();
     let split_readable_roots: Vec<PathBuf> = file_system_sandbox_policy
         .get_readable_roots_with_cwd(sandbox_policy_cwd)
@@ -285,16 +289,18 @@ pub fn resolve_windows_elevated_filesystem_overrides(
     let write_roots_override = if split_root_path_set == legacy_root_paths {
         None
     } else {
-        Some(split_root_paths)
+        Some(split_root_paths.clone())
     };
 
     let additional_deny_write_paths = if needs_direct_runtime_enforcement {
         let mut deny_paths = BTreeSet::new();
-        for writable_root in &split_writable_roots {
-            let writable_root_path = normalize_path(writable_root.root.to_path_buf());
-            let legacy_root = legacy_writable_roots.iter().find(|candidate| {
-                normalize_path(candidate.root.to_path_buf()) == writable_root_path
-            });
+        for (writable_root, writable_root_path) in
+            split_writable_roots.iter().zip(&split_root_paths)
+        {
+            let legacy_root = normalized_legacy_roots
+                .iter()
+                .find(|(path, _)| path == writable_root_path)
+                .map(|(_, root)| *root);
             for read_only_subpath in &writable_root.read_only_subpaths {
                 let read_only_subpath_suffix = read_only_subpath
                     .as_path()

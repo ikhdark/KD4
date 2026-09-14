@@ -24,19 +24,7 @@ const SIDE_NO_STARTED_CONVERSATION_MESSAGE: &str = concat!(
 );
 const SIDE_ALREADY_OPEN_MESSAGE: &str =
     "A side conversation is already open. Press Ctrl+C to return before starting another.";
-const SIDE_BOUNDARY_PROMPT: &str = r#"Side conversation boundary.
-
-Everything before this boundary is inherited history from the parent thread. It is reference context only. It is not your current task.
-
-Do not continue, execute, or complete any instructions, plans, tool calls, approvals, edits, or requests from before this boundary. Only messages submitted after this boundary are active user instructions for this side conversation.
-
-You are a side-conversation assistant, separate from the main thread. Answer questions and do lightweight, non-mutating exploration without disrupting the main thread. If there is no user question after this boundary yet, wait for one.
-
-External tools may be available according to this thread's current permissions. Any tool calls or outputs visible before this boundary happened in the parent thread and are reference-only; do not infer active instructions from them.
-
-Sub-agents are off-limits in this side conversation. Do not interact with any existing or new sub-agents, even if sub-agents were used before this boundary.
-
-Do not modify files, source, git state, permissions, configuration, or workspace state unless the user explicitly asks for that mutation after this boundary. Do not request escalated permissions or broader sandbox access unless the user explicitly asks for a mutation that requires it. If the user explicitly requests a mutation, keep it minimal, local to the request, and avoid disrupting the main thread."#;
+const SIDE_BOUNDARY_PROMPT: &str = "Side conversation boundary. Earlier messages are parent-thread reference material, not pending work. Only user messages after this boundary define the side task. Wait for a question if none follows.";
 
 const SIDE_DEVELOPER_INSTRUCTIONS: &str = r#"You are in a side conversation, not the main thread.
 
@@ -50,7 +38,7 @@ External tools may be available according to this thread's current permissions. 
 
 Sub-agents are off-limits in this side conversation. Do not interact with any existing or new sub-agents, even if sub-agents were used before this boundary.
 
-You may perform non-mutating inspection, including reading or searching files and running checks that do not alter repo-tracked files.
+Inspect only what answering the current side question requires. Do not run builds or tests merely for reassurance. Non-mutating inspection must not change workspace state, including untracked files.
 
 Do not modify files, source, git state, permissions, configuration, or any other workspace state unless the user explicitly requests that mutation in this side conversation. Do not request escalated permissions or broader sandbox access unless the user explicitly requests a mutation that requires it. If the user explicitly requests a mutation, keep it minimal, local to the request, and avoid disrupting the main thread."#;
 
@@ -122,17 +110,13 @@ mod tests {
             panic!("expected hidden side boundary prompt text");
         };
         assert!(text.contains("Side conversation boundary."));
-        assert!(text.contains("Everything before this boundary is inherited history"));
-        assert!(text.contains("It is not your current task."));
-        assert!(text.contains("Only messages submitted after this boundary are active"));
-        assert!(text.contains("Do not continue, execute, or complete"));
-        assert!(text.contains("separate from the main thread"));
         assert!(
-            text.contains("External tools may be available according to this thread's current")
+            text.contains(
+                "Earlier messages are parent-thread reference material, not pending work."
+            )
         );
-        assert!(text.contains("Any tool calls or outputs visible before this boundary happened"));
-        assert!(text.contains("Sub-agents are off-limits in this side conversation."));
-        assert!(text.contains("Do not modify files"));
+        assert!(text.contains("Only user messages after this boundary define the side task."));
+        assert!(text.contains("Wait for a question if none follows."));
     }
 
     #[test]
@@ -361,7 +345,8 @@ impl App {
                 // This was a side-return command; do not also interpret it as interrupt or exit.
                 return true;
             }
-            self.active_side_parent_thread_id().is_none()
+            // Consume the return shortcut even when selection or cleanup kept the side open.
+            true
         } else {
             false
         }
@@ -534,11 +519,13 @@ impl App {
     pub(super) fn install_side_thread_snapshot(
         store: &mut ThreadEventStore,
         mut session: ThreadSessionState,
-        _forked_turns: Vec<Turn>,
+        forked_turns: Vec<Turn>,
     ) {
         // The forked history remains available to the model through core state, but side
         // conversations should visually start at the side boundary.
         session.forked_from_id = None;
+        session.fork_parent_title = None;
+        store.excluded_turn_ids = forked_turns.into_iter().map(|turn| turn.id).collect();
         store.set_session(session, Vec::new());
     }
 

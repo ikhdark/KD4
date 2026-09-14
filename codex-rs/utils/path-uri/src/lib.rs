@@ -73,7 +73,12 @@ impl PathUri {
     /// The encoded null reserves a URI namespace that cannot collide with a
     /// real path on Unix or Windows.
     pub fn from_abs_path(path: &AbsolutePathBuf) -> Self {
-        if let Ok(url) = Url::from_file_path(path.as_path())
+        let localhost_unc = matches!(path.as_path().components().next(),
+            Some(std::path::Component::Prefix(prefix))
+                if matches!(prefix.kind(), std::path::Prefix::UNC(host, _) | std::path::Prefix::VerbatimUNC(host, _)
+                    if host.to_str().is_some_and(|host| host.eq_ignore_ascii_case("localhost"))));
+        if !localhost_unc
+            && let Ok(url) = Url::from_file_path(path.as_path())
             && let Ok(uri) = Self::try_from(url)
         {
             return uri;
@@ -225,13 +230,8 @@ impl PathUri {
             return None;
         }
         let mut url = self.0.clone();
-        {
-            let mut segments = match url.path_segments_mut() {
-                Ok(segments) => segments,
-                Err(()) => unreachable!("validated file URLs support hierarchical path segments"),
-            };
-            segments.pop_if_empty().pop();
-        }
+        let parent = self.0.path().trim_end_matches('/').rsplit_once('/')?.0;
+        url.set_path(parent.trim_end_matches('/'));
         Some(Self(url))
     }
 
@@ -286,8 +286,8 @@ impl PathUri {
     /// `%`, `?`, and `#` characters are percent-encoded as filename text. Paths
     /// containing a null character are rejected because they cannot be safely
     /// converted to native paths.
-    /// Opaque fallback URIs created by [`Self::from_abs_path`] reject non-empty
-    /// joins.
+    /// Opaque fallback URIs created by [`Self::from_abs_path`] reject relative
+    /// joins, but an absolute path can replace a base with an inferred convention.
     pub fn join(&self, path: &str) -> Result<Self, PathUriParseError> {
         if path.contains('\0') {
             return Err(PathUriParseError::InvalidFileUriPath {
@@ -322,6 +322,16 @@ impl PathUri {
         }
 
         let mut url = self.0.clone();
+        // Empty URI segments are separators, not native path components.
+        let normalized = format!(
+            "/{}",
+            url.path()
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("/")
+        );
+        url.set_path(&normalized);
         let anchor_depth = usize::from(convention == PathConvention::Windows);
         let mut depth = url
             .path_segments()
@@ -591,7 +601,7 @@ fn parse_windows_path(path: &str) -> Option<PathUri> {
                 && is_windows_separator_byte(*separator)
                 && matches!(*namespace, b'.' | b'?')
     );
-    if uses_namespace || path.contains('\0') {
+    if uses_namespace {
         return Some(windows_opaque_path_uri(path));
     }
 
@@ -600,6 +610,9 @@ fn parse_windows_path(path: &str) -> Option<PathUri> {
         [drive, b':', separator, ..]
             if drive.is_ascii_alphabetic() && is_windows_separator_byte(*separator)
     ) {
+        if path.contains('\0') {
+            return Some(windows_opaque_path_uri(path));
+        }
         return path_uri_from_segments(
             PathConvention::Windows,
             /*host*/ None,
@@ -613,6 +626,9 @@ fn parse_windows_path(path: &str) -> Option<PathUri> {
         let mut components = path[2..].split(is_windows_separator_char);
         let host = components.next().filter(|host| !host.is_empty())?;
         let share = components.next().filter(|share| !share.is_empty())?;
+        if path.contains('\0') || host.eq_ignore_ascii_case("localhost") {
+            return Some(windows_opaque_path_uri(path));
+        }
         return path_uri_from_segments(
             PathConvention::Windows,
             Some(host),
@@ -688,8 +704,6 @@ pub enum PathUriParseError {
     QueryNotAllowed,
     #[error("fragments are not allowed in path URIs")]
     FragmentNotAllowed,
-    #[error("path `{0}` must be relative when joining a path URI")]
-    JoinPathMustBeRelative(String),
 }
 
 /// Path syntax used to render a [`PathUri`] as an operating-system path.

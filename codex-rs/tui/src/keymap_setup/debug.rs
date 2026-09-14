@@ -8,6 +8,7 @@ use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
+use ratatui::widgets::Wrap;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -141,11 +142,17 @@ impl KeymapDebugView {
 
 impl Renderable for KeymapDebugView {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        Paragraph::new(self.lines(area.width)).render(area, buf);
+        Paragraph::new(self.lines(area.width))
+            .wrap(Wrap { trim: false })
+            .render(area, buf);
     }
 
     fn desired_height(&self, width: u16) -> u16 {
-        self.lines(width).len() as u16
+        Paragraph::new(self.lines(width))
+            .wrap(Wrap { trim: false })
+            .line_count(width)
+            .try_into()
+            .unwrap_or(u16::MAX)
     }
 }
 

@@ -3,11 +3,12 @@ use std::io;
 use std::path::Component;
 use std::path::Path;
 
-/// Opens a regular file through a path that is already resolved beneath
-/// `root`, without following a concurrently introduced Unix symlink.
+/// Opens a regular file on Windows and verifies its resolved handle path is
+/// beneath `root` before returning the opened file.
 ///
-/// Both paths must be absolute and normalized. Callers that accept user paths
-/// should canonicalize them and check confinement before calling this helper.
+/// Both paths must be canonical absolute paths in the Windows verbatim path
+/// representation returned by `std::fs::canonicalize`. Callers should check
+/// confinement before calling; this helper checks again using the opened handle.
 pub fn open_confined_file(root: &Path, path: &Path) -> io::Result<File> {
     let relative = path.strip_prefix(root).map_err(|_| outside_root_error())?;
     let components = relative

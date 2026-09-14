@@ -850,19 +850,10 @@ impl DirectFileSystem {
     ) -> FileSystemResult<Vec<ReadDirectoryEntry>> {
         reject_sandbox_context(sandbox)?;
         let path = path.to_abs_path()?;
-        let mut entries = Vec::new();
-        let mut read_dir = tokio::fs::read_dir(path.as_path()).await?;
-        while let Some(entry) = read_dir.next_entry().await? {
-            let Ok(metadata) = tokio::fs::metadata(entry.path()).await else {
-                continue;
-            };
-            entries.push(ReadDirectoryEntry {
-                file_name: entry.file_name().to_string_lossy().into_owned(),
-                is_directory: metadata.is_dir(),
-                is_file: metadata.is_file(),
-            });
-        }
-        Ok(entries)
+        tokio::task::spawn_blocking(move || read_directory_sync(path.as_path(), None))
+            .await
+            .map_err(io::Error::other)?
+            .map(|outcome| outcome.entries)
     }
 
     async fn read_directory_bounded(
@@ -879,32 +870,9 @@ impl DirectFileSystem {
             ));
         }
         let path = path.to_abs_path()?;
-        let mut entries = Vec::new();
-        let mut entries_examined = 0usize;
-        let mut read_dir = tokio::fs::read_dir(path.as_path()).await?;
-        while entries_examined < max_entries {
-            let Some(entry) = read_dir.next_entry().await? else {
-                return Ok(ReadDirectoryOutcome {
-                    entries,
-                    entries_examined,
-                    limit_reached: false,
-                });
-            };
-            entries_examined = entries_examined.saturating_add(1);
-            let Ok(metadata) = tokio::fs::metadata(entry.path()).await else {
-                continue;
-            };
-            entries.push(ReadDirectoryEntry {
-                file_name: entry.file_name().to_string_lossy().into_owned(),
-                is_directory: metadata.is_dir(),
-                is_file: metadata.is_file(),
-            });
-        }
-        Ok(ReadDirectoryOutcome {
-            entries,
-            entries_examined,
-            limit_reached: true,
-        })
+        tokio::task::spawn_blocking(move || read_directory_sync(path.as_path(), Some(max_entries)))
+            .await
+            .map_err(io::Error::other)?
     }
 
     async fn remove(
@@ -918,7 +886,11 @@ impl DirectFileSystem {
         match tokio::fs::symlink_metadata(path.as_path()).await {
             Ok(metadata) => {
                 let file_type = metadata.file_type();
-                if file_type.is_dir() {
+                use std::os::windows::fs::FileTypeExt;
+
+                if file_type.is_symlink_dir() {
+                    tokio::fs::remove_dir(path.as_path()).await?;
+                } else if file_type.is_dir() {
                     if options.recursive {
                         tokio::fs::remove_dir_all(path.as_path()).await?;
                     } else {
@@ -955,16 +927,8 @@ impl DirectFileSystem {
                         "fs/copy requires recursive: true when sourcePath is a directory",
                     ));
                 }
-                if destination_is_same_or_descendant_of_source(
-                    source_path.as_path(),
-                    destination_path.as_path(),
-                )? {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "fs/copy cannot copy a directory to itself or one of its descendants",
-                    ));
-                }
-                copy_dir_recursive(source_path.as_path(), destination_path.as_path())?;
+                let source_root = std::fs::canonicalize(&source_path)?;
+                copy_dir_recursive(&source_path, &destination_path, &source_root)?;
                 return Ok(());
             }
 
@@ -1282,7 +1246,42 @@ fn reject_platform_sandbox_context(sandbox: Option<&FileSystemSandboxContext>) -
     Ok(())
 }
 
-fn copy_dir_recursive(source: &Path, target: &Path) -> io::Result<()> {
+fn read_directory_sync(
+    path: &Path,
+    max_entries: Option<usize>,
+) -> io::Result<ReadDirectoryOutcome> {
+    let mut entries = Vec::new();
+    let mut entries_examined = 0;
+    let mut read_dir = std::fs::read_dir(path)?;
+    while max_entries.is_none_or(|limit| entries_examined < limit) {
+        let Some(entry) = read_dir.next() else {
+            return Ok(ReadDirectoryOutcome {
+                entries,
+                entries_examined,
+                limit_reached: false,
+            });
+        };
+        let entry = entry?;
+        entries_examined += 1;
+        // Preserve fresh, target-following metadata and count even skipped entries.
+        let Ok(metadata) = std::fs::metadata(entry.path()) else {
+            continue;
+        };
+        entries.push(ReadDirectoryEntry {
+            file_name: entry.file_name().to_string_lossy().into_owned(),
+            is_directory: metadata.is_dir(),
+            is_file: metadata.is_file(),
+        });
+    }
+    Ok(ReadDirectoryOutcome {
+        entries,
+        entries_examined,
+        limit_reached: true,
+    })
+}
+
+fn copy_dir_recursive(source: &Path, target: &Path, source_root: &Path) -> io::Result<()> {
+    reject_destination_in_source(target, source_root)?;
     std::fs::create_dir_all(target)?;
     for entry in std::fs::read_dir(source)? {
         let entry = entry?;
@@ -1291,8 +1290,9 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> io::Result<()> {
         let file_type = entry.file_type()?;
 
         if file_type.is_dir() {
-            copy_dir_recursive(&source_path, &target_path)?;
+            copy_dir_recursive(&source_path, &target_path, source_root)?;
         } else if file_type.is_file() {
+            reject_destination_in_source(&target_path, source_root)?;
             std::fs::copy(&source_path, &target_path)?;
         } else if file_type.is_symlink() {
             copy_symlink(&source_path, &target_path)?;
@@ -1301,13 +1301,15 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn destination_is_same_or_descendant_of_source(
-    source: &Path,
-    destination: &Path,
-) -> io::Result<bool> {
-    let source = std::fs::canonicalize(source)?;
+fn reject_destination_in_source(destination: &Path, source_root: &Path) -> io::Result<()> {
     let destination = resolve_existing_path(destination)?;
-    Ok(destination.starts_with(&source))
+    if destination.starts_with(source_root) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "fs/copy cannot copy a directory to itself or one of its descendants",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn resolve_existing_path(path: &Path) -> io::Result<PathBuf> {
@@ -1382,13 +1384,125 @@ mod tests {
         let link_path = temp_dir.path().join("source-link");
         std::fs::create_dir(&source_dir)?;
 
-        if symlink_dir(&source_dir, &link_path).is_err() {
-            return Ok(());
-        }
+        symlink_dir(&source_dir, &link_path)?;
 
         std::fs::remove_dir(&source_dir)?;
 
         assert_eq!(symlink_points_to_directory(&link_path)?, true);
+        Ok(())
+    }
+    #[test_case::test_case(false; "non_recursive")]
+    #[test_case::test_case(true; "recursive")]
+    #[tokio::test]
+    async fn remove_directory_link_preserves_target(recursive: bool) -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let target = temp.path().join("target");
+        let link = temp.path().join("link");
+        std::fs::create_dir(&target)?;
+        std::fs::write(target.join("keep.txt"), b"keep")?;
+        std::os::windows::fs::symlink_dir(&target, &link)?;
+        DirectFileSystem
+            .remove(
+                &PathUri::from_host_native_path(&link)?,
+                RemoveOptions {
+                    recursive,
+                    force: false,
+                },
+                None,
+            )
+            .await?;
+        assert_eq!(
+            std::fs::symlink_metadata(&link).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(std::fs::read(target.join("keep.txt"))?, b"keep");
+        Ok(())
+    }
+
+    #[test_case::test_case(false; "directory_alias")]
+    #[test_case::test_case(true; "file_alias")]
+    #[tokio::test]
+    async fn recursive_copy_rejects_destination_alias_into_source(
+        file_alias: bool,
+    ) -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        std::fs::create_dir_all(source.join("sub"))?;
+        std::fs::create_dir(&destination)?;
+        std::fs::write(source.join("a.txt"), b"original")?;
+        std::fs::write(source.join("sub/a.txt"), b"replacement")?;
+        if file_alias {
+            std::fs::create_dir(destination.join("sub"))?;
+            std::os::windows::fs::symlink_file(
+                source.join("a.txt"),
+                destination.join("sub/a.txt"),
+            )?;
+        } else {
+            std::os::windows::fs::symlink_dir(&source, destination.join("sub"))?;
+        }
+        let error = DirectFileSystem
+            .copy(
+                &PathUri::from_host_native_path(&source)?,
+                &PathUri::from_host_native_path(&destination)?,
+                CopyOptions { recursive: true },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read(source.join("a.txt"))?, b"original");
+        assert_eq!(std::fs::read(source.join("sub/a.txt"))?, b"replacement");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn directory_reads_follow_links_and_count_skipped_entries() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let directory = temp.path().join("directory");
+        std::fs::create_dir(&directory)?;
+        std::fs::write(temp.path().join("target"), b"target")?;
+        std::os::windows::fs::symlink_file(
+            temp.path().join("target"),
+            directory.join("file-link"),
+        )?;
+        std::os::windows::fs::symlink_file(
+            temp.path().join("missing"),
+            directory.join("dangling"),
+        )?;
+        std::fs::create_dir(directory.join("child"))?;
+        let uri = PathUri::from_host_native_path(&directory)?;
+        let mut all = DirectFileSystem.read_directory(&uri, None).await?;
+        all.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+        assert_eq!(
+            all,
+            vec![
+                ReadDirectoryEntry {
+                    file_name: "child".into(),
+                    is_directory: true,
+                    is_file: false
+                },
+                ReadDirectoryEntry {
+                    file_name: "file-link".into(),
+                    is_directory: false,
+                    is_file: true
+                },
+            ]
+        );
+        let mut bounded = DirectFileSystem
+            .read_directory_bounded(&uri, 3, None)
+            .await?;
+        bounded
+            .entries
+            .sort_by(|a, b| a.file_name.cmp(&b.file_name));
+        assert_eq!(bounded.entries, all);
+        assert_eq!(bounded.entries_examined, 3);
+        assert!(bounded.limit_reached);
+        let exhausted = DirectFileSystem
+            .read_directory_bounded(&uri, 4, None)
+            .await?;
+        assert_eq!(exhausted.entries_examined, 3);
+        assert!(!exhausted.limit_reached);
         Ok(())
     }
 }

@@ -14193,6 +14193,7 @@ async fn ephemeral_durable_history_is_visible_once_without_creating_rollout() ->
         config.model_provider.clone(),
         home.path().to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let started = manager.start_thread(config).await?;
     assert!(started.session_configured.rollout_path.is_none());
@@ -16069,6 +16070,10 @@ async fn try_start_turn_if_idle_rejects_pending_trigger_turn_without_injecting()
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Hold the contested owner to assert cancellation, admission, or cleanup behavior under contention"
+)]
 async fn late_idle_start_rejection_and_cancellation_notify_once_without_reentrant_deadlock() {
     struct GoalIdleContinuation {
         transaction: Arc<tokio::sync::Semaphore>,
@@ -16415,6 +16420,10 @@ async fn steer_input_revokes_spawn_authorization_with_contracted_denial() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Hold the contested owner to assert cancellation, admission, or cleanup behavior under contention"
+)]
 async fn steer_input_commits_effects_only_after_queue_admission() {
     use crate::responses_metadata::CodexResponsesRequestKind;
     use crate::session::input_queue::InputQueueActivity;
@@ -17097,6 +17106,7 @@ async fn resumed_legacy_artifact_recovery_enforces_workspace_freshness_at_sampli
             config.model_provider.clone(),
             home.path().to_path_buf(),
             Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+            Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         );
         let source = manager
             .start_thread(config.clone())

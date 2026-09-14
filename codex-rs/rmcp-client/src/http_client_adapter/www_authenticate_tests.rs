@@ -10,6 +10,14 @@ use super::parse_bearer_insufficient_scope;
 fn extracts_scope_from_bearer_insufficient_scope_challenges() {
     let cases = [
         (
+            r#", Bearer error="insufficient_scope", scope="read""#,
+            "read",
+        ),
+        (
+            r#"Bearer error="insufficient_scope",, scope="read""#,
+            "read",
+        ),
+        (
             r#"Bearer error="insufficient_scope", scope="files:read files:write""#,
             "files:read files:write",
         ),
@@ -70,6 +78,7 @@ fn rejects_invalid_or_ambiguous_scope_parameters() {
         r#"Bearer error="insufficient_scope", scope=files:read files:write"#,
         r#"Bearer error="insufficient_scope", scope=read=value"#,
         r#"Bearer error="insufficient_scope", scope="read", scope="write""#,
+        r#"Bearer error="insufficient_scope", scope="read",, scope="write""#,
     ];
 
     for header in cases {
@@ -87,6 +96,8 @@ fn rejects_invalid_or_ambiguous_scope_parameters() {
 fn ignores_scope_text_outside_a_scope_parameter() {
     let cases = [
         r#"Bearer error_description="request scope=admin""#,
+        r#"Bearer error="invalid_token", error="insufficient_scope", scope="read""#,
+        r#"Bearer error="insufficient_scope", error="invalid_token", scope="read""#,
         r#"Bearer resource_scope="admin""#,
         r#"Bearer "scope=admin""#,
         r#"Bearer error_description="unterminated scope=admin"#,
@@ -110,7 +121,7 @@ fn selects_bearer_challenge_from_a_later_www_authenticate_field_value() {
         },
         HttpHeader {
             name: "WWW-Authenticate".to_string(),
-            value: r#"Bearer error="insufficient_scope", scope="files:read""#.to_string(),
+            value: r#", Bearer error="insufficient_scope",, scope="files:read""#.to_string(),
         },
     ];
 

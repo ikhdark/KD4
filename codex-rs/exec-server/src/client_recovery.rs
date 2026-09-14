@@ -104,6 +104,53 @@ impl SessionState {
                     "process close sequence {target_seq} conflicts with recovered output"
                 )));
             }
+            // An exit may occupy exactly one absent sequence. Validate the union
+            // of retained output and pending notifications before publishing it:
+            // retention can also remove output, which must not become a false exit.
+            let inferred_exit = if exited && !exit_known {
+                if chunks.windows(2).any(|pair| pair[0].seq >= pair[1].seq)
+                    || chunks.iter().any(|chunk| chunk.seq > target_seq)
+                {
+                    return Err(recovery_gap_error(target_seq));
+                }
+                let first = ordered_events.last_published_seq.saturating_add(1);
+                let mut output = chunks
+                    .iter()
+                    .map(|chunk| chunk.seq)
+                    .filter(|seq| *seq >= first)
+                    .chain(closed.then_some(target_seq))
+                    .peekable();
+                let mut pending = ordered_events
+                    .pending
+                    .range(first..=target_seq)
+                    .map(|(seq, _)| *seq)
+                    .peekable();
+                let mut expected = first;
+                let mut missing = 0;
+                let mut exit_seq = None;
+                while let Some(seq) = match (output.peek(), pending.peek()) {
+                    (Some(a), Some(b)) if a <= b => output.next(),
+                    (Some(_), Some(_)) | (None, Some(_)) => pending.next(),
+                    (Some(_), None) => output.next(),
+                    (None, None) => None,
+                } {
+                    if seq > expected {
+                        missing += seq - expected;
+                        exit_seq = Some(expected);
+                    }
+                    expected = expected.max(seq.saturating_add(1));
+                }
+                if expected <= target_seq {
+                    missing += target_seq - expected + 1;
+                    exit_seq = Some(expected);
+                }
+                if missing != 1 {
+                    return Err(recovery_gap_error(target_seq));
+                }
+                exit_seq
+            } else {
+                None
+            };
             let mut published_closed = false;
             for chunk in chunks {
                 if chunk.seq > target_seq {
@@ -113,7 +160,7 @@ impl SessionState {
                     )));
                 }
                 let next_seq = ordered_events.last_published_seq.saturating_add(1);
-                if exited && !exit_known && chunk.seq > next_seq {
+                if !exit_known && inferred_exit == Some(next_seq) && chunk.seq > next_seq {
                     let exit_code = exit_code.ok_or_else(|| {
                         ExecServerError::Protocol(
                             "recovering exited process did not include its exit code".to_string(),
@@ -481,6 +528,7 @@ impl Inner {
                 Ok(true) => self.remove_session_if(process_id, session),
                 Ok(false) => {}
                 Err(error) => {
+                    let mut poll_delay = Duration::from_millis(10);
                     let terminated: Result<TerminateResponse, ExecServerError> = loop {
                         let result: Result<TerminateResponse, ExecServerError> = rpc_client
                             .call_for_cleanup(
@@ -494,7 +542,8 @@ impl Inner {
                             .map_err(ExecServerError::from);
                         match result {
                             Ok(response) if response.running => {
-                                tokio::time::sleep(Duration::from_millis(10)).await;
+                                tokio::time::sleep(poll_delay).await;
+                                poll_delay = (poll_delay * 2).min(Duration::from_millis(250));
                             }
                             result => break result,
                         }

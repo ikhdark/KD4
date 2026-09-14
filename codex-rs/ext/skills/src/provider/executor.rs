@@ -53,10 +53,9 @@ impl SkillProvider for ExecutorSkillProvider {
                     SkillAuthority::new(SkillSourceKind::Executor, selected_root_id.clone());
                 let Some(environment) = self.environment_manager.get_environment(&environment_id)
                 else {
-                    catalog.warnings.push(format!(
+                    return Err(SkillProviderError::new(format!(
                         "Selected capability root `{selected_root_id}` references unavailable environment `{environment_id}`."
-                    ));
-                    continue;
+                    )));
                 };
                 let file_system = environment.get_filesystem();
                 let outcome = load_environment_skills_from_root(
@@ -66,14 +65,14 @@ impl SkillProvider for ExecutorSkillProvider {
                 )
                 .await;
                 catalog.warnings.extend(outcome.warnings);
-                for skill in outcome.skills {
-                    catalog.push_entry(catalog_entry_from_skill(
-                        &skill,
+                catalog.extend_entries(outcome.skills.iter().map(|skill| {
+                    catalog_entry_from_skill(
+                        skill,
                         authority.clone(),
                         &selected_root_id,
                         &environment_id,
-                    ));
-                }
+                    )
+                }));
             }
 
             Ok(catalog)

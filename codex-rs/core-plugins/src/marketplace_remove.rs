@@ -103,9 +103,6 @@ impl Drop for StagedMarketplaceRoot {
         let Some(staged_root) = self.staged_root.as_ref() else {
             return;
         };
-        if !staged_root.exists() {
-            return;
-        }
         if let Err(err) = fs::rename(staged_root, &self.original_root) {
             let preserved_at = self.staging_dir.take().map(tempfile::TempDir::keep);
             tracing::error!(
@@ -284,6 +281,34 @@ mod tests {
     }
 
     #[test]
+    fn remove_marketplace_restores_dangling_link_when_config_removal_fails() {
+        let home = TempDir::new().unwrap();
+        fs::write(
+            home.path().join(codex_config::CONFIG_TOML_FILE),
+            "[marketplaces.debug\n",
+        )
+        .unwrap();
+        let root = marketplace_install_root(home.path()).join("debug");
+        fs::create_dir_all(root.parent().unwrap()).unwrap();
+        let target = home.path().join("missing");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&target, &root).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &root).unwrap();
+        assert!(!root.exists());
+        assert!(
+            remove_marketplace_sync(
+                home.path(),
+                MarketplaceRemoveRequest {
+                    marketplace_name: "debug".to_string()
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_link(root).unwrap(), target);
+    }
+
+    #[test]
     fn remove_marketplace_sync_keeps_installed_root_when_config_removal_fails() {
         let codex_home = TempDir::new().unwrap();
         fs::write(
@@ -399,6 +424,7 @@ mod tests {
         assert!(!config.contains("[marketplaces.debug]"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn remove_marketplace_commits_after_locked_root_is_staged() {
         use std::os::windows::fs::OpenOptionsExt;

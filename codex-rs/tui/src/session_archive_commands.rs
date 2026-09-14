@@ -561,6 +561,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::print_stdout,
+        reason = "The parent process requires this stdout marker to prove child assertions executed"
+    )]
     fn home_resolution_normal_startup_and_archive_subprocess() -> Result<()> {
         use clap::Parser;
         use codex_app_server_protocol::ClientRequest;
@@ -709,7 +713,7 @@ mod tests {
                     );
                     state_db.close().await;
                     let snapshot = codex_otel::global().expect("normal global metrics provider").snapshot()?;
-                    assert!(snapshot.scope_metrics().flat_map(|scope| scope.metrics()).any(|metric| metric.name() == codex_state::DB_METRIC_BACKFILL), "normal archive backfill must publish its actual SDK counter before startup completes");
+                    assert!(snapshot.scope_metrics().any(|scope| scope.metrics().any(|metric| metric.name() == codex_state::DB_METRIC_BACKFILL)), "normal archive backfill must publish its actual SDK counter before startup completes");
                 } else {
                     let detail = if mode == "archive-missing" {
                         "does not exist"

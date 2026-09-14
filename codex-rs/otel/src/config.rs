@@ -130,6 +130,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     fn statsig_default_metrics_exporter_is_disabled_in_debug_builds() {
         assert!(matches!(
             resolve_exporter(&OtelExporter::Statsig),

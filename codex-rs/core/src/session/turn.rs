@@ -2493,7 +2493,7 @@ async fn build_extension_turn_input_items(
     let thread_extension_data = &sess.services.thread_extension_data;
     let turn_extension_data = turn_context.extension_data.as_ref();
     for (contributor_index, contributor) in contributors.into_iter().enumerate() {
-        let input = input.clone();
+        let input = &input;
         pending.push_back(async move {
             let contribution = contributor
                 .contribute(
@@ -4419,16 +4419,13 @@ impl ProposedPlanItemState {
 /// text. The parser buffers each line until it can rule out a tag prefix, so
 /// plan-only outputs never show up as empty assistant messages.
 #[cfg(test)]
+type PlanStartPublicationGate = (
+    async_channel::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+#[cfg(test)]
 static PLAN_START_PUBLICATION_GATES: OnceLock<
-    Mutex<
-        HashMap<
-            codex_protocol::ThreadId,
-            (
-                async_channel::Sender<()>,
-                tokio::sync::oneshot::Receiver<()>,
-            ),
-        >,
-    >,
+    Mutex<HashMap<codex_protocol::ThreadId, PlanStartPublicationGate>>,
 > = OnceLock::new();
 
 async fn maybe_emit_pending_agent_message_start(
@@ -4522,6 +4519,10 @@ async fn complete_partial_plan_items(
         .await;
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "Owned state exists until its single handoff; a failed publication task cannot supply a replacement state"
+)]
 async fn handle_plan_segments(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,

@@ -287,193 +287,243 @@ fn sub_agent_started_activity_creates_spawn_edge() -> anyhow::Result<()> {
 
 #[test]
 fn send_message_runtime_payload_targets_delivered_child_message() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    let writer = create_started_agent_writer(&temp)?;
-    start_agent_turn(&writer, "turn-1")?;
-    let invocation_payload = writer.write_json_payload(
-        RawPayloadKind::ToolInvocation,
-        &json!({
-            "tool_name": "send_message",
-            "payload": {
-                "type": "function",
-                "arguments": "{\"target\":\"/root/child\",\"message\":\"hello\"}"
-            }
-        }),
-    )?;
-    writer.append_with_context(
-        trace_context_for_agent("turn-1"),
-        RawTraceEventPayload::ToolCallStarted {
-            tool_call_id: "call-send".to_string(),
-            model_visible_call_id: Some("call-send".to_string()),
-            code_mode_runtime_tool_id: None,
-            requester: RawToolCallRequester::Model,
-            kind: ToolCallKind::SendMessage,
-            summary: ToolCallSummary::Generic {
-                label: "send_message".to_string(),
-                input_preview: None,
-                output_preview: None,
+    for deliver_before_end in [false, true] {
+        let temp = TempDir::new()?;
+        let writer = create_started_agent_writer(&temp)?;
+        start_agent_turn(&writer, "turn-1")?;
+        let invocation_payload = writer.write_json_payload(
+            RawPayloadKind::ToolInvocation,
+            &json!({
+                "tool_name": "send_message",
+                "payload": {
+                    "type": "function",
+                    "arguments": "{\"target\":\"/root/child\",\"message\":\"hello\"}"
+                }
+            }),
+        )?;
+        writer.append_with_context(
+            trace_context_for_agent("turn-1"),
+            RawTraceEventPayload::ToolCallStarted {
+                tool_call_id: "call-send".to_string(),
+                model_visible_call_id: Some("call-send".to_string()),
+                code_mode_runtime_tool_id: None,
+                requester: RawToolCallRequester::Model,
+                kind: ToolCallKind::SendMessage,
+                summary: ToolCallSummary::Generic {
+                    label: "send_message".to_string(),
+                    input_preview: None,
+                    output_preview: None,
+                },
+                invocation_payload: Some(invocation_payload.clone()),
             },
-            invocation_payload: Some(invocation_payload),
-        },
-    )?;
-    let begin_payload = writer.write_json_payload(
-        RawPayloadKind::ToolRuntimeEvent,
-        &json!({
-            "call_id": "call-send",
-            "sender_thread_id": "019d0000-0000-7000-8000-000000000001",
-            "receiver_thread_id": "019d0000-0000-7000-8000-000000000002",
-            "prompt": "hello",
-            "status": "running"
-        }),
-    )?;
-    writer.append_with_context(
-        trace_context_for_agent("turn-1"),
-        RawTraceEventPayload::ToolCallRuntimeStarted {
-            tool_call_id: "call-send".to_string(),
-            runtime_payload: begin_payload,
-        },
-    )?;
-    let end_payload = writer.write_json_payload(
-        RawPayloadKind::ToolRuntimeEvent,
-        &json!({
-            "call_id": "call-send",
-            "sender_thread_id": "019d0000-0000-7000-8000-000000000001",
-            "receiver_thread_id": "019d0000-0000-7000-8000-000000000002",
-            "prompt": "hello",
-            "status": "running"
-        }),
-    )?;
-    writer.append_with_context(
-        trace_context_for_agent("turn-1"),
-        RawTraceEventPayload::ToolCallRuntimeEnded {
-            tool_call_id: "call-send".to_string(),
-            status: ExecutionStatus::Completed,
-            runtime_payload: end_payload,
-        },
-    )?;
-    start_thread(
-        &writer,
-        "019d0000-0000-7000-8000-000000000002",
-        "/root/child",
-    )?;
-    start_turn_for_thread(
-        &writer,
-        "019d0000-0000-7000-8000-000000000002",
-        "turn-child-1",
-    )?;
-    let delivered =
-        inter_agent_message("/root", "/root/child", "hello", /*trigger_turn*/ false);
-    append_inference_request(
-        &writer,
-        "019d0000-0000-7000-8000-000000000002",
-        "turn-child-1",
-        "inference-child-1",
-        vec![message("assistant", &delivered)],
-    )?;
-
-    let replayed = replay_bundle(temp.path())?;
-    let edge = &replayed.interaction_edges["edge:tool:call-send"];
-    assert_eq!(edge.kind, InteractionEdgeKind::SendMessage);
-    assert_eq!(
-        edge.source,
-        TraceAnchor::ToolCall {
-            tool_call_id: "call-send".to_string()
+        )?;
+        let begin_payload = writer.write_json_payload(
+            RawPayloadKind::ToolRuntimeEvent,
+            &json!({
+                "call_id": "call-send",
+                "sender_thread_id": "019d0000-0000-7000-8000-000000000001",
+                "receiver_thread_id": "019d0000-0000-7000-8000-000000000002",
+                "prompt": "hello",
+                "status": "running"
+            }),
+        )?;
+        writer.append_with_context(
+            trace_context_for_agent("turn-1"),
+            RawTraceEventPayload::ToolCallRuntimeStarted {
+                tool_call_id: "call-send".to_string(),
+                runtime_payload: begin_payload.clone(),
+            },
+        )?;
+        let end_payload = writer.write_json_payload(
+            RawPayloadKind::ToolRuntimeEvent,
+            &json!({
+                "call_id": "call-send",
+                "sender_thread_id": "019d0000-0000-7000-8000-000000000001",
+                "receiver_thread_id": "019d0000-0000-7000-8000-000000000002",
+                "prompt": "hello",
+                "status": "running"
+            }),
+        )?;
+        if !deliver_before_end {
+            writer.append_with_context(
+                trace_context_for_agent("turn-1"),
+                RawTraceEventPayload::ToolCallRuntimeEnded {
+                    tool_call_id: "call-send".to_string(),
+                    status: ExecutionStatus::Completed,
+                    runtime_payload: end_payload.clone(),
+                },
+            )?;
         }
-    );
-    let target_item_id = target_conversation_item_id(&edge.target);
-    assert_eq!(edge.carried_item_ids, vec![target_item_id.clone()]);
-    assert_eq!(
-        replayed.conversation_items[target_item_id].thread_id,
-        "019d0000-0000-7000-8000-000000000002"
-    );
-    assert!(edge.ended_at_unix_ms.is_some());
+        start_thread(
+            &writer,
+            "019d0000-0000-7000-8000-000000000002",
+            "/root/child",
+        )?;
+        start_turn_for_thread(
+            &writer,
+            "019d0000-0000-7000-8000-000000000002",
+            "turn-child-1",
+        )?;
+        let delivered =
+            inter_agent_message("/root", "/root/child", "hello", /*trigger_turn*/ false);
+        append_inference_request(
+            &writer,
+            "019d0000-0000-7000-8000-000000000002",
+            "turn-child-1",
+            "inference-child-1",
+            vec![
+                message("assistant", &delivered),
+                message("assistant", &delivered),
+            ],
+        )?;
+
+        if deliver_before_end {
+            writer.append_with_context(
+                trace_context_for_agent("turn-1"),
+                RawTraceEventPayload::ToolCallRuntimeEnded {
+                    tool_call_id: "call-send".to_string(),
+                    status: ExecutionStatus::Completed,
+                    runtime_payload: end_payload.clone(),
+                },
+            )?;
+        }
+        let result_payload =
+            writer.write_json_payload(RawPayloadKind::ToolResult, &json!({"sent": true}))?;
+        writer.append_with_context(
+            trace_context_for_agent("turn-1"),
+            RawTraceEventPayload::ToolCallEnded {
+                tool_call_id: "call-send".to_string(),
+                status: ExecutionStatus::Completed,
+                result_payload: Some(result_payload.clone()),
+            },
+        )?;
+        let replayed = replay_bundle(temp.path())?;
+        let edge = &replayed.interaction_edges["edge:tool:call-send"];
+        assert_eq!(edge.kind, InteractionEdgeKind::SendMessage);
+        assert_eq!(
+            edge.source,
+            TraceAnchor::ToolCall {
+                tool_call_id: "call-send".to_string()
+            }
+        );
+        let target_item_id = target_conversation_item_id(&edge.target);
+        assert_eq!(edge.carried_item_ids, vec![target_item_id.clone()]);
+        assert_eq!(
+            replayed.conversation_items[target_item_id].thread_id,
+            "019d0000-0000-7000-8000-000000000002"
+        );
+        assert!(edge.ended_at_unix_ms.is_some());
+        assert_eq!(replayed.interaction_edges.len(), 1);
+        assert_eq!(
+            target_item_id,
+            &replayed.threads["019d0000-0000-7000-8000-000000000002"].conversation_item_ids[0]
+        );
+        assert_eq!(
+            edge.carried_raw_payload_ids,
+            vec![
+                invocation_payload.raw_payload_id,
+                begin_payload.raw_payload_id,
+                end_payload.raw_payload_id,
+                result_payload.raw_payload_id
+            ]
+        );
+    }
 
     Ok(())
 }
 
 #[test]
 fn send_message_activity_targets_delivered_child_message() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    let writer = create_started_agent_writer(&temp)?;
-    start_agent_turn(&writer, "turn-1")?;
-    let child_thread_id = "019d0000-0000-7000-8000-000000000002";
-    let invocation_payload = writer.write_json_payload(
-        RawPayloadKind::ToolInvocation,
-        &json!({
-            "tool_name": "send_message",
-            "payload": {
-                "type": "function",
-                "arguments": "{\"target\":\"/root/child\",\"message\":\"hello again\"}"
-            }
-        }),
-    )?;
-    writer.append_with_context(
-        trace_context_for_agent("turn-1"),
-        RawTraceEventPayload::ToolCallStarted {
-            tool_call_id: "call-send-v2".to_string(),
-            model_visible_call_id: Some("call-send-v2".to_string()),
-            code_mode_runtime_tool_id: None,
-            requester: RawToolCallRequester::Model,
-            kind: ToolCallKind::SendMessage,
-            summary: ToolCallSummary::Generic {
-                label: "send_message".to_string(),
-                input_preview: None,
-                output_preview: None,
+    for missing_invocation in [false, true] {
+        let temp = TempDir::new()?;
+        let writer = create_started_agent_writer(&temp)?;
+        start_agent_turn(&writer, "turn-1")?;
+        let child_thread_id = "019d0000-0000-7000-8000-000000000002";
+        let invocation_payload = writer.write_json_payload(
+            RawPayloadKind::ToolInvocation,
+            &json!({
+                "tool_name": "send_message",
+                "payload": {
+                    "type": "function",
+                    "arguments": "{\"target\":\"/root/child\",\"message\":\"hello again\"}"
+                }
+            }),
+        )?;
+        writer.append_with_context(
+            trace_context_for_agent("turn-1"),
+            RawTraceEventPayload::ToolCallStarted {
+                tool_call_id: "call-send-v2".to_string(),
+                model_visible_call_id: Some("call-send-v2".to_string()),
+                code_mode_runtime_tool_id: None,
+                requester: RawToolCallRequester::Model,
+                kind: ToolCallKind::SendMessage,
+                summary: ToolCallSummary::Generic {
+                    label: "send_message".to_string(),
+                    input_preview: None,
+                    output_preview: None,
+                },
+                invocation_payload: (!missing_invocation).then_some(invocation_payload.clone()),
             },
-            invocation_payload: Some(invocation_payload.clone()),
-        },
-    )?;
-    let activity_payload = writer.write_json_payload(
-        RawPayloadKind::ToolRuntimeEvent,
-        &json!({
-            "event_id": "call-send-v2",
-            "occurred_at_ms": 1234,
-            "agent_thread_id": child_thread_id,
-            "agent_path": "/root/child",
-            "kind": "interacted"
-        }),
-    )?;
-    writer.append_with_context(
-        trace_context_for_agent("turn-1"),
-        RawTraceEventPayload::ToolCallRuntimeEnded {
-            tool_call_id: "call-send-v2".to_string(),
-            status: ExecutionStatus::Completed,
-            runtime_payload: activity_payload.clone(),
-        },
-    )?;
-    start_thread(&writer, child_thread_id, "/root/child")?;
-    start_turn_for_thread(&writer, child_thread_id, "turn-child-1")?;
-    let delivered = inter_agent_message(
-        "/root",
-        "/root/child",
-        "hello again",
-        /*trigger_turn*/ false,
-    );
-    append_inference_request(
-        &writer,
-        child_thread_id,
-        "turn-child-1",
-        "inference-child-1",
-        vec![message("assistant", &delivered)],
-    )?;
+        )?;
+        let activity_payload = writer.write_json_payload(
+            RawPayloadKind::ToolRuntimeEvent,
+            &json!({
+                "event_id": "call-send-v2",
+                "occurred_at_ms": 1234,
+                "agent_thread_id": child_thread_id,
+                "agent_path": "/root/child",
+                "kind": "interacted"
+            }),
+        )?;
+        writer.append_with_context(
+            trace_context_for_agent("turn-1"),
+            RawTraceEventPayload::ToolCallRuntimeEnded {
+                tool_call_id: "call-send-v2".to_string(),
+                status: ExecutionStatus::Completed,
+                runtime_payload: activity_payload.clone(),
+            },
+        )?;
+        start_thread(&writer, child_thread_id, "/root/child")?;
+        start_turn_for_thread(&writer, child_thread_id, "turn-child-1")?;
+        let delivered = inter_agent_message(
+            "/root",
+            "/root/child",
+            "hello again",
+            /*trigger_turn*/ false,
+        );
+        append_inference_request(
+            &writer,
+            child_thread_id,
+            "turn-child-1",
+            "inference-child-1",
+            vec![message("assistant", &delivered)],
+        )?;
 
-    let replayed = replay_bundle(temp.path())?;
-    let edge = &replayed.interaction_edges["edge:tool:call-send-v2"];
-    assert_eq!(edge.kind, InteractionEdgeKind::SendMessage);
-    let target_item_id = target_conversation_item_id(&edge.target);
-    assert_eq!(edge.carried_item_ids, vec![target_item_id.clone()]);
-    assert_eq!(
-        replayed.conversation_items[target_item_id].thread_id,
-        child_thread_id
-    );
-    assert_eq!(
-        edge.carried_raw_payload_ids,
-        vec![
-            invocation_payload.raw_payload_id,
-            activity_payload.raw_payload_id,
-        ]
-    );
-
+        let replayed = replay_bundle(temp.path())?;
+        if missing_invocation {
+            assert!(replayed.interaction_edges.is_empty());
+            assert_eq!(
+                replayed.tool_calls["call-send-v2"].raw_runtime_payload_ids,
+                vec![activity_payload.raw_payload_id]
+            );
+            continue;
+        }
+        let edge = &replayed.interaction_edges["edge:tool:call-send-v2"];
+        assert_eq!(edge.kind, InteractionEdgeKind::SendMessage);
+        let target_item_id = target_conversation_item_id(&edge.target);
+        assert_eq!(edge.carried_item_ids, vec![target_item_id.clone()]);
+        assert_eq!(
+            replayed.conversation_items[target_item_id].thread_id,
+            child_thread_id
+        );
+        assert_eq!(
+            edge.carried_raw_payload_ids,
+            vec![
+                invocation_payload.raw_payload_id,
+                activity_payload.raw_payload_id,
+            ]
+        );
+    }
     Ok(())
 }
 
@@ -706,7 +756,10 @@ fn agent_result_edge_links_child_result_to_parent_notification() -> anyhow::Resu
         "turn-child-1",
         "inference-child-1",
         vec![message("assistant", "task")],
-        vec![message("assistant", "done")],
+        (0..9)
+            .map(|i| message("assistant", &format!("progress {i}")))
+            .chain([message("assistant", "done")])
+            .collect(),
     )?;
 
     let notification = "<subagent_notification>{\"agent_path\":\"/root/child\",\"status\":{\"completed\":\"done\"}}</subagent_notification>";
@@ -775,95 +828,103 @@ fn agent_result_edge_links_child_result_to_parent_notification() -> anyhow::Resu
 
 #[test]
 fn agent_result_edge_falls_back_to_child_thread_without_result_message() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    let writer = create_started_agent_writer(&temp)?;
+    for legacy in [false, true] {
+        let temp = TempDir::new()?;
+        let writer = create_started_agent_writer(&temp)?;
 
-    // The child received its task but produced no assistant output. Failed
-    // child tasks can still notify the parent through AgentStatus, so the
-    // inbound task must not be mistaken for the child's result.
-    start_thread(
-        &writer,
-        "019d0000-0000-7000-8000-000000000002",
-        "/root/child",
-    )?;
-    start_turn_for_thread(
-        &writer,
-        "019d0000-0000-7000-8000-000000000002",
-        "turn-child-1",
-    )?;
-    append_inference_request(
-        &writer,
-        "019d0000-0000-7000-8000-000000000002",
-        "turn-child-1",
-        "inference-child-1",
-        vec![json!({
-            "type": "agent_message",
-            "author": "/root",
-            "recipient": "/root/child",
-            "content": [{"type": "input_text", "text": "do the task"}]
-        })],
-    )?;
+        // The child received its task but produced no assistant output. Failed
+        // child tasks can still notify the parent through AgentStatus, so the
+        // inbound task must not be mistaken for the child's result.
+        start_thread(
+            &writer,
+            "019d0000-0000-7000-8000-000000000002",
+            "/root/child",
+        )?;
+        start_turn_for_thread(
+            &writer,
+            "019d0000-0000-7000-8000-000000000002",
+            "turn-child-1",
+        )?;
+        append_inference_request(
+            &writer,
+            "019d0000-0000-7000-8000-000000000002",
+            "turn-child-1",
+            "inference-child-1",
+            vec![if legacy {
+                message(
+                    "assistant",
+                    &inter_agent_message("/root", "/root/child", "do the task", true),
+                )
+            } else {
+                json!({
+                    "type": "agent_message",
+                    "author": "/root",
+                    "recipient": "/root/child",
+                    "content": [{"type": "input_text", "text": "do the task"}]
+                })
+            }],
+        )?;
 
-    let notification = r#"<subagent_notification>{"agent_path":"/root/child","status":{"failed":"boom"}}</subagent_notification>"#;
-    let carried_payload = writer.write_json_payload(
-        RawPayloadKind::AgentResult,
-        &json!({
-            "child_agent_path": "/root/child",
-            "message": notification,
-            "status": {"failed": "boom"}
-        }),
-    )?;
-    writer.append_with_context(
-        trace_context_for_thread("019d0000-0000-7000-8000-000000000002", "turn-child-1"),
-        RawTraceEventPayload::AgentResultObserved {
-            edge_id: "edge:agent_result:thread-child:turn-child-1:thread-root".to_string(),
-            child_thread_id: "019d0000-0000-7000-8000-000000000002".to_string(),
-            child_codex_turn_id: "turn-child-1".to_string(),
-            parent_thread_id: "019d0000-0000-7000-8000-000000000001".to_string(),
-            message: notification.to_string(),
-            carried_payload: Some(carried_payload.clone()),
-        },
-    )?;
+        let notification = r#"<subagent_notification>{"agent_path":"/root/child","status":{"failed":"boom"}}</subagent_notification>"#;
+        let carried_payload = writer.write_json_payload(
+            RawPayloadKind::AgentResult,
+            &json!({
+                "child_agent_path": "/root/child",
+                "message": notification,
+                "status": {"failed": "boom"}
+            }),
+        )?;
+        writer.append_with_context(
+            trace_context_for_thread("019d0000-0000-7000-8000-000000000002", "turn-child-1"),
+            RawTraceEventPayload::AgentResultObserved {
+                edge_id: "edge:agent_result:thread-child:turn-child-1:thread-root".to_string(),
+                child_thread_id: "019d0000-0000-7000-8000-000000000002".to_string(),
+                child_codex_turn_id: "turn-child-1".to_string(),
+                parent_thread_id: "019d0000-0000-7000-8000-000000000001".to_string(),
+                message: notification.to_string(),
+                carried_payload: Some(carried_payload.clone()),
+            },
+        )?;
 
-    // The parent does receive the failure notification as a model-visible
-    // mailbox item. The target should remain that precise parent-side
-    // ConversationItem even though the source falls back to the child thread.
-    start_agent_turn(&writer, "turn-root-1")?;
-    let delivered = inter_agent_message(
-        "/root/child",
-        "/root",
-        notification,
-        /*trigger_turn*/ false,
-    );
-    append_inference_request(
-        &writer,
-        "019d0000-0000-7000-8000-000000000001",
-        "turn-root-1",
-        "inference-root-1",
-        vec![message("assistant", &delivered)],
-    )?;
+        // The parent does receive the failure notification as a model-visible
+        // mailbox item. The target should remain that precise parent-side
+        // ConversationItem even though the source falls back to the child thread.
+        start_agent_turn(&writer, "turn-root-1")?;
+        let delivered = inter_agent_message(
+            "/root/child",
+            "/root",
+            notification,
+            /*trigger_turn*/ false,
+        );
+        append_inference_request(
+            &writer,
+            "019d0000-0000-7000-8000-000000000001",
+            "turn-root-1",
+            "inference-root-1",
+            vec![message("assistant", &delivered)],
+        )?;
 
-    let replayed = replay_bundle(temp.path())?;
-    let edge =
-        &replayed.interaction_edges["edge:agent_result:thread-child:turn-child-1:thread-root"];
-    assert_eq!(edge.kind, InteractionEdgeKind::AgentResult);
-    assert_eq!(
-        edge.source,
-        TraceAnchor::Thread {
-            thread_id: "019d0000-0000-7000-8000-000000000002".to_string(),
-        }
-    );
-    let target_item_id = target_conversation_item_id(&edge.target);
-    assert_eq!(
-        replayed.conversation_items[target_item_id].thread_id,
-        "019d0000-0000-7000-8000-000000000001"
-    );
-    assert_eq!(edge.carried_item_ids, vec![target_item_id.clone()]);
-    assert_eq!(
-        edge.carried_raw_payload_ids,
-        vec![carried_payload.raw_payload_id]
-    );
-
+        let replayed = replay_bundle(temp.path())?;
+        let edge =
+            &replayed.interaction_edges["edge:agent_result:thread-child:turn-child-1:thread-root"];
+        assert_eq!(edge.kind, InteractionEdgeKind::AgentResult);
+        assert_eq!(
+            edge.source,
+            TraceAnchor::Thread {
+                thread_id: "019d0000-0000-7000-8000-000000000002".to_string(),
+            }
+        );
+        let target_item_id = target_conversation_item_id(&edge.target);
+        assert_eq!(
+            replayed.conversation_items[target_item_id].thread_id,
+            "019d0000-0000-7000-8000-000000000001"
+        );
+        assert_eq!(edge.carried_item_ids, vec![target_item_id.clone()]);
+        assert_eq!(
+            edge.carried_raw_payload_ids,
+            vec![carried_payload.raw_payload_id]
+        );
+    }
     Ok(())
 }
 

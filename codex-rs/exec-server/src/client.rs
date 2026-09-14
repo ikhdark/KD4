@@ -837,7 +837,6 @@ impl ExecServerClient {
             let client = self.clone();
             let (mut result_tx, result_rx) = tokio::sync::oneshot::channel();
             let process_start_task = async move {
-                let _active_start = active_start;
                 let start_result = tokio::select! {
                     biased;
                     result = client.call_rpc_with_timeout::<_, ExecResponse>(
@@ -850,6 +849,7 @@ impl ExecServerClient {
                 };
                 match start_result {
                     None => {
+                        drop(active_start);
                         cleanup_process_start(&client, &process_id, &state).await;
                     }
                     Some(Ok(_)) => {
@@ -861,11 +861,15 @@ impl ExecServerClient {
                         };
                         if result_tx.send(Ok(session)).is_err() {
                             state.recoverable.store(false, Ordering::Release);
+                            drop(active_start);
                             cleanup_process_start(&client, &process_id, &state).await;
                         }
                     }
                     Some(Err(error)) => {
                         let _ = result_tx.send(Err(error));
+                        // Cleanup can require a recovered connection. Only the start
+                        // outcome and recoverability belong inside the recovery barrier.
+                        drop(active_start);
                         cleanup_process_start(&client, &process_id, &state).await;
                     }
                 }
@@ -1067,16 +1071,18 @@ async fn cleanup_process_start(
     state: &Arc<SessionState>,
 ) {
     let deadline = Instant::now() + PROCESS_TERMINATION_TIMEOUT;
+    let mut poll_delay = Duration::from_millis(10);
     loop {
         match client.terminate_before(process_id, deadline).await {
             Ok(response) if !response.running => break,
             Ok(_) => {
-                if tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(10)))
+                if tokio::time::timeout_at(deadline, tokio::time::sleep(poll_delay))
                     .await
                     .is_err()
                 {
                     break;
                 }
+                poll_delay = (poll_delay * 2).min(Duration::from_millis(250));
             }
             Err(error) if is_transport_closed_error(&error) && !client.inner.is_failed() => {
                 continue;
@@ -1102,6 +1108,9 @@ impl From<RpcCallError> for ExecServerError {
             RpcCallError::PendingRequestLimitExceeded { limit } => Self::Protocol(format!(
                 "exec-server has reached its limit of {limit} pending requests"
             )),
+            RpcCallError::RequestIdExhausted => {
+                Self::Protocol("exec-server request IDs are exhausted".to_string())
+            }
         }
     }
 }
@@ -1346,13 +1355,13 @@ impl Session {
     }
 
     pub(crate) async fn write(&self, chunk: Vec<u8>) -> Result<WriteResponse, ExecServerError> {
-        let write_id = self.state.next_write_id();
+        let params = WriteParams {
+            process_id: self.process_id.clone(),
+            chunk: chunk.into(),
+            write_id: self.state.next_write_id(),
+        };
         loop {
-            match self
-                .client
-                .write(&self.process_id, chunk.clone(), write_id.clone())
-                .await
-            {
+            match self.client.call(EXEC_WRITE_METHOD, &params).await {
                 Ok(response) => return Ok(response),
                 Err(error)
                     if is_transport_closed_error(&error) && !self.client.inner.is_failed() =>
@@ -1370,6 +1379,7 @@ impl Session {
 
     pub(crate) async fn terminate(&self) -> Result<(), ExecServerError> {
         let deadline = Instant::now() + PROCESS_TERMINATION_TIMEOUT;
+        let mut poll_delay = Duration::from_millis(10);
         loop {
             match self
                 .client
@@ -1380,7 +1390,7 @@ impl Session {
                 Ok(_) => {
                     tokio::time::timeout_at(
                         deadline,
-                        tokio::time::sleep(Duration::from_millis(10)),
+                        tokio::time::sleep(poll_delay),
                     )
                     .await
                     .map_err(|_| {
@@ -1388,6 +1398,7 @@ impl Session {
                             "timed out confirming process termination after {PROCESS_TERMINATION_TIMEOUT:?}"
                         ))
                     })?;
+                    poll_delay = (poll_delay * 2).min(Duration::from_millis(250));
                 }
                 Err(error)
                     if is_transport_closed_error(&error) && !self.client.inner.is_failed() =>
@@ -2702,7 +2713,10 @@ mod tests {
                 let overflow = timeout(Duration::from_millis(1), client.fs_close(close_params))
                     .await
                     .expect("cleanup overflow must not wait for the withheld supervisor");
-                assert!(matches!(overflow, Err(super::ExecServerError::Disconnected(_))));
+                assert!(matches!(
+                    overflow,
+                    Err(super::ExecServerError::Disconnected(_))
+                ));
                 assert_eq!(tokio::time::Instant::now(), before);
                 assert_eq!(rpc.pending_request_count().await, 0);
                 drop(regular);
@@ -2958,6 +2972,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_process_start_cleanup_does_not_block_other_process_recovery() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let websocket_url = format!("ws://{}", listener.local_addr().unwrap());
+        let (cleaned_tx, cleaned_rx) = oneshot::channel();
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut first = accept_websocket(&listener).await;
+            complete_websocket_initialize(&mut first, "start-recovery", None).await;
+            let JSONRPCMessage::Request(start) = read_jsonrpc_websocket(&mut first).await else {
+                panic!("expected process start");
+            };
+            assert_eq!(start.method, EXEC_METHOD);
+            let params: ExecParams = serde_json::from_value(start.params.unwrap()).unwrap();
+            assert_eq!(params.process_id.as_str(), "unacknowledged");
+            drop(first);
+            let mut resumed = accept_websocket(&listener).await;
+            complete_websocket_session_initialize(
+                &mut resumed,
+                "start-recovery",
+                Some("start-recovery"),
+            )
+            .await;
+            let JSONRPCMessage::Request(read) = read_jsonrpc_websocket(&mut resumed).await else {
+                panic!("expected recovery read");
+            };
+            assert_eq!(read.method, EXEC_READ_METHOD);
+            let params: crate::protocol::ReadParams =
+                serde_json::from_value(read.params.unwrap()).unwrap();
+            assert_eq!(params.process_id.as_str(), "healthy");
+            write_jsonrpc_websocket(
+                &mut resumed,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: read.id,
+                    result: serde_json::to_value(ReadResponse {
+                        chunks: vec![crate::protocol::ProcessOutputChunk {
+                            seq: 1,
+                            stream: crate::protocol::ExecOutputStream::Stdout,
+                            chunk: b"recovered".to_vec().into(),
+                        }],
+                        next_seq: 2,
+                        exited: false,
+                        exit_code: None,
+                        closed: false,
+                        failure: None,
+                        sandbox_denied: false,
+                    })
+                    .unwrap(),
+                }),
+            )
+            .await;
+            let JSONRPCMessage::Request(terminate) = read_jsonrpc_websocket(&mut resumed).await
+            else {
+                panic!("expected provisional process cleanup");
+            };
+            assert_eq!(terminate.method, EXEC_TERMINATE_METHOD);
+            let params: crate::protocol::TerminateParams =
+                serde_json::from_value(terminate.params.unwrap()).unwrap();
+            assert_eq!(params.process_id.as_str(), "unacknowledged");
+            write_jsonrpc_websocket(
+                &mut resumed,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: terminate.id,
+                    result: serde_json::to_value(crate::protocol::TerminateResponse {
+                        running: false,
+                    })
+                    .unwrap(),
+                }),
+            )
+            .await;
+            cleaned_tx.send(()).unwrap();
+            finish_rx.await.unwrap();
+        });
+        let lazy = LazyRemoteExecServerClient::new(ExecServerTransportParams::websocket_url(
+            websocket_url,
+            Duration::from_secs(1),
+        ));
+        let client = lazy.get().await.unwrap();
+        let healthy = client
+            .register_session(&ProcessId::from("healthy"))
+            .await
+            .unwrap();
+        let mut events = healthy.state.subscribe_events();
+        let result = client
+            .start_process(ExecParams {
+                process_id: ProcessId::from("unacknowledged"),
+                argv: vec!["unused".into()],
+                cwd: PathUri::from_host_native_path(std::env::current_dir().unwrap()).unwrap(),
+                env_policy: None,
+                env: HashMap::new(),
+                tty: false,
+                pipe_stdin: false,
+                arg0: None,
+                sandbox: None,
+                enforce_managed_network: false,
+                managed_network: None,
+            })
+            .await;
+        assert!(result.is_err(), "an unacknowledged start must fail");
+        assert!(
+            matches!(timeout(Duration::from_secs(2), events.recv()).await.unwrap().unwrap(),
+            crate::process::ExecProcessEvent::Output(chunk) if chunk.seq == 1 && chunk.chunk.0 == b"recovered")
+        );
+        timeout(Duration::from_secs(1), cleaned_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!client.inner.is_failed());
+        finish_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn remote_websocket_client_resumes_session() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -2979,7 +3105,7 @@ mod tests {
             first.close(None).await.expect("websocket should close");
 
             let mut resumed = accept_websocket(&listener).await;
-            complete_websocket_initialize(
+            complete_websocket_session_initialize(
                 &mut resumed,
                 "session-1",
                 /*expected_resume_session_id*/ Some("session-1"),
@@ -3040,7 +3166,7 @@ mod tests {
             drop(first);
 
             let mut resumed = accept_websocket(&listener).await;
-            complete_websocket_initialize(
+            complete_websocket_session_initialize(
                 &mut resumed,
                 "session-1",
                 /*expected_resume_session_id*/ Some("session-1"),

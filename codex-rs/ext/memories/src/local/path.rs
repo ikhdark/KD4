@@ -9,7 +9,11 @@ pub(super) async fn read_sorted_dir_paths(
 ) -> Result<Vec<PathBuf>, MemoriesBackendError> {
     let mut dir = match tokio::fs::read_dir(dir_path).await {
         Ok(dir) => dir,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(MemoriesBackendError::NotFound {
+                path: dir_path.display().to_string(),
+            });
+        }
         Err(err) => return Err(err.into()),
     };
     let mut paths = Vec::new();

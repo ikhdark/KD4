@@ -58,6 +58,7 @@ pub(crate) enum RendezvousDisconnectReason {
     ReadError,
     WriteError,
     PongTimeout,
+    HandshakeBudgetExhausted,
     LocalShutdown,
 }
 
@@ -68,6 +69,7 @@ impl RendezvousDisconnectReason {
             Self::ReadError => "read_error",
             Self::WriteError => "write_error",
             Self::PongTimeout => WEBSOCKET_PONG_TIMEOUT_REASON,
+            Self::HandshakeBudgetExhausted => "handshake_budget_exhausted",
             Self::LocalShutdown => "local_shutdown",
         }
     }
@@ -244,6 +246,21 @@ enum RelayEventSendError {
     WebSocketClosed,
 }
 
+// A timed-out sink write may have partially sent the frame. Callers must
+// terminate the transport on error rather than retrying it.
+async fn send_with_deadline<T, E>(
+    websocket: &mut T,
+    message: Message,
+) -> Result<(), RelayEventSendError>
+where
+    T: Sink<Message, Error = E> + Unpin,
+{
+    timeout(WEBSOCKET_PONG_TIMEOUT, websocket.send(message))
+        .await
+        .map_err(|_| RelayEventSendError::WebSocketClosed)?
+        .map_err(|_| RelayEventSendError::WebSocketClosed)
+}
+
 async fn send_event_with_keepalive<T, E>(
     websocket: &mut T,
     keepalive: &mut tokio::time::Interval,
@@ -261,10 +278,7 @@ where
                 return result.map_err(|_| RelayEventSendError::IncomingClosed);
             }
             _ = keepalive.tick() => {
-                websocket
-                    .send(Message::Ping(Vec::new().into()))
-                    .await
-                    .map_err(|_| RelayEventSendError::WebSocketClosed)?;
+                send_with_deadline(websocket, Message::Ping(Vec::new().into())).await?;
             }
         }
     }
@@ -288,10 +302,12 @@ where
         let reader_label = connection_label;
         let reader_stream_id = stream_id.clone();
         let resume = RelayMessageFrame::resume(stream_id.clone());
-        if websocket
-            .send(Message::Binary(encode_relay_message_frame(&resume).into()))
-            .await
-            .is_err()
+        if send_with_deadline(
+            &mut websocket,
+            Message::Binary(encode_relay_message_frame(&resume).into()),
+        )
+        .await
+        .is_err()
         {
             let _ = disconnected_tx.send(true);
             return;
@@ -318,8 +334,7 @@ where
                     };
                     let frame = RelayMessageFrame::data(stream_id.clone(), next_seq, payload);
                     next_seq = next_seq.wrapping_add(1);
-                    if websocket
-                        .send(Message::Binary(encode_relay_message_frame(&frame).into()))
+                    if send_with_deadline(&mut websocket, Message::Binary(encode_relay_message_frame(&frame).into()))
                         .await
                         .is_err()
                     {
@@ -328,7 +343,7 @@ where
                     }
                 }
                 _ = keepalive.tick() => {
-                    if websocket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    if send_with_deadline(&mut websocket, Message::Ping(Vec::new().into())).await.is_err() {
                         let _ = disconnected_tx.send(true);
                         break;
                     }
@@ -557,7 +572,7 @@ where
     let mut validation_tasks: JoinSet<HarnessKeyValidationResult> = JoinSet::new();
     let mut failed_handshakes = 0usize;
     let mut next_validation_id = 0u64;
-    let mut disconnect_reason = RendezvousDisconnectReason::LocalShutdown;
+    let disconnect_reason;
 
     loop {
         // Registry calls run separately so a slow check does not block the relay.
@@ -614,6 +629,7 @@ where
                             );
                             send_reset(&physical_outgoing_tx, validation_result.stream_id);
                             if failed_handshake_budget_exhausted(&mut failed_handshakes) {
+                                disconnect_reason = RendezvousDisconnectReason::HandshakeBudgetExhausted;
                                 warn!("closing Noise relay after repeated handshake failures");
                                 break;
                             }
@@ -634,6 +650,7 @@ where
                                 warn!("failed to complete Noise relay handshake: {error}");
                                 send_reset(&physical_outgoing_tx, validation_result.stream_id);
                                 if failed_handshake_budget_exhausted(&mut failed_handshakes) {
+                                    disconnect_reason = RendezvousDisconnectReason::HandshakeBudgetExhausted;
                                     warn!("closing Noise relay after repeated handshake failures");
                                     break;
                                 }
@@ -646,11 +663,13 @@ where
                         );
                         // Do not leave a half-open stream if the handshake reply
                         // cannot be queued immediately.
-                        if physical_outgoing_tx
-                            .try_send(encode_relay_message_frame(&response))
-                            .is_err()
-                        {
-                            break;
+                        match physical_outgoing_tx.try_send(encode_relay_message_frame(&response)) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => continue,
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                disconnect_reason = RendezvousDisconnectReason::WriteError;
+                                break;
+                            }
                         }
                         info!(
                             noise_event = "handshake",
@@ -736,6 +755,7 @@ where
                 if pending_handshakes.remove(&stream_id).is_some() {
                     send_reset(&physical_outgoing_tx, stream_id);
                     if failed_handshake_budget_exhausted(&mut failed_handshakes) {
+                        disconnect_reason = RendezvousDisconnectReason::HandshakeBudgetExhausted;
                         warn!("closing Noise relay after repeated handshake failures");
                         break;
                     }
@@ -768,6 +788,8 @@ where
                             warn!("failed to read Noise relay handshake request: {error}");
                             send_reset(&physical_outgoing_tx, stream_id);
                             if failed_handshake_budget_exhausted(&mut failed_handshakes) {
+                                disconnect_reason =
+                                    RendezvousDisconnectReason::HandshakeBudgetExhausted;
                                 warn!("closing Noise relay after repeated handshake failures");
                                 break;
                             }
@@ -795,6 +817,7 @@ where
                 let Some(authorization) = authorization else {
                     send_reset(&physical_outgoing_tx, stream_id);
                     if failed_handshake_budget_exhausted(&mut failed_handshakes) {
+                        disconnect_reason = RendezvousDisconnectReason::HandshakeBudgetExhausted;
                         warn!("closing Noise relay after repeated handshake failures");
                         break;
                     }
@@ -842,6 +865,7 @@ where
                     if canceled_pending_handshake
                         && failed_handshake_budget_exhausted(&mut failed_handshakes)
                     {
+                        disconnect_reason = RendezvousDisconnectReason::HandshakeBudgetExhausted;
                         warn!("closing Noise relay after repeated handshake failures");
                         break;
                     }
@@ -863,7 +887,12 @@ where
                 }
             }
             RelayFrameBodyKind::Reset => {
-                pending_handshakes.remove(&stream_id);
+                if pending_handshakes.remove(&stream_id).is_some()
+                    && failed_handshake_budget_exhausted(&mut failed_handshakes)
+                {
+                    disconnect_reason = RendezvousDisconnectReason::HandshakeBudgetExhausted;
+                    break;
+                }
                 if let Some(stream) = streams.remove(&stream_id) {
                     // The reset reason is unauthenticated, so do not log it.
                     stream.disconnect(/*reason*/ None);
@@ -1128,6 +1157,31 @@ mod tests {
         assert_eq!(frame.stream_id, stream_id);
         assert_eq!(frame.into_jsonrpc_message()?, message);
         drop(connection);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn harness_connection_disconnects_when_outbound_write_stalls() -> anyhow::Result<()> {
+        let (websocket, control, mut outbound_rx) = ControlledWebSocket::new(true);
+        let mut connection = harness_connection_from_websocket(websocket, "test".to_string());
+        assert!(matches!(outbound_rx.next().await, Some(Message::Binary(_))));
+        control.set_write_blocked();
+        connection.outgoing_tx.send(test_jsonrpc_message()).await?;
+        control.wait_for_blocked_write().await?;
+        tokio::time::advance(WEBSOCKET_PONG_TIMEOUT).await;
+        assert!(
+            *timeout(
+                Duration::from_secs(1),
+                connection
+                    .disconnected_rx
+                    .wait_for(|disconnected| *disconnected)
+            )
+            .await??
+        );
+        assert!(
+            outbound_rx.next().await.is_none(),
+            "stalled frame must not be retried"
+        );
         Ok(())
     }
 

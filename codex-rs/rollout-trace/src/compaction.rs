@@ -12,9 +12,8 @@ use std::sync::atomic::Ordering;
 
 use codex_protocol::models::ResponseItem;
 use serde::Serialize;
-use serde_json::Value as JsonValue;
 
-use crate::inference::trace_response_item_json;
+use crate::inference::serialize_trace_response_items;
 use crate::model::AgentThreadId;
 use crate::model::CodexTurnId;
 use crate::model::CompactionId;
@@ -70,8 +69,9 @@ struct EnabledCompactionTraceAttempt {
 }
 
 #[derive(Serialize)]
-struct TracedCompactionCompleted {
-    output_items: Vec<JsonValue>,
+struct TracedCompactionCompleted<'a> {
+    #[serde(serialize_with = "serialize_trace_response_items")]
+    output_items: &'a [ResponseItem],
 }
 
 /// History replacement checkpoint persisted when compaction installs new live history.
@@ -81,7 +81,9 @@ struct TracedCompactionCompleted {
 /// `replacement_history` is what future prompts may carry after the checkpoint.
 #[derive(Serialize)]
 pub struct CompactionCheckpointTracePayload<'a> {
+    #[serde(serialize_with = "serialize_trace_response_items")]
     pub input_history: &'a [ResponseItem],
+    #[serde(serialize_with = "serialize_trace_response_items")]
     pub replacement_history: &'a [ResponseItem],
 }
 
@@ -134,8 +136,11 @@ impl CompactionTraceContext {
                 compaction_request_id: next_compaction_request_id(),
             }),
         };
-        attempt.record_started(request);
-        attempt
+        if attempt.record_started(request) {
+            attempt
+        } else {
+            CompactionTraceAttempt::disabled()
+        }
     }
 
     /// Records the point where compacted history becomes the live thread history.
@@ -175,16 +180,16 @@ impl CompactionTraceAttempt {
         }
     }
 
-    fn record_started(&self, request: &impl Serialize) {
+    fn record_started(&self, request: &impl Serialize) -> bool {
         let CompactionTraceAttemptState::Enabled(attempt) = &self.state else {
-            return;
+            return false;
         };
         let Some(request_payload) = write_json_payload_best_effort(
             &attempt.context.writer,
             RawPayloadKind::CompactionRequest,
             request,
         ) else {
-            return;
+            return false;
         };
 
         append_with_context_best_effort(
@@ -199,6 +204,7 @@ impl CompactionTraceAttempt {
                 request_payload,
             },
         );
+        true
     }
 
     /// Records the non-streaming compact endpoint response payload.
@@ -210,16 +216,12 @@ impl CompactionTraceAttempt {
         let CompactionTraceAttemptState::Enabled(attempt) = &self.state else {
             return;
         };
-        let response_payload = TracedCompactionCompleted {
-            output_items: output_items.iter().map(trace_response_item_json).collect(),
-        };
-        let Some(response_payload) = write_json_payload_best_effort(
+        let response_payload = TracedCompactionCompleted { output_items };
+        let response_payload = write_json_payload_best_effort(
             &attempt.context.writer,
             RawPayloadKind::CompactionResponse,
             &response_payload,
-        ) else {
-            return;
-        };
+        );
 
         append_with_context_best_effort(
             &attempt.context,

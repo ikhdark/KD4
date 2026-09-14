@@ -99,45 +99,50 @@ impl ChatWidget {
         action: QueuedInputAction,
         pending_pastes: Vec<(String, String)>,
     ) {
-        if !self.is_session_configured()
-            || self.is_user_turn_pending_or_running()
-            || self.input_queue.suppress_queue_autosend
-        {
-            self.input_queue
-                .queued_user_messages
-                .push_back(QueuedUserMessage {
-                    user_message,
-                    action,
-                    pending_pastes,
-                });
-            self.input_queue
-                .queued_user_message_history_records
-                .push_back(UserMessageHistoryRecord::UserMessageText);
-            self.refresh_pending_input_preview();
-        } else {
-            self.submit_user_message(user_message);
-        }
+        self.input_queue
+            .queued_user_messages
+            .push_back(QueuedUserMessage {
+                user_message,
+                action,
+                pending_pastes,
+                shell_escape_policy: ShellEscapePolicy::Allow,
+            });
+        self.input_queue
+            .queued_user_message_history_records
+            .push_back(UserMessageHistoryRecord::UserMessageText);
+        self.refresh_pending_input_preview();
+        self.maybe_send_next_queued_input();
     }
 
     /// If idle and there are queued inputs, submit exactly one to start the next turn.
     pub(crate) fn maybe_send_next_queued_input(&mut self) -> bool {
-        if self.input_queue.suppress_queue_autosend {
-            return false;
-        }
-        if self.is_user_turn_pending_or_running() {
+        if self.input_queue.suppress_queue_autosend
+            || !self.is_session_configured()
+            || self.is_plan_streaming_in_tui()
+            || self.is_user_turn_pending_or_running()
+        {
             return false;
         }
         let mut submitted_follow_up = false;
-        while !self.is_user_turn_pending_or_running() {
+        while !self.is_user_turn_pending_or_running()
+            && !self.input_queue.suppress_queue_autosend
+            && self.is_session_configured()
+            && !self.is_plan_streaming_in_tui()
+        {
             let Some((queued_message, history_record)) = self.pop_next_queued_user_message() else {
                 break;
             };
             match queued_message.action {
                 QueuedInputAction::Plain => {
-                    submitted_follow_up = self.submit_user_message_with_history_record(
-                        queued_message.into_user_message(),
-                        history_record,
-                    );
+                    let shell_escape_policy = queued_message.shell_escape_policy;
+                    submitted_follow_up = self
+                        .submit_user_message_with_history_and_shell_escape_policy(
+                            queued_message.into_user_message(),
+                            history_record,
+                            shell_escape_policy,
+                            false,
+                        )
+                        .0;
                     break;
                 }
                 QueuedInputAction::ParseSlash => {

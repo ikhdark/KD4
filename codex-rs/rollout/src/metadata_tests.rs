@@ -146,6 +146,51 @@ async fn listing_pass_supplies_reconciliation_extraction_without_reopening_rollo
         .expect("cached extraction");
     assert!(cache_hit);
     assert_eq!(outcome.metadata.id, id);
+
+    let compressed_path = crate::compression::compressed_rollout_path(&path);
+    std::fs::write(&compressed_path, b"stale compressed sibling").expect("write sibling");
+    assert!(
+        crate::list::read_thread_item_from_rollout(compressed_path.clone())
+            .await
+            .is_some()
+    );
+    assert!(
+        extract_metadata_from_rollout_with_cache_status(&compressed_path, "")
+            .await
+            .unwrap()
+            .1
+    );
+    let line = RolloutLine {
+        timestamp: "2026-01-28T00:00:00Z".into(),
+        item: RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "new-turn".into(),
+            trace_id: None,
+            started_at: Some(
+                DateTime::parse_from_rfc3339("2026-01-28T00:00:00Z")
+                    .unwrap()
+                    .timestamp(),
+            ),
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        })),
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writeln!(file, "{}", serde_json::to_string(&line).unwrap()).unwrap();
+    drop(file);
+    let (outcome, cache_hit) =
+        extract_metadata_from_rollout_with_cache_status(&compressed_path, "")
+            .await
+            .unwrap();
+    assert!(!cache_hit);
+    assert_eq!(
+        outcome.metadata.recency_at,
+        DateTime::parse_from_rfc3339("2026-01-28T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    );
 }
 
 #[tokio::test]
@@ -671,4 +716,40 @@ fn write_rollout_in_sessions_with_cwd(
     let mut file = File::create(&path).expect("create rollout");
     writeln!(file, "{json}").expect("write rollout");
     path
+}
+
+#[tokio::test]
+async fn backfill_discovery_failure_remains_retryable() {
+    let dir = tempdir().unwrap();
+    let sessions = dir.path().join("sessions");
+    std::fs::write(&sessions, b"not a directory").unwrap();
+    let runtime = codex_state::StateRuntime::init(dir.path().to_path_buf(), "test-provider".into())
+        .await
+        .unwrap();
+    backfill_sessions(runtime.as_ref(), dir.path(), "test-provider").await;
+    assert_ne!(
+        runtime.get_backfill_state().await.unwrap().status,
+        BackfillStatus::Complete
+    );
+    std::fs::remove_file(&sessions).unwrap();
+    let id = Uuid::new_v4();
+    write_rollout_in_sessions(
+        dir.path(),
+        "2026-01-27T12-34-56",
+        "2026-01-27T12:34:56Z",
+        id,
+        None,
+    );
+    backfill_sessions(runtime.as_ref(), dir.path(), "test-provider").await;
+    assert_eq!(
+        runtime.get_backfill_state().await.unwrap().status,
+        BackfillStatus::Complete
+    );
+    assert!(
+        runtime
+            .get_thread(ThreadId::from_string(&id.to_string()).unwrap())
+            .await
+            .unwrap()
+            .is_some()
+    );
 }

@@ -129,7 +129,7 @@ impl McpResourceClient {
     }
 }
 
-fn resource_from_rmcp(resource: rmcp::model::Resource) -> Result<Resource> {
+pub(crate) fn resource_from_rmcp(resource: rmcp::model::Resource) -> Result<Resource> {
     let rmcp::model::Annotated { raw, annotations } = resource;
     let rmcp::model::RawResource {
         uri,

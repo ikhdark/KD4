@@ -50,3 +50,33 @@ fn rejects_unbounded_reordering() {
             .is_err()
     );
 }
+
+#[test]
+fn aggregate_pending_budget_is_restored_after_release() {
+    let mut frames = OrderedCiphertextFrames::default();
+    let first = vec![1; MAX_PENDING_BYTES / 2];
+    let second = vec![2; MAX_PENDING_BYTES / 2];
+    assert!(frames.push(1, first.clone()).unwrap().is_empty());
+    assert!(frames.push(2, second.clone()).unwrap().is_empty());
+    assert!(frames.push(3, vec![3]).is_err());
+    assert_eq!(
+        frames.push(0, vec![0]).unwrap(),
+        vec![vec![0], first, second]
+    );
+    let next = vec![4; MAX_PENDING_BYTES];
+    assert!(frames.push(4, next.clone()).unwrap().is_empty());
+    assert_eq!(frames.push(3, vec![3]).unwrap(), vec![vec![3], next]);
+}
+
+#[test]
+fn accepts_exact_reorder_window() {
+    let mut frames = OrderedCiphertextFrames::default();
+    assert!(frames.push(64, vec![64]).unwrap().is_empty());
+    for seq in 0..63 {
+        assert_eq!(
+            frames.push(seq, vec![seq as u8]).unwrap(),
+            vec![vec![seq as u8]]
+        );
+    }
+    assert_eq!(frames.push(63, vec![63]).unwrap(), vec![vec![63], vec![64]]);
+}

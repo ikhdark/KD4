@@ -50,19 +50,21 @@ def format_bytes(size_bytes: int) -> str:
     return f"{size_bytes} B"
 
 
-def directory_size_bytes(path: Path) -> tuple[int, int]:
+def directory_size_bytes(path: Path, *, exclude: Path | None = None) -> tuple[int, int]:
     if not path.exists():
         return 0, 0
 
     total = 0
     errors = 0
-    stack = [os.fspath(path)]
+    stack = [os.fspath(path.resolve())]
     while stack:
         current = stack.pop()
         try:
             with os.scandir(current) as entries:
                 for entry in entries:
                     try:
+                        if exclude is not None and Path(entry.path) == exclude:
+                            continue
                         if _is_reparse_point(entry):
                             continue
                         if entry.is_dir(follow_symlinks=False):
@@ -78,16 +80,9 @@ def directory_size_bytes(path: Path) -> tuple[int, int]:
 
 def _is_reparse_point(entry: os.DirEntry[str]) -> bool:
     junction_probe = getattr(entry, "is_junction", None)
-    if callable(junction_probe):
-        try:
-            if junction_probe():
-                return True
-        except OSError:
-            return True
-    try:
-        attributes = getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
-    except OSError:
+    if callable(junction_probe) and junction_probe():
         return True
+    attributes = getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
     return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
 
 
@@ -147,6 +142,7 @@ def target_non_lane_size_bytes(
     for size_bytes, child_errors in directory_sizes_bytes(
         directories,
         size_workers=size_workers,
+        size_func=lambda path: directory_size_bytes(path, exclude=resolved_lane_root),
     ).values():
         total += size_bytes
         errors += child_errors

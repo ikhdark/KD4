@@ -483,10 +483,10 @@ impl WorldState {
                                         previous.source_digest == source_digest
                                             && previous.role == role
                                             && previous.rendered.len() >= rendered.len()
-                                    }) {
+                                    }) && let Some(rejected_snapshot) = rejected_snapshot {
                                         sections.insert(
                                             (*id).to_string(),
-                                            rejected_snapshot.expect("partial snapshot").clone(),
+                                            rejected_snapshot.clone(),
                                         );
                                         continue;
                                     }

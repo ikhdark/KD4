@@ -1,4 +1,5 @@
-//! In-memory cloud-tasks backend used by tests and local development.
+//! Fixed cloud-task fixtures for tests and local development. Apply operations
+//! simulate success without modifying a repository; task creation is unsupported.
 
 use chrono::Utc;
 use codex_cloud_tasks_client::ApplyOutcome;
@@ -23,25 +24,26 @@ pub struct MockClient;
 impl MockClient {
     async fn list_tasks(
         &self,
-        _env: Option<&str>,
-        _limit: Option<i64>,
-        _cursor: Option<&str>,
+        env: Option<&str>,
+        limit: Option<i64>,
+        cursor: Option<&str>,
     ) -> Result<TaskListPage> {
         // Slightly vary content by env to aid tests that rely on the mock
-        let rows = match _env {
+        let rows = match env {
             Some("env-A") => vec![("T-2000", "A: First", TaskStatus::Ready)],
             Some("env-B") => vec![
                 ("T-3000", "B: One", TaskStatus::Ready),
                 ("T-3001", "B: Two", TaskStatus::Pending),
             ],
-            _ => vec![
+            None => vec![
                 ("T-1000", "Update README formatting", TaskStatus::Ready),
                 ("T-1001", "Fix clippy warnings in core", TaskStatus::Pending),
                 ("T-1002", "Add contributing guide", TaskStatus::Ready),
             ],
+            Some(_) => return Err(CloudTaskError::Unimplemented("unknown mock environment")),
         };
-        let environment_id = _env.map(str::to_string);
-        let environment_label = match _env {
+        let environment_id = env.map(str::to_string);
+        let environment_label = match env {
             Some("env-A") => Some("Env A".to_string()),
             Some("env-B") => Some("Env B".to_string()),
             Some(other) => Some(other.to_string()),
@@ -56,7 +58,7 @@ impl MockClient {
                 id,
                 title: title.to_string(),
                 status,
-                updated_at: Utc::now(),
+                updated_at: Some(fixture_timestamp()),
                 environment_id: environment_id.clone(),
                 environment_label: environment_label.clone(),
                 summary: DiffSummary {
@@ -68,37 +70,66 @@ impl MockClient {
                 attempt_total: Some(if id_str == "T-1000" { 2 } else { 1 }),
             });
         }
+        let limit = match limit {
+            Some(value) if value > 0 => usize::try_from(value)
+                .map_err(|_| CloudTaskError::Msg("mock limit is too large".into()))?,
+            Some(_) => return Err(CloudTaskError::Msg("mock limit must be positive".into())),
+            None => out.len(),
+        };
+        let start = match cursor {
+            Some(value) => value
+                .parse::<usize>()
+                .map_err(|_| CloudTaskError::Msg("invalid mock cursor".into()))?,
+            None => 0,
+        };
+        if start > out.len() {
+            return Err(CloudTaskError::Msg("mock cursor is out of range".into()));
+        }
+        let end = start.saturating_add(limit).min(out.len());
+        let cursor = (end < out.len()).then(|| end.to_string());
         Ok(TaskListPage {
-            tasks: out,
-            cursor: None,
+            tasks: out.into_iter().skip(start).take(end - start).collect(),
+            cursor,
         })
     }
 
     async fn get_task_summary(&self, id: TaskId) -> Result<TaskSummary> {
-        let tasks = self
-            .list_tasks(/*env*/ None, /*limit*/ None, /*cursor*/ None)
-            .await?
-            .tasks;
-        tasks
-            .into_iter()
-            .find(|t| t.id == id)
-            .ok_or_else(|| CloudTaskError::Msg(format!("Task {} not found (mock)", id.0)))
+        for env in [None, Some("env-A"), Some("env-B")] {
+            if let Some(task) = self
+                .list_tasks(env, None, None)
+                .await?
+                .tasks
+                .into_iter()
+                .find(|task| task.id == id)
+            {
+                return Ok(task);
+            }
+        }
+        Err(CloudTaskError::Msg(format!(
+            "Task {} not found (mock)",
+            id.0
+        )))
     }
 
     async fn get_task_diff(&self, id: TaskId) -> Result<Option<String>> {
+        self.get_task_summary(id.clone()).await?;
         Ok(Some(mock_diff_for(&id)))
     }
 
-    async fn get_task_messages(&self, _id: TaskId) -> Result<Vec<String>> {
+    async fn get_task_messages(&self, id: TaskId) -> Result<Vec<String>> {
+        self.get_task_summary(id).await?;
         Ok(vec![
-            "Mock assistant output: this task contains no diff.".to_string(),
+            "Mock assistant output: fixture changes are ready for review.".to_string(),
         ])
     }
 
-    async fn get_task_text(&self, _id: TaskId) -> Result<TaskText> {
+    async fn get_task_text(&self, id: TaskId) -> Result<TaskText> {
+        self.get_task_summary(id).await?;
         Ok(TaskText {
-            prompt: Some("Why is there no diff?".to_string()),
-            messages: vec!["Mock assistant output: this task contains no diff.".to_string()],
+            prompt: Some("Review the fixture changes.".to_string()),
+            messages: vec![
+                "Mock assistant output: fixture changes are ready for review.".to_string(),
+            ],
             turn_id: Some("mock-turn".to_string()),
             sibling_turn_ids: Vec::new(),
             attempt_placement: Some(0),
@@ -106,11 +137,13 @@ impl MockClient {
         })
     }
 
-    async fn apply_task(&self, id: TaskId, _diff_override: Option<String>) -> Result<ApplyOutcome> {
+    async fn apply_task(&self, id: TaskId, diff_override: Option<String>) -> Result<ApplyOutcome> {
+        self.validate_apply_input(&id, diff_override.as_deref())
+            .await?;
         Ok(ApplyOutcome {
             applied: true,
             status: ApplyStatus::Success,
-            message: format!("Applied task {} locally (mock)", id.0),
+            message: format!("Simulated applying task {} (mock; no files changed)", id.0),
             skipped_paths: Vec::new(),
             conflict_paths: Vec::new(),
         })
@@ -119,8 +152,10 @@ impl MockClient {
     async fn apply_task_preflight(
         &self,
         id: TaskId,
-        _diff_override: Option<String>,
+        diff_override: Option<String>,
     ) -> Result<ApplyOutcome> {
+        self.validate_apply_input(&id, diff_override.as_deref())
+            .await?;
         Ok(ApplyOutcome {
             applied: false,
             status: ApplyStatus::Success,
@@ -133,19 +168,33 @@ impl MockClient {
     async fn list_sibling_attempts(
         &self,
         task: TaskId,
-        _turn_id: String,
+        turn_id: String,
     ) -> Result<Vec<TurnAttempt>> {
+        self.get_task_summary(task.clone()).await?;
+        if turn_id != "mock-turn" && !(task.0 == "T-1000" && turn_id == "T-1000-attempt-2") {
+            return Err(CloudTaskError::Unimplemented("unknown mock turn"));
+        }
         if task.0 == "T-1000" {
             return Ok(vec![TurnAttempt {
                 turn_id: "T-1000-attempt-2".to_string(),
                 attempt_placement: Some(1),
-                created_at: Some(Utc::now()),
+                created_at: Some(fixture_timestamp()),
                 status: AttemptStatus::Completed,
                 diff: Some(mock_diff_for(&task)),
                 messages: vec!["Mock alternate attempt".to_string()],
             }]);
         }
         Ok(Vec::new())
+    }
+
+    async fn validate_apply_input(&self, id: &TaskId, diff: Option<&str>) -> Result<()> {
+        self.get_task_summary(id.clone()).await?;
+        if diff.is_some_and(|diff| diff != mock_diff_for(id)) {
+            return Err(CloudTaskError::Unimplemented(
+                "custom mock diffs cannot be applied",
+            ));
+        }
+        Ok(())
     }
 
     async fn create_task(
@@ -157,8 +206,9 @@ impl MockClient {
         best_of_n: usize,
     ) -> Result<CreatedTask> {
         let _ = (env_id, prompt, git_ref, qa_mode, best_of_n);
-        let id = format!("task_local_{}", chrono::Utc::now().timestamp_millis());
-        Ok(CreatedTask { id: TaskId(id) })
+        Err(CloudTaskError::Unimplemented(
+            "fixed mock tasks cannot be created",
+        ))
     }
 }
 
@@ -265,5 +315,140 @@ fn count_from_unified(diff: &str) -> (usize, usize) {
             }
         }
         (a, d)
+    }
+}
+
+#[expect(clippy::expect_used, reason = "This fixed fixture timestamp is within the supported date range")]
+fn fixture_timestamp() -> chrono::DateTime<Utc> {
+    chrono::DateTime::from_timestamp(1_735_689_600, 0).expect("valid fixture timestamp")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn listed_fixtures_are_retrievable_and_stable() {
+        let backend: &dyn CloudBackend = &MockClient;
+        for env in [None, Some("env-A"), Some("env-B")] {
+            let page = backend.list_tasks(env, None, None).await.expect("list");
+            assert_eq!(
+                page.tasks.len(),
+                match env {
+                    None => 3,
+                    Some("env-A") => 1,
+                    _ => 2,
+                }
+            );
+            for task in page.tasks {
+                assert_eq!(
+                    backend
+                        .get_task_summary(task.id.clone())
+                        .await
+                        .expect("summary"),
+                    task
+                );
+                assert_eq!(
+                    task.updated_at.expect("fixture timestamp").timestamp(),
+                    1_735_689_600
+                );
+                assert!(
+                    backend
+                        .get_task_diff(task.id)
+                        .await
+                        .expect("diff")
+                        .is_some()
+                );
+            }
+        }
+        let siblings = backend
+            .list_sibling_attempts(TaskId("T-1000".into()), "mock-turn".into())
+            .await
+            .expect("siblings");
+        assert_eq!(siblings.len(), 1);
+        assert_eq!(
+            siblings[0].created_at.expect("timestamp").timestamp(),
+            1_735_689_600
+        );
+    }
+
+    #[tokio::test]
+    async fn pagination_returns_each_fixture_once() {
+        let backend: &dyn CloudBackend = &MockClient;
+        let mut cursor = None;
+        for (index, expected) in ["T-1000", "T-1001", "T-1002"].into_iter().enumerate() {
+            let page = backend
+                .list_tasks(None, Some(1), cursor.as_deref())
+                .await
+                .expect("page");
+            assert_eq!(page.tasks.len(), 1);
+            assert_eq!(page.tasks[0].id.0, expected);
+            assert_eq!(page.cursor, (index < 2).then(|| (index + 1).to_string()));
+            cursor = page.cursor;
+        }
+        assert!(backend.list_tasks(None, Some(0), None).await.is_err());
+        assert!(backend.list_tasks(None, None, Some("bad")).await.is_err());
+        assert!(backend.list_tasks(None, None, Some("99")).await.is_err());
+        assert!(
+            backend
+                .list_tasks(Some("unknown"), None, None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_operations_and_unknown_ids_are_rejected() {
+        let backend: &dyn CloudBackend = &MockClient;
+        let id = TaskId("unknown".into());
+        assert!(backend.get_task_summary(id.clone()).await.is_err());
+        assert!(backend.get_task_diff(id.clone()).await.is_err());
+        assert!(backend.get_task_messages(id.clone()).await.is_err());
+        assert!(backend.get_task_text(id.clone()).await.is_err());
+        assert!(
+            backend
+                .list_sibling_attempts(id.clone(), "mock-turn".into())
+                .await
+                .is_err()
+        );
+        assert!(backend.apply_task(id.clone(), None).await.is_err());
+        assert!(backend.apply_task_preflight(id, None).await.is_err());
+        assert!(matches!(
+            backend.create_task("env-A", "test", "main", false, 1).await,
+            Err(CloudTaskError::Unimplemented(_))
+        ));
+        let id = TaskId("T-1000".into());
+        assert!(
+            backend
+                .apply_task(id.clone(), Some("custom".into()))
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .apply_task_preflight(id.clone(), Some("custom".into()))
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .list_sibling_attempts(id.clone(), "unknown".into())
+                .await
+                .is_err()
+        );
+        let diff = backend
+            .get_task_diff(id.clone())
+            .await
+            .expect("fixture diff");
+        let preflight = backend
+            .apply_task_preflight(id.clone(), diff.clone())
+            .await
+            .expect("preflight");
+        assert_eq!(preflight.status, ApplyStatus::Success);
+        assert!(!preflight.applied);
+        let applied = backend.apply_task(id, diff).await.expect("simulated apply");
+        assert_eq!(applied.status, ApplyStatus::Success);
+        assert!(applied.applied);
+        assert!(applied.message.contains("no files changed"));
     }
 }

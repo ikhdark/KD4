@@ -20,6 +20,42 @@ FRESH_SOURCE_TIME = FIXTURE_TIME + 10_000
 
 
 class PublishLocalCodexApplyTest(PublishLocalCodexTestBase):
+    def test_manifest_source_mutation_is_rejected_before_install(self) -> None:
+        install = Path(self.repo_temp.name) / "install"
+        manifest = self.write_source_bundle_manifest(self.source_exe)
+        command = rf"""
+$global:Mutated = $false
+Set-PSBreakpoint -Command Get-CachedLocalPublishFileSha256 -Action {{
+    if (-not $global:Mutated) {{
+        [IO.File]::AppendAllText({ps_single_quote(self.source_code_mode_host)}, 'changed')
+        $global:Mutated = $true
+    }}
+}} | Out-Null
+& {ps_single_quote(SCRIPT)} -SkipBuild -RepoRoot {ps_single_quote(self.repo_root)} `
+    -SourceBundleManifest {ps_single_quote(manifest)} -InstallDir {ps_single_quote(install)}
+"""
+        result = subprocess.run(
+            [
+                self.shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ],
+            env=clean_env(),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=RUN_TIMEOUT_SECONDS,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "digest changed after manifest verification: code-mode-host", result.stderr
+        )
+        self.assertFalse((install / "codex.exe").exists())
+        self.assertEqual(list(install.parent.glob(".install.bundle.*")), [])
+
     def test_audit_publish_stages_complete_bundle_before_visibility(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -42,7 +78,7 @@ try {{
     throw 'expected staging failure'
 }}
 catch {{
-    if ($_.Exception.Message -eq 'expected staging failure') {{ throw }}
+    if ($_.Exception.Message -ne {ps_single_quote(f"Cannot stage runtime bundle: source is missing: {missing}")}) {{ throw }}
     exit 0
 }}
 """
@@ -58,6 +94,7 @@ catch {{
                 text=True,
                 capture_output=True,
                 check=False,
+                timeout=RUN_TIMEOUT_SECONDS,
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -73,6 +110,8 @@ catch {{
             target = install_dir / "codex.exe"
             backup = temp_path / "codex.bak"
             target.write_bytes(b"new")
+            new_target = install_dir / "host.exe"
+            new_target.write_bytes(b"new-host")
             backup.write_bytes(b"old")
             stage = temp_path / ".install.bundle.fixture"
             stage.mkdir()
@@ -99,6 +138,14 @@ $transaction = [pscustomobject]@{{
         HadPreviousTarget = $true
         Changed = $true
         State = 'Applying'
+    }}, [pscustomobject]@{{
+        Name = 'host'
+        StagedPath = {ps_single_quote(stage / "host.exe")}
+        TargetPath = {ps_single_quote(new_target)}
+        BackupPath = $null
+        HadPreviousTarget = $false
+        Changed = $true
+        State = 'Applied'
     }})
 }}
 Write-CodexPublishTransactionJournal -Transaction $transaction
@@ -116,12 +163,15 @@ if (-not (Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(jo
                 text=True,
                 capture_output=True,
                 check=False,
+                timeout=RUN_TIMEOUT_SECONDS,
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(target.read_bytes(), b"old")
             self.assertFalse(journal.exists())
             self.assertFalse(stage.exists())
+            self.assertFalse(new_target.exists())
+            self.assertFalse(rollback.exists())
 
     def test_apply_replaces_target_and_writes_backup(self) -> None:
         for output_args in ((), ("-Concise",), ("-Concise", "-Verbose")):
@@ -157,19 +207,23 @@ if (-not (Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(jo
                     )
                     self.assertEqual(target.read_bytes(), fake_codex.read_bytes())
                     self.assertEqual(
-                        code_mode_host_target.read_bytes(), self.source_code_mode_host_bytes
+                        code_mode_host_target.read_bytes(),
+                        self.source_code_mode_host_bytes,
                     )
                     sandbox_resources = install_dir / "codex-resources"
                     windows_sandbox_setup_target = (
                         sandbox_resources / "codex-windows-sandbox-setup.exe"
                     )
-                    command_runner_target = sandbox_resources / "codex-command-runner.exe"
+                    command_runner_target = (
+                        sandbox_resources / "codex-command-runner.exe"
+                    )
                     self.assertEqual(
                         windows_sandbox_setup_target.read_bytes(),
                         self.source_windows_sandbox_setup_bytes,
                     )
                     self.assertEqual(
-                        command_runner_target.read_bytes(), self.source_command_runner_bytes
+                        command_runner_target.read_bytes(),
+                        self.source_command_runner_bytes,
                     )
                     backup_dir = install_dir.parent / "publisher-backups"
                     backups = sorted(backup_dir.glob("codex-2*.exe"))
@@ -191,7 +245,9 @@ if (-not (Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(jo
                         self.assertNotIn("targetSha256:", result.stdout)
                         self.assertNotIn("backupPath:", result.stdout)
                         self.assertNotIn("desktopAppPackage:", result.stdout)
-                        self.assertLessEqual(len(result.stdout.splitlines()), 12, result.stdout)
+                        self.assertLessEqual(
+                            len(result.stdout.splitlines()), 12, result.stdout
+                        )
                     else:
                         self.assertIn("targetSha256:", result.stdout)
                         self.assertIn(f"backupSha256: {previous_sha256}", result.stdout)
@@ -203,12 +259,19 @@ if (-not (Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(jo
                         self.assertIn("backupPath:", result.stdout)
                         self.assertIn("codeModeHostBackupPath:", result.stdout)
                         self.assertIn("postPublishVerify: version ok", result.stdout)
-                        self.assertIn("codexPostPublishVerify: sha256 ok", result.stdout)
-                        self.assertIn("codeModeHostPostPublishVerify: sha256 ok", result.stdout)
                         self.assertIn(
-                            "windowsSandboxSetupPostPublishVerify: sha256 ok", result.stdout
+                            "codexPostPublishVerify: sha256 ok", result.stdout
                         )
-                        self.assertIn("commandRunnerPostPublishVerify: sha256 ok", result.stdout)
+                        self.assertIn(
+                            "codeModeHostPostPublishVerify: sha256 ok", result.stdout
+                        )
+                        self.assertIn(
+                            "windowsSandboxSetupPostPublishVerify: sha256 ok",
+                            result.stdout,
+                        )
+                        self.assertIn(
+                            "commandRunnerPostPublishVerify: sha256 ok", result.stdout
+                        )
                         self.assertRegex(
                             result.stdout,
                             r"targetBeforeVersion: <unavailable: [^\r\n]+>[\r\n]",
@@ -249,7 +312,14 @@ if (-not (Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(jo
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
             backups = sorted(backup_dir.glob("codex-*.exe"))
-            self.assertLessEqual(len(backups), 10)
+            self.assertEqual(len(backups), 10)
+            self.assertCountEqual(
+                [backup.read_bytes() for backup in backups],
+                [
+                    self.source_exe_bytes,
+                    *[f"backup-{index}".encode() for index in range(3, 12)],
+                ],
+            )
             self.assertIn("backupPruned:", result.stdout)
             self.assert_no_publish_temps(install_dir)
 

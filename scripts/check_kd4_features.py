@@ -78,6 +78,7 @@ def _verification_route(
     verification: dict[str, Any],
     repo_root: Path,
     rust_manifest: rust_test_runner.Manifest | None = None,
+    python_tree: ast.Module | None = None,
 ) -> str:
     """Accept only a single test selector in its declared source owner/binary."""
     command = verification.get("command")
@@ -97,7 +98,11 @@ def _verification_route(
         module = (
             source.relative_to(repo_root).with_suffix("").as_posix().replace("/", ".")
         )
-        tree = ast.parse(source.read_text(encoding="utf-8"))
+        tree = (
+            python_tree
+            if python_tree is not None
+            else ast.parse(source.read_text(encoding="utf-8"))
+        )
         selectors = {
             f"{module}.{node.name}.{symbol}"
             for node in tree.body
@@ -189,27 +194,10 @@ class _TestOutcome:
     failed: bool = False
     zero_tests: bool = False
 
-    def observe(self, line: str) -> None:
-        line = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
-        self.zero_tests |= bool(
-            re.search(r"\b(?:running 0 tests|Ran 0 tests|0 tests run)\b", line)
-        )
-        identity = status = None
-        if self.route == "unittest":
-            match = re.fullmatch(r"(\w+) \(([^)]+)\)(?: .*?)? \.\.\. (.+)", line)
-            if match and match[1] == self.symbol:
-                qualified = (
-                    match[2]
-                    if match[2].endswith("." + self.symbol)
-                    else match[2] + "." + self.symbol
-                )
-                if qualified == self.selector:
-                    identity, status = qualified, match[3]
-        if identity is None or identity.split("::")[-1].split(".")[-1] != self.symbol:
-            return
-        if status in {"ok", "PASS"}:
-            self.passed.add(identity)
-        elif status and status.startswith(("skipped", "ignored", "SKIP")):
+    def record(self, status: str) -> None:
+        if status == "ok":
+            self.passed.add(self.selector)
+        elif status.startswith("skipped"):
             self.skipped = True
         else:
             self.failed = True
@@ -224,6 +212,33 @@ class _TestOutcome:
         if len(self.passed) > 1:
             return "ambiguous_test_identity"
         return "zero_tests" if self.zero_tests else "not_executed"
+
+
+def _observe_unittest_output(
+    line: str, observers: dict[str, _TestOutcome], pending: str | None
+) -> str | None:
+    line = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+    header = re.match(r"^(\w+) \(([^)]+)\)(.*)$", line)
+    if header:
+        symbol, owner, suffix = header.groups()
+        identity = owner if owner.endswith("." + symbol) else owner + "." + symbol
+        pending = identity if identity in observers else None
+        line = suffix.strip()
+    if pending is not None:
+        status = line.rsplit("... ", 1)[-1]
+        if status in {
+            "ok",
+            "FAIL",
+            "ERROR",
+            "expected failure",
+            "unexpected success",
+        } or status.startswith("skipped"):
+            observers[pending].record(status)
+            pending = None
+    if re.search(r"\bRan 0 tests\b", line):
+        for observer in observers.values():
+            observer.zero_tests = True
+    return pending
 
 
 def execute_runtime_verification(
@@ -363,10 +378,7 @@ def execute_runtime_verification(
         }
         command = [interpreter, "-m", "unittest", "-v", *observers]
         if not quiet:
-            for feature in features:
-                print(
-                    f"KD4 RUNTIME VERIFICATION [{feature['id']}]: {' '.join(command)}"
-                )
+            print(f"KD4 RUNTIME VERIFICATION: {' '.join(command)}")
         try:
             with subprocess.Popen(
                 command,
@@ -379,9 +391,9 @@ def execute_runtime_verification(
                 env={**os.environ, "INSTA_UPDATE": "no"},
             ) as process:
                 assert process.stdout is not None
+                pending = None
                 for line in process.stdout:
-                    for observer in observers.values():
-                        observer.observe(line)
+                    pending = _observe_unittest_output(line, observers, pending)
                     if not quiet:
                         print(line, end="")
                 returncode = process.wait()
@@ -554,7 +566,11 @@ def _validate_runtime_status(
 ) -> str | None:
     config_keys = feature.get("config_keys")
     feature_config_keys = (
-        [key for key in config_keys if key.startswith("features.")]
+        [
+            key
+            for key in config_keys
+            if isinstance(key, str) and key.startswith("features.")
+        ]
         if isinstance(config_keys, list)
         else []
     )
@@ -590,7 +606,10 @@ def _validate_runtime_status(
                 feature_id,
             )
         )
-    if runtime_status not in ALLOWED_RUNTIME_STATUSES:
+    if (
+        not isinstance(runtime_status, str)
+        or runtime_status not in ALLOWED_RUNTIME_STATUSES
+    ):
         findings.append(
             Finding(
                 "error",
@@ -755,7 +774,7 @@ def _validate_evidence(
             continue
 
         kind = evidence.get("kind")
-        if kind not in ALLOWED_EVIDENCE_KINDS:
+        if not isinstance(kind, str) or kind not in ALLOWED_EVIDENCE_KINDS:
             findings.append(
                 Finding(
                     "error",
@@ -878,6 +897,7 @@ def _validate_runtime_verification(
     findings: list[Finding],
     text_cache: dict[Path, str],
     rust_manifest_cache: dict[Path, rust_test_runner.Manifest],
+    python_ast_cache: dict[Path, ast.Module],
 ) -> bool:
     if not isinstance(verification, dict):
         findings.append(
@@ -891,7 +911,7 @@ def _validate_runtime_verification(
         return False
 
     kind = verification.get("kind")
-    if kind not in ALLOWED_RUNTIME_VERIFICATION_KINDS:
+    if not isinstance(kind, str) or kind not in ALLOWED_RUNTIME_VERIFICATION_KINDS:
         findings.append(
             Finding(
                 "error",
@@ -980,7 +1000,12 @@ def _validate_runtime_verification(
                     manifest_path
                 )
             rust_manifest = rust_manifest_cache[manifest_path]
-        _verification_route(verification, repo_root, rust_manifest)
+        module = None
+        if path.suffix == ".py":
+            if path not in python_ast_cache:
+                python_ast_cache[path] = ast.parse(text_cache[path])
+            module = python_ast_cache[path]
+        _verification_route(verification, repo_root, rust_manifest, module)
     except (
         ValueError,
         OSError,
@@ -994,23 +1019,14 @@ def _validate_runtime_verification(
         return False
 
     if path.suffix.lower() == ".py":
-        try:
-            module = ast.parse(text)
-        except SyntaxError as exc:
-            findings.append(
-                Finding(
-                    "error",
-                    "invalid-runtime-verification",
-                    f"{verification.get('path')} is not valid Python: {exc}",
-                    feature_id,
-                )
-            )
-            return False
+        assert module is not None
+        class_name = command[3].rsplit(".", 2)[-2]
         matching_tests = [
-            node
-            for node in ast.walk(module)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == symbol
+            method
+            for node in module.body
+            if isinstance(node, ast.ClassDef) and node.name == class_name
+            for method in node.body
+            if isinstance(method, ast.FunctionDef) and method.name == symbol
         ]
         if not matching_tests or all(
             all(
@@ -1107,7 +1123,7 @@ def _validate_contract_schema(
     try:
         if path not in text_cache:
             text_cache[path] = path.read_text(encoding="utf-8")
-        text = text_cache[path]
+        text = _executable_source_text(path, text_cache[path])
     except (OSError, UnicodeError) as exc:
         findings.append(
             Finding(
@@ -1447,6 +1463,7 @@ def validate_manifest(
     runtime_status_counts: Counter[str] = Counter()
     text_cache: dict[Path, str] = {}
     rust_manifest_cache: dict[Path, rust_test_runner.Manifest] = {}
+    python_ast_cache: dict[Path, ast.Module] = {}
     feature_registry_cache: dict[str, dict[str, bool] | None] = {}
     project_config_cache: dict[str, object] = {}
     owner_cache: dict[str, dict[str, Any]] | None = None
@@ -1502,7 +1519,7 @@ def validate_manifest(
             )
 
         status = feature.get("status")
-        if status not in ALLOWED_STATUSES:
+        if not isinstance(status, str) or status not in ALLOWED_STATUSES:
             findings.append(
                 Finding(
                     "error",
@@ -1515,7 +1532,10 @@ def validate_manifest(
             status_counts[status] += 1
 
         capability_kind = feature.get("capability_kind")
-        if capability_kind not in ALLOWED_CAPABILITY_KINDS:
+        if (
+            not isinstance(capability_kind, str)
+            or capability_kind not in ALLOWED_CAPABILITY_KINDS
+        ):
             findings.append(
                 Finding(
                     "error",
@@ -1674,7 +1694,7 @@ def validate_manifest(
                     )
                 )
             if (
-                capability_kind in {"runtime", "workflow", "guidance"}
+                capability_kind in ("runtime", "workflow", "guidance")
                 and evidence_kinds["registration"] == 0
             ):
                 findings.append(
@@ -1686,7 +1706,7 @@ def validate_manifest(
                     )
                 )
             if (
-                capability_kind in {"runtime", "workflow"}
+                capability_kind in ("runtime", "workflow")
                 and evidence_kinds["test"] == 0
             ):
                 findings.append(
@@ -1705,6 +1725,7 @@ def validate_manifest(
                     findings=findings,
                     text_cache=text_cache,
                     rust_manifest_cache=rust_manifest_cache,
+                    python_ast_cache=python_ast_cache,
                 )
         if status == "orphaned":
             findings.append(

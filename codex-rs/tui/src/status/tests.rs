@@ -434,7 +434,7 @@ async fn status_permissions_named_read_only_profile_shows_builtin_label() {
 }
 
 #[tokio::test]
-async fn status_permissions_read_only_profile_shows_additional_writable_roots() {
+async fn status_permissions_read_only_profile_preserves_preset_label_for_internal_writes() {
     let temp_home = TempDir::new().expect("temp home");
     let mut config = test_config(&temp_home).await;
     config
@@ -511,7 +511,7 @@ async fn status_permissions_workspace_auto_review_shows_reviewer_label() {
 }
 
 #[tokio::test]
-async fn status_permissions_named_profile_shows_additional_writable_roots() {
+async fn status_permissions_named_profile_hides_internal_writable_roots() {
     let temp_home = TempDir::new().expect("temp home");
     let mut config = test_config(&temp_home).await;
     config
@@ -1237,7 +1237,6 @@ async fn status_card_token_usage_excludes_cached_tokens() {
     config.model = Some("gpt-5.1-codex-max".to_string());
     set_workspace_cwd(&mut config, test_path_buf("/workspace/tests").abs());
 
-    let account_display = test_status_account_display();
     let usage = TokenUsage {
         input_tokens: 1_200,
         cached_input_tokens: 200,
@@ -1255,7 +1254,7 @@ async fn status_card_token_usage_excludes_cached_tokens() {
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output(
         &config,
-        account_display.as_ref(),
+        /*account_display*/ None,
         Some(&token_info),
         &usage,
         &None,
@@ -1270,6 +1269,12 @@ async fn status_card_token_usage_excludes_cached_tokens() {
     );
     let rendered = render_lines(&composite.display_lines(/*width*/ 120));
 
+    assert!(
+        rendered
+            .iter()
+            .any(|line| line.contains("1.9K total  (1K input + 900 output)")),
+        "expected non-cached token arithmetic, got: {rendered:?}"
+    );
     assert!(
         rendered.iter().all(|line| !line.contains("cached")),
         "cached tokens should not be displayed, got: {rendered:?}"
@@ -1393,7 +1398,7 @@ async fn status_snapshot_shows_missing_limits_message() {
 }
 
 #[tokio::test]
-async fn status_snapshot_uses_default_reasoning_when_config_empty() {
+async fn status_snapshot_uses_reasoning_override_when_config_empty() {
     let temp_home = TempDir::new().expect("temp home");
     let mut config = test_config(&temp_home).await;
     config.model = Some("gpt-5.1-codex-max".to_string());
@@ -1445,11 +1450,14 @@ async fn status_snapshot_uses_default_reasoning_when_config_empty() {
         }
     }
     let sanitized = sanitize_directory(rendered_lines).join("\n");
-    assert_snapshot!(sanitized);
+    assert_snapshot!(
+        "status_snapshot_uses_default_reasoning_when_config_empty",
+        sanitized
+    );
 }
 
 #[tokio::test]
-async fn status_snapshot_shows_refreshing_limits_notice() {
+async fn status_snapshot_keeps_available_limits_while_refreshing() {
     let temp_home = TempDir::new().expect("temp home");
     let mut config = test_config(&temp_home).await;
     config.model = Some("gpt-5.1-codex-max".to_string());
@@ -1512,7 +1520,7 @@ async fn status_snapshot_shows_refreshing_limits_notice() {
         }
     }
     let sanitized = sanitize_directory(rendered_lines).join("\n");
-    assert_snapshot!(sanitized);
+    assert_snapshot!("status_snapshot_shows_refreshing_limits_notice", sanitized);
 }
 
 #[tokio::test]

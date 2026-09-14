@@ -806,7 +806,19 @@ pub struct CollaborationModeMask {
     pub name: String,
     pub mode: Option<ModeKind>,
     pub model: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "serde_with::rust::double_option::deserialize"
+    )]
+    #[ts(optional = nullable)]
     pub reasoning_effort: Option<Option<ReasoningEffort>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "serde_with::rust::double_option::deserialize"
+    )]
+    #[ts(optional = nullable)]
     pub developer_instructions: Option<Option<String>>,
 }
 
@@ -923,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_mask_can_clear_optional_fields() {
+    fn apply_mask_preserves_missing_null_and_value_through_json() {
         let mode = CollaborationMode {
             mode: ModeKind::Default,
             settings: Settings {
@@ -932,23 +944,41 @@ mod tests {
                 developer_instructions: Some("stay focused".to_string()),
             },
         };
-        let mask = CollaborationModeMask {
-            name: "Clear".to_string(),
-            mode: None,
-            model: None,
-            reasoning_effort: Some(None),
-            developer_instructions: Some(None),
-        };
-
-        let expected = CollaborationMode {
-            mode: ModeKind::Default,
-            settings: Settings {
-                model: "gpt-5.2-codex".to_string(),
-                reasoning_effort: None,
-                developer_instructions: None,
-            },
-        };
-        assert_eq!(expected, mode.apply_mask(&mask));
+        for (fields, effort, instructions) in [
+            (
+                serde_json::json!({}),
+                Some(ReasoningEffort::High),
+                Some("stay focused"),
+            ),
+            (
+                serde_json::json!({"reasoning_effort": null, "developer_instructions": null}),
+                None,
+                None,
+            ),
+            (
+                serde_json::json!({"reasoning_effort": "low", "developer_instructions": "new instructions"}),
+                Some(ReasoningEffort::Low),
+                Some("new instructions"),
+            ),
+        ] {
+            let mut json = serde_json::json!({"name": "Mask", "mode": null, "model": null});
+            json.as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let mask: CollaborationModeMask = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&mask).unwrap(), json);
+            assert_eq!(
+                mode.apply_mask(&mask),
+                CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
+                        model: "gpt-5.2-codex".to_string(),
+                        reasoning_effort: effort,
+                        developer_instructions: instructions.map(str::to_string),
+                    },
+                }
+            );
+        }
     }
 
     #[test]

@@ -60,15 +60,19 @@ fn display_width(s: &str) -> usize {
         return s.width();
     }
 
-    // Strip OSC sequences: ESC ] ... BEL
+    // Strip OSC sequences terminated by BEL or ST (ESC backslash).
     let mut visible = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(ch) = chars.next() {
         if ch == '\x1B' && chars.clone().next() == Some(']') {
-            // Consume the ']' and everything up to and including BEL.
+            // Consume the ']' and everything up to and including the terminator.
             chars.next(); // skip ']'
-            for c in chars.by_ref() {
+            while let Some(c) = chars.next() {
                 if c == '\x07' {
+                    break;
+                }
+                if c == '\x1B' && chars.clone().next() == Some('\\') {
+                    chars.next();
                     break;
                 }
             }
@@ -619,7 +623,9 @@ fn diff_buffers(a: &Buffer, b: &Buffer, force_redraw: bool) -> Vec<DrawCommand> 
             column += width.max(1); // treat zero-width symbols as width 1
         }
 
-        if last_nonblank_column + 1 < row.len() {
+        if last_nonblank_column + 1 < row.len()
+            && (force_redraw || row != &previous_buffer[row_start..row_end])
+        {
             let (x, y) = a.pos_of(row_start + last_nonblank_column + 1);
             updates.push(DrawCommand::ClearToEnd { x, y, bg });
         }
@@ -637,7 +643,7 @@ fn diff_buffers(a: &Buffer, b: &Buffer, force_redraw: bool) -> Vec<DrawCommand> 
         {
             let (x, y) = a.pos_of(i);
             let row = i / a.area.width as usize;
-            if x <= last_nonblank_columns[row] {
+            if x - a.area.x <= last_nonblank_columns[row] {
                 updates.push(DrawCommand::Put {
                     x,
                     y,
@@ -646,12 +652,10 @@ fn diff_buffers(a: &Buffer, b: &Buffer, force_redraw: bool) -> Vec<DrawCommand> 
             }
         }
 
-        to_skip = display_width(current.symbol()).saturating_sub(1);
+        let current_width = display_width(current.symbol());
+        to_skip = current_width.saturating_sub(1);
 
-        let affected_width = std::cmp::max(
-            display_width(current.symbol()),
-            display_width(previous.symbol()),
-        );
+        let affected_width = std::cmp::max(current_width, display_width(previous.symbol()));
         invalidated = std::cmp::max(affected_width, invalidated).saturating_sub(1);
     }
     updates
@@ -745,6 +749,9 @@ impl ModifierDiff {
         }
         if removed.contains(Modifier::DIM) {
             queue!(w, SetAttribute(CAttribute::NormalIntensity))?;
+            if self.to.contains(Modifier::BOLD) {
+                queue!(w, SetAttribute(CAttribute::Bold))?;
+            }
         }
         if removed.contains(Modifier::CROSSED_OUT) {
             queue!(w, SetAttribute(CAttribute::NotCrossedOut))?;
@@ -888,6 +895,78 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
+        }
+    }
+
+    #[test]
+    fn unchanged_rows_emit_no_commands_but_invalidated_rows_repaint() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
+        buffer.set_string(0, 0, "text", Style::default());
+        assert!(diff_buffers(&buffer, &buffer, false).is_empty());
+        let forced = diff_buffers(&buffer, &buffer, true);
+        assert!(
+            forced
+                .iter()
+                .any(|command| matches!(command, DrawCommand::Put { x: 0, .. }))
+        );
+        assert!(
+            forced
+                .iter()
+                .any(|command| matches!(command, DrawCommand::ClearToEnd { x: 4, .. }))
+        );
+    }
+
+    #[test]
+    fn offset_viewport_updates_use_relative_row_bounds() {
+        let previous = Buffer::empty(Rect::new(5, 2, 10, 1));
+        let mut next = previous.clone();
+        next.set_string(5, 2, "ok", Style::default());
+        let mut backend = crate::test_backend::VT100Backend::new(20, 4);
+        draw(
+            &mut backend,
+            diff_buffers(&previous, &next, false).into_iter(),
+        )
+        .unwrap();
+        assert_eq!(backend.vt100().screen().cell(2, 5).unwrap().contents(), "o");
+        assert_eq!(backend.vt100().screen().cell(2, 6).unwrap().contents(), "k");
+    }
+
+    #[test]
+    fn removing_dim_preserves_bold_in_terminal_output() {
+        let mut terminal =
+            Terminal::with_options(crate::test_backend::VT100Backend::new(3, 1)).unwrap();
+        terminal.set_viewport_area(Rect::new(0, 0, 3, 1));
+        terminal
+            .draw(|frame| {
+                frame.buffer.set_string(
+                    0,
+                    0,
+                    "a",
+                    Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
+                );
+                frame
+                    .buffer
+                    .set_string(1, 0, "b", Style::default().add_modifier(Modifier::BOLD));
+            })
+            .unwrap();
+        let cell = terminal.backend().vt100().screen().cell(0, 1).unwrap();
+        assert_eq!(cell.contents(), "b");
+        assert!(cell.bold());
+    }
+
+    #[test]
+    fn hyperlink_width_accepts_bel_and_string_terminators() {
+        for terminator in ["\x07", "\x1b\\"] {
+            let symbol = format!("\x1b]8;;https://example.com{terminator}界\x1b]8;;{terminator}");
+            assert_eq!(display_width(&symbol), 2);
+            let previous = Buffer::empty(Rect::new(0, 0, 8, 1));
+            let mut next = previous.clone();
+            next[(0, 0)].set_symbol(&symbol);
+            assert!(
+                diff_buffers(&previous, &next, false)
+                    .iter()
+                    .any(|command| matches!(command, DrawCommand::ClearToEnd { x: 2, .. }))
+            );
         }
     }
 

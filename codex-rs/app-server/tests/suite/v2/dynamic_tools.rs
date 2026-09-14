@@ -224,6 +224,9 @@ async fn thread_start_rejects_invalid_dynamic_tool_inputs() -> Result<()> {
 
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
+    let project = TempDir::new()?;
+    let config_path = codex_home.path().join("config.toml");
+    let original_config = std::fs::read_to_string(&config_path)?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -320,7 +323,11 @@ async fn thread_start_rejects_invalid_dynamic_tool_inputs() -> Result<()> {
         let thread_req = mcp
             .send_raw_request(
                 "thread/start",
-                Some(json!({ "dynamicTools": dynamic_tools })),
+                Some(json!({
+                    "dynamicTools": dynamic_tools,
+                    "cwd": project.path(),
+                    "sandbox": "danger-full-access"
+                })),
             )
             .await?;
         let error = timeout(
@@ -334,6 +341,7 @@ async fn thread_start_rejects_invalid_dynamic_tool_inputs() -> Result<()> {
             "unexpected error: {}",
             error.error.message
         );
+        assert_eq!(std::fs::read_to_string(&config_path)?, original_config);
     }
 
     Ok(())

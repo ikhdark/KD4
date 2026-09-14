@@ -11,6 +11,53 @@ from scripts import asciicheck
 
 
 class AsciiCheckTest(unittest.TestCase):
+    def test_crlf_chunk_boundaries_preserve_character_and_decode_locations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "boundary.txt"
+            for payload, location in (
+                (b"abc\r\n\x01", "line 2, column 1"),
+                ("abc\r\n\u2014".encode(), "line 2, column 1"),
+                (b"abc\r\n\xff", "line 2, column 1"),
+            ):
+                path.write_bytes(payload)
+                output = io.StringIO()
+                with (
+                    mock.patch.object(asciicheck, "_READ_CHUNK_SIZE", 4),
+                    contextlib.redirect_stdout(output),
+                ):
+                    self.assertTrue(asciicheck.lint_utf8_ascii(path, fix=False))
+                self.assertIn(location, output.getvalue())
+                self.assertIn(str(path), output.getvalue())
+                self.assertNotIn("line 3", output.getvalue())
+
+    def test_reports_bounded_sample_with_exact_total(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "many.txt"
+            path.write_bytes(b"\x01" * 1000)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertTrue(asciicheck.lint_utf8_ascii(path, fix=False))
+            self.assertEqual(output.getvalue().count("Invalid character"), 100)
+            self.assertIn(
+                "900 additional errors omitted; 1000 errors total", output.getvalue()
+            )
+
+    def test_failed_atomic_replace_preserves_original_and_cleans_temp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fix.txt"
+            original = "unchanged\u2014text\r\n".encode()
+            path.write_bytes(original)
+            with (
+                mock.patch.object(
+                    asciicheck.os, "replace", side_effect=OSError("replace failed")
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.assertTrue(asciicheck.lint_utf8_ascii(path, fix=True))
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(list(Path(directory).iterdir()), [path])
+
     def test_ascii_and_allowed_unicode_pass(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "allowed.md"

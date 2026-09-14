@@ -32,8 +32,9 @@ pub struct SpendControlLimitDetails {
     pub remaining_percent: i32,
     #[serde(rename = "reset_after_seconds")]
     pub reset_after_seconds: i32,
+    /// Unix timestamp in seconds, matching the runtime reset timestamp range.
     #[serde(rename = "reset_at")]
-    pub reset_at: i32,
+    pub reset_at: i64,
 }
 
 impl SpendControlLimitDetails {
@@ -44,7 +45,7 @@ impl SpendControlLimitDetails {
         used_percent: i32,
         remaining_percent: i32,
         reset_after_seconds: i32,
-        reset_at: i32,
+        reset_at: i64,
     ) -> SpendControlLimitDetails {
         SpendControlLimitDetails {
             source: None,

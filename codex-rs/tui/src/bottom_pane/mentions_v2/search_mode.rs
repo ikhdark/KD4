@@ -38,7 +38,7 @@ impl SearchMode {
         match self {
             Self::Results => "All Results",
             Self::FilesystemOnly => "Filesystem Only",
-            Self::Tools => "Plugins",
+            Self::Tools => "Tools",
         }
     }
 }

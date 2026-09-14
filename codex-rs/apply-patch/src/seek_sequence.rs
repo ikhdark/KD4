@@ -1,9 +1,8 @@
 /// Attempt to find the sequence of `pattern` lines within `lines` beginning at or after `start`.
 /// Returns the starting index of the match or `None` if not found. Matches are attempted with
 /// decreasing strictness: exact match, then ignoring trailing whitespace, then ignoring leading
-/// and trailing whitespace. When `eof` is true, we first try starting at the end-of-file (so that
-/// patterns intended to match file endings are applied at the end), and fall back to searching
-/// from `start` if needed.
+/// and trailing whitespace. When `eof` is true, the match must end at end-of-file
+/// and must still begin at or after `start`.
 ///
 /// Special cases handled defensively:
 ///  • Empty `pattern` → returns `Some(start)` (no-op match)
@@ -23,14 +22,11 @@ pub(crate) fn seek_sequence(
     // match. Early‑return to avoid the out‑of‑bounds slice that would occur in
     // the search loops below (previously caused a panic when
     // `pattern.len() > lines.len()`).
-    if pattern.len() > lines.len() {
+    let last_start = lines.len().checked_sub(pattern.len())?;
+    if start > last_start {
         return None;
     }
-    let search_start = if eof && lines.len() >= pattern.len() {
-        lines.len() - pattern.len()
-    } else {
-        start
-    };
+    let search_start = if eof { last_start } else { start };
     // Exact match first.
     for i in search_start..=lines.len().saturating_sub(pattern.len()) {
         if lines[i..i + pattern.len()] == *pattern {
@@ -73,30 +69,27 @@ pub(crate) fn seek_sequence(
     // differences when locating context lines.
     // ------------------------------------------------------------------
 
-    fn normalise(s: &str) -> String {
-        s.trim()
-            .chars()
-            .map(|c| match c {
-                // Various dash / hyphen code-points → ASCII '-'
-                '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
-                | '\u{2212}' => '-',
-                // Fancy single quotes → '\''
-                '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
-                // Fancy double quotes → '"'
-                '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
-                // Non-breaking space and other odd spaces → normal space
-                '\u{00A0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}'
-                | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200A}' | '\u{202F}' | '\u{205F}'
-                | '\u{3000}' => ' ',
-                other => other,
-            })
-            .collect::<String>()
+    fn normalise(s: &str) -> impl Iterator<Item = char> + '_ {
+        s.trim().chars().map(|c| match c {
+            // Various dash / hyphen code-points → ASCII '-'
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+            | '\u{2212}' => '-',
+            // Fancy single quotes → '\''
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
+            // Fancy double quotes → '"'
+            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
+            // Non-breaking space and other odd spaces → normal space
+            '\u{00A0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}'
+            | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200A}' | '\u{202F}' | '\u{205F}'
+            | '\u{3000}' => ' ',
+            other => other,
+        })
     }
 
     for i in search_start..=lines.len().saturating_sub(pattern.len()) {
         let mut ok = true;
         for (p_idx, pat) in pattern.iter().enumerate() {
-            if normalise(&lines[i + p_idx]) != normalise(pat) {
+            if !normalise(&lines[i + p_idx]).eq(normalise(pat)) {
                 ok = false;
                 break;
             }
@@ -159,5 +152,22 @@ mod tests {
             seek_sequence(&lines, &pattern, /*start*/ 0, /*eof*/ false),
             None
         );
+    }
+
+    #[test]
+    fn test_eof_match_respects_start() {
+        let lines = to_vec(&["a", "b", "c"]);
+        let pattern = to_vec(&["c"]);
+        assert_eq!(seek_sequence(&lines, &pattern, 2, true), Some(2));
+        assert_eq!(seek_sequence(&lines, &pattern, 3, true), None);
+        assert_eq!(seek_sequence(&lines, &to_vec(&["b"]), 0, true), None);
+    }
+
+    #[test]
+    fn test_exact_match_precedes_unicode_fallback() {
+        let lines = to_vec(&["‘early’—value", "'early'-value"]);
+        let pattern = to_vec(&["'early'-value"]);
+        assert_eq!(seek_sequence(&lines, &pattern, 0, false), Some(1));
+        assert_eq!(seek_sequence(&lines[..1], &pattern, 0, false), Some(0));
     }
 }

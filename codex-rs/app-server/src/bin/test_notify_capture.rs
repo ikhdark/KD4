@@ -15,7 +15,10 @@ fn main() -> Result<()> {
         .into_string()
         .map_err(|_| anyhow!("payload must be valid UTF-8"))?;
 
-    let temp_path = output_path.with_extension("json.tmp");
+    anyhow::ensure!(args.next().is_none(), "expected payload as final argument");
+    let mut temp_name = output_path.as_os_str().to_os_string();
+    temp_name.push(".tmp");
+    let temp_path = PathBuf::from(temp_name);
     std::fs::write(&temp_path, payload)?;
     std::fs::rename(&temp_path, &output_path)?;
 

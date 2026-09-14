@@ -2060,6 +2060,7 @@ impl Session {
             .map(|_| ())
     }
 
+    #[expect(clippy::await_holding_invalid_type, reason = "Serialize settings projection and commit against concurrent accepted updates")]
     async fn update_settings_and_get(
         &self,
         updates: &SessionSettingsUpdate,
@@ -2136,9 +2137,8 @@ impl Session {
         &self,
         updates: &SessionSettingsUpdate,
     ) -> ConstraintResult<ThreadConfigSnapshot> {
-        let state = self.state.lock().await;
-        state
-            .session_configuration
+        let configuration = { self.state.lock().await.session_configuration.clone() };
+        configuration
             .apply_async(updates)
             .await
             .map(|configuration| configuration.thread_config_snapshot())
@@ -2383,6 +2383,7 @@ impl Session {
 
     /// Publish the original terminal outcome once, retaining its actual live-delivery receipt.
     /// Parent notification is a separate finalizer phase so recovery can finish it independently.
+    #[expect(clippy::expect_used, reason = "Terminal dispatch retains the original terminal source before delivery")]
     pub(crate) async fn publish_terminal_event(
         &self,
         turn_context: &TurnContext,
@@ -4039,10 +4040,9 @@ impl Session {
             }
             durability_result
         });
-        let result = commit.await.map_err(|err| {
+        commit.await.map_err(|err| {
             std::io::Error::other(format!("durable history commit failed: {err}"))
-        })?;
-        result
+        })?
     }
 
     pub(crate) async fn persist_missing_call_outputs_durable(
@@ -5689,6 +5689,7 @@ impl Session {
         Some(commit(state_owner))
     }
 
+    #[expect(clippy::await_holding_invalid_type, reason = "Keep planning generation validation atomic with durable context publication")]
     async fn commit_prepared_context_update(
         self: &Arc<Self>,
         prepared: PreparedContextUpdate,
@@ -6232,6 +6233,7 @@ pub(crate) fn emit_subagent_session_started(
 }
 
 /// Builds the hook engine for one config snapshot, including any enabled plugin hooks.
+#[expect(clippy::expect_used, reason = "Hook discovery failure must not silently disable configured hooks")]
 async fn build_hooks_for_config(
     config: &Config,
     plugins_manager: &PluginsManager,

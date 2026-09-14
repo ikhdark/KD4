@@ -22,7 +22,7 @@ use pretty_assertions::assert_eq;
 use super::*;
 
 #[test]
-fn evaluator_reuses_one_snapshot_across_tools() {
+fn evaluator_applies_one_config_snapshot_consistently_across_tools() {
     let apps_config = AppsConfigToml {
         default: None,
         apps: HashMap::from([(
@@ -643,6 +643,93 @@ fn evaluator_matches_tool_title_for_user_config() {
         AppToolPolicy {
             enabled: true,
             approval: AppToolApproval::Approve,
+        }
+    );
+}
+
+#[test]
+fn app_disable_takes_precedence_over_explicit_tool_enable() {
+    for managed in [false, true] {
+        let apps = AppsConfigToml {
+            default: None,
+            apps: HashMap::from([(
+                "calendar".to_string(),
+                AppConfig {
+                    enabled: managed,
+                    tools: Some(AppToolsConfig {
+                        tools: HashMap::from([(
+                            "events/create".to_string(),
+                            AppToolConfig {
+                                enabled: Some(true),
+                                approval_mode: Some(AppToolApproval::Prompt),
+                            },
+                        )]),
+                    }),
+                    ..Default::default()
+                },
+            )]),
+        };
+        let requirements = managed.then(|| app_enabled_requirement("calendar", false));
+        assert_eq!(
+            policy_from_config_parts(
+                Some(&apps),
+                requirements.as_ref(),
+                Some("calendar"),
+                "events/create",
+                None,
+                None,
+                None
+            ),
+            AppToolPolicy {
+                enabled: false,
+                approval: AppToolApproval::Prompt
+            }
+        );
+    }
+}
+
+#[test]
+fn raw_user_tool_name_takes_precedence_over_conflicting_title() {
+    let apps = AppsConfigToml {
+        default: None,
+        apps: HashMap::from([(
+            "calendar".to_string(),
+            AppConfig {
+                tools: Some(AppToolsConfig {
+                    tools: HashMap::from([
+                        (
+                            "raw".to_string(),
+                            AppToolConfig {
+                                enabled: Some(false),
+                                approval_mode: Some(AppToolApproval::Prompt),
+                            },
+                        ),
+                        (
+                            "Title".to_string(),
+                            AppToolConfig {
+                                enabled: Some(true),
+                                approval_mode: Some(AppToolApproval::Approve),
+                            },
+                        ),
+                    ]),
+                }),
+                ..Default::default()
+            },
+        )]),
+    };
+    assert_eq!(
+        policy_from_apps_config(
+            Some(&apps),
+            Some("calendar"),
+            "raw",
+            Some("Title"),
+            None,
+            None,
+            None
+        ),
+        AppToolPolicy {
+            enabled: false,
+            approval: AppToolApproval::Prompt
         }
     );
 }

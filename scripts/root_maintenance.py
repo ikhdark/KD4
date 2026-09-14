@@ -142,7 +142,16 @@ def script_inventory() -> tuple[
     python_sources: list[str] = []
     unittest_targets: list[str] = []
     script_kinds: list[tuple[str, str]] = []
-    owned_paths = (path for root in SCRIPT_AUDIT_ROOTS for path in root.rglob("*"))
+
+    def owned_files():
+        for root in SCRIPT_AUDIT_ROOTS:
+            for directory, subdirs, files in os.walk(root):
+                subdirs[:] = [
+                    name for name in subdirs if name not in {".venv", "__pycache__"}
+                ]
+                yield from (Path(directory) / name for name in files)
+
+    owned_paths = owned_files()
     for path in dict.fromkeys((*owned_paths, *tracked_script_entrypoints())):
         if not path.is_file() or "__pycache__" in path.parts or ".venv" in path.parts:
             continue
@@ -467,7 +476,7 @@ def test_modules_for_changed_path(path_text: str) -> tuple[str, ...]:
         selected.append(module)
     else:
         test_module = ".".join((*path.parts[:-1], f"test_{path.stem}"))
-        if test_module in python_unittest_targets():
+        if (REPO_ROOT / path.with_name(f"test_{path.stem}.py")).is_file():
             selected.append(test_module)
     return tuple(dict.fromkeys(selected))
 
@@ -998,17 +1007,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             if changed_paths or not args.changed or args.module
             else []
         )
+        uncovered = [
+            path
+            for path in changed_paths
+            if changed_production_script_requires_test(path)
+            and not test_modules_for_changed_path(path)
+        ]
+        if uncovered:
+            print(
+                "Changed production script validation is unverified: no focused test route for "
+                + ", ".join(uncovered),
+                file=sys.stderr,
+            )
+            return 2
         if not targets:
             print("No matching changed Python test modules to run.")
-            if args.changed and any(
-                changed_production_script_requires_test(path) for path in changed_paths
-            ):
-                print(
-                    "Changed production script validation is unverified because no "
-                    "focused test route was selected.",
-                    file=sys.stderr,
-                )
-                return 2
             return 0
         return run(
             [

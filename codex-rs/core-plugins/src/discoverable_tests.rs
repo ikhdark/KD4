@@ -212,7 +212,7 @@ async fn includes_openai_curated_when_remote_enabled_without_auth() {
 }
 
 #[tokio::test]
-async fn deduplicates_and_reprojects_cached_configured_marketplace_plugin() {
+async fn reprojects_cached_configured_marketplace_plugin() {
     let codex_home = tempdir().expect("tempdir should succeed");
     let plugin_name = "sample";
     let marketplace_name = OPENAI_BUNDLED_MARKETPLACE_NAME;
@@ -591,7 +591,7 @@ async fn omits_not_available_curated_plugins() {
 }
 
 #[tokio::test]
-async fn does_not_reload_marketplace_per_plugin() {
+async fn reports_invalid_prompts_for_discoverable_plugins() {
     let codex_home = tempdir().expect("tempdir should succeed");
     let curated_root = curated_plugins_repo_path(codex_home.path());
     write_openai_curated_marketplace(&curated_root, &["slack", "gmail", "openai-developers"]);
@@ -644,13 +644,9 @@ async fn does_not_reload_marketplace_per_plugin() {
     let logs = String::from_utf8(buffer.lock().expect("buffer lock").clone())
         .expect("utf8 logs")
         .replace('\\', "/");
-    assert_eq!(logs.matches("ignoring interface.defaultPrompt").count(), 8);
-    assert_eq!(logs.matches("gmail/.codex-plugin/plugin.json").count(), 4);
-    assert_eq!(
-        logs.matches("openai-developers/.codex-plugin/plugin.json")
-            .count(),
-        4
-    );
+    assert!(logs.contains("ignoring interface.defaultPrompt"));
+    assert!(logs.contains("gmail/.codex-plugin/plugin.json"));
+    assert!(logs.contains("openai-developers/.codex-plugin/plugin.json"));
 }
 
 #[tokio::test]

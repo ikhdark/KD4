@@ -305,8 +305,20 @@ fn resolved_prompts_satisfy_named_contract_registry() {
             };
             assert!(
                 passed,
-                "prompt {label} violated contract {} with anchors {:?}",
-                contract.id, contract.anchors
+                "prompt {label} violated contract {}: relevant anchors {:?}",
+                contract.id,
+                contract
+                    .anchors
+                    .iter()
+                    .zip(&matches)
+                    .filter_map(|(anchor, matched)| {
+                        let relevant = match contract.expectation {
+                            AnchorExpectation::Any | AnchorExpectation::All => !matched,
+                            AnchorExpectation::None => *matched,
+                        };
+                        relevant.then_some(anchor)
+                    })
+                    .collect::<Vec<_>>()
             );
         }
     }

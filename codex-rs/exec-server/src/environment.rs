@@ -66,13 +66,14 @@ pub const REMOTE_ENVIRONMENT_ID: &str = "remote";
 impl EnvironmentManager {
     /// Builds a test-only manager without configured sandbox helper paths.
     pub fn default_for_tests() -> Self {
+        let local_environment = Arc::new(Environment::default_for_tests());
         Self {
             default_environment: Some(LOCAL_ENVIRONMENT_ID.to_string()),
             environments: RwLock::new(HashMap::from([(
                 LOCAL_ENVIRONMENT_ID.to_string(),
-                Arc::new(Environment::default_for_tests()),
+                Arc::clone(&local_environment),
             )])),
-            local_environment: Some(Arc::new(Environment::default_for_tests())),
+            local_environment: Some(local_environment),
             local_runtime_paths: None,
         }
     }
@@ -304,6 +305,11 @@ impl EnvironmentManager {
         exec_server_url: String,
         connect_timeout: Option<std::time::Duration>,
     ) -> Result<(), ExecServerError> {
+        if environment_id == LOCAL_ENVIRONMENT_ID {
+            return Err(ExecServerError::Protocol(format!(
+                "environment id `{LOCAL_ENVIRONMENT_ID}` is reserved for EnvironmentManager"
+            )));
+        }
         if environment_id.is_empty() {
             return Err(ExecServerError::Protocol(
                 "environment id cannot be empty".to_string(),
@@ -345,6 +351,11 @@ impl EnvironmentManager {
         environment_id: String,
         provider: Arc<dyn NoiseRendezvousConnectProvider>,
     ) -> Result<(), ExecServerError> {
+        if environment_id == LOCAL_ENVIRONMENT_ID {
+            return Err(ExecServerError::Protocol(format!(
+                "environment id `{LOCAL_ENVIRONMENT_ID}` is reserved for EnvironmentManager"
+            )));
+        }
         if environment_id.is_empty() {
             return Err(ExecServerError::Protocol(
                 "environment id cannot be empty".to_string(),
@@ -582,7 +593,13 @@ impl Environment {
     pub async fn info(&self) -> Result<EnvironmentInfo, ExecServerError> {
         match &self.remote_client {
             Some(client) => client.environment_info().await,
-            None => Ok(EnvironmentInfo::local()),
+            None => tokio::task::spawn_blocking(EnvironmentInfo::local)
+                .await
+                .map_err(|error| {
+                    ExecServerError::Protocol(format!(
+                        "local environment discovery task failed: {error}"
+                    ))
+                }),
         }
     }
 
@@ -603,17 +620,17 @@ impl Environment {
 
     /// Starts the initial connection after an environment is actually selected for use.
     pub(crate) fn start_connecting_for_use(environment: &Arc<Self>) {
-        if environment.remote_client.is_none() {
+        let Some(client) = &environment.remote_client else {
             return;
-        }
+        };
         let mut startup_task = environment
             .startup_task
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if startup_task.is_none() {
-            let environment = Arc::clone(environment);
+            let client = client.clone();
             *startup_task = Some(AbortOnDropHandle::new(tokio::spawn(async move {
-                if let Err(error) = environment.wait_until_ready().await {
+                if let Err(error) = client.wait_until_ready().await {
                     tracing::debug!(%error, "exec-server environment startup failed");
                 }
             })));
@@ -833,9 +850,12 @@ mod tests {
         assert!(manager.try_local_environment().is_none());
     }
 
-    #[test]
-    fn local_environment_info_includes_current_directory() {
-        let info = super::EnvironmentInfo::local();
+    #[tokio::test]
+    async fn local_environment_info_includes_current_directory() {
+        let info = Environment::local(test_runtime_paths())
+            .info()
+            .await
+            .expect("local environment information");
 
         assert_eq!(
             info.cwd,
@@ -844,6 +864,44 @@ mod tests {
                     .expect("cwd URI")
             )
         );
+        assert_eq!(info.operating_system.as_deref(), Some("windows"));
+        assert!(!info.shell.name.is_empty());
+        assert!(!info.shell.path.is_empty());
+    }
+
+    #[test]
+    fn local_environment_info_uses_blocking_worker() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("single-worker runtime");
+        runtime.block_on(async {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let occupied = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).expect("report occupied worker");
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            });
+            started_rx.await.expect("worker occupied");
+            let environment = Environment::local(test_runtime_paths());
+            let mut discovery = Box::pin(environment.info());
+            assert!(futures::poll!(discovery.as_mut()).is_pending());
+            release_tx.send(()).expect("release discovery worker");
+            occupied.await.expect("blocking worker exits");
+            let info = timeout(Duration::from_secs(5), discovery)
+                .await
+                .expect("discovery completes")
+                .expect("local environment information");
+            assert_eq!(info.operating_system.as_deref(), Some("windows"));
+            assert_eq!(
+                info.cwd,
+                Some(
+                    PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
+                        .expect("cwd URI")
+                )
+            );
+        });
     }
 
     #[tokio::test]
@@ -882,7 +940,18 @@ mod tests {
 
         assert_eq!(environment.exec_server_url(), None);
         assert!(!environment.is_remote());
-        assert!(environment.info().await.is_ok());
+        let info = environment
+            .info()
+            .await
+            .expect("local environment information");
+        assert_eq!(info.operating_system.as_deref(), Some("windows"));
+        assert_eq!(
+            info.cwd,
+            Some(
+                PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
+                    .expect("cwd URI")
+            )
+        );
     }
 
     #[tokio::test]
@@ -1479,6 +1548,148 @@ mod tests {
         assert!(status.ready_roots.is_empty());
         assert_eq!(status.warnings.len(), 1);
         assert!(status.warnings[0].contains("environment `stdio` is unavailable"));
+    }
+
+    #[tokio::test]
+    async fn selected_capability_resolution_does_not_reconnect_failed_startup() {
+        use crate::ExecServerError;
+        use codex_protocol::capabilities::CapabilityRootLocation;
+        use codex_protocol::capabilities::SelectedCapabilityRoot;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let environment = Environment::remote_with_transport(
+            ExecServerTransportParams::websocket_url(
+                format!("ws://{}", listener.local_addr().expect("listener address")),
+                Duration::from_secs(5),
+            ),
+            None,
+        );
+        let manager = EnvironmentManager::from_snapshot(
+            EnvironmentProviderSnapshot {
+                environments: vec![("remote".to_string(), environment)],
+                default: EnvironmentDefault::Disabled,
+                include_local: true,
+            },
+            Some(test_runtime_paths()),
+        )
+        .expect("environment manager");
+        // Fail the initial handshake with a retryable transport error. Keep the
+        // listener alive so an accidental reconnect would wait for a handshake.
+        let (stream, _) = timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("initial connection starts")
+            .expect("accept connection");
+        drop(stream);
+        let remote = manager
+            .get_environment("remote")
+            .expect("remote environment");
+        timeout(Duration::from_secs(5), async {
+            while !remote.startup_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial failure completes");
+        assert!(
+            matches!(remote.readiness_result(), Some(Err(ExecServerError::ConnectionAttempt(error)))
+            if matches!(error.as_ref(), ExecServerError::WebSocketConnect { .. }))
+        );
+
+        let selected_roots =
+            ["remote", LOCAL_ENVIRONMENT_ID].map(|environment_id| SelectedCapabilityRoot {
+                id: environment_id.to_string(),
+                location: CapabilityRootLocation::Environment {
+                    environment_id: environment_id.to_string(),
+                    path: PathUri::parse("file:///C:/plugins/demo").expect("root URI"),
+                },
+            });
+        let captured = HashMap::new();
+        let mut resolution =
+            Box::pin(manager.resolve_selected_capability_roots(&selected_roots, &captured));
+        let std::task::Poll::Ready(resolved) = futures::poll!(resolution.as_mut()) else {
+            panic!("root resolution must not wait for a reconnect");
+        };
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].selected_root(), &selected_roots[1]);
+        assert!(Arc::ptr_eq(
+            resolved[0].environment(),
+            &manager.try_local_environment().expect("local environment")
+        ));
+        assert!(
+            futures::poll!(Box::pin(listener.accept()).as_mut()).is_pending(),
+            "resolution must not open a new connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_environment_cancels_on_use_startup() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let environment = Arc::new(Environment::remote_with_transport(
+            ExecServerTransportParams::websocket_url(
+                format!("ws://{}", listener.local_addr().expect("address")),
+                Duration::from_secs(30),
+            ),
+            None,
+        ));
+        Environment::start_connecting_for_use(&environment);
+        let (_socket, _) = timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .expect("startup must begin connecting")
+            .expect("accept");
+        let abort = environment
+            .startup_task
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+        let weak = Arc::downgrade(&environment);
+        drop(environment);
+        assert!(
+            weak.upgrade().is_none(),
+            "startup must not own its environment"
+        );
+        timeout(Duration::from_secs(1), async {
+            while !abort.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the environment must abort startup");
+    }
+
+    #[test]
+    fn environment_manager_rejects_reserved_local_upserts_and_preserves_identity() {
+        struct UnusedProvider;
+        impl crate::NoiseRendezvousConnectProvider for UnusedProvider {
+            fn connect_bundle(
+                &self,
+                _: crate::NoiseChannelPublicKey,
+            ) -> futures::future::BoxFuture<
+                '_,
+                Result<crate::NoiseRendezvousConnectBundle, crate::ExecServerError>,
+            > {
+                panic!("reserved identifier must be rejected before connecting");
+            }
+        }
+        let manager = EnvironmentManager::default_for_tests();
+        let local = manager.try_local_environment().expect("local environment");
+        assert!(Arc::ptr_eq(&local, &manager.default_environment().unwrap()));
+        let direct = manager.upsert_environment("local".into(), "ws://127.0.0.1:1".into(), None);
+        let noise = manager.upsert_noise_environment("local".into(), Arc::new(UnusedProvider));
+        for result in [direct, noise] {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "exec-server protocol error: environment id `local` is reserved for EnvironmentManager"
+            );
+        }
+        assert!(Arc::ptr_eq(
+            &local,
+            &manager.get_environment("local").unwrap()
+        ));
+        assert!(Arc::ptr_eq(&local, &manager.default_environment().unwrap()));
     }
 
     #[tokio::test]

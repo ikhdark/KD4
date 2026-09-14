@@ -145,7 +145,7 @@ pub(super) fn test_model_catalog(_config: &Config) -> Arc<ModelCatalog> {
 }
 
 // --- Helpers for tests that need direct construction and event draining ---
-pub(super) async fn make_chatwidget_manual(
+pub(in crate::chatwidget) async fn make_chatwidget_manual(
     model_override: Option<&str>,
 ) -> (
     ChatWidget,

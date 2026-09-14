@@ -1553,10 +1553,8 @@ mod tests_optimization {
             "<root_orchestration_instructions>current orchestration</root_orchestration_instructions>",
         );
 
-        let projected = project_stable_context(
-            vec![old, current.clone()].into(),
-            StableContextTarget::Sampling,
-        );
+        let projected =
+            project_stable_context(vec![old, current].into(), StableContextTarget::Sampling);
         let root_items = projected
             .manifest
             .components

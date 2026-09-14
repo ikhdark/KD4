@@ -96,8 +96,8 @@ def get_changed_paths(
 ) -> list[ChangedPath]:
     args = [
         "diff",
-        "--numstat",
-        "--diff-filter=AM",
+        "--numstat" if include_kind else "--name-only",
+        "--diff-filter=AMT",
         "--no-renames",
         "-z",
         base,
@@ -106,16 +106,35 @@ def get_changed_paths(
     if paths is not None:
         if not include_kind:
             return [ChangedPath(path=path, is_binary=False) for path in paths]
-        output = run_git_func(*args)
-        binary_by_path = {
-            changed.path: changed.is_binary for changed in parse_numstat_z(output)
-        }
+        binary_by_path: dict[str, bool] = {}
+        batch: list[str] = []
+        batch_chars = 0
+        for path in paths:
+            literal = f":(literal){path}"
+            if batch and batch_chars + len(literal) * 2 + 3 > 8000:
+                binary_by_path.update(
+                    (entry.path, entry.is_binary)
+                    for entry in parse_numstat_z(run_git_func(*args, "--", *batch))
+                )
+                batch = []
+                batch_chars = 0
+            batch.append(literal)
+            batch_chars += len(literal) * 2 + 3
+        if batch:
+            binary_by_path.update(
+                (entry.path, entry.is_binary)
+                for entry in parse_numstat_z(run_git_func(*args, "--", *batch))
+            )
         return [
             ChangedPath(path=path, is_binary=binary_by_path.get(path, False))
             for path in paths
         ]
     output = run_git_func(*args)
-    return parse_numstat_z(output)
+    return (
+        parse_numstat_z(output)
+        if include_kind
+        else [ChangedPath(path, False) for path in output.split("\0") if path]
+    )
 
 
 def batch_blob_sizes(
@@ -329,8 +348,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         for blob in blobs
         if blob.size_bytes > args.max_bytes and not blob.is_allowlisted
     ]
-    violation_paths = {blob.path for blob in violations}
-
     write_step_summary(
         args.max_bytes, blobs, violations, include_kind=args.include_kind
     )
@@ -342,19 +359,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(
         f"Checked {len(blobs)} changed file(s) against the {args.max_bytes}-byte limit."
     )
-    for blob in blobs:
-        status = blob_status(blob, violation_paths)
-        kind = "binary" if blob.is_binary else "non-binary"
-        size = f"{blob.size_bytes} bytes ({format_kib(blob.size_bytes)})"
-        if args.include_kind:
-            print(f"- {blob.path}: {size} [{kind}, {status}]")
-        else:
-            print(f"- {blob.path}: {size} [{status}]")
-
     if violations:
         print("\nFile(s) exceed the configured limit:")
         for blob in violations:
-            print(f"- {blob.path}: {blob.size_bytes} bytes > {args.max_bytes} bytes")
+            kind = (
+                f" [{'binary' if blob.is_binary else 'non-binary'}]"
+                if args.include_kind
+                else ""
+            )
+            print(
+                f"- {blob.path}: {blob.size_bytes} bytes > {args.max_bytes} bytes{kind}"
+            )
         print(
             "\nIf one of these is a real checked-in asset we want to keep, add its "
             f"repo-relative path to {args.allowlist}. Otherwise, "

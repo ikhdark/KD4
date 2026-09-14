@@ -66,7 +66,6 @@ mod tests {
     use crate::search::SearchQuery;
     use crate::search::SearchSettings;
     use codex_client::Request;
-    use codex_client::RequestBody;
     use codex_client::Response;
     use codex_client::StreamResponse;
     use codex_client::TransportError;
@@ -218,14 +217,12 @@ mod tests {
             .expect("lock request store")
             .clone()
             .expect("request should be captured");
-        let body = request
-            .body
-            .as_ref()
-            .and_then(RequestBody::json)
-            .expect("request body should be JSON");
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.prepare_body_for_send().unwrap().body_bytes())
+                .expect("request body should be JSON");
         assert_eq!(
             body,
-            &json!({
+            json!({
                 "id": "search-session",
                 "model": "gpt-test",
                 "input": [{

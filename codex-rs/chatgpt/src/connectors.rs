@@ -26,22 +26,14 @@ use codex_plugin::AppConnectorId;
 
 const DIRECTORY_CONNECTORS_TIMEOUT: Duration = Duration::from_secs(60);
 
-async fn apps_enabled(config: &Config) -> bool {
-    let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
-    let auth = auth_manager.auth().await;
+fn apps_enabled(config: &Config, auth: Option<&CodexAuth>) -> bool {
     config
         .features
-        .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::uses_codex_backend))
+        .apps_enabled_for_auth(auth.is_some_and(CodexAuth::uses_codex_backend))
 }
 
-async fn connector_auth(config: &Config) -> anyhow::Result<CodexAuth> {
-    let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
-    let auth = auth_manager
-        .auth()
-        .await
-        .ok_or_else(|| anyhow::anyhow!("ChatGPT auth not available"))?;
+fn connector_auth(auth: Option<CodexAuth>) -> anyhow::Result<CodexAuth> {
+    let auth = auth.ok_or_else(|| anyhow::anyhow!("ChatGPT auth not available"))?;
     anyhow::ensure!(
         auth.uses_codex_backend(),
         "ChatGPT connectors require Codex backend auth"
@@ -57,11 +49,14 @@ pub async fn list_cached_all_connectors(
     config: &Config,
     plugin_apps: &[AppConnectorId],
 ) -> Option<Vec<AppInfo>> {
-    if !apps_enabled(config).await {
+    let auth_manager =
+        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
+    let auth = auth_manager.auth().await;
+    if !apps_enabled(config, auth.as_ref()) {
         return Some(Vec::new());
     }
 
-    let auth = connector_auth(config).await.ok()?;
+    let auth = connector_auth(auth).ok()?;
     let cache_context = connector_directory_cache_context(config, &auth);
     let connectors = codex_connectors::cached_directory_connectors(&cache_context)?;
     Some(merge_directory_and_plugin_connectors(
@@ -75,16 +70,18 @@ pub async fn list_all_connectors_with_options(
     force_refetch: bool,
     plugin_apps: &[AppConnectorId],
 ) -> anyhow::Result<Vec<AppInfo>> {
-    if !apps_enabled(config).await {
+    let auth_manager =
+        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
+    let auth = auth_manager.auth().await;
+    if !apps_enabled(config, auth.as_ref()) {
         return Ok(Vec::new());
     }
-    let auth = connector_auth(config).await?;
+    let auth = connector_auth(auth)?;
     let http_clients = chatgpt_http_clients(config);
     let chatgpt_base_url = config.chatgpt_base_url.clone();
     let cache_context = connector_directory_cache_context(config, &auth);
     let connectors = codex_connectors::list_all_connectors_with_options(
         cache_context,
-        auth.is_workspace_account(),
         force_refetch,
         move |path| {
             let auth = auth.clone();
@@ -183,6 +180,64 @@ mod tests {
     use codex_connectors::metadata::connector_install_url;
     use codex_plugin::AppConnectorId;
     use pretty_assertions::assert_eq;
+
+    #[tokio::test]
+    async fn listing_preserves_disabled_uncached_and_cached_results() {
+        use codex_core::config::ConfigBuilder;
+        use wiremock::Mock;
+        use wiremock::MockServer;
+        use wiremock::ResponseTemplate;
+        use wiremock::matchers::path;
+
+        let home = tempfile::tempdir().expect("Codex home");
+        std::fs::write(home.path().join("config.toml"), "[features]\napps = true\n")
+            .expect("apps config");
+        let mut config = ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .fallback_cwd(Some(home.path().to_path_buf()))
+            .build()
+            .await
+            .expect("config");
+        let server = MockServer::start().await;
+        config.chatgpt_base_url = server.uri();
+        assert_eq!(
+            list_cached_all_connectors(&config, &[]).await,
+            Some(Vec::new())
+        );
+        assert_eq!(
+            list_all_connectors(&config)
+                .await
+                .expect("disabled listing"),
+            Vec::new()
+        );
+        codex_login::auth::login_with_chatgpt_auth_tokens(
+            home.path(),
+            "e30.e30.signature",
+            "connector-test-account",
+            Some("plus"),
+        )
+        .expect("auth");
+        assert_eq!(list_cached_all_connectors(&config, &[]).await, None);
+        Mock::given(path("/connectors/directory/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apps": [{"id": "alpha", "name": "alpha"}], "next_token": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let expected = vec![merged_app("alpha", false)];
+        assert_eq!(
+            list_all_connectors(&config)
+                .await
+                .expect("directory listing"),
+            expected
+        );
+        assert_eq!(
+            list_cached_all_connectors(&config, &[]).await,
+            Some(expected)
+        );
+        server.verify().await;
+    }
 
     fn app(id: &str) -> AppInfo {
         AppInfo {

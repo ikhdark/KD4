@@ -436,6 +436,39 @@ mod tests {
     use crate::engine::command_runner::CommandRunResult;
 
     #[test]
+    fn stopping_handler_suppresses_another_handlers_continuation() {
+        let blocker = parse_completed(
+            &handler(),
+            run_result(
+                Some(0),
+                r#"{"decision":"block","reason":"keep working"}"#,
+                "",
+            ),
+            None,
+        );
+        let stopper = parse_completed(
+            &handler(),
+            run_result(Some(0), r#"{"continue":false,"stopReason":"done"}"#, ""),
+            None,
+        );
+        for results in [
+            [&blocker.data, &stopper.data],
+            [&stopper.data, &blocker.data],
+        ] {
+            assert_eq!(
+                aggregate_results(results),
+                StopHandlerData {
+                    should_stop: true,
+                    stop_reason: Some("done".into()),
+                    should_block: false,
+                    block_reason: None,
+                    continuation_fragments: Vec::new(),
+                }
+            );
+        }
+    }
+
+    #[test]
     fn block_decision_with_reason_sets_continuation_prompt() {
         let parsed = parse_completed(
             &handler(),

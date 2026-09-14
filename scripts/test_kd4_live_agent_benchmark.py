@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from io import StringIO
@@ -19,12 +22,16 @@ def _pid_is_running(pid: int) -> bool:
     """Whether a pid is still live, without reaping anything we do not own."""
     if os.name == "nt":
         probe = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
             capture_output=True,
             text=True,
-            check=False,
+            check=True,
+            timeout=10,
         )
-        return str(pid) in probe.stdout
+        return any(
+            len(row) > 1 and row[1] == str(pid)
+            for row in csv.reader(probe.stdout.splitlines())
+        )
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -32,6 +39,39 @@ def _pid_is_running(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _read_child_pid(parent: subprocess.Popen[str]) -> int:
+    ready: queue.Queue[str] = queue.Queue(maxsize=1)
+    assert parent.stdout is not None
+    threading.Thread(
+        target=lambda: ready.put(parent.stdout.readline()), daemon=True
+    ).start()
+    return int(ready.get(timeout=10).strip())
+
+
+def _cleanup_test_processes(
+    parent: subprocess.Popen[str], child_pid: int | None
+) -> None:
+    if os.name == "nt":
+        for pid in (parent.pid, child_pid):
+            if pid is not None:
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+    elif child_pid is not None:
+        try:
+            os.kill(child_pid, 9)
+        except ProcessLookupError:
+            pass
+    if parent.poll() is None:
+        parent.kill()
+    parent.wait(timeout=10)
+    if parent.stdout:
+        parent.stdout.close()
 
 
 def _run(*, outcome_correct: bool, task_contract_compliant: bool) -> dict[str, object]:
@@ -194,6 +234,72 @@ def _trace(
 
 
 class Kd4LiveAgentBenchmarkTest(unittest.TestCase):
+    def test_cli_summary_keeps_full_evidence_in_the_report(self) -> None:
+        results = {
+            "regressionGate": {"passed": True, "mode": "enforce"},
+            "pairs": ["trace" * 1000],
+        }
+        report = {"results": results}
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "report.json"
+            for full_json in (False, True):
+                with (
+                    self.subTest(full_json=full_json),
+                    mock.patch.object(
+                        benchmark,
+                        "parse_args",
+                        return_value=argparse.Namespace(
+                            self_test=False, output=path, full_json=full_json
+                        ),
+                    ),
+                    mock.patch.object(benchmark, "make_report", return_value=report),
+                    mock.patch("sys.stdout", new_callable=StringIO) as output,
+                ):
+                    benchmark.main()
+                self.assertEqual(json.loads(path.read_text()), report)
+                self.assertEqual(
+                    json.loads(output.getvalue()),
+                    results
+                    if full_json
+                    else {
+                        "report": str(path.resolve()),
+                        "gatePassed": True,
+                        "gateMode": "enforce",
+                    },
+                )
+
+    def test_required_metric_needs_repetition_coverage(self):
+        pairs = _gate_pairs()
+        task_id = pairs[0]["taskId"]
+        selected = [pair for pair in pairs if pair["taskId"] == task_id]
+        for pair in selected[1:]:
+            pair["currentFork"]["modelWaitMs"] = None
+        gate = benchmark.build_regression_gate(
+            pairs,
+            fork_label="currentFork",
+            upstream_label="upstreamC",
+            experiment_feature="reasoning_governor",
+        )
+        metric = gate["taskGates"][task_id]["metrics"]["modelWaitMs"]
+        self.assertFalse(gate["passed"])
+        self.assertEqual(metric["status"], "not_evaluable")
+        self.assertEqual(metric["usablePairs"], 1)
+
+    def test_bounded_reader_preserves_complete_evidence(self):
+        import io
+
+        class BoundedStream(io.StringIO):
+            def readline(self, size=-1):
+                if size < 0 or size > 9:
+                    raise AssertionError("unbounded read")
+                return super().readline(size)
+
+        original = "x" * 100 + "\nnext\n"
+        sink = io.StringIO()
+        rows = list(benchmark.bounded_text_lines(BoundedStream(original), 8, sink=sink))
+        self.assertEqual(rows, [("xxxxxxxx", True), ("next", False)])
+        self.assertEqual(sink.getvalue(), original)
+
     def test_turn_measurements_use_union_wait_and_continuation_flags(self) -> None:
         event = {
             "type": "turn.completed",
@@ -428,17 +534,17 @@ def render_report(text: str) -> str:
             },
         )
         self.assertIsNone(
-            benchmark.summarize([no_count, no_wait, zero_count])["modelWaitPerGeneration"]
+            benchmark.summarize([no_count, no_wait, zero_count])[
+                "modelWaitPerGeneration"
+            ]
         )
 
-    def test_comparison_latency_explanation_states_the_measured_mechanism(self) -> None:
+    def test_comparison_latency_explanation_does_not_infer_causality(self) -> None:
         fork = {
             "successfulCompletionTime": {"medianMs": 100_000.0},
             "actualCommandCount": {"median": 8.0},
             "latencyExplanation": {
-                "harnessObserved": {
-                    "commandExecutionObservedMs": {"medianMs": 120.0}
-                },
+                "harnessObserved": {"commandExecutionObservedMs": {"medianMs": 120.0}},
                 "instrumentedRuntime": {
                     "available": True,
                     "availableRuns": 2,
@@ -447,9 +553,7 @@ def render_report(text: str) -> str:
                         "toolOnlyMs": 4_000.0,
                         "orchestrationMs": 6_000.0,
                     },
-                    "exclusiveOwnershipSharePercent": {
-                        "modelOnlyPercent": 95.0
-                    },
+                    "exclusiveOwnershipSharePercent": {"modelOnlyPercent": 95.0},
                     "counterTotals": {
                         "logicalGenerationCount": 20,
                         "modelRetryCount": 0,
@@ -463,9 +567,7 @@ def render_report(text: str) -> str:
             "successfulCompletionTime": {"medianMs": 50_000.0},
             "actualCommandCount": {"median": 4.0},
             "latencyExplanation": {
-                "harnessObserved": {
-                    "commandExecutionObservedMs": {"medianMs": 100.0}
-                },
+                "harnessObserved": {"commandExecutionObservedMs": {"medianMs": 100.0}},
                 "instrumentedRuntime": {"available": False},
             },
         }
@@ -479,7 +581,8 @@ def render_report(text: str) -> str:
 
         joined = " ".join(explanation["findings"])
         self.assertIn("2.00x", joined)
-        self.assertIn("command processes themselves do not explain", joined)
+        self.assertIn("observations alone do not establish the cause", joined)
+        self.assertNotIn("command processes themselves do not explain", joined)
         self.assertIn("18 continuation(s)", joined)
         self.assertIn("0 model retries", joined)
         self.assertFalse(explanation["internalOwnershipHeadToHeadComparable"])
@@ -542,7 +645,9 @@ def render_report(text: str) -> str:
             },
         )
 
-    def test_final_verification_complaints_are_separate_from_runtime_markers(self) -> None:
+    def test_final_verification_complaints_are_separate_from_runtime_markers(
+        self,
+    ) -> None:
         for final_message, expected in (
             ("Tests passed, but the results are unverified.", True),
             ("Verification is unverifiable in this session.", True),
@@ -661,7 +766,7 @@ def render_report(text: str) -> str:
             'powershell.exe -NoProfile -Command "cd repo; python -m unittest -q"',
             (
                 "pwsh -Command \"@'\nassert 2 > 1\n'@ | python -\n"
-                "python -m unittest -q\""
+                'python -m unittest -q"'
             ),
             'cmd.exe /c "python -m unittest -q"',
         )
@@ -692,7 +797,7 @@ def render_report(text: str) -> str:
             'bash -lc "python -m unittest -q; exit $?"',
             (
                 "pwsh -Command \"@'\nassert 2 > 1\n'@ | python -\n"
-                "python -m unittest -q\""
+                'python -m unittest -q"'
             ),
             "python -m unittest -q; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
         )
@@ -701,7 +806,7 @@ def render_report(text: str) -> str:
             "python -m unittest -q; echo done",
             "python -m unittest -q; exit 0",
             (
-                "pwsh -Command \"python -m unittest -q\n"
+                'pwsh -Command "python -m unittest -q\n'
                 "@'\nassert 2 > 1\n'@ | python -\""
             ),
             'bash -lc "python -m unittest -q || true"',
@@ -748,12 +853,11 @@ def render_report(text: str) -> str:
             'bash -lc "echo x > duration.py"': ("mutation", True),
             "sed -i 's/a/b/' duration.py": ("mutation", True),
             'echo ">"': ("inspection", False),
-            (
-                "pwsh -Command \"@'\nassert 2 > 1\n'@ | python -\""
-            ): ("other", False),
-            (
-                "pwsh -Command \"@'\nassert 2 > 1\n'@ > duration.py\""
-            ): ("mutation", True),
+            ("pwsh -Command \"@'\nassert 2 > 1\n'@ | python -\""): ("other", False),
+            ("pwsh -Command \"@'\nassert 2 > 1\n'@ > duration.py\""): (
+                "mutation",
+                True,
+            ),
             "some-unknown-tool --run": ("other", False),
         }
 
@@ -871,7 +975,9 @@ def render_report(text: str) -> str:
             ["runtime-a", "runtime-b"],
         )
 
-    def test_runtime_tool_call_id_links_nested_command_without_using_outer_call(self) -> None:
+    def test_runtime_tool_call_id_links_nested_command_without_using_outer_call(
+        self,
+    ) -> None:
         timing = {
             "classificationComplete": True,
             "modelRequests": [
@@ -950,9 +1056,7 @@ def render_report(text: str) -> str:
         self.assertEqual(trace["toolCalls"][1]["commandItemId"], "item_nested")
 
     def test_failure_evidence_keeps_a_bounded_prefix_and_full_hash(self) -> None:
-        output = "failure: " + "x" * (
-            benchmark.MAX_MODEL_VISIBLE_EVIDENCE_CHARS + 500
-        )
+        output = "failure: " + "x" * (benchmark.MAX_MODEL_VISIBLE_EVIDENCE_CHARS + 500)
         row = benchmark.failure_evidence_from_event(
             event_type="item.completed",
             event={},
@@ -1059,9 +1163,7 @@ def render_report(text: str) -> str:
         )
         self.assertTrue(command["commandTruncated"])
         self.assertEqual(command["commandChars"], len(full_command))
-        self.assertEqual(
-            command["commandSha256"], benchmark.text_sha256(full_command)
-        )
+        self.assertEqual(command["commandSha256"], benchmark.text_sha256(full_command))
         self.assertEqual(command["itemId"], "item_1")
         self.assertEqual(command["requestLink"]["generationIndex"], 0)
         self.assertEqual(command["completedObservedAtUnixMs"], 1_700_000_000_050.0)
@@ -1070,18 +1172,10 @@ def render_report(text: str) -> str:
         )
 
     def test_required_test_must_cover_final_workspace_state(self) -> None:
-        self.assertTrue(
-            benchmark.required_test_covers_final_workspace_state(3, 2)
-        )
-        self.assertTrue(
-            benchmark.required_test_covers_final_workspace_state(3, 3)
-        )
-        self.assertFalse(
-            benchmark.required_test_covers_final_workspace_state(2, 3)
-        )
-        self.assertFalse(
-            benchmark.required_test_covers_final_workspace_state(None, 3)
-        )
+        self.assertTrue(benchmark.required_test_covers_final_workspace_state(3, 2))
+        self.assertTrue(benchmark.required_test_covers_final_workspace_state(3, 3))
+        self.assertFalse(benchmark.required_test_covers_final_workspace_state(2, 3))
+        self.assertFalse(benchmark.required_test_covers_final_workspace_state(None, 3))
 
     def test_rerunning_a_passing_suite_over_unchanged_state_is_redundant(self) -> None:
         timing = {
@@ -1428,9 +1522,7 @@ def render_report(text: str) -> str:
         )
 
         self.assertEqual(explanation["status"], "instrumented")
-        self.assertEqual(
-            explanation["observed"]["commandExecutionObservedMs"], 40.0
-        )
+        self.assertEqual(explanation["observed"]["commandExecutionObservedMs"], 40.0)
         runtime = explanation["instrumentedRuntime"]
         self.assertEqual(runtime["dominantOwner"], "modelOnlyMs")
         self.assertEqual(
@@ -1438,11 +1530,12 @@ def render_report(text: str) -> str:
         )
         self.assertEqual(runtime["counters"]["logicalGenerationCount"], 2)
         self.assertEqual(runtime["providerInputGrowth"]["deltaTokens"], 150)
-        self.assertEqual(
-            runtime["topSlowModelRounds"][0]["generationIndex"], 1
-        )
+        self.assertEqual(runtime["topSlowModelRounds"][0]["generationIndex"], 1)
         self.assertTrue(
-            any("tool-output projection recovery" in row for row in explanation["findings"])
+            any(
+                "tool-output projection recovery" in row
+                for row in explanation["findings"]
+            )
         )
 
         run = {
@@ -1452,9 +1545,7 @@ def render_report(text: str) -> str:
         aggregate = benchmark.summarize_latency_explanations([run])
         self.assertEqual(aggregate["instrumentedRuns"], 1)
         self.assertEqual(
-            aggregate["instrumentedRuntime"]["counterTotals"][
-                "logicalGenerationCount"
-            ],
+            aggregate["instrumentedRuntime"]["counterTotals"]["logicalGenerationCount"],
             2,
         )
 
@@ -1629,9 +1720,7 @@ def render_report(text: str) -> str:
             experiment_feature="terminalization",
         )
 
-        completion = gate["taskGates"]["slug_diagnostic"]["metrics"][
-            "completionMs"
-        ]
+        completion = gate["taskGates"]["slug_diagnostic"]["metrics"]["completionMs"]
         self.assertFalse(gate["passed"])
         self.assertTrue(completion["median"]["passed"])
         self.assertFalse(completion["p90"]["passed"])
@@ -1794,7 +1883,11 @@ def render_report(text: str) -> str:
             ],
             {
                 "type": "item.completed",
-                "item": {"id": "item_2", "type": "agent_message", "text": final_message},
+                "item": {
+                    "id": "item_2",
+                    "type": "agent_message",
+                    "text": final_message,
+                },
             },
             {"type": "turn.completed", "usage": {}, "timing": timing},
         ]
@@ -1818,7 +1911,9 @@ def render_report(text: str) -> str:
                 benchmark,
                 "build_agent_command",
                 side_effect=lambda **kwargs: [
-                    sys.executable, str(stub), str(kwargs["workspace"])
+                    sys.executable,
+                    str(stub),
+                    str(kwargs["workspace"]),
                 ],
             ):
                 run = benchmark.run_agent(
@@ -1881,9 +1976,7 @@ def render_report(text: str) -> str:
             explanation["instrumentedRuntime"]["dominantOwner"], "modelOnlyMs"
         )
         self.assertEqual(
-            explanation["instrumentedRuntime"]["counters"][
-                "logicalGenerationCount"
-            ],
+            explanation["instrumentedRuntime"]["counters"]["logicalGenerationCount"],
             2,
         )
 
@@ -2170,7 +2263,9 @@ def render_report(text: str) -> str:
             for relative, content in benchmark.FIXTURE_FILES.items():
                 (root / relative).write_text(content, encoding="utf-8", newline="\n")
             with (
-                mock.patch.object(benchmark, "spawn_owned_process", side_effect=fake_popen),
+                mock.patch.object(
+                    benchmark, "spawn_owned_process", side_effect=fake_popen
+                ),
                 mock.patch.object(benchmark, "terminate_process"),
             ):
                 benchmark.verify_fixture(root)
@@ -2178,7 +2273,7 @@ def render_report(text: str) -> str:
         self.assertEqual(len(processes), 2)
         for process in processes:
             self.assertEqual(
-                process.communicate.call_args_list[0].kwargs["timeout"],
+                process.wait.call_args_list[0].kwargs["timeout"],
                 benchmark.VERIFIER_TIMEOUT_SECONDS,
             )
 
@@ -2266,16 +2361,16 @@ def render_report(text: str) -> str:
         self.assertEqual(wall_clock["medianDelta"], 40.0)
         self.assertEqual(wall_clock["forkHigherPairs"], 3)
         self.assertEqual(comparison["metrics"]["ttfoMs"]["usablePairs"], 3)
-        self.assertEqual(
-            comparison["metrics"]["actualCommandCount"]["usablePairs"], 3
-        )
+        self.assertEqual(comparison["metrics"]["actualCommandCount"]["usablePairs"], 3)
 
         model_wait = comparison["metrics"]["modelWaitMs"]
         self.assertTrue(model_wait["censoringSensitive"])
         self.assertEqual(model_wait["usablePairs"], 2)
         self.assertEqual(model_wait["excludedPairs"], 1)
 
-    def test_paired_comparison_excludes_incorrect_or_noncompliant_fast_runs(self) -> None:
+    def test_paired_comparison_excludes_incorrect_or_noncompliant_fast_runs(
+        self,
+    ) -> None:
         pairs = [
             {
                 "repetition": 1,
@@ -2336,7 +2431,9 @@ def render_report(text: str) -> str:
 
     def test_terminal_timing_does_not_duplicate_uncapped_trace_rows(self) -> None:
         timing = {
-            "modelRequests": [_model_request(generationIndex=index) for index in range(2)],
+            "modelRequests": [
+                _model_request(generationIndex=index) for index in range(2)
+            ],
             "toolCalls": [_tool_call(callId=f"call-{index}") for index in range(2)],
             "toolCallTimingOverflow": 0,
         }
@@ -2416,9 +2513,9 @@ def render_report(text: str) -> str:
             text=True,
             start_new_session=True,
         )
+        child_pid = None
         try:
-            assert parent.stdout
-            child_pid = int(parent.stdout.readline().strip())
+            child_pid = _read_child_pid(parent)
             benchmark.terminate_process(parent)
             self.assertIsNotNone(parent.poll())
 
@@ -2430,11 +2527,7 @@ def render_report(text: str) -> str:
                 f"grandchild {child_pid} survived terminate_process",
             )
         finally:
-            if parent.poll() is None:
-                parent.kill()
-            if parent.stdout:
-                parent.stdout.close()
-            parent.wait(timeout=10)
+            _cleanup_test_processes(parent, child_pid)
 
     def test_native_process_owner_survives_root_exit(self) -> None:
         script = (
@@ -2448,9 +2541,9 @@ def render_report(text: str) -> str:
             stderr=subprocess.DEVNULL,
             text=True,
         )
+        child_pid = None
         try:
-            assert parent.stdout
-            child_pid = int(parent.stdout.readline().strip())
+            child_pid = _read_child_pid(parent)
             parent.wait(timeout=10)
             self.assertTrue(_pid_is_running(child_pid))
 
@@ -2463,11 +2556,14 @@ def render_report(text: str) -> str:
                 f"grandchild {child_pid} survived after its root exited",
             )
         finally:
-            benchmark.terminate_process(parent)
-            if parent.stdout:
-                parent.stdout.close()
+            try:
+                benchmark.terminate_process(parent)
+            finally:
+                _cleanup_test_processes(parent, child_pid)
 
-    def test_run_agent_finally_kills_descendants_after_unexpected_exception(self) -> None:
+    def test_run_agent_finally_kills_descendants_after_unexpected_exception(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory(prefix="kd4-live-finally-") as temp:
             root = Path(temp)
             pid_file = root / "child.pid"
@@ -2553,7 +2649,9 @@ def render_report(text: str) -> str:
         ):
             benchmark.parse_args()
 
-    def test_config_ablation_cli_launches_and_records_each_variants_overrides(self) -> None:
+    def test_config_ablation_cli_launches_and_records_each_variants_overrides(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory(prefix="kd4-live-config-") as temp:
             root = Path(temp)
             source = root / "source"
@@ -2596,23 +2694,40 @@ def render_report(text: str) -> str:
             )
             argv = [
                 "kd4_live_agent_benchmark.py",
-                "--fork-binary", str(binary),
-                "--upstream-binary", str(binary),
-                "--fork-root", str(source),
-                "--upstream-root", str(source),
-                "--fork-revision", revision,
-                "--upstream-revision", revision,
-                "--fork-build-command", "test fixture",
-                "--auth-source", str(auth),
-                "--output", str(output),
-                "--tasks", "duration_parser",
-                "--repetitions", "2",
-                "--gate-mode", "off",
-                "--experiment-feature", "direct_runtime",
-                "--fork-config", "features.direct_runtime=true",
-                "--fork-config", "features.current_time_reminder=false",
-                "--upstream-config", "features.direct_runtime=false",
-                "--upstream-config", "features.current_time_reminder=false",
+                "--fork-binary",
+                str(binary),
+                "--upstream-binary",
+                str(binary),
+                "--fork-root",
+                str(source),
+                "--upstream-root",
+                str(source),
+                "--fork-revision",
+                revision,
+                "--upstream-revision",
+                revision,
+                "--fork-build-command",
+                "test fixture",
+                "--auth-source",
+                str(auth),
+                "--output",
+                str(output),
+                "--tasks",
+                "duration_parser",
+                "--repetitions",
+                "2",
+                "--gate-mode",
+                "off",
+                "--experiment-feature",
+                "direct_runtime",
+                "--fork-config",
+                "features.direct_runtime=true",
+                "--fork-config",
+                "features.current_time_reminder=false",
+                "--upstream-config",
+                "features.direct_runtime=false",
+                "--upstream-config",
+                "features.current_time_reminder=false",
             ]
             spawn = benchmark.spawn_owned_process
 
@@ -2626,7 +2741,9 @@ def render_report(text: str) -> str:
             with (
                 mock.patch.object(sys, "argv", argv),
                 mock.patch.object(sys, "stdout", StringIO()),
-                mock.patch.object(benchmark, "spawn_owned_process", side_effect=launch_stub),
+                mock.patch.object(
+                    benchmark, "spawn_owned_process", side_effect=launch_stub
+                ),
             ):
                 benchmark.main()
             report = json.loads(output.read_text(encoding="utf-8"))
@@ -2643,20 +2760,48 @@ def render_report(text: str) -> str:
                     self.assertEqual(len(trace["requests"]), 2)
                     for request in trace["requests"]:
                         self.assertEqual(request["tokenUsage"]["cachedInputTokens"], 30)
-                        raw_request = json.loads(Path(request["requestPath"]).read_text(encoding="utf-8"))
-                        self.assertEqual(raw_request["input"][0]["content"], "request-" + "x" * 5000)
-                        raw_response = json.loads(Path(request["responsePath"]).read_text(encoding="utf-8"))
-                        self.assertEqual(raw_response["output_items"][0]["content"][0]["text"], "commentary-" + "y" * 5000)
-                        self.assertEqual(raw_response["output_items"][1]["input"], "patch-" + "z" * 5000)
+                        raw_request = json.loads(
+                            Path(request["requestPath"]).read_text(encoding="utf-8")
+                        )
+                        self.assertEqual(
+                            raw_request["input"][0]["content"], "request-" + "x" * 5000
+                        )
+                        raw_response = json.loads(
+                            Path(request["responsePath"]).read_text(encoding="utf-8")
+                        )
+                        self.assertEqual(
+                            raw_response["output_items"][0]["content"][0]["text"],
+                            "commentary-" + "y" * 5000,
+                        )
+                        self.assertEqual(
+                            raw_response["output_items"][1]["input"],
+                            "patch-" + "z" * 5000,
+                        )
                     capture = Path(trace["root"])
-                    raw_cli = [json.loads(line) for line in (capture / "cli.stdout.jsonl").read_text(encoding="utf-8").splitlines()]
-                    self.assertEqual(raw_cli[0]["item"]["text"], "commentary-" + "y" * 5000)
-                    self.assertEqual(raw_cli[1]["item"]["command"], "command-" + "c" * 5000)
-                    self.assertEqual(raw_cli[1]["item"]["aggregated_output"], "output-" + "o" * 5000)
-                    self.assertEqual((capture / "cli.stderr.log").read_text(encoding="utf-8"), "diagnostic-" + "d" * 5000 + "\n")
+                    raw_cli = [
+                        json.loads(line)
+                        for line in (capture / "cli.stdout.jsonl")
+                        .read_text(encoding="utf-8")
+                        .splitlines()
+                    ]
+                    self.assertEqual(
+                        raw_cli[0]["item"]["text"], "commentary-" + "y" * 5000
+                    )
+                    self.assertEqual(
+                        raw_cli[1]["item"]["command"], "command-" + "c" * 5000
+                    )
+                    self.assertEqual(
+                        raw_cli[1]["item"]["aggregated_output"], "output-" + "o" * 5000
+                    )
+                    self.assertEqual(
+                        (capture / "cli.stderr.log").read_text(encoding="utf-8"),
+                        "diagnostic-" + "d" * 5000 + "\n",
+                    )
                     self.assertEqual((capture / "workspace.diff").read_bytes(), b"")
                     for artifact in trace["files"]:
-                        self.assertEqual(artifact["sha256"], benchmark.sha256(Path(artifact["path"])))
+                        self.assertEqual(
+                            artifact["sha256"], benchmark.sha256(Path(artifact["path"]))
+                        )
             self.assertEqual(len(capture_roots), 4)
 
         expected = {
@@ -2669,7 +2814,9 @@ def render_report(text: str) -> str:
                 "features.current_time_reminder=false",
             ],
         }
-        self.assertEqual(report["methodology"]["experiment"]["configOverrides"], expected)
+        self.assertEqual(
+            report["methodology"]["experiment"]["configOverrides"], expected
+        )
         pairs = report["results"]["pairs"]
         self.assertEqual(len(pairs), 2)
         self.assertEqual(pairs[0]["order"], "upstreamC,currentFork")
@@ -2678,13 +2825,16 @@ def render_report(text: str) -> str:
             for role, overrides in expected.items():
                 run = pair[role]
                 received = json.loads(run["finalMessage"])
-                self.assertEqual(received["configs"], [
-                    'model_reasoning_effort="high"',
-                    'personality="pragmatic"',
-                    'approval_policy="never"',
-                    "features.code_mode=true",
-                    *overrides,
-                ])
+                self.assertEqual(
+                    received["configs"],
+                    [
+                        'model_reasoning_effort="high"',
+                        'personality="pragmatic"',
+                        'approval_policy="never"',
+                        "features.code_mode=true",
+                        *overrides,
+                    ],
+                )
                 self.assertEqual(run["configOverrides"], overrides)
                 self.assertTrue(received["promptMatches"])
                 # The stub never edited or tested: successful process completion
@@ -2692,66 +2842,128 @@ def render_report(text: str) -> str:
                 self.assertFalse(run["outcomeCorrect"])
                 self.assertFalse(run["taskContractCompliant"])
 
-                self.assertEqual(run["tokenUsage"], {
-                    "source": "terminal.usage", "inputTokens": 100,
-                    "cachedInputTokens": 60, "cacheWriteInputTokens": 10,
-                    "outputTokens": 20, "reasoningOutputTokens": 12,
-                    "totalTokens": 120,
-                })
+                self.assertEqual(
+                    run["tokenUsage"],
+                    {
+                        "source": "terminal.usage",
+                        "inputTokens": 100,
+                        "cachedInputTokens": 60,
+                        "cacheWriteInputTokens": 10,
+                        "outputTokens": 20,
+                        "reasoningOutputTokens": 12,
+                        "totalTokens": 120,
+                    },
+                )
                 self.assertIsNone(run["modelWaitMs"])
         for role in expected:
             summary = report["results"][role]
             self.assertEqual(summary["totalTokens"]["median"], 120)
             self.assertEqual(summary["totalTokens"]["count"], 2)
             self.assertEqual(summary["tokenUsage"]["cachedInputTokens"]["median"], 60)
-            self.assertEqual(summary["inferenceTrace"], {
-                "completeRuns": 2, "incompleteRuns": 0, "requestCount": 4, "requestsWithUsage": 4,
-            })
+            self.assertEqual(
+                summary["inferenceTrace"],
+                {
+                    "completeRuns": 2,
+                    "incompleteRuns": 0,
+                    "requestCount": 4,
+                    "requestsWithUsage": 4,
+                },
+            )
 
     def test_inference_capture_reports_missing_and_unreconciled_payloads(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            missing = benchmark.collect_inference_trace(root, None, readers_drained=False)
+            missing = benchmark.collect_inference_trace(
+                root, None, readers_drained=False
+            )
             self.assertEqual(missing["status"], "incomplete")
             self.assertIn("no native trace bundle emitted", missing["issues"])
             self.assertIn("CLI readers did not drain", missing["issues"])
             bundle = root / "runtime" / "bundle"
             bundle.mkdir(parents=True)
-            (bundle / "trace.jsonl").write_text(json.dumps({
-                "seq": 1, "payload": {"type": "inference_started", "inference_call_id": "one",
-                "request_payload": {"raw_payload_id": "request", "path": "missing.json"}},
-            }) + "\n", encoding="utf-8")
-            incomplete = benchmark.collect_inference_trace(root, benchmark.turn_token_usage({
-                "usage": {"input_tokens": 10, "output_tokens": 2},
-            }), readers_drained=True)
+            (bundle / "trace.jsonl").write_text(
+                json.dumps(
+                    {
+                        "seq": 1,
+                        "payload": {
+                            "type": "inference_started",
+                            "inference_call_id": "one",
+                            "request_payload": {
+                                "raw_payload_id": "request",
+                                "path": "missing.json",
+                            },
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            incomplete = benchmark.collect_inference_trace(
+                root,
+                benchmark.turn_token_usage(
+                    {
+                        "usage": {"input_tokens": 10, "output_tokens": 2},
+                    }
+                ),
+                readers_drained=True,
+            )
             self.assertEqual(incomplete["status"], "incomplete")
             self.assertFalse(incomplete["usageReconciled"])
-            self.assertIn("missing or invalid payload reference: missing.json", incomplete["issues"])
-            self.assertIn("inference request has no terminal trace event", incomplete["issues"])
+            self.assertIn(
+                "missing or invalid payload reference: missing.json",
+                incomplete["issues"],
+            )
+            self.assertIn(
+                "inference request has no terminal trace event", incomplete["issues"]
+            )
             self.assertIsNone(incomplete["requests"][0]["requestPath"])
 
     def test_standard_token_usage_pairing_and_missing_values(self) -> None:
         a = _gate_run()
         b = _gate_run()
-        a["tokenUsage"] = benchmark.turn_token_usage({"usage": {
-            "input_tokens": 100, "output_tokens": 20,
-            "cached_input_tokens": 90, "reasoning_output_tokens": 15,
-        }})
-        b["tokenUsage"] = benchmark.turn_token_usage({"usage": {
-            "input_tokens": 80, "output_tokens": 10,
-        }})
+        a["tokenUsage"] = benchmark.turn_token_usage(
+            {
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "cached_input_tokens": 90,
+                    "reasoning_output_tokens": 15,
+                }
+            }
+        )
+        b["tokenUsage"] = benchmark.turn_token_usage(
+            {
+                "usage": {
+                    "input_tokens": 80,
+                    "output_tokens": 10,
+                }
+            }
+        )
         b.pop("latencyExplanation", None)
-        result = benchmark.paired_comparison([
-            {"repetition": 1, "currentFork": a, "upstreamC": b}
-        ], fork_label="A", upstream_label="B")
+        result = benchmark.paired_comparison(
+            [{"repetition": 1, "currentFork": a, "upstreamC": b}],
+            fork_label="A",
+            upstream_label="B",
+        )
         self.assertEqual(result["metrics"]["totalTokens"]["medianDelta"], 30)
         self.assertEqual(result["metrics"]["totalTokens"]["usablePairs"], 1)
         self.assertIsNone(b["tokenUsage"]["cachedInputTokens"])
-        self.assertEqual(benchmark.turn_token_usage({"usage": {
-            "input_tokens": 0, "output_tokens": 0,
-        }})["totalTokens"], 0)
-        for usage in ({}, {"input_tokens": True, "output_tokens": 1},
-                      {"input_tokens": -1, "output_tokens": 1}):
+        self.assertEqual(
+            benchmark.turn_token_usage(
+                {
+                    "usage": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                    }
+                }
+            )["totalTokens"],
+            0,
+        )
+        for usage in (
+            {},
+            {"input_tokens": True, "output_tokens": 1},
+            {"input_tokens": -1, "output_tokens": 1},
+        ):
             self.assertIsNone(benchmark.turn_token_usage({"usage": usage}))
         self.assertIsNone(benchmark.turn_token_usage(None))
 
@@ -2763,7 +2975,10 @@ def render_report(text: str) -> str:
             ["features.typo=true"],
             ["features.direct_runtime=true", "features.direct_runtime=false"],
         ):
-            with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as temp:
+            with (
+                self.subTest(overrides=overrides),
+                tempfile.TemporaryDirectory() as temp,
+            ):
                 output = Path(temp) / "report.json"
                 argv = ["benchmark", "--output", str(output)]
                 for override in overrides:
@@ -2842,7 +3057,9 @@ def render_report(text: str) -> str:
                 }
 
             with mock.patch.object(benchmark, "run_agent", side_effect=stub_run):
-                with self.assertRaisesRegex(RuntimeError, "changed during the benchmark"):
+                with self.assertRaisesRegex(
+                    RuntimeError, "changed during the benchmark"
+                ):
                     benchmark.make_report(args)
 
     def test_binary_identity_records_the_pre_run_hash(self) -> None:

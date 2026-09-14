@@ -92,13 +92,13 @@ fn chart_lines(
     width: u16,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    let values = daily_values(buckets, today);
     let shown_columns = shown_columns(width);
     if shown_columns == 0 {
         lines.push("   Widen terminal to show activity graph".dim().into());
         return lines;
     }
 
+    let values = daily_values(buckets, today);
     let palette = TokenActivityPalette::current();
     let levels = levels_for_view(&values, view);
     let first_column = WEEK_COUNT - shown_columns;

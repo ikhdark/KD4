@@ -315,6 +315,10 @@ pub async fn run_doctor(
     Ok(())
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "A failed diagnostic worker cannot provide authoritative health checks or a reachability plan"
+)]
 async fn build_report(
     command: &DoctorCommand,
     root_config_overrides: CliConfigOverrides,
@@ -354,7 +358,7 @@ async fn build_report(
             .await,
         );
     }
-    checks.push(run_sync_check("search", progress.clone(), search_check));
+    checks.push(run_async_check("search", progress.clone(), search_check()).await);
 
     progress.begin("config");
     let config_result = load_config(root_config_overrides, interactive, arg0_paths).await;
@@ -362,56 +366,80 @@ async fn build_report(
         Ok(config) => {
             let auth_manager =
                 AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ true).await;
-            let reachability_plan = provider_reachability_plan(config);
+            let blocking_config = config.clone();
+            let blocking_progress = progress.clone();
+            let no_color = command.no_color;
+            let blocking_checks = tokio::task::spawn_blocking(move || {
+                let config = &blocking_config;
+                let progress = blocking_progress;
+                let stored_auth = load_auth_dot_json(
+                    &config.codex_home,
+                    config.cli_auth_credentials_store_mode,
+                    config.auth_keyring_backend_kind(),
+                );
+                let reachability_plan = provider_reachability_plan(
+                    config,
+                    stored_auth.as_ref().ok().and_then(|auth| auth.as_ref()),
+                );
+                let checks = [
+                    run_sync_check("config", progress.clone(), || config_check(config)),
+                    run_sync_check("auth", progress.clone(), || {
+                        auth_check(config, &stored_auth)
+                    }),
+                    run_sync_check("updates", progress.clone(), || updates_check(config)),
+                    run_sync_check("network", progress.clone(), network_check),
+                    run_sync_check("sandbox", progress.clone(), || sandbox_check(config)),
+                    run_sync_check("terminal", progress.clone(), || terminal_check(no_color)),
+                    run_sync_check("terminal title", progress.clone(), || {
+                        terminal_title_check(config)
+                    }),
+                ];
+                (checks, reachability_plan)
+            });
+            let checks_and_reachability = async {
+                let (checks, plan) = blocking_checks
+                    .await
+                    .expect("doctor blocking checks task panicked");
+                let reachability = run_async_check(
+                    "provider reachability",
+                    progress.clone(),
+                    provider_reachability_check(plan),
+                )
+                .await;
+                (checks, reachability)
+            };
             let (
-                config_check,
-                auth_check,
-                updates_check,
-                network_check,
+                (sync_checks, reachability_check),
                 websocket_check,
                 mcp_check,
-                sandbox_check,
-                terminal_check,
                 git_check,
-                terminal_title_check,
                 state_check,
                 thread_inventory_check,
-                reachability_check,
             ) = tokio::join!(
-                async { run_sync_check("config", progress.clone(), || config_check(config)) },
-                async { run_sync_check("auth", progress.clone(), || auth_check(config)) },
-                async { run_sync_check("updates", progress.clone(), || updates_check(config)) },
-                async { run_sync_check("network", progress.clone(), network_check) },
+                checks_and_reachability,
                 run_async_check(
                     "websocket",
                     progress.clone(),
                     websocket_reachability_check(config, Some(auth_manager)),
                 ),
                 run_async_check("MCP", progress.clone(), mcp_check(config)),
-                async { run_sync_check("sandbox", progress.clone(), || { sandbox_check(config) }) },
-                async {
-                    run_sync_check("terminal", progress.clone(), || {
-                        terminal_check(command.no_color)
-                    })
-                },
                 run_async_check("git", progress.clone(), git_check(config.cwd.as_path())),
-                async {
-                    run_sync_check("terminal title", progress.clone(), || {
-                        terminal_title_check(config)
-                    })
-                },
                 run_async_check("state", progress.clone(), state_check(config)),
                 run_async_check(
                     "thread inventory",
                     progress.clone(),
                     thread_inventory_check(config),
                 ),
-                run_async_check(
-                    "provider reachability",
-                    progress.clone(),
-                    provider_reachability_check(reachability_plan),
-                ),
             );
+            let [
+                config_check,
+                auth_check,
+                updates_check,
+                network_check,
+                sandbox_check,
+                terminal_check,
+                terminal_title_check,
+            ] = sync_checks;
             checks.extend([
                 config_check,
                 auth_check,
@@ -514,6 +542,7 @@ async fn load_config(
     ConfigBuilder::default()
         .cli_overrides(cli_kv_overrides)
         .harness_overrides(overrides)
+        .strict_config(interactive.strict_config)
         .build()
         .await
         .context("failed to load Codex config")
@@ -625,7 +654,7 @@ fn redacted_json_check(check: &DoctorCheck) -> JsonDoctorCheck {
         id: check.id.clone(),
         category: check.category.clone(),
         status: check.status,
-        summary: check.summary.clone(),
+        summary: redact_detail(&check.summary),
         details,
         issues: check.issues.iter().map(redacted_json_issue).collect(),
         notes,
@@ -1033,18 +1062,77 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|err| err.to_string())?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if stderr.is_empty() {
-            return Err(format!("exited with status {}", output.status));
+    run_command_with_timeout(program, args, Duration::from_secs(5))
+}
+
+fn run_command_with_timeout<I, S>(
+    program: &str,
+    args: I,
+    timeout: Duration,
+) -> Result<String, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    const MAX_OUTPUT: u64 = 64 * 1024;
+    let run = || -> std::io::Result<Result<String, String>> {
+        let mut stdout = tempfile::tempfile()?;
+        let mut stderr = tempfile::tempfile()?;
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(stdout.try_clone()?)
+            .stderr(stderr.try_clone()?)
+            .spawn()?;
+        let start = Instant::now();
+        let status = (|| -> std::io::Result<Result<std::process::ExitStatus, String>> {
+            loop {
+                let too_large =
+                    stdout.metadata()?.len() > MAX_OUTPUT || stderr.metadata()?.len() > MAX_OUTPUT;
+                if start.elapsed() >= timeout || too_large {
+                    return Ok(Err(if too_large {
+                        "diagnostic command output limit exceeded"
+                    } else {
+                        "diagnostic command timed out"
+                    }
+                    .to_string()));
+                }
+                if let Some(status) = child.try_wait()? {
+                    return Ok(Ok(status));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })();
+        let status = match status {
+            Ok(Ok(status)) => status,
+            result => {
+                let _ = child.kill();
+                child.wait()?;
+                return result.map(|result| result.map(|_| String::new()));
+            }
+        };
+        stdout.seek(SeekFrom::Start(0))?;
+        stderr.seek(SeekFrom::Start(0))?;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        stdout.take(MAX_OUTPUT + 1).read_to_end(&mut out)?;
+        stderr.take(MAX_OUTPUT + 1).read_to_end(&mut err)?;
+        if out.len() as u64 > MAX_OUTPUT || err.len() as u64 > MAX_OUTPUT {
+            return Ok(Err("diagnostic command output limit exceeded".to_string()));
         }
-        return Err(stderr);
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        if !status.success() {
+            let err = String::from_utf8_lossy(&err).trim().to_string();
+            return Ok(Err(if err.is_empty() {
+                format!("exited with status {status}")
+            } else {
+                err
+            }));
+        }
+        Ok(Ok(String::from_utf8_lossy(&out).into_owned()))
+    };
+    run().map_err(|err| err.to_string())?
 }
 
 fn config_check(config: &Config) -> DoctorCheck {
@@ -1133,7 +1221,7 @@ fn config_toml_details(config: &Config, details: &mut Vec<String>) {
     }
 }
 
-fn auth_check(config: &Config) -> DoctorCheck {
+fn auth_check(config: &Config, stored_auth: &std::io::Result<Option<AuthDotJson>>) -> DoctorCheck {
     let mut details = Vec::new();
     let auth_path = config.codex_home.join("auth.json");
     details.push(format!(
@@ -1166,20 +1254,16 @@ fn auth_check(config: &Config) -> DoctorCheck {
         return check;
     }
 
-    match load_auth_dot_json(
-        &config.codex_home,
-        config.cli_auth_credentials_store_mode,
-        config.auth_keyring_backend_kind(),
-    ) {
+    match stored_auth {
         Ok(Some(auth)) => {
-            details.push(format!("stored auth mode: {}", stored_auth_mode(&auth)));
+            details.push(format!("stored auth mode: {}", stored_auth_mode(auth)));
             details.push(format!("stored API key: {}", auth.openai_api_key.is_some()));
             details.push(format!("stored ChatGPT tokens: {}", auth.tokens.is_some()));
             details.push(format!(
                 "stored agent identity: {}",
                 auth.agent_identity.is_some()
             ));
-            let auth_issues = stored_auth_issues(&auth, env_var_present);
+            let auth_issues = stored_auth_issues(auth, env_var_present);
             details.extend(
                 auth_issues
                     .iter()
@@ -1478,6 +1562,7 @@ async fn mcp_check_from_servers(servers: &HashMap<String, McpServerConfig>) -> D
     let mut has_missing_environment = false;
     let mut unreachable_required_http = Vec::new();
     let mut unreachable_optional_http = Vec::new();
+    let mut http_probes = tokio::task::JoinSet::new();
 
     for (name, server) in servers {
         let disabled_server = !server.enabled || server.disabled_reason.is_some();
@@ -1580,17 +1665,33 @@ async fn mcp_check_from_servers(servers: &HashMap<String, McpServerConfig>) -> D
                         }
                     }
                 }
-                if let Err(err) = mcp_http_probe_url(url).await {
-                    let detail = format!("{name}: {url} ({err})");
-                    if server.required {
-                        unreachable_required_http.push(detail);
-                    } else {
-                        unreachable_optional_http.push(detail);
-                    }
+                let name = name.clone();
+                let url = url.clone();
+                let required = server.required;
+                http_probes.spawn(async move {
+                    let result = mcp_http_probe_url(&url).await;
+                    (name, url, required, result)
+                });
+                if http_probes.len() >= 4 {
+                    record_mcp_probe(
+                        http_probes.join_next().await,
+                        &mut unreachable_required_http,
+                        &mut unreachable_optional_http,
+                    );
                 }
             }
         }
     }
+
+    while !http_probes.is_empty() {
+        record_mcp_probe(
+            http_probes.join_next().await,
+            &mut unreachable_required_http,
+            &mut unreachable_optional_http,
+        );
+    }
+    unreachable_required_http.sort();
+    unreachable_optional_http.sort();
 
     details.push(format!("configured servers: {}", servers.len()));
     details.push(format!("disabled servers: {disabled}"));
@@ -1648,6 +1749,28 @@ async fn mcp_check_from_servers(servers: &HashMap<String, McpServerConfig>) -> D
         check = check.remediation(remediation.join(" "));
     }
     check
+}
+
+type McpProbeTaskResult =
+    Result<(String, String, bool, Result<String, String>), tokio::task::JoinError>;
+
+fn record_mcp_probe(
+    result: Option<McpProbeTaskResult>,
+    required_failures: &mut Vec<String>,
+    optional_failures: &mut Vec<String>,
+) {
+    match result {
+        Some(Ok((name, url, required, Err(err)))) => {
+            let failures = if required {
+                required_failures
+            } else {
+                optional_failures
+            };
+            failures.push(format!("{name}: {url} ({err})"));
+        }
+        Some(Err(err)) => required_failures.push(format!("MCP probe task failed: {err}")),
+        _ => {}
+    }
 }
 
 fn sandbox_check(config: &Config) -> DoctorCheck {
@@ -2063,60 +2186,101 @@ fn terminal_size_issues(inputs: &TerminalCheckInputs) -> Vec<DoctorIssue> {
 
 async fn state_check(config: &Config) -> DoctorCheck {
     let mut details = Vec::new();
-    path_readiness(&mut details, "CODEX_HOME", &config.codex_home);
-    path_readiness(&mut details, "log dir", &config.log_dir);
-    path_readiness(&mut details, "sqlite home", &config.sqlite_home);
-    let mut integrity_failures = Vec::new();
-    for db in codex_state::runtime_db_paths(&config.sqlite_home) {
-        path_readiness(&mut details, db.label, &db.path);
-        sqlite_integrity_detail(&mut details, &mut integrity_failures, db.label, &db.path).await;
+    let mut failures = Vec::new();
+    for (label, path) in [
+        ("CODEX_HOME", config.codex_home.as_path()),
+        ("log dir", config.log_dir.as_path()),
+        ("sqlite home", config.sqlite_home.as_path()),
+    ] {
+        if !path_readiness(&mut details, label, path) {
+            failures.push(format!(
+                "{label}: path is inaccessible or is not a directory"
+            ));
+        }
     }
-    rollout_stats_details(&mut details, &config.codex_home);
-    standalone_release_cache_details(&mut details);
-
-    let status = if integrity_failures.is_empty() {
+    let mut corrupt = false;
+    for db in codex_state::runtime_db_paths(&config.sqlite_home) {
+        corrupt |= sqlite_integrity_detail(&mut details, &mut failures, db.label, &db.path).await;
+    }
+    let codex_home = config.codex_home.clone();
+    match tokio::task::spawn_blocking(move || {
+        let mut details = Vec::new();
+        rollout_stats_details(&mut details, &codex_home);
+        standalone_release_cache_details(&mut details);
+        details
+    })
+    .await
+    {
+        Ok(scan_details) => details.extend(scan_details),
+        Err(err) => details.push(format!("state scan failed: {err}")),
+    }
+    let status = if failures.is_empty() {
         CheckStatus::Ok
     } else {
         CheckStatus::Fail
     };
-    let summary = if status == CheckStatus::Ok {
+    let summary = if failures.is_empty() {
         "state paths and databases are inspectable"
     } else {
-        "state database integrity check failed"
+        "state paths or databases could not be inspected"
     };
+    let locked = failures
+        .iter()
+        .any(|detail| codex_state::sqlite_error_detail_is_lock(detail));
+    details.extend(failures);
     let mut check = DoctorCheck::new("state.paths", "state", status, summary).details(details);
-    if status == CheckStatus::Fail {
+    if corrupt {
+        check = check.remediation("Move only the damaged SQLite database aside, then restart the interactive CLI or app server so it can rebuild from saved data.");
+    } else if locked {
         check = check.remediation(
-            "Move the damaged SQLite database aside, then restart the interactive CLI or app server so it can rebuild that runtime database from saved data. Other entry points may not rebuild automatically.",
+            "Close other Codex processes using the database, then rerun codex doctor.",
         );
+    } else if status == CheckStatus::Fail {
+        check = check
+            .remediation("Fix the reported path type or access problem, then rerun codex doctor.");
     }
     check
 }
 
 async fn sqlite_integrity_detail(
     details: &mut Vec<String>,
-    integrity_failures: &mut Vec<String>,
+    failures: &mut Vec<String>,
     label: &str,
     path: &Path,
-) {
-    if !path.is_file() {
-        details.push(format!("{label} integrity: skipped (missing)"));
-        return;
-    }
-
-    match codex_state::sqlite_integrity_check(path).await {
-        Ok(rows) if rows.iter().all(|row| row == "ok") => {
-            details.push(format!("{label} integrity: ok"));
+) -> bool {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            failures.push(format!(
+                "{label}: {} is not a regular database file",
+                path.display()
+            ));
+            return false;
         }
-        Ok(rows) => {
-            let message = format!("{label} integrity: {}", rows.join("; "));
-            integrity_failures.push(message.clone());
-            details.push(message);
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            details.push(format!("{label} integrity: skipped (missing)"));
+            return false;
         }
         Err(err) => {
-            let message = format!("{label} integrity: {err}");
-            integrity_failures.push(message.clone());
-            details.push(message);
+            failures.push(format!("{label}: {} ({err})", path.display()));
+            return false;
+        }
+    }
+    match codex_state::sqlite_integrity_check(path).await {
+        Ok(rows) if !rows.is_empty() && rows.iter().all(|row| row == "ok") => {
+            details.push(format!("{label} integrity: ok"));
+            false
+        }
+        Ok(rows) => {
+            failures.push(format!("{label} integrity: {}", rows.join("; ")));
+            true
+        }
+        Err(err) => {
+            let detail = err.to_string();
+            let corrupt = !codex_state::sqlite_error_detail_is_lock(&detail)
+                && codex_state::sqlite_error_detail_is_corruption(&detail);
+            failures.push(format!("{label} integrity: {detail}"));
+            corrupt
         }
     }
 }
@@ -2130,7 +2294,10 @@ fn rollout_stats_details(details: &mut Vec<String>, codex_home: &Path) {
 
 fn push_rollout_stats_detail(details: &mut Vec<String>, label: &str, stats: RolloutStats) {
     match stats.error {
-        Some(error) => details.push(format!("{label}: scan failed ({error})")),
+        Some(error) => details.push(format!(
+            "{label}: incomplete scan ({} files, {} total bytes counted; {error})",
+            stats.files, stats.total_bytes
+        )),
         None => details.push(format!(
             "{label}: {} files, {} total bytes, {} average bytes",
             stats.files,
@@ -2155,12 +2322,28 @@ impl RolloutStats {
 
 fn collect_rollout_stats(root: &Path) -> RolloutStats {
     let mut stats = RolloutStats::default();
-    collect_rollout_stats_inner(root, &mut stats);
+    collect_rollout_stats_inner(
+        root,
+        &mut stats,
+        &mut 10_000,
+        Instant::now() + Duration::from_secs(2),
+        0,
+    );
     stats
 }
 
-fn collect_rollout_stats_inner(path: &Path, stats: &mut RolloutStats) {
+fn collect_rollout_stats_inner(
+    path: &Path,
+    stats: &mut RolloutStats,
+    remaining: &mut usize,
+    deadline: Instant,
+    depth: usize,
+) {
     if stats.error.is_some() {
+        return;
+    }
+    if *remaining == 0 || Instant::now() >= deadline || depth >= 64 {
+        stats.error = Some("scan budget exhausted".to_string());
         return;
     }
     let entries = match std::fs::read_dir(path) {
@@ -2173,6 +2356,14 @@ fn collect_rollout_stats_inner(path: &Path, stats: &mut RolloutStats) {
     };
 
     for entry in entries {
+        if stats.error.is_some() {
+            return;
+        }
+        if *remaining == 0 || Instant::now() >= deadline {
+            stats.error = Some("scan budget exhausted".to_string());
+            return;
+        }
+        *remaining -= 1;
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
@@ -2189,7 +2380,7 @@ fn collect_rollout_stats_inner(path: &Path, stats: &mut RolloutStats) {
             }
         };
         if metadata.is_dir() {
-            collect_rollout_stats_inner(&path, stats);
+            collect_rollout_stats_inner(&path, stats, remaining, deadline, depth + 1);
         } else if metadata.is_file() && is_rollout_file(&path) {
             stats.files += 1;
             stats.total_bytes = stats.total_bytes.saturating_add(metadata.len());
@@ -2309,7 +2500,10 @@ async fn websocket_reachability_check(
                 probe.server_model_present
             ));
             if let Some(close) = probe.immediate_close {
-                details.push(format!("immediate close code: {}", close.code));
+                details.push(format!(
+                    "immediate close code: {}",
+                    close.code.as_deref().unwrap_or("not supplied")
+                ));
                 details.push(format!("immediate close reason: {}", close.reason));
                 return DoctorCheck::new(
                     "network.websocket_reachability",
@@ -2468,18 +2662,14 @@ impl ProviderAuthReachabilityMode {
     }
 }
 
-fn provider_reachability_plan(config: &Config) -> ReachabilityPlan {
-    let stored_auth = load_auth_dot_json(
-        &config.codex_home,
-        config.cli_auth_credentials_store_mode,
-        config.auth_keyring_backend_kind(),
-    )
-    .ok()
-    .flatten();
+fn provider_reachability_plan(
+    config: &Config,
+    stored_auth: Option<&AuthDotJson>,
+) -> ReachabilityPlan {
     let mode = provider_auth_reachability_mode_from_auth(
         config.model_provider.requires_openai_auth,
         env_var_present,
-        stored_auth.as_ref(),
+        stored_auth,
     );
     provider_reachability_plan_from_parts(
         mode,
@@ -2545,7 +2735,7 @@ fn provider_reachability_plan_from_parts(
             (mode == ProviderAuthReachabilityMode::ApiKey).then_some("https://api.openai.com/v1")
         })
         .and_then(|url| {
-            should_probe_models_route(provider_name, url, is_amazon_bedrock)
+            should_probe_models_route(provider_id, provider_name, url, is_amazon_bedrock)
                 .then(|| provider_url_for_path(url, "models", provider_query_params))
         });
     let endpoints = match mode {
@@ -2580,8 +2770,16 @@ fn provider_reachability_plan_from_parts(
     }
 }
 
-fn should_probe_models_route(provider_name: &str, base_url: &str, is_amazon_bedrock: bool) -> bool {
-    !is_amazon_bedrock && !is_azure_responses_provider(provider_name, Some(base_url))
+fn should_probe_models_route(
+    provider_id: &str,
+    provider_name: &str,
+    base_url: &str,
+    is_amazon_bedrock: bool,
+) -> bool {
+    // Custom Responses providers need not implement the model catalog API.
+    provider_id == "openai"
+        && !is_amazon_bedrock
+        && !is_azure_responses_provider(provider_name, Some(base_url))
 }
 
 fn provider_url_for_path(
@@ -2589,29 +2787,23 @@ fn provider_url_for_path(
     path: &str,
     query_params: Option<&HashMap<String, String>>,
 ) -> String {
-    let base = base_url.trim_end_matches('/');
-    let path = path.trim_start_matches('/');
-    let mut url = if path.is_empty() {
-        base.to_string()
-    } else {
-        format!("{base}/{path}")
+    let Ok(mut url) = url::Url::parse(base_url) else {
+        return base_url.to_string();
     };
-
-    if let Some(params) = query_params
-        && !params.is_empty()
-    {
-        let separator = if url.contains('?') { '&' } else { '?' };
-        url.push(separator);
-        url.push_str(
-            &params
-                .iter()
-                .map(|(key, value)| format!("{key}={value}"))
-                .collect::<Vec<_>>()
-                .join("&"),
+    if let Ok(mut segments) = url.path_segments_mut() {
+        segments.pop_if_empty();
+        segments.extend(
+            path.trim_matches('/')
+                .split('/')
+                .filter(|part| !part.is_empty()),
         );
     }
-
-    url
+    if let Some(params) = query_params {
+        let mut params = params.iter().collect::<Vec<_>>();
+        params.sort_by_key(|(key, _)| *key);
+        url.query_pairs_mut().extend_pairs(params);
+    }
+    url.into()
 }
 
 async fn provider_reachability_check(plan: ReachabilityPlan) -> DoctorCheck {
@@ -2778,13 +2970,27 @@ async fn mcp_http_probe_url(url: &str) -> Result<String, String> {
 }
 
 async fn mcp_http_probe_url_with_timeout(url: &str, timeout: Duration) -> Result<String, String> {
-    match http_probe_url_with_timeout(url, timeout).await {
-        Ok(status) => Ok(status),
-        Err(head_err) => match http_get_probe_url_with_timeout(url, timeout).await {
-            Ok(status) => Ok(status),
-            Err(get_err) => Err(format!("HEAD {head_err}; GET {get_err}")),
-        },
+    let client = create_client_without_request_logging()
+        .map_err(|err| format!("failed to build HTTP client for {url}: {err}"))?;
+    let mut failures = Vec::new();
+    for (method, request) in [("HEAD", client.head(url)), ("GET", client.get(url))] {
+        match request.timeout(timeout).send().await {
+            Ok(response) => return Ok(format!("HTTP {}", response.status().as_u16())),
+            Err(err) => {
+                let detail = if err.is_timeout() {
+                    "request timed out".to_string()
+                } else if err.is_connect() {
+                    "connect failed".to_string()
+                } else if err.is_builder() {
+                    "request could not be built".to_string()
+                } else {
+                    err.to_string()
+                };
+                failures.push(format!("{method} {detail}"));
+            }
+        }
     }
+    Err(failures.join("; "))
 }
 
 async fn http_probe_url_with_timeout(url: &str, timeout: Duration) -> Result<String, String> {
@@ -2806,12 +3012,6 @@ async fn http_probe_url_with_timeout(url: &str, timeout: Duration) -> Result<Str
             }
         })?;
     Ok(format!("HTTP {}", response.status().as_u16()))
-}
-
-async fn http_get_probe_url_with_timeout(url: &str, timeout: Duration) -> Result<String, String> {
-    http_get_probe_status_with_timeout(url, timeout)
-        .await
-        .map(|status| format!("HTTP {status}"))
 }
 
 async fn http_get_probe_status_with_timeout(url: &str, timeout: Duration) -> Result<u16, String> {
@@ -2892,7 +3092,7 @@ fn executable_file_permission(_path: &Path, _metadata: &std::fs::Metadata) -> Re
     Ok(())
 }
 
-fn path_readiness(details: &mut Vec<String>, label: &str, path: &Path) {
+fn path_readiness(details: &mut Vec<String>, label: &str, path: &Path) -> bool {
     match std::fs::metadata(path) {
         Ok(metadata) => {
             let kind = if metadata.is_dir() {
@@ -2903,11 +3103,16 @@ fn path_readiness(details: &mut Vec<String>, label: &str, path: &Path) {
                 "other"
             };
             details.push(format!("{label}: {} ({kind})", path.display()));
+            metadata.is_dir()
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             details.push(format!("{label}: {} (missing)", path.display()));
+            true
         }
-        Err(err) => details.push(format!("{label}: {} ({err})", path.display())),
+        Err(err) => {
+            details.push(format!("{label}: {} ({err})", path.display()));
+            false
+        }
     }
 }
 
@@ -3032,8 +3237,34 @@ mod tests {
         }
     }
 
+    fn accept_probe(listener: &TcpListener) -> std::net::TcpStream {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    return stream;
+                }
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(err) => panic!("probe request did not arrive: {err}"),
+            }
+        }
+    }
+
     fn respond_once(listener: &TcpListener, response: &[u8]) {
-        let (mut stream, _) = listener.accept().expect("accept probe request");
+        let mut stream = accept_probe(listener);
         let mut request = [0; 1024];
         let _ = stream.read(&mut request);
         stream.write_all(response).expect("write response");
@@ -3645,7 +3876,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_reachability_adds_models_route_probe_for_openai_compatible_base_urls() {
+    fn provider_reachability_does_not_require_models_route_for_custom_providers() {
         let query_params = HashMap::from([("api-version".to_string(), "2026-01-01".to_string())]);
 
         assert_eq!(
@@ -3664,9 +3895,7 @@ mod tests {
                     label: "custom API".to_string(),
                     url: "https://example.com/openai/v1/".to_string(),
                     required: true,
-                    route_probe_url: Some(
-                        "https://example.com/openai/v1/models?api-version=2026-01-01".to_string()
-                    ),
+                    route_probe_url: None,
                 }],
             }
         );
@@ -3805,6 +4034,128 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn state_check_reports_wrong_path_types_without_corruption_advice() {
+        let home = tempfile::tempdir().unwrap();
+        let mut config = Config::load_default_with_cli_overrides_for_codex_home(
+            home.path().to_path_buf(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        config.sqlite_home = home.path().to_path_buf();
+        config.log_dir = home.path().join("not-a-directory");
+        std::fs::write(&config.log_dir, "file").unwrap();
+        let db = codex_state::runtime_db_paths(&config.sqlite_home).remove(0);
+        std::fs::create_dir(&db.path).unwrap();
+        let check = state_check(&config).await;
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(
+            check
+                .details
+                .iter()
+                .any(|detail| detail.contains("log dir") && detail.contains("not a directory"))
+        );
+        assert!(
+            check
+                .details
+                .iter()
+                .any(|detail| detail.contains("not a regular database file"))
+        );
+        assert_eq!(
+            check.remediation.as_deref(),
+            Some("Fix the reported path type or access problem, then rerun codex doctor.")
+        );
+    }
+
+    #[tokio::test]
+    async fn state_check_reserves_rebuild_advice_for_corruption() {
+        let home = tempfile::tempdir().unwrap();
+        let mut config = Config::load_default_with_cli_overrides_for_codex_home(
+            home.path().to_path_buf(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        config.sqlite_home = home.path().to_path_buf();
+        assert_eq!(state_check(&config).await.status, CheckStatus::Ok);
+        let db = codex_state::runtime_db_paths(&config.sqlite_home).remove(0);
+        std::fs::write(&db.path, vec![b'x'; 4096]).unwrap();
+        let check = state_check(&config).await;
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(
+            check
+                .remediation
+                .as_deref()
+                .unwrap()
+                .contains("damaged SQLite")
+        );
+    }
+
+    #[test]
+    fn provider_route_preserves_and_encodes_query_parameters() {
+        let plan = provider_reachability_plan_from_parts(
+            ProviderAuthReachabilityMode::ApiKey,
+            "openai",
+            "OpenAI",
+            Some("https://example.com/v1/?tenant=a%20b#fragment"),
+            Some(&HashMap::from([(
+                "api-version".to_string(),
+                "a&b=c".to_string(),
+            )])),
+            false,
+            "https://chatgpt.com/backend-api/",
+        );
+        assert_eq!(
+            plan.endpoints[0].route_probe_url.as_deref(),
+            Some("https://example.com/v1/models?tenant=a%20b&api-version=a%26b%3Dc#fragment")
+        );
+    }
+
+    #[test]
+    fn rollout_scan_reports_budget_exhaustion() {
+        let home = tempfile::tempdir().unwrap();
+        let mut nested = home.path().join("sessions");
+        for _ in 0..65 {
+            nested.push("a");
+        }
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("rollout-test.jsonl"), "data").unwrap();
+        let mut details = Vec::new();
+        rollout_stats_details(&mut details, home.path());
+        assert!(details[0].contains("incomplete scan"));
+        assert!(details[0].contains("scan budget exhausted"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn diagnostic_commands_enforce_time_and_output_limits() {
+        let result = run_command_with_timeout(
+            "powershell.exe",
+            [
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 10",
+            ],
+            Duration::from_millis(100),
+        );
+        assert_eq!(result, Err("diagnostic command timed out".to_string()));
+        let result = run_command(
+            "powershell.exe",
+            [
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Console]::Write('x' * 70000)",
+            ],
+        );
+        assert_eq!(
+            result,
+            Err("diagnostic command output limit exceeded".to_string())
+        );
+    }
+
     #[test]
     fn collect_rollout_stats_counts_nested_rollout_files() {
         let temp = tempfile::tempdir().expect("create temp dir");
@@ -3835,7 +4186,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
         let addr = listener.local_addr().expect("listener address");
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept probe request");
+            let mut stream = accept_probe(&listener);
             let mut request = [0; 1024];
             let _ = stream.read(&mut request);
             stream
@@ -3856,14 +4207,14 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
         let addr = listener.local_addr().expect("listener address");
         let server = std::thread::spawn(move || {
-            let (mut head_stream, _) = listener.accept().expect("accept HEAD probe request");
+            let mut head_stream = accept_probe(&listener);
             let head = std::thread::spawn(move || {
                 let mut request = [0; 1024];
                 let _ = head_stream.read(&mut request);
                 std::thread::sleep(Duration::from_millis(50));
             });
 
-            let (mut get_stream, _) = listener.accept().expect("accept GET probe request");
+            let mut get_stream = accept_probe(&listener);
             let mut request = [0; 1024];
             let _ = get_stream.read(&mut request);
             get_stream

@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde::de::Deserializer;
 use serde::de::{self};
 use std::time::Duration;
-use std::time::Instant;
+use tokio::time::Instant;
 
 use crate::default_client::create_raw_auth_client;
 use crate::pkce::PkceCodes;
@@ -16,7 +16,7 @@ const ANSI_BLUE: &str = "\x1b[94m";
 const ANSI_GRAY: &str = "\x1b[90m";
 const ANSI_RESET: &str = "\x1b[0m";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DeviceCode {
     pub verification_url: String,
     pub user_code: String,
@@ -24,12 +24,23 @@ pub struct DeviceCode {
     interval: u64,
 }
 
+impl std::fmt::Debug for DeviceCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceCode")
+            .field("interval", &self.interval)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Deserialize)]
 struct UserCodeResp {
     device_auth_id: String,
     #[serde(alias = "user_code", alias = "usercode")]
     user_code: String,
-    #[serde(default, deserialize_with = "deserialize_interval")]
+    #[serde(
+        default = "default_poll_interval",
+        deserialize_with = "deserialize_interval"
+    )]
     interval: u64,
 }
 
@@ -49,7 +60,21 @@ where
     D: Deserializer<'de>,
 {
     let s = String::deserialize(deserializer)?;
-    s.trim().parse::<u64>().map_err(de::Error::custom)
+    s.trim()
+        .parse::<u64>()
+        .map(|interval| {
+            if interval == 0 {
+                default_poll_interval()
+            } else {
+                interval
+            }
+        })
+        .map_err(de::Error::custom)
+}
+
+// Device authorization uses a five-second polling interval when none is supplied.
+fn default_poll_interval() -> u64 {
+    5
 }
 
 #[derive(Deserialize)]
@@ -104,46 +129,78 @@ async fn poll_for_token(
     user_code: &str,
     interval: u64,
 ) -> std::io::Result<CodeSuccessResp> {
+    poll_for_token_until(
+        client,
+        auth_base_url,
+        device_auth_id,
+        user_code,
+        interval,
+        Instant::now() + Duration::from_secs(15 * 60),
+    )
+    .await
+}
+
+async fn poll_for_token_until(
+    client: &HttpClient,
+    auth_base_url: &str,
+    device_auth_id: &str,
+    user_code: &str,
+    interval: u64,
+    deadline: Instant,
+) -> std::io::Result<CodeSuccessResp> {
     let url = format!("{auth_base_url}/deviceauth/token");
-    let max_wait = Duration::from_secs(15 * 60);
-    let start = Instant::now();
-
-    loop {
-        let body = serde_json::to_string(&TokenPollReq {
-            device_auth_id: device_auth_id.to_string(),
-            user_code: user_code.to_string(),
-        })
-        .map_err(std::io::Error::other)?;
-        let resp = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .body(body)
-            .send()
-            .await
-            .map_err(std::io::Error::other)?;
-
-        let status = resp.status();
-
-        if status.is_success() {
-            return resp.json().await.map_err(std::io::Error::other);
-        }
-
-        if status == StatusCode::FORBIDDEN || status == StatusCode::NOT_FOUND {
-            if start.elapsed() >= max_wait {
-                return Err(std::io::Error::other(
-                    "device auth timed out after 15 minutes",
-                ));
+    let body = serde_json::to_string(&TokenPollReq {
+        device_auth_id: device_auth_id.to_string(),
+        user_code: user_code.to_string(),
+    })
+    .map_err(std::io::Error::other)?;
+    let timeout_error = || {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "device auth timed out after 15 minutes",
+        )
+    };
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            if Instant::now() >= deadline {
+                return Err(timeout_error());
             }
-            let sleep_for = Duration::from_secs(interval).min(max_wait - start.elapsed());
-            tokio::time::sleep(sleep_for).await;
-            continue;
-        }
+            let resp = client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .body(body.clone())
+                .send()
+                .await
+                .map_err(std::io::Error::other)?;
 
-        return Err(std::io::Error::other(format!(
-            "device auth failed with status {}",
-            resp.status()
-        )));
-    }
+            let status = resp.status();
+
+            if status.is_success() {
+                let token = resp.json().await.map_err(std::io::Error::other)?;
+                if Instant::now() >= deadline {
+                    return Err(timeout_error());
+                }
+                return Ok(token);
+            }
+
+            if status == StatusCode::FORBIDDEN || status == StatusCode::NOT_FOUND {
+                let sleep_for = Duration::from_secs(if interval == 0 {
+                    default_poll_interval()
+                } else {
+                    interval
+                });
+                tokio::time::sleep(sleep_for).await;
+                continue;
+            }
+
+            return Err(std::io::Error::other(format!(
+                "device auth failed with status {}",
+                resp.status()
+            )));
+        }
+    })
+    .await
+    .map_err(|_| timeout_error())?
 }
 
 fn device_code_prompt(verification_url: &str, code: &str) -> String {

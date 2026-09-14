@@ -9,6 +9,7 @@ async fn session_summary_skips_when_no_usage_or_resume_hint() {
             /*thread_id*/ None,
             /*thread_name*/ None,
             /*rollout_path*/ None,
+            false,
         )
         .await
         .is_none()
@@ -28,6 +29,7 @@ async fn session_summary_skips_resume_hint_until_rollout_exists() {
             Some(conversation),
             /*thread_name*/ None,
             Some(&rollout_path),
+            false,
         )
         .await
         .is_none()
@@ -52,6 +54,7 @@ async fn session_summary_includes_resume_hint_for_persisted_rollout() {
         Some(conversation),
         /*thread_name*/ None,
         Some(&rollout_path),
+        false,
     )
     .await
     .expect("summary");
@@ -62,6 +65,17 @@ async fn session_summary_includes_resume_hint_for_persisted_rollout() {
     assert_eq!(
         summary.resume_hint,
         Some("codex resume 123e4567-e89b-12d3-a456-426614174000".to_string())
+    );
+    assert_eq!(
+        summary
+            .into_lines()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        vec![
+            "Token usage: total=12 input=10 output=2",
+            "To continue this session, run codex resume 123e4567-e89b-12d3-a456-426614174000",
+        ]
     );
 }
 
@@ -83,6 +97,7 @@ async fn session_summary_names_picker_item_when_thread_has_name() {
         Some(conversation),
         Some("my-session".to_string()),
         Some(&rollout_path),
+        false,
     )
     .await
     .expect("summary");
@@ -112,6 +127,7 @@ async fn session_summary_omits_resume_hint_for_empty_files_and_directories_but_p
             Some(conversation),
             Some("my-session".to_string()),
             Some(path),
+            false,
         )
         .await
         .expect("usage summary must survive an unresumable path");
@@ -121,4 +137,33 @@ async fn session_summary_omits_resume_hint_for_empty_files_and_directories_but_p
         );
         assert_eq!(summary.resume_hint, None);
     }
+}
+
+#[tokio::test]
+async fn session_summary_remote_identity_does_not_require_a_local_rollout() {
+    let thread_id = ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap();
+    let summary = session_summary(TokenUsage::default(), Some(thread_id), None, None, true)
+        .await
+        .expect("remote session identity");
+    assert_eq!(summary.resume_hint, None);
+    assert_eq!(summary.usage_line, None);
+    assert_eq!(
+        summary.into_lines(),
+        vec![Line::from(
+            "Session ID: 123e4567-e89b-12d3-a456-426614174000"
+        )]
+    );
+
+    let resume_hint = resume_hint_for_resumable_thread(Some(thread_id), None, None, true).await;
+    let exit = AppExitInfo {
+        token_usage: TokenUsage::default(),
+        thread_id: Some(thread_id),
+        resume_hint,
+        update_action: None,
+        exit_reason: ExitReason::UserRequested,
+    };
+    assert_eq!(
+        exit.format_exit_messages(false),
+        vec!["Session ID: 123e4567-e89b-12d3-a456-426614174000"]
+    );
 }

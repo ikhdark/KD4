@@ -151,6 +151,15 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
     let client = HttpClientBuilder::new()
         .without_redirects()
         .build_direct()?;
+    let premature = client
+        .get(format!("http://127.0.0.1:{login_port}/success"))
+        .send()
+        .await?;
+    assert_eq!(premature.status(), 409);
+    assert_eq!(
+        std::fs::read_to_string(codex_home.join("auth.json"))?,
+        serde_json::to_string_pretty(&stale_auth)?
+    );
     let url = format!(
         "http://127.0.0.1:{login_port}/auth/callback?code=abc&state=test_state_123.onboarding_entrypoint=life_sciences"
     );
@@ -160,6 +169,12 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
     let success_url = Url::parse(success_url)?;
     assert_eq!(success_url.host_str(), Some("localhost"));
     assert_eq!(success_url.path(), "/success");
+    assert!(!success_url.query_pairs().any(|(key, _)| key == "id_token"));
+
+    let saved_auth = std::fs::read(codex_home.join("auth.json"))?;
+    let repeated = client.get(&url).send().await?;
+    assert_eq!(repeated.status(), 409);
+    assert_eq!(std::fs::read(codex_home.join("auth.json"))?, saved_auth);
 
     let success_resp = client.get(success_url).send().await?;
     assert!(success_resp.status().is_success());
@@ -788,5 +803,165 @@ fn async_login_startup_keeps_runtime_responsive_and_cleans_cancelled_binding() -
         };
         assert!(!home.path().join("auth.json").exists());
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_during_exchange_does_not_persist_credentials() -> Result<()> {
+    for cancel_api_key_exchange in [false, true] {
+        let issuer = wiremock::MockServer::start().await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let token = format!("e30.{}.sig", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({"https://api.openai.com/auth": {"chatgpt_account_id": "account"}}))?
+        ));
+        let signal = started.clone();
+        wiremock::Mock::given(wiremock::matchers::path("/oauth/token"))
+            .respond_with(move |request: &wiremock::Request| {
+                let api_key_exchange = String::from_utf8_lossy(&request.body)
+                    .contains("requested_token=openai-api-key");
+                if api_key_exchange == cancel_api_key_exchange {
+                    signal.notify_one();
+                    wiremock::ResponseTemplate::new(200).set_delay(Duration::from_secs(60))
+                } else {
+                    wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id_token": token, "access_token": "access", "refresh_token": "refresh"
+                    }))
+                }
+            })
+            .expect(if cancel_api_key_exchange { 2 } else { 1 })
+            .mount(&issuer)
+            .await;
+        let home = tempdir()?;
+        let mut opts = ServerOptions::new(
+            home.path().to_path_buf(),
+            "client".into(),
+            None,
+            AuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::Direct,
+            codex_login::test_support::transport_default_auth_route_config(),
+        );
+        opts.issuer = issuer.uri();
+        opts.port = 0;
+        opts.open_browser = false;
+        opts.force_state = Some("state".into());
+        let server = run_login_server(opts)?;
+        let callback = format!(
+            "http://127.0.0.1:{}/auth/callback?code=code&state=state",
+            server.actual_port
+        );
+        let client = HttpClientBuilder::new()
+            .without_redirects()
+            .build_direct()?;
+        let request = tokio::spawn(async move { client.get(callback).send().await });
+        tokio::time::timeout(Duration::from_secs(5), started.notified()).await?;
+        server.cancel();
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), server.block_until_done()).await?;
+        assert!(
+            result.is_err(),
+            "cancelled exchange must not report login success"
+        );
+        assert!(!home.path().join("auth.json").exists());
+        let response = request.await??;
+        assert!(response.text().await?.contains("Login cancelled"));
+        issuer.verify().await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn committed_login_finishes_without_browser_success_handoff() -> Result<()> {
+    for cancel_after_commit in [false, true] {
+        let issuer = wiremock::MockServer::start().await;
+        let jwt = format!("e30.{}.sig", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({"https://api.openai.com/auth": {"chatgpt_account_id": "committed-account"}}))?
+        ));
+        wiremock::Mock::given(wiremock::matchers::path("/oauth/token"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id_token": jwt, "access_token": "committed-access", "refresh_token": "committed-refresh"
+            })))
+            .expect(2)
+            .mount(&issuer)
+            .await;
+        let home = tempdir()?;
+        let mut opts = ServerOptions::new(
+            home.path().to_path_buf(),
+            "client".into(),
+            None,
+            AuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::Direct,
+            codex_login::test_support::transport_default_auth_route_config(),
+        );
+        opts.issuer = format!("{}/", issuer.uri());
+        opts.port = 0;
+        opts.open_browser = false;
+        opts.force_state = Some("state".into());
+        let server = run_login_server(opts)?;
+        assert_eq!(Url::parse(&server.auth_url)?.path(), "/oauth/authorize");
+        let client = HttpClientBuilder::new()
+            .without_redirects()
+            .build_direct()?;
+        let response = client.get(format!(
+            "http://127.0.0.1:{}/auth/callback?code=code&state=state.onboarding_entrypoint=life_sciences",
+            server.actual_port
+        )).send().await?;
+        assert_eq!(response.status(), 302);
+        let saved = std::fs::read(home.path().join("auth.json"))?;
+        let auth: serde_json::Value = serde_json::from_slice(&saved)?;
+        assert_eq!(auth["tokens"]["account_id"], "committed-account");
+        assert_eq!(auth["tokens"]["access_token"], "committed-access");
+        if cancel_after_commit {
+            server.cancel();
+            let response = client
+                .get(format!("http://127.0.0.1:{}/cancel", server.actual_port))
+                .send()
+                .await?;
+            assert_eq!(response.status(), 200);
+            assert_eq!(response.text().await?, "Login already completed");
+        }
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            server.block_until_done_with_callback_result(),
+        )
+        .await??;
+        assert_eq!(
+            result.onboarding_entrypoint,
+            Some(LoginOnboardingEntrypoint::LifeSciences)
+        );
+        assert_eq!(std::fs::read(home.path().join("auth.json"))?, saved);
+        issuer.verify().await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropping_login_server_cancels_pending_login() -> Result<()> {
+    let home = tempdir()?;
+    let mut opts = ServerOptions::new(
+        home.path().to_path_buf(),
+        "client".into(),
+        None,
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::Direct,
+        codex_login::test_support::transport_default_auth_route_config(),
+    );
+    opts.port = 0;
+    opts.open_browser = false;
+    let server = run_login_server(opts)?;
+    let port = server.actual_port;
+    drop(server);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match TcpListener::bind(("127.0.0.1", port)) {
+                Ok(listener) => break listener,
+                Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                    tokio::time::sleep(Duration::from_millis(10)).await
+                }
+                Err(error) => panic!("unexpected bind failure: {error}"),
+            }
+        }
+    })
+    .await?;
+    assert!(!home.path().join("auth.json").exists());
     Ok(())
 }

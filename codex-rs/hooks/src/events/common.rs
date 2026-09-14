@@ -68,15 +68,6 @@ pub(crate) fn append_additional_context(
     additional_contexts_for_model.push(additional_context);
 }
 
-pub(crate) fn flatten_additional_contexts<'a>(
-    additional_contexts: impl IntoIterator<Item = &'a [String]>,
-) -> Vec<String> {
-    additional_contexts
-        .into_iter()
-        .flat_map(|chunk| chunk.iter().cloned())
-        .collect()
-}
-
 pub(crate) fn serialization_failure_hook_events(
     handlers: Vec<ConfiguredHandler>,
     turn_id: Option<String>,
@@ -143,28 +134,59 @@ pub(crate) fn matcher_pattern_for_event(
     }
 }
 
-pub(crate) fn validate_matcher_pattern(matcher: &str) -> Result<(), regex::Error> {
-    if is_match_all_matcher(matcher) || is_exact_matcher(matcher) {
-        return Ok(());
-    }
-    regex::Regex::new(matcher).map(|_| ())
+/// A validated matcher whose compiled regex shares the handler's lifetime.
+#[derive(Debug, Clone)]
+pub(crate) struct HookMatcher {
+    pattern: String,
+    regex: Option<regex::Regex>,
 }
 
-pub(crate) fn matches_matcher(matcher: Option<&str>, input: Option<&str>) -> bool {
-    match matcher {
-        None => true,
-        Some(matcher) if is_match_all_matcher(matcher) => true,
-        Some(matcher) if is_exact_matcher(matcher) => input
-            .map(|input| matcher.split('|').any(|candidate| candidate == input))
-            .unwrap_or(false),
-        Some(matcher) => input
-            .and_then(|input| {
-                regex::Regex::new(matcher)
-                    .ok()
-                    .map(|regex| regex.is_match(input))
-            })
-            .unwrap_or(false),
+impl HookMatcher {
+    pub(crate) fn new(pattern: &str) -> Result<Self, regex::Error> {
+        let regex = if is_match_all_matcher(pattern) || is_exact_matcher(pattern) {
+            None
+        } else {
+            Some(regex::Regex::new(pattern)?)
+        };
+        Ok(Self {
+            pattern: pattern.to_owned(),
+            regex,
+        })
     }
+
+    #[cfg(test)]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.pattern
+    }
+
+    pub(crate) fn matches(&self, input: Option<&str>) -> bool {
+        if is_match_all_matcher(&self.pattern) {
+            return true;
+        }
+        input.is_some_and(|input| match &self.regex {
+            Some(regex) => regex.is_match(input),
+            None => self.pattern.split('|').any(|candidate| candidate == input),
+        })
+    }
+}
+
+impl PartialEq for HookMatcher {
+    fn eq(&self, other: &Self) -> bool {
+        self.pattern == other.pattern
+    }
+}
+
+impl Eq for HookMatcher {}
+
+#[cfg(test)]
+fn validate_matcher_pattern(matcher: &str) -> Result<(), regex::Error> {
+    HookMatcher::new(matcher).map(|_| ())
+}
+
+#[cfg(test)]
+pub(crate) fn matches_matcher(matcher: Option<&str>, input: Option<&str>) -> bool {
+    matcher
+        .is_none_or(|pattern| HookMatcher::new(pattern).is_ok_and(|matcher| matcher.matches(input)))
 }
 
 pub(crate) fn matcher_inputs<'a>(
@@ -194,39 +216,40 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::ContextInjectingHookOutcome;
-    use super::StatelessHookOutcome;
     use super::matcher_pattern_for_event;
     use super::matches_matcher;
     use super::validate_matcher_pattern;
 
     #[test]
-    fn shared_hook_outcomes_preserve_their_payload_shapes() {
-        let empty_context_injecting =
-            ContextInjectingHookOutcome::from_serialization_failure(Vec::new());
-        assert!(empty_context_injecting.hook_events.is_empty());
-        assert!(!empty_context_injecting.should_stop);
-        assert_eq!(empty_context_injecting.stop_reason, None);
-        assert!(empty_context_injecting.additional_contexts.is_empty());
-
-        let context_injecting = ContextInjectingHookOutcome {
-            hook_events: Vec::new(),
-            should_stop: true,
-            stop_reason: Some("blocked".to_string()),
-            additional_contexts: vec!["context".to_string()],
-        };
-        assert!(context_injecting.hook_events.is_empty());
-        assert!(context_injecting.should_stop);
-        assert_eq!(context_injecting.stop_reason.as_deref(), Some("blocked"));
-        assert_eq!(context_injecting.additional_contexts, vec!["context"]);
-
-        let stateless = StatelessHookOutcome {
-            hook_events: Vec::new(),
-            should_stop: false,
-            stop_reason: None,
-        };
-        assert!(stateless.hook_events.is_empty());
-        assert!(!stateless.should_stop);
-        assert_eq!(stateless.stop_reason, None);
+    fn serialization_failure_preserves_events_and_does_not_stop() {
+        use codex_protocol::protocol::{HookEventName, HookRunStatus, HookSource};
+        use codex_utils_absolute_path::test_support::{PathBufExt, test_path_buf};
+        let events = super::serialization_failure_hook_events(
+            vec![crate::engine::ConfiguredHandler {
+                event_name: HookEventName::SessionStart,
+                matcher: None,
+                command: "echo hook".into(),
+                timeout_sec: 5,
+                status_message: None,
+                source_path: test_path_buf("/tmp/hooks.json").abs(),
+                source: HookSource::User,
+                display_order: 0,
+                env: Default::default(),
+            }],
+            Some("turn-1".into()),
+            "serialization failed".into(),
+        );
+        let expected = events.clone();
+        let outcome = ContextInjectingHookOutcome::from_serialization_failure(events);
+        assert_eq!(outcome.hook_events, expected);
+        assert_eq!(outcome.hook_events[0].run.status, HookRunStatus::Failed);
+        assert_eq!(
+            outcome.hook_events[0].run.entries[0].text,
+            "serialization failed"
+        );
+        assert!(!outcome.should_stop);
+        assert_eq!(outcome.stop_reason, None);
+        assert!(outcome.additional_contexts.is_empty());
     }
 
     #[test]

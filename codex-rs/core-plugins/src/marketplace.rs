@@ -317,7 +317,9 @@ pub fn validate_marketplace_root(root: &Path) -> Result<String, MarketplaceError
             message: "marketplace root does not contain a supported manifest".to_string(),
         });
     };
-    let marketplace = load_marketplace(&path)?;
+    let marketplace = load_raw_marketplace_manifest(&path)?;
+    codex_plugin::validate_plugin_segment(&marketplace.name, "marketplace name")
+        .map_err(MarketplaceError::InvalidPlugin)?;
     Ok(marketplace.name)
 }
 
@@ -369,7 +371,19 @@ fn marketplace_root_from_layout(marketplace_path: &Path, relative_path: &str) ->
 }
 
 pub fn load_marketplace(path: &AbsolutePathBuf) -> Result<Marketplace, MarketplaceError> {
+    load_marketplace_with_declared_names(path).map(|(marketplace, _)| marketplace)
+}
+
+pub(crate) fn load_marketplace_with_declared_names(
+    path: &AbsolutePathBuf,
+) -> Result<(Marketplace, Vec<String>), MarketplaceError> {
     let marketplace = load_raw_marketplace_manifest(path)?;
+    // Refresh deletion decisions require the declared inventory, including unusable sources.
+    let declared_names = marketplace
+        .plugins
+        .iter()
+        .map(|plugin| plugin.name.clone())
+        .collect();
     let mut plugins = Vec::new();
 
     for plugin in marketplace.plugins {
@@ -412,12 +426,15 @@ pub fn load_marketplace(path: &AbsolutePathBuf) -> Result<Marketplace, Marketpla
         });
     }
 
-    Ok(Marketplace {
-        name: marketplace.name,
-        path: path.clone(),
-        interface: resolve_marketplace_interface(marketplace.interface),
-        plugins,
-    })
+    Ok((
+        Marketplace {
+            name: marketplace.name,
+            path: path.clone(),
+            interface: resolve_marketplace_interface(marketplace.interface),
+            plugins,
+        },
+        declared_names,
+    ))
 }
 
 #[doc(hidden)]
@@ -460,18 +477,18 @@ fn discover_marketplace_paths_from_roots(
     }
 
     for root in additional_roots {
-        if let Some(path) = supported_marketplace_manifest_path(root.as_path())
-            && !paths.contains(&path)
-        {
-            paths.push(path);
+        if let Some(path) = supported_marketplace_manifest_path(root.as_path()) {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
             continue;
         }
         // Curated marketplaces can now come from an HTTP-downloaded directory that is not a git
         // checkout, so check the root directly before falling back to repo-root discovery.
-        if let Some(path) = find_marketplace_manifest_path(root.as_path())
-            && !paths.contains(&path)
-        {
-            paths.push(path);
+        if let Some(path) = find_marketplace_manifest_path(root.as_path()) {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
             continue;
         }
         if let Some(repo_root) = get_git_repo_root(root.as_path())

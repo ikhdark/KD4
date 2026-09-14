@@ -16,6 +16,7 @@ pub use apply::apply_git_patch;
 pub use apply::extract_paths_from_patch;
 pub use apply::parse_git_apply_output;
 pub use apply::stage_paths;
+pub use apply::unescape_c_bytes;
 pub use baseline::GitBaselineChange;
 pub use baseline::GitBaselineChangeStatus;
 pub use baseline::GitBaselineDiff;

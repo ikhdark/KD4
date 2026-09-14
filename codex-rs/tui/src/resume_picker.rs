@@ -815,6 +815,7 @@ async fn load_transcript_preview(
         .turns
         .iter()
         .flat_map(|turn| turn.items.iter())
+        .rev()
         .filter_map(|item| match item {
             ThreadItem::UserMessage { content, .. } => Some(TranscriptPreviewLine {
                 speaker: TranscriptPreviewSpeaker::User,
@@ -838,17 +839,18 @@ async fn load_transcript_preview(
         .flat_map(|line| {
             line.text
                 .lines()
+                .rev()
                 .filter(|text| !text.trim().is_empty())
+                .take(MAX_PREVIEW_LINES)
                 .map(move |text| TranscriptPreviewLine {
                     speaker: line.speaker,
                     text: text.trim().to_string(),
                 })
                 .collect::<Vec<_>>()
         })
+        .take(MAX_PREVIEW_LINES)
         .collect::<Vec<_>>();
-    if lines.len() > MAX_PREVIEW_LINES {
-        lines.drain(..lines.len() - MAX_PREVIEW_LINES);
-    }
+    lines.reverse();
     Ok(lines)
 }
 
@@ -885,10 +887,9 @@ enum SeenRowKey {
 
 impl Row {
     fn seen_key(&self) -> Option<SeenRowKey> {
-        if let Some(path) = self.path.clone() {
-            return Some(SeenRowKey::Path(path));
-        }
-        self.thread_id.map(SeenRowKey::Thread)
+        self.thread_id
+            .map(SeenRowKey::Thread)
+            .or_else(|| self.path.clone().map(SeenRowKey::Path))
     }
 
     fn display_preview(&self) -> &str {
@@ -1398,17 +1399,21 @@ impl PickerState {
             self.pagination.reached_scan_cap = true;
         }
 
+        let query = self.query.to_lowercase();
         for row in page.rows {
-            if let Some(seen_key) = row.seen_key() {
-                if self.seen_rows.insert(seen_key) {
-                    self.all_rows.push(row);
-                }
-            } else {
-                self.all_rows.push(row);
+            if row
+                .seen_key()
+                .is_some_and(|key| !self.seen_rows.insert(key))
+            {
+                continue;
             }
+            if self.row_matches_filter(&row) && (query.is_empty() || row.matches_query(&query)) {
+                self.filtered_rows.push(row.clone());
+            }
+            self.all_rows.push(row);
         }
-
-        self.apply_filter();
+        self.ensure_selected_visible();
+        self.request_frame();
     }
 
     fn complete_pending_page_down(&mut self) {
@@ -1546,11 +1551,24 @@ impl PickerState {
         if self.selected < self.scroll_top {
             self.scroll_top = self.selected;
         }
-        while self.rendered_height_between(self.scroll_top, self.selected)
-            > self.available_content_rows(viewport_rows)
-            && self.scroll_top < self.selected
-        {
-            self.scroll_top += 1;
+        let previous_top = self.scroll_top;
+        let lower_indicator = usize::from(
+            self.pagination.next_cursor.is_some() || self.selected + 1 < self.filtered_rows.len(),
+        );
+        let mut used = self.session_row_height(self.selected);
+        self.scroll_top = self.selected;
+        while self.scroll_top > previous_top {
+            let candidate = self.scroll_top - 1;
+            let capacity = viewport_rows
+                .saturating_sub(usize::from(candidate > 0))
+                .saturating_sub(lower_indicator)
+                .max(1);
+            let height = self.session_row_height(candidate) + self.row_separator_height();
+            if used.saturating_add(height) > capacity {
+                break;
+            }
+            used += height;
+            self.scroll_top = candidate;
         }
     }
 
@@ -1561,13 +1579,14 @@ impl PickerState {
         if self.pagination.loading.is_pending() || self.pagination.next_cursor.is_none() {
             return;
         }
-        let rendered_rows = if self.filtered_rows.is_empty() {
-            0
-        } else {
-            self.rendered_height_between(/*start*/ 0, self.filtered_rows.len() - 1)
-        };
-        if rendered_rows >= self.available_content_rows(minimum_rows) {
-            return;
+        let capacity = self.available_content_rows(minimum_rows);
+        let mut used = 0usize;
+        for index in 0..self.filtered_rows.len() {
+            used += self.session_row_height(index)
+                + usize::from(index > 0) * self.row_separator_height();
+            if used >= capacity {
+                return;
+            }
         }
         if let Some(token) = self.search_state.active_token() {
             self.load_more_if_needed(LoadTrigger::Search { token });
@@ -1725,39 +1744,32 @@ impl PickerState {
             return;
         }
         self.expanded_thread_id = Some(thread_id);
-        if let std::collections::hash_map::Entry::Vacant(e) =
-            self.transcript_previews.entry(thread_id)
-        {
-            e.insert(TranscriptPreviewState::Loading);
+        if matches!(
+            self.transcript_previews.get(&thread_id),
+            None | Some(TranscriptPreviewState::Failed)
+        ) {
+            self.transcript_previews
+                .insert(thread_id, TranscriptPreviewState::Loading);
             (self.picker_loader)(PickerLoadRequest::Preview { thread_id });
         }
         self.request_frame();
     }
 
-    fn rendered_height_between(&self, start: usize, end_inclusive: usize) -> usize {
-        self.filtered_rows
-            .get(start..=end_inclusive)
-            .unwrap_or_default()
-            .iter()
-            .enumerate()
-            .map(|(offset, row)| {
-                let row_idx = start + offset;
-                let is_selected = row_idx == self.selected;
-                let is_expanded = is_selected
-                    && row.thread_id.is_some()
-                    && self.expanded_thread_id == row.thread_id;
-                render_session_lines(
-                    row,
-                    self,
-                    is_selected,
-                    is_expanded,
-                    /*is_zebra*/ false,
-                    self.view_width.unwrap_or(u16::MAX),
-                )
-                .len()
-            })
-            .sum::<usize>()
-            + self.row_separator_height() * end_inclusive.saturating_sub(start)
+    fn session_row_height(&self, index: usize) -> usize {
+        let row = &self.filtered_rows[index];
+        let width = self.view_width.unwrap_or(u16::MAX);
+        if index == self.selected
+            && row.thread_id.is_some()
+            && self.expanded_thread_id == row.thread_id
+        {
+            return 1 + render_transcript_preview_lines(row, self, width).len();
+        }
+        match self.density {
+            SessionListDensity::Dense => 1,
+            SessionListDensity::Comfortable => {
+                1 + footer_part_ranges(&session_footer_parts(row, self), width).len()
+            }
+        }
     }
 
     fn has_more_above(&self) -> bool {
@@ -1773,20 +1785,9 @@ impl PickerState {
         }
         let capacity = self.available_content_rows(viewport_height);
         let mut used = 0usize;
-        for (offset, row) in self.filtered_rows[self.scroll_top..].iter().enumerate() {
-            let row_idx = self.scroll_top + offset;
-            let is_selected = row_idx == self.selected;
-            let is_expanded =
-                is_selected && row.thread_id.is_some() && self.expanded_thread_id == row.thread_id;
-            let row_height = render_session_lines(
-                row,
-                self,
-                is_selected,
-                is_expanded,
-                /*is_zebra*/ false,
-                self.view_width.unwrap_or(u16::MAX),
-            )
-            .len();
+        for row_idx in self.scroll_top..self.filtered_rows.len() {
+            let offset = row_idx - self.scroll_top;
+            let row_height = self.session_row_height(row_idx);
             let separator_height = usize::from(offset > 0) * self.row_separator_height();
             if used + separator_height + row_height > capacity {
                 return true;
@@ -2051,7 +2052,7 @@ fn filter_mode_label(filter_mode: SessionFilterMode) -> &'static str {
 }
 
 struct PickerFooterHint {
-    key: &'static str,
+    key: String,
     wide_label: String,
     compact_label: String,
     priority: u8,
@@ -2151,37 +2152,48 @@ fn picker_footer_scroll_percent(state: &PickerState, list_height: u16) -> u8 {
     }
 
     let content_rows = state.available_content_rows(list_height as usize);
-    let total_height =
-        state.rendered_height_between(/*start*/ 0, state.filtered_rows.len() - 1);
-    let max_scroll = total_height.saturating_sub(content_rows);
-    if max_scroll == 0 {
-        return 100;
+    let mut total_height = 0usize;
+    let mut skipped_height = 0usize;
+    for index in 0..state.filtered_rows.len() {
+        total_height += usize::from(index > 0) * state.row_separator_height();
+        if index == state.scroll_top {
+            skipped_height = total_height;
+        }
+        total_height += state.session_row_height(index);
     }
-    let remaining_height =
-        state.rendered_height_between(state.scroll_top, state.filtered_rows.len() - 1);
-    if remaining_height <= content_rows {
+    let max_scroll = total_height.saturating_sub(content_rows);
+    if max_scroll == 0 || total_height.saturating_sub(skipped_height) <= content_rows {
         return 100;
     }
 
-    let skipped_height = if state.scroll_top == 0 {
-        0
-    } else {
-        state.rendered_height_between(/*start*/ 0, state.scroll_top - 1)
-    };
     (((skipped_height.min(max_scroll)) as f32 / max_scroll as f32) * 100.0).round() as u8
+}
+
+fn picker_binding_label(
+    bindings: &[crate::key_hint::KeyBinding],
+    searchable_navigation: bool,
+) -> String {
+    bindings
+        .iter()
+        .find(|binding| {
+            let (code, modifiers) = binding.parts();
+            !searchable_navigation || !is_plain_text_key_event(KeyEvent::new(code, modifiers))
+        })
+        .map(|binding| binding.display_label().replace(" + ", "+"))
+        .unwrap_or_else(|| "unbound".to_string())
 }
 
 fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
     if state.is_transcript_loading() {
         let hints = [
             PickerFooterHint {
-                key: "loading",
+                key: "loading".into(),
                 wide_label: String::from("transcript"),
                 compact_label: String::from("transcript"),
                 priority: 0,
             },
             PickerFooterHint {
-                key: "ctrl+c",
+                key: "ctrl+c".into(),
                 wide_label: String::from("quit"),
                 compact_label: String::from("quit"),
                 priority: 1,
@@ -2217,31 +2229,35 @@ fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
     };
     let first_row_hints = vec![
         PickerFooterHint {
-            key: "enter",
+            key: picker_binding_label(&state.list_keymap.accept, false),
             wide_label: action_label.to_string(),
             compact_label: action_label.to_string(),
             priority: 0,
         },
         PickerFooterHint {
-            key: "esc",
+            key: picker_binding_label(&state.list_keymap.cancel, false),
             wide_label: esc_label.to_string(),
             compact_label: esc_compact_label.to_string(),
             priority: 1,
         },
         PickerFooterHint {
-            key: "ctrl+c",
+            key: "ctrl+c".into(),
             wide_label: ctrl_c_label.to_string(),
             compact_label: ctrl_c_label.to_string(),
             priority: 2,
         },
         PickerFooterHint {
-            key: "tab",
+            key: "tab".into(),
             wide_label: String::from("focus sort/filter"),
             compact_label: String::from("focus"),
             priority: 7,
         },
         PickerFooterHint {
-            key: "←/→",
+            key: format!(
+                "{}/{}",
+                picker_binding_label(&state.list_keymap.move_left, true),
+                picker_binding_label(&state.list_keymap.move_right, true)
+            ),
             wide_label: String::from("change option"),
             compact_label: String::from("option"),
             priority: 8,
@@ -2249,25 +2265,29 @@ fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
     ];
     let second_row_hints = vec![
         PickerFooterHint {
-            key: "ctrl+o",
+            key: "ctrl+o".into(),
             wide_label: density_label.to_string(),
             compact_label: density_compact_label.to_string(),
             priority: 3,
         },
         PickerFooterHint {
-            key: "ctrl+t",
+            key: "ctrl+t".into(),
             wide_label: String::from("transcript"),
             compact_label: String::from("preview"),
             priority: 4,
         },
         PickerFooterHint {
-            key: "ctrl+e",
+            key: "ctrl+e".into(),
             wide_label: String::from("expand"),
             compact_label: String::from("exp"),
             priority: 6,
         },
         PickerFooterHint {
-            key: "↑/↓",
+            key: format!(
+                "{}/{}",
+                picker_binding_label(&state.list_keymap.move_up, true),
+                picker_binding_label(&state.list_keymap.move_down, true)
+            ),
             wide_label: String::from("browse"),
             compact_label: String::from("browse"),
             priority: 5,
@@ -2392,7 +2412,7 @@ fn fit_footer_hint_refs(
         if idx > 0 {
             spans.push(" ".repeat(gap_width).set_style(footer_hint_label_style()));
         }
-        spans.push(hint.key.set_style(footer_hint_key_style()));
+        spans.push(hint.key.clone().set_style(footer_hint_key_style()));
         let label = match mode {
             FooterHintLabelMode::Wide => Some(hint.wide_label.as_str()),
             FooterHintLabelMode::Compact => Some(hint.compact_label.as_str()),
@@ -2441,7 +2461,7 @@ fn footer_hints_width(
                     }
                     FooterHintLabelMode::KeyOnly => 0,
                 };
-                let hint_width = UnicodeWidthStr::width(hint.key) + label_width;
+                let hint_width = UnicodeWidthStr::width(hint.key.as_str()) + label_width;
                 if idx == 0 {
                     hint_width
                 } else {
@@ -2587,23 +2607,7 @@ fn render_comfortable_session_lines(
         return lines;
     }
 
-    let reference = state.relative_time_reference.unwrap_or_else(Utc::now);
-    let created = format_relative_time(reference, row.created_at);
-    let updated = format_relative_time(reference, row.updated_at.or(row.created_at));
-    let branch = row.git_branch.as_deref();
-    let cwd = row
-        .cwd
-        .as_ref()
-        .map(|path| format_directory_display(path, /*max_width*/ None));
-    let footer_lines = render_footer_lines(
-        state.sort_key,
-        &created,
-        &updated,
-        branch,
-        cwd.as_deref(),
-        state.filter_mode == SessionFilterMode::All,
-        width,
-    );
+    let footer_lines = pack_footer_parts(session_footer_parts(row, state), width);
     if let Some(style) = row_style {
         lines.extend(apply_session_row_background(footer_lines, style, width));
     } else {
@@ -2767,6 +2771,25 @@ fn selected_session_title_span(title: String) -> Span<'static> {
     title.set_style(selected_session_style())
 }
 
+fn session_footer_parts(row: &Row, state: &PickerState) -> Vec<FooterPart> {
+    let reference = state.relative_time_reference.unwrap_or_else(Utc::now);
+    let created = format_relative_time(reference, row.created_at);
+    let updated = format_relative_time(reference, row.updated_at.or(row.created_at));
+    let cwd = row
+        .cwd
+        .as_ref()
+        .map(|path| format_directory_display(path, None));
+    make_footer_parts(
+        state.sort_key,
+        &created,
+        &updated,
+        row.git_branch.as_deref(),
+        cwd.as_deref(),
+        state.filter_mode == SessionFilterMode::All,
+    )
+}
+
+#[cfg(test)]
 fn render_footer_lines(
     sort_key: ThreadSortKey,
     created: &str,
@@ -2776,6 +2799,20 @@ fn render_footer_lines(
     show_cwd: bool,
     width: u16,
 ) -> Vec<Line<'static>> {
+    pack_footer_parts(
+        make_footer_parts(sort_key, created, updated, branch, cwd, show_cwd),
+        width,
+    )
+}
+
+fn make_footer_parts(
+    sort_key: ThreadSortKey,
+    created: &str,
+    updated: &str,
+    branch: Option<&str>,
+    cwd: Option<&str>,
+    show_cwd: bool,
+) -> Vec<FooterPart> {
     let date = match sort_key {
         ThreadSortKey::CreatedAt => created,
         ThreadSortKey::UpdatedAt | ThreadSortKey::RecencyAt => updated,
@@ -2785,7 +2822,7 @@ fn render_footer_lines(
         parts.push(FooterPart::Cwd(cwd.map(str::to_string)));
     }
     parts.push(FooterPart::Branch(branch.map(str::to_string)));
-    pack_footer_parts(parts, width)
+    parts
 }
 
 enum FooterPart {
@@ -2814,35 +2851,36 @@ impl FooterPart {
 }
 
 fn pack_footer_parts(parts: Vec<FooterPart>, width: u16) -> Vec<Line<'static>> {
-    let available_width = width as usize;
-    if available_width <= SESSION_META_INDENT_WIDTH {
+    let ranges = footer_part_ranges(&parts, width);
+    let mut parts = parts.into_iter();
+    ranges
+        .into_iter()
+        .map(|range| {
+            footer_line(
+                parts.by_ref().take(range.len()).collect(),
+                width as usize,
+                cwd_column_width(width as usize),
+            )
+        })
+        .collect()
+}
+
+fn footer_part_ranges(parts: &[FooterPart], width: u16) -> Vec<std::ops::Range<usize>> {
+    let available = usize::from(width);
+    if available <= SESSION_META_INDENT_WIDTH || parts.is_empty() {
         return Vec::new();
     }
-    let cwd_width = cwd_column_width(available_width);
-    let all_parts_width = footer_parts_width(&parts, cwd_width);
-    if all_parts_width <= available_width {
-        return vec![footer_line(parts, available_width, cwd_width)];
-    }
-
-    let mut lines = Vec::with_capacity(parts.len());
-    let mut current_parts = Vec::new();
-    for part in parts {
-        let mut candidate_parts = std::mem::take(&mut current_parts);
-        candidate_parts.push(part);
-        if candidate_parts.len() > 1
-            && footer_parts_width(&candidate_parts, cwd_width) > available_width
-        {
-            let previous_parts = candidate_parts
-                .drain(..candidate_parts.len().saturating_sub(1))
-                .collect();
-            lines.push(footer_line(previous_parts, available_width, cwd_width));
+    let cwd_width = cwd_column_width(available);
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    for end in 1..parts.len() {
+        if footer_parts_width(&parts[start..=end], cwd_width) > available {
+            ranges.push(start..end);
+            start = end;
         }
-        current_parts = candidate_parts;
     }
-    if !current_parts.is_empty() {
-        lines.push(footer_line(current_parts, available_width, cwd_width));
-    }
-    lines
+    ranges.push(start..parts.len());
+    ranges
 }
 
 fn cwd_column_width(width: usize) -> usize {
@@ -2858,7 +2896,9 @@ fn footer_parts_width(parts: &[FooterPart], cwd_width: usize) -> usize {
         .enumerate()
         .map(|(idx, part)| footer_part_width(part, idx + 1 < parts.len(), cwd_width))
         .sum();
-    SESSION_META_INDENT_WIDTH + content_width
+    SESSION_META_INDENT_WIDTH
+        + content_width
+        + SESSION_META_FIELD_GAP_WIDTH * parts.len().saturating_sub(1)
 }
 
 fn footer_part_width(part: &FooterPart, padded: bool, cwd_width: usize) -> usize {
@@ -3418,6 +3458,174 @@ mod tests {
             .map(str::trim_end)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[tokio::test]
+    async fn jumping_to_end_keeps_only_fitting_rows_above_selection() {
+        let mut state = PickerState::new(
+            FrameRequester::test_dummy(),
+            page_only_loader(|_| {}),
+            ProviderFilter::Any,
+            true,
+            None,
+            SessionPickerAction::Resume,
+        );
+        state.density = SessionListDensity::Dense;
+        state.filtered_rows = (0..10_000)
+            .map(|index| make_row(&format!("{index}.jsonl"), "2026-05-02T12:00:00Z", "session"))
+            .collect();
+        state.update_viewport(5, 40);
+        state
+            .handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(state.selected, 9_999);
+        assert_eq!(state.scroll_top, 9_996);
+    }
+
+    #[test]
+    fn measured_row_heights_match_rendering_at_footer_wrap_boundaries() {
+        let mut state = PickerState::new(
+            FrameRequester::test_dummy(),
+            page_only_loader(|_| {}),
+            ProviderFilter::Any,
+            true,
+            None,
+            SessionPickerAction::Resume,
+        );
+        let mut row = make_row("session.jsonl", "2026-05-02T12:00:00Z", "session");
+        row.git_branch = Some("a-long-branch-name".to_string());
+        row.cwd = Some(PathBuf::from("/workspace/project"));
+        state.filtered_rows = vec![row];
+        for density in [SessionListDensity::Dense, SessionListDensity::Comfortable] {
+            state.density = density;
+            for width in [1, 20, 44, 80] {
+                state.view_width = Some(width);
+                let rendered = render_session_lines(
+                    &state.filtered_rows[0],
+                    &state,
+                    true,
+                    false,
+                    false,
+                    width,
+                );
+                assert_eq!(state.session_row_height(0), rendered.len(), "width {width}");
+            }
+        }
+    }
+
+    #[test]
+    fn footer_wrap_accounts_for_the_gap_between_fields() {
+        let render = |width| {
+            render_footer_lines(
+                ThreadSortKey::UpdatedAt,
+                "5h ago",
+                "3h ago",
+                Some("branch"),
+                None,
+                false,
+                width,
+            )
+        };
+        let narrow = render(22);
+        assert_eq!(narrow.len(), 2);
+        assert_eq!(narrow[0].to_string(), "  3h ago");
+        assert_eq!(narrow[1].to_string(), "   branch");
+        let wide = render(24);
+        assert_eq!(wide.len(), 1);
+        assert_eq!(wide[0].width(), 24);
+        assert!(wide[0].to_string().ends_with(" branch"));
+    }
+
+    #[test]
+    fn appended_pages_filter_new_rows_and_deduplicate_by_thread_id() {
+        let mut state = PickerState::new(
+            FrameRequester::test_dummy(),
+            page_only_loader(|_| {}),
+            ProviderFilter::Any,
+            true,
+            None,
+            SessionPickerAction::Resume,
+        );
+        state.query = "needle".to_string();
+        let mut row = make_row("old-path.jsonl", "2026-05-02T12:00:00Z", "needle");
+        row.thread_id = Some(ThreadId::new());
+        let mut relocated = row.clone();
+        relocated.path = Some(PathBuf::from("new-path.jsonl"));
+        for rows in [
+            vec![row],
+            vec![
+                relocated,
+                make_row("other.jsonl", "2026-05-02T12:00:00Z", "other"),
+            ],
+        ] {
+            state.ingest_page(PickerPage {
+                rows,
+                next_cursor: None,
+                num_scanned_files: 1,
+                reached_scan_cap: false,
+            });
+        }
+        assert_eq!(state.all_rows.len(), 2);
+        assert_eq!(state.filtered_rows.len(), 1);
+        assert_eq!(state.filtered_rows[0].preview, "needle");
+    }
+
+    #[tokio::test]
+    async fn reopening_a_failed_preview_requests_it_again() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let loader: PickerLoader = Arc::new(move |request| {
+            if let PickerLoadRequest::Preview { thread_id } = request {
+                captured.lock().unwrap().push(thread_id);
+            }
+        });
+        let mut state = PickerState::new(
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::Any,
+            true,
+            None,
+            SessionPickerAction::Resume,
+        );
+        let mut row = make_row("session.jsonl", "2026-05-02T12:00:00Z", "session");
+        let id = ThreadId::new();
+        row.thread_id = Some(id);
+        state.filtered_rows.push(row);
+        let key = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        state.handle_key(key).await.unwrap();
+        state
+            .transcript_previews
+            .insert(id, TranscriptPreviewState::Failed);
+        state.handle_key(key).await.unwrap();
+        state.handle_key(key).await.unwrap();
+        assert_eq!(*requests.lock().unwrap(), vec![id, id]);
+        assert!(matches!(
+            state.transcript_previews.get(&id),
+            Some(TranscriptPreviewState::Loading)
+        ));
+    }
+
+    #[test]
+    fn footer_hints_show_active_searchable_bindings() {
+        let mut state = PickerState::new(
+            FrameRequester::test_dummy(),
+            page_only_loader(|_| {}),
+            ProviderFilter::Any,
+            true,
+            None,
+            SessionPickerAction::Resume,
+        );
+        state.list_keymap.move_up = vec![
+            crate::key_hint::plain(KeyCode::Char('k')),
+            crate::key_hint::ctrl(KeyCode::Char('p')),
+        ];
+        state.list_keymap.move_down = vec![crate::key_hint::ctrl(KeyCode::Char('n'))];
+        state.list_keymap.accept = vec![crate::key_hint::plain(KeyCode::F(2))];
+        let text = footer_lines_text(&state, 200);
+        assert!(text.contains("ctrl+p/ctrl+n"), "{text}");
+        assert!(text.contains("f2 resume"), "{text}");
+        assert!(!text.contains("enter"), "{text}");
     }
 
     #[test]
@@ -4995,6 +5203,10 @@ session_picker_view = "dense"
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Assert the independent expected RGB value for the explicit true-color test terminal"
+    )]
     fn dense_zebra_summary_line_uses_full_width_background() {
         crate::terminal_palette::with_test_terminal_colors(
             (0, 0, 0),
@@ -5018,6 +5230,10 @@ session_picker_view = "dense"
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Assert the independent expected RGB value for the explicit true-color test terminal"
+    )]
     fn comfortable_zebra_lines_use_full_width_background() {
         crate::terminal_palette::with_test_terminal_colors(
             (0, 0, 0),

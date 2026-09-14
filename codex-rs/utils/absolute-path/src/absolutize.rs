@@ -24,6 +24,13 @@ pub(super) fn absolutize_from(path: &Path, base_path: &Path) -> PathBuf {
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
+    // Verbatim components (including dots and trailing spaces) have different
+    // filesystem semantics. Safe prefixes were already simplified by dunce.
+    #[cfg(windows)]
+    if matches!(path.components().next(), Some(Component::Prefix(prefix)) if prefix.kind().is_verbatim())
+    {
+        return path.to_path_buf();
+    }
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -44,7 +51,7 @@ fn normalize_path(path: &Path) -> PathBuf {
     }
 }
 
-fn path_with_base(path: &Path, base_path: &Path) -> PathBuf {
+pub(super) fn path_with_base(path: &Path, base_path: &Path) -> PathBuf {
     if path.is_absolute() || path.has_root() {
         return base_path.join(path);
     }
@@ -73,7 +80,7 @@ fn path_with_base(path: &Path, base_path: &Path) -> PathBuf {
     path
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;

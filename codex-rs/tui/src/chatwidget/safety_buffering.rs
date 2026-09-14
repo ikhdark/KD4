@@ -13,14 +13,14 @@ const SAFETY_BUFFERING_MESSAGE_WITH_RETRY: &str = "Hang tight or retry with a fa
 #[derive(Debug)]
 struct ActiveSafetyBuffering {
     turn_id: String,
-    last_prompt_had_retry: bool,
-    agent_message_started: bool,
+    last_prompt_retry_model: Option<String>,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct SafetyBufferingState {
     submitted_turn: Option<(String, AppCommand)>,
     active: Option<ActiveSafetyBuffering>,
+    agent_message_started: bool,
 }
 
 impl ChatWidget {
@@ -32,6 +32,7 @@ impl ChatWidget {
         self.bottom_pane
             .dismiss_view_by_id(SAFETY_BUFFERING_PROMPT_VIEW_ID);
         self.safety_buffering.active = None;
+        self.safety_buffering.agent_message_started = false;
     }
 
     pub(crate) fn clear_safety_buffering(&mut self) {
@@ -41,25 +42,21 @@ impl ChatWidget {
     }
 
     pub(super) fn mark_safety_buffering_agent_message_started(&mut self) {
-        if let Some(active) = self.safety_buffering.active.as_mut() {
-            active.agent_message_started = true;
-        }
+        self.safety_buffering.agent_message_started = true;
     }
 
     pub(super) fn safety_buffering_is_waiting(&self) -> bool {
-        self.safety_buffering
-            .active
-            .as_ref()
-            .is_some_and(|active| !active.agent_message_started)
+        self.safety_buffering.active.is_some() && !self.safety_buffering.agent_message_started
     }
 
     pub(crate) fn can_retry_safety_buffered_turn(&self, turn_id: &str) -> bool {
         self.turn_lifecycle.agent_turn_running
+            && !self.safety_buffering.agent_message_started
             && self
                 .safety_buffering
                 .active
                 .as_ref()
-                .is_some_and(|active| active.turn_id == turn_id && !active.agent_message_started)
+                .is_some_and(|active| active.turn_id == turn_id)
     }
 
     pub(crate) fn prepare_safety_buffering_retry(&mut self) {
@@ -112,27 +109,30 @@ impl ChatWidget {
             return;
         }
 
-        let retry_turn = self
-            .safety_buffering
-            .submitted_turn
-            .as_ref()
-            .filter(|(submitted_turn_id, _)| replay_kind.is_none() && submitted_turn_id == &turn_id)
-            .map(|(_, turn)| turn.clone());
+        if self.safety_buffering.agent_message_started {
+            return;
+        }
+
+        let has_retry_turn =
+            self.safety_buffering
+                .submitted_turn
+                .as_ref()
+                .is_some_and(|(submitted_turn_id, _)| {
+                    replay_kind.is_none() && submitted_turn_id == &turn_id
+                });
         let thread_id = self.thread_id;
-        let can_offer_retry = faster_model.is_some() && retry_turn.is_some() && thread_id.is_some();
+        let retry_model = faster_model.filter(|_| has_retry_turn && thread_id.is_some());
+        let can_offer_retry = retry_model.is_some();
         let previous_active = self
             .safety_buffering
             .active
             .as_ref()
             .filter(|active| active.turn_id == turn_id);
         let should_show_prompt =
-            previous_active.is_none_or(|active| active.last_prompt_had_retry != can_offer_retry);
-        let agent_message_started =
-            previous_active.is_some_and(|active| active.agent_message_started);
+            previous_active.is_none_or(|active| active.last_prompt_retry_model != retry_model);
         self.safety_buffering.active = Some(ActiveSafetyBuffering {
             turn_id: turn_id.clone(),
-            last_prompt_had_retry: can_offer_retry,
-            agent_message_started,
+            last_prompt_retry_model: retry_model.clone(),
         });
 
         let status_details = if can_offer_retry {
@@ -165,9 +165,12 @@ impl ChatWidget {
         }
         let header = ColumnRenderable::with(header);
         let mut items = Vec::new();
-        if let (Some(faster_model), Some(turn), Some(thread_id)) =
-            (faster_model, retry_turn, thread_id)
-        {
+        if let (Some(faster_model), Some((_, turn)), Some(thread_id)) = (
+            retry_model,
+            self.safety_buffering.submitted_turn.as_ref(),
+            thread_id,
+        ) {
+            let turn = turn.clone();
             items.push(SelectionItem {
                 name: "Retry with a faster model".to_string(),
                 actions: vec![Box::new(move |tx| {

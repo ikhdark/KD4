@@ -21,7 +21,7 @@ impl ChatWidget {
         }
     }
 
-    fn submit_shell_command(&mut self, command: &str) -> QueueDrain {
+    fn submit_shell_command(&mut self, command: &str) -> Result<QueueDrain, ()> {
         let cmd = command.trim();
         if cmd.is_empty() {
             self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
@@ -30,10 +30,11 @@ impl ChatWidget {
                     Some(USER_SHELL_COMMAND_HELP_HINT.to_string()),
                 ),
             )));
-            QueueDrain::Continue
+            Ok(QueueDrain::Continue)
         } else {
-            self.submit_op(AppCommand::run_user_shell_command(cmd.to_string()));
-            QueueDrain::Stop
+            self.submit_op(AppCommand::run_user_shell_command(cmd.to_string()))
+                .then_some(QueueDrain::Stop)
+                .ok_or(())
         }
     }
 
@@ -41,19 +42,25 @@ impl ChatWidget {
         &mut self,
         command: &str,
         history_text: &str,
-    ) -> QueueDrain {
-        let drain = self.submit_shell_command(command);
+    ) -> Result<QueueDrain, ()> {
+        let drain = self.submit_shell_command(command)?;
         if drain == QueueDrain::Stop {
             self.append_message_history_entry(history_text.to_string());
         }
-        drain
+        Ok(drain)
     }
 
     pub(super) fn submit_queued_shell_prompt(&mut self, user_message: UserMessage) -> QueueDrain {
         match user_message.text.strip_prefix('!') {
             Some(command) => {
                 let history_text = user_message.text.clone();
-                self.submit_shell_command_with_history(command, &history_text)
+                match self.submit_shell_command_with_history(command, &history_text) {
+                    Ok(drain) => drain,
+                    Err(()) => {
+                        self.restore_user_message_to_composer(user_message);
+                        QueueDrain::Stop
+                    }
+                }
             }
             None => {
                 self.submit_user_message(user_message);
@@ -78,6 +85,7 @@ impl ChatWidget {
             user_message,
             history_record,
             ShellEscapePolicy::Allow,
+            false,
         )
         .0
     }
@@ -91,21 +99,26 @@ impl ChatWidget {
             user_message,
             UserMessageHistoryRecord::UserMessageText,
             shell_escape_policy,
+            true,
         )
         .1
     }
 
-    fn submit_user_message_with_history_and_shell_escape_policy(
+    pub(super) fn submit_user_message_with_history_and_shell_escape_policy(
         &mut self,
         user_message: UserMessage,
         history_record: UserMessageHistoryRecord,
         shell_escape_policy: ShellEscapePolicy,
+        retain_command: bool,
     ) -> (bool, Option<AppCommand>) {
         if !self.is_session_configured() {
             tracing::warn!("cannot submit user message before session is configured; queueing");
             self.input_queue
                 .queued_user_messages
-                .push_front(QueuedUserMessage::from(user_message));
+                .push_front(QueuedUserMessage {
+                    shell_escape_policy,
+                    ..QueuedUserMessage::from(user_message)
+                });
             self.input_queue
                 .queued_user_message_history_records
                 .push_front(history_record);
@@ -153,12 +166,43 @@ impl ChatWidget {
             && let Some(stripped) = text.strip_prefix('!')
         {
             let app_command = match self.submit_shell_command_with_history(stripped, &text) {
-                QueueDrain::Continue => None,
-                QueueDrain::Stop => Some(AppCommand::run_user_shell_command(
+                Ok(QueueDrain::Continue) => None,
+                Ok(QueueDrain::Stop) => Some(AppCommand::run_user_shell_command(
                     stripped.trim().to_string(),
                 )),
+                Err(()) => {
+                    self.restore_user_message_to_composer(user_message_for_restore(
+                        UserMessage {
+                            text,
+                            local_images,
+                            remote_image_urls,
+                            text_elements,
+                            mention_bindings,
+                        },
+                        &history_record,
+                    ));
+                    return (false, None);
+                }
             };
             return (app_command.is_some(), app_command);
+        }
+
+        let effective_mode = self.effective_collaboration_mode();
+        if effective_mode.model().trim().is_empty() {
+            self.add_error_message(
+                "Thread model is unavailable. Wait for the thread to finish syncing or choose a model before sending input.".to_string(),
+            );
+            self.restore_user_message_to_composer(user_message_for_restore(
+                UserMessage {
+                    text,
+                    local_images,
+                    remote_image_urls,
+                    text_elements,
+                    mention_bindings,
+                },
+                &history_record,
+            ));
+            return (false, None);
         }
 
         for image_url in &remote_image_urls {
@@ -296,24 +340,6 @@ impl ChatWidget {
             }
         }
 
-        let effective_mode = self.effective_collaboration_mode();
-        if effective_mode.model().trim().is_empty() {
-            self.add_error_message(
-                "Thread model is unavailable. Wait for the thread to finish syncing or choose a model before sending input.".to_string(),
-            );
-            self.restore_user_message_to_composer(user_message_for_restore(
-                UserMessage {
-                    text,
-                    local_images,
-                    remote_image_urls,
-                    text_elements,
-                    mention_bindings,
-                },
-                &history_record,
-            ));
-            return (false, None);
-        }
-
         self.maybe_apply_ide_context(&mut items);
 
         let collaboration_mode = if self.collaboration_modes_enabled() {
@@ -355,7 +381,18 @@ impl ChatWidget {
             personality,
         );
 
-        if !self.submit_op(op.clone()) {
+        let retained_op = retain_command.then(|| op.clone());
+        if !self.submit_op(op) {
+            self.restore_user_message_to_composer(user_message_for_restore(
+                UserMessage {
+                    text,
+                    local_images,
+                    remote_image_urls,
+                    text_elements,
+                    mention_bindings,
+                },
+                &history_record,
+            ));
             return (false, None);
         }
         if render_in_history {
@@ -413,7 +450,7 @@ impl ChatWidget {
         }
 
         self.transcript.needs_final_message_separator = false;
-        (true, Some(op))
+        (true, retained_op)
     }
 
     /// Restore the blocked submission draft without losing mention resolution state.

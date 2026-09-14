@@ -28,6 +28,7 @@ use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ToolExposure;
 use codex_tools::default_namespace_description;
 use http::HeaderMap;
+use std::sync::LazyLock;
 use url::Url;
 
 use crate::history::recent_input;
@@ -52,24 +53,27 @@ impl ToolExecutor<ToolCall> for WebSearchTool {
     }
 
     fn spec(&self) -> ToolSpec {
-        // parse schema without compaction that removes field metadata/descriptions to match hosted tool definition
-        let parameters = match parse_tool_input_schema_without_compaction(&commands_schema()) {
-            Ok(parameters) => parameters,
-            Err(err) => panic!("search command schema should parse: {err}"),
-        };
+        static SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+            // parse schema without compaction that removes field metadata/descriptions to match hosted tool definition
+            let parameters = match parse_tool_input_schema_without_compaction(&commands_schema()) {
+                Ok(parameters) => parameters,
+                Err(err) => panic!("search command schema should parse: {err}"),
+            };
 
-        ToolSpec::Namespace(ResponsesApiNamespace {
-            name: WEB_NAMESPACE.to_string(),
-            description: default_namespace_description(WEB_NAMESPACE),
-            tools: vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
-                name: RUN_TOOL_NAME.to_string(),
-                description: WEB_RUN_DESCRIPTION.to_string(),
-                strict: false,
-                parameters,
-                output_schema: None,
-                defer_loading: None,
-            })],
-        })
+            ToolSpec::Namespace(ResponsesApiNamespace {
+                name: WEB_NAMESPACE.to_string(),
+                description: default_namespace_description(WEB_NAMESPACE),
+                tools: vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+                    name: RUN_TOOL_NAME.to_string(),
+                    description: WEB_RUN_DESCRIPTION.to_string(),
+                    strict: false,
+                    parameters,
+                    output_schema: None,
+                    defer_loading: None,
+                })],
+            })
+        });
+        SPEC.clone()
     }
 
     fn exposure(&self) -> ToolExposure {
@@ -221,9 +225,8 @@ fn command_action(commands: &SearchCommands) -> WebSearchAction {
                 .open
                 .as_deref()
                 .and_then(|operations| operations.first())
-                .and_then(|operation| {
-                    literal_url(&operation.ref_id)
-                        .map(|url| WebSearchAction::OpenPage { url: Some(url) })
+                .map(|operation| WebSearchAction::OpenPage {
+                    url: literal_url(&operation.ref_id),
                 })
         })
         .or_else(|| {
@@ -304,7 +307,7 @@ mod tests {
             ),
             (
                 r#"{"open":[{"ref_id":"turn0search0"}]}"#,
-                WebSearchAction::Other,
+                WebSearchAction::OpenPage { url: None },
             ),
         ];
 

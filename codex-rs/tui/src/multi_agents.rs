@@ -178,6 +178,32 @@ pub(crate) fn tool_call_history_cell(
         .and_then(|id| parse_thread_id(id));
     let prompt = prompt.as_deref().unwrap_or_default();
 
+    if matches!(status, CollabAgentToolCallStatus::Failed) && !matches!(tool, CollabAgentTool::Wait)
+    {
+        let failure = match tool {
+            CollabAgentTool::SpawnAgent => "Agent spawn failed",
+            CollabAgentTool::SendInput => "Sending input failed",
+            CollabAgentTool::ResumeAgent => "Agent resume failed",
+            CollabAgentTool::CloseAgent => "Closing agent failed",
+            CollabAgentTool::Wait => unreachable!(),
+        };
+        let title = if let Some(receiver) = first_receiver {
+            title_with_agent(
+                failure,
+                agent_label(receiver, &agent_metadata(receiver)),
+                None,
+            )
+        } else {
+            title_text(failure)
+        };
+        let details = first_agent_state(receiver_thread_ids, agents_states)
+            .and_then(|state| state.message.as_deref())
+            .map(|message| Line::from(error_summary_spans(message)))
+            .into_iter()
+            .collect();
+        return Some(collab_event(title, details));
+    }
+
     match tool {
         CollabAgentTool::SpawnAgent => {
             if matches!(status, CollabAgentToolCallStatus::InProgress) {
@@ -564,14 +590,8 @@ fn first_agent_state<'a>(
     agents_states: &'a std::collections::HashMap<String, CollabAgentState>,
 ) -> Option<&'a CollabAgentState> {
     receiver_thread_ids
-        .iter()
-        .find_map(|thread_id| agents_states.get(thread_id))
-        .or_else(|| {
-            agents_states
-                .iter()
-                .min_by(|left, right| left.0.cmp(right.0))
-                .map(|(_, status)| status)
-        })
+        .first()
+        .and_then(|thread_id| agents_states.get(thread_id))
 }
 
 fn status_summary_line(status: Option<&CollabAgentState>, fallback_error: &str) -> Line<'static> {
@@ -591,10 +611,8 @@ fn status_summary_spans(status: &CollabAgentState) -> Vec<Span<'static>> {
         CollabAgentStatus::Completed => {
             let mut spans = vec![Span::from("Completed").green()];
             if let Some(message) = status.message.as_ref() {
-                let message_preview = truncate_text(
-                    &message.split_whitespace().collect::<Vec<_>>().join(" "),
-                    COLLAB_AGENT_RESPONSE_PREVIEW_GRAPHEMES,
-                );
+                let message_preview =
+                    normalized_preview(message, COLLAB_AGENT_RESPONSE_PREVIEW_GRAPHEMES);
                 if !message_preview.is_empty() {
                     spans.push(Span::from(" - ").dim());
                     spans.push(Span::from(message_preview));
@@ -610,12 +628,34 @@ fn status_summary_spans(status: &CollabAgentState) -> Vec<Span<'static>> {
     }
 }
 
+fn normalized_preview(text: &str, max_graphemes: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut preview = String::new();
+    let mut pending_space = false;
+    for grapheme in text.graphemes(true) {
+        for ch in grapheme.chars() {
+            if ch.is_whitespace() {
+                pending_space = !preview.is_empty();
+            } else {
+                if pending_space {
+                    preview.push(' ');
+                    pending_space = false;
+                }
+                preview.push(ch);
+            }
+        }
+        // The bounded prefix includes one complete lookahead grapheme so ellipsis
+        // decisions use the same boundary as truncate_text, including combining marks.
+        if preview.graphemes(true).count() > max_graphemes {
+            break;
+        }
+    }
+    truncate_text(&preview, max_graphemes)
+}
+
 fn error_summary_spans(error: &str) -> Vec<Span<'static>> {
     let mut spans = vec![Span::from("Error").red()];
-    let error_preview = truncate_text(
-        &error.split_whitespace().collect::<Vec<_>>().join(" "),
-        COLLAB_AGENT_ERROR_PREVIEW_GRAPHEMES,
-    );
+    let error_preview = normalized_preview(error, COLLAB_AGENT_ERROR_PREVIEW_GRAPHEMES);
     if !error_preview.is_empty() {
         spans.push(Span::from(" - ").dim());
         spans.push(Span::from(error_preview));
@@ -881,5 +921,70 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<Vec<_>>()
             .join("")
+    }
+    #[test]
+    fn failed_calls_with_receivers_never_render_success() {
+        let receiver = "00000000-0000-0000-0000-000000000002";
+        for (tool, expected) in [
+            (CollabAgentTool::SpawnAgent, "Agent spawn failed"),
+            (CollabAgentTool::SendInput, "Sending input failed"),
+            (CollabAgentTool::ResumeAgent, "Agent resume failed"),
+            (CollabAgentTool::CloseAgent, "Closing agent failed"),
+        ] {
+            let item = ThreadItem::CollabAgentToolCall {
+                id: "failed".into(),
+                tool,
+                status: CollabAgentToolCallStatus::Failed,
+                sender_thread_id: "00000000-0000-0000-0000-000000000001".into(),
+                receiver_thread_ids: vec![receiver.into()],
+                prompt: None,
+                model: None,
+                reasoning_effort: None,
+                agents_states: HashMap::from([(
+                    receiver.into(),
+                    agent_state(CollabAgentStatus::Errored, Some("denied")),
+                )]),
+            };
+            let cell = tool_call_history_cell(&item, None, |_| AgentMetadata::default())
+                .expect("failure row");
+            let lines = cell.display_lines(120);
+            assert!(lines[0].to_string().contains(expected));
+            assert!(lines.iter().any(|line| line.to_string().contains("denied")));
+        }
+    }
+
+    #[test]
+    fn resume_state_is_bound_to_first_receiver() {
+        let states = HashMap::from([(
+            "other".to_string(),
+            agent_state(CollabAgentStatus::Running, None),
+        )]);
+        assert_eq!(
+            first_agent_state(&["missing".into(), "other".into()], &states),
+            None
+        );
+        assert_eq!(
+            first_agent_state(&["other".into()], &states),
+            states.get("other")
+        );
+    }
+
+    #[test]
+    fn normalized_previews_preserve_whitespace_and_grapheme_contract() {
+        for input in [
+            "  hello\nworld ",
+            "👩‍💻 e\u{301} xyz",
+            "\r\n",
+            "one two three four five",
+        ] {
+            for limit in [1, 3, 8, 240] {
+                let expected = truncate_text(
+                    &input.split_whitespace().collect::<Vec<_>>().join(" "),
+                    limit,
+                );
+                assert_eq!(normalized_preview(input, limit), expected);
+            }
+        }
+        assert_eq!(normalized_preview(&"x".repeat(100000), 8), "xxxxx...");
     }
 }

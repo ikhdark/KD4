@@ -35,7 +35,7 @@ fn convert_apply_patch_maps_add_variant() {
     assert_eq!(
         got.get(path.as_path()),
         Some(&FileChange::Add {
-            content: "hello".to_string()
+            content: "hello\n".to_string()
         })
     );
 }

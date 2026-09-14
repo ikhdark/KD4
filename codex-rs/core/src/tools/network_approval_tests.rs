@@ -813,7 +813,7 @@ fn dropped_network_registration_is_unregistered_without_explicit_finish() -> any
             )
             .await?;
         let spec = |mode| NetworkApprovalSpec {
-            network: Some(proxy_owner.proxy().clone()),
+            network: Some(proxy_owner.proxy()),
             mode,
             trigger: GuardianNetworkAccessTrigger {
                 call_id: "drop-registration".to_string(),
@@ -1013,7 +1013,7 @@ async fn http_network_approval_preserves_foreign_environment_cwd_uri() -> anyhow
         env: std::collections::HashMap::new(),
         exec_server_env_config: None,
         explicit_env_overrides: std::collections::HashMap::new(),
-        network: Some(proxy_owner.proxy().clone()),
+        network: Some(proxy_owner.proxy()),
         tty: false,
         sandbox_permissions: SandboxPermissions::UseDefault,
         additional_permissions: None,

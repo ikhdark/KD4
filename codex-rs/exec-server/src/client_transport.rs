@@ -195,7 +195,7 @@ impl ExecServerClient {
         let websocket_url = args.websocket_url.clone();
         let connect_timeout = args.connect_timeout;
         let (stream, _) = timeout(connect_timeout, async {
-            let connector = websocket_connector_with_custom_ca().await?;
+            let connector = websocket_connector_with_custom_ca(&websocket_url).await?;
             connect_async_tls_with_config(
                 websocket_url.as_str(),
                 /*config*/ None,
@@ -282,7 +282,7 @@ impl ExecServerClient {
             .headers_mut()
             .extend(current_trace_context_headers());
         let (stream, _) = timeout(connect_timeout, async {
-            let connector = websocket_connector_with_custom_ca().await?;
+            let connector = websocket_connector_with_custom_ca(&websocket_url).await?;
             connect_async_tls_with_config(
                 request,
                 Some(noise_relay_websocket_config()),
@@ -361,8 +361,13 @@ impl ExecServerClient {
     }
 }
 
-pub(crate) async fn websocket_connector_with_custom_ca()
--> Result<Option<Connector>, tokio_tungstenite::tungstenite::Error> {
+pub(crate) async fn websocket_connector_with_custom_ca(
+    websocket_url: &str,
+) -> Result<Option<Connector>, tokio_tungstenite::tungstenite::Error> {
+    let request = websocket_url.into_client_request()?;
+    if request.uri().scheme_str() != Some("wss") {
+        return Ok(None);
+    }
     tokio::task::spawn_blocking(|| {
         maybe_build_rustls_client_config_with_custom_ca()
             .map(|config| config.map(Connector::Rustls))

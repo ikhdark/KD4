@@ -3784,11 +3784,11 @@ fn cargo_workspace_graph_with_manifest_cache(
         let manifest = cached_cargo_manifest(&manifest_path, manifest_cache, read_manifest);
         if let Some(manifest) = manifest {
             pending.extend(cargo_manifest_path_dependencies(&manifest, &directory));
-            if let Some(name) = cargo_manifest_package_name(&manifest) {
-                if graph.packages.insert(name, directory.clone()).is_some() {
-                    // Distinct manifests cannot establish one unambiguous package identity.
-                    graph.complete = false;
-                }
+            if let Some(name) = cargo_manifest_package_name(&manifest)
+                && graph.packages.insert(name, directory.clone()).is_some()
+            {
+                // Distinct manifests cannot establish one unambiguous package identity.
+                graph.complete = false;
             }
             graph.manifests.insert(directory.clone(), manifest);
         }
@@ -3951,15 +3951,14 @@ fn collect_cargo_package_dependencies(
                 .get("path")
                 .and_then(toml::Value::as_str)
                 .map(|path| dependency_root.join(path));
-            if let Some(local_root) = local_root {
-                if !collect_cargo_package_dependencies(
+            if let Some(local_root) = local_root
+                && !collect_cargo_package_dependencies(
                     &local_root,
                     workspace_graph,
                     visited,
                     dependencies,
                 ) {
                     return false;
-                }
             }
         }
     }

@@ -581,7 +581,7 @@ def _audit_decision(report: dict[str, Any]) -> dict[str, Any]:
         "instruction": (
             "Stop rollout inspection and answer from this report."
             if ready
-            else "Continue only to resolve the listed blockers."
+            else "Answer from the valid evidence and state unresolved blockers. Reinspect only when an identified missing or changed input can resolve a blocker; otherwise report the limitation."
         ),
     }
 
@@ -871,9 +871,7 @@ def _diagnostic_token_report(aggregates: Iterable[dict[str, Any]]) -> dict[str, 
     totals["nonCachedInputTokens"] = max(
         0, totals["inputTokens"] - totals["cachedInputTokens"]
     )
-    totals["observedBillableTokens"] = (
-        totals["nonCachedInputTokens"] + totals["outputTokens"]
-    )
+    totals["observedBillableTokens"] = totals["inputTokens"] + totals["outputTokens"]
     return dict(totals)
 
 
@@ -965,6 +963,7 @@ def _apply_detailed_tool_timing(
         nested_process_calls = nested_by_parent.get(call_key)
         process_calls = nested_process_calls or [call]
         process_runtime_ns = 0
+        intervals: list[tuple[int, int]] = []
         reported_child_calls = 0
         for process_call in process_calls:
             process_spawned_at = process_call.get("processSpawnedAtMs")
@@ -978,21 +977,32 @@ def _apply_detailed_tool_timing(
                 max(0, process_exited_at - process_spawned_at) * 1_000_000
             )
             reported_child_calls += 1
+            start = max(accepted_at, process_spawned_at)
+            end = min(model_visible_at, process_exited_at)
+            if end > start:
+                intervals.append((start, end))
         if reported_child_calls == 0:
             stats["matchedWithoutCompleteTiming"] += 1
             return
 
         round_trip_ns = max(0, model_visible_at - accepted_at) * 1_000_000
-        orchestration_gap_ns = max(0, round_trip_ns - process_runtime_ns)
+        covered_ms = 0
+        covered_end = accepted_at
+        for start, end in sorted(intervals):
+            covered_ms += max(0, end - max(start, covered_end))
+            covered_end = max(covered_end, end)
+        orchestration_gap_ns = max(0, round_trip_ns - covered_ms * 1_000_000)
+        complete = reported_child_calls == len(process_calls)
         record.update(
             {
                 "roundTripNs": round_trip_ns,
                 "reportedChildCalls": reported_child_calls,
                 "reportedChildWorkNs": process_runtime_ns,
-                "orchestrationGapLowerBoundNs": orchestration_gap_ns,
+                "reportedChildElapsedCoverageNs": covered_ms * 1_000_000,
+                "orchestrationGapLowerBoundNs": orchestration_gap_ns if complete else 0,
                 "orchestrationGapUpperBoundNs": orchestration_gap_ns,
                 "timingSource": "toolCalls",
-                "timingConfidence": "high",
+                "timingConfidence": "high" if complete else "low",
                 "timingDetailSource": (
                     "persistedNestedLifecycle"
                     if nested_process_calls
@@ -1885,7 +1895,7 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
     line_count = 0
     byte_count = 0
     snapshots: list[dict[str, str | int]] = []
-    captured_snapshots = []
+    first_action_records = []
     command_orchestration_records: list[dict[str, Any]] = []
     source_discovery_events: list[dict[str, Any]] = []
     execution_loop_counts: collections.Counter[str] = collections.Counter()
@@ -1901,16 +1911,20 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
         calls_since_sampling_boundary = 0
         last_tool_output_ns: int | None = None
         snapshot = read_rollout_snapshot(file)
-        captured_snapshots.append(snapshot)
+        action_records = []
+        first_action_records.append((snapshot.metadata(), action_records))
         snapshots.append(snapshot.metadata())
         byte_count += snapshot.byte_length
         cwd = ""
-        with io.StringIO(snapshot.data.decode("utf-8")) as handle:
+        with io.BytesIO(snapshot.data) as handle:
             for line_number, line in enumerate(handle, 1):
                 line_count += 1
                 try:
                     item = json.loads(line)
-                except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                    if not isinstance(item, dict):
+                        raise TypeError("rollout record must be an object")
+                except (ValueError, TypeError) as error:
+                    action_records.append(None)
                     parse_error_count += 1
                     if len(parse_errors) < 100:
                         parse_errors.append(
@@ -1921,7 +1935,31 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
                             }
                         )
                     continue
-                payload = item.get("payload") or {}
+                payload = item.get("payload")
+                if not isinstance(payload, dict):
+                    payload = {}
+                # Only compact fields used by first-action analysis survive this pass.
+                action_records.append(
+                    {
+                        "timestamp": item.get("timestamp"),
+                        "type": item.get("type"),
+                        "payload": {
+                            key: payload[key]
+                            for key in ("type", "name", "execution")
+                            if key in payload
+                        }
+                        | (
+                            {
+                                "timing": {
+                                    key: payload["timing"].get(key)
+                                    for key in ("schemaVersion", "milestones")
+                                }
+                            }
+                            if isinstance(payload.get("timing"), dict)
+                            else {}
+                        ),
+                    }
+                )
                 timestamp_ns = _timestamp_ns(item.get("timestamp"))
                 if timestamp_ns is not None:
                     first_timestamp_ns = (
@@ -2118,7 +2156,8 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
         ]
         for name in ("all", "eval", "repository_root", "other")
     }
-    invalid = [record for record in records if record not in valid]
+    valid_ids = {id(record) for record in valid}
+    invalid = [record for record in records if id(record) not in valid_ids]
     execution_loop = {
         **dict(execution_loop_counts),
         **dict(execution_loop_ns),
@@ -2166,16 +2205,15 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
         }
         for turn_id in terminal_unresolved_turn_ids
     ]
+    commands_by_turn = collections.defaultdict(list)
+    for command in command_orchestration_records:
+        commands_by_turn[command.get("turnId")].append(command)
     per_turn = sorted(
         (
             _turn_report(
                 record,
                 repo_root,
-                [
-                    command
-                    for command in command_orchestration_records
-                    if command.get("turnId") == record["turn_id"]
-                ],
+                commands_by_turn[record["turn_id"]],
             )
             for record in records
         ),
@@ -2267,7 +2305,7 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
         "toolRelay": tool_relay,
         "sourceDiscovery": _source_discovery_report(source_discovery_events),
         "firstUsefulActionAnalysis": (
-            kd4_first_useful_action_analysis.analyze_snapshots(captured_snapshots)
+            kd4_first_useful_action_analysis.analyze_records(first_action_records)
         ),
         "perTurn": per_turn,
         "behaviorSignals": _behavior_report(

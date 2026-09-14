@@ -2,6 +2,7 @@
 
 import importlib.util
 import shutil
+import sys
 import tomllib
 from pathlib import Path
 from types import ModuleType
@@ -18,7 +19,7 @@ def powershell() -> str | None:
 
 
 def pwsh_only() -> str | None:
-    # invoke-rust-perf-env.ps1 runs under pwsh 7.4+ in production (recipes
+    # invoke-rust-perf-env.ps1 runs under pwsh 7.5+ in production (recipes
     # invoke it inline in the just-shell pwsh session), and its -NoSccache
     # proof depends on pwsh's empty-env-var semantics, so its tests must not
     # fall back to Windows PowerShell 5.1.
@@ -35,7 +36,16 @@ def load_script_module(filename: str, module_name: str) -> ModuleType:
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        if previous is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous
+        raise
     return module
 
 

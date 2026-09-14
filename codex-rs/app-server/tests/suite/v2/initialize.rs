@@ -469,6 +469,81 @@ async fn initialize_installs_effective_loaders_after_non_strict_config_preload_f
     Ok(())
 }
 
+#[test]
+fn capture_helpers_preserve_payloads_paths_and_reject_extra_arguments() -> Result<()> {
+    for binary in [
+        "codex-app-server-test-notify-capture",
+        "test_notify_capture",
+    ] {
+        let capture = cargo_bin(binary)?;
+        let dir = TempDir::new()?;
+        // An unrelated destination's temporary path must never be touched.
+        std::fs::create_dir(dir.path().join("event.json.tmp"))?;
+        let output = dir.path().join("event.txt");
+        let payload = "{\"message\":\"exact payload \u{2014} caf\u{e9}\"}";
+        let result = std::process::Command::new(&capture)
+            .arg(&output)
+            .arg(payload)
+            .output()?;
+        assert!(
+            result.status.success(),
+            "{binary}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(&output)?, payload);
+        assert!(dir.path().join("event.json.tmp").is_dir());
+        assert!(!dir.path().join("event.txt.tmp").exists());
+        let result = std::process::Command::new(&capture)
+            .arg(&output)
+            .arg("replacement")
+            .arg("unexpected")
+            .output()?;
+        assert!(!result.status.success());
+        assert_eq!(std::fs::read_to_string(&output)?, payload);
+    }
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn capture_helpers_preserve_native_paths_and_reject_invalid_payload_encoding() -> Result<()> {
+    #[cfg(unix)]
+    let invalid = {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(vec![0xff])
+    };
+    #[cfg(windows)]
+    let invalid = {
+        use std::os::windows::ffi::OsStringExt;
+        std::ffi::OsString::from_wide(&[0xd800])
+    };
+    for binary in [
+        "codex-app-server-test-notify-capture",
+        "test_notify_capture",
+    ] {
+        let capture = cargo_bin(binary)?;
+        let dir = TempDir::new()?;
+        let output = dir.path().join(&invalid);
+        let result = std::process::Command::new(&capture)
+            .arg(&output)
+            .arg("preserved")
+            .output()?;
+        assert!(
+            result.status.success(),
+            "{binary}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(&output)?, "preserved");
+        let result = std::process::Command::new(&capture)
+            .arg(&output)
+            .arg(&invalid)
+            .output()?;
+        assert!(!result.status.success());
+        assert_eq!(std::fs::read_to_string(&output)?, "preserved");
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn turn_start_notify_payload_includes_initialize_client_name() -> Result<()> {
     let responses = vec![create_final_assistant_message_sse_response("Done")?];

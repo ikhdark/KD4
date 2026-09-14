@@ -150,3 +150,62 @@ fn test_client(base_url: &str, path_style: PathStyle) -> Client {
         path_style,
     }
 }
+
+#[tokio::test]
+async fn public_redemption_methods_send_exact_credit_targets_once() {
+    use codex_http_client::{HttpClientFactory, OutboundProxyPolicy};
+    use wiremock::matchers::{body_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    for base_path in ["/api/codex", "/backend-api/wham"] {
+        for (request_id, credit_id, code) in [
+            ("Auto-Request", None, "reset"),
+            ("Explicit-Request", Some("Credit-123"), "already_redeemed"),
+        ] {
+            let mut body = serde_json::json!({"redeem_request_id": request_id});
+            if let Some(credit_id) = credit_id {
+                body["credit_id"] = serde_json::json!(credit_id);
+            }
+            Mock::given(method("POST"))
+                .and(path(format!(
+                    "{base_path}/rate-limit-reset-credits/consume"
+                )))
+                .and(body_json(body))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"code": code, "windows_reset": 2})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+    }
+    for suffix in ["", "/backend-api"] {
+        let client = Client::new(
+            format!("{}{suffix}", server.uri()),
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        );
+        assert_eq!(
+            client
+                .consume_rate_limit_reset_credit("Auto-Request")
+                .await
+                .unwrap(),
+            ConsumeRateLimitResetCreditResponse {
+                code: ConsumeRateLimitResetCreditCode::Reset,
+                windows_reset: 2,
+            }
+        );
+        assert_eq!(
+            client
+                .consume_rate_limit_reset_credit_by_id("Explicit-Request", "Credit-123")
+                .await
+                .unwrap(),
+            ConsumeRateLimitResetCreditResponse {
+                code: ConsumeRateLimitResetCreditCode::AlreadyRedeemed,
+                windows_reset: 2,
+            }
+        );
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    server.verify().await;
+}

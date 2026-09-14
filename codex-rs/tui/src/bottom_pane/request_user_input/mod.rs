@@ -489,24 +489,7 @@ impl RequestUserInputOverlay {
     }
 
     pub(super) fn options_preferred_height(&self, width: u16) -> u16 {
-        if !self.has_options() {
-            return 0;
-        }
-
-        let rows = self.option_rows();
-        if rows.is_empty() {
-            return 1;
-        }
-
-        let mut state = self
-            .current_answer()
-            .map(|answer| answer.options_state)
-            .unwrap_or_default();
-        if state.selected_idx.is_none() {
-            state.selected_idx = Some(0);
-        }
-
-        measure_rows_height(&rows, &state, rows.len(), width.max(1))
+        self.options_required_height(width)
     }
 
     fn capture_composer_draft(&self) -> ComposerDraft {
@@ -1022,12 +1005,11 @@ impl RequestUserInputOverlay {
     }
 
     fn first_unanswered_index(&self) -> Option<usize> {
-        let current_text = self.composer.current_text();
         self.request
             .questions
             .iter()
             .enumerate()
-            .find(|(idx, _)| !self.is_question_answered(*idx, &current_text))
+            .find(|(idx, _)| !self.is_question_answered(*idx))
             .map(|(idx, _)| idx)
     }
 
@@ -1062,7 +1044,7 @@ impl RequestUserInputOverlay {
             .collect()
     }
 
-    fn is_question_answered(&self, idx: usize, _current_text: &str) -> bool {
+    fn is_question_answered(&self, idx: usize) -> bool {
         let Some(question) = self.request.questions.get(idx) else {
             return false;
         };
@@ -1082,12 +1064,11 @@ impl RequestUserInputOverlay {
 
     /// Count questions that would submit an empty answer list.
     fn unanswered_count(&self) -> usize {
-        let current_text = self.composer.current_text();
         self.request
             .questions
             .iter()
             .enumerate()
-            .filter(|(idx, _question)| !self.is_question_answered(*idx, &current_text))
+            .filter(|(idx, _question)| !self.is_question_answered(*idx))
             .count()
     }
 
@@ -1258,14 +1239,21 @@ impl BottomPaneView for RequestUserInputOverlay {
 
         if self.focus_is_notes() && self.composer_submit_keys.is_pressed(key_event) {
             self.ensure_selected_for_notes();
+            let empty_answer = !self.composer.is_in_paste_burst()
+                && self.composer.current_text_with_pending().trim().is_empty();
             self.pending_submission_draft = Some(self.capture_composer_draft());
             let (result, _) = self.composer.handle_key_event(key_event);
             if !self.handle_composer_input_result(result) {
                 self.pending_submission_draft = None;
-                if self.has_options() {
-                    self.select_current_option(/*committed*/ true);
+                if empty_answer
+                    && !self.composer.is_in_paste_burst()
+                    && self.composer.current_text_with_pending().trim().is_empty()
+                {
+                    if self.has_options() {
+                        self.select_current_option(/*committed*/ true);
+                    }
+                    self.go_next_or_submit();
                 }
-                self.go_next_or_submit();
             }
             return;
         }
@@ -1400,12 +1388,13 @@ impl BottomPaneView for RequestUserInputOverlay {
                 }
             }
             Focus::Notes => {
-                let notes_empty = self.composer.current_text_with_pending().trim().is_empty();
                 if self.has_options() && matches!(key_event.code, KeyCode::Tab) {
                     self.clear_notes_and_focus_options();
                     return;
                 }
-                if self.has_options() && matches!(key_event.code, KeyCode::Backspace) && notes_empty
+                if self.has_options()
+                    && matches!(key_event.code, KeyCode::Backspace)
+                    && self.composer.current_text_with_pending().trim().is_empty()
                 {
                     self.save_current_draft();
                     if let Some(answer) = self.current_answer_mut() {
@@ -1454,10 +1443,13 @@ impl BottomPaneView for RequestUserInputOverlay {
                 {
                     answer.answer_committed = false;
                 }
-                let before = self.capture_composer_draft();
+                let before = self
+                    .current_answer()
+                    .filter(|answer| answer.answer_committed)
+                    .map(|_| self.capture_composer_draft());
                 let (result, _) = self.composer.handle_key_event(key_event);
                 let submitted = self.handle_composer_input_result(result);
-                if !submitted {
+                if !submitted && let Some(before) = before {
                     let after = self.capture_composer_draft();
                     if before != after
                         && let Some(answer) = self.current_answer_mut()
@@ -2930,6 +2922,87 @@ mod tests {
     }
 
     #[test]
+    fn secret_answer_is_not_recalled_in_the_next_question() {
+        let (tx, mut rx) = test_sender();
+        let mut secret = question_without_options("q1", "Secret");
+        secret.is_secret = true;
+        let mut overlay = RequestUserInputOverlay::new(
+            request_event(
+                "turn-1",
+                vec![secret, question_without_options("q2", "Public")],
+            ),
+            tx,
+            true,
+            false,
+            true,
+        );
+        overlay
+            .composer
+            .set_text_content("private token".to_string(), Vec::new(), Vec::new());
+        overlay.composer.move_cursor_to_end();
+        overlay.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(overlay.current_idx, 1);
+        overlay.handle_key_event(KeyEvent::from(KeyCode::Up));
+        assert_eq!(overlay.composer.current_text(), "");
+        overlay.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert_eq!(overlay.composer.current_text(), "");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn oversized_answer_does_not_advance_or_commit() {
+        let (tx, _rx) = test_sender();
+        let mut overlay = RequestUserInputOverlay::new(
+            request_event(
+                "turn-1",
+                vec![
+                    question_without_options("q1", "First"),
+                    question_without_options("q2", "Second"),
+                ],
+            ),
+            tx,
+            true,
+            false,
+            true,
+        );
+        let answer = "x".repeat(codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS + 1);
+        overlay
+            .composer
+            .set_text_content(answer.clone(), Vec::new(), Vec::new());
+        overlay.composer.move_cursor_to_end();
+        overlay.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(overlay.current_idx, 0);
+        assert!(!overlay.answers[0].answer_committed);
+        assert_eq!(overlay.composer.current_text(), answer);
+    }
+
+    #[test]
+    fn paste_burst_enter_does_not_advance_or_commit() {
+        let (tx, mut rx) = test_sender();
+        let mut overlay = RequestUserInputOverlay::new(
+            request_event(
+                "turn-1",
+                vec![
+                    question_without_options("q1", "First"),
+                    question_without_options("q2", "Second"),
+                ],
+            ),
+            tx,
+            true,
+            false,
+            false,
+        );
+        overlay.handle_key_event(KeyEvent::from(KeyCode::Char('x')));
+        assert!(overlay.composer.is_in_paste_burst());
+        overlay.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(overlay.current_idx, 0);
+        assert!(!overlay.answers[0].answer_committed);
+        overlay.composer.set_disable_paste_burst(true);
+        assert_eq!(overlay.composer.current_text_with_pending(), "x\n");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn freeform_requires_enter_with_text_to_mark_answered() {
         let (tx, _rx) = test_sender();
         let mut overlay = RequestUserInputOverlay::new(
@@ -3294,6 +3367,7 @@ mod tests {
             question_without_options("q1", "Details"),
             question_with_options("q1", "Choice"),
         ] {
+            let has_options = question.options.is_some();
             question.question = "prompt\n".repeat(65_536);
             let (tx, mut rx) = test_sender();
             let overlay = RequestUserInputOverlay::new(
@@ -3309,7 +3383,14 @@ mod tests {
             for line in rendered.lines().skip(1).take(7) {
                 assert_eq!(line.trim(), "prompt");
             }
-            assert_eq!(overlay.cursor_pos(area), None);
+            if has_options {
+                assert_eq!(overlay.cursor_pos(area), None);
+            } else {
+                let (x, y) = overlay
+                    .cursor_pos(area)
+                    .expect("freeform input stays visible");
+                assert!(x < area.right() && y < area.bottom());
+            }
             assert!(matches!(
                 rx.try_recv(),
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty)

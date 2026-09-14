@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::merge::merge_toml_values;
+use crate::merge::merge_owned_toml_values;
 use codex_network_proxy::InjectedHeaderConfig;
 use codex_network_proxy::MitmHookActionsConfig;
 use codex_network_proxy::MitmHookBodyConfig;
@@ -20,8 +20,8 @@ use thiserror::Error;
 use toml::Value as TomlValue;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(transparent)]
 pub struct PermissionsToml {
-    #[serde(flatten)]
     pub entries: BTreeMap<String, PermissionProfileToml>,
 }
 
@@ -184,7 +184,7 @@ fn merge_permission_profiles(
         .map_err(|source| PermissionProfileResolutionError::SerializeProfileToml { source })?;
     let child = TomlValue::try_from(child)
         .map_err(|source| PermissionProfileResolutionError::SerializeProfileToml { source })?;
-    merge_toml_values(&mut merged, &child);
+    merge_owned_toml_values(&mut merged, child);
     merged
         .try_into()
         .map_err(|source| PermissionProfileResolutionError::DeserializeProfileToml { source })

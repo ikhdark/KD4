@@ -1114,3 +1114,32 @@ async fn plugin_add_rejects_cached_plugins_without_authorizing_marketplace_snaps
 
     Ok(())
 }
+
+#[tokio::test]
+async fn plugin_list_ignores_broken_unselected_marketplace() -> Result<()> {
+    let (codex_home, _source) = setup_local_marketplace()?;
+    let broken = TempDir::new()?;
+    record_user_marketplace(
+        codex_home.path(),
+        "broken",
+        &configured_local_marketplace(&broken.path().to_string_lossy()),
+    )?;
+    codex_command(codex_home.path())?
+        .args([
+            "plugin",
+            "list",
+            "--marketplace",
+            "debug",
+            "--available",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("sample").and(contains("debug")));
+    codex_command(codex_home.path())?
+        .args(["plugin", "list", "--json"])
+        .assert()
+        .failure()
+        .stderr(contains("`broken`"));
+    Ok(())
+}

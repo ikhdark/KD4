@@ -7,12 +7,13 @@ use crate::RequirementSource;
 use crate::Sourced;
 use crate::config_requirements::FilesystemRequirementsToml;
 use crate::config_requirements::PermissionsRequirementsToml;
+use indexmap::IndexSet;
 
 use super::stack::merge_output_source;
 
 #[derive(Default)]
 pub(super) struct DenyReadMergeState {
-    deny_read: Vec<FilesystemDenyReadPattern>,
+    deny_read: IndexSet<FilesystemDenyReadPattern>,
     source: Option<RequirementSource>,
 }
 
@@ -30,11 +31,10 @@ impl DenyReadMergeState {
             return;
         };
 
-        for pattern in incoming_deny_read {
-            if !self.deny_read.contains(&pattern) {
-                self.deny_read.push(pattern);
-                self.merge_source(source);
-            }
+        let previous_len = self.deny_read.len();
+        self.deny_read.extend(incoming_deny_read);
+        if self.deny_read.len() != previous_len {
+            self.merge_source(source);
         }
     }
 
@@ -48,7 +48,7 @@ impl DenyReadMergeState {
             *target = Some(Sourced::new(
                 PermissionsRequirementsToml {
                     filesystem: Some(FilesystemRequirementsToml {
-                        deny_read: Some(self.deny_read),
+                        deny_read: Some(self.deny_read.into_iter().collect()),
                     }),
                     profiles: Default::default(),
                 },
@@ -62,10 +62,15 @@ impl DenyReadMergeState {
             .filesystem
             .get_or_insert_with(Default::default);
         let deny_read = filesystem.deny_read.get_or_insert_with(Vec::new);
-        for pattern in self.deny_read {
-            if !deny_read.contains(&pattern) {
-                deny_read.push(pattern);
-            }
+        if deny_read.is_empty() {
+            *deny_read = self.deny_read.into_iter().collect();
+        } else {
+            let mut patterns: IndexSet<_> = deny_read.iter().cloned().collect();
+            deny_read.extend(
+                self.deny_read
+                    .into_iter()
+                    .filter(|pattern| patterns.insert(pattern.clone())),
+            );
         }
         if existing.source != source {
             existing.source = RequirementSource::composite([existing.source.clone(), source]);

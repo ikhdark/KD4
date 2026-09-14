@@ -312,6 +312,7 @@ pub(super) struct PendingProcessRegistration {
     primary_process: Option<Arc<UnifiedExecProcess>>,
     network_approval: Option<DeferredNetworkApproval>,
     initial_exec_command_active: Option<Arc<AtomicBool>>,
+    pending_startup_completion: Option<(PathUri, Arc<tokio::sync::Mutex<HeadTailBuffer>>, Instant)>,
     committed: bool,
 }
 
@@ -363,6 +364,7 @@ impl PendingProcessRegistration {
             primary_process: None,
             network_approval: None,
             initial_exec_command_active: None,
+            pending_startup_completion: None,
             committed: false,
         }
     }
@@ -933,9 +935,15 @@ impl UnifiedExecProcessManager {
         );
         let request_started_at = Instant::now();
         let mut cancelled = false;
+        // Finish an accepted event and its legacy dispatch before cancellation
+        // takes ownership of the command's terminal transition.
+        let event_delivery = tokio::sync::Mutex::new(());
         let mut result = tokio::select! {
             biased;
-            _ = cancellation_token.cancelled() => {
+            _ = async {
+                cancellation_token.cancelled().await;
+                let _event_delivery = event_delivery.lock().await;
+            } => {
                 cancelled = true;
                 Err(UnifiedExecError::process_failed(
                     "unified exec cancelled".to_string(),
@@ -946,8 +954,32 @@ impl UnifiedExecProcessManager {
                 &mut process_id_reservation,
                 context,
                 &mut registration,
+                &event_delivery,
             ) => result,
         };
+        if let Some((cwd, transcript, started_at)) = registration.pending_startup_completion.take()
+            && let Err(error) = &result
+        {
+            // Startup has published a command item, but no exit watcher owns its
+            // completion yet. The existing cancellation boundary also closes it.
+            if let Err(persistence_error) = emit_failed_initial_exec_end_if_unstored(
+                false,
+                registration.primary_process.as_ref(),
+                context,
+                &request,
+                cwd,
+                transcript,
+                String::new(),
+                error.to_string(),
+                started_at.elapsed(),
+            )
+            .await
+            {
+                result = Err(UnifiedExecError::process_failed(format!(
+                    "{error}; failed to persist command completion: {persistence_error}"
+                )));
+            }
+        }
         if result.is_err()
             && !matches!(
                 &result,
@@ -1003,12 +1035,17 @@ impl UnifiedExecProcessManager {
         .await
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Keep the request-local cancellation gate held until command lifecycle event delivery finishes"
+    )]
     async fn exec_command_inner(
         &self,
         request: &mut ExecCommandRequest,
         process_id_reservation: &mut ProcessIdReservation,
         context: &UnifiedExecContext,
         registration: &mut PendingProcessRegistration,
+        event_delivery: &tokio::sync::Mutex<()>,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let cwd = request.cwd.clone();
         let mut tool_history_error = None;
@@ -1048,7 +1085,12 @@ impl UnifiedExecProcessManager {
                     None,
                     request.turn_environment.environment_id.clone(),
                 );
-                emitter.begin(event_ctx).await;
+                // Cached replay has no exit watcher to finish an interrupted event pair.
+                let event_delivery_guard = event_delivery.lock().await;
+                emitter
+                    .begin(event_ctx)
+                    .await
+                    .map_err(|error| UnifiedExecError::process_failed(error.to_string()))?;
                 if let Err(message) = finish_deferred_network_approval_for_session(
                     Some(&context.session),
                     deferred_network_approval.take(),
@@ -1081,6 +1123,7 @@ impl UnifiedExecProcessManager {
                     context.tracker.clone(),
                 )
                 .await;
+                drop(event_delivery_guard);
                 self.release_process_id_reservation(process_id_reservation)
                     .await;
                 persistence_result.map_err(|error| UnifiedExecError::ToolHistoryPersistence {
@@ -1137,9 +1180,16 @@ impl UnifiedExecProcessManager {
             Some(request.process_id.to_string()),
             request.turn_environment.environment_id.clone(),
         );
-        emitter.begin(event_ctx).await;
+        let event_delivery_guard = event_delivery.lock().await;
+        emitter
+            .begin(event_ctx)
+            .await
+            .map_err(|error| UnifiedExecError::process_failed(error.to_string()))?;
 
         let start = Instant::now();
+        registration.pending_startup_completion =
+            Some((cwd.clone(), Arc::clone(&transcript), start));
+        drop(event_delivery_guard);
         start_streaming_output(&process, context, Arc::clone(&transcript))?;
         // Persist live sessions before the initial yield wait so handler cancellation cannot
         // orphan the process. Mutating sessions are explicitly terminated when their owning turn
@@ -1239,6 +1289,7 @@ impl UnifiedExecProcessManager {
                 deferred_network_approval.take(),
             )
             .await;
+            let event_delivery_guard = event_delivery.lock().await;
             let persistence_result = emit_failed_initial_exec_end_if_unstored(
                 process_started_alive,
                 Some(&process),
@@ -1251,6 +1302,8 @@ impl UnifiedExecProcessManager {
                 wall_time,
             )
             .await;
+            registration.pending_startup_completion = None;
+            drop(event_delivery_guard);
             let process_error = self
                 .fail_process_with_message(request.process_id, &process, message)
                 .await;
@@ -1268,6 +1321,7 @@ impl UnifiedExecProcessManager {
                 deferred_network_approval.take(),
             )
             .await;
+            let event_delivery_guard = event_delivery.lock().await;
             let persistence_result = emit_failed_initial_exec_end_if_unstored(
                 process_started_alive,
                 Some(&process),
@@ -1280,6 +1334,8 @@ impl UnifiedExecProcessManager {
                 wall_time,
             )
             .await;
+            registration.pending_startup_completion = None;
+            drop(event_delivery_guard);
             let message = finish_result.err().unwrap_or(message);
             let process_error = self
                 .fail_process_with_message(request.process_id, &process, message)
@@ -1333,6 +1389,7 @@ impl UnifiedExecProcessManager {
             )
             .await;
             if let Err(message) = finish_result {
+                let event_delivery_guard = event_delivery.lock().await;
                 let persistence_result = emit_failed_initial_exec_end_if_unstored(
                     process_started_alive,
                     Some(&process),
@@ -1345,6 +1402,8 @@ impl UnifiedExecProcessManager {
                     wall_time,
                 )
                 .await;
+                registration.pending_startup_completion = None;
+                drop(event_delivery_guard);
                 let process_error = self
                     .fail_process_with_message(request.process_id, &process, message)
                     .await;
@@ -1358,6 +1417,7 @@ impl UnifiedExecProcessManager {
             }
             let exit_code = process.exit_code();
             let exit = exit_code.unwrap_or(-1);
+            let event_delivery_guard = event_delivery.lock().await;
             tool_history_error = emit_exec_end_for_unified_exec(
                 Arc::clone(&context.session),
                 Arc::clone(&context.turn),
@@ -1377,6 +1437,8 @@ impl UnifiedExecProcessManager {
             )
             .await
             .err();
+            registration.pending_startup_completion = None;
+            drop(event_delivery_guard);
 
             self.release_process_id_reservation(process_id_reservation)
                 .await;
@@ -1680,6 +1742,10 @@ impl UnifiedExecProcessManager {
         Ok(response.with_prepared_reduction_notice().await)
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Check process identity and drained output atomically before removing its store entry"
+    )]
     async fn refresh_process_state(
         &self,
         process_id: u32,
@@ -1879,6 +1945,7 @@ impl UnifiedExecProcessManager {
             return Err(UnifiedExecError::process_failed(message));
         }
 
+        registration.pending_startup_completion = None;
         spawn_exit_watcher(
             Arc::clone(&process),
             Arc::clone(&context.session),

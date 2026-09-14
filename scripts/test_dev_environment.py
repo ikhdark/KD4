@@ -4,7 +4,9 @@ import contextlib
 import io
 import os
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path, PureWindowsPath
 from unittest import mock
@@ -15,11 +17,62 @@ from scripts import (
     dev_env_doctor,
     generated_output_lock,
     git_doctor,
+    tool_versions,
     vscode_runtime_proof,
 )
 
 
 class DevEnvironmentDoctorTest(unittest.TestCase):
+    def test_pnpm_pin_distinguishes_prerelease(self):
+        for actual, expected, ok in (
+            ("10.1.0-rc.1", "10.1.0", False),
+            ("10.1.0-rc.1", "10.1.0-rc.1", True),
+        ):
+            with (
+                mock.patch.object(dev_env_doctor.shutil, "which", return_value="pnpm"),
+                mock.patch.object(dev_env_doctor, "run_version", return_value=actual),
+            ):
+                self.assertEqual(
+                    dev_env_doctor.check_tool(
+                        "pnpm",
+                        ["pnpm", "--version"],
+                        required=True,
+                        guidance="pin",
+                        required_version=expected,
+                    ).ok,
+                    ok,
+                )
+
+    def test_tool_probes_overlap_and_keep_declared_order(self):
+        import threading
+
+        barrier = threading.Barrier(4, timeout=5)
+        first = {"python", "git", "cargo", "rustfmt"}
+
+        def check(name, command, **kwargs):
+            if name in first:
+                barrier.wait()
+            return name
+
+        with mock.patch.object(dev_env_doctor, "check_tool", side_effect=check):
+            checks = dev_env_doctor.collect_checks()
+        self.assertEqual(
+            checks,
+            [
+                "python",
+                "git",
+                "cargo",
+                "rustfmt",
+                "clippy",
+                "just",
+                "cargo-nextest",
+                "uv",
+                "node",
+                "pnpm",
+                "pwsh",
+            ],
+        )
+
     def test_collect_checks_covers_required_workflow_tools(self) -> None:
         with (
             mock.patch.object(
@@ -30,7 +83,6 @@ class DevEnvironmentDoctorTest(unittest.TestCase):
                 "check_tool",
                 side_effect=lambda name, command, **kwargs: name,
             ),
-            mock.patch.object(dev_env_doctor.os, "name", "nt"),
         ):
             checks = dev_env_doctor.collect_checks()
 
@@ -199,6 +251,67 @@ class GitDoctorTest(unittest.TestCase):
 
 
 class VscodeRuntimeProofTest(unittest.TestCase):
+    def test_default_target_matches_publisher_bin_directory(self) -> None:
+        with mock.patch.dict(os.environ, {"CODEX_LOCAL_PUBLISH_DIR": ""}):
+            self.assertEqual(
+                Path(vscode_runtime_proof.desktop_target()),
+                Path.home() / "Desktop" / "LOCAL-KD" / "bin" / "codex.exe",
+            )
+
+    def test_expected_binary_checks_only_path(self) -> None:
+        target = str(Path("codex.exe").resolve())
+        for actual, expected_rc in ((target, 0), (None, 1)):
+            with (
+                self.subTest(actual=actual),
+                mock.patch.object(
+                    vscode_runtime_proof.shutil, "which", return_value=actual
+                ),
+                mock.patch.object(vscode_runtime_proof, "desktop_target") as desktop,
+                mock.patch.object(
+                    vscode_runtime_proof, "extension_candidates"
+                ) as extensions,
+                mock.patch.object(
+                    vscode_runtime_proof, "run_version", return_value="codex 1"
+                ) as version,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(
+                    vscode_runtime_proof.main(["--expected-binary", target]),
+                    expected_rc,
+                )
+                desktop.assert_not_called()
+                extensions.assert_not_called()
+                self.assertEqual(version.call_count, int(actual is not None))
+
+    def test_full_inventory_reuses_versions_and_honors_no_run(self) -> None:
+        target = str(Path("codex.exe").resolve())
+        for no_run in (False, True):
+            stdout = io.StringIO()
+            with (
+                self.subTest(no_run=no_run),
+                mock.patch.object(
+                    vscode_runtime_proof.shutil, "which", return_value=target
+                ),
+                mock.patch.object(
+                    vscode_runtime_proof, "desktop_target", return_value=target
+                ),
+                mock.patch.object(
+                    vscode_runtime_proof, "extension_candidates", return_value=[target]
+                ),
+                mock.patch.object(
+                    vscode_runtime_proof, "run_version", return_value="codex 1"
+                ) as version,
+                contextlib.redirect_stdout(stdout),
+            ):
+                self.assertEqual(
+                    vscode_runtime_proof.main(["--no-run-codex"] if no_run else []), 0
+                )
+                self.assertEqual(version.call_count, 0 if no_run else 1)
+                self.assertEqual(
+                    stdout.getvalue().count("version=codex 1"), 0 if no_run else 3
+                )
+                self.assertIn("inventory, not proof", stdout.getvalue())
+
     def test_desktop_target_uses_publish_dir_env(self) -> None:
         with mock.patch.dict(
             vscode_runtime_proof.os.environ,
@@ -227,6 +340,36 @@ class VscodeRuntimeProofTest(unittest.TestCase):
 
         self.assertEqual(len(matches), 1)
         self.assertTrue(matches[0].endswith("codex.exe"))
+
+
+class ToolVersionsTest(unittest.TestCase):
+    def test_ruff_requirement_matches_exact_dependency_name(self) -> None:
+        for requirement in ("ruff>=0.15.8", "Ruff == 0.15.8", "ruff[extra]>=0.15.8"):
+            with (
+                self.subTest(requirement=requirement),
+                mock.patch.object(tool_versions.Path, "read_text", return_value=""),
+                mock.patch.object(
+                    tool_versions.tomllib,
+                    "loads",
+                    return_value={
+                        "project": {
+                            "dependencies": ["ruff-lsp>=1", "ruffus>=1", requirement]
+                        }
+                    },
+                ),
+            ):
+                self.assertEqual(
+                    tool_versions.scripts_ruff_requirement.__wrapped__(), requirement
+                )
+        with (
+            mock.patch.object(
+                tool_versions.Path,
+                "read_text",
+                return_value='[project]\ndependencies = ["ruff-lsp>=1"]',
+            ),
+            self.assertRaisesRegex(RuntimeError, "must declare a ruff dependency"),
+        ):
+            tool_versions.scripts_ruff_requirement.__wrapped__()
 
 
 class ConfigSchemaCheckTest(unittest.TestCase):
@@ -351,24 +494,93 @@ class GeneratedOutputLockTest(unittest.TestCase):
     def test_lock_is_process_scoped_and_recovers_after_release(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            with generated_output_lock.generated_output_lock(
-                root, "assignment:owner-a"
-            ) as lock_path:
-                self.assertTrue(lock_path.is_file())
+            ready = root / "ready"
+            script = (
+                "import sys; from pathlib import Path; "
+                "from scripts.generated_output_lock import generated_output_lock\n"
+                "with generated_output_lock(Path(sys.argv[1]), 'assignment:owner-a') as lock:\n"
+                "    Path(sys.argv[2]).write_text(str(lock), encoding='utf-8')\n"
+                "    sys.stdin.read(1)\n"
+            )
+            child = subprocess.Popen(
+                [sys.executable, "-c", script, str(root), str(ready)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                cwd=Path(__file__).resolve().parents[1],
+            )
+            try:
+                deadline = time.monotonic() + 10
+                while (
+                    not ready.exists()
+                    and child.poll() is None
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.02)
+                self.assertTrue(
+                    ready.exists(), "child did not acquire the generation lock"
+                )
                 with self.assertRaises(generated_output_lock.GenerationLockError):
                     with generated_output_lock.generated_output_lock(
                         root, "assignment:owner-b"
                     ):
                         self.fail("a live generation owner cannot be stolen")
-            self.assertIn("assignment:owner-a", lock_path.read_text("utf-8"))
+                _, errors = child.communicate(b"x", timeout=10)
+                self.assertEqual(child.returncode, 0, errors)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                child.communicate(timeout=10)
 
             with generated_output_lock.generated_output_lock(
                 root, "assignment:owner-b"
-            ):
-                pass
+            ) as lock_path:
+                self.assertTrue(lock_path.is_file())
+            self.assertIn("assignment:owner-b", lock_path.read_text("utf-8"))
 
 
 class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
+    def test_new_constraint_maps_remain_breaking_changes(self):
+        compare = app_server_schema_runtime_check.stable_schema_compatibility_issues
+        for keyword in ("patternProperties", "dependentSchemas"):
+            self.assertEqual(
+                compare({keyword: {}}, {keyword: {"field": {"type": "string"}}}),
+                [f"$/{keyword}/field:added"],
+            )
+
+    def test_annotation_names_are_real_properties_and_enum_values(self):
+        compare = app_server_schema_runtime_check.stable_schema_compatibility_issues
+        for name in ("title", "description", "default", "examples"):
+            baseline = {"properties": {name: {"type": "string"}}}
+            self.assertEqual(
+                compare(baseline, {"properties": {}}), [f"$/properties/{name}:removed"]
+            )
+            self.assertEqual(
+                compare(baseline, {"properties": {name: {"type": "integer"}}}),
+                [f"$/properties/{name}/type:changed"],
+            )
+        self.assertEqual(
+            compare({"enum": [{"title": "a"}]}, {"enum": [{"title": "b"}]}),
+            ["$/enum:changed"],
+        )
+
+    def test_combinator_annotations_are_ignored_but_constraints_are_checked(self):
+        compare = app_server_schema_runtime_check.stable_schema_compatibility_issues
+        for keyword in ("oneOf", "anyOf", "allOf", "prefixItems"):
+            baseline = {keyword: [{"type": "string", "description": "before"}]}
+            self.assertEqual(
+                compare(
+                    baseline, {keyword: [{"type": "string", "description": "after"}]}
+                ),
+                [],
+            )
+            self.assertEqual(
+                compare(
+                    baseline, {keyword: [{"type": "integer", "description": "before"}]}
+                ),
+                [f"$/{keyword}:changed"],
+            )
+
     def test_schema_inputs_cover_core_protocol_dependency(self) -> None:
         self.assertIn(
             "codex-rs/protocol/src",
@@ -595,6 +807,15 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
         self,
     ) -> None:
         calls: list[str] = []
+
+        @contextlib.contextmanager
+        def lock():
+            calls.append("lock")
+            try:
+                yield
+            finally:
+                calls.append("unlock")
+
         with (
             mock.patch.object(
                 app_server_schema_runtime_check, "repo_root", return_value=Path("/repo")
@@ -603,7 +824,7 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
                 app_server_schema_runtime_check,
                 "schema_inputs_changed",
                 return_value=False,
-            ),
+            ) as input_probe,
             mock.patch.object(
                 app_server_schema_runtime_check,
                 "run_protocol_check",
@@ -624,7 +845,7 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
             mock.patch.object(
                 app_server_schema_runtime_check,
                 "generated_output_lock",
-                return_value=contextlib.nullcontext(),
+                return_value=lock(),
             ),
         ):
             self.assertEqual(
@@ -632,7 +853,10 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
                 0,
             )
 
-        self.assertEqual(calls, ["protocol", "compatibility:HEAD^", "python-sdk"])
+        input_probe.assert_not_called()
+        self.assertEqual(
+            calls, ["lock", "protocol", "compatibility:HEAD^", "python-sdk", "unlock"]
+        )
 
     def test_schema_gate_stops_before_consumer_on_compatibility_failure(self) -> None:
         with (

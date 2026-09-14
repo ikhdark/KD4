@@ -115,10 +115,6 @@ impl OssSelectionWidget<'_> {
             },
             ProviderOption {
                 name: "Ollama (Responses)".to_string(),
-                status: ollama_status.clone(),
-            },
-            ProviderOption {
-                name: "Ollama (Chat)".to_string(),
                 status: ollama_status,
             },
         ];
@@ -315,8 +311,8 @@ pub(crate) struct OssProviderSelection {
 
 pub async fn select_oss_provider() -> io::Result<OssProviderSelection> {
     // Check provider statuses first
-    let lmstudio_status = check_lmstudio_status().await;
-    let ollama_status = check_ollama_status().await;
+    let (lmstudio_status, ollama_status) =
+        tokio::join!(check_lmstudio_status(), check_ollama_status());
 
     // Autoselect if only one is running
     match (&lmstudio_status, &ollama_status) {
@@ -339,10 +335,41 @@ pub async fn select_oss_provider() -> io::Result<OssProviderSelection> {
         }
     }
 
+    tokio::task::spawn_blocking(move || run_provider_picker(lmstudio_status, ollama_status))
+        .await
+        .map_err(io::Error::other)?
+}
+
+struct ProviderTerminalGuard {
+    raw_mode: bool,
+    alternate_screen: bool,
+}
+
+impl Drop for ProviderTerminalGuard {
+    fn drop(&mut self) {
+        if self.raw_mode {
+            let _ = disable_raw_mode();
+        }
+        if self.alternate_screen {
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        }
+    }
+}
+
+fn run_provider_picker(
+    lmstudio_status: ProviderStatus,
+    ollama_status: ProviderStatus,
+) -> io::Result<OssProviderSelection> {
     let mut widget = OssSelectionWidget::new(lmstudio_status, ollama_status)?;
 
+    let mut guard = ProviderTerminalGuard {
+        raw_mode: false,
+        alternate_screen: false,
+    };
     enable_raw_mode()?;
+    guard.raw_mode = true;
     let mut stdout = io::stdout();
+    guard.alternate_screen = true;
     execute!(stdout, EnterAlternateScreen)?;
 
     let backend = CrosstermBackend::new(stdout);
@@ -363,9 +390,8 @@ pub async fn select_oss_provider() -> io::Result<OssProviderSelection> {
         }
     };
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-
+    drop(terminal);
+    drop(guard);
     result
 }
 
@@ -430,6 +456,17 @@ mod tests {
         let mut widget = OssSelectionWidget::new(ProviderStatus::Unknown, ProviderStatus::Unknown)
             .expect("widget should initialize");
 
+        let area = Rect::new(0, 0, 100, 25);
+        let mut buffer = Buffer::empty(area);
+        (&widget).render_ref(area, &mut buffer);
+        let rendered: String = buffer
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(rendered.contains("LM Studio"));
+        assert!(rendered.contains("Ollama (Responses)"));
+        assert!(!rendered.contains("Ollama (Chat)"));
         assert_eq!(widget.selected_option, 0);
         widget.handle_key_event(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
         assert_eq!(widget.selected_option, 1);

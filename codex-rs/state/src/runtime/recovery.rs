@@ -20,6 +20,37 @@ pub struct RuntimeDbBackup {
 }
 
 #[derive(Debug)]
+struct PartialBackupError {
+    source: std::io::Error,
+    backups: Vec<RuntimeDbBackup>,
+}
+
+impl std::fmt::Display for PartialBackupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "backup failed: {}", self.source)?;
+        for backup in &self.backups {
+            write!(
+                f,
+                "; moved {} to {}",
+                backup.original_path.display(),
+                backup.backup_path.display()
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for PartialBackupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn partial_backup_error(source: std::io::Error, backups: Vec<RuntimeDbBackup>) -> std::io::Error {
+    std::io::Error::new(source.kind(), PartialBackupError { source, backups })
+}
+
+#[derive(Debug)]
 pub(crate) struct RuntimeDbInitError {
     label: &'static str,
     operation: &'static str,
@@ -159,13 +190,25 @@ async fn backup_sqlite_paths(
     let mut backups = Vec::new();
 
     for path in paths {
-        if tokio::fs::try_exists(path.as_path()).await? {
+        let result = async {
+            if !tokio::fs::try_exists(path.as_path()).await? {
+                return Ok(None);
+            }
             let backup_path = backup_dir.join(file_name(path.as_path())?);
             tokio::fs::rename(path.as_path(), backup_path.as_path()).await?;
-            backups.push(RuntimeDbBackup {
+            Ok(Some(RuntimeDbBackup {
                 original_path: path,
                 backup_path,
-            });
+            }))
+        }
+        .await;
+        match result {
+            Ok(Some(backup)) => backups.push(backup),
+            Ok(None) => {}
+            // No exclusive recovery lock is held here. Rolling back could
+            // overwrite a file recreated by another process; retain and report
+            // every completed move so the original bytes remain recoverable.
+            Err(source) => return Err(partial_backup_error(source, backups)),
         }
     }
 
@@ -192,11 +235,14 @@ async fn backup_blocking_sqlite_home(sqlite_home: &Path) -> std::io::Result<Vec<
     let backup_dir = create_unique_backup_dir(backup_parent.as_path()).await?;
     let backup_path = backup_dir.join(file_name(sqlite_home)?);
     tokio::fs::rename(sqlite_home, backup_path.as_path()).await?;
-    tokio::fs::create_dir_all(sqlite_home).await?;
-    Ok(vec![RuntimeDbBackup {
+    let backups = vec![RuntimeDbBackup {
         original_path: sqlite_home.to_path_buf(),
         backup_path,
-    }])
+    }];
+    if let Err(source) = tokio::fs::create_dir_all(sqlite_home).await {
+        return Err(partial_backup_error(source, backups));
+    }
+    Ok(backups)
 }
 
 fn sqlite_paths(db_path: &Path) -> Vec<PathBuf> {

@@ -11,8 +11,8 @@
 //! - Bounded graceful shutdown with abort fallback.
 //!
 //! Each transport interposes a worker task between the caller and the underlying
-//! runtime or connection. Queues are bounded so overload surfaces as explicit
-//! backpressure behavior rather than unbounded memory growth.
+//! runtime or connection. Command and event queues are bounded; these queue
+//! capacities do not bound the number of dispatched requests awaiting responses.
 
 mod path;
 mod remote;
@@ -96,6 +96,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 tokio::task_local! {
     // Scheduling control only: the real worker still owns its runtime and queue.
     static TEST_WORKER_PAUSE: Arc<tokio::sync::Notify>;
+    static TEST_PENDING_DELIVERY: Arc<tokio::sync::Notify>;
 }
 
 /// Raw app-server request result for typed in-process requests.
@@ -254,7 +255,7 @@ fn skipped_event_count(event: &InProcessServerEvent) -> usize {
 /// Outcome of attempting to forward a single event to the consumer channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForwardEventResult {
-    /// The event was delivered (or intentionally dropped); the stream is healthy.
+    /// The event was delivered, retained, or intentionally dropped; the stream is healthy.
     Continue,
     /// The consumer channel is closed; the caller should stop producing events.
     DisableStream,
@@ -263,15 +264,16 @@ enum ForwardEventResult {
 /// Forwards a single in-process event to the consumer, respecting the
 /// lossless/best-effort split.
 ///
-/// Lossless events (transcript deltas, item/turn completions) block until the
-/// consumer drains capacity. Best-effort events use `try_send` and increment
-/// `skipped_events` on failure. When a lag marker needs to be flushed before a
-/// lossless event, the flush itself blocks so the marker is never lost.
+/// Lossless events and preceding lag markers are retained until the consumer
+/// drains capacity, with upstream reads paused and delivery selected alongside
+/// commands. Best-effort events use `try_send` and increment `skipped_events`
+/// on failure.
 ///
 /// If a dropped event is a `ServerRequest`, `reject_server_request` is called
 /// so the server does not wait for a response that will never come.
-async fn forward_in_process_event<F>(
+fn forward_in_process_event<F>(
     event_tx: &mpsc::Sender<InProcessServerEvent>,
+    pending_delivery: &mut std::collections::VecDeque<InProcessServerEvent>,
     skipped_events: &mut usize,
     event: InProcessServerEvent,
     mut reject_server_request: F,
@@ -279,49 +281,33 @@ async fn forward_in_process_event<F>(
 where
     F: FnMut(ServerRequest),
 {
-    if *skipped_events > 0 {
-        if event_requires_delivery(&event) {
-            // Surface lag before the lossless event, but do not let the lag marker itself cause
-            // us to drop the transcript/completion notification the caller is blocked on.
-            if event_tx
-                .send(InProcessServerEvent::Lagged {
-                    skipped: *skipped_events,
-                })
-                .await
-                .is_err()
-            {
-                return ForwardEventResult::DisableStream;
-            }
-            *skipped_events = 0;
-        } else {
-            match event_tx.try_send(InProcessServerEvent::Lagged {
-                skipped: *skipped_events,
-            }) {
-                Ok(()) => {
-                    *skipped_events = 0;
-                }
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    *skipped_events = skipped_events.saturating_add(skipped_event_count(&event));
-                    warn!("dropping in-process app-server event because consumer queue is full");
-                    if let InProcessServerEvent::ServerRequest(request) = event {
-                        reject_server_request(request);
-                    }
-                    return ForwardEventResult::Continue;
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    return ForwardEventResult::DisableStream;
-                }
-            }
-        }
+    if event_tx.is_closed() {
+        return ForwardEventResult::DisableStream;
     }
-
     if event_requires_delivery(&event) {
-        // Block until the consumer catches up for transcript/completion notifications; this
-        // preserves the visible assistant output even when the queue is otherwise saturated.
-        if event_tx.send(event).await.is_err() {
-            return ForwardEventResult::DisableStream;
+        if *skipped_events > 0 {
+            pending_delivery.push_back(InProcessServerEvent::Lagged {
+                skipped: *skipped_events,
+            });
+            *skipped_events = 0;
         }
+        pending_delivery.push_back(event);
         return ForwardEventResult::Continue;
+    }
+    if *skipped_events > 0 {
+        match event_tx.try_send(InProcessServerEvent::Lagged {
+            skipped: *skipped_events,
+        }) {
+            Ok(()) => *skipped_events = 0,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                *skipped_events = skipped_events.saturating_add(skipped_event_count(&event));
+                if let InProcessServerEvent::ServerRequest(request) = event {
+                    reject_server_request(request);
+                }
+                return ForwardEventResult::Continue;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return ForwardEventResult::DisableStream,
+        }
     }
 
     match event_tx.try_send(event) {
@@ -622,6 +608,8 @@ impl InProcessAppServerClient {
 
         #[cfg(test)]
         let worker_pause = TEST_WORKER_PAUSE.try_with(Arc::clone).ok();
+        #[cfg(test)]
+        let pending_delivery_signal = TEST_PENDING_DELIVERY.try_with(Arc::clone).ok();
         let worker_handle = tokio::spawn(async move {
             #[cfg(test)]
             if let Some(pause) = worker_pause {
@@ -629,8 +617,22 @@ impl InProcessAppServerClient {
             }
             let mut event_stream_enabled = true;
             let mut skipped_events = 0usize;
+            let mut pending_delivery = std::collections::VecDeque::new();
             loop {
                 tokio::select! {
+                    permit = event_tx.reserve(), if !pending_delivery.is_empty() => {
+                        match permit {
+                            Ok(permit) => {
+                                if let Some(event) = pending_delivery.pop_front() {
+                                    permit.send(event);
+                                }
+                            }
+                            Err(_) => {
+                                pending_delivery.clear();
+                                event_stream_enabled = false;
+                            }
+                        }
+                    }
                     command = command_rx.recv() => {
                         match command {
                             Some(command) if command.is_abandoned_request() => {}
@@ -679,7 +681,7 @@ impl InProcessAppServerClient {
                             }
                         }
                     }
-                    event = handle.next_event(), if event_stream_enabled => {
+                    event = handle.next_event(), if event_stream_enabled && pending_delivery.is_empty() => {
                         let Some(event) = event else {
                             break;
                         };
@@ -705,6 +707,7 @@ impl InProcessAppServerClient {
 
                         match forward_in_process_event(
                             &event_tx,
+                            &mut pending_delivery,
                             &mut skipped_events,
                             event,
                             |request| {
@@ -716,10 +719,14 @@ impl InProcessAppServerClient {
                                     ),
                                 );
                             },
-                        )
-                        .await
-                        {
-                            ForwardEventResult::Continue => {}
+                        ) {
+                            ForwardEventResult::Continue => {
+                                #[cfg(test)]
+                                if !pending_delivery.is_empty() && event_tx.capacity() == 0
+                                    && let Some(signal) = &pending_delivery_signal {
+                                    signal.notify_one();
+                                }
+                            }
                             ForwardEventResult::DisableStream => {
                                 event_stream_enabled = false;
                             }
@@ -1163,21 +1170,57 @@ mod tests {
         assert_eq!(start.sandbox, None);
     }
 
-    #[test]
-    fn cancelled_in_process_request_is_abandoned_before_dispatch() {
-        let (response_tx, response_rx) = oneshot::channel();
-        drop(response_rx);
-        let command = ClientCommand::Request {
-            request: Box::new(ClientRequest::GetAccount {
-                request_id: RequestId::Integer(1),
-                params: codex_app_server_protocol::GetAccountParams {
-                    refresh_token: false,
+    #[tokio::test]
+    async fn cancelled_in_process_request_is_abandoned_before_dispatch() {
+        let pause = Arc::new(tokio::sync::Notify::new());
+        let client = TEST_WORKER_PAUSE
+            .scope(
+                Arc::clone(&pause),
+                start_test_client_with_capacity(SessionSource::Cli, 1),
+            )
+            .await;
+        let handle = client.request_handle();
+        let mut request = Box::pin(handle.request(ClientRequest::ThreadStart {
+            request_id: RequestId::Integer(901),
+            params: ThreadStartParams {
+                ephemeral: Some(true),
+                ..Default::default()
+            },
+        }));
+        assert!(futures::poll!(&mut request).is_pending());
+        assert_eq!(client.command_tx.capacity(), 0);
+        drop(request);
+        pause.notify_one();
+        let live: ThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(902),
+                params: ThreadStartParams {
+                    ephemeral: Some(true),
+                    ..Default::default()
                 },
             }),
-            response_tx,
-        };
-
-        assert!(command.is_abandoned_request());
+        )
+        .await
+        .expect("live request finishes")
+        .expect("live thread starts");
+        let loaded: codex_app_server_protocol::ThreadLoadedListResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadLoadedList {
+                request_id: RequestId::Integer(903),
+                params: codex_app_server_protocol::ThreadLoadedListParams::default(),
+            }),
+        )
+        .await
+        .expect("loaded list finishes")
+        .expect("loaded list");
+        assert_eq!(
+            loaded.data,
+            vec![live.thread.id],
+            "cancelled start must not create a loaded thread"
+        );
+        assert_eq!(loaded.next_cursor, None);
+        client.shutdown().await.expect("shutdown");
     }
 
     async fn build_test_config_for_codex_home(codex_home: &Path) -> Config {
@@ -1258,7 +1301,7 @@ mod tests {
         start_test_client_with_capacity(session_source, DEFAULT_IN_PROCESS_CHANNEL_CAPACITY).await
     }
 
-    async fn start_test_remote_server<F, Fut>(handler: F) -> String
+    async fn start_test_remote_server<F, Fut>(handler: F) -> (String, tokio::task::JoinHandle<()>)
     where
         F: FnOnce(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> Fut
             + Send
@@ -1271,7 +1314,7 @@ mod tests {
     async fn start_test_remote_server_with_auth<F, Fut>(
         expected_auth_token: Option<String>,
         handler: F,
-    ) -> String
+    ) -> (String, tokio::task::JoinHandle<()>)
     where
         F: FnOnce(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> Fut
             + Send
@@ -1282,7 +1325,7 @@ mod tests {
             .await
             .expect("listener should bind");
         let addr = listener.local_addr().expect("listener address");
-        tokio::spawn(async move {
+        let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept should succeed");
             let websocket = accept_hdr_async(
                 stream,
@@ -1303,7 +1346,7 @@ mod tests {
             .expect("websocket upgrade should succeed");
             handler(websocket).await;
         });
-        format!("ws://{addr}")
+        (format!("ws://{addr}"), server)
     }
 
     async fn expect_remote_initialize<S>(websocket: &mut tokio_tungstenite::WebSocketStream<S>)
@@ -1533,13 +1576,14 @@ mod tests {
     #[tokio::test]
     async fn typed_request_roundtrip_works() {
         let client = start_test_client(SessionSource::Exec).await;
-        let _response: ConfigRequirementsReadResponse = client
+        let response: ConfigRequirementsReadResponse = client
             .request_typed(ClientRequest::ConfigRequirementsRead {
                 request_id: RequestId::Integer(1),
                 params: None,
             })
             .await
             .expect("typed request should succeed");
+        assert_eq!(response.requirements, None);
         client.shutdown().await.expect("shutdown should complete");
     }
 
@@ -1620,14 +1664,98 @@ mod tests {
     async fn tiny_channel_capacity_still_supports_request_roundtrip() {
         let client =
             start_test_client_with_capacity(SessionSource::Exec, /*channel_capacity*/ 1).await;
-        let _response: ConfigRequirementsReadResponse = client
+        let response: ConfigRequirementsReadResponse = client
             .request_typed(ClientRequest::ConfigRequirementsRead {
                 request_id: RequestId::Integer(1),
                 params: None,
             })
             .await
             .expect("typed request should succeed");
+        assert_eq!(response.requirements, None);
         client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn in_process_requests_progress_while_required_delivery_is_full() {
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let mut client = TEST_PENDING_DELIVERY
+            .scope(
+                Arc::clone(&signal),
+                start_test_client_with_capacity(SessionSource::Cli, 1),
+            )
+            .await;
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(800),
+                params: ThreadStartParams::default(),
+            })
+            .await
+            .expect("thread starts");
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let event = client.client.next_event().await.expect("event stream open");
+                if let InProcessServerEvent::ServerNotification(
+                    ServerNotification::ThreadStarted(notification),
+                ) = event
+                {
+                    assert_eq!(notification.thread.id, started.thread.id);
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("initial thread event arrives");
+        for (id, name) in [(801, "first"), (802, "second")] {
+            timeout(
+                Duration::from_secs(2),
+                client.request_typed::<codex_app_server_protocol::ThreadSetNameResponse>(
+                    ClientRequest::ThreadSetName {
+                        request_id: RequestId::Integer(id),
+                        params: codex_app_server_protocol::ThreadSetNameParams {
+                            thread_id: started.thread.id.clone(),
+                            name: name.into(),
+                        },
+                    },
+                ),
+            )
+            .await
+            .expect("name request completes while event queue fills")
+            .expect("set thread name");
+        }
+        timeout(Duration::from_secs(2), signal.notified())
+            .await
+            .expect("worker retains required event behind full queue");
+        let response: GetAccountResponse = timeout(
+            Duration::from_secs(2),
+            client.request_typed(ClientRequest::GetAccount {
+                request_id: RequestId::Integer(803),
+                params: codex_app_server_protocol::GetAccountParams {
+                    refresh_token: false,
+                },
+            }),
+        )
+        .await
+        .expect("RPC completes before event consumption")
+        .expect("account read");
+        assert_eq!(response.account, None);
+        for name in ["first", "second"] {
+            let notification = timeout(Duration::from_secs(2), async {
+                loop {
+                    let event = client.client.next_event().await.expect("event stream open");
+                    if let InProcessServerEvent::ServerNotification(
+                        ServerNotification::ThreadNameUpdated(notification),
+                    ) = event
+                    {
+                        break notification;
+                    }
+                }
+            })
+            .await
+            .expect("required name update arrives");
+            assert_eq!(notification.thread_id, started.thread.id);
+            assert_eq!(notification.thread_name.as_deref(), Some(name));
+        }
+        client.shutdown().await.expect("shutdown");
     }
 
     #[tokio::test]
@@ -1641,25 +1769,26 @@ mod tests {
             .expect("initial event should enqueue");
 
         let mut skipped_events = 0usize;
+        let mut pending_delivery = std::collections::VecDeque::new();
         let result = forward_in_process_event(
             &event_tx,
+            &mut pending_delivery,
             &mut skipped_events,
             InProcessServerEvent::ServerNotification(command_execution_output_delta_notification(
                 "stdout-2",
             )),
             |_| {},
-        )
-        .await;
+        );
         assert_eq!(result, ForwardEventResult::Continue);
         assert_eq!(skipped_events, 1);
 
         let result = forward_in_process_event(
             &event_tx,
+            &mut pending_delivery,
             &mut skipped_events,
             InProcessServerEvent::Lagged { skipped: 2 },
             |_| {},
-        )
-        .await;
+        );
         assert_eq!(result, ForwardEventResult::Continue);
         assert_eq!(skipped_events, 3);
 
@@ -1684,12 +1813,15 @@ mod tests {
         ] {
             let result = forward_in_process_event(
                 &event_tx,
+                &mut pending_delivery,
                 &mut skipped_events,
                 InProcessServerEvent::ServerNotification(notification),
                 |_| {},
-            )
-            .await;
+            );
             assert_eq!(result, ForwardEventResult::Continue);
+            while let Some(event) = pending_delivery.pop_front() {
+                event_tx.send(event).await.expect("deliver required event");
+            }
         }
         assert_eq!(skipped_events, 0);
 
@@ -1737,7 +1869,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_typed_request_roundtrip_works() {
-        let websocket_url = start_test_remote_server(|mut websocket| async move {
+        let (websocket_url, server) = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
             let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
             else {
@@ -1827,6 +1959,10 @@ mod tests {
         assert_eq!(response.account, None);
 
         client.shutdown().await.expect("shutdown should complete");
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server should finish")
+            .expect("server assertions should pass");
     }
 
     #[tokio::test]
@@ -1837,7 +1973,7 @@ mod tests {
         let mut listener = UnixListener::bind(socket_path.as_path())
             .await
             .expect("listener should bind");
-        tokio::spawn(async move {
+        let server = tokio::spawn(async move {
             let stream = listener.accept().await.expect("accept should succeed");
             let mut websocket = accept_async(stream)
                 .await
@@ -1886,12 +2022,16 @@ mod tests {
         assert_eq!(response.account, None);
 
         client.shutdown().await.expect("shutdown should complete");
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server should finish")
+            .expect("server assertions should pass");
     }
 
     #[tokio::test]
     async fn remote_typed_request_accepts_large_single_frame_response() {
         let padding = "x".repeat((17 << 20) + 1024);
-        let websocket_url = start_test_remote_server(move |mut websocket| async move {
+        let (websocket_url, server) = start_test_remote_server(move |mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
             let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
             else {
@@ -1935,12 +2075,16 @@ mod tests {
         );
 
         client.shutdown().await.expect("shutdown should complete");
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server should finish")
+            .expect("server assertions should pass");
     }
 
     #[tokio::test]
     async fn remote_connect_includes_auth_header_when_configured() {
         let auth_token = "remote-bearer-token".to_string();
-        let websocket_url = start_test_remote_server_with_auth(
+        let (websocket_url, server) = start_test_remote_server_with_auth(
             Some(auth_token.clone()),
             |mut websocket| async move {
                 expect_remote_initialize(&mut websocket).await;
@@ -1964,6 +2108,10 @@ mod tests {
         .expect("remote client should connect");
 
         client.shutdown().await.expect("shutdown should complete");
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server should finish")
+            .expect("server assertions should pass");
     }
 
     #[tokio::test]
@@ -2008,7 +2156,7 @@ mod tests {
     #[tokio::test]
     async fn remote_duplicate_request_id_keeps_original_waiter() {
         let (first_request_seen_tx, first_request_seen_rx) = tokio::sync::oneshot::channel();
-        let websocket_url = start_test_remote_server(|mut websocket| async move {
+        let (websocket_url, server) = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
             let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
             else {
@@ -2091,11 +2239,15 @@ mod tests {
         );
 
         client.shutdown().await.expect("shutdown should complete");
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server should finish")
+            .expect("server assertions should pass");
     }
 
     #[tokio::test]
     async fn remote_notifications_arrive_over_websocket() {
-        let websocket_url = start_test_remote_server(|mut websocket| async move {
+        let (websocket_url, server) = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
             write_websocket_message(
                 &mut websocket,
@@ -2126,13 +2278,17 @@ mod tests {
         ));
 
         client.shutdown().await.expect("shutdown should complete");
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server should finish")
+            .expect("server assertions should pass");
     }
 
     #[tokio::test]
     async fn remote_backpressure_preserves_transcript_notifications() {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let (saturated_tx, saturated_rx) = tokio::sync::oneshot::channel();
-        let websocket_url = start_test_remote_server(|mut websocket| async move {
+        let (websocket_url, server) = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
             for notification in [
                 command_execution_output_delta_notification("stdout-1"),
@@ -2292,11 +2448,15 @@ mod tests {
             .send(())
             .expect("server completion signal should send");
         client.shutdown().await.expect("shutdown should complete");
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server should finish")
+            .expect("server assertions should pass");
     }
 
     #[tokio::test]
     async fn remote_server_request_resolution_roundtrip_works() {
-        let websocket_url = start_test_remote_server(|mut websocket| async move {
+        let (websocket_url, server) = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
             let request_id = RequestId::String("srv-1".to_string());
             let server_request = JSONRPCRequest {
@@ -2346,12 +2506,16 @@ mod tests {
             .await
             .expect("server request should resolve");
 
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server should finish")
+            .expect("server assertions should pass");
         client.shutdown().await.expect("shutdown should complete");
     }
 
     #[tokio::test]
     async fn remote_server_request_received_during_initialize_is_rejected() {
-        let websocket_url = start_test_remote_server(|mut websocket| async move {
+        let (websocket_url, server) = start_test_remote_server(|mut websocket| async move {
             let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
             else {
                 panic!("expected initialize request");
@@ -2418,12 +2582,16 @@ mod tests {
             .expect("remote client should connect");
 
         client.shutdown().await.expect("shutdown should complete");
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server should finish")
+            .expect("server assertions should pass");
     }
 
     #[tokio::test]
     async fn remote_initialize_pending_events_are_bounded() {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        let websocket_url = start_test_remote_server(|mut websocket| async move {
+        let (websocket_url, server) = start_test_remote_server(|mut websocket| async move {
             let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
             else {
                 panic!("expected initialize request");
@@ -2467,11 +2635,15 @@ mod tests {
         done_tx
             .send(())
             .expect("server completion signal should send");
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server should finish")
+            .expect("server assertions should pass");
     }
 
     #[tokio::test]
     async fn remote_unknown_server_request_is_rejected() {
-        let websocket_url = start_test_remote_server(|mut websocket| async move {
+        let (websocket_url, server) = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
             let request_id = RequestId::String("srv-unknown".to_string());
             write_websocket_message(
@@ -2501,12 +2673,158 @@ mod tests {
             .await
             .expect("remote client should connect");
 
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server should finish")
+            .expect("server assertions should pass");
         client.shutdown().await.expect("shutdown should complete");
     }
 
     #[tokio::test]
+    async fn remote_disconnect_fails_requests_before_draining_events() {
+        let (websocket_url, server) = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let JSONRPCMessage::Request(first) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("first request")
+            };
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Notification(
+                    serde_json::from_value(
+                        serde_json::to_value(item_completed_notification("preserved"))
+                            .expect("notification JSON"),
+                    )
+                    .expect("notification"),
+                ),
+            )
+            .await;
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: first.id,
+                    result: serde_json::json!({"barrier": true}),
+                }),
+            )
+            .await;
+            let JSONRPCMessage::Request(second) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("second request")
+            };
+            assert_eq!(second.id, RequestId::Integer(2));
+            websocket.close(None).await.expect("close peer");
+        })
+        .await;
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            channel_capacity: 1,
+            ..test_remote_connect_args(websocket_url)
+        })
+        .await
+        .expect("connect");
+        let handle = client.request_handle();
+        let request = |id| JSONRPCRequest {
+            id: RequestId::Integer(id),
+            method: "test/pending".into(),
+            params: None,
+            trace: None,
+        };
+        assert_eq!(
+            handle
+                .request_json_rpc(request(1))
+                .await
+                .expect("first RPC")
+                .expect("first response"),
+            serde_json::json!({"barrier": true})
+        );
+        let error = timeout(Duration::from_secs(2), handle.request_json_rpc(request(2)))
+            .await
+            .expect("disconnect fails pending RPC without consuming events")
+            .expect_err("peer closed");
+        assert_eq!(error.kind(), ErrorKind::ConnectionAborted);
+        assert_eq!(
+            handle
+                .request_json_rpc(request(3))
+                .await
+                .expect_err("admission is retired")
+                .kind(),
+            ErrorKind::BrokenPipe
+        );
+        assert!(
+            matches!(client.next_event().await, Some(AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(notification))) if matches!(&notification.item, codex_app_server_protocol::ThreadItem::AgentMessage { text, .. } if text == "preserved"))
+        );
+        assert!(matches!(
+            client.next_event().await,
+            Some(AppServerEvent::Disconnected { .. })
+        ));
+        assert!(client.next_event().await.is_none());
+        client.shutdown().await.expect("shutdown");
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server finishes")
+            .expect("server assertions");
+    }
+
+    #[tokio::test]
+    async fn cancelled_remote_request_is_abandoned_before_dispatch() {
+        let (websocket_url, server) = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("live request")
+            };
+            assert_eq!(
+                request.id,
+                RequestId::Integer(2),
+                "cancelled request must never reach peer"
+            );
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::json!({"live": true}),
+                }),
+            )
+            .await;
+        })
+        .await;
+        let pause = Arc::new(tokio::sync::Notify::new());
+        let client = TEST_WORKER_PAUSE
+            .scope(
+                Arc::clone(&pause),
+                RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+                    channel_capacity: 1,
+                    ..test_remote_connect_args(websocket_url)
+                }),
+            )
+            .await
+            .expect("connect");
+        let handle = client.request_handle();
+        let request = |id| JSONRPCRequest {
+            id: RequestId::Integer(id),
+            method: "test/cancellation".into(),
+            params: None,
+            trace: None,
+        };
+        let mut cancelled = Box::pin(handle.request_json_rpc(request(1)));
+        assert!(futures::poll!(&mut cancelled).is_pending());
+        drop(cancelled);
+        pause.notify_one();
+        let result = timeout(Duration::from_secs(2), handle.request_json_rpc(request(2)))
+            .await
+            .expect("live request completes")
+            .expect("transport")
+            .expect("response");
+        assert_eq!(result, serde_json::json!({"live": true}));
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server finishes")
+            .expect("server assertions");
+        client.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
     async fn remote_disconnect_surfaces_as_event() {
-        let websocket_url = start_test_remote_server(|mut websocket| async move {
+        let (websocket_url, server) = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
             websocket.close(None).await.expect("close should succeed");
         })
@@ -2520,6 +2838,10 @@ mod tests {
             .await
             .expect("disconnect event should arrive");
         assert!(matches!(event, AppServerEvent::Disconnected { .. }));
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server should finish")
+            .expect("server assertions should pass");
     }
 
     #[test]
@@ -2812,9 +3134,15 @@ mod tests {
             .expect("a full command queue must not escape the shutdown deadline")
             .expect("forced shutdown should complete");
 
-        assert!(worker.is_finished(), "shutdown must retire the actual worker");
+        assert!(
+            worker.is_finished(),
+            "shutdown must retire the actual worker"
+        );
         assert_eq!(
-            queued_request.await.expect_err("queued request is abandoned").kind(),
+            queued_request
+                .await
+                .expect_err("queued request is abandoned")
+                .kind(),
             ErrorKind::BrokenPipe
         );
         assert_eq!(

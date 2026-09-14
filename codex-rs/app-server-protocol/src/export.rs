@@ -167,21 +167,53 @@ pub fn generate_ts_with_options(
         && let Some(prettier_bin) = prettier
         && !ts_files.is_empty()
     {
-        let status = Command::new(prettier_bin)
-            .arg("--write")
-            .arg("--log-level")
-            .arg("warn")
-            .args(ts_files.iter().map(|p| p.as_os_str()))
-            .status()
-            .with_context(|| format!("Failed to invoke Prettier at {}", prettier_bin.display()))?;
-        if !status.success() {
-            return Err(anyhow!("Prettier failed with status {status}"));
+        for batch in prettier_file_batches(prettier_bin, &ts_files)? {
+            let status = Command::new(prettier_bin)
+                .arg("--write")
+                .arg("--log-level")
+                .arg("warn")
+                .args(batch)
+                .status()
+                .with_context(|| {
+                    format!("Failed to invoke Prettier at {}", prettier_bin.display())
+                })?;
+            if !status.success() {
+                return Err(anyhow!("Prettier failed with status {status}"));
+            }
         }
     }
 
     trim_trailing_whitespace_in_ts_files(&ts_files)?;
 
     Ok(())
+}
+
+// Conservative allowance for Windows quoting/escaping, below the process limit.
+fn prettier_file_batches<'a>(prettier: &Path, files: &'a [PathBuf]) -> Result<Vec<&'a [PathBuf]>> {
+    const LIMIT: usize = 30_000;
+    let argument_size = |path: &Path| path.as_os_str().as_encoded_bytes().len() * 2 + 3;
+    let base = argument_size(prettier) + 64;
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut size = base;
+    for (index, file) in files.iter().enumerate() {
+        let next = argument_size(file);
+        anyhow::ensure!(
+            base + next <= LIMIT,
+            "Prettier file argument is too long: {}",
+            file.display()
+        );
+        if size + next > LIMIT {
+            batches.push(&files[start..index]);
+            start = index;
+            size = base;
+        }
+        size += next;
+    }
+    if start < files.len() {
+        batches.push(&files[start..]);
+    }
+    Ok(batches)
 }
 
 pub fn generate_internal_json_schema(out_dir: &Path) -> Result<()> {
@@ -229,8 +261,17 @@ pub fn generate_json_with_experimental(out_dir: &Path, experimental_api: bool) -
         .retain(|schema| !schema.in_v1_dir || JSON_V1_ALLOWLIST.contains(&schema.logical_name()));
 
     let mut bundle = build_schema_bundle(schemas)?;
+    let registered_fields = experimental_fields();
+    let method_types = experimental_method_types();
+    let methods = experimental_methods();
     if !experimental_api {
-        filter_experimental_schema(&mut bundle)?;
+        filter_experimental_schema_with_metadata(
+            &mut bundle,
+            &registered_fields,
+            &methods,
+            &method_types,
+        );
+        filter_experimental_json_files(out_dir, &registered_fields, &methods, &method_types)?;
     }
     write_pretty_json(
         out_dir.join("codex_app_server_protocol.schemas.json"),
@@ -241,10 +282,6 @@ pub fn generate_json_with_experimental(out_dir: &Path, experimental_api: bool) -
         out_dir.join("codex_app_server_protocol.v2.schemas.json"),
         &flat_v2_bundle,
     )?;
-
-    if !experimental_api {
-        filter_experimental_json_files(out_dir)?;
-    }
 
     Ok(())
 }
@@ -270,7 +307,7 @@ pub(crate) fn filter_experimental_ts_tree(tree: &mut BTreeMap<PathBuf, String>) 
         ("ServerRequest.ts", EXPERIMENTAL_SERVER_METHODS),
     ] {
         if let Some(content) = tree.get_mut(Path::new(file_name)) {
-            *content = filter_request_ts_contents(std::mem::take(content), experimental_methods);
+            *content = filter_request_ts_contents(std::mem::take(content), experimental_methods)?;
         }
     }
 
@@ -292,7 +329,7 @@ pub(crate) fn filter_experimental_ts_tree(tree: &mut BTreeMap<PathBuf, String>) 
         let filtered = filter_experimental_type_fields_ts_contents(
             std::mem::take(content),
             experimental_field_names,
-        );
+        )?;
         *content = filtered;
     }
 
@@ -308,16 +345,18 @@ fn filter_request_ts(out_dir: &Path, file_name: &str, experimental_methods: &[&s
     }
     let mut content =
         fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
-    content = filter_request_ts_contents(content, experimental_methods);
+    content = filter_request_ts_contents(content, experimental_methods)?;
 
     fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
 }
 
-fn filter_request_ts_contents(mut content: String, experimental_methods: &[&str]) -> String {
-    let Some((prefix, body, suffix)) = split_type_alias(&content) else {
-        return content;
-    };
+fn filter_request_ts_contents(
+    mut content: String,
+    experimental_methods: &[&str],
+) -> Result<String> {
+    let (prefix, body, suffix) =
+        split_type_alias(&content).context("cannot parse generated request type alias")?;
     let experimental_methods: HashSet<&str> = experimental_methods
         .iter()
         .copied()
@@ -333,10 +372,7 @@ fn filter_request_ts_contents(mut content: String, experimental_methods: &[&str]
         .collect();
     let new_body = filtered_arms.join(" | ");
     content = format!("{prefix}{new_body}{suffix}");
-    let import_usage_scope = split_type_alias(&content)
-        .map(|(_, filtered_body, _)| filtered_body)
-        .unwrap_or_else(|| new_body.clone());
-    prune_unused_type_imports(content, &import_usage_scope)
+    Ok(prune_unused_type_imports(content))
 }
 
 /// Removes experimental properties from generated TypeScript type files.
@@ -374,7 +410,7 @@ fn filter_experimental_fields_in_ts_file(
 ) -> Result<()> {
     let mut content =
         fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
-    content = filter_experimental_type_fields_ts_contents(content, experimental_field_names);
+    content = filter_experimental_type_fields_ts_contents(content, experimental_field_names)?;
     fs::write(path, content).with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
 }
@@ -382,10 +418,9 @@ fn filter_experimental_fields_in_ts_file(
 fn filter_experimental_type_fields_ts_contents(
     mut content: String,
     experimental_field_names: &HashSet<String>,
-) -> String {
-    let Some((open_brace, close_brace)) = type_body_brace_span(&content) else {
-        return content;
-    };
+) -> Result<String> {
+    let (open_brace, close_brace) = type_body_brace_span(&content)
+        .context("cannot parse generated type with experimental fields")?;
     let inner = &content[open_brace + 1..close_brace];
     let fields = split_top_level_multi(inner, &[',', ';']);
     let filtered_fields: Vec<String> = fields
@@ -400,20 +435,41 @@ fn filter_experimental_type_fields_ts_contents(
     let prefix = &content[..open_brace + 1];
     let suffix = &content[close_brace..];
     content = format!("{prefix}{new_inner}{suffix}");
-    let import_usage_scope = split_type_alias(&content)
-        .map(|(_, body, _)| body)
-        .unwrap_or_else(|| new_inner.clone());
-    prune_unused_type_imports(content, &import_usage_scope)
+    Ok(prune_unused_type_imports(content))
 }
 
+#[cfg(test)]
 fn filter_experimental_schema(bundle: &mut Value) -> Result<()> {
-    let registered_fields = experimental_fields();
-    filter_experimental_fields_in_root(bundle, &registered_fields);
-    filter_experimental_fields_in_definitions(bundle, &registered_fields);
-    prune_experimental_methods(bundle, EXPERIMENTAL_CLIENT_METHODS);
-    prune_experimental_methods(bundle, EXPERIMENTAL_SERVER_METHODS);
-    remove_experimental_method_type_definitions(bundle);
+    filter_experimental_schema_with_metadata(
+        bundle,
+        &experimental_fields(),
+        &experimental_methods(),
+        &experimental_method_types(),
+    );
     Ok(())
+}
+
+fn experimental_methods() -> HashSet<&'static str> {
+    EXPERIMENTAL_CLIENT_METHODS
+        .iter()
+        .chain(EXPERIMENTAL_SERVER_METHODS)
+        .copied()
+        .filter(|method| !method.is_empty())
+        .collect()
+}
+
+fn filter_experimental_schema_with_metadata(
+    bundle: &mut Value,
+    registered_fields: &[&'static crate::experimental_api::ExperimentalField],
+    methods: &HashSet<&str>,
+    method_types: &HashSet<String>,
+) {
+    filter_experimental_fields_in_root(bundle, registered_fields);
+    filter_experimental_fields_in_definitions(bundle, registered_fields);
+    prune_experimental_methods_inner(bundle, methods);
+    if let Some(definitions) = bundle.get_mut("definitions").and_then(Value::as_object_mut) {
+        remove_experimental_method_type_definitions_map(definitions, method_types);
+    }
 }
 
 fn filter_experimental_fields_in_root(
@@ -501,15 +557,6 @@ fn remove_property_from_schema(schema: &mut Value, field_name: &str) {
     }
 }
 
-fn prune_experimental_methods(bundle: &mut Value, experimental_methods: &[&str]) {
-    let experimental_methods: HashSet<&str> = experimental_methods
-        .iter()
-        .copied()
-        .filter(|method| !method.is_empty())
-        .collect();
-    prune_experimental_methods_inner(bundle, &experimental_methods);
-}
-
 fn prune_experimental_methods_inner(value: &mut Value, experimental_methods: &HashSet<&str>) {
     match value {
         Value::Array(items) => {
@@ -552,14 +599,28 @@ fn is_experimental_method_variant(value: &Value, experimental_methods: &HashSet<
     false
 }
 
-fn filter_experimental_json_files(out_dir: &Path) -> Result<()> {
+fn filter_experimental_json_files(
+    out_dir: &Path,
+    registered_fields: &[&'static crate::experimental_api::ExperimentalField],
+    methods: &HashSet<&str>,
+    method_types: &HashSet<String>,
+) -> Result<()> {
     for path in json_files_in_recursive(out_dir)? {
+        if path == out_dir.join("codex_app_server_protocol.schemas.json")
+            || path == out_dir.join("codex_app_server_protocol.v2.schemas.json")
+        {
+            continue;
+        }
         let mut value = read_json_value(&path)?;
-        filter_experimental_schema(&mut value)?;
+        filter_experimental_schema_with_metadata(
+            &mut value,
+            registered_fields,
+            methods,
+            method_types,
+        );
         write_pretty_json(path, &value)?;
     }
-    let experimental_method_types = experimental_method_types();
-    remove_generated_type_files(out_dir, &experimental_method_types, "json")?;
+    remove_generated_type_files(out_dir, method_types, "json")?;
     Ok(())
 }
 
@@ -626,14 +687,6 @@ fn remove_generated_type_entries(
     }
 }
 
-fn remove_experimental_method_type_definitions(bundle: &mut Value) {
-    let type_names = experimental_method_types();
-    let Some(definitions) = bundle.get_mut("definitions").and_then(Value::as_object_mut) else {
-        return;
-    };
-    remove_experimental_method_type_definitions_map(definitions, &type_names);
-}
-
 fn remove_experimental_method_type_definitions_map(
     definitions: &mut Map<String, Value>,
     experimental_type_names: &HashSet<String>,
@@ -664,12 +717,30 @@ fn remove_experimental_method_type_definitions_map(
     }
 }
 
-fn prune_unused_type_imports(content: String, type_alias_body: &str) -> String {
+fn prune_unused_type_imports(content: String) -> String {
+    let Some((declaration, _)) = type_declaration_start(&content) else {
+        return content;
+    };
+    let mut identifiers = HashSet::new();
+    let mut state = ScanState::default();
+    let mut start = None;
+    let scope = &content[declaration..];
+    for (index, ch) in scope
+        .char_indices()
+        .chain(std::iter::once((scope.len(), ' ')))
+    {
+        if !state.in_ignored_syntax() && is_ident_char(ch) {
+            start.get_or_insert(index);
+        } else if let Some(start) = start.take() {
+            identifiers.insert(&scope[start..index]);
+        }
+        state.observe(ch);
+    }
     let trailing_newline = content.ends_with('\n');
     let mut lines = Vec::new();
     for line in content.lines() {
         if let Some(type_name) = parse_imported_type_name(line)
-            && !type_alias_body.contains(type_name)
+            && !identifiers.contains(type_name)
         {
             continue;
         }
@@ -719,33 +790,64 @@ fn read_json_value(path: &Path) -> Result<Value> {
     serde_json::from_str(&content).with_context(|| format!("Failed to parse {}", path.display()))
 }
 
+// Restrict parsing to a real generated declaration, ignoring examples in comments.
+fn type_declaration_start(content: &str) -> Option<(usize, bool)> {
+    let mut state = ScanState::default();
+    for (index, ch) in content.char_indices() {
+        if !state.in_ignored_syntax()
+            && state.depth.is_top_level()
+            && (index == 0
+                || !content[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_ident_char))
+        {
+            if content[index..].starts_with("export type ") {
+                return Some((index, false));
+            }
+            if content[index..].starts_with("export interface ") {
+                return Some((index, true));
+            }
+        }
+        state.observe(ch);
+    }
+    None
+}
+
+fn top_level_char(input: &str, target: char) -> Option<usize> {
+    let mut state = ScanState::default();
+    for (index, ch) in input.char_indices() {
+        if !state.in_ignored_syntax() && state.depth.is_top_level() && ch == target {
+            return Some(index);
+        }
+        state.observe(ch);
+    }
+    None
+}
+
 fn split_type_alias(content: &str) -> Option<(String, String, String)> {
-    let eq_index = content.find('=')?;
-    let semi_index = content.rfind(';')?;
-    if semi_index <= eq_index {
+    let (start, interface) = type_declaration_start(content)?;
+    if interface {
         return None;
     }
-    let prefix = content[..eq_index + 1].to_string();
-    let body = content[eq_index + 1..semi_index].to_string();
-    let suffix = content[semi_index..].to_string();
-    Some((prefix, body, suffix))
+    let eq_index = start + top_level_char(&content[start..], '=')?;
+    let semi_index = eq_index + 1 + top_level_char(&content[eq_index + 1..], ';')?;
+    Some((
+        content[..eq_index + 1].to_string(),
+        content[eq_index + 1..semi_index].to_string(),
+        content[semi_index..].to_string(),
+    ))
 }
 
 fn type_body_brace_span(content: &str) -> Option<(usize, usize)> {
-    if let Some(eq_index) = content.find('=') {
-        let after_eq = &content[eq_index + 1..];
-        let (open_rel, close_rel) = find_top_level_brace_span(after_eq)?;
-        return Some((eq_index + 1 + open_rel, eq_index + 1 + close_rel));
-    }
-
-    const INTERFACE_MARKER: &str = "export interface";
-    let interface_index = content.find(INTERFACE_MARKER)?;
-    let after_interface = &content[interface_index + INTERFACE_MARKER.len()..];
-    let (open_rel, close_rel) = find_top_level_brace_span(after_interface)?;
-    Some((
-        interface_index + INTERFACE_MARKER.len() + open_rel,
-        interface_index + INTERFACE_MARKER.len() + close_rel,
-    ))
+    let (start, interface) = type_declaration_start(content)?;
+    let body_start = if interface {
+        start + "export interface ".len()
+    } else {
+        start + top_level_char(&content[start..], '=')? + 1
+    };
+    let (open, close) = find_top_level_brace_span(&content[body_start..])?;
+    Some((body_start + open, body_start + close))
 }
 
 fn find_top_level_brace_span(input: &str) -> Option<(usize, usize)> {
@@ -835,6 +937,7 @@ fn parse_property_name(input: &str) -> Option<String> {
     }
     if let Some((literal, consumed)) = parse_string_literal(trimmed) {
         let rest = trimmed[consumed..].trim_start();
+        let rest = rest.strip_prefix('?').unwrap_or(rest).trim_start();
         if rest.starts_with(':') {
             return Some(literal);
         }
@@ -890,7 +993,7 @@ fn parse_string_literal(input: &str) -> Option<(String, usize)> {
 }
 
 fn is_ident_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || ch == '_'
+    ch.is_alphanumeric() || ch == '_' || ch == '$'
 }
 
 #[derive(Default)]
@@ -1013,7 +1116,6 @@ fn build_schema_bundle(schemas: Vec<GeneratedSchema>) -> Result<Value> {
             rewrite_refs_to_known_namespaces(&mut value, &namespaced_types);
         }
 
-        let mut forced_namespace_refs: Vec<(String, String)> = Vec::new();
         if let Value::Object(ref mut obj) = value
             && let Some(defs) = obj.remove("definitions")
             && let Value::Object(defs_obj) = defs
@@ -1036,26 +1138,17 @@ fn build_schema_bundle(schemas: Vec<GeneratedSchema>) -> Result<Value> {
                     if namespace.as_deref() == Some(ns.as_str()) {
                         rewrite_refs_to_namespace(&mut def_schema, ns);
                         insert_into_namespace(&mut definitions, ns, def_name.clone(), def_schema)?;
-                    } else if !forced_namespace_refs
-                        .iter()
-                        .any(|(name, existing_ns)| name == &def_name && existing_ns == ns)
-                    {
-                        forced_namespace_refs.push((def_name.clone(), ns.clone()));
                     }
                 } else {
-                    definitions.insert(def_name, def_schema);
+                    insert_definition(&mut definitions, def_name, def_schema, "root")?;
                 }
             }
-        }
-
-        for (name, ns) in forced_namespace_refs {
-            rewrite_named_ref_to_namespace(&mut value, &ns, &name);
         }
 
         if let Some(ref ns) = namespace {
             insert_into_namespace(&mut definitions, ns, logical_name.clone(), value)?;
         } else {
-            definitions.insert(logical_name, value);
+            insert_definition(&mut definitions, logical_name, value, "root")?;
         }
     }
 
@@ -1099,14 +1192,24 @@ fn build_flat_v2_schema(bundle: &Value) -> Result<Value> {
         .and_then(Value::as_object)
         .ok_or_else(|| anyhow!("expected v2 namespace in bundle definitions"))?;
 
-    let mut flat_root = root.clone();
+    let mut flat_root: Map<String, Value> = root
+        .iter()
+        .filter(|(key, _)| key.as_str() != "definitions")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
     let title = root
         .get("title")
         .and_then(Value::as_str)
         .unwrap_or("CodexAppServerProtocol");
     let mut flat_definitions = v2_definitions.clone();
     let mut shared_definitions = Map::new();
-    let mut non_v2_refs = collect_non_v2_refs(&Value::Object(v2_definitions.clone()));
+    let mut non_v2_refs = HashSet::new();
+    for schema in v2_definitions.values() {
+        collect_non_v2_refs_inner(schema, &mut non_v2_refs);
+    }
+    for schema in flat_definitions.values_mut() {
+        rewrite_ref_prefix(schema, "#/definitions/v2/", "#/definitions/");
+    }
 
     for shared in FLAT_V2_SHARED_DEFINITIONS {
         let Some(shared_schema) = definitions.get(*shared) else {
@@ -1118,15 +1221,20 @@ fn build_flat_v2_schema(bundle: &Value) -> Result<Value> {
     }
 
     for name in collect_definition_dependencies(definitions, non_v2_refs) {
-        if name == "v2" || flat_definitions.contains_key(&name) {
+        if name == "v2" {
             continue;
         }
         if let Some(schema) = definitions.get(&name) {
-            flat_definitions.insert(name, schema.clone());
+            let mut schema = schema.clone();
+            rewrite_ref_prefix(&mut schema, "#/definitions/v2/", "#/definitions/");
+            insert_definition(&mut flat_definitions, name, schema, "flat v2")?;
         }
     }
 
-    flat_definitions.extend(shared_definitions);
+    for (name, mut schema) in shared_definitions {
+        rewrite_ref_prefix(&mut schema, "#/definitions/v2/", "#/definitions/");
+        insert_definition(&mut flat_definitions, name, schema, "flat v2")?;
+    }
     flat_root.insert("title".to_string(), Value::String(format!("{title}V2")));
     flat_root.insert("definitions".to_string(), Value::Object(flat_definitions));
     let mut flat_bundle = Value::Object(flat_root);
@@ -1301,8 +1409,36 @@ fn insert_definition(
     schema: Value,
     location: &str,
 ) -> Result<()> {
-    if let Some(existing) = definitions.get(&name) {
+    if let Some(existing) = definitions.get_mut(&name) {
         if existing == &schema {
+            return Ok(());
+        }
+
+        // Schemars includes the dialect and type title on standalone roots but
+        // omits them on the same type embedded in another schema's definitions.
+        // Compare that representation consistently without masking different
+        // dialects, titles, or validation keywords.
+        let normalize = |value: &Value| {
+            let mut value = value.clone();
+            if let Some(map) = value.as_object_mut() {
+                if map.get("$schema").and_then(Value::as_str)
+                    == Some("http://json-schema.org/draft-07/schema#")
+                {
+                    map.remove("$schema");
+                }
+                if map.get("title").and_then(Value::as_str) == Some(name.as_str()) {
+                    map.remove("title");
+                }
+            }
+            value
+        };
+        if normalize(existing) == normalize(&schema) {
+            // Root definitions historically kept the last emitted representation;
+            // namespace and flattened definitions kept the first. Preserve those
+            // annotations without allowing incompatible schemas to overwrite.
+            if location == "root" {
+                *existing = schema;
+            }
             return Ok(());
         }
 
@@ -1907,33 +2043,6 @@ fn ensure_dir(dir: &Path) -> Result<()> {
         .with_context(|| format!("Failed to create output directory {}", dir.display()))
 }
 
-fn rewrite_named_ref_to_namespace(value: &mut Value, ns: &str, name: &str) {
-    let direct = format!("#/definitions/{name}");
-    let prefixed = format!("{direct}/");
-    let replacement = format!("#/definitions/{ns}/{name}");
-    let replacement_prefixed = format!("{replacement}/");
-    match value {
-        Value::Object(obj) => {
-            if let Some(Value::String(reference)) = obj.get_mut("$ref") {
-                if reference == &direct {
-                    *reference = replacement;
-                } else if let Some(rest) = reference.strip_prefix(&prefixed) {
-                    *reference = format!("{replacement_prefixed}{rest}");
-                }
-            }
-            for child in obj.values_mut() {
-                rewrite_named_ref_to_namespace(child, ns, name);
-            }
-        }
-        Value::Array(items) => {
-            for child in items {
-                rewrite_named_ref_to_namespace(child, ns, name);
-            }
-        }
-        _ => {}
-    }
-}
-
 fn prepend_header_if_missing(path: &Path) -> Result<()> {
     let mut content = String::new();
     {
@@ -2188,6 +2297,10 @@ mod tests {
                 .is_some_and(|stem| {
                     stem.ends_with("Params")
                         || stem == "InitializeCapabilities"
+                        // Preserve optional client fields while admitting the nulls
+                        // serialized by skill metadata and image inputs.
+                        || stem == "SkillInterface"
+                        || stem == "UserInput"
                         || matches!(
                             stem,
                             "CollabAgentRef"
@@ -2365,32 +2478,177 @@ mod tests {
 
     #[test]
     fn generate_ts_with_experimental_api_retains_experimental_entries() -> Result<()> {
-        let client_request_ts = ClientRequest::export_to_string()?;
-        assert_eq!(client_request_ts.contains("mock/experimentalMethod"), true);
-        assert_eq!(
-            client_request_ts.contains("MockExperimentalMethodParams"),
-            true
-        );
-        assert_eq!(
-            v2::MockExperimentalMethodParams::export_to_string()?
-                .contains("MockExperimentalMethodParams"),
-            true
-        );
-        assert_eq!(
-            v2::MockExperimentalMethodResponse::export_to_string()?
-                .contains("MockExperimentalMethodResponse"),
-            true
-        );
+        for experimental_api in [false, true] {
+            let dir = tempfile::tempdir()?;
+            generate_ts_with_options(
+                dir.path(),
+                None,
+                GenerateTsOptions {
+                    experimental_api,
+                    run_prettier: false,
+                    ..GenerateTsOptions::default()
+                },
+            )?;
+            let requests = fs::read_to_string(dir.path().join("ClientRequest.ts"))?;
+            assert!(requests.contains("thread/start"));
+            assert_eq!(
+                requests.contains("mock/experimentalMethod"),
+                experimental_api
+            );
+            assert_eq!(
+                dir.path()
+                    .join("v2/MockExperimentalMethodParams.ts")
+                    .exists(),
+                experimental_api
+            );
+            assert_eq!(
+                dir.path()
+                    .join("v2/MockExperimentalMethodResponse.ts")
+                    .exists(),
+                experimental_api
+            );
+            let params = fs::read_to_string(dir.path().join("v2/ThreadStartParams.ts"))?;
+            assert_eq!(params.contains("mockExperimentalField"), experimental_api);
+            let approval = fs::read_to_string(
+                dir.path()
+                    .join("v2/CommandExecutionRequestApprovalParams.ts"),
+            )?;
+            assert_eq!(approval.contains("additionalPermissions"), experimental_api);
+        }
+        Ok(())
+    }
 
-        let thread_start_ts = v2::ThreadStartParams::export_to_string()?;
-        assert_eq!(thread_start_ts.contains("mockExperimentalField"), true);
-        let command_execution_request_approval_ts =
-            v2::CommandExecutionRequestApprovalParams::export_to_string()?;
-        assert_eq!(
-            command_execution_request_approval_ts.contains("additionalPermissions"),
-            true
-        );
+    #[test]
+    fn experimental_ts_filter_ignores_doc_declarations_and_preserves_exact_imports() -> Result<()> {
+        static FIELD: crate::experimental_api::ExperimentalField =
+            crate::experimental_api::ExperimentalField {
+                type_name: "Demo",
+                field_name: "hidden-field",
+                reason: "test/hidden",
+            };
+        for declaration in [
+            r#"export type Demo = { "hidden-field"?: Foo, kept: FooBar };"#,
+            r#"export interface Demo extends Base { "hidden-field"?: Foo; kept: FooBar; }"#,
+        ] {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("Demo.ts");
+            let docs = r#"/** export type Demo = { "hidden-field": "docs" }; */"#;
+            fs::write(
+                &path,
+                format!(
+                    "import type {{ Foo }} from \"./Foo\";\nimport type {{ FooBar }} from \"./FooBar\";\nimport type {{ Base }} from \"./Base\";\n{docs}\n{declaration}\n"
+                ),
+            )?;
+            filter_experimental_type_fields_ts(dir.path(), &[&FIELD])?;
+            let output = fs::read_to_string(&path)?;
+            assert!(output.contains(docs));
+            assert!(!output.contains(r#""hidden-field"?:"#));
+            assert!(!output.contains("import type { Foo }"));
+            assert!(output.contains("import type { FooBar }"));
+            assert_eq!(
+                output.contains("import type { Base }"),
+                declaration.contains("extends Base")
+            );
+            assert!(output.contains("kept: FooBar"));
+        }
+        Ok(())
+    }
 
+    #[test]
+    fn experimental_ts_filter_rejects_unparseable_target_without_writing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("Demo.ts");
+        let input = "export type Demo = string;";
+        fs::write(&path, input)?;
+        assert!(
+            filter_experimental_fields_in_ts_file(&path, &HashSet::from(["hidden".to_string()]))
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(path)?, input);
+        Ok(())
+    }
+
+    #[test]
+    fn prettier_batches_preserve_exact_scope_and_bound_command_size() -> Result<()> {
+        let files: Vec<_> = (0..660)
+            .map(|i| {
+                PathBuf::from(format!(
+                    "C:/long output directory/{}/Type{i}.ts",
+                    "x".repeat(80)
+                ))
+            })
+            .collect();
+        let batches = prettier_file_batches(Path::new("prettier"), &files)?;
+        assert!(batches.len() > 1);
+        assert_eq!(
+            batches
+                .iter()
+                .flat_map(|batch| batch.iter())
+                .collect::<Vec<_>>(),
+            files.iter().collect::<Vec<_>>()
+        );
+        for batch in batches {
+            let command_length = "prettier --write --log-level warn ".len()
+                + batch
+                    .iter()
+                    .map(|path| path.to_string_lossy().encode_utf16().count() + 3)
+                    .sum::<usize>();
+            assert!(command_length < 32767);
+        }
+        assert_eq!(
+            prettier_file_batches(Path::new("prettier"), &files[..2])?,
+            vec![&files[..2]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn schema_bundles_reject_conflicting_definitions() -> Result<()> {
+        let schema = |kind: &str| GeneratedSchema {
+            namespace: None,
+            logical_name: "Shared".into(),
+            in_v1_dir: false,
+            value: serde_json::json!({"type":kind}),
+        };
+        assert!(
+            build_schema_bundle(vec![schema("integer"), schema("string")])
+                .unwrap_err()
+                .to_string()
+                .contains("Shared")
+        );
+        let same = build_schema_bundle(vec![schema("integer"), schema("integer")])?;
+        assert_eq!(same["definitions"]["Shared"]["type"], "integer");
+        let standalone = GeneratedSchema {
+            value: serde_json::json!({
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "title": "Shared",
+                "type": "integer"
+            }),
+            ..schema("integer")
+        };
+        let equivalent = build_schema_bundle(vec![schema("integer"), standalone])?;
+        assert_eq!(equivalent["definitions"]["Shared"]["title"], "Shared");
+        assert_eq!(equivalent["definitions"]["Shared"]["type"], "integer");
+        let conflicting_title = GeneratedSchema {
+            value: serde_json::json!({"title": "Different", "type": "integer"}),
+            ..schema("integer")
+        };
+        assert!(build_schema_bundle(vec![schema("integer"), conflicting_title]).is_err());
+        let mut bundle = serde_json::json!({"definitions": {
+            "Shared": {"type":"integer"},
+            "v2": {"Shared":{"type":"string"}, "Use":{"$ref":"#/definitions/Shared"}}
+        }});
+        assert!(
+            build_flat_v2_schema(&bundle)
+                .unwrap_err()
+                .to_string()
+                .contains("Shared")
+        );
+        bundle["definitions"]["v2"]["Shared"]["type"] = serde_json::json!("integer");
+        assert_eq!(
+            build_flat_v2_schema(&bundle)?["definitions"]["Shared"]["type"],
+            "integer"
+        );
         Ok(())
     }
 
@@ -2863,6 +3121,13 @@ permissionProfile?: string | null};
         assert_eq!(
             command_execution_request_approval_json.contains("additionalPermissions"),
             false
+        );
+        let approval_schema: serde_json::Value =
+            serde_json::from_str(&command_execution_request_approval_json)?;
+        assert!(
+            approval_schema["properties"]
+                .get("availableDecisions")
+                .is_some()
         );
 
         let client_request_json = fs::read_to_string(output_dir.join("ClientRequest.json"))?;

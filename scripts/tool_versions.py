@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tomllib
 from functools import cache
 from pathlib import Path
@@ -18,7 +19,9 @@ def scripts_ruff_requirement() -> str:
         (REPO_ROOT / "scripts" / "pyproject.toml").read_text(encoding="utf-8")
     )
     for dependency in data.get("project", {}).get("dependencies", []):
-        if isinstance(dependency, str) and dependency.startswith("ruff"):
+        if isinstance(dependency, str) and re.match(
+            r"^\s*ruff(?=\s|\[|[<>=!~@;]|$)", dependency, re.IGNORECASE
+        ):
             return dependency
     raise RuntimeError("scripts/pyproject.toml must declare a ruff dependency")
 

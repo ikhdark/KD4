@@ -60,12 +60,15 @@ use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 
 #[test]
-fn logging_contract_analytics_failure_metadata_omits_body() {
-    let metadata = analytics_failure_log_metadata(500, "response body secret".len());
+fn analytics_failure_metadata_preserves_status_and_optional_declared_length() {
+    let metadata = analytics_failure_log_metadata(500, Some(20));
 
     assert_eq!(metadata.status, 500);
-    assert_eq!(metadata.body_bytes, 20);
-    assert!(!format!("{metadata:?}").contains("response body secret"));
+    assert_eq!(metadata.declared_body_bytes, Some(20));
+    assert_eq!(
+        analytics_failure_log_metadata(503, None).declared_body_bytes,
+        None
+    );
 }
 
 fn sample_accepted_line_fingerprint_event(thread_id: &str) -> TrackEventRequest {
@@ -203,17 +206,33 @@ async fn pending_analytics_queue_delivers_bounded_correlations_and_recovers() {
     ready(&client).await;
     client.track_response(7, RequestId::Integer(-2), sample_thread_resume_response());
     let events = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        use std::io::Read;
+        let mut file = fs::File::open(&capture_path).expect("open capture");
+        let mut pending = Vec::new();
+        let mut events = Vec::new();
         loop {
-            let events = fs::read_to_string(&capture_path)
-                .unwrap()
-                .lines()
-                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                .flat_map(|payload| payload["events"].as_array().unwrap().clone())
-                .collect::<Vec<_>>();
-            if events
-                .iter()
-                .any(|event| event["event_params"]["thread_id"] == "thread-2")
-            {
+            file.read_to_end(&mut pending)
+                .expect("read appended capture");
+            let mut consumed = 0;
+            let mut barrier = false;
+            for (index, byte) in pending.iter().enumerate() {
+                if *byte != b'\n' {
+                    continue;
+                }
+                let mut payload: serde_json::Value =
+                    serde_json::from_slice(&pending[consumed..index])
+                        .expect("complete capture record");
+                let serde_json::Value::Array(batch) = payload["events"].take() else {
+                    panic!("events array");
+                };
+                for event in batch {
+                    barrier |= event["event_params"]["thread_id"] == "thread-2";
+                    events.push(event);
+                }
+                consumed = index + 1;
+            }
+            pending.drain(..consumed);
+            if barrier {
                 break events;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -576,7 +595,7 @@ fn track_response_only_enqueues_analytics_relevant_responses() {
 }
 
 #[test]
-fn ignored_notifications_are_filtered_before_cloning() {
+fn ignored_notifications_are_not_enqueued() {
     let (client, mut receiver) = client_with_receiver();
     let notification = ServerNotification::AccountUpdated(AccountUpdatedNotification {
         auth_mode: None,
@@ -587,6 +606,135 @@ fn ignored_notifications_are_filtered_before_cloning() {
     client.track_notification(&notification);
 
     assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+
+    let item = codex_app_server_protocol::ThreadItem::Sleep {
+        id: "sleep".to_string(),
+        duration_ms: 10,
+    };
+    client.track_notification(&ServerNotification::ItemStarted(
+        codex_app_server_protocol::ItemStartedNotification {
+            thread_id: "thread".to_string(),
+            turn_id: "turn".to_string(),
+            started_at_ms: 1,
+            item: item.clone(),
+        },
+    ));
+    client.track_notification(&ServerNotification::ItemCompleted(
+        codex_app_server_protocol::ItemCompletedNotification {
+            thread_id: "thread".to_string(),
+            turn_id: "turn".to_string(),
+            completed_at_ms: 11,
+            item,
+        },
+    ));
+    assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+}
+
+#[test]
+fn usage_deduplication_survives_queue_overflow_and_capacity_duplicates() {
+    use crate::analytics_client_tests::sample_plugin_metadata;
+    use crate::analytics_client_tests::test_tracking_context;
+    use crate::facts::AppInvocation;
+    use crate::facts::CustomAnalyticsFact;
+
+    let (client, mut receiver) = client_with_receiver();
+    let tracking = test_tracking_context("thread", "turn");
+    let app = || AppInvocation {
+        connector_id: Some("calendar".to_string()),
+        app_name: None,
+        invocation_type: None,
+    };
+    for id in 0..8 {
+        client.track_error_response(7, RequestId::Integer(id), None);
+    }
+    client.track_app_used(tracking.clone(), app());
+    client.track_plugin_used(tracking.clone(), sample_plugin_metadata());
+    for _ in 0..8 {
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AnalyticsFact::ErrorResponse { .. })
+        ));
+    }
+    client.track_app_used(tracking.clone(), app());
+    client.track_plugin_used(tracking.clone(), sample_plugin_metadata());
+    assert!(
+        matches!(receiver.try_recv(), Ok(AnalyticsFact::Custom(CustomAnalyticsFact::AppUsed(input))) if input.tracking.turn_id == "turn")
+    );
+    assert!(
+        matches!(receiver.try_recv(), Ok(AnalyticsFact::Custom(CustomAnalyticsFact::PluginUsed(input))) if input.tracking.turn_id == "turn")
+    );
+
+    for id in 1..super::ANALYTICS_EVENT_DEDUPE_MAX_KEYS {
+        let tracking = test_tracking_context("thread", &format!("turn-{id}"));
+        client.track_app_used(tracking.clone(), app());
+        client.track_plugin_used(tracking, sample_plugin_metadata());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AnalyticsFact::Custom(CustomAnalyticsFact::AppUsed(_)))
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AnalyticsFact::Custom(CustomAnalyticsFact::PluginUsed(_)))
+        ));
+    }
+    client.track_app_used(tracking.clone(), app());
+    client.track_plugin_used(tracking, sample_plugin_metadata());
+    assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+}
+
+#[tokio::test]
+async fn queued_facts_are_sent_in_bounded_fifo_batches() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let queue = AnalyticsEventsQueue::new(
+        codex_login::AuthManager::from_auth_for_testing(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        ),
+        AnalyticsEventsDestination::Http { url: server.uri() },
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+    let client = AnalyticsEventsClient { queue: Some(queue) };
+    // No await until all facts are queued: the worker then sees one bounded drain.
+    for id in 0..33 {
+        client.track_app_used(
+            crate::analytics_client_tests::test_tracking_context("thread", &format!("turn-{id}")),
+            crate::facts::AppInvocation {
+                connector_id: Some("calendar".to_string()),
+                app_name: None,
+                invocation_type: None,
+            },
+        );
+    }
+    let requests = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let requests = server.received_requests().await.expect("requests");
+            if requests.len() == 2 {
+                break requests;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("two batches delivered");
+    let batches: Vec<serde_json::Value> = requests
+        .iter()
+        .map(|request| serde_json::from_slice(&request.body).expect("payload"))
+        .collect();
+    assert_eq!(batches[0]["events"].as_array().unwrap().len(), 32);
+    assert_eq!(batches[1]["events"].as_array().unwrap().len(), 1);
+    let turns: Vec<_> = batches
+        .iter()
+        .flat_map(|batch| batch["events"].as_array().unwrap())
+        .map(|event| event["event_params"]["turn_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        turns,
+        (0..33).map(|id| format!("turn-{id}")).collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]

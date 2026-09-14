@@ -16,11 +16,11 @@ use serde_json::json;
 #[command(version)]
 struct Cli {
     /// Whether to output results in JSON format.
-    #[clap(long, default_value = "false")]
+    #[clap(long, default_value = "false", requires = "pattern")]
     json: bool,
 
-    /// Maximum number of results to return.
-    #[clap(long, short = 'l', default_value = "64")]
+    /// Maximum number of search results to return (requires a pattern).
+    #[clap(long, short = 'l', default_value = "64", requires = "pattern")]
     limit: NonZero<usize>,
 
     /// Directory to search.
@@ -28,35 +28,32 @@ struct Cli {
     cwd: Option<PathBuf>,
 
     /// Include matching file indices in the output.
-    #[arg(long, default_value = "false")]
+    #[arg(long, default_value = "false", requires = "pattern")]
     compute_indices: bool,
 
-    // Filetree traversal is I/O-bound; more than two workers has not shown a
-    // meaningful benefit in practice.
-    /// Number of worker threads to use.
+    /// Number of fuzzy-matcher worker threads.
     #[clap(long, default_value = "2")]
     threads: NonZero<usize>,
 
     /// Exclude patterns.
-    #[arg(short, long, action = ArgAction::Append)]
+    #[arg(short, long, action = ArgAction::Append, requires = "pattern")]
     exclude: Vec<String>,
 
     /// Search pattern.
     pattern: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let reporter = StdioReporter {
         write_output_as_json: cli.json,
         show_indices: cli.compute_indices && std::io::stdout().is_terminal(),
     };
-    run_main(cli, &reporter).await?;
+    run_main(cli, &reporter)?;
     Ok(())
 }
 
-async fn run_main(
+fn run_main(
     Cli {
         pattern,
         limit,
@@ -77,8 +74,8 @@ async fn run_main(
         None => {
             reporter.warn_no_search_pattern(&search_directory);
 
-            let mut entries = tokio::fs::read_dir(search_directory).await?;
-            while let Some(entry) = entries.next_entry().await? {
+            for entry in std::fs::read_dir(search_directory)? {
+                let entry = entry?;
                 println!("{}", entry.file_name().to_string_lossy());
             }
             return Ok(());
@@ -236,5 +233,24 @@ mod tests {
         assert!(cli.compute_indices);
         assert_eq!(cli.exclude, ["target"]);
         assert_eq!(cli.pattern.as_deref(), Some("needle"));
+    }
+
+    #[test]
+    fn cli_requires_a_pattern_for_search_output_options() {
+        assert!(Cli::try_parse_from(["codex-file-search"]).is_ok());
+        for args in [
+            vec!["--json"],
+            vec!["--limit", "1"],
+            vec!["--exclude", "target"],
+            vec!["--compute-indices"],
+        ] {
+            let error = Cli::try_parse_from(std::iter::once("codex-file-search").chain(args))
+                .err()
+                .expect("missing pattern must fail");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+        }
     }
 }

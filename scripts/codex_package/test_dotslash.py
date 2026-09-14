@@ -3,6 +3,8 @@
 import hashlib
 import io
 import json
+import os
+import zipfile
 from pathlib import Path
 import sys
 import tarfile
@@ -138,7 +140,12 @@ class DotSlashCacheStampTest(unittest.TestCase):
                 archive_member=spec.rg_name,
                 url="https://example.test/rg.zip",
             )
-            dest = root / "cache" / "rg-cache" / spec.rg_name
+            identity = hashlib.sha256(
+                json.dumps(
+                    [digest, "zip", spec.rg_name], separators=(",", ":")
+                ).encode()
+            ).hexdigest()
+            dest = root / "cache" / "rg-cache" / identity / spec.rg_name
             dest.parent.mkdir(parents=True)
             dest.write_text("rg", encoding="utf-8")
             dotslash.write_extracted_member_stamp(dest, artifact)
@@ -195,7 +202,12 @@ class DotSlashCacheStampTest(unittest.TestCase):
                 archive_member=spec.rg_name,
                 url="https://example.test/rg.zip",
             )
-            dest = root / "cache" / "rg-cache" / spec.rg_name
+            identity = hashlib.sha256(
+                json.dumps(
+                    [digest, "zip", spec.rg_name], separators=(",", ":")
+                ).encode()
+            ).hexdigest()
+            dest = root / "cache" / "rg-cache" / identity / spec.rg_name
             dest.parent.mkdir(parents=True)
             dest.write_text("rg", encoding="utf-8")
             dotslash.write_extracted_member_stamp(dest, artifact)
@@ -210,7 +222,9 @@ class DotSlashCacheStampTest(unittest.TestCase):
                     cache_key="rg-cache",
                     dest_name=spec.rg_name,
                 )
-                dest.unlink()
+                before = dest.stat()
+                dest.write_bytes(b"xx")
+                os.utime(dest, ns=(before.st_atime_ns, before.st_mtime_ns))
 
                 def fake_extract(
                     _archive_path: Path,
@@ -219,6 +233,7 @@ class DotSlashCacheStampTest(unittest.TestCase):
                     _artifact_label: str,
                 ) -> None:
                     extract_dest.write_text("rg", encoding="utf-8")
+                    dotslash.write_extracted_member_stamp(extract_dest, artifact)
 
                 with (
                     mock.patch.object(dotslash, "archive_is_valid", return_value=True),
@@ -256,6 +271,89 @@ class DotSlashCacheStampTest(unittest.TestCase):
             self.assertEqual(third, dest)
             extract.assert_called_once()
 
+    def test_concurrent_artifact_revisions_keep_their_own_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            spec = TARGET_SPECS["x86_64-pc-windows-msvc"]
+            manifests = []
+            artifacts = []
+            for label in ["A", "B"]:
+                archive_path = root / f"{label}.zip"
+                with zipfile.ZipFile(archive_path, "w") as zipped:
+                    zipped.writestr("rg.exe", label.encode())
+                artifact = DotSlashArtifact(
+                    archive_path.stat().st_size,
+                    hashlib.sha256(archive_path.read_bytes()).hexdigest(),
+                    "zip",
+                    "rg.exe",
+                    archive_path.as_uri(),
+                )
+                artifacts.append(artifact)
+                manifest = root / f"{label}.json"
+                manifest.write_text(
+                    json.dumps(
+                        {
+                            "platforms": {
+                                spec.dotslash_platform: {
+                                    "providers": [{"url": artifact.url}],
+                                    "hash": "sha256",
+                                    "size": artifact.size,
+                                    "digest": artifact.digest,
+                                    "format": "zip",
+                                    "path": "rg.exe",
+                                }
+                            }
+                        }
+                    )
+                )
+                manifests.append(manifest)
+
+            def fetch(manifest):
+                return dotslash.fetch_dotslash_executable(
+                    spec,
+                    manifest_path=manifest,
+                    artifact_label="rg",
+                    cache_key="shared",
+                    dest_name="rg.exe",
+                )
+
+            original_extract = dotslash.extract_archive_member
+            second = []
+
+            def interleaved_extract(path, artifact, dest, label):
+                original_extract(path, artifact, dest, label)
+                if artifact == artifacts[0]:
+                    second.append(fetch(manifests[1]))
+
+            with (
+                mock.patch.object(
+                    dotslash, "default_cache_root", return_value=root / "cache"
+                ),
+                mock.patch.object(
+                    dotslash, "extract_archive_member", side_effect=interleaved_extract
+                ),
+            ):
+                first = fetch(manifests[0])
+            self.assertNotEqual(first, second[0])
+            self.assertEqual(first.read_bytes(), b"A")
+            self.assertEqual(second[0].read_bytes(), b"B")
+            self.assertTrue(dotslash.extracted_member_is_valid(first, artifacts[0]))
+            self.assertFalse(
+                dotslash.extracted_member_is_valid(second[0], artifacts[0])
+            )
+
+    def test_stamp_publication_failure_preserves_previous_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stamp = Path(temp_dir) / "stamp.json"
+            stamp.write_text('{"old": true}')
+            with mock.patch.object(
+                Path, "replace", side_effect=OSError("publish failed")
+            ):
+                with self.assertRaisesRegex(OSError, "publish failed"):
+                    dotslash.write_json_stamp(stamp, {"new": True})
+            self.assertEqual(dotslash.read_json_stamp(stamp), {"old": True})
+            self.assertEqual(list(stamp.parent.glob("*.tmp")), [])
+
     def test_json_stamp_reads_are_memoized_until_file_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             stamp = Path(temp_dir) / "stamp.json"
@@ -265,7 +363,10 @@ class DotSlashCacheStampTest(unittest.TestCase):
                 self.assertEqual(dotslash.read_json_stamp(stamp), {"ok": True})
                 self.assertEqual(dotslash.read_json_stamp(stamp), {"ok": True})
 
-            self.assertEqual(loads.call_count, 1)
+                self.assertEqual(loads.call_count, 1)
+                stamp.write_text('{"changed": true}\n', encoding="utf-8")
+                self.assertEqual(dotslash.read_json_stamp(stamp), {"changed": True})
+                self.assertEqual(loads.call_count, 2)
 
     def test_manifest_rejects_unsafe_archive_member(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

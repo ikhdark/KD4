@@ -24,6 +24,105 @@ def publish_source_text() -> str:
 
 
 class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
+    def test_restart_waits_for_the_original_process_identity(self) -> None:
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+        fixture_home = self.enterContext(tempfile.TemporaryDirectory())
+        command = rf"""
+. {ps_single_quote(SCRIPT)} -ImportOnly
+$script:Reads = 0
+$script:Stopped = 0
+$script:Launched = $false
+$script:Start = [DateTime]::UtcNow
+function Get-CodexDesktopExecutableProof {{ return 'C:\fixture\Desktop.exe' }}
+function Get-CodexDesktopProcessesForPath {{
+    return @([pscustomobject]@{{ Id = 91; Path = 'C:\fixture\Desktop.exe'; StartTime = $script:Start }})
+}}
+function Get-Process {{
+    param([int]$Id)
+    $script:Reads++
+    $process = [pscustomobject]@{{ Id = $Id; Path = 'C:\fixture\Desktop.exe'; StartTime = $script:Start; HasExited = ($script:Reads -ge 3) }}
+    $process | Add-Member -MemberType ScriptMethod -Name Dispose -Value {{}}
+    return $process
+}}
+function Stop-Process {{
+    param([object]$InputObject)
+    if ($InputObject.Id -ne 91) {{ throw 'wrong process stopped' }}
+    $script:Stopped++
+}}
+function Start-Process {{
+    if ($script:Reads -lt 3) {{ throw 'activated before original process exited' }}
+    $script:Launched = $true
+}}
+function Test-DesktopRuntimeProof {{ return $true }}
+Restart-CodexDesktop -LocalCliPath 'C:\fixture\codex.exe' -LocalCodexHome {ps_single_quote(fixture_home)} -LocalCodexSqliteHome {ps_single_quote(fixture_home)}
+[pscustomobject]@{{ Reads = $script:Reads; Stopped = $script:Stopped; Launched = $script:Launched }} | ConvertTo-Json -Compress
+"""
+        result = subprocess.run(
+            [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            env=clean_env(),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=RUN_TIMEOUT_SECONDS,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout.splitlines()[-1]),
+            {"Reads": 3, "Stopped": 1, "Launched": True},
+        )
+
+    def test_main_routing_preserves_already_current_values(self) -> None:
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+        with tempfile.TemporaryDirectory() as temp:
+            command = rf"""
+. {ps_single_quote(SCRIPT)} -ImportOnly
+$ConfigureDesktopLocalCli = $true
+$skipBuildBlockedByStaleSource = $false
+$DryRun = $false
+$DesktopCliEnvironmentTarget = 'Process'
+$InstallDir = {ps_single_quote(Path(temp) / "bin")}
+$targetPath = Join-Path $InstallDir 'codex.exe'
+$LocalCodexHome = {ps_single_quote(temp)}
+$LocalCodexSqliteHome = {ps_single_quote(temp)}
+foreach ($entry in @(@('CODEX_CLI_PATH', $targetPath), @('CODEX_HOME', $LocalCodexHome), @('CODEX_SQLITE_HOME', $LocalCodexSqliteHome))) {{
+    [Environment]::SetEnvironmentVariable($entry[0], $entry[1], 'Process')
+}}
+function Sync-OfficialDesktopEnvironmentCleanup {{ throw 'main must not clear routing before comparing it' }}
+function Set-EnvironmentVariableForTarget {{ throw 'unchanged routing must not be rewritten' }}
+function Send-EnvironmentChangedBroadcast {{ throw 'unchanged routing must not broadcast' }}
+$source = Get-Content -LiteralPath {ps_single_quote(SCRIPT)} -Raw
+$start = $source.IndexOf('$desktopRoutingResult = [pscustomobject]')
+$end = $source.IndexOf('if ($DryRun) {{', $start)
+. ([scriptblock]::Create($source.Substring($start, $end - $start)))
+$desktopRoutingResult | ConvertTo-Json -Compress
+"""
+            result = subprocess.run(
+                [
+                    shell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    command,
+                ],
+                env=clean_env(),
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=RUN_TIMEOUT_SECONDS,
+                creationflags=CREATE_NO_WINDOW,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout.splitlines()[-1]),
+            {"Changed": False, "RestartRequired": False},
+        )
+
     def test_backup_pruning_rejects_unmarked_directory(self) -> None:
         shell = powershell()
         if shell is None:
@@ -36,7 +135,7 @@ $tokens=$null; $errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile(%s,[ref]$tokens,[ref]$errors)
 $fn=$ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Remove-OldCodexBackups'},$true)[0]
 Invoke-Expression $fn.Extent.Text
-try { Remove-OldCodexBackups -BackupDir %s -Keep 0; exit 9 } catch { }
+try { Remove-OldCodexBackups -BackupDir %s -Keep 0; exit 9 } catch { if ($_.Exception.Message -notlike 'Refusing to prune an unmarked backup directory:*') { throw } }
 if (-not (Test-Path -LiteralPath %s -PathType Leaf)) { exit 10 }
 """ % (
                 ps_single_quote(SCRIPT),
@@ -55,6 +154,7 @@ if (-not (Test-Path -LiteralPath %s -PathType Leaf)) { exit 10 }
                 text=True,
                 capture_output=True,
                 check=False,
+                timeout=RUN_TIMEOUT_SECONDS,
             )
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
@@ -98,9 +198,16 @@ foreach ($name in @('Get-VerifiedFileHashObservation', 'Get-CachedLocalPublishFi
 $script:LocalPublishContentHashCache = @{{}}
 function Test-Sha256Text {{ param($Value) return ([string]$Value) -cmatch '\A[0-9a-f]{{64}}\z' }}
 function Get-FileSha256 {{ throw 'nested hash helper must not be called' }}
+$script:hashObservations = 0
+$script:realObservation = (Get-Command Get-VerifiedFileHashObservation).ScriptBlock
+function Get-VerifiedFileHashObservation {{
+    param($Path, $Before)
+    $script:hashObservations++
+    & $script:realObservation -Path $Path -Before $Before
+}}
 $first = Get-CachedLocalPublishFileSha256 -Path {ps_single_quote(payload)}
 $second = Get-CachedLocalPublishFileSha256 -Path {ps_single_quote(payload)}
-[pscustomobject]@{{ first = $first; second = $second }} | ConvertTo-Json -Compress
+[pscustomobject]@{{ first = $first; second = $second; observations = $script:hashObservations }} | ConvertTo-Json -Compress
 """
             result = subprocess.run(
                 [
@@ -121,17 +228,48 @@ $second = Get-CachedLocalPublishFileSha256 -Path {ps_single_quote(payload)}
         self.assertEqual(result.returncode, 0, result.stderr)
         output = json.loads(result.stdout)
         expected = hashlib.sha256("hÃ©llo".encode()).hexdigest()
-        self.assertEqual(output, {"first": expected, "second": expected})
+        self.assertEqual(
+            output, {"first": expected, "second": expected, "observations": 1}
+        )
 
     def test_shutdown_waits_on_verified_handles_without_polling(self) -> None:
-        source = publish_source_text()
-        start = source.index("function Stop-RunningCodexTargetProcesses")
-        end = source.index("function Format-ProofValue", start)
-        function_source = source[start:end]
-
-        self.assertIn("$process.WaitForExit($remainingMilliseconds)", function_source)
-        self.assertNotIn("Start-Sleep -Milliseconds 200", function_source)
-        self.assertNotIn("while ((Get-Date) -lt $forceDeadline)", function_source)
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+        command = rf"""
+$ErrorActionPreference = 'Stop'
+. {ps_single_quote(SCRIPT)} -ImportOnly
+$script:events = [Collections.Generic.List[string]]::new()
+$script:exited = $false
+function Write-ProofLine {{}}
+function Format-ProcessProof {{ return 'test process' }}
+function Stop-Process {{ throw 'gracefully exited process must not be killed' }}
+function Get-LiveProcessesById {{
+    if ($script:exited) {{ return }}
+    $process = [pscustomobject]@{{ MainWindowHandle = [IntPtr]1 }}
+    $process | Add-Member ScriptMethod CloseMainWindow {{ $script:events.Add('close'); return $true }}
+    $process | Add-Member ScriptMethod WaitForExit {{
+        param($milliseconds)
+        $script:events.Add("wait:$($milliseconds -ge 0 -and $milliseconds -le 1000)")
+        $script:exited = $true
+        return $true
+    }}
+    $process | Add-Member ScriptMethod Dispose {{ $script:events.Add('dispose') }}
+    return $process
+}}
+Stop-RunningCodexTargetProcesses -Processes @([pscustomobject]@{{ Id = 123 }}) -TimeoutSeconds 1
+ConvertTo-Json -InputObject @($script:events) -Compress
+"""
+        result = subprocess.run(
+            [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=RUN_TIMEOUT_SECONDS,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), ["close", "wait:True", "dispose"])
 
     def test_process_revalidation_ignores_a_process_that_exited_before_path_read(
         self,
@@ -145,7 +283,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $tokens = $null
 $errors = $null
-$ast = [System.Management.Automation.Language.Parser]::ParseFile('{SCRIPT}', [ref]$tokens, [ref]$errors)
+$ast = [System.Management.Automation.Language.Parser]::ParseFile({ps_single_quote(SCRIPT)}, [ref]$tokens, [ref]$errors)
 if ($errors.Count -ne 0) {{
     throw "Failed to parse publish script: $($errors[0].Message)"
 }}
@@ -246,12 +384,53 @@ if (-not $script:disposed) {{
             publish_script,
         )
 
-    def test_publish_script_uses_global_publish_mutex(self) -> None:
-        publish_script = publish_source_text()
-
-        self.assertIn('"Global\\CodexLocalPublish"', publish_script)
-        self.assertIn(".WaitOne([TimeSpan]::FromSeconds(30))", publish_script)
-        self.assertIn(".ReleaseMutex()", publish_script)
+    def test_publish_mutex_excludes_contenders_and_releases(self) -> None:
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+        command = rf"""
+$ErrorActionPreference = 'Stop'
+. {ps_single_quote(SCRIPT)} -ImportOnly
+# Isolate the name while exercising the actual acquisition/release functions.
+$script:mutexName = 'Local\CodexPublishTest-' + [Guid]::NewGuid().ToString('N')
+$definition = (Get-Command Enter-CodexLocalPublishMutex).ScriptBlock.ToString()
+if (-not $definition.Contains('Global\CodexLocalPublish')) {{ throw 'missing publisher mutex name' }}
+Set-Item Function:Enter-CodexLocalPublishMutex ([ScriptBlock]::Create($definition.Replace('Global\CodexLocalPublish', $script:mutexName)))
+Add-Type -TypeDefinition @'
+using System;
+using System.Threading;
+public static class MutexContender {{
+    public static bool TryAcquire(string name) {{
+        bool acquired = false;
+        var thread = new Thread(() => {{
+            using (var mutex = new Mutex(false, name)) {{
+                acquired = mutex.WaitOne(0);
+                if (acquired) mutex.ReleaseMutex();
+            }}
+        }});
+        thread.IsBackground = true;
+        thread.Start();
+        if (!thread.Join(5000)) throw new TimeoutException("mutex contender hung");
+        return acquired;
+    }}
+}}
+'@
+$lock = Enter-CodexLocalPublishMutex
+try {{ $blocked = -not [MutexContender]::TryAcquire($script:mutexName) }}
+finally {{ Exit-CodexLocalPublishMutex -Lock $lock }}
+$released = [MutexContender]::TryAcquire($script:mutexName)
+[pscustomobject]@{{ blocked = $blocked; released = $released }} | ConvertTo-Json -Compress
+"""
+        result = subprocess.run(
+            [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=RUN_TIMEOUT_SECONDS,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"blocked": True, "released": True})
 
     def test_publish_build_calls_shared_msvc_linker_setup(self) -> None:
         publish_script = publish_source_text()
@@ -276,6 +455,7 @@ if (-not $script:disposed) {{
             capture_output=True,
             text=True,
             check=False,
+            timeout=RUN_TIMEOUT_SECONDS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         commands = result.stdout + result.stderr
@@ -450,15 +630,15 @@ catch {{
             self.skipTest("PowerShell is not available")
         command = rf"""
 . {ps_single_quote(SCRIPT)} -ImportOnly
+$script:Launched = $false
 function Get-CodexDesktopExecutableProof {{ return 'C:\Program Files\WindowsApps\OpenAI.Codex\app\Codex.exe' }}
 function Get-CodexDesktopProcessesForPath {{
     param([string]$DesktopPath)
+    if (-not $script:Launched) {{ return @() }}
     return @([pscustomobject]@{{ Id = 91; Path = $DesktopPath }})
 }}
 function Test-DesktopRuntimeProof {{ return $false }}
-function Start-Process {{}}
-function Stop-Process {{}}
-function Get-LiveProcessesById {{ return @() }}
+function Start-Process {{ $script:Launched = $true }}
 try {{
     Restart-CodexDesktop `
         -LocalCliPath 'C:\local\codex.exe' `
@@ -517,7 +697,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $tokens = $null
 $errors = $null
-$ast = [System.Management.Automation.Language.Parser]::ParseFile('{SCRIPT}', [ref]$tokens, [ref]$errors)
+$ast = [System.Management.Automation.Language.Parser]::ParseFile({ps_single_quote(SCRIPT)}, [ref]$tokens, [ref]$errors)
 if ($errors.Count -ne 0) {{
     throw "Failed to parse publish script: $($errors[0].Message)"
 }}

@@ -5,6 +5,42 @@ use super::truncate_middle_with_token_budget;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn token_budget_includes_marker_for_small_positive_budgets() {
+    for input in ["abcdef".to_string(), "雪!".repeat(100)] {
+        for budget in 1..=20 {
+            let original_count = approx_token_count(&input);
+            let (output, original) = truncate_middle_with_token_budget(&input, budget);
+            assert!(
+                approx_token_count(&output) <= budget,
+                "budget={budget}: {output}"
+            );
+            assert_eq!(
+                original,
+                (original_count > budget).then_some(original_count as u64)
+            );
+            if original_count <= budget {
+                assert_eq!(output, input);
+            }
+        }
+    }
+}
+
+#[test]
+fn token_budget_handles_dense_ends_and_large_sparse_middle() {
+    let input = format!(
+        "{}{}{}",
+        "!".repeat(5_000),
+        "a".repeat(990_000),
+        "!".repeat(5_000)
+    );
+    let (output, original) = truncate_middle_with_token_budget(&input, 2_000);
+    assert_eq!(original, Some(approx_token_count(&input) as u64));
+    assert!(approx_token_count(&output) <= 2_000);
+    assert!(output.starts_with('!') && output.ends_with('!'));
+    assert!(output.contains("tokens truncated"));
+}
+
+#[test]
 fn split_string_works() {
     assert_eq!(
         split_string(

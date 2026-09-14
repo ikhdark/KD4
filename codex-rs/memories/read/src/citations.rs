@@ -60,11 +60,17 @@ fn parse_memory_citation_entry(line: &str) -> Option<MemoryCitationEntry> {
     let note = note.strip_suffix(']')?.trim().to_string();
     let (path, line_range) = location.rsplit_once(':')?;
     let (line_start, line_end) = line_range.split_once('-')?;
+    let path = path.trim();
+    let line_start = line_start.trim().parse().ok()?;
+    let line_end = line_end.trim().parse().ok()?;
+    if path.is_empty() || line_start > line_end {
+        return None;
+    }
 
     Some(MemoryCitationEntry {
-        path: path.trim().to_string(),
-        line_start: line_start.trim().parse().ok()?,
-        line_end: line_end.trim().parse().ok()?,
+        path: path.to_string(),
+        line_start,
+        line_end,
         note,
     })
 }

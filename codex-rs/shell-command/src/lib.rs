@@ -12,7 +12,14 @@ pub use command_safety::is_safe_command;
 
 /// Escapes text that will be placed between PowerShell single quotes.
 pub fn escape_powershell_single_quoted(input: &str) -> String {
-    input.replace('\'', "''")
+    let mut escaped = String::with_capacity(input.len());
+    for ch in input.chars() {
+        escaped.push(ch);
+        if matches!(ch, '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}') {
+            escaped.push(ch);
+        }
+    }
+    escaped
 }
 
 /// Renders one PowerShell single-quoted string literal.

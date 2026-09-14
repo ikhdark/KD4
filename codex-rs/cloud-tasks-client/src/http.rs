@@ -164,7 +164,9 @@ mod api {
             limit: Option<i64>,
             cursor: Option<&str>,
         ) -> Result<TaskListPage> {
-            let limit_i32 = limit.and_then(|lim| i32::try_from(lim).ok());
+            let limit_i32 = limit.map(i32::try_from).transpose().map_err(|_| {
+                CloudTaskError::Msg("Task limit is outside the supported i32 range".to_string())
+            })?;
             let resp = self
                 .backend
                 .list_tasks(limit_i32, Some("current"), env, cursor)
@@ -177,7 +179,7 @@ mod api {
                 .map(map_task_list_item_to_summary)
                 .collect();
 
-            append_error_log(format!(
+            tracing::debug!(
                 "http.list_tasks: env={} limit={} cursor_in={} cursor_out={} items={}",
                 env.unwrap_or("<all>"),
                 limit_i32
@@ -186,7 +188,7 @@ mod api {
                 cursor.unwrap_or("<none>"),
                 resp.cursor.as_deref().unwrap_or("<none>"),
                 tasks.len()
-            ));
+            );
             Ok(TaskListPage {
                 tasks,
                 cursor: resp.cursor,
@@ -194,32 +196,31 @@ mod api {
         }
 
         pub(crate) async fn summary(&self, id: TaskId) -> Result<TaskSummary> {
-            let id_str = id.0.clone();
             let (details, body, ct) = self
                 .details_with_body(&id.0)
                 .await
                 .map_err(|e| CloudTaskError::Http(format!("get_task_details failed: {e}")))?;
-            let parsed: Value = serde_json::from_str(&body).map_err(|e| {
+            // Project only task metadata; the typed response already decoded turns.
+            #[derive(serde::Deserialize)]
+            struct Metadata {
+                task: HashMap<String, Value>,
+                task_status_display: Option<HashMap<String, Value>>,
+            }
+            let parsed: Metadata = serde_json::from_str(&body).map_err(|e| {
                 CloudTaskError::Http(format!(
-                    "Decode error for {}: {e}; content-type={ct}; body={body}",
-                    id.0
+                    "Decode error for {}: {e}; content-type={ct}; body_bytes={}; body_excerpt={}",
+                    id.0,
+                    body.len(),
+                    excerpt(&body, 2000)
                 ))
             })?;
-            let task_obj = parsed
-                .get("task")
-                .and_then(Value::as_object)
-                .ok_or_else(|| {
-                    CloudTaskError::Http(format!("Task metadata missing from details for {id_str}"))
-                })?;
-            let status_display = parsed
-                .get("task_status_display")
-                .or_else(|| task_obj.get("task_status_display"))
-                .and_then(Value::as_object)
-                .map(|m| {
-                    m.iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect::<HashMap<String, Value>>()
-                });
+            let mut task_obj = parsed.task;
+            let status_display = parsed.task_status_display.or_else(|| {
+                match task_obj.remove("task_status_display")? {
+                    Value::Object(map) => Some(map.into_iter().collect()),
+                    _ => None,
+                }
+            });
             let status = map_status(status_display.as_ref());
             let mut summary = diff_summary_from_status_display(status_display.as_ref());
             if summary.files_changed == 0
@@ -229,10 +230,8 @@ mod api {
             {
                 summary = diff_summary_from_diff(&diff);
             }
-            let updated_at_raw = task_obj
-                .get("updated_at")
-                .and_then(Value::as_f64)
-                .or_else(|| task_obj.get("created_at").and_then(Value::as_f64))
+            let updated_at = parse_timestamp_value(task_obj.get("updated_at"))
+                .or_else(|| parse_timestamp_value(task_obj.get("created_at")))
                 .or_else(|| latest_turn_timestamp(status_display.as_ref()));
             let environment_id = task_obj
                 .get("environment_id")
@@ -253,7 +252,7 @@ mod api {
                 id,
                 title,
                 status,
-                updated_at: parse_updated_at(updated_at_raw.as_ref()),
+                updated_at,
                 environment_id,
                 environment_label,
                 summary,
@@ -296,7 +295,9 @@ mod api {
                 None => format!("{}/api/codex/tasks/{}", self.base_url, id.0),
             };
             Err(CloudTaskError::Http(format!(
-                "No assistant text messages in response. GET {url}; content-type={ct}; body={body}"
+                "No assistant text messages in response. GET {url}; content-type={ct}; body_bytes={}; body_excerpt={}",
+                body.len(),
+                excerpt(&body, 2000)
             )))
         }
 
@@ -373,11 +374,11 @@ mod api {
 
             match self.backend.create_task(request_body).await {
                 Ok(id) => {
-                    append_error_log(format!(
+                    tracing::debug!(
                         "new_task: created id={id} env={} prompt_chars={}",
                         env_id,
                         prompt.chars().count()
-                    ));
+                    );
                     Ok(crate::CreatedTask { id: TaskId(id) })
                 }
                 Err(e) => {
@@ -446,6 +447,8 @@ mod api {
             diff_override: Option<String>,
             preflight: bool,
         ) -> Result<ApplyOutcome> {
+            let cwd = std::env::current_dir()
+                .map_err(|e| CloudTaskError::Io(format!("resolve patch working directory: {e}")))?;
             let id = task_id.0.clone();
             let diff = match diff_override {
                 Some(diff) => diff,
@@ -459,7 +462,6 @@ mod api {
                 }
             };
 
-            let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
             // The worker owns the request and Git's temporary files until the
             // entire application finishes, even if the awaiting caller leaves.
             tokio::task::spawn_blocking(move || Self::apply_diff(id, diff, preflight, cwd))
@@ -491,7 +493,7 @@ mod api {
 
             let req = ApplyGitRequest {
                 cwd,
-                diff: diff.clone(),
+                diff,
                 revert: false,
                 preflight,
             };
@@ -550,7 +552,7 @@ mod api {
                 || (preflight && !matches!(status, ApplyStatus::Success))
             {
                 let mut log = String::new();
-                let summary = summarize_patch_for_logging(&diff);
+                let summary = summarize_patch_for_logging(&req.diff);
                 let mode = if preflight { "preflight" } else { "apply" };
                 use std::fmt::Write as _;
                 let _ = writeln!(
@@ -571,10 +573,6 @@ mod api {
                     tail(&r.stderr, /*max*/ 2000)
                 );
                 let _ = writeln!(&mut log, "{summary}");
-                let _ = writeln!(
-                    &mut log,
-                    "----- PATCH BEGIN -----\n{diff}\n----- PATCH END -----"
-                );
                 append_error_log(&log);
             }
 
@@ -793,9 +791,8 @@ mod api {
         TaskStatus::Pending
     }
 
-    fn parse_updated_at(ts: Option<&f64>) -> DateTime<Utc> {
+    fn parse_updated_at(ts: Option<&f64>) -> Option<DateTime<Utc>> {
         ts.and_then(|ts| timestamp_from_seconds(*ts))
-            .unwrap_or_else(Utc::now)
     }
 
     fn env_label_from_status_display(v: Option<&HashMap<String, Value>>) -> Option<String> {
@@ -809,17 +806,45 @@ mod api {
         let mut files_changed = 0usize;
         let mut lines_added = 0usize;
         let mut lines_removed = 0usize;
+        let mut remaining = (0usize, 0usize);
+        let mut git_headers = false;
         for line in diff.lines() {
             if line.starts_with("diff --git ") {
                 files_changed += 1;
+                git_headers = true;
+                remaining = (0, 0);
                 continue;
             }
-            if line.starts_with("+++") || line.starts_with("---") || line.starts_with("@@") {
+            if line.starts_with("@@ ") {
+                let mut ranges = line.split_whitespace().skip(1);
+                let count = |range: Option<&str>| {
+                    range
+                        .map(|r| r.split_once(',').map_or("1", |(_, count)| count))
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .unwrap_or(0)
+                };
+                remaining = (count(ranges.next()), count(ranges.next()));
+                continue;
+            }
+            if remaining == (0, 0) {
+                if !git_headers && line.starts_with("--- ") {
+                    files_changed += 1;
+                }
                 continue;
             }
             match line.as_bytes().first() {
-                Some(b'+') => lines_added += 1,
-                Some(b'-') => lines_removed += 1,
+                Some(b'+') => {
+                    lines_added += 1;
+                    remaining.1 = remaining.1.saturating_sub(1);
+                }
+                Some(b'-') => {
+                    lines_removed += 1;
+                    remaining.0 = remaining.0.saturating_sub(1);
+                }
+                Some(b' ') => {
+                    remaining.0 = remaining.0.saturating_sub(1);
+                    remaining.1 = remaining.1.saturating_sub(1);
+                }
                 _ => {}
             }
         }
@@ -854,15 +879,13 @@ mod api {
         out
     }
 
-    fn latest_turn_timestamp(v: Option<&HashMap<String, Value>>) -> Option<f64> {
+    fn latest_turn_timestamp(v: Option<&HashMap<String, Value>>) -> Option<DateTime<Utc>> {
         let map = v?;
         let latest = map
             .get("latest_turn_status_display")
             .and_then(Value::as_object)?;
-        latest
-            .get("updated_at")
-            .or_else(|| latest.get("created_at"))
-            .and_then(Value::as_f64)
+        parse_timestamp_value(latest.get("updated_at"))
+            .or_else(|| parse_timestamp_value(latest.get("created_at")))
     }
 
     fn attempt_total_from_status_display(v: Option<&HashMap<String, Value>>) -> Option<usize> {
@@ -879,7 +902,8 @@ mod api {
         if t.starts_with("diff --git ") {
             return true;
         }
-        let has_dash_headers = diff.contains("\n--- ") && diff.contains("\n+++ ");
+        let has_dash_headers = diff.lines().any(|line| line.starts_with("--- "))
+            && diff.lines().any(|line| line.starts_with("+++ "));
         let has_hunk = diff.contains("\n@@ ") || diff.starts_with("@@ ");
         has_dash_headers && has_hunk
     }
@@ -909,15 +933,19 @@ mod api {
             .ok()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "<unknown>".to_string());
-        let head: String = patch.lines().take(20).collect::<Vec<&str>>().join("\n");
-        let head_trunc = if head.len() > 800 {
-            format!("{}…", &head[..head.floor_char_boundary(800)])
-        } else {
-            head
-        };
+        let head = excerpt(patch, 800);
+        let head_trunc = head.lines().take(20).collect::<Vec<_>>().join("\n");
         format!(
             "patch_summary: kind={kind} lines={lines} chars={chars} cwd={cwd} ; head=\n{head_trunc}"
         )
+    }
+
+    fn excerpt(text: &str, max_bytes: usize) -> String {
+        if text.len() <= max_bytes {
+            text.to_string()
+        } else {
+            format!("{}…", &text[..text.floor_char_boundary(max_bytes)])
+        }
     }
 
     #[cfg(test)]
@@ -1044,16 +1072,70 @@ mod api {
                     attempt.turn_id
                 );
             }
-            let before = Utc::now();
             let summary = client
                 .get_task_summary(TaskId("task".to_string()))
                 .await
                 .expect("public task summary");
-            let after = Utc::now();
             server.await.expect("HTTP server");
             assert_eq!(summary.id, TaskId("task".to_string()));
             assert_eq!(summary.title, "Invalid timestamp");
-            assert!(before <= summary.updated_at && summary.updated_at <= after);
+            assert_eq!(summary.updated_at, None);
+        }
+
+        #[tokio::test]
+        async fn task_summary_validates_timestamp_fallbacks_and_counts_hunk_content() {
+            let patch = "--- a/f\n+++ b/f\n@@ -1 +1 @@\n---counter;\n+++counter;\n--- a/g\n+++ b/g\n@@ -0,0 +1 @@\n+++ value\n";
+            let (client, server) = client_with_json_responses(vec![(
+                "/api/codex/tasks/task",
+                serde_json::json!({
+                    "task": {"title": "Fallback", "updated_at": 1e300, "created_at": -1.25},
+                        "current_diff_task_turn": {"output_items": [{"type": "output_diff", "diff": patch}]}
+                }),
+                ),
+                ("/api/codex/tasks/task", serde_json::json!({
+                    "task": {"title": "Latest turn", "updated_at": 1e300},
+                    "task_status_display": {"latest_turn_status_display": {"updated_at": 1e300, "created_at": 1.25}}
+                }))
+            ]).await;
+            let summary = client
+                .get_task_summary(TaskId("task".to_string()))
+                .await
+                .expect("summary");
+            assert_eq!(
+                summary.updated_at,
+                DateTime::from_timestamp(-2, 750_000_000)
+            );
+            assert_eq!(
+                summary.summary,
+                DiffSummary {
+                    files_changed: 2,
+                    lines_added: 2,
+                    lines_removed: 1
+                }
+            );
+            let summary = client
+                .get_task_summary(TaskId("task".to_string()))
+                .await
+                .expect("latest turn timestamp");
+            assert_eq!(summary.updated_at, DateTime::from_timestamp(1, 250_000_000));
+            server.await.expect("server");
+        }
+
+        #[tokio::test]
+        async fn list_rejects_unrepresentable_limit_before_sending_request() {
+            let client = HttpClient::new(
+                "http://127.0.0.1:1",
+                codex_http_client::HttpClientFactory::new(
+                    codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+                ),
+            );
+            let error = client
+                .list_tasks(None, Some(i64::MAX), None)
+                .await
+                .expect_err("invalid limit");
+            assert!(
+                matches!(error, CloudTaskError::Msg(ref message) if message.contains("i32 range"))
+            );
         }
 
         #[test]
@@ -1160,7 +1242,9 @@ mod api {
             git(cwd, &["add", "file.txt"]);
             git(cwd, &["commit", "--quiet", "-m", "initial"]);
             std::fs::write(cwd.join("file.txt"), "after\n").expect("changed file");
-            let patch = git(cwd, &["diff", "--binary"]);
+            // An ordinary unified patch starts with the old-file header at byte zero.
+            let patch =
+                "--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-before\n+after\n".to_string();
             std::fs::write(cwd.join("file.txt"), "before\n").expect("restore file");
             // Git's normal clean-filter path supplies a real slow subprocess on
             // both Windows (Git's sh) and Unix, without replacing patch logic.

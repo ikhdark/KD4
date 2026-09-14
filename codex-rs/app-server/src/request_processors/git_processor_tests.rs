@@ -13,6 +13,17 @@ async fn git_diff_to_remote_response_maps_git_result_to_protocol_payload() {
     let remote = temp.path().join("remote.git");
     std::fs::create_dir_all(&repo).expect("create repository directory");
     run_git(&repo, &["init"]);
+    let hooks = temp.path().join("empty-hooks");
+    std::fs::create_dir(&hooks).expect("create empty hooks directory");
+    run_git(
+        &repo,
+        &[
+            "config",
+            "core.hooksPath",
+            hooks.to_str().expect("hooks path"),
+        ],
+    );
+    run_git(&repo, &["config", "commit.gpgSign", "false"]);
     run_git(&repo, &["config", "core.autocrlf", "false"]);
     run_git(&repo, &["config", "user.email", "test@example.com"]);
     run_git(&repo, &["config", "user.name", "Test User"]);
@@ -39,7 +50,11 @@ async fn git_diff_to_remote_response_maps_git_result_to_protocol_payload() {
         ],
     );
     run_git(&repo, &["push", "-u", "origin", &branch]);
-    std::fs::write(repo.join("tracked.txt"), "base\nlocal\n").expect("write local change");
+    std::fs::write(repo.join("tracked.txt"), "base\nunpushed\n").expect("write unpushed change");
+    run_git(&repo, &["add", "tracked.txt"]);
+    run_git(&repo, &["commit", "-m", "unpushed"]);
+    std::fs::write(repo.join("tracked.txt"), "base\nunpushed\nlocal\n")
+        .expect("write local change");
 
     let payload = git_diff_to_remote_response(GitDiffToRemoteParams { cwd: repo })
         .await
@@ -51,12 +66,14 @@ async fn git_diff_to_remote_response_maps_git_result_to_protocol_payload() {
 
     assert_eq!(response.sha, GitSha::new(&base_sha));
     assert!(response.diff.contains("tracked.txt"));
+    assert!(response.diff.contains("+unpushed"));
     assert!(response.diff.contains("+local"));
 }
 
 #[tokio::test]
 async fn git_diff_to_remote_response_preserves_invalid_request_error() {
-    let cwd = tempfile::tempdir().expect("tempdir").path().to_path_buf();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path().to_path_buf();
 
     let error = git_diff_to_remote_response(GitDiffToRemoteParams { cwd: cwd.clone() })
         .await

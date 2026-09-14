@@ -1,4 +1,6 @@
 An earlier checkpoint summary is already present in the supplied history.
+Compare against the latest effective checkpoint, including all previously
+appended updates. Explicitly retire resolved blockers and superseded next actions.
 Produce only a concise incremental update containing task-relevant information
 that became true, changed, or remains newly unresolved after that checkpoint.
 Do not repeat unchanged facts from the earlier summary. The runtime will append

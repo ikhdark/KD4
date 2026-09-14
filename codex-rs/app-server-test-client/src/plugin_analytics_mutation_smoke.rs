@@ -63,7 +63,19 @@ pub(super) fn run(
         result: sequence_result,
         uninstall_rpc_failed,
     } = run_mutation_sequence(&mut client, &capture_path, &initial);
-    let restoration = restore_uninstalled_state(&mut client, remote_plugin_id);
+    // A timed-out mutation may have reached the backend before its child was killed.
+    // Recover through a fresh connection; never replay an ambiguous installation.
+    drop(client);
+    let restoration =
+        match spawn_client(codex_bin, config_overrides, &capture_path).and_then(|mut client| {
+            client.initialize()?;
+            Ok(client)
+        }) {
+            Ok(mut recovery_client) => {
+                restore_uninstalled_state(&mut recovery_client, remote_plugin_id)
+            }
+            Err(err) => RestorationStatus::Unknown(err),
+        };
     println!("capture file: {}", capture_path.display());
 
     match (sequence_result, restoration) {
@@ -92,13 +104,6 @@ pub(super) fn run(
                 "FAIL-LOCAL-CACHE: backend state is uninstalled, but local cleanup reported an error: {cleanup_err:#}"
             );
             Err(sequence_err.unwrap_or(cleanup_err))
-        }
-        (sequence_result, RestorationStatus::Dirty(cleanup_err)) => {
-            if let Err(err) = sequence_result {
-                eprintln!("mutation smoke failed before cleanup: {err:#}");
-            }
-            print_dirty_recovery(codex_bin, config_overrides, remote_plugin_id, &cleanup_err);
-            Err(cleanup_err)
         }
         (sequence_result, RestorationStatus::Unknown(cleanup_err)) => {
             if let Err(err) = sequence_result {
@@ -137,10 +142,6 @@ pub(super) fn run_cleanup(
             eprintln!(
                 "FAIL-LOCAL-CACHE: backend state is uninstalled, but local cleanup reported an error: {err:#}"
             );
-            Err(err)
-        }
-        RestorationStatus::Dirty(err) => {
-            print_dirty_recovery(codex_bin, config_overrides, remote_plugin_id, &err);
             Err(err)
         }
         RestorationStatus::Unknown(err) => {
@@ -381,7 +382,7 @@ fn wait_for_installed_state(
     expected_state: ExpectedInstalledState,
     deadline: Instant,
 ) -> Result<RemotePluginExpectation> {
-    client.with_stdio_deadline(deadline, |client| {
+    client.with_operation_deadline(deadline, |client| {
         wait_for_installed_state_until(client, remote_plugin_id, expected_state, deadline)
     })
 }
@@ -399,8 +400,7 @@ fn wait_for_installed_state_until(
         match read_remote_plugin(client, remote_plugin_id) {
             Ok(plugin) if plugin.installed == expected_state.is_installed() => return Ok(plugin),
             Ok(_) => {}
-            Err(err) if Instant::now() >= deadline => return Err(err),
-            Err(_) => {}
+            Err(err) => return Err(err),
         }
         if Instant::now() >= deadline {
             bail!(
@@ -414,13 +414,30 @@ fn wait_for_installed_state_until(
 enum RestorationStatus {
     Clean,
     LocalCleanupFailure(anyhow::Error),
-    Dirty(anyhow::Error),
     Unknown(anyhow::Error),
 }
 
 fn restore_uninstalled_state(
     client: &mut CodexClient,
     remote_plugin_id: &str,
+) -> RestorationStatus {
+    let deadline = Instant::now() + STATE_TIMEOUT;
+    match client.with_operation_deadline(deadline, |client| {
+        Ok(restore_uninstalled_state_until(
+            client,
+            remote_plugin_id,
+            deadline,
+        ))
+    }) {
+        Ok(status) => status,
+        Err(err) => RestorationStatus::Unknown(err),
+    }
+}
+
+fn restore_uninstalled_state_until(
+    client: &mut CodexClient,
+    remote_plugin_id: &str,
+    deadline: Instant,
 ) -> RestorationStatus {
     let current = match read_remote_plugin(client, remote_plugin_id) {
         Ok(current) => current,
@@ -435,7 +452,7 @@ fn restore_uninstalled_state(
         client,
         remote_plugin_id,
         ExpectedInstalledState::Uninstalled,
-        Instant::now() + STATE_TIMEOUT,
+        deadline,
     ) {
         Ok(_) => match uninstall_result {
             Ok(()) => RestorationStatus::Clean,
@@ -448,7 +465,7 @@ fn restore_uninstalled_state(
                     "cleanup uninstall failed: {uninstall_err:#}; state verification failed: {state_err:#}"
                 ),
             };
-            RestorationStatus::Dirty(error)
+            RestorationStatus::Unknown(error)
         }
     }
 }
@@ -471,24 +488,12 @@ fn wait_for_remote_plugin_event(
     }
 }
 
-fn print_dirty_recovery(
-    codex_bin: &Path,
-    config_overrides: &[String],
-    remote_plugin_id: &str,
-    err: &anyhow::Error,
-) {
-    eprintln!(
-        "FAIL-DIRTY: remote plugin `{remote_plugin_id}` still appears installed after cleanup: {err:#}"
-    );
-    print_recovery_command(codex_bin, config_overrides, remote_plugin_id);
-}
-
 fn print_recovery_command(codex_bin: &Path, config_overrides: &[String], remote_plugin_id: &str) {
     let test_client = std::env::current_exe()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| "codex-app-server-test-client".to_string());
     let mut command = format!(
-        "{} --codex-bin {}",
+        "& {} --codex-bin {}",
         powershell_quote(&test_client),
         powershell_quote(&codex_bin.display().to_string())
     );
@@ -508,12 +513,79 @@ mod deadline_tests {
     use super::*;
 
     #[test]
+    fn smoke_deadline_bounds_install_and_uninstall_without_replaying_mutations() {
+        let plugin = RemotePluginExpectation {
+            plugin_id: "fixture-plugin".into(),
+            remote_plugin_id: "fixture-remote".into(),
+            plugin_name: "Fixture".into(),
+            marketplace_name: REMOTE_MARKETPLACE_HINT.into(),
+            installed: false,
+            install_policy: PluginInstallPolicy::Available,
+            availability: PluginAvailability::Available,
+        };
+        for method in ["plugin/install", "plugin/uninstall"] {
+            let temp = tempfile::tempdir().unwrap();
+            let log = temp.path().join("requests.jsonl");
+            let mut client = crate::tests::smoke_deadline_client(&log, "Start-Sleep -Seconds 5");
+            let started = Instant::now();
+            let error = client
+                .with_operation_deadline(started + Duration::from_millis(200), |client| {
+                    if method == "plugin/install" {
+                        install_remote_plugin(client, &plugin)
+                    } else {
+                        uninstall_remote_plugin(client, &plugin.remote_plugin_id)
+                    }
+                })
+                .expect_err("a mutation that never replies must exhaust its IO budget");
+            assert!(error.to_string().contains("deadline"), "{error:#}");
+            assert!(started.elapsed() < Duration::from_secs(2));
+            let requests = std::fs::read_to_string(log).unwrap();
+            let requests = requests
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(requests.len(), 1, "ambiguous mutations cannot be replayed");
+            assert_eq!(requests[0]["method"], method);
+            let identity_field = if method == "plugin/install" {
+                "pluginName"
+            } else {
+                "pluginId"
+            };
+            assert_eq!(requests[0]["params"][identity_field], "fixture-remote");
+        }
+    }
+
+    #[test]
+    fn restoration_reports_unknown_when_remote_state_cannot_be_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("requests.jsonl");
+        let mut client = crate::tests::smoke_deadline_client(
+            &log,
+            "$response = @{id=$request.id; error=@{code=-32000; message='state unavailable'}}; [Console]::WriteLine(($response | ConvertTo-Json -Depth 10 -Compress))",
+        );
+        match restore_uninstalled_state(&mut client, "fixture-remote") {
+            RestorationStatus::Unknown(error) => {
+                assert!(error.to_string().contains("state unavailable"), "{error:#}")
+            }
+            _ => panic!("an unreadable remote state must remain unknown"),
+        }
+        let requests = std::fs::read_to_string(log).unwrap();
+        assert_eq!(
+            requests.lines().count(),
+            1,
+            "unverifiable state cannot authorize another mutation"
+        );
+        let request: Value = serde_json::from_str(requests.lines().next().unwrap()).unwrap();
+        assert_eq!(request["method"], "plugin/read");
+    }
+
+    #[test]
     fn smoke_deadline_bounds_plugin_read_and_stops_polling_after_expiry() {
         for (body, budget) in [
             ("Start-Sleep -Seconds 5", Duration::from_millis(200)),
             (
                 "$response = @{jsonrpc='2.0'; id=$request.id; error=@{code=-32000; message='retryable test failure'}}; [Console]::WriteLine(($response | ConvertTo-Json -Depth 10 -Compress))",
-                Duration::from_millis(50),
+                Duration::from_secs(1),
             ),
         ] {
             let temp = tempfile::tempdir().expect("peer log root");
@@ -528,7 +600,16 @@ mod deadline_tests {
                 deadline,
             )
             .expect_err("state polling is bounded through its actual plugin/read RPC");
-            assert!(error.to_string().contains("deadline"), "{error:#}");
+            assert!(
+                error
+                    .to_string()
+                    .contains(if body.starts_with("Start-Sleep") {
+                        "deadline"
+                    } else {
+                        "retryable test failure"
+                    }),
+                "{error:#}"
+            );
             assert!(start.elapsed() < Duration::from_secs(2));
             let requests = std::fs::read_to_string(&log).expect("actual plugin/read request");
             let requests = requests
@@ -546,7 +627,7 @@ mod deadline_tests {
                 &mut client,
                 "fixture-remote",
                 ExpectedInstalledState::Installed,
-                deadline,
+                Instant::now() - Duration::from_millis(1),
             )
             .expect_err("expired deadline rejects without another RPC");
             assert_eq!(

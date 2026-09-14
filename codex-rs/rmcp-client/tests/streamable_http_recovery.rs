@@ -676,6 +676,47 @@ async fn dropping_streamable_http_operation_cancels_the_live_request_id() -> any
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn dropping_streamable_http_operation_outside_runtime_cancels_live_request()
+-> anyhow::Result<()> {
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let (cancellation_tx, mut cancellation_rx) = mpsc::unbounded_channel();
+    let (base_url, server_handle) =
+        start_cancellation_observer_server(started_tx, cancellation_tx).await?;
+    let client = create_client(&base_url).await?;
+    let mut operation = Box::pin(async move {
+        client
+            .call_tool(
+                "slow".to_string(),
+                /*arguments*/ None,
+                /*meta*/ None,
+                /*timeout*/ None,
+            )
+            .await
+    });
+    let started_request_id = tokio::select! {
+        result = &mut operation => panic!("slow operation completed before cancellation: {result:?}"),
+        started = timeout(Duration::from_secs(2), started_rx.recv()) => {
+            started?.ok_or_else(|| anyhow::anyhow!("server closed the started-request channel"))?
+        }
+    };
+    std::thread::spawn(move || {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        drop(operation);
+    })
+    .join()
+    .expect("drop operation outside the originating runtime");
+
+    let cancellation = timeout(Duration::from_secs(2), cancellation_rx.recv())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("server did not observe request cancellation"))?;
+    assert_eq!(cancellation.request_id, started_request_id);
+    assert_eq!(cancellation.reason.as_deref(), Some("request cancelled"));
+    server_handle.abort();
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn streamable_http_session_recovery_retries_initialize_failure() -> anyhow::Result<()> {
     let (_server, base_url) = spawn_streamable_http_server().await?;
     let http_client = FailFirstInitializeHttpClient::new(

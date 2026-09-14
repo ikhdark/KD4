@@ -1,4 +1,3 @@
-use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 
@@ -25,16 +24,25 @@ pub(super) async fn add_ad_hoc_note(
 
     let notes_dir = ensure_notes_dir(backend).await?;
     let path = notes_dir.join(&request.filename);
-    let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(MemoriesBackendError::AdHocNoteAlreadyExists {
-                filename: request.filename,
-            });
+    tokio::task::spawn_blocking(move || -> Result<(), MemoriesBackendError> {
+        // Hidden staging files are excluded from both search and note consumption.
+        // Dropping the tempfile cleans up failed writes and publication conflicts.
+        let mut file = tempfile::Builder::new()
+            .prefix(".note-")
+            .tempfile_in(notes_dir)?;
+        file.write_all(request.note.as_bytes())?;
+        match file.persist_noclobber(path) {
+            Ok(_) => Ok(()),
+            Err(err) if err.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(MemoriesBackendError::AdHocNoteAlreadyExists {
+                    filename: request.filename,
+                })
+            }
+            Err(err) => Err(err.error.into()),
         }
-        Err(err) => return Err(err.into()),
-    };
-    file.write_all(request.note.as_bytes())?;
+    })
+    .await
+    .map_err(std::io::Error::other)??;
 
     Ok(AddAdHocMemoryNoteResponse {})
 }
@@ -63,7 +71,11 @@ async fn ensure_directory(path: &Path) -> Result<(), MemoriesBackendError> {
                 "must be a directory",
             ));
         }
-        None => tokio::fs::create_dir(path).await?,
+        None => match tokio::fs::create_dir(path).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err.into()),
+        },
     }
 
     let Some(metadata) = LocalMemoriesBackend::metadata_or_none(path).await? else {

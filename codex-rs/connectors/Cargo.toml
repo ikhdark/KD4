@@ -10,12 +10,13 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 codex-config = { workspace = true }
+codex-file-system = { workspace = true }
 codex-plugin = { workspace = true }
 codex-utils-string = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["rt"] }
+tokio = { workspace = true, features = ["rt", "sync"] }
 tracing = { workspace = true }
 urlencoding = { workspace = true }
 

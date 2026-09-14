@@ -1,5 +1,4 @@
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthChar;
 use unicode_width::UnicodeWidthStr;
 
 pub(crate) fn capitalize_first(input: &str) -> String {
@@ -15,22 +14,77 @@ pub(crate) fn capitalize_first(input: &str) -> String {
 }
 
 /// Truncate a tool result to fit within the given height and width. If the text is valid JSON, we format it in a compact way before truncating.
-/// This is a best-effort approach that may not work perfectly for text where 1 grapheme is rendered as multiple terminal cells.
+#[expect(
+    clippy::expect_used,
+    reason = "Rows start nonempty and are never removed; a positive-width row contains a grapheme"
+)]
 pub(crate) fn format_and_truncate_tool_result(
     text: &str,
     max_lines: usize,
     line_width: usize,
 ) -> String {
-    // Work out the maximum number of graphemes we can display for a result.
-    // It's not guaranteed that 1 grapheme = 1 cell, so we subtract 1 per line as a fudge factor.
-    // It also won't handle future terminal resizes properly, but it's an OK approximation for now.
-    let max_graphemes = (max_lines * line_width).saturating_sub(max_lines);
-
-    if let Some(formatted_json) = format_json_compact(text) {
-        truncate_text(&formatted_json, max_graphemes)
-    } else {
-        truncate_text(text, max_graphemes)
+    if max_lines == 0 || line_width == 0 {
+        return String::new();
     }
+    let formatted = format_json_compact(text);
+    let text = formatted.as_deref().unwrap_or(text);
+    let mut lines = vec![String::new()];
+    let mut width = 0;
+    let mut truncated = false;
+    for grapheme in text.graphemes(true) {
+        let newline = matches!(grapheme, "\n" | "\r\n" | "\r");
+        let cells = UnicodeWidthStr::width(grapheme);
+        if cells > line_width {
+            truncated = true;
+            break;
+        }
+        if newline || width + cells > line_width {
+            if lines.len() == max_lines {
+                truncated = true;
+                break;
+            }
+            // Prefer a word boundary, but split long tokens only between graphemes.
+            let last = lines.last_mut().expect("preview has a row");
+            let carry = if !newline && !grapheme.chars().all(char::is_whitespace) {
+                last.grapheme_indices(true)
+                    .rev()
+                    .find_map(|(index, grapheme)| (grapheme == " ").then_some(index))
+                    .filter(|boundary| {
+                        UnicodeWidthStr::width(&last[boundary + 1..]) + cells <= line_width
+                    })
+                    .map(|boundary| {
+                        let carry = last[boundary + 1..].to_string();
+                        last.truncate(boundary);
+                        carry
+                    })
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            width = UnicodeWidthStr::width(carry.as_str());
+            lines.push(carry);
+            if newline {
+                continue;
+            }
+        }
+        lines
+            .last_mut()
+            .expect("preview has a row")
+            .push_str(grapheme);
+        width += cells;
+    }
+    if truncated {
+        let last = lines.last_mut().expect("preview has a row");
+        while UnicodeWidthStr::width(last.as_str()) >= line_width {
+            let (index, _) = last
+                .grapheme_indices(true)
+                .next_back()
+                .expect("nonempty row");
+            last.truncate(index);
+        }
+        last.push('…');
+    }
+    lines.join("\n")
 }
 
 /// Format JSON text in a compact single-line format with spaces for better Ratatui wrapping.
@@ -43,16 +97,15 @@ pub(crate) fn format_and_truncate_tool_result(
 /// Relevant issue: https://github.com/ratatui/ratatui/issues/293
 pub(crate) fn format_json_compact(text: &str) -> Option<String> {
     let json = serde_json::from_str::<serde_json::Value>(text).ok()?;
-    let json_pretty = serde_json::to_string_pretty(&json).unwrap_or_else(|_| json.to_string());
+    let json_compact = json.to_string();
 
-    // Convert multi-line pretty JSON to compact single-line format by removing newlines and excess whitespace
+    // Add structural whitespace without expanding the whole payload into pretty JSON.
     let mut result = String::new();
-    let mut chars = json_pretty.chars().peekable();
     let mut in_string = false;
     let mut escape_next = false;
 
     // Iterate over the characters in the JSON string, adding spaces after : and , but only when not in a string
-    while let Some(ch) = chars.next() {
+    for ch in json_compact.chars() {
         match ch {
             '"' if !escape_next => {
                 in_string = !in_string;
@@ -62,18 +115,9 @@ pub(crate) fn format_json_compact(text: &str) -> Option<String> {
                 escape_next = !escape_next;
                 result.push(ch);
             }
-            '\n' | '\r' if !in_string => {
-                // Skip newlines when not in a string
-            }
-            ' ' | '\t' if !in_string => {
-                // Add a space after : and , but only when not in a string
-                if let Some(&next_ch) = chars.peek()
-                    && let Some(last_ch) = result.chars().last()
-                    && (last_ch == ':' || last_ch == ',')
-                    && !matches!(next_ch, '}' | ']')
-                {
-                    result.push(' ');
-                }
+            ':' | ',' if !in_string => {
+                result.push(ch);
+                result.push(' ');
             }
             _ => {
                 if escape_next && in_string {
@@ -126,12 +170,10 @@ pub(crate) fn center_truncate_path(path: &str, max_width: usize) -> String {
     }
 
     let sep = std::path::MAIN_SEPARATOR;
-    let has_leading_sep = path.starts_with(sep);
+    let prefix_len = path.len() - path.trim_start_matches(sep).len();
+    let prefix = &path[..prefix_len];
     let has_trailing_sep = path.ends_with(sep);
-    let mut raw_segments: Vec<&str> = path.split(sep).collect();
-    if has_leading_sep && !raw_segments.is_empty() && raw_segments[0].is_empty() {
-        raw_segments.remove(0);
-    }
+    let mut raw_segments: Vec<&str> = path[prefix_len..].split(sep).collect();
     if has_trailing_sep
         && !raw_segments.is_empty()
         && raw_segments.last().is_some_and(|last| last.is_empty())
@@ -140,11 +182,8 @@ pub(crate) fn center_truncate_path(path: &str, max_width: usize) -> String {
     }
 
     if raw_segments.is_empty() {
-        if has_leading_sep {
-            let root = sep.to_string();
-            if UnicodeWidthStr::width(root.as_str()) <= max_width {
-                return root;
-            }
+        if !prefix.is_empty() && UnicodeWidthStr::width(prefix) <= max_width {
+            return prefix.to_string();
         }
         return "…".to_string();
     }
@@ -156,13 +195,10 @@ pub(crate) fn center_truncate_path(path: &str, max_width: usize) -> String {
         is_suffix: bool,
     }
 
-    let assemble = |leading: bool, segments: &[Segment<'_>]| -> String {
-        let mut result = String::new();
-        if leading {
-            result.push(sep);
-        }
-        for segment in segments {
-            if !result.is_empty() && !result.ends_with(sep) {
+    let assemble = |segments: &[Segment<'_>]| -> String {
+        let mut result = prefix.to_string();
+        for (index, segment) in segments.iter().enumerate() {
+            if index > 0 {
                 result.push(sep);
             }
             result.push_str(segment.text.as_str());
@@ -181,61 +217,59 @@ pub(crate) fn center_truncate_path(path: &str, max_width: usize) -> String {
             return "…".to_string();
         }
 
-        let mut kept: Vec<char> = Vec::new();
+        let mut start = original.len();
         let mut used_width = 1; // reserve space for leading ellipsis
-        for ch in original.chars().rev() {
-            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        for (index, grapheme) in original.grapheme_indices(true).rev() {
+            let ch_width = UnicodeWidthStr::width(grapheme);
             if used_width + ch_width > allowed_width {
                 break;
             }
             used_width += ch_width;
-            kept.push(ch);
+            start = index;
         }
-        kept.reverse();
         let mut truncated = String::from("…");
-        for ch in kept {
-            truncated.push(ch);
-        }
+        truncated.push_str(&original[start..]);
         truncated
     };
 
-    let mut combos: Vec<(usize, usize)> = Vec::new();
     let segment_count = raw_segments.len();
-    for left in 1..=segment_count {
-        let min_right = if left == segment_count { 0 } else { 1 };
-        for right in min_right..=(segment_count - left) {
-            combos.push((left, right));
-        }
-    }
+    // Keep the server and share together when shortening a UNC path.
+    let preferred_suffix = if prefix_len == 2 * sep.len_utf8() {
+        1
+    } else {
+        2
+    };
     let desired_suffix = if segment_count > 1 {
-        std::cmp::min(2, segment_count - 1)
+        std::cmp::min(preferred_suffix, segment_count - 1)
     } else {
         0
     };
-    let mut prioritized: Vec<(usize, usize)> = Vec::new();
-    let mut fallback: Vec<(usize, usize)> = Vec::new();
-    for combo in combos {
-        if combo.1 >= desired_suffix {
-            prioritized.push(combo);
+    let combos = [true, false].into_iter().flat_map(|prioritized| {
+        (1..=segment_count).rev().flat_map(move |left| {
+            let min_right = usize::from(left != segment_count);
+            (min_right..=segment_count - left)
+                .rev()
+                .filter(move |right| (*right >= desired_suffix) == prioritized)
+                .map(move |right| (left, right))
+        })
+    });
+    // Prefix sums reject candidates that cannot fit even after permitted segment
+    // truncation, before allocating any candidate strings.
+    let mut min_widths = vec![0usize];
+    for segment in &raw_segments {
+        let width = UnicodeWidthStr::width(*segment);
+        let minimum = if width > max_width || segment_count <= 2 {
+            width.min(1)
         } else {
-            fallback.push(combo);
-        }
+            width
+        };
+        min_widths.push(min_widths.last().copied().unwrap_or(0) + minimum);
     }
-    let sort_combos = |items: &mut Vec<(usize, usize)>| {
-        items.sort_by(|(left_a, right_a), (left_b, right_b)| {
-            left_b
-                .cmp(left_a)
-                .then_with(|| right_b.cmp(right_a))
-                .then_with(|| (left_b + right_b).cmp(&(left_a + right_a)))
-        });
-    };
-    sort_combos(&mut prioritized);
-    sort_combos(&mut fallback);
 
     let fit_segments =
         |segments: &mut Vec<Segment<'_>>, allow_front_truncate: bool| -> Option<String> {
             loop {
-                let candidate = assemble(has_leading_sep, segments);
+                let candidate = assemble(segments);
                 let width = UnicodeWidthStr::width(candidate.as_str());
                 if width <= max_width {
                     return Some(candidate);
@@ -284,7 +318,18 @@ pub(crate) fn center_truncate_path(path: &str, max_width: usize) -> String {
             }
         };
 
-    for (left_count, right_count) in prioritized.into_iter().chain(fallback) {
+    for (left_count, right_count) in combos {
+        let need_ellipsis = left_count + right_count < segment_count;
+        let min_width =
+            UnicodeWidthStr::width(prefix) + min_widths[left_count] + min_widths[segment_count]
+                - min_widths[segment_count - right_count]
+                + left_count
+                + right_count
+                - 1
+                + 2 * usize::from(need_ellipsis);
+        if min_width > max_width {
+            continue;
+        }
         let mut segments: Vec<Segment<'_>> = raw_segments[..left_count]
             .iter()
             .map(|seg| Segment {
@@ -295,7 +340,6 @@ pub(crate) fn center_truncate_path(path: &str, max_width: usize) -> String {
             })
             .collect();
 
-        let need_ellipsis = left_count + right_count < segment_count;
         if need_ellipsis {
             segments.push(Segment {
                 original: "…",
@@ -358,6 +402,55 @@ pub(crate) fn proper_join<T: AsRef<str>>(items: &[T]) -> String {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn tool_preview_obeys_rows_cells_and_grapheme_boundaries() {
+        assert_eq!(format_and_truncate_tool_result("a\nb\nc", 2, 80), "a\nb…");
+        assert_eq!(format_and_truncate_tool_result("界界界", 2, 2), "界\n…");
+        assert_eq!(
+            format_and_truncate_tool_result("Ae\u{301}BC", 2, 2),
+            "Ae\u{301}\nBC"
+        );
+        assert_eq!(format_and_truncate_tool_result("👩‍💻x", 1, 1), "…");
+        assert_eq!(
+            format_and_truncate_tool_result("a \u{301}bcX", 2, 4),
+            "a \u{301}bc\nX"
+        );
+        assert_eq!(format_and_truncate_tool_result("abc", 0, usize::MAX), "");
+        assert_eq!(format_and_truncate_tool_result("abc", usize::MAX, 0), "");
+        assert_eq!(
+            format_and_truncate_tool_result("abc", usize::MAX, usize::MAX),
+            "abc"
+        );
+    }
+
+    #[test]
+    fn front_truncation_keeps_combining_marks_with_their_base() {
+        assert_eq!(center_truncate_path("Ae\u{301}BC", 3), "…BC");
+        assert_eq!(center_truncate_path("X👩‍💻BC", 4), "…BC");
+    }
+
+    #[test]
+    fn center_truncation_preserves_unc_prefix() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let path = format!("{sep}{sep}server{sep}share{sep}folder{sep}file.txt");
+        assert_eq!(
+            center_truncate_path(&path, 29),
+            format!("{sep}{sep}server{sep}share{sep}…{sep}file.txt")
+        );
+    }
+
+    #[test]
+    fn compact_json_preserves_escaped_quotes_and_structural_characters_in_strings() {
+        let input = r#"{"text":"a, b: \\\"quoted\\\"", "slash":"\\\\"}"#;
+        let output = format_json_compact(input).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output).unwrap(),
+            serde_json::from_str::<serde_json::Value>(input).unwrap()
+        );
+        assert!(output.contains("\"text\": \"a, b:"));
+        assert!(output.contains(", \""));
+    }
 
     #[test]
     fn test_truncate_text() {

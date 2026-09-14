@@ -125,7 +125,10 @@ impl Renderable for TranscriptAreaRenderable<'_> {
     }
 
     fn desired_height(&self, width: u16) -> u16 {
-        let child_width = width.saturating_sub(self.right).max(1);
+        let child_width = width.saturating_sub(self.right);
+        if child_width == 0 {
+            return 0;
+        }
         HistoryCell::desired_height(self.child, child_width).saturating_add(self.top)
     }
 }
@@ -134,17 +137,13 @@ impl TranscriptAreaRenderable<'_> {
     fn child_area(&self, area: Rect) -> Rect {
         let y = area.y.saturating_add(self.top);
         let height = area.height.saturating_sub(self.top);
-        Rect::new(
-            area.x,
-            y,
-            area.width.saturating_sub(self.right).max(1),
-            height,
-        )
+        Rect::new(area.x, y, area.width.saturating_sub(self.right), height)
     }
 }
 
 impl Renderable for ChatWidget {
     fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.pet_picker_preview_state.clear_area();
         self.as_renderable().render(area, buf);
         self.last_rendered_width.set(Some(area.width as usize));
     }
@@ -168,6 +167,23 @@ mod tests {
     use crate::history_cell::HistoryRenderMode;
     use crate::history_cell::PlainHistoryCell;
     use ratatui::text::Span;
+
+    #[test]
+    fn transcript_with_no_available_columns_leaves_buffer_untouched() {
+        let cell = PlainHistoryCell::new(vec![Line::from("hidden")]);
+        for (width, right) in [(0, 0), (2, 2), (2, 3)] {
+            let renderable = TranscriptAreaRenderable {
+                child: &cell,
+                top: 0,
+                right,
+            };
+            let mut buffer = Buffer::with_lines(["....", "...."]);
+            let original = buffer.clone();
+            renderable.render(Rect::new(1, 0, width, 2), &mut buffer);
+            assert_eq!(buffer, original);
+            assert_eq!(renderable.desired_height(width), 0);
+        }
+    }
 
     #[test]
     fn transcript_height_saturates_and_preserves_visible_tail_and_reserved_area() {

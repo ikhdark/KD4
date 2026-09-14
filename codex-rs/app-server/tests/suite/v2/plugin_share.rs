@@ -771,6 +771,12 @@ async fn plugin_share_checkout_adds_personal_marketplace_entry() -> Result<()> {
     );
 
     std::fs::write(plugin_path.as_path().join("local-edit.txt"), "keep")?;
+    let mut extended_marketplace = marketplace;
+    extended_marketplace["plugins"][0]["description"] = json!("Local description");
+    extended_marketplace["plugins"][0]["source"]["custom"] = json!("local source extension");
+    extended_marketplace["plugins"][0]["policy"]["custom"] = json!("local policy extension");
+    let marketplace_contents = extended_marketplace.to_string();
+    std::fs::write(marketplace_path.as_path(), &marketplace_contents)?;
     let request_id = mcp
         .send_raw_request(
             "plugin/share/checkout",
@@ -787,8 +793,39 @@ async fn plugin_share_checkout_adds_personal_marketplace_entry() -> Result<()> {
     let response: PluginShareCheckoutResponse = to_response(response)?;
     assert_eq!(response.plugin_path, plugin_path);
     assert_eq!(
+        std::fs::read_to_string(marketplace_path.as_path())?,
+        marketplace_contents
+    );
+    assert_eq!(
         std::fs::read_to_string(plugin_path.as_path().join("local-edit.txt"))?,
         "keep"
+    );
+
+    std::fs::write(plugin_path.as_path().join(".codex-plugin/plugin.json"), "{")?;
+    let request_id = mcp
+        .send_raw_request(
+            "plugin/share/checkout",
+            Some(json!({
+                "remotePluginId": "plugins_123"
+            })),
+        )
+        .await?;
+    let error = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert!(
+        error.error.message.contains("valid plugin manifest"),
+        "{error:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(plugin_path.as_path().join("local-edit.txt"))?,
+        "keep"
+    );
+    assert_eq!(
+        std::fs::read_to_string(marketplace_path.as_path())?,
+        marketplace_contents
     );
 
     Ok(())

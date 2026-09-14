@@ -113,7 +113,11 @@ impl SkillProvider for OrchestratorSkillProvider {
                     }
                 }
 
-                if truncated {
+                if truncated
+                    || (skill_resources_seen >= MAX_ORCHESTRATOR_SKILLS
+                        && result.next_cursor.is_some())
+                {
+                    truncated = true;
                     break;
                 }
                 let Some(next_cursor) = result.next_cursor else {
@@ -246,7 +250,7 @@ fn validated_skill_uri(uri: &str, max_chars: usize) -> Option<&str> {
 }
 
 fn validated_skill_url(uri: &str, max_chars: usize) -> Option<Url> {
-    if uri.chars().count() > max_chars
+    if uri.chars().nth(max_chars).is_some()
         || uri
             .chars()
             .any(|ch| ch.is_control() || ch.is_whitespace() || matches!(ch, '<' | '>'))
@@ -301,25 +305,92 @@ fn normalized_label(value: &str, max_chars: usize) -> Option<String> {
 }
 
 fn normalized_description(value: &str) -> Option<String> {
-    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if value.chars().any(char::is_control) {
-        return None;
+    // Bound normalization before allocating or escaping a potentially huge description.
+    let mut output = String::new();
+    let mut pending_space = false;
+    let mut count = 0;
+    for ch in value.chars() {
+        if ch.is_whitespace() {
+            pending_space = !output.is_empty();
+            continue;
+        }
+        if ch.is_control() {
+            return None;
+        }
+        let escaped = match ch {
+            '&' => Some("&amp;"),
+            '<' => Some("&lt;"),
+            '>' => Some("&gt;"),
+            _ => None,
+        };
+        let added = escaped.map_or(1, str::len) + usize::from(pending_space);
+        if count + added > 1_021 {
+            output.push_str("...");
+            break;
+        }
+        if pending_space {
+            output.push(' ');
+            pending_space = false;
+        }
+        if let Some(escaped) = escaped {
+            output.push_str(escaped);
+        } else {
+            output.push(ch);
+        }
+        count += added;
     }
-
-    Some(
-        value
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;"),
-    )
+    Some(output)
 }
 
 fn normalized_single_line(value: &str, max_chars: usize) -> Option<String> {
-    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    let valid = value.chars().count() <= max_chars && !value.chars().any(char::is_control);
-    valid.then_some(value)
+    let mut output = String::new();
+    let mut pending_space = false;
+    let mut count = 0;
+    for ch in value.chars() {
+        if ch.is_whitespace() {
+            pending_space = !output.is_empty();
+            continue;
+        }
+        if ch.is_control() {
+            return None;
+        }
+        count += 1 + usize::from(pending_space);
+        if count > max_chars {
+            return None;
+        }
+        if pending_space {
+            output.push(' ');
+            pending_space = false;
+        }
+        output.push(ch);
+    }
+    Some(output)
 }
 
 fn main_prompt_uri(package_uri: &str) -> String {
     format!("{}/SKILL.md", package_uri.trim_end_matches('/'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_metadata_is_bounded_and_escaped_before_entering_catalog() {
+        let mut resource: Resource = serde_json::from_value(serde_json::json!({
+            "uri": "skill://plugin/demo", "name": "demo", "mimeType": "mcp/skill",
+            "description": format!("  A & <B>\n{}", "🚀".repeat(100_000)),
+            "_meta": {"skill_name": " demo ", "source": "user"}
+        }))
+        .expect("valid resource");
+        let entry = catalog_entry_from_resource(&resource).expect("valid skill");
+        assert_eq!(entry.name, "demo");
+        assert_eq!(entry.main_prompt.as_str(), "skill://plugin/demo/SKILL.md");
+        assert!(entry.description.starts_with("A &amp; &lt;B&gt; "));
+        assert!(entry.description.ends_with("..."));
+        assert!(entry.description.chars().count() <= 1_024);
+        resource.meta =
+            Some(serde_json::json!({"skill_name": "x".repeat(100_000), "source": "user"}));
+        assert!(catalog_entry_from_resource(&resource).is_none());
+    }
 }

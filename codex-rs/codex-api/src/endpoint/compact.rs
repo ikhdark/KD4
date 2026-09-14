@@ -89,17 +89,34 @@ struct CompactHistoryResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthProvider;
+    use crate::provider::RetryConfig;
     use codex_client::Request;
     use codex_client::Response;
     use codex_client::StreamResponse;
     use codex_client::TransportError;
+    use http::StatusCode;
+    use serde_json::json;
+    use std::sync::Mutex;
 
     #[derive(Clone, Default)]
-    struct DummyTransport;
+    struct CapturingTransport(Arc<Mutex<Option<Request>>>);
 
-    impl HttpTransport for DummyTransport {
-        async fn execute(&self, _req: Request) -> Result<Response, TransportError> {
-            Err(TransportError::Build("execute should not run".to_string()))
+    impl HttpTransport for CapturingTransport {
+        async fn execute(&self, req: Request) -> Result<Response, TransportError> {
+            *self.0.lock().unwrap() = Some(req);
+            Ok(Response {
+                status: StatusCode::OK,
+                headers: HeaderMap::from_iter([(
+                    X_CODEX_TURN_STATE_HEADER.parse().unwrap(),
+                    "next-turn-state".parse().unwrap(),
+                )]),
+                body: serde_json::to_vec(&json!({"output": [
+                    {"type": "compaction", "encrypted_content": "compacted-history"}
+                ]}))
+                .unwrap()
+                .into(),
+            })
         }
 
         async fn stream(&self, _req: Request) -> Result<StreamResponse, TransportError> {
@@ -107,8 +124,89 @@ mod tests {
         }
     }
 
-    #[test]
-    fn path_is_responses_compact() {
-        assert_eq!(CompactClient::<DummyTransport>::path(), "responses/compact");
+    struct DummyAuth;
+
+    impl AuthProvider for DummyAuth {
+        fn add_auth_headers(&self, headers: &mut HeaderMap) {
+            headers.insert("authorization", "Bearer test-token".parse().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_input_preserves_request_and_response_contracts() {
+        let transport = CapturingTransport::default();
+        let client = CompactClient::new(
+            transport.clone(),
+            Provider {
+                name: "test".to_string(),
+                base_url: "https://example.com/api/codex".to_string(),
+                query_params: None,
+                headers: HeaderMap::new(),
+                retry: RetryConfig {
+                    max_retries: 0,
+                    base_delay: Duration::ZERO,
+                    retry_429: false,
+                    retry_5xx: false,
+                    retry_transport: false,
+                },
+                stream_idle_timeout: Duration::from_secs(1),
+            },
+            Arc::new(DummyAuth),
+        );
+        let input = CompactionInput {
+            model: "gpt-test",
+            input: &[],
+            instructions: "Preserve project decisions.",
+            tools: None,
+            parallel_tool_calls: true,
+            reasoning: None,
+            service_tier: None,
+            prompt_cache_key: None,
+            text: None,
+        };
+        let timeout = Duration::from_secs(73);
+        let turn_state = OnceLock::new();
+        let output = client
+            .compact_input(
+                &input,
+                HeaderMap::from_iter([(
+                    "x-request-id".parse().unwrap(),
+                    "compact-request".parse().unwrap(),
+                )]),
+                timeout,
+                Some(&turn_state),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(output).unwrap(),
+            json!([
+                {"type": "compaction", "encrypted_content": "compacted-history"}
+            ])
+        );
+        assert_eq!(
+            turn_state.get().map(String::as_str),
+            Some("next-turn-state")
+        );
+        let stored_request = transport.0.lock().unwrap();
+        let request = stored_request.as_ref().unwrap();
+        assert_eq!(request.method, Method::POST);
+        assert_eq!(
+            request.url,
+            "https://example.com/api/codex/responses/compact"
+        );
+        assert_eq!(request.timeout, Some(timeout));
+        assert_eq!(request.headers["x-request-id"], "compact-request");
+        assert_eq!(request.headers["authorization"], "Bearer test-token");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &request.prepare_body_for_send().unwrap().body_bytes()
+            )
+            .unwrap(),
+            json!({
+                "model": "gpt-test", "input": [], "instructions": "Preserve project decisions.",
+                "parallel_tool_calls": true
+            })
+        );
     }
 }

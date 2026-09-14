@@ -57,15 +57,30 @@ pub(super) async fn resolve_provider_auth(
     managed_auth: Option<&BedrockApiKeyAuth>,
     aws: &ModelProviderAwsAuthInfo,
 ) -> Result<SharedAuthProvider> {
-    match resolve_auth_method(managed_auth, aws).await? {
-        BedrockAuthMethod::ManagedBearerToken { token, .. }
-        | BedrockAuthMethod::EnvBearerToken { token, .. } => Ok(Arc::new(BearerAuthProvider {
-            token: Some(token),
-            account_id: None,
-            is_fedramp_account: false,
-        })),
-        BedrockAuthMethod::AwsSdkAuth { context } => {
-            Ok(Arc::new(BedrockMantleSigV4AuthProvider::new(context)))
+    Ok(resolve_auth_method(managed_auth, aws)
+        .await?
+        .into_provider())
+}
+
+impl BedrockAuthMethod {
+    pub(super) fn region(&self) -> &str {
+        match self {
+            Self::ManagedBearerToken { region, .. } | Self::EnvBearerToken { region, .. } => region,
+            Self::AwsSdkAuth { context } => context.region(),
+        }
+    }
+
+    pub(super) fn into_provider(self) -> SharedAuthProvider {
+        match self {
+            BedrockAuthMethod::ManagedBearerToken { token, .. }
+            | BedrockAuthMethod::EnvBearerToken { token, .. } => Arc::new(BearerAuthProvider {
+                token: Some(token),
+                account_id: None,
+                is_fedramp_account: false,
+            }),
+            BedrockAuthMethod::AwsSdkAuth { context } => {
+                Arc::new(BedrockMantleSigV4AuthProvider::new(context))
+            }
         }
     }
 }

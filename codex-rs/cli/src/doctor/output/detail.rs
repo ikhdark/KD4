@@ -32,10 +32,11 @@ pub(super) enum HumanDetail {
 struct ParsedDetail {
     label: String,
     value: String,
+    expected: Option<String>,
 }
 
 pub(super) fn detail_lines(check: &DoctorCheck, options: HumanOutputOptions) -> Vec<HumanDetail> {
-    let parsed = parsed_details(check);
+    let parsed = parsed_details(check, options);
     let details = match check.category.as_str() {
         "system" => system_details(&parsed),
         "runtime" => runtime_details(&parsed),
@@ -43,14 +44,10 @@ pub(super) fn detail_lines(check: &DoctorCheck, options: HumanOutputOptions) -> 
         "git" => git_details(&parsed, options),
         "title" => title_details(&parsed),
         "config" => config_details(&parsed, options),
-        "state" => state_details(&parsed),
+        "state" => state_details(&parsed, options),
         _ => generic_details(&parsed),
     };
-    let mut details = details
-        .into_iter()
-        .map(|detail| attach_issue_metadata(detail, check))
-        .map(|detail| humanize_detail(detail, options))
-        .collect::<Vec<_>>();
+    let mut details = details.into_iter().collect::<Vec<_>>();
     details.extend(issue_remedies(check));
     details
 }
@@ -92,13 +89,19 @@ fn system_details(parsed: &[ParsedDetail]) -> Vec<HumanDetail> {
 }
 
 pub(super) fn detail_value(check: &DoctorCheck, label: &str) -> Option<String> {
-    parsed_details(check)
-        .into_iter()
-        .find(|detail| detail.label == label)
-        .map(|detail| detail.value)
+    check
+        .details
+        .iter()
+        .find(|line| line.split_once(": ").is_some_and(|(key, _)| key == label))
+        .and_then(|line| {
+            redact_detail(line)
+                .split_once(": ")
+                .map(|(_, value)| value.to_string())
+        })
 }
 
-pub(super) fn rollout_summary(value: &str) -> Option<String> {
+pub(super) fn rollout_summary(value: &str, options: HumanOutputOptions) -> Option<String> {
+    let sep = super::inline_separator(options);
     let (files, rest) = value.split_once(" files, ")?;
     let (total_bytes, rest) = rest.split_once(" total bytes, ")?;
     let (average_bytes, _) = rest.split_once(" average bytes")?;
@@ -106,7 +109,7 @@ pub(super) fn rollout_summary(value: &str) -> Option<String> {
     let total_bytes = total_bytes.trim().parse::<u64>().ok()?;
     let average_bytes = average_bytes.trim().parse::<u64>().ok()?;
     Some(format!(
-        "{} files · {} (avg {})",
+        "{} files{sep}{} (avg {})",
         format_count(files),
         format_bytes(total_bytes),
         format_bytes(average_bytes)
@@ -157,7 +160,7 @@ pub(super) fn format_count(count: u64) -> String {
     }
 }
 
-fn parsed_details(check: &DoctorCheck) -> Vec<ParsedDetail> {
+fn parsed_details(check: &DoctorCheck, options: HumanOutputOptions) -> Vec<ParsedDetail> {
     check
         .details
         .iter()
@@ -167,11 +170,13 @@ fn parsed_details(check: &DoctorCheck) -> Vec<ParsedDetail> {
                 .split_once(": ")
                 .map(|(label, value)| ParsedDetail {
                     label: label.to_string(),
-                    value: value.to_string(),
+                    value: humanize_source_value(label, value, options),
+                    expected: issue_expected_for_label(check, label),
                 })
                 .unwrap_or_else(|| ParsedDetail {
                     label: String::new(),
                     value: detail,
+                    expected: None,
                 })
         })
         .collect()
@@ -199,6 +204,7 @@ fn runtime_details(parsed: &[ParsedDetail]) -> Vec<HumanDetail> {
 }
 
 fn install_details(parsed: &[ParsedDetail], options: HumanOutputOptions) -> Vec<HumanDetail> {
+    let sep = super::inline_separator(options);
     let mut out = Vec::new();
     push_row_if_present(&mut out, parsed, "install context", "context");
     if parsed.iter().any(|detail| {
@@ -216,17 +222,25 @@ fn install_details(parsed: &[ParsedDetail], options: HumanOutputOptions) -> Vec<
     out.push(HumanDetail::Row {
         label: "managed by".to_string(),
         value: format!(
-            "npm: {} · bun: {} · pnpm: {} · package root {}",
+            "npm: {}{sep}bun: {}{sep}pnpm: {}{sep}package root {}",
             yes_no(managed_by_npm),
             yes_no(managed_by_bun),
             yes_no(managed_by_pnpm),
             if is_falsy(package_root) {
-                "—".to_string()
+                (if options.ascii { "-" } else { "—" }).to_string()
             } else {
                 package_root.to_string()
             }
         ),
-        expected: None,
+        expected: expected(
+            parsed,
+            &[
+                "managed by npm",
+                "managed by bun",
+                "managed by pnpm",
+                "managed package root",
+            ],
+        ),
     });
 
     let path_entries = numbered_values(parsed, "PATH codex #");
@@ -240,7 +254,17 @@ fn install_details(parsed: &[ParsedDetail], options: HumanOutputOptions) -> Vec<
         out.push(HumanDetail::Row {
             label: format!("PATH entries ({total})"),
             value: path_entries[0].clone(),
-            expected: None,
+            expected: expected(
+                parsed,
+                &parsed
+                    .iter()
+                    .filter(|detail| {
+                        detail.label == "PATH codex entries"
+                            || detail.label.starts_with("PATH codex #")
+                    })
+                    .map(|detail| detail.label.as_str())
+                    .collect::<Vec<_>>(),
+            ),
         });
         out.extend(
             path_entries
@@ -252,7 +276,12 @@ fn install_details(parsed: &[ParsedDetail], options: HumanOutputOptions) -> Vec<
         );
         if shown < total {
             out.push(HumanDetail::Continuation(
-                "… (full list with --all)".to_string(),
+                (if options.ascii {
+                    "... (full list with --all)"
+                } else {
+                    "… (full list with --all)"
+                })
+                .to_string(),
             ));
         }
     }
@@ -296,7 +325,16 @@ fn git_details(parsed: &[ParsedDetail], options: HumanOutputOptions) -> Vec<Huma
         out.push(HumanDetail::Row {
             label: format!("PATH entries ({total})"),
             value: path_entries[0].clone(),
-            expected: None,
+            expected: expected(
+                parsed,
+                &parsed
+                    .iter()
+                    .filter(|detail| {
+                        detail.label == "PATH git entries" || detail.label.starts_with("PATH git #")
+                    })
+                    .map(|detail| detail.label.as_str())
+                    .collect::<Vec<_>>(),
+            ),
         });
         out.extend(
             path_entries
@@ -308,7 +346,12 @@ fn git_details(parsed: &[ParsedDetail], options: HumanOutputOptions) -> Vec<Huma
         );
         if shown < total {
             out.push(HumanDetail::Continuation(
-                "… (full list with --all)".to_string(),
+                (if options.ascii {
+                    "... (full list with --all)"
+                } else {
+                    "… (full list with --all)"
+                })
+                .to_string(),
             ));
         }
     }
@@ -366,16 +409,17 @@ fn title_details(parsed: &[ParsedDetail]) -> Vec<HumanDetail> {
 }
 
 fn config_details(parsed: &[ParsedDetail], options: HumanOutputOptions) -> Vec<HumanDetail> {
+    let sep = super::inline_separator(options);
     let mut out = Vec::new();
     if let Some(model) = value(parsed, "model") {
         let value = value(parsed, "model provider").map_or_else(
             || model.to_string(),
-            |provider| format!("{model} · {provider}"),
+            |provider| format!("{model}{sep}{provider}"),
         );
         out.push(HumanDetail::Row {
             label: "model".to_string(),
             value,
-            expected: None,
+            expected: expected(parsed, &["model", "model provider"]),
         });
     }
     push_row_if_present(&mut out, parsed, "cwd", "cwd");
@@ -392,7 +436,7 @@ fn config_details(parsed: &[ParsedDetail], options: HumanOutputOptions) -> Vec<H
         out.push(HumanDetail::Row {
             label: "legacy alias".to_string(),
             value: detail.value.clone(),
-            expected: None,
+            expected: detail.expected.clone(),
         });
     }
 
@@ -420,16 +464,15 @@ fn config_details(parsed: &[ParsedDetail], options: HumanOutputOptions) -> Vec<H
     out
 }
 
-fn state_details(parsed: &[ParsedDetail]) -> Vec<HumanDetail> {
+fn state_details(parsed: &[ParsedDetail], options: HumanOutputOptions) -> Vec<HumanDetail> {
     let mut out = Vec::new();
     push_row_if_present(&mut out, parsed, "CODEX_HOME", "CODEX_HOME");
     push_row_if_present(&mut out, parsed, "log dir", "log dir");
     push_row_if_present(&mut out, parsed, "sqlite home", "sqlite home");
-    push_database_row(&mut out, parsed, "state DB");
-    push_database_row(&mut out, parsed, "log DB");
-    push_database_row(&mut out, parsed, "goals DB");
-    push_database_row(&mut out, parsed, "memories DB");
-
+    push_database_row(&mut out, parsed, "state DB", options);
+    push_database_row(&mut out, parsed, "log DB", options);
+    push_database_row(&mut out, parsed, "goals DB", options);
+    push_database_row(&mut out, parsed, "memories DB", options);
     for (source, label) in [
         ("active rollout files", "active rollouts"),
         ("archived rollout files", "archived rollouts"),
@@ -437,8 +480,8 @@ fn state_details(parsed: &[ParsedDetail]) -> Vec<HumanDetail> {
         if let Some(value) = value(parsed, source) {
             out.push(HumanDetail::Row {
                 label: label.to_string(),
-                value: rollout_summary(value).unwrap_or_else(|| value.to_string()),
-                expected: None,
+                value: rollout_summary(value, options).unwrap_or_else(|| value.to_string()),
+                expected: expected(parsed, &[source]),
             });
         }
     }
@@ -476,7 +519,7 @@ fn generic_details(parsed: &[ParsedDetail]) -> Vec<HumanDetail> {
                 HumanDetail::Row {
                     label: display_label(&detail.label),
                     value: detail.value.clone(),
-                    expected: None,
+                    expected: detail.expected.clone(),
                 }
             }
         })
@@ -488,6 +531,7 @@ fn push_feature_flags(
     parsed: &[ParsedDetail],
     options: HumanOutputOptions,
 ) {
+    let sep = super::inline_separator(options);
     let enabled_count = value(parsed, "feature flags enabled")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or_default();
@@ -500,17 +544,36 @@ fn push_feature_flags(
     };
     out.push(HumanDetail::Row {
         label: "feature flags".to_string(),
-        value: format!("{enabled_count} enabled · {override_count} overridden{hint}"),
-        expected: None,
+        value: format!("{enabled_count} enabled{sep}{override_count} overridden{hint}"),
+        expected: expected(
+            parsed,
+            &[
+                "feature flags enabled",
+                "feature flag overrides",
+                "enabled feature flags",
+            ],
+        ),
     });
 
     if !overrides.is_empty() {
-        push_list_row(out, "overrides", &override_names(&overrides), options);
+        push_list_row(
+            out,
+            "overrides",
+            &overrides,
+            options,
+            expected(parsed, &["feature flag overrides"]),
+        );
     }
     if options.show_all {
         let enabled = list_items(value(parsed, "enabled feature flags").unwrap_or("none"));
         if !enabled.is_empty() {
-            push_list_row(out, "enabled flags", &enabled, options);
+            push_list_row(
+                out,
+                "enabled flags",
+                &enabled,
+                options,
+                expected(parsed, &["enabled feature flags"]),
+            );
         }
     }
 }
@@ -520,6 +583,7 @@ fn push_list_row(
     label: &str,
     items: &[String],
     options: HumanOutputOptions,
+    expected: Option<String>,
 ) {
     let limit = if options.show_all {
         items.len()
@@ -533,28 +597,38 @@ fn push_list_row(
         .collect::<Vec<_>>()
         .join(", ");
     if limit < items.len() {
-        value.push_str(", … (full list with --all)");
+        value.push_str(if options.ascii {
+            ", ... (full list with --all)"
+        } else {
+            ", … (full list with --all)"
+        });
     }
     out.push(HumanDetail::Row {
         label: label.to_string(),
         value,
-        expected: None,
+        expected,
     });
 }
 
-fn push_database_row(out: &mut Vec<HumanDetail>, parsed: &[ParsedDetail], label: &str) {
+fn push_database_row(
+    out: &mut Vec<HumanDetail>,
+    parsed: &[ParsedDetail],
+    label: &str,
+    options: HumanOutputOptions,
+) {
+    let sep = super::inline_separator(options);
     let Some(path) = value(parsed, label) else {
         return;
     };
     let integrity = value(parsed, &format!("{label} integrity"));
     let value = integrity.map_or_else(
         || path.to_string(),
-        |integrity| format!("{path} · integrity {integrity}"),
+        |integrity| format!("{path}{sep}integrity {integrity}"),
     );
     out.push(HumanDetail::Row {
         label: label.to_string(),
         value,
-        expected: None,
+        expected: expected(parsed, &[label, &format!("{label} integrity")]),
     });
 }
 
@@ -568,7 +642,7 @@ fn push_row_if_present(
         out.push(HumanDetail::Row {
             label: display_label.to_string(),
             value: value.to_string(),
-            expected: None,
+            expected: expected(parsed, &[source_label]),
         });
     }
 }
@@ -596,59 +670,27 @@ fn push_remaining(
             out.push(HumanDetail::Row {
                 label: display_label(&detail.label),
                 value: detail.value.clone(),
-                expected: None,
+                expected: detail.expected.clone(),
             });
         }
     }
 }
 
-fn humanize_detail(detail: HumanDetail, options: HumanOutputOptions) -> HumanDetail {
-    match detail {
-        HumanDetail::Row {
-            label,
-            value,
-            expected,
-        } => HumanDetail::Row {
-            label,
-            value: humanize_value(&value, options),
-            expected,
-        },
-        HumanDetail::Continuation(value) => {
-            HumanDetail::Continuation(humanize_value(&value, options))
-        }
-        HumanDetail::Bullet(value) => HumanDetail::Bullet(humanize_value(&value, options)),
-        HumanDetail::Remedy(value) => HumanDetail::Remedy(value),
-    }
-}
-
-fn attach_issue_metadata(detail: HumanDetail, check: &DoctorCheck) -> HumanDetail {
-    let HumanDetail::Row {
-        label,
-        value,
-        expected,
-    } = detail
-    else {
-        return detail;
-    };
-    let expected = expected.or_else(|| issue_expected_for_label(check, &label));
-    HumanDetail::Row {
-        label,
-        value,
-        expected,
-    }
+fn expected(parsed: &[ParsedDetail], sources: &[&str]) -> Option<String> {
+    let values = parsed
+        .iter()
+        .filter(|detail| sources.contains(&detail.label.as_str()))
+        .filter_map(|detail| detail.expected.clone())
+        .collect::<BTreeSet<_>>();
+    (!values.is_empty()).then(|| values.into_iter().collect::<Vec<_>>().join("; "))
 }
 
 fn issue_expected_for_label(check: &DoctorCheck, label: &str) -> Option<String> {
     check
         .issues
         .iter()
-        .find(|issue| {
-            issue
-                .fields
-                .iter()
-                .any(|field| display_label(field) == label || field == label)
-        })
-        .and_then(|issue| issue.expected.clone())
+        .find(|issue| issue.fields.iter().any(|field| field == label))
+        .and_then(|issue| issue.expected.as_deref().map(redact_detail))
 }
 
 fn issue_remedies(check: &DoctorCheck) -> Vec<HumanDetail> {
@@ -658,59 +700,64 @@ fn issue_remedies(check: &DoctorCheck) -> Vec<HumanDetail> {
         .iter()
         .filter_map(|issue| issue.remedy.as_ref())
         .filter(|remedy| seen.insert((*remedy).clone()))
-        .cloned()
+        .map(|remedy| redact_detail(remedy))
         .map(HumanDetail::Remedy)
         .collect()
 }
 
-fn humanize_value(value: &str, _options: HumanOutputOptions) -> String {
-    if looks_like_path(value) {
-        return shorten_path_prefix(value);
+fn humanize_source_value(label: &str, value: &str, options: HumanOutputOptions) -> String {
+    let path_field = matches!(
+        label,
+        "current executable"
+            | "selected git"
+            | "git exec path"
+            | "repo root"
+            | "cwd"
+            | "config.toml"
+            | "CODEX_HOME"
+            | "log dir"
+            | "sqlite home"
+            | "state DB"
+            | "log DB"
+            | "goals DB"
+            | "memories DB"
+            | "managed package root"
+    ) || label.starts_with("PATH codex #")
+        || label.starts_with("PATH git #");
+    if path_field && looks_like_path(value) {
+        let value = home_shortened_path(value);
+        if options.show_all {
+            return value;
+        }
+        return middle_truncate(&value, PATH_LIMIT, options);
     }
-    if let Some(timestamp) = humanize_timestamp(value) {
-        return timestamp;
-    }
+    // Keep timestamps and arbitrary diagnostic values intact instead of guessing their syntax.
     value.to_string()
 }
 
-fn humanize_timestamp(value: &str) -> Option<String> {
-    if value.len() < 17 || !value.ends_with('Z') {
-        return None;
-    }
-    let (date, time) = value.split_once('T')?;
-    let hour_minute = time.get(..5)?;
-    Some(format!("{date} {hour_minute} UTC"))
-}
-
-fn shorten_path_prefix(value: &str) -> String {
-    let (path, suffix) = value.split_once(" (").map_or_else(
-        || (value, String::new()),
-        |(path, suffix)| (path, format!(" ({suffix}")),
-    );
-    let home_shortened = home_shortened_path(path);
-    let shortened = middle_truncate(&home_shortened, PATH_LIMIT);
-    format!("{shortened}{suffix}")
-}
-
 fn home_shortened_path(path: &str) -> String {
-    let Some(home) = env::var_os("HOME").and_then(|home| home.into_string().ok()) else {
+    let Some(home) = env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .and_then(|home| home.into_string().ok())
+    else {
         return path.to_string();
     };
     if path == home {
         "~".to_string()
     } else {
         path.strip_prefix(&format!("{home}/"))
+            .or_else(|| path.strip_prefix(&format!("{home}\\")))
             .map_or_else(|| path.to_string(), |tail| format!("~/{tail}"))
     }
 }
 
-fn middle_truncate(value: &str, max_chars: usize) -> String {
+fn middle_truncate(value: &str, max_chars: usize, options: HumanOutputOptions) -> String {
     let char_count = value.chars().count();
     if char_count <= max_chars {
         return value.to_string();
     }
     let head_len = max_chars / 2;
-    let tail_len = max_chars.saturating_sub(head_len + 1);
+    let marker = if options.ascii { "..." } else { "…" };
+    let tail_len = max_chars.saturating_sub(head_len + marker.chars().count());
     let head = value.chars().take(head_len).collect::<String>();
     let tail = value
         .chars()
@@ -720,11 +767,17 @@ fn middle_truncate(value: &str, max_chars: usize) -> String {
         .chars()
         .rev()
         .collect::<String>();
-    format!("{head}…{tail}")
+    format!("{head}{marker}{tail}")
 }
 
 fn looks_like_path(value: &str) -> bool {
-    value.starts_with('/')
+    value.starts_with("\\\\")
+        || (value.as_bytes().get(1) == Some(&b':')
+            && value
+                .as_bytes()
+                .get(2)
+                .is_some_and(|byte| *byte == b'\\' || *byte == b'/'))
+        || value.starts_with('/')
         || value.starts_with("~/")
         || value.starts_with("./")
         || value.starts_with("../")
@@ -762,14 +815,6 @@ fn list_items(value: &str) -> Vec<String> {
         .split(',')
         .map(str::trim)
         .filter(|item| !item.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-fn override_names(items: &[String]) -> Vec<String> {
-    items
-        .iter()
-        .map(|item| item.split_once('=').map_or(item.as_str(), |(name, _)| name))
         .map(str::to_string)
         .collect()
 }

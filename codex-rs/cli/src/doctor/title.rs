@@ -31,7 +31,17 @@ pub(super) fn terminal_title_check(config: &Config) -> DoctorCheck {
     terminal_title_check_from_inputs(TerminalTitleInputs {
         configured_items: config.tui_terminal_title.clone(),
         cwd: config.cwd.to_path_buf(),
-        project_root: terminal_title_project_root(config, &config.cwd),
+        project_root: config
+            .tui_terminal_title
+            .as_ref()
+            .is_none_or(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| terminal_title_item_id(item))
+                    .any(|item| item == "project-name")
+            })
+            .then(|| terminal_title_project_root(config, &config.cwd))
+            .flatten(),
     })
 }
 

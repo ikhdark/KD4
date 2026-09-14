@@ -51,23 +51,44 @@ fn reasoning_policy_summary_notification() -> ServerNotification {
     })
 }
 
-fn response_with_reasoning_policy_history() -> OutgoingMessage {
-    OutgoingMessage::Response(OutgoingResponse {
-        id: RequestId::Integer(99),
-        result: json!({
-            "thread": {
-                "turns": [{
-                    "id": "turn-1",
-                    "reasoningPolicyHistory": {
-                        "turnId": "turn-1",
-                        "entries": [],
-                        "totalEntries": 0,
-                        "truncated": false
-                    }
-                }]
-            }
-        }),
-    })
+async fn response_with_reasoning_policy_history(
+    connection_id: ConnectionId,
+    experimental: bool,
+) -> OutgoingEnvelope {
+    let (tx, mut rx) = mpsc::channel(1);
+    let outgoing = crate::outgoing_message::OutgoingMessageSender::new(
+        tx,
+        codex_analytics::AnalyticsEventsClient::disabled(),
+    );
+    outgoing
+        .connection_opened_with_runtime(
+            connection_id,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(experimental)),
+            CancellationToken::new(),
+        )
+        .await;
+    let turn = serde_json::from_value(json!({
+        "id": "turn-1",
+        "items": [{
+            "type": "mcpToolCall", "id": "tool-1", "server": "test", "tool": "echo",
+            "status": "completed", "arguments": {"reasoningPolicyHistory": "application arguments"},
+            "result": {"content": [], "structuredContent": {"reasoningPolicyHistory": "application result"}}
+        }],
+        "status": "completed",
+        "reasoningPolicyHistory": {"turnId": "turn-1", "entries": [], "totalEntries": 0, "truncated": false}
+    })).expect("valid turn response");
+    outgoing
+        .send_response(
+            crate::outgoing_message::ConnectionRequestId {
+                connection_id,
+                request_id: RequestId::Integer(99),
+            },
+            codex_app_server_protocol::TurnStartResponse { turn },
+        )
+        .await;
+    rx.try_recv()
+        .expect("typed response is synchronously admitted")
 }
 
 #[test]
@@ -143,7 +164,10 @@ async fn envelope_target_selection_preserves_the_only_delivery_path_difference()
     );
     route_outgoing_envelope(&mut connections, broadcast).await;
     assert!(initialized_writer_rx.try_recv().is_ok());
-    assert!(uninitialized_writer_rx.try_recv().is_err());
+    assert!(matches!(
+        uninitialized_writer_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
 
     for connection_id in [uninitialized_connection_id, missing_connection_id] {
         let direct = OutgoingEnvelope::ToConnection {
@@ -209,7 +233,7 @@ async fn to_connection_notification_respects_opt_out_filters() {
     .await;
 
     assert!(
-        writer_rx.try_recv().is_err(),
+        matches!(writer_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
         "opted-out notification should be dropped"
     );
 }
@@ -251,7 +275,7 @@ async fn to_connection_notifications_are_dropped_for_opted_out_clients() {
     .await;
 
     assert!(
-        writer_rx.try_recv().is_err(),
+        matches!(writer_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
         "opted-out notifications should not reach clients"
     );
 }
@@ -291,8 +315,7 @@ async fn to_connection_notifications_are_preserved_for_non_opted_out_clients() {
     .await;
 
     let message = writer_rx
-        .recv()
-        .await
+        .try_recv()
         .expect("notification should reach non-opted-out clients");
     assert!(matches!(
         message.message,
@@ -338,8 +361,7 @@ async fn to_connection_receipt_sender_reaches_the_transport_writer() {
     .await;
 
     let queued_message = writer_rx
-        .recv()
-        .await
+        .try_recv()
         .expect("notification should reach the transport writer");
     queued_message
         .write_complete_tx
@@ -384,7 +406,7 @@ async fn experimental_notifications_are_dropped_without_capability() {
     .await;
 
     assert!(
-        writer_rx.try_recv().is_err(),
+        matches!(writer_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
         "experimental notifications should not reach clients without capability"
     );
 }
@@ -417,8 +439,7 @@ async fn experimental_notifications_are_preserved_with_capability() {
     .await;
 
     let message = writer_rx
-        .recv()
-        .await
+        .try_recv()
         .expect("experimental notification should reach opted-in client");
     let OutgoingMessage::AppServerNotification(ServerNotification::TurnReasoningPolicyUpdated(
         notification,
@@ -468,7 +489,10 @@ async fn reasoning_policy_summary_notification_respects_capability() {
         },
     )
     .await;
-    assert!(writer_rx.try_recv().is_err());
+    assert!(matches!(
+        writer_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
 
     experimental_api_enabled.store(true, std::sync::atomic::Ordering::Release);
     route_outgoing_envelope(
@@ -484,8 +508,7 @@ async fn reasoning_policy_summary_notification_respects_capability() {
     .await;
 
     let message = writer_rx
-        .recv()
-        .await
+        .try_recv()
         .expect("summary should reach opted-in client");
     assert!(matches!(
         message.message,
@@ -511,27 +534,32 @@ async fn reasoning_policy_history_is_omitted_without_capability() {
 
     route_outgoing_envelope(
         &mut connections,
-        OutgoingEnvelope::ToConnection {
-            connection_id,
-            message: response_with_reasoning_policy_history(),
-            write_complete_tx: None,
-        },
+        response_with_reasoning_policy_history(connection_id, false).await,
     )
     .await;
 
-    let message = writer_rx
-        .recv()
-        .await
-        .expect("response should be delivered");
+    let message = writer_rx.try_recv().expect("response should be delivered");
     let OutgoingMessage::Response(response) = message.message else {
         panic!("expected response");
     };
     assert!(
         response
             .result
-            .pointer("/thread/turns/0/reasoningPolicyHistory")
+            .pointer("/turn/reasoningPolicyHistory")
             .is_none(),
         "history must be omitted for clients without the capability"
+    );
+    assert_eq!(
+        response
+            .result
+            .pointer("/turn/items/0/arguments/reasoningPolicyHistory"),
+        Some(&json!("application arguments"))
+    );
+    assert_eq!(
+        response
+            .result
+            .pointer("/turn/items/0/result/structuredContent/reasoningPolicyHistory"),
+        Some(&json!("application result"))
     );
 }
 
@@ -553,25 +581,18 @@ async fn reasoning_policy_history_is_preserved_with_capability() {
 
     route_outgoing_envelope(
         &mut connections,
-        OutgoingEnvelope::ToConnection {
-            connection_id,
-            message: response_with_reasoning_policy_history(),
-            write_complete_tx: None,
-        },
+        response_with_reasoning_policy_history(connection_id, true).await,
     )
     .await;
 
-    let message = writer_rx
-        .recv()
-        .await
-        .expect("response should be delivered");
+    let message = writer_rx.try_recv().expect("response should be delivered");
     let OutgoingMessage::Response(response) = message.message else {
         panic!("expected response");
     };
     assert_eq!(
         response
             .result
-            .pointer("/thread/turns/0/reasoningPolicyHistory/turnId"),
+            .pointer("/turn/reasoningPolicyHistory/turnId"),
         Some(&json!("turn-1"))
     );
 }
@@ -635,8 +656,7 @@ async fn command_execution_request_approval_strips_additional_permissions_withou
     .await;
 
     let message = writer_rx
-        .recv()
-        .await
+        .try_recv()
         .expect("request should be delivered to the connection");
     let json = serde_json::to_value(message.message).expect("request should serialize");
     assert_eq!(json["params"].get("additionalPermissions"), None);
@@ -701,8 +721,7 @@ async fn command_execution_request_approval_keeps_additional_permissions_with_ca
     .await;
 
     let message = writer_rx
-        .recv()
-        .await
+        .try_recv()
         .expect("request should be delivered to the connection");
     let json = serde_json::to_value(message.message).expect("request should serialize");
     let allowed_path = absolute_path("/tmp/allowed").to_string_lossy().into_owned();

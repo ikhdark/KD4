@@ -153,7 +153,7 @@ async fn process_sse_with_metadata(
             }
         };
 
-        trace!("SSE event: {}", &sse.data);
+        trace!(event = %sse.event, payload_bytes = sse.data.len(), "SSE event");
 
         let events = match interpreter.process_payload(&sse.data) {
             Ok(events) => {
@@ -166,7 +166,7 @@ async fn process_sse_with_metadata(
                 if let Some(t) = telemetry.as_ref() {
                     t.on_sse_event(&sse.event, start.elapsed(), Some(&error));
                 }
-                debug!("Failed to parse SSE event: {error}, data: {}", &sse.data);
+                debug!(event = %sse.event, payload_bytes = sse.data.len(), %error, "Failed to parse SSE event");
                 let _ = tx_event
                     .send(Err(ApiError::Stream(format!(
                         "failed to parse SSE event: {error}"
@@ -182,6 +182,9 @@ async fn process_sse_with_metadata(
                     t.on_sse_event(&sse.event, start.elapsed(), Some(&error));
                 }
                 let _ = tx_event.send(Err(error)).await;
+                if let Some(t) = telemetry.as_ref() {
+                    t.on_sse_cleanup(SseCleanupOutcome::ResponseError, start.elapsed());
+                }
                 return;
             }
         };
@@ -201,17 +204,23 @@ async fn process_sse_with_metadata(
                 drop(tx_event);
                 let cleanup_start = Instant::now();
                 let cleanup_timeout = idle_timeout.min(Duration::from_secs(1));
+                let cleanup_deadline = cleanup_start + cleanup_timeout;
                 let drain = timeout(cleanup_timeout, async {
-                    while stream.next().await.is_some() {}
+                    loop {
+                        if Instant::now() >= cleanup_deadline {
+                            return SseCleanupOutcome::CompletedDrainTimeout;
+                        }
+                        match stream.next().await {
+                            Some(Ok(_)) => {}
+                            Some(Err(_)) => return SseCleanupOutcome::CompletedDrainError,
+                            None => return SseCleanupOutcome::CompletedAndDrained,
+                        }
+                    }
                 })
                 .await;
                 if let Some(t) = telemetry.as_ref() {
                     t.on_sse_cleanup(
-                        if drain.is_ok() {
-                            SseCleanupOutcome::CompletedAndDrained
-                        } else {
-                            SseCleanupOutcome::CompletedDrainTimeout
-                        },
+                        drain.unwrap_or(SseCleanupOutcome::CompletedDrainTimeout),
                         cleanup_start.elapsed(),
                     );
                 }
@@ -275,11 +284,7 @@ mod tests {
                 .get("type")
                 .and_then(|v| v.as_str())
                 .expect("fixture event missing type");
-            if e.as_object().map(|o| o.len() == 1).unwrap_or(false) {
-                body.push_str(&format!("event: {kind}\n\n"));
-            } else {
-                body.push_str(&format!("event: {kind}\ndata: {e}\n\n"));
-            }
+            body.push_str(&format!("event: {kind}\ndata: {e}\n\n"));
         }
 
         let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(8);
@@ -855,6 +860,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingSseTelemetry {
         interpreted_events: std::sync::Mutex<Vec<(String, bool)>>,
+        cleanup_outcomes: std::sync::Mutex<Vec<SseCleanupOutcome>>,
     }
 
     impl SseTelemetry for RecordingSseTelemetry {
@@ -884,6 +890,98 @@ mod tests {
                 .expect("recording telemetry lock")
                 .push((kind.to_string(), error.is_none()));
         }
+
+        fn on_sse_cleanup(&self, outcome: SseCleanupOutcome, _duration: Duration) {
+            self.cleanup_outcomes
+                .lock()
+                .expect("cleanup lock")
+                .push(outcome);
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_reports_errors_and_pending_carriers() {
+        for (payload, tail, expected) in [
+            (
+                json!({"type": "response.completed", "response": {"id": "done"}}),
+                Box::pin(stream::empty()) as ByteStream,
+                SseCleanupOutcome::CompletedAndDrained,
+            ),
+            (
+                json!({"type": "response.completed", "response": {"id": "done"}}),
+                Box::pin(
+                    stream::iter([Err(TransportError::Network("broken carrier".into()))])
+                        .chain(stream::pending()),
+                ) as ByteStream,
+                SseCleanupOutcome::CompletedDrainError,
+            ),
+            (
+                json!({"type": "response.completed", "response": {"id": "done"}}),
+                Box::pin(stream::pending()) as ByteStream,
+                SseCleanupOutcome::CompletedDrainTimeout,
+            ),
+            (
+                json!({"type": "response.completed"}),
+                Box::pin(stream::pending()) as ByteStream,
+                SseCleanupOutcome::ResponseError,
+            ),
+        ] {
+            let telemetry = Arc::new(RecordingSseTelemetry::default());
+            let bytes = stream::iter([Ok(Bytes::from(format!("data: {payload}\n\n")))]).chain(tail);
+            let (tx, mut rx) = mpsc::channel(8);
+            let task = tokio::spawn(process_sse(
+                Box::pin(bytes),
+                tx,
+                Duration::from_millis(20),
+                Some(telemetry.clone()),
+            ));
+            let event = rx.recv().await.expect("terminal result");
+            if expected == SseCleanupOutcome::ResponseError {
+                assert_matches!(event, Err(ApiError::Stream(message)) if message == "response.completed event missing response");
+            } else {
+                assert_matches!(event, Ok(ResponseEvent::Completed { response_id, .. }) if response_id == "done");
+            }
+            assert!(rx.recv().await.is_none());
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("producer must terminate")
+                .expect("producer task");
+            assert_eq!(
+                *telemetry.cleanup_outcomes.lock().expect("cleanup lock"),
+                vec![expected]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_drain_checks_deadline_between_ready_events() {
+        let telemetry = Arc::new(RecordingSseTelemetry::default());
+        let consumed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = consumed.clone();
+        let tail = stream::iter(0..100).map(move |_| {
+            // Model ready-only work: there is no async yield for timeout to preempt.
+            std::thread::sleep(Duration::from_millis(1));
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Bytes::from_static(b"data: {}\n\n"))
+        });
+        let bytes = stream::iter([Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"done\"}}\n\n",
+        ))])
+        .chain(tail);
+        let (tx, mut rx) = mpsc::channel(8);
+        let task = tokio::spawn(process_sse(
+            Box::pin(bytes),
+            tx,
+            Duration::from_millis(20),
+            Some(telemetry.clone()),
+        ));
+        assert_matches!(rx.recv().await, Some(Ok(ResponseEvent::Completed { .. })));
+        task.await.expect("producer task");
+        assert!(consumed.load(std::sync::atomic::Ordering::SeqCst) < 100);
+        assert_eq!(
+            *telemetry.cleanup_outcomes.lock().expect("cleanup lock"),
+            vec![SseCleanupOutcome::CompletedDrainTimeout]
+        );
     }
 
     #[tokio::test]
@@ -912,6 +1010,65 @@ mod tests {
                 .expect("recording telemetry lock"),
             vec![("response.output_item.done".to_string(), false)]
         );
+    }
+
+    #[tokio::test]
+    async fn stream_error_codes_ignore_unused_metadata() {
+        for code in [
+            "context_length_exceeded",
+            "insufficient_quota",
+            "cyber_policy",
+        ] {
+            let payload = json!({"type": "response.failed", "response": {"error": {
+                "code": code, "message": "recognized error", "type": [], "plan_type": {}, "resets_at": "unknown"
+            }}});
+            let body = format!("data: {payload}\n\n");
+            let events = collect_events(&[body.as_bytes()]).await;
+            assert_eq!(events.len(), 1);
+            match code {
+                "context_length_exceeded" => {
+                    assert_matches!(&events[0], Err(ApiError::ContextWindowExceeded))
+                }
+                "insufficient_quota" => assert_matches!(&events[0], Err(ApiError::QuotaExceeded)),
+                "cyber_policy" => {
+                    assert_matches!(&events[0], Err(ApiError::CyberPolicy { message }) if message == "recognized error")
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limit_frames_accept_fields_outside_the_ordinary_event_shape() {
+        let events = run_sse(vec![
+            json!({"type": "codex.rate_limits", "delta": {}, "summary_index": "unused",
+                "metered_limit_name": "custom-family", "rate_limits": {"primary": {"used_percent": 25.0}}}),
+            json!({"type": "response.completed", "response": {"id": "done"}}),
+        ]).await;
+        assert_eq!(events.len(), 2);
+        assert_matches!(&events[0], ResponseEvent::RateLimits(snapshot) if snapshot.limit_id.as_deref() == Some("custom_family") && snapshot.primary.as_ref().is_some_and(|window| window.used_percent == 25.0));
+        assert_matches!(&events[1], ResponseEvent::Completed { .. });
+    }
+
+    #[tokio::test]
+    async fn stream_headers_discover_secondary_only_limit_families() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-example-secondary-used-percent",
+            HeaderValue::from_static("42"),
+        );
+        headers.insert(
+            "x-example-secondary-window-minutes",
+            HeaderValue::from_static("60"),
+        );
+        let response = StreamResponse {
+            status: StatusCode::OK,
+            headers,
+            bytes: Box::pin(stream::empty()),
+        };
+        let mut response = spawn_response_stream(response, idle_timeout(), None, None);
+        assert_matches!(response.rx_event.recv().await, Some(Ok(ResponseEvent::RateLimits(snapshot))) if snapshot.limit_id.as_deref() == Some("codex"));
+        assert_matches!(response.rx_event.recv().await, Some(Ok(ResponseEvent::RateLimits(snapshot))) if snapshot.limit_id.as_deref() == Some("example") && snapshot.primary.is_none() && snapshot.secondary.as_ref().is_some_and(|window| window.used_percent == 42.0 && window.window_minutes == Some(60)));
     }
 
     #[tokio::test]

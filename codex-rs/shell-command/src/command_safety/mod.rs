@@ -10,3 +10,6 @@ pub(crate) use powershell_parser::is_trusted_powershell_host;
 pub(crate) use powershell_parser::try_parse_powershell_ast_analysis;
 pub(crate) use powershell_parser::try_parse_powershell_ast_analysis_with_resolution;
 pub(crate) use powershell_parser::try_parse_powershell_ast_commands;
+
+pub(crate) use powershell_parser::PowershellInvocation;
+pub(crate) use powershell_parser::parse_powershell_invocation;

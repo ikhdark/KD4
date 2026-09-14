@@ -190,9 +190,20 @@ where
         // fetch/restore the cursor position. insert_history_lines should be cursor-position-neutral :)
         queue!(writer, MoveTo(/*x*/ 0, cursor_top))?;
 
+        let scroll_bottom = area.top().saturating_sub(1) as usize;
+        let mut cursor_row = cursor_top as usize;
         for line in &wrapped {
             queue!(writer, Print("\r\n"))?;
-            write_history_line(writer, line, wrap_width)?;
+            cursor_row = (cursor_row + 1).min(scroll_bottom);
+            write_history_line(
+                writer,
+                line,
+                wrap_width,
+                scroll_bottom.saturating_sub(cursor_row),
+            )?;
+            cursor_row = cursor_row
+                .saturating_add(line.width().max(1).div_ceil(wrap_width) - 1)
+                .min(scroll_bottom);
         }
 
         queue!(writer, ResetScrollRegion)?;
@@ -237,11 +248,13 @@ fn write_history_line<W: Write>(
     writer: &mut W,
     line: &HyperlinkLine,
     wrap_width: usize,
+    reachable_rows_below: usize,
 ) -> io::Result<()> {
     let physical_rows = line.width().max(1).div_ceil(wrap_width);
-    if physical_rows > 1 {
+    let rows_to_clear = physical_rows.saturating_sub(1).min(reachable_rows_below);
+    if rows_to_clear > 0 {
         queue!(writer, SavePosition)?;
-        for _ in 1..physical_rows {
+        for _ in 0..rows_to_clear {
             queue!(writer, MoveDown(1), MoveToColumn(0))?;
             queue!(writer, Clear(ClearType::UntilNewLine))?;
         }
@@ -270,7 +283,7 @@ fn write_history_line<W: Write>(
         .spans
         .iter()
         .map(|s| Span {
-            style: s.style.patch(line.line.style),
+            style: line.line.style.patch(s.style),
             content: s.content.clone(),
         })
         .collect();
@@ -333,20 +346,15 @@ impl ModifierDiff {
         if removed.contains(Modifier::REVERSED) {
             queue!(w, SetAttribute(CAttribute::NoReverse))?;
         }
-        if removed.contains(Modifier::BOLD) {
+        let intensity_reset = removed.intersects(Modifier::BOLD | Modifier::DIM);
+        if intensity_reset {
             queue!(w, SetAttribute(CAttribute::NormalIntensity))?;
-            if self.to.contains(Modifier::DIM) {
-                queue!(w, SetAttribute(CAttribute::Dim))?;
-            }
         }
         if removed.contains(Modifier::ITALIC) {
             queue!(w, SetAttribute(CAttribute::NoItalic))?;
         }
         if removed.contains(Modifier::UNDERLINED) {
             queue!(w, SetAttribute(CAttribute::NoUnderline))?;
-        }
-        if removed.contains(Modifier::DIM) {
-            queue!(w, SetAttribute(CAttribute::NormalIntensity))?;
         }
         if removed.contains(Modifier::CROSSED_OUT) {
             queue!(w, SetAttribute(CAttribute::NotCrossedOut))?;
@@ -355,7 +363,10 @@ impl ModifierDiff {
             queue!(w, SetAttribute(CAttribute::NoBlink))?;
         }
 
-        let added = self.to - self.from;
+        let mut added = self.to - self.from;
+        if intensity_reset {
+            added |= self.to & (Modifier::BOLD | Modifier::DIM);
+        }
         if added.contains(Modifier::REVERSED) {
             queue!(w, SetAttribute(CAttribute::Reverse))?;
         }
@@ -415,7 +426,7 @@ where
             bg = next_bg;
         }
 
-        queue!(writer, Print(span.content.clone()))?;
+        queue!(writer, Print(span.content.as_ref()))?;
     }
 
     queue!(
@@ -433,6 +444,41 @@ mod tests {
     use crate::test_backend::VT100Backend;
     use ratatui::layout::Rect;
     use ratatui::style::Color;
+    use ratatui::style::Style;
+
+    #[test]
+    fn vt100_span_style_overrides_line_style_and_preserves_bold_after_dim() {
+        let backend = VT100Backend::new(20, 6);
+        let mut terminal =
+            crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 5, 20, 1));
+        let line = Line::from(vec![
+            Span::styled(
+                "A",
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::BOLD | Modifier::DIM),
+            ),
+            Span::styled(
+                "B",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+        ])
+        .style(Style::default().fg(Color::Green));
+        insert_history_lines(&mut terminal, vec![line]).expect("insert styled line");
+        let screen = terminal.backend().vt100().screen();
+        let row = (0..6)
+            .find(|row| {
+                screen
+                    .cell(*row, 0)
+                    .is_some_and(|cell| cell.contents() == "A")
+            })
+            .expect("styled history must render");
+        let second = screen.cell(row, 1).expect("second span");
+        assert_eq!(second.contents(), "B");
+        assert_eq!(second.fgcolor(), vt100::Color::Idx(1));
+        assert!(second.bold(), "removing dim must retain bold");
+    }
 
     #[test]
     fn history_insertion_repaints_unchanged_blank_viewport() {
@@ -512,16 +558,16 @@ mod tests {
     }
 
     #[test]
-    fn very_long_history_line_clears_every_continuation_row() {
+    fn very_long_history_line_bounds_clearing_to_reachable_rows() {
         let line = HyperlinkLine::new(Line::from("x".repeat(65_536)));
         let mut output = Vec::new();
 
-        write_history_line(&mut output, &line, 1).expect("write long history line");
+        write_history_line(&mut output, &line, 1, 5).expect("write long history line");
 
         let output = String::from_utf8(output).expect("UTF-8 terminal output");
-        assert_eq!(output.matches("\x1b[1B").count(), 65_535);
+        assert_eq!(output.matches("\x1b[1B").count(), 5);
         // Clear each continuation row and the initial row before writing the text.
-        assert_eq!(output.matches("\x1b[K").count(), 65_536);
+        assert_eq!(output.matches("\x1b[K").count(), 6);
         assert!(output.contains(&"x".repeat(65_536)));
     }
 
@@ -559,7 +605,13 @@ mod tests {
         let line = crate::terminal_hyperlinks::annotate_web_urls_in_line(Line::from(destination));
         let mut actual = Vec::new();
 
-        write_history_line(&mut actual, &line, /*wrap_width*/ 80).expect("write history line");
+        write_history_line(
+            &mut actual,
+            &line,
+            /*wrap_width*/ 80,
+            /*reachable_rows_below*/ 0,
+        )
+        .expect("write history line");
 
         let output = String::from_utf8(actual).expect("UTF-8 terminal output");
         assert!(output.contains("\x1b]8;;https://example.com/long/path\x07"));
@@ -687,41 +739,34 @@ mod tests {
 
         let screen = term.backend().vt100().screen();
 
-        // Find the first non-empty row; verify first three cells are colored, following cells default.
-        'rows: for row in 0..height {
-            let mut has_text = false;
-            for col in 0..width {
-                if let Some(cell) = screen.cell(row, col)
-                    && cell.has_contents()
-                    && cell.contents() != " "
-                {
-                    has_text = true;
-                    break;
-                }
-            }
-            if !has_text {
-                continue;
-            }
-
-            // Expect "1. Hello world" starting at col 0.
-            for col in 0..3 {
-                let cell = screen.cell(row, col).unwrap();
-                assert!(
-                    cell.fgcolor() != vt100::Color::Default,
-                    "expected colored prefix at col {col}, got {:?}",
-                    cell.fgcolor()
-                );
-            }
-            for col in 3..(3 + "Hello world".len() as u16) {
-                let cell = screen.cell(row, col).unwrap();
-                assert_eq!(
-                    cell.fgcolor(),
-                    vt100::Color::Default,
-                    "expected default color for plain text at col {col}, got {:?}",
-                    cell.fgcolor()
-                );
-            }
-            break 'rows;
+        let row = (0..height)
+            .find(|row| {
+                screen
+                    .cell(*row, 0)
+                    .is_some_and(|cell| cell.contents() == "1")
+            })
+            .expect("history must render the expected numbered line");
+        let text: String = (0..14)
+            .map(|col| screen.cell(row, col).unwrap().contents())
+            .collect();
+        assert_eq!(text, "1. Hello world");
+        // Expect "1. Hello world" starting at col 0.
+        for col in 0..3 {
+            let cell = screen.cell(row, col).unwrap();
+            assert!(
+                cell.fgcolor() != vt100::Color::Default,
+                "expected colored prefix at col {col}, got {:?}",
+                cell.fgcolor()
+            );
+        }
+        for col in 3..(3 + "Hello world".len() as u16) {
+            let cell = screen.cell(row, col).unwrap();
+            assert_eq!(
+                cell.fgcolor(),
+                vt100::Color::Default,
+                "expected default color for plain text at col {col}, got {:?}",
+                cell.fgcolor()
+            );
         }
     }
 

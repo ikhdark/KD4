@@ -7,7 +7,7 @@ use super::*;
 use crate::app_backtrack::SIDE_EDIT_PREVIOUS_UNAVAILABLE_MESSAGE;
 
 impl App {
-    pub(super) async fn launch_external_editor(&mut self, tui: &mut tui::Tui) {
+    pub(super) async fn launch_external_editor(&mut self, tui: &mut tui::Tui) -> Result<()> {
         let editor_cmd = match external_editor::resolve_editor_command() {
             Ok(cmd) => cmd,
             Err(external_editor::EditorError::MissingEditor) => {
@@ -17,7 +17,7 @@ impl App {
                         .to_string(),
                 ));
                 self.reset_external_editor_state(tui);
-                return;
+                return Ok(());
             }
             Err(err) => {
                 self.chat_widget
@@ -25,14 +25,14 @@ impl App {
                         "Failed to open editor: {err}",
                     )));
                 self.reset_external_editor_state(tui);
-                return;
+                return Ok(());
             }
         };
 
         let seed = self.chat_widget.composer_text_with_pending();
         let editor_result = tui
             .with_restored(|| async { external_editor::run_editor(&seed, &editor_cmd).await })
-            .await;
+            .await?;
         self.reset_external_editor_state(tui);
 
         match editor_result {
@@ -49,6 +49,7 @@ impl App {
             }
         }
         tui.frame_requester().schedule_frame();
+        Ok(())
     }
 
     pub(super) fn request_external_editor_launch(&mut self, tui: &mut tui::Tui) {
@@ -97,50 +98,30 @@ impl App {
         // keyboard reporting is available. We only treat those word-motion fallbacks as
         // agent-switch shortcuts when the composer is empty so we never steal the expected
         // editing behavior for moving across words inside a draft.
-        let allow_agent_word_motion_fallback = !self.enhanced_keys_supported
-            && self.chat_widget.composer_text_with_pending().is_empty();
-        if self.overlay.is_none()
+        let allow_agent_word_motion_fallback = !self.enhanced_keys_supported;
+        let direction =
+            if previous_agent_shortcut_matches(key_event, allow_agent_word_motion_fallback) {
+                Some(AgentNavigationDirection::Previous)
+            } else if next_agent_shortcut_matches(key_event, allow_agent_word_motion_fallback) {
+                Some(AgentNavigationDirection::Next)
+            } else {
+                None
+            };
+        if let Some(direction) = direction
+            && self.overlay.is_none()
             && self.chat_widget.no_modal_or_popup_active()
-            // Alt+Left/Right are also natural word-motion keys in the composer. Keep agent
-            // fast-switch available only once the draft is empty so editing behavior wins whenever
-            // there is text on screen.
             && self.chat_widget.composer_text_with_pending().is_empty()
-            && previous_agent_shortcut_matches(key_event, allow_agent_word_motion_fallback)
         {
             if let Some(thread_id) = self
-                .adjacent_thread_id_with_backfill(app_server, AgentNavigationDirection::Previous)
+                .adjacent_thread_id_with_backfill(app_server, direction)
                 .await
-            {
-                if let Err(err) = self
+                && let Err(err) = self
                     .select_agent_thread_and_discard_side(tui, app_server, thread_id)
                     .await
-                {
-                    self.chat_widget.add_error_message(format!(
-                        "Failed to switch to agent thread {thread_id}: {err}"
-                    ));
-                }
-            }
-            return;
-        }
-        if self.overlay.is_none()
-            && self.chat_widget.no_modal_or_popup_active()
-            // Mirror the previous-agent rule above: empty drafts may use these keys for thread
-            // switching, but non-empty drafts keep them for expected word-wise cursor motion.
-            && self.chat_widget.composer_text_with_pending().is_empty()
-            && next_agent_shortcut_matches(key_event, allow_agent_word_motion_fallback)
-        {
-            if let Some(thread_id) = self
-                .adjacent_thread_id_with_backfill(app_server, AgentNavigationDirection::Next)
-                .await
             {
-                if let Err(err) = self
-                    .select_agent_thread_and_discard_side(tui, app_server, thread_id)
-                    .await
-                {
-                    self.chat_widget.add_error_message(format!(
-                        "Failed to switch to agent thread {thread_id}: {err}"
-                    ));
-                }
+                self.chat_widget.add_error_message(format!(
+                    "Failed to switch to agent thread {thread_id}: {err}"
+                ));
             }
             return;
         }

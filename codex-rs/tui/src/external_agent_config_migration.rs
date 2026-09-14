@@ -488,7 +488,6 @@ impl ExternalAgentConfigMigrationScreen {
                 }
             }
         }
-        self.ensure_selected_item_visible();
         self.request_frame.schedule_frame();
     }
 
@@ -522,7 +521,6 @@ impl ExternalAgentConfigMigrationScreen {
                 }
             }
         }
-        self.ensure_selected_item_visible();
         self.request_frame.schedule_frame();
     }
 
@@ -583,32 +581,8 @@ impl ExternalAgentConfigMigrationScreen {
         self.confirm_selection();
     }
 
-    fn ensure_selected_item_visible(&mut self) {
-        let Some(selected_idx) = self.selected_item_idx else {
-            self.scroll_top = 0;
-            return;
-        };
-        let selected_render_idx = self.selected_render_line_index(selected_idx);
-        let visible_rows = self.render_line_count().max(1);
-        if selected_render_idx < self.scroll_top {
-            self.scroll_top = selected_render_idx;
-        } else {
-            let bottom = self.scroll_top + visible_rows.saturating_sub(1);
-            if selected_render_idx > bottom {
-                self.scroll_top = selected_render_idx + 1 - visible_rows;
-            }
-        }
-    }
-
     fn render_line_count(&self) -> usize {
         self.build_render_lines().len()
-    }
-
-    fn selected_render_line_index(&self, selected_item_idx: usize) -> usize {
-        self.build_render_lines()
-            .iter()
-            .position(|entry| entry.item_idx == Some(selected_item_idx))
-            .unwrap_or(selected_item_idx)
     }
 
     fn section_title(cwd: Option<&std::path::Path>) -> Line<'static> {
@@ -858,6 +832,24 @@ mod tests {
     }
 
     #[test]
+    fn unknown_session_details_do_not_display_a_zero_session_count() {
+        let mut items = sample_items();
+        items[1].details = None;
+        let screen = ExternalAgentConfigMigrationScreen::new(
+            FrameRequester::test_dummy(),
+            &items,
+            &items,
+            None,
+        );
+        let rendered = render_screen(&screen, 80, 24);
+        assert!(rendered.contains("[x] Chat sessions"));
+        assert!(
+            !rendered.contains("Chat sessions ("),
+            "missing details are an unknown count"
+        );
+    }
+
+    #[test]
     fn prompt_snapshot() {
         let items = sample_items();
         let screen = ExternalAgentConfigMigrationScreen::new(
@@ -870,6 +862,49 @@ mod tests {
         let rendered = render_screen(&screen, /*width*/ 80, /*height*/ 24);
 
         assert_snapshot!("external_agent_config_migration_prompt_windows", rendered);
+    }
+
+    #[test]
+    fn narrow_screen_preserves_wrapped_intro_and_error_style() {
+        use ratatui::widgets::WidgetRef;
+        let error = "Import failed because the destination is unavailable. Please retry.";
+        let screen = ExternalAgentConfigMigrationScreen::new(
+            FrameRequester::test_dummy(),
+            &[],
+            &[],
+            Some(error.into()),
+        );
+        let area = Rect::new(0, 0, 32, 40);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        (&screen).render_ref(area, &mut buffer);
+        let rendered: String = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            rendered.contains("Standard Claude Chat data cannot be imported."),
+            "{rendered}"
+        );
+        assert!(rendered.contains(error), "{rendered}");
+        assert!(
+            buffer
+                .content
+                .iter()
+                .any(|cell| cell.symbol() == "I" && cell.fg == ratatui::style::Color::Red)
+        );
+
+        let small = Rect::new(0, 0, 32, 7);
+        let mut buffer = ratatui::buffer::Buffer::empty(small);
+        (&screen).render_ref(small, &mut buffer);
+        assert_eq!(buffer[(2, 1)].symbol(), "I");
+        assert_eq!(buffer[(2, 1)].fg, ratatui::style::Color::Red);
     }
 
     #[test]

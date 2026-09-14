@@ -1138,7 +1138,7 @@ pub(crate) fn codex_plugin_install_requested_metadata(
         thread_id: tracking.thread_id.clone(),
         turn_id: tracking.turn_id.clone(),
         model_slug: tracking.model_slug.clone(),
-        product_client_id: Some(originator().value),
+        product_client_id: Some(tracking.product_client_id.clone()),
     }
 }
 

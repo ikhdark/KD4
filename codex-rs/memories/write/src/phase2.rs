@@ -63,20 +63,7 @@ pub async fn run(context: Arc<MemoryStartupContext>, config: Arc<Config>) {
         }
     };
 
-    // 2. Ensure the memories root has a git baseline repository.
-    if let Err(err) = prepare_memory_workspace(&root).await {
-        tracing::error!("failed preparing memory workspace: {err}");
-        job::failed(
-            context.as_ref(),
-            db.as_ref(),
-            &claim,
-            "failed_prepare_workspace",
-        )
-        .await;
-        return;
-    }
-
-    // 3. Build the locked-down config used by the consolidation agent.
+    // 2. Build the locked-down config used by the consolidation agent.
     let Some(agent_config) = agent::get_config(config.as_ref(), context.provider()) else {
         // If we can't get the config, we can't consolidate.
         tracing::error!("failed to get agent config");
@@ -89,6 +76,19 @@ pub async fn run(context: Arc<MemoryStartupContext>, config: Arc<Config>) {
         .await;
         return;
     };
+
+    // 3. Ensure the memories root has a git baseline repository.
+    if let Err(err) = prepare_memory_workspace(&root).await {
+        tracing::error!("failed preparing memory workspace: {err}");
+        job::failed(
+            context.as_ref(),
+            db.as_ref(),
+            &claim,
+            "failed_prepare_workspace",
+        )
+        .await;
+        return;
+    }
 
     // 4. Load current DB-backed Phase 2 inputs.
     let raw_memories = match db
@@ -141,9 +141,9 @@ pub async fn run(context: Arc<MemoryStartupContext>, config: Arc<Config>) {
         }
     };
     if !workspace_diff.has_changes() {
-        tracing::error!("Phase 2 no changes");
+        tracing::debug!("Phase 2 no changes");
         // We check only after sync of the file system.
-        job::succeed(
+        if !job::succeed(
             context.as_ref(),
             db.as_ref(),
             &claim,
@@ -151,7 +151,10 @@ pub async fn run(context: Arc<MemoryStartupContext>, config: Arc<Config>) {
             &raw_memories,
             "succeeded_no_workspace_changes",
         )
-        .await;
+        .await
+        {
+            job::failed(context.as_ref(), db.as_ref(), &claim, "failed_acknowledge").await;
+        }
         return;
     }
 
@@ -182,22 +185,22 @@ pub async fn run(context: Arc<MemoryStartupContext>, config: Arc<Config>) {
         }
     };
 
-    // 9. Hand off completion handling, heartbeats, and baseline reset.
-    agent::handle(
-        Arc::clone(&context),
-        claim,
-        new_watermark,
-        raw_memories.clone(),
-        root,
-        agent,
-        phase_two_e2e_timer,
-    );
-
-    // 10. Emit dispatch metrics.
+    // 9. Emit dispatch metrics.
     let counters = Counters {
         input: raw_memory_count as i64,
     };
     emit_metrics(context.as_ref(), counters);
+    // 10. Await completion, worker shutdown, and baseline reset.
+    agent::handle(
+        Arc::clone(&context),
+        claim,
+        new_watermark,
+        raw_memories,
+        root,
+        agent,
+        phase_two_e2e_timer,
+    )
+    .await;
 }
 
 async fn sync_phase2_workspace_inputs(
@@ -286,11 +289,21 @@ mod job {
         selected_outputs: &[codex_state::Stage1Output],
         reason: &'static str,
     ) -> bool {
-        context.counter(MEMORY_PHASE_TWO_JOBS, /*inc*/ 1, &[("status", reason)]);
-        db.memories()
+        match db
+            .memories()
             .mark_global_phase2_job_succeeded(&claim.token, completion_watermark, selected_outputs)
             .await
-            .unwrap_or(false)
+        {
+            Ok(true) => {
+                context.counter(MEMORY_PHASE_TWO_JOBS, 1, &[("status", reason)]);
+                true
+            }
+            Ok(false) => false,
+            Err(err) => {
+                tracing::error!("failed acknowledging memory consolidation: {err}");
+                false
+            }
+        }
     }
 }
 
@@ -377,7 +390,7 @@ mod agent {
 
     /// Handle the agent while it is running.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn handle(
+    pub(super) async fn handle(
         context: Arc<MemoryStartupContext>,
         claim: Claim,
         new_watermark: i64,
@@ -390,22 +403,50 @@ mod agent {
             return;
         };
 
-        tokio::spawn(async move {
+        {
             let _phase_two_e2e_timer = phase_two_e2e_timer;
             let SpawnedConsolidationAgent { thread_id, thread } = agent;
 
             // Loop the agent until we have the final status.
-            let final_status =
+            let mut final_status =
                 loop_agent(db.clone(), claim.token.clone(), thread_id, &thread).await;
 
-            if is_successful_agent_status(&final_status) {
-                if let Some(token_usage) = thread
-                    .token_usage_info()
-                    .await
-                    .map(|info| info.total_token_usage)
-                {
-                    emit_token_usage_metrics(context.as_ref(), &token_usage);
+            if let Some(token_usage) = thread
+                .token_usage_info()
+                .await
+                .map(|info| info.total_token_usage)
+            {
+                emit_token_usage_metrics(context.as_ref(), &token_usage);
+            }
+            let shutdown = context
+                .shutdown_consolidation_agent(SpawnedConsolidationAgent { thread_id, thread });
+            tokio::pin!(shutdown);
+            let mut heartbeat =
+                tokio::time::interval(Duration::from_secs(crate::stage_two::JOB_HEARTBEAT_SECONDS));
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut renew_lease = true;
+            let shutdown_result = loop {
+                tokio::select! {
+                    result = &mut shutdown => break result,
+                    _ = heartbeat.tick(), if renew_lease => {
+                        if !matches!(db.memories().heartbeat_global_phase2_job(
+                            &claim.token, crate::stage_two::JOB_LEASE_SECONDS,
+                        ).await, Ok(true)) {
+                            renew_lease = false;
+                            final_status = AgentStatus::Errored(
+                                "lost phase-2 ownership during worker shutdown".to_string(),
+                            );
+                        }
+                    }
                 }
+            };
+            if let Err(err) = shutdown_result {
+                // Do not advertise completion while a worker may still be able to write.
+                warn!("failed to close memory consolidation agent {thread_id}: {err}");
+                return;
+            }
+
+            if is_successful_agent_status(&final_status) {
                 // Do not reset the workspace baseline if we lost the lock.
                 let still_owns_lock = match db
                     .memories()
@@ -454,19 +495,7 @@ mod agent {
             } else {
                 job::failed(context.as_ref(), &db, &claim, "failed_agent").await;
             }
-
-            let cleanup_context = Arc::clone(&context);
-            tokio::spawn(async move {
-                if let Err(err) = cleanup_context
-                    .shutdown_consolidation_agent(SpawnedConsolidationAgent { thread_id, thread })
-                    .await
-                {
-                    warn!(
-                        "failed to auto-close global memory consolidation agent {thread_id}: {err}"
-                    );
-                }
-            });
-        });
+        }
     }
 
     async fn loop_agent(
@@ -550,10 +579,7 @@ pub(super) fn get_watermark(
 }
 
 fn is_final_agent_status(status: &AgentStatus) -> bool {
-    !matches!(
-        status,
-        AgentStatus::PendingInit | AgentStatus::Running | AgentStatus::Interrupted
-    )
+    !matches!(status, AgentStatus::PendingInit | AgentStatus::Running)
 }
 
 pub(super) fn is_successful_agent_status(status: &AgentStatus) -> bool {

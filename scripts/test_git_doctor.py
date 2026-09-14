@@ -15,6 +15,23 @@ def completed(returncode: int, *, stdout: str = "", stderr: str = ""):
 
 
 class GitDoctorTest(unittest.TestCase):
+    def test_config_failure_is_not_an_unset_setting(self):
+        with mock.patch.object(
+            git_doctor, "run_git", return_value=completed(128, stderr="bad config")
+        ):
+            with self.assertRaisesRegex(git_doctor.RepositoryProbeError, "bad config"):
+                git_doctor.git_config("core.fsmonitor")
+        with mock.patch.object(git_doctor, "run_git", return_value=completed(1)):
+            self.assertIsNone(git_doctor.git_config("core.fsmonitor"))
+
+    def test_timed_status_discards_stdout(self):
+        with mock.patch.object(
+            git_doctor.subprocess, "run", return_value=completed(0)
+        ) as run:
+            self.assertFalse(git_doctor.timed_status(1).failed)
+        self.assertIs(run.call_args.kwargs["stdout"], subprocess.DEVNULL)
+        self.assertIs(run.call_args.kwargs["stderr"], subprocess.PIPE)
+
     def test_repository_root_probe_failure_is_fatal(self) -> None:
         with mock.patch.object(
             git_doctor,
@@ -27,7 +44,7 @@ class GitDoctorTest(unittest.TestCase):
                 git_doctor.build_report(1.0)
 
     def test_nonzero_status_is_reported_and_main_fails(self) -> None:
-        def run_git(args, *, timeout=5.0):
+        def run_git(args, *, timeout=5.0, discard_stdout=False):
             del timeout
             if args[0] == "rev-parse":
                 return completed(0, stdout="/repo\n")

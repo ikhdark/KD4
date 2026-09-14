@@ -103,10 +103,8 @@ impl SharedCliOptions {
         if config_profile_v2.is_none() {
             config_profile_v2.clone_from(root_config_profile_v2);
         }
-        if sandbox_mode.is_none() {
-            *sandbox_mode = *root_sandbox_mode;
-        }
         if !self_selected_sandbox_mode {
+            *sandbox_mode = *root_sandbox_mode;
             *dangerously_bypass_approvals_and_sandbox =
                 *root_dangerously_bypass_approvals_and_sandbox;
         }
@@ -172,6 +170,57 @@ impl SharedCliOptions {
         }
         if !add_dir.is_empty() {
             self.add_dir.extend(add_dir);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        shared: SharedCliOptions,
+    }
+
+    #[test]
+    fn inherits_sandbox_selection_only_when_child_has_no_selection() {
+        for (root_args, child_args, expected_mode, expected_bypass) in [
+            (
+                vec!["codex", "--sandbox", "read-only"],
+                vec!["codex", "--yolo"],
+                None,
+                true,
+            ),
+            (
+                vec!["codex", "--yolo"],
+                vec!["codex", "--sandbox", "read-only"],
+                Some(SandboxModeCliArg::ReadOnly),
+                false,
+            ),
+            (
+                vec!["codex", "--sandbox", "read-only"],
+                vec!["codex"],
+                Some(SandboxModeCliArg::ReadOnly),
+                false,
+            ),
+            (vec!["codex", "--yolo"], vec!["codex"], None, true),
+        ] {
+            let root = Cli::try_parse_from(root_args).expect("root args").shared;
+            let mut child = Cli::try_parse_from(child_args).expect("child args").shared;
+            child.inherit_exec_root_options(&root);
+            assert_eq!(
+                child
+                    .sandbox_mode
+                    .map(codex_protocol::config_types::SandboxMode::from),
+                expected_mode.map(codex_protocol::config_types::SandboxMode::from)
+            );
+            assert_eq!(
+                child.dangerously_bypass_approvals_and_sandbox,
+                expected_bypass
+            );
         }
     }
 }

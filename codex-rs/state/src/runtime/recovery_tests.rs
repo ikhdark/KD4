@@ -1,10 +1,10 @@
 use super::*;
-use crate::runtime::test_support::unique_temp_dir;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
 async fn backup_moves_only_requested_runtime_db_files_to_backup_folder() -> std::io::Result<()> {
-    let sqlite_home = unique_temp_dir();
+    let temp = tempfile::tempdir()?;
+    let sqlite_home = temp.path().to_path_buf();
     tokio::fs::create_dir_all(sqlite_home.as_path()).await?;
     let runtime_paths = super::super::runtime_db_paths(sqlite_home.as_path());
     let mut expected_paths = Vec::new();
@@ -27,7 +27,10 @@ async fn backup_moves_only_requested_runtime_db_files_to_backup_folder() -> std:
         .iter()
         .filter(|path| !failed_paths.contains(path))
     {
-        assert!(tokio::fs::try_exists(path.as_path()).await?);
+        assert_eq!(
+            tokio::fs::read(path).await?,
+            path.display().to_string().as_bytes()
+        );
     }
     for backup in backups {
         assert!(
@@ -35,14 +38,18 @@ async fn backup_moves_only_requested_runtime_db_files_to_backup_folder() -> std:
                 .backup_path
                 .starts_with(sqlite_home.join(BACKUP_DIR_NAME))
         );
-        assert!(tokio::fs::try_exists(backup.backup_path.as_path()).await?);
+        assert_eq!(
+            tokio::fs::read(&backup.backup_path).await?,
+            backup.original_path.display().to_string().as_bytes()
+        );
     }
     Ok(())
 }
 
 #[tokio::test]
 async fn backup_replaces_blocking_sqlite_home_file() -> std::io::Result<()> {
-    let temp_dir = unique_temp_dir();
+    let temp = tempfile::tempdir()?;
+    let temp_dir = temp.path().to_path_buf();
     tokio::fs::create_dir_all(temp_dir.as_path()).await?;
     let sqlite_home = temp_dir.join("sqlite-home");
     tokio::fs::write(sqlite_home.as_path(), b"not-a-directory").await?;
@@ -59,7 +66,10 @@ async fn backup_replaces_blocking_sqlite_home_file() -> std::io::Result<()> {
             .backup_path
             .starts_with(temp_dir.join(format!("sqlite-home.{BACKUP_DIR_NAME}")))
     );
-    assert!(tokio::fs::try_exists(backups[0].backup_path.as_path()).await?);
+    assert_eq!(
+        tokio::fs::read(&backups[0].backup_path).await?,
+        b"not-a-directory"
+    );
     Ok(())
 }
 
@@ -77,7 +87,8 @@ fn sqlite_error_detail_classifies_corruption_and_lock_errors() {
 #[tokio::test]
 async fn runtime_db_path_for_corruption_error_returns_failed_database_path() -> std::io::Result<()>
 {
-    let sqlite_home = unique_temp_dir();
+    let temp = tempfile::tempdir()?;
+    let sqlite_home = temp.path().to_path_buf();
     tokio::fs::create_dir_all(sqlite_home.as_path()).await?;
     let path = super::super::state_db_path(sqlite_home.as_path());
     tokio::fs::write(path.as_path(), b"not sqlite").await?;
@@ -102,4 +113,38 @@ fn runtime_db_path_for_corruption_error_ignores_corrupt_word_in_path() {
     ));
 
     assert_eq!(runtime_db_path_for_corruption_error(&err), None);
+}
+
+#[tokio::test]
+async fn partial_backup_failure_reports_and_preserves_completed_moves() -> std::io::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let first = temp.path().join("state.sqlite");
+    let second = temp.path().join("other/state.sqlite");
+    tokio::fs::write(&first, b"original database").await?;
+    tokio::fs::create_dir_all(&second).await?;
+    tokio::fs::write(second.join("contents"), b"untouched").await?;
+    let error = backup_sqlite_paths(temp.path(), [first.clone(), second.clone()])
+        .await
+        .expect_err("directory cannot replace backed-up file");
+    let detail = error
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<PartialBackupError>()
+        .expect("partial backup context");
+    assert_eq!(detail.backups.len(), 1);
+    assert_eq!(detail.backups[0].original_path, first);
+    assert_eq!(
+        tokio::fs::read(&detail.backups[0].backup_path).await?,
+        b"original database"
+    );
+    assert_eq!(
+        tokio::fs::read(second.join("contents")).await?,
+        b"untouched"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains(&detail.backups[0].backup_path.display().to_string())
+    );
+    Ok(())
 }

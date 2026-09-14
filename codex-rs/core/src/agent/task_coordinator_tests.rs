@@ -224,7 +224,7 @@ async fn terminal_emission_exports_once_after_diagnostic_event_saturation() {
     let export = exports.last().expect("terminal export");
     let emitted = export
         .scope_metrics()
-        .flat_map(|scope| scope.metrics())
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
         .collect::<Vec<_>>();
     let terminal = emitted
         .iter()

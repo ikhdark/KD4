@@ -161,6 +161,9 @@ impl ExecProcessEventReceiver {
     /// `Lagged` means this receiver fell behind the bounded live channel. The
     /// caller should recover through [`ExecProcess::read`] using the last
     /// delivered sequence number, then continue receiving pushed events.
+    /// Discard sequenced pushed events at or below the last sequence already
+    /// delivered, including events delivered by the recovery read. A sequence
+    /// gap or truncated initial replay means earlier history may be missing.
     pub async fn recv(&mut self) -> Result<ExecProcessEvent, broadcast::error::RecvError> {
         if let Some(event) = self.replay.pop_front() {
             return Ok(event);

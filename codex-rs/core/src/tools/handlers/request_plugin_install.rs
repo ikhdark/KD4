@@ -626,7 +626,10 @@ async fn verified_plugin_install_completed(
             .any(|plugin| plugin.id == tool_id && plugin.installed)
     })
     .await
-    .expect("plugin install verification worker should complete")
+    .unwrap_or_else(|error| {
+        tracing::warn!(%error, "plugin install verification worker failed");
+        false
+    })
 }
 
 #[cfg(test)]

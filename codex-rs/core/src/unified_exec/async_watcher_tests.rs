@@ -242,7 +242,7 @@ fn split_valid_utf8_prefix_avoids_splitting_utf8_codepoints() {
         &mut buf, /*max_bytes*/ 3, /*flush_incomplete*/ false,
     )
     .expect("expected prefix");
-    assert_eq!(std::str::from_utf8(&first).unwrap(), "é");
+    assert_eq!(std::str::from_utf8(first).unwrap(), "é");
     assert_eq!(buf, "éé".as_bytes().to_vec());
 }
 
@@ -345,9 +345,9 @@ async fn final_loss_markers_survive_head_tail_eviction_without_duplication() {
     let transcript = Arc::new(Mutex::new(HeadTailBuffer::new(16)));
     {
         let mut guard = transcript.lock().await;
-        guard.push_chunk(&vec![b'a'; 16]);
+        guard.push_chunk(&[b'a'; 16]);
         guard.record_lagged_chunks(7);
-        guard.push_chunk(&vec![b'b'; 64]);
+        guard.push_chunk(&[b'b'; 64]);
     }
 
     let aggregated = resolve_aggregated_output(&transcript, String::new()).await;
@@ -779,10 +779,10 @@ async fn exit_watcher_applies_late_network_denial_before_terminal_event_and_cach
         .map_err(anyhow::Error::msg)?;
         let mut terminal_events = Vec::new();
         while let Ok(event) = events.try_recv() {
-            if let EventMsg::ExecCommandEnd(end) = event.msg {
-                if end.call_id == "late-denial" {
-                    terminal_events.push(end);
-                }
+            if let EventMsg::ExecCommandEnd(end) = event.msg
+                && end.call_id == "late-denial"
+            {
+                terminal_events.push(end);
             }
         }
         assert_eq!(terminal_events.len(), 1);

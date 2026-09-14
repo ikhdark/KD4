@@ -8,39 +8,61 @@ use tracing_subscriber::layer::SubscriberExt;
 
 #[tokio::test]
 async fn route_aware_pool_strips_credentials_on_cross_origin_redirect() {
-    let (destination_addr, destination_thread) = spawn_proxy_listener();
-    let destination_url = format!("http://{destination_addr}/final");
-    let (redirect_addr, redirect_thread) = spawn_redirect_listener(&destination_url);
-    let initial_url = format!("http://{redirect_addr}/start");
-    cache_system_proxy_decision(&initial_url, SystemProxyDecision::Direct);
-    cache_system_proxy_decision(&destination_url, SystemProxyDecision::Direct);
-    let pool = crate::RouteAwareClientPool::new(
-        HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy),
-        ClientRouteClass::Api,
-    );
+    for defaults in [false, true] {
+        let (destination_addr, destination_thread) = spawn_proxy_listener();
+        let destination_url = format!("http://{destination_addr}/final");
+        let (redirect_addr, redirect_thread) = spawn_redirect_listener(&destination_url);
+        let initial_url = format!("http://{redirect_addr}/start");
+        cache_system_proxy_decision(&initial_url, SystemProxyDecision::Direct);
+        cache_system_proxy_decision(&destination_url, SystemProxyDecision::Direct);
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer origin-secret"),
+        );
+        headers.insert(
+            COOKIE,
+            http::HeaderValue::from_static("session=origin-secret"),
+        );
+        headers.insert(
+            PROXY_AUTHORIZATION,
+            http::HeaderValue::from_static("Basic proxy-secret"),
+        );
+        let pool = crate::RouteAwareClientPool::with_builder(
+            HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy),
+            ClientRouteClass::Api,
+            crate::HttpClientBuilder::new().default_headers(if defaults {
+                headers.clone()
+            } else {
+                http::HeaderMap::new()
+            }),
+        );
 
-    let response = tokio::time::timeout(
-        Duration::from_secs(2),
-        pool.get(&initial_url)
-            .header(AUTHORIZATION, "Bearer origin-secret")
-            .header(COOKIE, "session=origin-secret")
-            .header(PROXY_AUTHORIZATION, "Basic proxy-secret")
-            .send(),
-    )
-    .await
-    .expect("redirected request should finish")
-    .expect("cross-origin redirect should succeed");
-    let initial_request = only_request(redirect_thread, "redirect");
-    let destination_request = only_request(destination_thread, "destination");
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            pool.get(&initial_url)
+                .headers(if defaults {
+                    http::HeaderMap::new()
+                } else {
+                    headers
+                })
+                .send(),
+        )
+        .await
+        .expect("redirected request should finish")
+        .expect("cross-origin redirect should succeed");
+        let initial_request = only_request(redirect_thread, "redirect");
+        let destination_request = only_request(destination_thread, "destination");
 
-    assert_eq!(response.url().as_str(), destination_url);
-    assert_eq!(
-        [
-            credential_headers(&initial_request),
-            credential_headers(&destination_request),
-        ],
-        [(true, true, true), (false, false, false)]
-    );
+        assert_eq!(response.url().as_str(), destination_url);
+        assert_eq!(
+            [
+                credential_headers(&initial_request),
+                credential_headers(&destination_request),
+            ],
+            [(true, true, true), (false, false, false)]
+        );
+    }
 }
 
 #[tokio::test]
@@ -82,6 +104,59 @@ async fn route_aware_pool_retains_credentials_for_same_origin_and_route() {
             .map(|request| credential_headers(request))
             .collect::<Vec<_>>(),
         vec![(true, true, true), (true, true, true)]
+    );
+}
+
+#[tokio::test]
+async fn same_origin_route_change_strips_only_proxy_authorization() {
+    let (first_addr, first_server) = spawn_http_listener(vec![
+        "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .into(),
+    ]);
+    let (second_addr, second_server) = spawn_proxy_listener();
+    let initial = "http://changing-route.test/start";
+    let destination = "http://changing-route.test/final";
+    cache_system_proxy_decision(
+        initial,
+        SystemProxyDecision::Proxy {
+            url: format!("http://{first_addr}"),
+        },
+    );
+    cache_system_proxy_decision(
+        destination,
+        SystemProxyDecision::Proxy {
+            url: format!("http://{second_addr}"),
+        },
+    );
+    let pool = crate::RouteAwareClientPool::with_builder(
+        HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy),
+        ClientRouteClass::Api,
+        crate::HttpClientBuilder::new()
+            .timeout(Duration::from_secs(2))
+            .default_headers(http::HeaderMap::from_iter([
+                (
+                    AUTHORIZATION,
+                    http::HeaderValue::from_static("Bearer origin-secret"),
+                ),
+                (
+                    COOKIE,
+                    http::HeaderValue::from_static("session=origin-secret"),
+                ),
+                (
+                    PROXY_AUTHORIZATION,
+                    http::HeaderValue::from_static("Basic proxy-secret"),
+                ),
+            ])),
+    );
+    let response = pool.get(initial).send().await.expect("redirect succeeds");
+    assert_eq!(response.url().as_str(), destination);
+    assert_eq!(
+        credential_headers(&only_request(first_server, "first proxy")),
+        (true, true, true)
+    );
+    assert_eq!(
+        credential_headers(&only_request(second_server, "second proxy")),
+        (true, true, false)
     );
 }
 

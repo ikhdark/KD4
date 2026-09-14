@@ -36,7 +36,27 @@ const GITHUB_LATEST_RELEASE_URL: &str = "https://api.github.com/repos/openai/cod
 pub(super) fn updates_check(config: &Config) -> DoctorCheck {
     let current_exe = std::env::current_exe().ok();
     let install_context = doctor_install_context(current_exe.as_deref());
-    let update_action = UpdateAction::from_install_context(&install_context)
+    let npm_result = doctor_managed_by_npm(current_exe.as_deref()).then(npm_global_root_check);
+    let current_version = env!("CARGO_PKG_VERSION");
+    let latest =
+        (!is_source_build_version(current_version)).then(|| fetch_latest_version(&install_context));
+    updates_check_from_inputs(
+        config,
+        &install_context,
+        npm_result,
+        current_version,
+        latest,
+    )
+}
+
+fn updates_check_from_inputs(
+    config: &Config,
+    install_context: &InstallContext,
+    npm_result: Option<NpmRootCheck>,
+    current_version: &str,
+    latest: Option<Result<String, String>>,
+) -> DoctorCheck {
+    let update_action = UpdateAction::from_install_context(install_context)
         .map(UpdateAction::command_str)
         .unwrap_or_else(|| "manual or unknown".to_string());
     let mut details = vec![
@@ -53,8 +73,8 @@ pub(super) fn updates_check(config: &Config) -> DoctorCheck {
     let mut summary = "update configuration is locally consistent".to_string();
     let mut remediation = None;
 
-    if doctor_managed_by_npm(current_exe.as_deref()) {
-        match npm_global_root_check() {
+    if let Some(npm_result) = npm_result {
+        match npm_result {
             NpmRootCheck::Match { package_root } => {
                 details.push(format!("npm update target: {}", package_root.display()));
             }
@@ -91,23 +111,32 @@ pub(super) fn updates_check(config: &Config) -> DoctorCheck {
         }
     }
 
-    let current_version = env!("CARGO_PKG_VERSION");
-    if is_source_build_version(current_version) {
-        details.push("latest version probe: skipped for source build".to_string());
-    } else {
-        match fetch_latest_version(&install_context) {
-            Ok(latest_version) => {
-                details.push(format!("latest version: {latest_version}"));
-                if is_newer_version(&latest_version, current_version) == Some(true) {
-                    details.push("latest version status: newer version is available".to_string());
-                } else {
-                    details.push("latest version status: current version is not older".to_string());
+    match latest {
+        None => details.push("latest version probe: skipped for source build".to_string()),
+        Some(Ok(latest_version)) => {
+            let comparison = is_newer_version(&latest_version, current_version);
+            details.push(format!("latest version: {latest_version}"));
+            details.push(format!(
+                "latest version status: {}",
+                match comparison {
+                    Some(true) => "newer version is available",
+                    Some(false) => "current version is not older",
+                    None => "version comparison unavailable",
                 }
-            }
-            Err(err) => {
+            ));
+            if comparison.is_none() {
+                if status == CheckStatus::Ok {
+                    summary = "update versions could not be compared".to_string();
+                }
                 status = status.max(CheckStatus::Warning);
-                details.push(format!("latest version probe: {err}"));
             }
+        }
+        Some(Err(err)) => {
+            if status == CheckStatus::Ok {
+                summary = "update freshness could not be checked".to_string();
+            }
+            status = status.max(CheckStatus::Warning);
+            details.push(format!("latest version probe: {err}"));
         }
     }
 
@@ -194,7 +223,49 @@ mod tests {
             .await
             .expect("config");
 
-        let check = updates_check(&config);
+        let context = doctor_install_context(None);
+        let check = updates_check_from_inputs(
+            &config,
+            &context,
+            None,
+            "1.0.0",
+            Some(Err("offline".to_string())),
+        );
+        assert_eq!(check.status, CheckStatus::Warning);
+        assert_eq!(check.summary, "update freshness could not be checked");
+        assert!(
+            check
+                .details
+                .contains(&"latest version probe: offline".to_string())
+        );
+        let incomparable = updates_check_from_inputs(
+            &config,
+            &context,
+            None,
+            "invalid",
+            Some(Ok("1.0.0".to_string())),
+        );
+        assert_eq!(incomparable.status, CheckStatus::Warning);
+        assert!(
+            incomparable
+                .details
+                .contains(&"latest version status: version comparison unavailable".to_string())
+        );
+        let npm_failure = updates_check_from_inputs(
+            &config,
+            &context,
+            Some(NpmRootCheck::Mismatch {
+                running_package_root: "running".into(),
+                npm_package_root: "other".into(),
+            }),
+            "1.0.0",
+            Some(Err("offline".to_string())),
+        );
+        assert_eq!(npm_failure.status, CheckStatus::Fail);
+        assert_eq!(
+            npm_failure.summary,
+            "update would target a different npm install"
+        );
 
         assert!(
             check

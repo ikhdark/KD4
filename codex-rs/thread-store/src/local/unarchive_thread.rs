@@ -1,12 +1,10 @@
 use codex_rollout::find_archived_thread_path_by_id_str;
-use codex_rollout::read_thread_item_from_rollout;
 use codex_rollout::rollout_date_parts;
 
 use super::LocalThreadStore;
 use super::helpers::matching_rollout_file_name;
 use super::helpers::rollout_lookup_error;
 use super::helpers::scoped_rollout_path_async;
-use super::helpers::stored_thread_from_rollout_item;
 use super::helpers::touch_modified_time;
 use crate::ArchiveThreadParams;
 use crate::StoredThread;
@@ -71,26 +69,20 @@ where
         .join(day);
     let restored_path = dest_dir.join(&file_name);
 
-    let item = read_thread_item_from_rollout(canonical_archived_path.clone())
-        .await
-        .ok_or_else(|| ThreadStoreError::Internal {
-            message: format!(
-                "failed to read archived thread {}",
-                canonical_archived_path.display()
-            ),
-        })?;
-    let mut thread = stored_thread_from_rollout_item(
-        item,
-        /*archived*/ false,
-        store.config.default_model_provider_id.as_str(),
+    let mut thread = super::read_thread::read_thread_by_rollout_path(
+        store,
+        canonical_archived_path.clone(),
+        true,
+        false,
     )
-    .ok_or_else(|| ThreadStoreError::Internal {
-        message: format!(
-            "failed to read archived thread id from {}",
-            canonical_archived_path.display()
-        ),
-    })?;
+    .await?;
+    if thread.thread_id != thread_id {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: "archived rollout belongs to a different thread".to_string(),
+        });
+    }
     thread.rollout_path = Some(codex_rollout::plain_rollout_path(restored_path.as_path()));
+    thread.archived_at = None;
 
     tokio::fs::create_dir_all(&dest_dir)
         .await
@@ -114,10 +106,16 @@ where
         );
     }
 
-    let touch_result = tokio::task::spawn_blocking(move || touch(restored_path.as_path()))
-        .await
-        .map_err(std::io::Error::other)
-        .and_then(std::convert::identity);
+    let touch_result = tokio::task::spawn_blocking(move || {
+        touch(restored_path.as_path())?;
+        std::fs::metadata(&restored_path)?.modified()
+    })
+    .await
+    .map_err(std::io::Error::other)
+    .and_then(std::convert::identity);
+    if let Ok(modified) = touch_result.as_ref() {
+        thread.updated_at = (*modified).into();
+    }
     if let Err(err) = touch_result {
         tracing::warn!(
             "failed to update unarchived thread timestamp after moving the rollout; \
@@ -146,6 +144,30 @@ mod tests {
     use crate::local::test_support::write_archived_session_file;
 
     #[tokio::test]
+    async fn unarchive_rejects_mismatched_identity_before_moving_rollout() {
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), None);
+        let uuid = Uuid::from_u128(9994);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("id");
+        let path =
+            write_archived_session_file(home.path(), "2025-01-03T13-00-00", uuid).expect("rollout");
+        let bytes = std::fs::read_to_string(&path)
+            .expect("bytes")
+            .replace(&uuid.to_string(), &Uuid::from_u128(9995).to_string());
+        std::fs::write(&path, &bytes).expect("mismatch");
+        let error = store
+            .unarchive_thread(ArchiveThreadParams { thread_id })
+            .await
+            .expect_err("mismatch");
+        assert!(matches!(error, ThreadStoreError::InvalidRequest { .. }));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("retained bytes"),
+            bytes
+        );
+        assert!(!home.path().join("sessions").exists());
+    }
+
+    #[tokio::test]
     async fn unarchive_thread_restores_rollout_and_returns_updated_thread() {
         let home = TempDir::new().expect("temp dir");
         let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
@@ -154,6 +176,9 @@ mod tests {
         let archived_path = write_archived_session_file(home.path(), "2025-01-03T13-00-00", uuid)
             .expect("archived session file");
 
+        codex_rollout::append_thread_name(home.path(), thread_id, "Named archive")
+            .await
+            .expect("name index");
         let thread = store
             .unarchive_thread(ArchiveThreadParams { thread_id })
             .await
@@ -167,6 +192,14 @@ mod tests {
         assert!(restored_path.exists());
         assert_eq!(thread.thread_id, thread_id);
         assert_eq!(thread.rollout_path, Some(restored_path));
+        assert_eq!(thread.name.as_deref(), Some("Named archive"));
+        let modified: chrono::DateTime<Utc> =
+            std::fs::metadata(thread.rollout_path.as_ref().expect("path"))
+                .expect("metadata")
+                .modified()
+                .expect("modified")
+                .into();
+        assert_eq!(thread.updated_at, modified);
         assert_eq!(thread.archived_at, None);
         assert_eq!(thread.preview, "Archived user message");
         assert_eq!(

@@ -230,11 +230,14 @@ impl ExternalAgentConfigService {
                 .await?;
         }
 
+        let mut detected_roots = std::collections::HashSet::new();
         for cwd in params.cwds.as_deref().unwrap_or(&[]) {
             let Some(repo_root) = find_repo_root(Some(cwd))? else {
                 continue;
             };
-            self.detect_migrations(Some(&repo_root), &mut items).await?;
+            if detected_roots.insert(repo_root.clone()) {
+                self.detect_migrations(Some(&repo_root), &mut items).await?;
+            }
         }
 
         Ok(items)
@@ -261,6 +264,37 @@ impl ExternalAgentConfigService {
     }
 
     pub(crate) async fn import(
+        &self,
+        migration_items: Vec<ExternalAgentConfigMigrationItem>,
+    ) -> ExternalAgentConfigImportOutcome {
+        let service = self.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let worker_items = migration_items.clone();
+        match tokio::task::spawn_blocking(move || {
+            runtime.block_on(service.import_impl(worker_items))
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => ExternalAgentConfigImportOutcome {
+                pending_plugin_imports: Vec::new(),
+                item_results: migration_items
+                    .into_iter()
+                    .map(|item| {
+                        let mut result = ExternalAgentConfigImportItemResult::new(
+                            item.item_type,
+                            item.description,
+                            item.cwd,
+                        );
+                        record_import_error(&mut result, "import_worker", err.to_string(), None);
+                        result
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    async fn import_impl(
         &self,
         migration_items: Vec<ExternalAgentConfigMigrationItem>,
     ) -> ExternalAgentConfigImportOutcome {
@@ -348,7 +382,7 @@ impl ExternalAgentConfigService {
 
                         if let Some(local_details) = local_details {
                             let plugin_outcome = match self
-                                .import_plugins(cwd.as_deref(), Some(local_details))
+                                .import_plugins_impl(cwd.as_deref(), Some(local_details))
                                 .await
                             {
                                 Ok(plugin_outcome) => plugin_outcome,
@@ -903,6 +937,23 @@ impl ExternalAgentConfigService {
         cwd: Option<&Path>,
         details: Option<MigrationDetails>,
     ) -> io::Result<PluginImportOutcome> {
+        // Approved remote imports enter here directly, outside import's worker.
+        // Their synchronous settings and marketplace reads need the same boundary.
+        let service = self.clone();
+        let cwd = cwd.map(Path::to_path_buf);
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            runtime.block_on(service.import_plugins_impl(cwd.as_deref(), details))
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
+    async fn import_plugins_impl(
+        &self,
+        cwd: Option<&Path>,
+        details: Option<MigrationDetails>,
+    ) -> io::Result<PluginImportOutcome> {
         let Some(MigrationDetails { plugins, .. }) = details else {
             return Err(invalid_data_error(
                 "plugins migration item is missing details".to_string(),
@@ -1350,7 +1401,17 @@ impl ExternalAgentConfigService {
                 continue;
             }
 
-            copy_dir_recursive(&entry.path(), &target)?;
+            let staging = tempfile::Builder::new()
+                .prefix(".skill-import-")
+                .tempdir_in(&target_skills)?;
+            let staged_skill = staging.path().join(entry.file_name());
+            copy_dir_recursive(&entry.path(), &staged_skill)?;
+            // Serialize publication with other import attempts and preserve existing directories.
+            let _lock = codex_file_system::acquire_atomic_write_lock(&target)?;
+            if target.exists() {
+                continue;
+            }
+            fs::rename(&staged_skill, &target)?;
             copied_names.push(entry.file_name().to_string_lossy().to_string());
         }
 
@@ -1949,7 +2010,7 @@ fn merge_missing_mcp_servers(
 fn write_toml_file(path: &Path, value: &TomlValue) -> io::Result<()> {
     let serialized = toml::to_string_pretty(value)
         .map_err(|err| invalid_data_error(format!("failed to serialize config.toml: {err}")))?;
-    fs::write(path, format!("{}\n", serialized.trim_end()))
+    codex_file_system::write_atomically(path, &format!("{}\n", serialized.trim_end()))
 }
 
 fn migrated_mcp_server_names(value: &TomlValue) -> Vec<String> {

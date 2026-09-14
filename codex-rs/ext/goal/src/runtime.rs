@@ -45,6 +45,7 @@ struct GoalRuntimeInner {
     thread_manager: Weak<ThreadManager>,
     accounting_state: Arc<GoalAccountingState>,
     enabled: AtomicBool,
+    continuation_suppressed: AtomicBool,
     tools_available_for_thread: bool,
     goal_state_lock: Semaphore,
 }
@@ -97,6 +98,7 @@ impl GoalRuntimeHandle {
                 thread_manager,
                 accounting_state,
                 enabled: AtomicBool::new(config.enabled),
+                continuation_suppressed: AtomicBool::new(false),
                 tools_available_for_thread: config.tools_available_for_thread,
                 goal_state_lock: Semaphore::new(/*permits*/ 1),
             }),
@@ -104,7 +106,9 @@ impl GoalRuntimeHandle {
     }
 
     pub(crate) fn set_enabled(&self, enabled: bool) {
-        self.inner.enabled.store(enabled, Ordering::Relaxed);
+        if self.inner.enabled.swap(enabled, Ordering::Relaxed) && !enabled {
+            self.inner.accounting_state.suspend_accounting();
+        }
     }
 
     pub(crate) fn is_enabled(&self) -> bool {
@@ -132,10 +136,6 @@ impl GoalRuntimeHandle {
     }
 
     pub async fn prepare_external_goal_mutation(&self) -> Result<(), String> {
-        if !self.is_enabled() {
-            return Ok(());
-        }
-
         self.retry_pending_goal_progress(None).await?;
 
         if let Some(turn_id) = self.inner.accounting_state.current_turn_id() {
@@ -193,6 +193,9 @@ impl GoalRuntimeHandle {
         });
         match goal.status {
             codex_state::ThreadGoalStatus::Active => {
+                self.inner
+                    .continuation_suppressed
+                    .store(false, Ordering::Relaxed);
                 if self.inner.accounting_state.current_turn_id().is_some() {
                     let _ = self
                         .inner
@@ -207,7 +210,6 @@ impl GoalRuntimeHandle {
                     let item = objective_updated_steering_item(&protocol_goal_from_state(goal));
                     self.inject_active_turn_steering(item).await;
                 }
-                self.continue_if_idle().await?;
             }
             codex_state::ThreadGoalStatus::BudgetLimited => {
                 if self.inner.accounting_state.current_turn_id().is_none() {
@@ -263,6 +265,9 @@ impl GoalRuntimeHandle {
             return Ok(());
         }
 
+        self.inner
+            .continuation_suppressed
+            .store(true, Ordering::Relaxed);
         let (event_name, status) = match reason {
             ActiveGoalStopReason::TurnError => {
                 ("turn-error", codex_state::ThreadGoalStatus::Blocked)
@@ -271,13 +276,18 @@ impl GoalRuntimeHandle {
                 ("usage-limit", codex_state::ThreadGoalStatus::UsageLimited)
             }
         };
-        self.account_active_goal_progress(
-            turn_id,
-            &format!("{turn_id}:{event_name}-progress"),
-            codex_state::GoalAccountingMode::ActiveOnly,
-            BudgetLimitedGoalDisposition::ClearActive,
-        )
-        .await?;
+        let accounting_result = self
+            .account_active_goal_progress(
+                turn_id,
+                &format!("{turn_id}:{event_name}-progress"),
+                codex_state::GoalAccountingMode::ActiveOnly,
+                BudgetLimitedGoalDisposition::ClearActive,
+            )
+            .await;
+        if let Err(err) = &accounting_result {
+            tracing::warn!("stopping goal despite failed accounting: {err}");
+            self.inner.accounting_state.suspend_accounting();
+        }
 
         let Some(active_goal) = self
             .inner
@@ -331,7 +341,7 @@ impl GoalRuntimeHandle {
             Some(turn_id.to_string()),
             goal,
         );
-        Ok(())
+        accounting_result.map(|_| ())
     }
 
     pub async fn restore_after_resume(&self) -> Result<(), String> {
@@ -359,14 +369,17 @@ impl GoalRuntimeHandle {
     }
 
     pub(crate) async fn continue_if_idle(&self) -> Result<(), String> {
+        // Recheck stopping state after any mutation we waited for has completed.
+        let _goal_state_permit = self.goal_state_permit().await?;
+        if self.inner.continuation_suppressed.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         if !self.tools_visible() {
             self.inner.accounting_state.clear_active_goal();
             return Ok(());
         }
         // Hold this through the read/start window so external set/clear cannot
         // change the goal after we read it but before the continuation launches.
-        let _goal_state_permit = self.goal_state_permit().await?;
-
         let Some(thread_manager) = self.inner.thread_manager.upgrade() else {
             tracing::debug!("skipping goal continuation because thread manager is unavailable");
             return Ok(());
@@ -416,18 +429,20 @@ impl GoalRuntimeHandle {
         Ok(())
     }
 
-    pub(crate) async fn inject_active_turn_steering(&self, item: ResponseItem) {
+    pub(crate) async fn inject_active_turn_steering(&self, item: ResponseItem) -> bool {
         let Some(thread_manager) = self.inner.thread_manager.upgrade() else {
             tracing::debug!("skipping goal steering because thread manager is unavailable");
-            return;
+            return false;
         };
         let Ok(thread) = thread_manager.get_thread(self.inner.thread_id).await else {
             tracing::debug!("skipping goal steering because live thread is unavailable");
-            return;
+            return false;
         };
         if thread.inject_if_running(vec![item]).await.is_err() {
             tracing::debug!("skipping goal steering because no turn is active");
+            return false;
         }
+        true
     }
 
     pub(crate) async fn account_active_goal_progress(
@@ -459,7 +474,7 @@ impl GoalRuntimeHandle {
             self.account_goal_progress_for_turn(
                 &turn_id,
                 &format!("{turn_id}:terminal-accounting-retry"),
-                codex_state::GoalAccountingMode::ActiveOnly,
+                codex_state::GoalAccountingMode::ActiveOrStopped,
                 BudgetLimitedGoalDisposition::ClearActive,
             )
             .await?;
@@ -527,7 +542,15 @@ impl GoalRuntimeHandle {
                 );
                 Some(AccountedGoalProgress { goal, goal_id })
             }
-            codex_state::GoalAccountingOutcome::Unchanged(_) => None,
+            codex_state::GoalAccountingOutcome::Unchanged(_) => {
+                accounting.mark_progress_accounted_for_status(
+                    turn_id,
+                    &snapshot,
+                    codex_state::ThreadGoalStatus::Paused,
+                    BudgetLimitedGoalDisposition::ClearActive,
+                );
+                None
+            }
         })
     }
 

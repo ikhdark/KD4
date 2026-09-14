@@ -145,7 +145,8 @@ pub enum Command {
     /// Resume a previous session by id or pick the most recent with --last.
     Resume(ResumeArgs),
 
-    /// Run a code review against the current repository.
+    /// Unavailable: review is not supported by the exec app-server protocol.
+    #[command(hide = true)]
     Review(ReviewArgs),
 }
 
@@ -177,7 +178,7 @@ struct ResumeArgsRaw {
     images: Vec<PathBuf>,
 
     /// Prompt to send after resuming the session. If `-` is used, read from stdin.
-    #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
+    #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other, conflicts_with = "last")]
     prompt: Option<String>,
 }
 

@@ -54,20 +54,17 @@ fn config_error_from_ignored_toml_value_fields_for_source<T: DeserializeOwned>(
     contents: &str,
     value: TomlValue,
 ) -> Option<ConfigError> {
-    let unknown_feature_paths = unknown_feature_toml_value_path(&value);
-    let mut ignored_paths = Vec::new();
+    let unknown_feature_path = unknown_feature_toml_value_path(&value);
+    let mut first_ignored_path = None;
     let mut ignored_callback = |ignored_path: serde_ignored::Path<'_>| {
-        let path_segments = ignored_path_segments(&ignored_path);
-        if !path_segments.is_empty() {
-            ignored_paths.push(path_segments);
-        }
+        record_first_ignored_path(&mut first_ignored_path, &ignored_path);
     };
     let deserializer = serde_ignored::Deserializer::new(value, &mut ignored_callback);
     let result: Result<T, _> = serde_path_to_error::deserialize(deserializer);
 
     match result {
-        Ok(_) => unknown_field_error_from_paths(source, contents, ignored_paths)
-            .or_else(|| unknown_field_error_from_paths(source, contents, unknown_feature_paths)),
+        Ok(_) => unknown_field_error_from_path(source, contents, first_ignored_path)
+            .or_else(|| unknown_field_error_from_path(source, contents, unknown_feature_path)),
         Err(err) => {
             let path_hint = err.path().clone();
             let toml_err = err.into_inner();
@@ -85,36 +82,36 @@ fn config_error_from_ignored_toml_value_fields_for_source<T: DeserializeOwned>(
 }
 
 pub(crate) fn ignored_toml_value_field<T: DeserializeOwned>(value: TomlValue) -> Option<String> {
-    let mut ignored_paths = Vec::new();
+    let mut first_ignored_path = None;
     let result: Result<T, _> = serde_ignored::deserialize(value, |ignored_path| {
-        let path_segments = ignored_path_segments(&ignored_path);
-        if !path_segments.is_empty() {
-            ignored_paths.push(path_segments);
-        }
+        record_first_ignored_path(&mut first_ignored_path, &ignored_path);
     });
     if result.is_err() {
         return None;
     }
 
-    ignored_paths
-        .into_iter()
-        .next()
-        .map(|path_segments| path_segments.join("."))
+    first_ignored_path.map(|path_segments| path_segments.join("."))
 }
 
 pub(crate) fn unknown_feature_toml_value_field(value: &TomlValue) -> Option<String> {
-    unknown_feature_toml_value_path(value)
-        .into_iter()
-        .next()
-        .map(|path_segments| path_segments.join("."))
+    unknown_feature_toml_value_path(value).map(|path_segments| path_segments.join("."))
 }
 
-fn unknown_field_error_from_paths(
+fn record_first_ignored_path(first: &mut Option<Vec<String>>, path: &serde_ignored::Path<'_>) {
+    if first.is_none() {
+        let segments = ignored_path_segments(path);
+        if !segments.is_empty() {
+            *first = Some(segments);
+        }
+    }
+}
+
+fn unknown_field_error_from_path(
     source: ConfigDiagnosticSource<'_>,
     contents: &str,
-    ignored_paths: Vec<Vec<String>>,
+    ignored_path: Option<Vec<String>>,
 ) -> Option<ConfigError> {
-    let path_segments = ignored_paths.into_iter().next()?;
+    let path_segments = ignored_path?;
     let ignored_path = path_segments.join(".");
     let range = span_for_toml_key_path(contents, &path_segments)
         .map(|span| text_range_from_span(contents, span))
@@ -126,13 +123,11 @@ fn unknown_field_error_from_paths(
     ))
 }
 
-fn unknown_feature_toml_value_path(value: &TomlValue) -> Vec<Vec<String>> {
-    let Some(root) = value.as_table() else {
-        return Vec::new();
-    };
-
-    let mut paths = Vec::new();
-    push_unknown_feature_paths(&mut paths, &["features"], root.get("features"));
+fn unknown_feature_toml_value_path(value: &TomlValue) -> Option<Vec<String>> {
+    let root = value.as_table()?;
+    if let Some(path) = first_unknown_feature_path(&["features"], root.get("features")) {
+        return Some(path);
+    }
 
     if let Some(profiles) = root.get("profiles").and_then(TomlValue::as_table) {
         for (profile_name, profile) in profiles {
@@ -140,34 +135,30 @@ fn unknown_feature_toml_value_path(value: &TomlValue) -> Vec<Vec<String>> {
             let features = profile
                 .as_table()
                 .and_then(|profile| profile.get("features"));
-            push_unknown_feature_paths(&mut paths, &prefix, features);
+            if let Some(path) = first_unknown_feature_path(&prefix, features) {
+                return Some(path);
+            }
         }
     }
 
-    paths
+    None
 }
 
-fn push_unknown_feature_paths(
-    paths: &mut Vec<Vec<String>>,
+fn first_unknown_feature_path(
     prefix: &[&str],
     features: Option<&TomlValue>,
-) {
-    let Some(features) = features.and_then(TomlValue::as_table) else {
-        return;
-    };
-
-    for feature_key in features
+) -> Option<Vec<String>> {
+    let features = features.and_then(TomlValue::as_table)?;
+    let feature_key = features
         .keys()
         .map(String::as_str)
-        .filter(|key| !is_known_feature_key(key))
-    {
-        let mut path = prefix
-            .iter()
-            .map(|segment| (*segment).to_string())
-            .collect::<Vec<_>>();
-        path.push(feature_key.to_string());
-        paths.push(path);
-    }
+        .find(|key| !is_known_feature_key(key))?;
+    let mut path = prefix
+        .iter()
+        .map(|segment| (*segment).to_string())
+        .collect::<Vec<_>>();
+    path.push(feature_key.to_string());
+    Some(path)
 }
 
 fn ignored_path_segments(path: &serde_ignored::Path<'_>) -> Vec<String> {

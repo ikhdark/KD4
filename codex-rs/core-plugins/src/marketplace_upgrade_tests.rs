@@ -138,6 +138,21 @@ fn up_to_date_fast_path_validates_marketplace_name() {
     };
     super::activation::write_installed_marketplace_metadata(&destination, &marketplace, REVISION)
         .expect("write installed marketplace metadata");
+    std::fs::write(
+        manifest_dir.join("marketplace.json"),
+        r#"{"name":"good","plugins":[]}"#,
+    )
+    .unwrap();
+    assert!(
+        upgrade_configured_git_marketplace(codex_home.path(), &install_root, &marketplace)
+            .unwrap()
+            .is_none()
+    );
+    std::fs::write(
+        manifest_dir.join("marketplace.json"),
+        r#"{"name":"wrong","plugins":[]}"#,
+    )
+    .unwrap();
     let err = upgrade_configured_git_marketplace(codex_home.path(), &install_root, &marketplace)
         .expect_err("mismatched marketplace name must not use the up-to-date fast path");
 

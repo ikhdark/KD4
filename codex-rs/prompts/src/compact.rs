@@ -16,6 +16,7 @@ mod tests {
     use super::COMPACTION_BASE_INSTRUCTIONS;
     use super::INCREMENTAL_SUMMARIZATION_PROMPT;
     use super::SUMMARIZATION_PROMPT;
+    use super::SUMMARY_PREFIX;
 
     #[test]
     fn compaction_base_is_small_and_task_specific() {
@@ -40,6 +41,13 @@ mod tests {
             assert!(INCREMENTAL_SUMMARIZATION_PROMPT.contains(heading));
         }
         assert!(INCREMENTAL_SUMMARIZATION_PROMPT.contains("latest observed state"));
+        assert!(
+            INCREMENTAL_SUMMARIZATION_PROMPT
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains("including all previously appended updates")
+        );
         assert!(!INCREMENTAL_SUMMARIZATION_PROMPT.contains("structured harness state"));
     }
 
@@ -66,6 +74,18 @@ mod tests {
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(normalized_prompt.contains("self-contained recovery checkpoint"));
         assert!(normalized_prompt.contains("without rediscovering the repository"));
+        assert!(
+            normalized_prompt.contains("evidence identifier or command, scope, observed outcome")
+        );
+        let normalized_prefix = SUMMARY_PREFIX
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            normalized_prefix.contains(
+                "do not repeat discovery or validation solely because compaction occurred"
+            )
+        );
         assert!(!normalized_prompt.contains("structured harness state"));
     }
 }

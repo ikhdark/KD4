@@ -35,6 +35,7 @@ use ratatui::style::Stylize;
 use ratatui::text::Line;
 
 pub(super) const PLUGINS_SELECTION_VIEW_ID: &str = "plugins-selection";
+pub(super) const PLUGINS_LOADING_VIEW_ID: &str = "plugins-list-loading";
 pub(super) const ALL_PLUGINS_TAB_ID: &str = "all-plugins";
 pub(super) const ADD_MARKETPLACE_TAB_ID: &str = "add-marketplace";
 
@@ -75,10 +76,12 @@ impl ChatWidget {
 
         match self.plugins_cache_for_current_cwd() {
             PluginsCacheState::Ready(response) => {
-                self.open_plugins_popup(&response);
+                let params =
+                    self.plugins_popup_params(response, self.plugins_active_tab_id.clone(), None);
+                self.bottom_pane.show_selection_view(params);
             }
             PluginsCacheState::Failed(err) => {
-                self.add_to_history(history_cell::new_error_event(err));
+                self.add_to_history(history_cell::new_error_event(err.clone()));
             }
             PluginsCacheState::Loading | PluginsCacheState::Uninitialized => {
                 self.open_plugins_loading_popup();
@@ -94,7 +97,7 @@ impl ChatWidget {
     ) {
         let request_was_in_flight =
             self.plugins_fetch_state.in_flight_cwd.as_deref() == Some(cwd.as_path());
-        if request_was_in_flight {
+        if request_was_in_flight && result.is_err() {
             self.plugins_fetch_state.in_flight_cwd = None;
         }
 
@@ -103,19 +106,8 @@ impl ChatWidget {
         }
 
         let auth_flow_active = self.plugin_install_auth_flow.is_some();
-        let should_refresh_plugins_popup = !auth_flow_active
-            && (self
-                .bottom_pane
-                .active_tab_id_for_active_view(PLUGINS_SELECTION_VIEW_ID)
-                .is_some()
-                || self
-                    .bottom_pane
-                    .selected_index_for_active_view(PLUGINS_SELECTION_VIEW_ID)
-                    .is_some()
-                || !matches!(
-                    self.plugins_cache_for_current_cwd(),
-                    PluginsCacheState::Ready(_)
-                ));
+        let popup_view_id = self.active_plugins_list_view_id();
+        let should_refresh_plugins_popup = !auth_flow_active && popup_view_id.is_some();
 
         match result {
             Ok(response) => {
@@ -139,9 +131,9 @@ impl ChatWidget {
                         marketplace_tab_id_matching_saved_id(tab_id, &response.marketplaces)
                     });
                 self.plugins_active_tab_id = active_tab_id;
-                self.plugins_cache = PluginsCacheState::Ready(response.clone());
+                self.plugins_cache = PluginsCacheState::Ready(response);
                 if should_refresh_plugins_popup {
-                    self.refresh_plugins_popup_if_open(&response);
+                    self.refresh_plugins_popup_if_open();
                 }
                 self.newly_installed_marketplace_tab_id = None;
             }
@@ -149,11 +141,11 @@ impl ChatWidget {
                 self.plugin_remote_sections_loading = false;
                 self.plugin_remote_sections_loaded = false;
                 self.plugins_fetch_state.vertical_section_requested = false;
+                self.plugins_fetch_state.cache_cwd = Some(cwd);
+                self.plugins_cache = PluginsCacheState::Failed(err.clone());
                 if should_refresh_plugins_popup {
-                    self.plugins_fetch_state.cache_cwd = None;
-                    self.plugins_cache = PluginsCacheState::Failed(err.clone());
                     let _ = self.bottom_pane.replace_selection_view_if_active(
-                        PLUGINS_SELECTION_VIEW_ID,
+                        popup_view_id.unwrap_or(PLUGINS_SELECTION_VIEW_ID),
                         self.plugins_error_popup_params(&err),
                     );
                 }
@@ -175,27 +167,28 @@ impl ChatWidget {
             .bottom_pane
             .active_tab_id_for_active_view(PLUGINS_SELECTION_VIEW_ID)
             .is_some();
+        if self.plugins_fetch_state.in_flight_cwd.as_deref() == Some(cwd.as_path()) {
+            self.plugins_fetch_state.in_flight_cwd = None;
+        }
         self.plugin_remote_sections_loading = false;
         self.plugin_remote_sections_loaded = true;
         self.plugins_fetch_state.vertical_section_requested = false;
-        let refreshed_response = match &mut self.plugins_cache {
+        let refreshed = match &mut self.plugins_cache {
             PluginsCacheState::Ready(response)
                 if self.plugins_fetch_state.cache_cwd.as_deref() == Some(cwd.as_path()) =>
             {
                 merge_remote_marketplaces(response, marketplaces);
                 self.plugin_remote_section_errors = section_errors;
-                Some(response.clone())
+                true
             }
             _ => {
                 self.plugin_remote_section_errors = section_errors;
-                None
+                false
             }
         };
 
-        if let Some(response) = refreshed_response
-            && should_refresh_plugins_popup
-        {
-            self.refresh_plugins_popup_if_open(&response);
+        if refreshed && should_refresh_plugins_popup {
+            self.refresh_plugins_popup_if_open();
         }
     }
 
@@ -222,22 +215,32 @@ impl ChatWidget {
         }
     }
 
-    pub(super) fn plugins_cache_for_current_cwd(&self) -> PluginsCacheState {
+    pub(super) fn plugins_cache_for_current_cwd(&self) -> &PluginsCacheState {
         if self.plugins_fetch_state.cache_cwd.as_deref() == Some(self.config.cwd.as_path()) {
-            self.plugins_cache.clone()
+            &self.plugins_cache
         } else {
-            PluginsCacheState::Uninitialized
+            &PluginsCacheState::Uninitialized
         }
     }
 
     fn open_plugins_loading_popup(&mut self) {
-        if !self.bottom_pane.replace_selection_view_if_active(
-            PLUGINS_SELECTION_VIEW_ID,
-            self.plugins_loading_popup_params(),
-        ) {
+        let view_id = self
+            .active_plugins_list_view_id()
+            .unwrap_or(PLUGINS_SELECTION_VIEW_ID);
+        if !self
+            .bottom_pane
+            .replace_selection_view_if_active(view_id, self.plugins_loading_popup_params())
+        {
             self.bottom_pane
                 .show_selection_view(self.plugins_loading_popup_params());
         }
+    }
+
+    fn await_plugins_list_after_mutation(&mut self) {
+        let params = self.plugins_loading_popup_params();
+        let _ = self
+            .bottom_pane
+            .replace_selection_view_if_active(PLUGINS_SELECTION_VIEW_ID, params);
     }
 
     fn open_plugins_popup(&mut self, response: &PluginListResponse) {
@@ -256,7 +259,7 @@ impl ChatWidget {
         }
 
         let response = match self.plugins_cache_for_current_cwd() {
-            PluginsCacheState::Ready(current_response) => current_response,
+            PluginsCacheState::Ready(current_response) => current_response.clone(),
             PluginsCacheState::Uninitialized
             | PluginsCacheState::Loading
             | PluginsCacheState::Failed(_) => response,
@@ -352,6 +355,7 @@ impl ChatWidget {
             return;
         };
 
+        let plugins_response = plugins_response.clone();
         let params = self.marketplace_remove_confirmation_popup_params(
             &plugins_response,
             marketplace_name.clone(),
@@ -426,17 +430,18 @@ impl ChatWidget {
         match result {
             Ok(response) => {
                 if let Some(plugins_response) = plugins_response {
-                    let _ = self.bottom_pane.replace_selection_view_if_active(
-                        PLUGINS_SELECTION_VIEW_ID,
-                        self.plugin_detail_popup_params(&plugins_response, &response.plugin),
-                    );
+                    let params =
+                        self.plugin_detail_popup_params(plugins_response, &response.plugin);
+                    let _ = self
+                        .bottom_pane
+                        .replace_selection_view_if_active(PLUGINS_SELECTION_VIEW_ID, params);
                 }
             }
             Err(err) => {
-                let _ = self.bottom_pane.replace_selection_view_if_active(
-                    PLUGINS_SELECTION_VIEW_ID,
-                    self.plugin_detail_error_popup_params(&err, plugins_response.as_ref()),
-                );
+                let params = self.plugin_detail_error_popup_params(&err, plugins_response);
+                let _ = self
+                    .bottom_pane
+                    .replace_selection_view_if_active(PLUGINS_SELECTION_VIEW_ID, params);
             }
         }
     }
@@ -492,10 +497,10 @@ impl ChatWidget {
                     PluginsCacheState::Ready(response) => Some(response),
                     _ => None,
                 };
-                let _ = self.bottom_pane.replace_selection_view_if_active(
-                    PLUGINS_SELECTION_VIEW_ID,
-                    self.plugin_detail_error_popup_params(&err, plugins_response.as_ref()),
-                );
+                let params = self.plugin_detail_error_popup_params(&err, plugins_response);
+                let _ = self
+                    .bottom_pane
+                    .replace_selection_view_if_active(PLUGINS_SELECTION_VIEW_ID, params);
                 true
             }
         }
@@ -513,6 +518,7 @@ impl ChatWidget {
         match result {
             Ok(response) => {
                 let marketplace_tab_id = marketplace_tab_id_from_path(&response.installed_root);
+                self.await_plugins_list_after_mutation();
                 self.plugins_active_tab_id = Some(marketplace_tab_id.clone());
                 self.newly_installed_marketplace_tab_id =
                     (!response.already_added).then_some(marketplace_tab_id);
@@ -532,15 +538,15 @@ impl ChatWidget {
                     )),
                 );
             }
-            Err(_) => {
+            Err(err) => {
                 self.plugins_active_tab_id = Some(ADD_MARKETPLACE_TAB_ID.to_string());
-                let params = self.marketplace_add_error_popup_params();
+                let params = self.marketplace_add_error_popup_params(&err);
                 if !self
                     .bottom_pane
                     .replace_selection_view_if_active(PLUGINS_SELECTION_VIEW_ID, params)
                 {
                     self.bottom_pane
-                        .show_selection_view(self.marketplace_add_error_popup_params());
+                        .show_selection_view(self.marketplace_add_error_popup_params(&err));
                 }
             }
         }
@@ -560,6 +566,7 @@ impl ChatWidget {
         match result {
             Ok(response) => {
                 self.plugins_active_tab_id = Some(ALL_PLUGINS_TAB_ID.to_string());
+                self.await_plugins_list_after_mutation();
                 self.add_info_message(
                     format!("Removed marketplace {marketplace_display_name}."),
                     Some(match response.installed_root {
@@ -573,10 +580,11 @@ impl ChatWidget {
                     }),
                 );
             }
-            Err(_) => {
+            Err(err) => {
                 let params = self.marketplace_remove_error_popup_params(
                     &marketplace_name,
                     &marketplace_display_name,
+                    &err,
                 );
                 if !self
                     .bottom_pane
@@ -586,6 +594,7 @@ impl ChatWidget {
                         self.marketplace_remove_error_popup_params(
                             &marketplace_name,
                             &marketplace_display_name,
+                            &err,
                         ),
                     );
                 }
@@ -601,6 +610,8 @@ impl ChatWidget {
         if self.config.cwd.as_path() != cwd.as_path() {
             return;
         }
+
+        self.await_plugins_list_after_mutation();
 
         match result {
             Ok(response) => {
@@ -753,13 +764,11 @@ impl ChatWidget {
             self.add_error_message(format!(
                 "Failed to update plugin config for {plugin_id}: {err}"
             ));
-            if let PluginsCacheState::Ready(response) = self.plugins_cache_for_current_cwd() {
-                self.refresh_plugins_popup_if_open(&response);
-            }
+            self.refresh_plugins_popup_if_open();
             return;
         }
 
-        let refreshed_response = match &mut self.plugins_cache {
+        let refreshed = match &mut self.plugins_cache {
             PluginsCacheState::Ready(response)
                 if self.plugins_fetch_state.cache_cwd.as_deref() == Some(cwd.as_path()) =>
             {
@@ -771,13 +780,13 @@ impl ChatWidget {
                 {
                     plugin.enabled = enabled;
                 }
-                Some(response.clone())
+                true
             }
-            _ => None,
+            _ => false,
         };
 
-        if let Some(response) = refreshed_response {
-            self.refresh_plugins_popup_if_open(&response);
+        if refreshed {
+            self.refresh_plugins_popup_if_open();
         }
     }
 
@@ -793,6 +802,7 @@ impl ChatWidget {
 
         match result {
             Ok(_response) => {
+                self.await_plugins_list_after_mutation();
                 self.plugin_install_apps_needing_auth.clear();
                 self.plugin_install_auth_flow = None;
                 self.add_info_message(
@@ -805,10 +815,10 @@ impl ChatWidget {
                     PluginsCacheState::Ready(response) => Some(response),
                     _ => None,
                 };
-                let _ = self.bottom_pane.replace_selection_view_if_active(
-                    PLUGINS_SELECTION_VIEW_ID,
-                    self.plugin_detail_error_popup_params(&err, plugins_response.as_ref()),
-                );
+                let params = self.plugin_detail_error_popup_params(&err, plugins_response);
+                let _ = self
+                    .bottom_pane
+                    .replace_selection_view_if_active(PLUGINS_SELECTION_VIEW_ID, params);
             }
         }
     }
@@ -986,30 +996,52 @@ impl ChatWidget {
         };
         if let Some(plugins_response) = plugins_response {
             let tab_id = self.plugins_active_tab_id.clone();
-            let _ = self.bottom_pane.replace_selection_view_if_active(
-                PLUGINS_SELECTION_VIEW_ID,
-                self.plugins_popup_params(
-                    &plugins_response,
-                    tab_id,
-                    /*initial_selected_idx*/ None,
-                ),
+            let params = self.plugins_popup_params(
+                plugins_response,
+                tab_id,
+                /*initial_selected_idx*/ None,
             );
+            let _ = self
+                .bottom_pane
+                .replace_selection_view_if_active(PLUGINS_SELECTION_VIEW_ID, params);
         }
     }
 
-    fn refresh_plugins_popup_if_open(&mut self, response: &PluginListResponse) {
-        let active_tab_id = self
+    fn active_plugins_list_view_id(&self) -> Option<&'static str> {
+        if self
             .bottom_pane
             .active_tab_id_for_active_view(PLUGINS_SELECTION_VIEW_ID)
+            .is_some()
+        {
+            Some(PLUGINS_SELECTION_VIEW_ID)
+        } else if self
+            .bottom_pane
+            .selected_index_for_active_view(PLUGINS_LOADING_VIEW_ID)
+            .is_some()
+        {
+            Some(PLUGINS_LOADING_VIEW_ID)
+        } else {
+            None
+        }
+    }
+
+    fn refresh_plugins_popup_if_open(&mut self) {
+        let Some(view_id) = self.active_plugins_list_view_id() else {
+            return;
+        };
+        let active_tab_id = self
+            .bottom_pane
+            .active_tab_id_for_active_view(view_id)
             .map(str::to_string)
             .or_else(|| self.plugins_active_tab_id.clone());
-        let selected_idx = self
-            .bottom_pane
-            .selected_index_for_active_view(PLUGINS_SELECTION_VIEW_ID);
+        let selected_idx = self.bottom_pane.selected_index_for_active_view(view_id);
         self.plugins_active_tab_id = active_tab_id.clone();
-        let _ = self.bottom_pane.replace_selection_view_if_active(
-            PLUGINS_SELECTION_VIEW_ID,
-            self.plugins_popup_params(response, active_tab_id, selected_idx),
-        );
+        let PluginsCacheState::Ready(response) = self.plugins_cache_for_current_cwd() else {
+            return;
+        };
+        let params = self.plugins_popup_params(response, active_tab_id, selected_idx);
+        let _ = self
+            .bottom_pane
+            .replace_selection_view_if_active(view_id, params);
     }
 }

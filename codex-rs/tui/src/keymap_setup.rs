@@ -147,13 +147,13 @@ pub(crate) fn build_keymap_action_menu_params(
     runtime_keymap: &RuntimeKeymap,
     keymap_config: &TuiKeymap,
 ) -> SelectionViewParams {
-    let current_bindings =
-        active_binding_specs(runtime_keymap, &context, &action).unwrap_or_else(|_| Vec::new());
-    let current_binding = if current_bindings.is_empty() {
-        "unbound".to_string()
-    } else {
-        current_bindings.join(", ")
+    let binding_result = active_binding_specs(runtime_keymap, &context, &action);
+    let current_binding = match &binding_result {
+        Err(_) => "unavailable".to_string(),
+        Ok(bindings) if bindings.is_empty() => "unbound".to_string(),
+        Ok(bindings) => bindings.join(", "),
     };
+    let current_bindings = binding_result.unwrap_or_default();
     let active_binding_count = current_bindings.len();
     let custom_binding = has_custom_binding(keymap_config, &context, &action).unwrap_or(false);
     let descriptor = KEYMAP_ACTIONS
@@ -175,7 +175,7 @@ pub(crate) fn build_keymap_action_menu_params(
     let source = if custom_binding {
         "Custom root override".cyan()
     } else {
-        "Default keymap".dim()
+        "Inherited binding".dim()
     };
     let mut header = ColumnRenderable::new();
     header.push(Line::from("Edit Shortcut".bold()));
@@ -264,12 +264,12 @@ pub(crate) fn build_keymap_action_menu_params(
     items.push(SelectionItem {
         name: "Remove custom binding".to_string(),
         description: Some(if custom_binding {
-            "Restore the default keymap binding.".to_string()
+            "Restore the inherited binding.".to_string()
         } else {
             "No root override to remove.".to_string()
         }),
         selected_description: Some(
-            "Delete the root override and use the default keymap again.".to_string(),
+            "Remove the root override and restore the inherited binding.".to_string(),
         ),
         disabled_reason: remove_disabled_reason,
         actions: vec![Box::new(move |tx| {
@@ -544,7 +544,8 @@ pub(crate) fn active_binding_specs(
     bindings
         .iter()
         .map(|binding| binding_to_config_key_spec(*binding))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()
+        .map(dedup_bindings)
 }
 
 fn dedup_bindings(bindings: Vec<String>) -> Vec<String> {
@@ -730,6 +731,7 @@ fn key_parts_to_config_key_spec(
         KeyCode::Backspace => "backspace".to_string(),
         KeyCode::Esc => "esc".to_string(),
         KeyCode::Delete => "delete".to_string(),
+        KeyCode::Insert => "insert".to_string(),
         KeyCode::Up => "up".to_string(),
         KeyCode::Down => "down".to_string(),
         KeyCode::Left => "left".to_string(),
@@ -818,6 +820,57 @@ mod tests {
         let mut buf = Buffer::empty(area);
         view.render(area, &mut buf);
         render_buffer(&buf)
+    }
+
+    #[test]
+    fn all_default_action_bindings_survive_config_round_trip() {
+        let runtime = RuntimeKeymap::defaults();
+        for descriptor in KEYMAP_ACTIONS {
+            let specs = active_binding_specs(&runtime, descriptor.context, descriptor.action)
+                .expect("every default binding must be serializable");
+            let config = keymap_with_bindings(
+                &TuiKeymap::default(),
+                descriptor.context,
+                descriptor.action,
+                &specs,
+            )
+            .expect("default bindings must be valid config");
+            let restored = RuntimeKeymap::from_config(&config).expect("reload serialized defaults");
+            let original = bindings_for_action(&runtime, descriptor.context, descriptor.action)
+                .expect("default action");
+            let restored = bindings_for_action(&restored, descriptor.context, descriptor.action)
+                .expect("restored action");
+            for (source, target) in [(original, restored), (restored, original)] {
+                for binding in source {
+                    let (code, modifiers) = binding.parts();
+                    assert!(
+                        target
+                            .iter()
+                            .any(|candidate| candidate.is_press(KeyEvent::new(code, modifiers))),
+                        "{}.{} lost binding {binding:?}",
+                        descriptor.context,
+                        descriptor.action
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn debug_view_wraps_instructions_without_clipping_the_last_row() {
+        let view = build_keymap_debug_view(&RuntimeKeymap::defaults(), &TuiKeymap::default());
+        let rendered = render_debug(&view, 24)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            rendered.contains("Esc is inspected; Ctrl+C closes."),
+            "{rendered}"
+        );
+        assert!(
+            rendered.ends_with("Waiting for a keypress..."),
+            "{rendered}"
+        );
     }
 
     fn render_picker(params: SelectionViewParams, width: u16) -> String {

@@ -27,7 +27,7 @@ class SourceBinariesForTargetTest(unittest.TestCase):
         command_identity = mock.patch.object(
             cargo_module,
             "command_identity",
-            side_effect=lambda command, *_args: {
+            side_effect=lambda command, *_args, **_kwargs: {
                 "path": command,
                 "version": f"{command} test",
             },
@@ -659,23 +659,16 @@ class SourceBinariesForTargetTest(unittest.TestCase):
 
         self.assertFalse(matched)
 
-    def test_source_output_match_rehashes_cached_output(self) -> None:
+    def test_source_output_match_rejects_metadata_preserving_corruption(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = touch_file(Path(temp_dir) / "codex.exe")
             fingerprint = cargo_module.source_output_fingerprint(path)
-
-            with mock.patch.object(
-                cargo_module,
-                "source_output_fingerprint",
-                wraps=cargo_module.source_output_fingerprint,
-            ) as source_output_fingerprint:
-                matched = cargo_module.source_output_matches_fingerprint(
-                    path,
-                    fingerprint,
-                )
-
-        self.assertTrue(matched)
-        source_output_fingerprint.assert_called_once_with(path)
+            before = path.stat()
+            path.write_bytes(b"x" * before.st_size)
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+            self.assertFalse(
+                cargo_module.source_output_matches_fingerprint(path, fingerprint)
+            )
 
     def test_source_build_stamp_write_preserves_existing_file_on_replace_failure(
         self,
@@ -921,6 +914,184 @@ class SourceBinariesForTargetTest(unittest.TestCase):
 
         run.assert_not_called()
 
+    def test_override_at_default_path_does_not_gain_source_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            spec = TARGET_SPECS["x86_64-pc-windows-msvc"]
+            variant = PACKAGE_VARIANTS["codex"]
+            with (
+                mock.patch.object(cargo_module, "CODEX_RS_ROOT", root),
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.object(
+                    cargo_module,
+                    "source_tree_fingerprint",
+                    return_value=fixed_source_fingerprint(),
+                ),
+            ):
+                target = cargo_package_target_dir(spec, "release")
+                entrypoint = touch_file(target / spec.target / "release" / "codex.exe")
+
+                def compile(cmd, *, cwd, check, env):
+                    write_bins_for_cmd(cmd, env=env, spec=spec, profile="release")
+
+                with mock.patch.object(
+                    cargo_module.subprocess, "run", side_effect=compile
+                ) as run:
+                    build_source_binaries(
+                        spec,
+                        variant,
+                        cargo="cargo",
+                        profile="release",
+                        entrypoint_bin=entrypoint,
+                        code_mode_host_bin=None,
+                        codex_command_runner_bin=None,
+                        codex_windows_sandbox_setup_bin=None,
+                    )
+                    stamp = cargo_module.read_source_build_stamp(target)
+                    self.assertNotIn("entrypoint_bin", stamp["outputs"])
+                    build_source_binaries(
+                        spec,
+                        variant,
+                        cargo="cargo",
+                        profile="release",
+                        entrypoint_bin=None,
+                        code_mode_host_bin=None,
+                        codex_command_runner_bin=None,
+                        codex_windows_sandbox_setup_bin=None,
+                        reuse_existing=True,
+                    )
+                cmd = run.call_args.args[0]
+                self.assertEqual(
+                    [cmd[i + 1] for i, v in enumerate(cmd) if v == "--bin"], ["codex"]
+                )
+                self.assertEqual(run.call_count, 2)
+
+    def test_effective_environment_changes_invalidate_reuse(self) -> None:
+        spec = TARGET_SPECS["x86_64-pc-windows-msvc"]
+        with mock.patch.dict(
+            os.environ, {"CODEX_RELEASE_VERSION": "1.2.3"}, clear=True
+        ):
+            with mock.patch.object(
+                cargo_module, "find_windows_lld_link", return_value="first-linker"
+            ):
+                first = cargo_module.build_recipe_fingerprint(
+                    spec=spec, profile="release"
+                )
+            with mock.patch.object(
+                cargo_module, "find_windows_lld_link", return_value="second-linker"
+            ):
+                second = cargo_module.build_recipe_fingerprint(
+                    spec=spec, profile="release"
+                )
+                os.environ["CODEX_RELEASE_VERSION"] = "1.2.4"
+                third = cargo_module.build_recipe_fingerprint(
+                    spec=spec, profile="release"
+                )
+        self.assertNotEqual(first, second)
+        self.assertNotEqual(second, third)
+
+    def test_unavailable_tool_identity_cannot_authorize_reuse(self) -> None:
+        spec = TARGET_SPECS["x86_64-pc-windows-msvc"]
+        with mock.patch.object(
+            cargo_module, "command_identity", return_value={"status": "unavailable"}
+        ):
+            recipe = cargo_module.build_recipe_fingerprint(spec=spec, profile="release")
+            stamp = {
+                "target": spec.target,
+                "variant": "codex",
+                "profile": "release",
+                "build_recipe": recipe,
+            }
+            self.assertFalse(
+                cargo_module.source_build_stamp_metadata_matches(
+                    stamp,
+                    spec=spec,
+                    profile="release",
+                    variant=PACKAGE_VARIANTS["codex"],
+                )
+            )
+
+    def test_non_pe_override_fails_before_build(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            entry = Path(temp_dir) / "codex.exe"
+            entry.write_bytes(b"not PE")
+            with mock.patch.object(cargo_module, "run_cargo_build") as build:
+                with self.assertRaisesRegex(RuntimeError, "Invalid PE"):
+                    build_source_binaries(
+                        TARGET_SPECS["x86_64-pc-windows-msvc"],
+                        PACKAGE_VARIANTS["codex"],
+                        cargo="cargo",
+                        profile="release",
+                        entrypoint_bin=entry,
+                        code_mode_host_bin=None,
+                        codex_command_runner_bin=None,
+                        codex_windows_sandbox_setup_bin=None,
+                    )
+                build.assert_not_called()
+
+    def test_known_output_mismatch_skips_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = touch_file(Path(temp_dir) / "codex.exe")
+            fingerprint = cargo_module.source_output_fingerprint(path)
+            path.write_bytes(b"different size")
+            with mock.patch.object(
+                cargo_module,
+                "source_output_fingerprint",
+                side_effect=AssertionError("must not hash"),
+            ):
+                self.assertFalse(
+                    cargo_module.source_output_matches_fingerprint(path, fingerprint)
+                )
+
+
+class SourceEvidenceTest(unittest.TestCase):
+    def test_tool_identity_uses_build_directory(self) -> None:
+        with mock.patch.object(
+            cargo_module.subprocess, "run", return_value=mock.Mock(stdout="cargo test")
+        ) as run:
+            identity = cargo_module.command_identity("cargo", "--version")
+        self.assertEqual(identity["version"], "cargo test")
+        self.assertEqual(run.call_args.kwargs["cwd"], cargo_module.CODEX_RS_ROOT)
+
+    def test_unreadable_untracked_source_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            subprocess.run(["git", "init", "--quiet", str(root)], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "--allow-empty",
+                    "-m",
+                    "fixture",
+                ],
+                check=True,
+            )
+            source = root / "untracked.rs"
+            source.write_text("fn main() {}")
+            original_open = Path.open
+
+            def open_file(path, *args, **kwargs):
+                if path == source:
+                    raise PermissionError("test unreadable source")
+                return original_open(path, *args, **kwargs)
+
+            with (
+                mock.patch.object(cargo_module, "CODEX_RS_ROOT", root),
+                mock.patch.object(Path, "open", open_file),
+            ):
+                self.assertEqual(
+                    cargo_module.source_tree_fingerprint(),
+                    {"status": "unavailable", "reason": "unreadable-source"},
+                )
+
 
 class SetSccacheEnvTest(unittest.TestCase):
     def test_cache_size_defaults_and_honors_override(self) -> None:
@@ -967,8 +1138,7 @@ def write_bins_for_cmd(
 
 def touch_file(path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("", encoding="utf-8")
-    return path.resolve()
+    return write_pe(path, 0x8664)
 
 
 def write_pe(path: Path, machine: int) -> Path:

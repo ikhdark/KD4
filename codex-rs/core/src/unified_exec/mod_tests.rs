@@ -348,8 +348,8 @@ async fn write_stdin_yield_deadlines_include_reaction_and_cap_background_wait() 
 fn push_chunk_preserves_prefix_and_suffix() {
     let mut buffer = HeadTailBuffer::default();
     buffer.push_chunk(&vec![b'a'; UNIFIED_EXEC_OUTPUT_MAX_BYTES]);
-    buffer.push_chunk(&vec![b'b']);
-    buffer.push_chunk(&vec![b'c']);
+    buffer.push_chunk(b"b");
+    buffer.push_chunk(b"c");
 
     assert_eq!(buffer.retained_bytes(), UNIFIED_EXEC_OUTPUT_MAX_BYTES);
     let snapshot = buffer.snapshot_chunks();
@@ -376,7 +376,12 @@ fn head_tail_buffer_default_preserves_prefix_and_suffix() {
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_exec_persists_across_requests() -> anyhow::Result<()> {
-    let (session, turn) = test_session_and_turn().await;
+    let (session, mut turn) = test_session_and_turn().await;
+    // This fixture has no approval responder; explicitly authorize its interactive shell.
+    Arc::get_mut(&mut turn)
+        .expect("turn is uniquely owned")
+        .approval_policy
+        .set(codex_protocol::protocol::AskForApproval::Never)?;
     let cwd = turn.cwd().clone();
 
     let open_shell = exec_command(

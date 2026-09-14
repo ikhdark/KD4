@@ -89,14 +89,17 @@ pub(crate) async fn run(
         };
     }
 
-    let input_json = match command_input_json(&request) {
+    let cwd = request.cwd.clone();
+    let turn_id = request.turn_id.clone();
+    let tool_use_id = request.tool_use_id.clone();
+    let input_json = match command_input_json(request) {
         Ok(input_json) => input_json,
         Err(error) => {
             let hook_events = common::serialization_failure_hook_events_for_tool_use(
                 matched,
-                Some(request.turn_id.clone()),
+                Some(turn_id.clone()),
                 format!("failed to serialize pre tool use hook input: {error}"),
-                &request.tool_use_id,
+                &tool_use_id,
             );
             return serialization_failure_outcome(hook_events);
         }
@@ -106,8 +109,8 @@ pub(crate) async fn run(
         shell,
         matched,
         input_json,
-        request.cwd.as_path(),
-        Some(request.turn_id.clone()),
+        cwd.as_path(),
+        Some(turn_id.clone()),
         parse_completed,
     )
     .await;
@@ -116,22 +119,20 @@ pub(crate) async fn run(
     let block_reason = results
         .iter()
         .find_map(|result| result.data.block_reason.clone());
-    let additional_contexts = common::flatten_additional_contexts(
-        results
-            .iter()
-            .map(|result| result.data.additional_contexts_for_model.as_slice()),
-    );
+
     let updated_input = if should_block {
         None
     } else {
         latest_updated_input(&results)
     };
 
+    let mut additional_contexts = Vec::new();
     PreToolUseOutcome {
         hook_events: results
             .into_iter()
             .map(|result| {
-                common::hook_completed_for_tool_use(result.completed, &request.tool_use_id)
+                additional_contexts.extend(result.data.additional_contexts_for_model);
+                common::hook_completed_for_tool_use(result.completed, &tool_use_id)
             })
             .collect(),
         should_block,
@@ -150,15 +151,9 @@ fn latest_updated_input(
 ) -> Option<Value> {
     results
         .iter()
-        .filter_map(|result| {
-            result
-                .data
-                .updated_input
-                .clone()
-                .map(|updated_input| (result.completion_order, updated_input))
-        })
-        .max_by_key(|(completion_order, _)| *completion_order)
-        .map(|(_, updated_input)| updated_input)
+        .filter(|result| result.data.updated_input.is_some())
+        .max_by_key(|result| result.completion_order)
+        .and_then(|result| result.data.updated_input.clone())
 }
 
 /// Serializes command stdin for a selected `PreToolUse` hook.
@@ -167,21 +162,21 @@ fn latest_updated_input(
 /// the canonical `tool_name` so audit logs and downstream policy decisions stay
 /// stable. Shell-like tools pass `{ "command": ... }` as `tool_input`; MCP
 /// tools pass their resolved JSON arguments.
-fn command_input_json(request: &PreToolUseRequest) -> Result<String, serde_json::Error> {
+fn command_input_json(request: PreToolUseRequest) -> Result<String, serde_json::Error> {
     let subagent = SubagentCommandInputFields::from(request.subagent.as_ref());
     serde_json::to_string(&PreToolUseCommandInput {
         session_id: request.session_id.to_string(),
-        turn_id: request.turn_id.clone(),
+        turn_id: request.turn_id,
         agent_id: subagent.agent_id,
         agent_type: subagent.agent_type,
-        transcript_path: crate::schema::NullableString::from_path(request.transcript_path.clone()),
+        transcript_path: crate::schema::NullableString::from_path(request.transcript_path),
         cwd: request.cwd.display().to_string(),
         hook_event_name: "PreToolUse".to_string(),
-        model: request.model.clone(),
-        permission_mode: request.permission_mode.clone(),
-        tool_name: request.tool_name.clone(),
-        tool_input: request.tool_input.clone(),
-        tool_use_id: request.tool_use_id.clone(),
+        model: request.model,
+        permission_mode: request.permission_mode,
+        tool_name: request.tool_name,
+        tool_input: request.tool_input,
+        tool_use_id: request.tool_use_id,
     })
 }
 
@@ -267,7 +262,11 @@ fn parse_completed(
                         text: reason,
                     });
                 } else {
-                    status = HookRunStatus::Failed;
+                    status = HookRunStatus::Blocked;
+                    should_block = true;
+                    block_reason = Some(
+                        "PreToolUse hook blocked execution without providing a reason".to_string(),
+                    );
                     entries.push(HookOutputEntry {
                         kind: HookOutputEntryKind::Error,
                         text: "PreToolUse hook exited with code 2 but did not write a blocking reason to stderr".to_string(),
@@ -343,7 +342,7 @@ mod tests {
         let mut request = request_for_tool_use("call-apply-patch");
         request.tool_name = "apply_patch".to_string();
 
-        let input_json = command_input_json(&request).expect("serialize command input");
+        let input_json = command_input_json(request).expect("serialize command input");
         let input: serde_json::Value =
             serde_json::from_str(&input_json).expect("parse command input");
 
@@ -430,7 +429,7 @@ mod tests {
         earlier_configured.completion_order = 1;
 
         assert_eq!(
-            latest_updated_input(&[later_configured, earlier_configured]),
+            latest_updated_input(&[earlier_configured, later_configured]),
             Some(serde_json::json!({ "command": "echo finished later" }))
         );
     }
@@ -776,7 +775,7 @@ mod tests {
     fn handler() -> ConfiguredHandler {
         ConfiguredHandler {
             event_name: HookEventName::PreToolUse,
-            matcher: Some("^Bash$".to_string()),
+            matcher: Some(common::HookMatcher::new("^Bash$").expect("valid matcher")),
             command: "echo hook".to_string(),
             timeout_sec: 5,
             status_message: None,

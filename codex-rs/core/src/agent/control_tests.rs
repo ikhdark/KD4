@@ -184,6 +184,7 @@ impl AgentControlHarness {
             config.codex_home.to_path_buf(),
             std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
             state_db.clone(),
+            Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         )
         .with_agent_graph_store_for_tests(agent_graph_store);
         let control = manager.agent_control();
@@ -1526,6 +1527,7 @@ fn resume_agent_from_rollout_does_not_reopen_v2_descendants() {
                 harness.config.codex_home.to_path_buf(),
                 std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
                 harness.state_db.clone(),
+                Arc::new(crate::test_support::EmptyUserInstructionsProvider),
             );
             let resumed_control = resumed_manager.agent_control();
             let resumed_parent_thread_id = resumed_control
@@ -3087,6 +3089,7 @@ async fn spawn_agent_respects_max_threads_limit() {
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let control = manager.agent_control();
 
@@ -3139,6 +3142,7 @@ async fn spawn_agent_releases_slot_after_shutdown() {
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let control = manager.agent_control();
 
@@ -3182,6 +3186,7 @@ async fn spawn_agent_limit_shared_across_clones() {
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let control = manager.agent_control();
     let cloned = control.clone();
@@ -3227,6 +3232,7 @@ async fn resume_agent_respects_max_threads_limit() {
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let control = manager.agent_control();
 
@@ -3283,6 +3289,7 @@ async fn resume_agent_releases_slot_after_resume_failure() {
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let control = manager.agent_control();
 
@@ -4298,6 +4305,7 @@ fn list_agent_subtree_thread_ids_finds_live_descendants_of_unloaded_root() {
                 config.codex_home.to_path_buf(),
                 std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
                 /*state_db*/ None,
+                Arc::new(crate::test_support::EmptyUserInstructionsProvider),
             );
             let control = manager.agent_control();
             let parent_thread_id = manager

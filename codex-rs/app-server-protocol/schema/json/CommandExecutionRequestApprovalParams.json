@@ -8,6 +8,7 @@
     "AdditionalFileSystemPermissions": {
       "properties": {
         "entries": {
+          "description": "When present, replaces legacy `read` and `write`, including when empty.",
           "items": {
             "$ref": "#/definitions/V2FileSystemSandboxEntry"
           },
@@ -524,6 +525,16 @@
       "description": "Unique identifier for this specific approval callback.\n\nFor regular shell/unified_exec approvals, this is null.\n\nFor zsh-exec-bridge subcommand approvals, multiple callbacks can belong to one parent `itemId`, so `approvalId` is a distinct opaque callback id (a UUID) used to disambiguate routing.",
       "type": [
         "string",
+        "null"
+      ]
+    },
+    "availableDecisions": {
+      "description": "Ordered list of decisions the client may present for this prompt.",
+      "items": {
+        "$ref": "#/definitions/CommandExecutionApprovalDecision"
+      },
+      "type": [
+        "array",
         "null"
       ]
     },

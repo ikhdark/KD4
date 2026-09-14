@@ -13,6 +13,8 @@ class Kd4SyncAuditTest(unittest.TestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
         self.repo = Path(self.tempdir.name)
+
+    def init_repo(self) -> None:
         self.git("init", "-b", "main")
         self.git("config", "user.name", "KD4 Test")
         self.git("config", "user.email", "kd4@example.invalid")
@@ -30,9 +32,11 @@ class Kd4SyncAuditTest(unittest.TestCase):
             encoding="utf-8",
             errors="replace",
             check=check,
+            timeout=30,
         )
 
     def create_divergence(self, *, conflict: bool) -> None:
+        self.init_repo()
         self.git("checkout", "-b", "upstream")
         (self.repo / "upstream.txt").write_text("upstream\n", encoding="utf-8")
         if conflict:
@@ -51,6 +55,13 @@ class Kd4SyncAuditTest(unittest.TestCase):
         self.git("add", ".")
         self.git("commit", "-m", "fork")
 
+    def test_first_unstaged_path_preserves_porcelain_columns(self) -> None:
+        self.create_divergence(conflict=False)
+        (self.repo / "shared.txt").write_text("changed\n", encoding="utf-8")
+        audit = kd4_sync_audit.audit_repository(self.repo)
+        self.assertEqual(audit.worktree.staged_paths, 0)
+        self.assertEqual(audit.worktree.unstaged_paths, 1)
+
     def test_stale_local_upstream_ref_is_not_safe(self) -> None:
         self.create_divergence(conflict=False)
         stale = self.git("rev-parse", "refs/remotes/upstream/main").stdout.strip()
@@ -65,7 +76,13 @@ class Kd4SyncAuditTest(unittest.TestCase):
     def test_clean_trial_merge_is_safe_for_pristine_worktree(self) -> None:
         self.create_divergence(conflict=False)
 
+        head = self.git("rev-parse", "HEAD").stdout
+        branch = self.git("symbolic-ref", "HEAD").stdout
+        status = self.git("status", "--porcelain=v1").stdout
         audit = kd4_sync_audit.audit_repository(self.repo)
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout, head)
+        self.assertEqual(self.git("symbolic-ref", "HEAD").stdout, branch)
+        self.assertEqual(self.git("status", "--porcelain=v1").stdout, status)
 
         self.assertEqual((audit.ahead, audit.behind), (1, 1))
         self.assertEqual(audit.merge_forecast.status, "clean")
@@ -74,7 +91,13 @@ class Kd4SyncAuditTest(unittest.TestCase):
     def test_conflicting_trial_merge_requires_isolated_strategy(self) -> None:
         self.create_divergence(conflict=True)
 
+        head = self.git("rev-parse", "HEAD").stdout
+        branch = self.git("symbolic-ref", "HEAD").stdout
+        status = self.git("status", "--porcelain=v1").stdout
         audit = kd4_sync_audit.audit_repository(self.repo)
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout, head)
+        self.assertEqual(self.git("symbolic-ref", "HEAD").stdout, branch)
+        self.assertEqual(self.git("status", "--porcelain=v1").stdout, status)
 
         self.assertEqual(audit.merge_forecast.status, "conflicts")
         self.assertIn("shared.txt", audit.merge_forecast.conflict_paths)

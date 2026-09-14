@@ -19,7 +19,7 @@ use super::sixel;
 const ESC: &str = "\x1b";
 const ST: &str = "\x1b\\";
 const KITTY_CHUNK_SIZE: usize = 4096;
-const SIXEL_CACHE_VERSION: &str = "v2";
+const SIXEL_CACHE_VERSION: &str = "v3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageProtocol {
@@ -184,7 +184,7 @@ pub fn sixel_frame(frame_path: &Path, cache_dir: &Path, height_px: u16) -> Resul
         .and_then(|stem| stem.to_str())
         .context("frame path has no valid file stem")?;
     let path = cache_dir.join(format!("{stem}_h{height_px}_{SIXEL_CACHE_VERSION}.six"));
-    if path.exists() {
+    if path.is_file() {
         return Ok(path);
     }
 
@@ -199,7 +199,11 @@ pub fn sixel_frame(frame_path: &Path, cache_dir: &Path, height_px: u16) -> Resul
     let (width, height) = rgba.dimensions();
     let sixel = sixel::encode_rgba(&rgba.into_raw(), width, height)?;
 
-    fs::write(&path, sixel).with_context(|| format!("write {}", path.display()))?;
+    let staging = tempfile::NamedTempFile::new_in(cache_dir)?;
+    fs::write(staging.path(), sixel).with_context(|| format!("write {}", path.display()))?;
+    staging
+        .persist(&path)
+        .with_context(|| format!("publish {}", path.display()))?;
     Ok(path)
 }
 

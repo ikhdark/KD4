@@ -622,14 +622,7 @@ impl App {
             guard
                 .buffer
                 .push_back(ThreadBufferedEvent::FeedbackSubmission(event.clone()));
-            if guard.buffer.len() > guard.capacity
-                && let Some(removed) = guard.buffer.pop_front()
-                && let ThreadBufferedEvent::Request(request) = &removed
-            {
-                guard
-                    .pending_interactive_replay
-                    .note_evicted_server_request(request);
-            }
+            guard.trim_buffer();
             guard.active
         };
 
@@ -908,10 +901,16 @@ pub(super) async fn fetch_additional_plugin_remote_sections(
         section_errors.push(plugin_sharing_disabled_remote_section_error());
     }
 
-    for (section_id, label, marketplace_kinds) in sections {
-        match request_plugin_list_for_kinds(request_handle.clone(), cwd.clone(), marketplace_kinds)
-            .await
-        {
+    let requests = sections.into_iter().map(|(section_id, label, kinds)| {
+        let request_handle = request_handle.clone();
+        let cwd = cwd.clone();
+        async move {
+            let result = request_plugin_list_for_kinds(request_handle, cwd, kinds).await;
+            (section_id, label, result)
+        }
+    });
+    for (section_id, label, result) in futures::future::join_all(requests).await {
+        match result {
             Ok(mut response) => {
                 hide_cli_only_plugin_marketplaces(&mut response);
                 marketplaces.extend(response.marketplaces);
@@ -1360,9 +1359,111 @@ mod tests {
         AbsolutePathBuf::try_from(PathBuf::from(path)).expect("absolute test path")
     }
 
+    #[tokio::test]
+    async fn remote_plugin_sections_run_concurrently_and_preserve_order_and_errors() {
+        use codex_app_server_client::AppServerClient;
+        use codex_app_server_client::RemoteAppServerClient;
+        use codex_app_server_client::RemoteAppServerConnectArgs;
+        use codex_app_server_client::RemoteAppServerEndpoint;
+        use futures::SinkExt;
+        use futures::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind server");
+        let endpoint = format!("ws://{}", listener.local_addr().expect("server address"));
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket");
+            let initialize = socket.next().await.expect("initialize").expect("frame");
+            let initialize: serde_json::Value =
+                serde_json::from_str(initialize.to_text().expect("text")).expect("JSON");
+            socket
+                .send(Message::Text(
+                    serde_json::json!({"id": initialize["id"], "result": {}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("initialize response");
+            let initialized = socket.next().await.expect("initialized").expect("frame");
+            let initialized: serde_json::Value =
+                serde_json::from_str(initialized.to_text().expect("text")).expect("JSON");
+            assert_eq!(initialized["method"], "initialized");
+            // Every request must arrive before any response; serial fetching times out here.
+            let mut requests = Vec::new();
+            for _ in 0..3 {
+                let request = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                    .await
+                    .expect("concurrent request deadline")
+                    .expect("request")
+                    .expect("frame");
+                let request: serde_json::Value =
+                    serde_json::from_str(request.to_text().expect("text")).expect("JSON");
+                assert_eq!(request["method"], "plugin/list");
+                requests.push(request);
+            }
+            for (index, request) in requests.iter().enumerate().rev() {
+                let response = if index == 1 {
+                    serde_json::json!({"id": request["id"], "error": {"code": -32603, "message": "workspace unavailable"}})
+                } else {
+                    serde_json::json!({"id": request["id"], "result": {
+                        "marketplaces": [{"name": format!("section-{index}"), "path": null, "interface": null, "plugins": []}],
+                        "marketplaceLoadErrors": [], "featuredPluginIds": []
+                    }})
+                };
+                socket
+                    .send(Message::Text(response.to_string().into()))
+                    .await
+                    .expect("section response");
+            }
+        });
+        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            endpoint: RemoteAppServerEndpoint::WebSocket {
+                websocket_url: endpoint,
+                auth_token: None,
+            },
+            client_name: "codex-tui-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("connect client");
+        let client = AppServerClient::Remote(client);
+        let (marketplaces, errors) = tokio::time::timeout(
+            Duration::from_secs(10),
+            fetch_additional_plugin_remote_sections(
+                client.request_handle(),
+                crate::test_support::test_path_buf("/workspace"),
+                true,
+                false,
+            ),
+        )
+        .await
+        .expect("section fetch deadline");
+        assert_eq!(
+            marketplaces
+                .iter()
+                .map(|marketplace| marketplace.name.as_str())
+                .collect::<Vec<_>>(),
+            ["section-0", "section-2"]
+        );
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].section_id, "workspace");
+        assert!(errors[0].message.contains("workspace unavailable"));
+        peer.await.expect("server assertions");
+        client.shutdown().await.expect("client shutdown");
+    }
+
     #[test]
     fn marketplace_add_source_for_request_resolves_relative_local_paths() {
-        let cwd = PathBuf::from(r"C:\workspace\project");
+        let cwd = crate::test_support::test_path_buf("/workspace/project");
 
         let resolved = marketplace_add_source_for_request(&cwd, "./marketplace".to_string());
         assert!(std::path::Path::new(&resolved).is_absolute());

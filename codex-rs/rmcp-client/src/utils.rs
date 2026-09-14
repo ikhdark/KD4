@@ -13,14 +13,23 @@ pub(crate) fn create_env_for_mcp_server(
     env_vars: &[McpServerEnvVar],
 ) -> Result<HashMap<OsString, OsString>> {
     let additional_env_vars = local_stdio_env_var_names(env_vars)?;
-    let env = DEFAULT_ENV_VARS
+    let entries = DEFAULT_ENV_VARS
         .iter()
         .copied()
         .chain(additional_env_vars)
         .filter_map(|var| env::var_os(var).map(|value| (OsString::from(var), value)))
-        .chain(extra_env.unwrap_or_default())
-        .collect();
+        .chain(extra_env.unwrap_or_default());
+    let mut env: HashMap<OsString, OsString> = HashMap::new();
+    for (key, value) in entries {
+        env.retain(|existing, _| !env_keys_equal(existing, &key));
+        env.insert(key, value);
+    }
     Ok(env)
+}
+
+pub(crate) fn env_keys_equal(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> bool {
+    left.as_encoded_bytes()
+        .eq_ignore_ascii_case(right.as_encoded_bytes())
 }
 
 pub(crate) fn create_env_overlay_for_remote_mcp_server(
@@ -159,6 +168,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn mixed_case_path_override_has_one_effective_value() {
+        let env = create_env_for_mcp_server(
+            Some(HashMap::from([(
+                OsString::from("pAtH"),
+                OsString::from("custom-bin"),
+            )])),
+            &["PATH".into()],
+        )
+        .unwrap();
+        let paths: Vec<_> = env
+            .iter()
+            .filter(|(key, _)| env_keys_equal(key, OsStr::new("PATH")))
+            .collect();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].1, &OsString::from("custom-bin"));
     }
 
     #[tokio::test]

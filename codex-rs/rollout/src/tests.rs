@@ -167,6 +167,13 @@ async fn read_thread_item_from_rollout_rejects_unknown_canonical_history_mode() 
     )
     .unwrap();
 
+    assert_eq!(
+        crate::list::read_session_meta_line(&path)
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
     assert_eq!(crate::list::read_thread_item_from_rollout(path).await, None);
 }
 
@@ -919,7 +926,7 @@ async fn test_pagination_cursor() {
             },
         ],
         next_cursor: Some(expected_cursor2.clone()),
-        num_scanned_files: 5, // scanned 05, 04 (anchor), 03, 02, and peeked at 01
+        num_scanned_files: 3, // scanned 03, 02, and peeked at 01
         reached_scan_cap: false,
     };
     assert_eq!(page2, expected_page2);
@@ -967,7 +974,7 @@ async fn test_pagination_cursor() {
             updated_at: updated_page3.first().cloned().flatten(),
         }],
         next_cursor: None,
-        num_scanned_files: 5, // scanned 05, 04 (anchor), 03, 02 (anchor), 01
+        num_scanned_files: 1, // scanned 01 after rejecting the cursor prefix
         reached_scan_cap: false,
     };
     assert_eq!(page3, expected_page3);
@@ -1573,7 +1580,7 @@ async fn test_cursor_preserves_same_second_filesystem_ties() {
             updated_at: updated_page2,
         }],
         next_cursor: None,
-        num_scanned_files: 3,
+        num_scanned_files: 1,
         reached_scan_cap: false,
     };
     assert_eq!(page2, expected_page2);
@@ -1759,4 +1766,131 @@ async fn test_model_provider_filter_selects_only_matching_sessions() -> Result<(
     assert_eq!(all_sessions.items.len(), 3);
 
     Ok(())
+}
+
+#[tokio::test]
+async fn header_reader_stops_before_invalid_utf8_history_and_head_scan_is_bounded() {
+    let temp = TempDir::new().unwrap();
+    let uuid = Uuid::new_v4();
+    let ts = "2025-01-03T12-00-00";
+    write_session_file(temp.path(), ts, uuid, 1, Some(SessionSource::Cli)).unwrap();
+    let path = temp
+        .path()
+        .join(format!("sessions/2025/01/03/rollout-{ts}-{uuid}.jsonl"));
+    let original = fs::read_to_string(&path).unwrap();
+    let header = original.lines().next().unwrap();
+    let mut content = format!("{header}\n").into_bytes();
+    content.extend_from_slice(&[0xff, b'\n']);
+    fs::write(&path, content).unwrap();
+    assert_eq!(
+        crate::list::read_session_meta_line(&path)
+            .await
+            .unwrap()
+            .meta
+            .id
+            .to_string(),
+        uuid.to_string()
+    );
+    fs::write(&path, format!("{}{header}\n", "not-json\n".repeat(10))).unwrap();
+    assert!(read_head_for_summary(&path).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn recency_pagination_uses_turn_start_instead_of_file_mtime() {
+    let temp = TempDir::new().unwrap();
+    let mut ids = Vec::new();
+    for index in 1..=3 {
+        let uuid = Uuid::from_u128(index);
+        let ts = format!("2025-01-0{index}T12-00-00");
+        write_session_file(temp.path(), &ts, uuid, 1, Some(SessionSource::Cli)).unwrap();
+        let path = temp.path().join(format!(
+            "sessions/2025/01/0{index}/rollout-{ts}-{uuid}.jsonl"
+        ));
+        let line = serde_json::json!({"timestamp": "2026-01-01T00:00:00Z", "type": "event_msg", "payload": {
+            "type": "task_started", "turn_id": "turn", "started_at": chrono::DateTime::parse_from_rfc3339(&format!("2026-01-0{index}T00:00:00Z")).unwrap().timestamp()
+        }});
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{line}").unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(
+            std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_800_000_000 - index as u64),
+        ))
+        .unwrap();
+        ids.push(thread_id_from_uuid(uuid));
+    }
+    let mut cursor = None;
+    for expected in ids.into_iter().rev() {
+        let page = get_threads(
+            temp.path(),
+            1,
+            cursor.as_ref(),
+            ThreadSortKey::RecencyAt,
+            &[],
+            None,
+            None,
+            TEST_PROVIDER,
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].thread_id, Some(expected));
+        cursor = page.next_cursor;
+    }
+    assert!(cursor.is_none());
+}
+
+#[tokio::test]
+async fn created_time_continuation_and_ascending_start_cross_scan_cap() {
+    let temp = TempDir::new().unwrap();
+    let recent = temp.path().join("sessions/2026/01/01");
+    fs::create_dir_all(&recent).unwrap();
+    for index in 0..10_000 {
+        fs::write(
+            recent.join(format!(
+                "rollout-2026-01-01T00-00-00-{}.jsonl",
+                Uuid::from_u128(index as u128)
+            )),
+            b"",
+        )
+        .unwrap();
+    }
+    let oldest = Uuid::from_u128(42);
+    write_session_file(
+        temp.path(),
+        "2025-01-01T00-00-00",
+        oldest,
+        1,
+        Some(SessionSource::Cli),
+    )
+    .unwrap();
+    let cursor = parse_cursor(&format!("2026-01-01T00:00:00Z|{}", Uuid::nil())).unwrap();
+    let page = get_threads(
+        temp.path(),
+        1,
+        Some(&cursor),
+        ThreadSortKey::CreatedAt,
+        &[],
+        None,
+        None,
+        TEST_PROVIDER,
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.items[0].thread_id, Some(thread_id_from_uuid(oldest)));
+    assert_eq!(page.num_scanned_files, 1);
+    assert!(!page.reached_scan_cap);
+    let page = crate::list::get_threads_ascending(
+        temp.path(),
+        1,
+        None,
+        ThreadSortKey::CreatedAt,
+        &[],
+        None,
+        None,
+        TEST_PROVIDER,
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.items[0].thread_id, Some(thread_id_from_uuid(oldest)));
+    assert!(page.num_scanned_files <= 2);
 }

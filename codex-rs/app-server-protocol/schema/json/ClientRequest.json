@@ -3948,6 +3948,10 @@
             "null"
           ]
         },
+        "replace": {
+          "description": "Replace the goal atomically, resetting usage and its identity. Requires an objective.",
+          "type": "boolean"
+        },
         "status": {
           "anyOf": [
             {

@@ -15,10 +15,9 @@ pub struct SymlinkWritePaths {
 }
 
 pub fn resolve_symlink_write_paths(path: &Path) -> io::Result<SymlinkWritePaths> {
-    let root = AbsolutePathBuf::from_absolute_path(path)
+    let mut current = AbsolutePathBuf::from_absolute_path(path)
         .map(AbsolutePathBuf::into_path_buf)
         .unwrap_or_else(|_| path.to_path_buf());
-    let mut current = root.clone();
     let mut visited = HashSet::new();
 
     loop {
@@ -30,12 +29,7 @@ pub fn resolve_symlink_write_paths(path: &Path) -> io::Result<SymlinkWritePaths>
                     write_path: current,
                 });
             }
-            Err(_) => {
-                return Ok(SymlinkWritePaths {
-                    read_path: None,
-                    write_path: root,
-                });
-            }
+            Err(error) => return Err(error),
         };
         if !metadata.file_type().is_symlink() {
             return Ok(SymlinkWritePaths {
@@ -44,39 +38,23 @@ pub fn resolve_symlink_write_paths(path: &Path) -> io::Result<SymlinkWritePaths>
             });
         }
         if !visited.insert(current.clone()) {
-            return Ok(SymlinkWritePaths {
-                read_path: None,
-                write_path: root,
-            });
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("symlink cycle while resolving {}", path.display()),
+            ));
         }
-        let target = match std::fs::read_link(&current) {
-            Ok(target) => target,
-            Err(_) => {
-                return Ok(SymlinkWritePaths {
-                    read_path: None,
-                    write_path: root,
-                });
-            }
-        };
+        let target = std::fs::read_link(&current)?;
         let next = if target.is_absolute() {
             AbsolutePathBuf::from_absolute_path(&target)
         } else if let Some(parent) = current.parent() {
             Ok(AbsolutePathBuf::resolve_path_against_base(&target, parent))
         } else {
-            return Ok(SymlinkWritePaths {
-                read_path: None,
-                write_path: root,
-            });
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("symlink {} has no parent directory", current.display()),
+            ));
         };
-        current = match next {
-            Ok(path) => path.into_path_buf(),
-            Err(_) => {
-                return Ok(SymlinkWritePaths {
-                    read_path: None,
-                    write_path: root,
-                });
-            }
-        };
+        current = next?.into_path_buf();
     }
 }
 
@@ -124,6 +102,9 @@ pub fn write_atomically(write_path: &Path, contents: &str) -> io::Result<()> {
     write_bytes_atomically(write_path, contents.as_bytes())
 }
 
+/// Replaces the destination after synchronizing a same-directory temporary file.
+/// Parent-directory synchronization is best-effort on Windows. An error after
+/// replacement does not imply that the old contents remain installed.
 pub fn write_bytes_atomically(write_path: &Path, contents: &[u8]) -> io::Result<()> {
     let parent = write_path.parent().ok_or_else(|| {
         io::Error::new(
@@ -137,7 +118,15 @@ pub fn write_bytes_atomically(write_path: &Path, contents: &[u8]) -> io::Result<
     temporary.flush()?;
     temporary.as_file().sync_all()?;
     temporary.persist(write_path).map_err(|error| error.error)?;
-    sync_parent_directory(parent)?;
+    sync_parent_directory(parent).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "{} was replaced, but synchronizing its parent directory failed: {error}",
+                write_path.display()
+            ),
+        )
+    })?;
     Ok(())
 }
 

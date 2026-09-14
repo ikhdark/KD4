@@ -888,7 +888,7 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
     let (tx, rx) = mpsc::channel::<(PathBuf, Result<bool>)>();
     std::thread::scope(|scope| {
         for (root, root_cap_sid_str) in grant_tasks {
-            let sid_strings = vec![sandbox_group_sid_str.clone(), root_cap_sid_str];
+            let sid_strings = [sandbox_group_sid_str.clone(), root_cap_sid_str];
             let tx = tx.clone();
             scope.spawn(move || {
                 // Retain each converted SID even when a later conversion fails.

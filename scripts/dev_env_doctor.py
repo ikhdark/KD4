@@ -5,11 +5,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Sequence
@@ -112,9 +113,7 @@ def check_tool(
         actual = numeric_version(version)
         ok = ok and actual is not None and actual >= min_version
     if required_version is not None:
-        actual = numeric_version(version)
-        expected = numeric_version(required_version)
-        ok = ok and actual is not None and expected is not None and actual == expected
+        ok = ok and version == required_version
     return ToolCheck(
         name=name,
         command=tuple(command),
@@ -129,63 +128,73 @@ def check_tool(
 def collect_checks() -> list[ToolCheck]:
     pnpm_pin = package_manager_pin()
     checks = [
-        check_tool(
+        partial(
+            check_tool,
             "python",
             [sys.executable, "--version"],
             required=True,
             guidance="Install Python 3.11+ and rerun this script.",
             min_version=(3, 11),
         ),
-        check_tool(
+        partial(
+            check_tool,
             "git",
             ["git", "--version"],
             required=True,
             guidance="Install Git before using repo status, diffs, and validation.",
         ),
-        check_tool(
+        partial(
+            check_tool,
             "cargo",
             ["cargo", "--version"],
             required=True,
             guidance="Install Rust with rustup, then run `rustup component add rustfmt clippy`.",
         ),
-        check_tool(
+        partial(
+            check_tool,
             "rustfmt",
             ["cargo", "fmt", "--version"],
             required=True,
             guidance="Install with `rustup component add rustfmt`.",
         ),
-        check_tool(
+        partial(
+            check_tool,
             "clippy",
             ["cargo", "clippy", "--version"],
             required=True,
             guidance="Install with `rustup component add clippy`.",
         ),
-        check_tool(
+        partial(
+            check_tool,
             "just",
             ["just", "--version"],
             required=True,
             guidance="Install with `cargo install --locked just`.",
         ),
-        check_tool(
+        partial(
+            check_tool,
             "cargo-nextest",
             ["cargo", "nextest", "--version"],
             required=True,
             guidance="Install with `cargo install --locked cargo-nextest`.",
         ),
-        check_tool(
+        partial(
+            check_tool,
             "uv",
             ["uv", "--version"],
             required=True,
             guidance="Install uv before running maintained Python workflows.",
         ),
-        check_tool(
+        partial(
+            check_tool,
             "node",
             ["node", "--version"],
             required=True,
             guidance="Install Node 22+; this repo uses the root packageManager pin.",
             min_node_major=22,
         ),
-        check_tool(
+        partial(
+            check_tool,
             "pnpm",
             ["pnpm", "--version"],
             required=True,
@@ -194,7 +203,8 @@ def collect_checks() -> list[ToolCheck]:
         ),
     ]
     checks.append(
-        check_tool(
+        partial(
+            check_tool,
             "pwsh",
             [
                 "pwsh",
@@ -204,11 +214,12 @@ def collect_checks() -> list[ToolCheck]:
                 "$PSVersionTable.PSVersion.ToString()",
             ],
             required=True,
-            guidance="Install PowerShell 7.4 or newer for maintained Windows recipes.",
-            min_version=(7, 4),
+            guidance="Install PowerShell 7.5 or newer for maintained Windows recipes.",
+            min_version=(7, 5),
         )
     )
-    return checks
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        return list(executor.map(lambda check: check(), checks))
 
 
 def tool_status(check: ToolCheck) -> str:

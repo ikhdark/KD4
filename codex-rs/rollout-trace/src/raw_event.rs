@@ -22,7 +22,8 @@ use serde_json::Value;
 /// Monotonic sequence number assigned by the raw trace writer.
 pub type RawEventSeq = u64;
 
-/// Current raw event envelope schema version.
+/// Current raw event envelope schema version. Existing response-reference objects
+/// remain readable; completion events also accept null when capture is unavailable.
 pub(crate) const RAW_TRACE_EVENT_SCHEMA_VERSION: u32 = 1;
 
 /// One append-only raw trace event.
@@ -34,7 +35,8 @@ pub struct RawTraceEvent {
     pub schema_version: u32,
     /// Contiguous writer-assigned order inside one rollout event log.
     pub seq: RawEventSeq,
-    /// Unix wall-clock timestamp in milliseconds. Use for display/latency.
+    /// Recorder wall-clock time for display; use `seq` for recorded order and
+    /// explicit runtime durations for latency. This clock is not monotonic.
     pub wall_time_unix_ms: i64,
     pub rollout_id: String,
     pub thread_id: Option<AgentThreadId>,
@@ -106,7 +108,8 @@ pub enum RawTraceEventPayload {
         response_id: Option<String>,
         /// Provider transport request id, such as `x-request-id`.
         upstream_request_id: Option<String>,
-        response_payload: RawPayloadRef,
+        /// None means capture was unavailable, not an empty provider response.
+        response_payload: Option<RawPayloadRef>,
     },
     InferenceFailed {
         inference_call_id: InferenceCallId,
@@ -192,7 +195,8 @@ pub enum RawTraceEventPayload {
     CompactionRequestCompleted {
         compaction_id: CompactionId,
         compaction_request_id: CompactionRequestId,
-        response_payload: RawPayloadRef,
+        /// None means capture was unavailable, not an empty provider response.
+        response_payload: Option<RawPayloadRef>,
     },
     CompactionRequestFailed {
         compaction_id: CompactionId,
@@ -233,7 +237,7 @@ pub enum RawTraceEventPayload {
 
 impl RawTraceEventPayload {
     /// Raw payload refs that must exist before this raw event is appended.
-    pub(crate) fn raw_payload_refs(&self) -> Vec<&RawPayloadRef> {
+    pub(crate) fn raw_payload_refs(&self) -> &[RawPayloadRef] {
         match self {
             RawTraceEventPayload::RolloutStarted { .. }
             | RawTraceEventPayload::RolloutEnded { .. }
@@ -246,23 +250,15 @@ impl RawTraceEventPayload {
             | RawTraceEventPayload::AgentResultObserved {
                 carried_payload: None,
                 ..
-            } => Vec::new(),
+            } => &[],
             RawTraceEventPayload::ThreadStarted {
                 metadata_payload, ..
-            } => metadata_payload.iter().collect(),
+            } => metadata_payload.as_slice(),
             RawTraceEventPayload::InferenceStarted {
                 request_payload, ..
             }
-            | RawTraceEventPayload::InferenceCompleted {
-                response_payload: request_payload,
-                ..
-            }
             | RawTraceEventPayload::CompactionRequestStarted {
                 request_payload, ..
-            }
-            | RawTraceEventPayload::CompactionRequestCompleted {
-                response_payload: request_payload,
-                ..
             }
             | RawTraceEventPayload::CompactionInstalled {
                 checkpoint_payload: request_payload,
@@ -271,7 +267,13 @@ impl RawTraceEventPayload {
             | RawTraceEventPayload::ProtocolEventObserved {
                 event_payload: request_payload,
                 ..
-            } => vec![request_payload],
+            } => std::slice::from_ref(request_payload),
+            RawTraceEventPayload::InferenceCompleted {
+                response_payload, ..
+            } => response_payload.as_slice(),
+            RawTraceEventPayload::CompactionRequestCompleted {
+                response_payload, ..
+            } => response_payload.as_slice(),
             RawTraceEventPayload::InferenceFailed {
                 partial_response_payload,
                 ..
@@ -295,18 +297,48 @@ impl RawTraceEventPayload {
             | RawTraceEventPayload::CodeCellEnded {
                 response_payload: partial_response_payload,
                 ..
-            } => partial_response_payload.iter().collect(),
+            } => partial_response_payload.as_slice(),
             RawTraceEventPayload::AgentResultObserved {
                 carried_payload: Some(carried_payload),
                 ..
-            } => vec![carried_payload],
+            } => std::slice::from_ref(carried_payload),
             RawTraceEventPayload::ToolCallRuntimeStarted {
                 runtime_payload, ..
             }
             | RawTraceEventPayload::ToolCallRuntimeEnded {
                 runtime_payload, ..
-            } => vec![runtime_payload],
-            RawTraceEventPayload::Other { payloads, .. } => payloads.iter().collect(),
+            } => std::slice::from_ref(runtime_payload),
+            RawTraceEventPayload::Other { payloads, .. } => payloads.as_slice(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn completion_payloads_preserve_existing_json_and_accept_unavailable_capture()
+    -> anyhow::Result<()> {
+        for mut value in [
+            json!({"type":"inference_completed", "inference_call_id":"inference-1",
+                "response_id":"response-1", "upstream_request_id":null}),
+            json!({"type":"compaction_request_completed", "compaction_id":"compaction-1",
+                "compaction_request_id":"request-1"}),
+        ] {
+            value["response_payload"] = json!({"raw_payload_id":"payload-1",
+                "kind":{"type":"inference_response"}, "path":"payloads/1.json"});
+            let event: RawTraceEventPayload = serde_json::from_value(value.clone())?;
+            assert_eq!(serde_json::to_value(&event)?, value);
+            assert_eq!(event.raw_payload_refs().len(), 1);
+            assert_eq!(event.raw_payload_refs()[0].raw_payload_id, "payload-1");
+
+            value["response_payload"] = Value::Null;
+            let event: RawTraceEventPayload = serde_json::from_value(value.clone())?;
+            assert_eq!(serde_json::to_value(&event)?, value);
+            assert!(event.raw_payload_refs().is_empty());
+        }
+        Ok(())
     }
 }

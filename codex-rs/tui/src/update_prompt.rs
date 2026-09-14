@@ -1,7 +1,8 @@
-#![cfg(not(debug_assertions))]
+#![cfg(any(not(debug_assertions), test))]
 
 use crate::history_cell::padded_emoji;
 use crate::key_hint;
+#[cfg(not(debug_assertions))]
 use crate::legacy_core::config::Config;
 use crate::render::Insets;
 use crate::render::renderable::ColumnRenderable;
@@ -9,10 +10,14 @@ use crate::render::renderable::Renderable;
 use crate::render::renderable::RenderableExt as _;
 use crate::selection_list::selection_option_row;
 use crate::tui::FrameRequester;
+#[cfg(not(debug_assertions))]
 use crate::tui::Tui;
+#[cfg(not(debug_assertions))]
 use crate::tui::TuiEvent;
 use crate::update_action::UpdateAction;
+#[cfg(not(debug_assertions))]
 use crate::updates;
+#[cfg(not(debug_assertions))]
 use color_eyre::Result;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -25,28 +30,29 @@ use ratatui::style::Stylize as _;
 use ratatui::text::Line;
 use ratatui::widgets::Clear;
 use ratatui::widgets::WidgetRef;
+#[cfg(not(debug_assertions))]
 use tokio_stream::StreamExt;
 
 const RELEASE_NOTES_URL: &str = "https://github.com/openai/codex/releases/latest";
 
+#[cfg(not(debug_assertions))]
 pub(crate) enum UpdatePromptOutcome {
     Continue,
     RunUpdate(UpdateAction),
 }
 
+#[cfg(not(debug_assertions))]
 pub(crate) async fn run_update_prompt_if_needed(
     tui: &mut Tui,
     config: &Config,
+    latest_version: &str,
+    update_action: UpdateAction,
 ) -> Result<UpdatePromptOutcome> {
-    let Some(latest_version) = updates::get_upgrade_version_for_popup(config).await else {
-        return Ok(UpdatePromptOutcome::Continue);
-    };
-    let Some(update_action) = crate::update_action::get_update_action() else {
-        return Ok(UpdatePromptOutcome::Continue);
-    };
-
-    let mut screen =
-        UpdatePromptScreen::new(tui.frame_requester(), latest_version.clone(), update_action);
+    let mut screen = UpdatePromptScreen::new(
+        tui.frame_requester(),
+        latest_version.to_string(),
+        update_action,
+    );
     tui.draw(u16::MAX, |frame| {
         frame.render_widget_ref(&screen, frame.area());
     })?;
@@ -110,7 +116,7 @@ impl UpdatePromptScreen {
         Self {
             request_frame,
             latest_version,
-            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            current_version: crate::version::CODEX_CLI_VERSION.to_string(),
             update_action,
             highlighted: UpdateSelection::UpdateNow,
             selection: None,
@@ -160,6 +166,7 @@ impl UpdatePromptScreen {
         self.selection
     }
 
+    #[cfg(not(debug_assertions))]
     fn latest_version(&self) -> &str {
         self.latest_version.as_str()
     }
@@ -248,7 +255,7 @@ mod tests {
     use crossterm::event::KeyCode;
     use crossterm::event::KeyEvent;
     use crossterm::event::KeyModifiers;
-    use ratatui::Terminal;
+    use crate::custom_terminal::Terminal;
 
     fn new_prompt() -> UpdatePromptScreen {
         UpdatePromptScreen::new(
@@ -261,10 +268,14 @@ mod tests {
     #[test]
     fn update_prompt_snapshot() {
         let screen = new_prompt();
-        let mut terminal = Terminal::new(VT100Backend::new(80, 12)).expect("terminal");
+        let mut terminal = Terminal::with_options(VT100Backend::new(80, 12)).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 0, 80, 12));
         terminal
             .draw(|frame| frame.render_widget_ref(&screen, frame.area()))
             .expect("render update prompt");
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("https://github.com/openai/codex/releases/latest"));
+        assert!(rendered.contains("npm install -g @openai/codex"));
         insta::assert_snapshot!("update_prompt_modal", terminal.backend());
     }
 

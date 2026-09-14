@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::Path;
 
 use codex_app_server_protocol::ServerNotification;
@@ -29,6 +30,11 @@ pub(crate) trait EventProcessor {
     /// Handle an unrecoverable failure in exec's local app-server event stream.
     fn process_event_stream_error(&mut self, message: String);
 
+    /// Return a delivery failure so the runtime can shut down before returning it.
+    fn take_output_error(&mut self) -> Option<std::io::Error> {
+        None
+    }
+
     fn print_final_output(&mut self) -> std::io::Result<()> {
         Ok(())
     }
@@ -39,7 +45,7 @@ pub(crate) fn handle_last_message(
     output_file: &Path,
 ) -> std::io::Result<()> {
     let message = last_agent_message.unwrap_or_default();
-    std::fs::write(output_file, message).map_err(|error| {
+    write_last_message(output_file, message).map_err(|error| {
         std::io::Error::new(
             error.kind(),
             format!(
@@ -54,6 +60,39 @@ pub(crate) fn handle_last_message(
             output_file.display()
         );
     }
+    Ok(())
+}
+
+fn write_last_message(output_file: &Path, message: &str) -> std::io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(output_file) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    // Follow symlinks and keep device/pipe targets as writable streams.
+    if metadata
+        .as_ref()
+        .is_some_and(|metadata| !metadata.is_file())
+    {
+        return std::fs::write(output_file, message);
+    }
+    let parent = output_file
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    if let Some(metadata) = metadata {
+        if metadata.permissions().readonly() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "last message file is read-only",
+            ));
+        }
+        staged.as_file().set_permissions(metadata.permissions())?;
+    }
+    staged.write_all(message.as_bytes())?;
+    staged.flush()?;
+    staged.persist(output_file).map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -76,6 +115,37 @@ pub(crate) fn final_message_from_turn_items(items: &[ThreadItem]) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn last_message_replaces_complete_artifact_and_preserves_read_only_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("answer.txt");
+        std::fs::write(&path, "old answer").expect("seed artifact");
+        let old = std::fs::File::open(&path).expect("open old artifact");
+        handle_last_message(Some("new answer"), &path).expect("replace artifact");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read new artifact"),
+            "new answer"
+        );
+        assert_eq!(
+            std::io::read_to_string(old).expect("read original handle"),
+            "old answer"
+        );
+        let permissions = std::fs::metadata(&path).expect("metadata").permissions();
+        let mut read_only = permissions.clone();
+        read_only.set_readonly(true);
+        std::fs::set_permissions(&path, read_only).expect("read-only target");
+        let result = handle_last_message(Some("must not replace"), &path);
+        std::fs::set_permissions(&path, permissions).expect("restore permissions");
+        assert_eq!(
+            result.expect_err("read-only write must fail").kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read preserved artifact"),
+            "new answer"
+        );
+    }
 
     #[test]
     fn final_message_prefers_latest_agent_message_and_falls_back_to_plan() {

@@ -33,8 +33,9 @@ pub struct AbsolutePathBuf(PathBuf);
 impl AbsolutePathBuf {
     fn maybe_expand_home_directory(path: &Path) -> PathBuf {
         if let Some(path_str) = path.to_str()
-            && let Some(home) = home_dir()
             && let Some(rest) = path_str.strip_prefix('~')
+            && (rest.is_empty() || rest.starts_with(['/', '\\']))
+            && let Some(home) = home_dir()
         {
             if rest.is_empty() {
                 return home;
@@ -47,6 +48,11 @@ impl AbsolutePathBuf {
         path.to_path_buf()
     }
 
+    /// Resolve a path without consulting the process working directory.
+    ///
+    /// # Panics
+    /// Panics if the supplied path and base do not resolve to an absolute path.
+    /// Validate raw bases with [`Self::from_absolute_path_checked`] before use.
     pub fn resolve_path_against_base<P: AsRef<Path>, B: AsRef<Path>>(
         path: P,
         base_path: B,
@@ -54,10 +60,9 @@ impl AbsolutePathBuf {
         let expanded = Self::maybe_expand_home_directory(path.as_ref());
         let expanded = normalize_path_for_platform(&expanded);
         let base_path = normalize_path_for_platform(base_path.as_ref());
-        Self(absolutize::absolutize_from(
-            expanded.as_ref(),
-            base_path.as_ref(),
-        ))
+        let resolved = absolutize::absolutize_from(expanded.as_ref(), base_path.as_ref());
+        assert!(resolved.is_absolute(), "path base must be absolute");
+        Self(resolved)
     }
 
     pub fn from_absolute_path<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
@@ -145,13 +150,9 @@ impl AbsolutePathBuf {
 }
 
 fn normalize_path_for_platform(path: &Path) -> Cow<'_, Path> {
-    if let Some(path) = path.to_str()
-        && let Some(normalized) = normalize_windows_device_path(path)
-    {
-        return Cow::Owned(PathBuf::from(normalized));
-    }
-
-    Cow::Borrowed(path)
+    // dunce only simplifies native Windows paths when ordinary-path semantics
+    // are equivalent; foreign backslashes and unsafe verbatim paths stay intact.
+    Cow::Borrowed(dunce::simplified(path))
 }
 
 /// Normalize supported Windows device-path prefixes into ordinary absolute paths.
@@ -197,13 +198,7 @@ pub fn is_windows_absolute_path(path: &str) -> bool {
 /// absolute path; use [`canonicalize_existing_preserving_symlinks`] for paths
 /// that must exist.
 pub fn canonicalize_preserving_symlinks(path: &Path) -> std::io::Result<PathBuf> {
-    let logical = AbsolutePathBuf::from_absolute_path(path)?.into_path_buf();
-    let preserve_logical_path = should_preserve_logical_path(&logical);
-    match dunce::canonicalize(path) {
-        Ok(canonical) if preserve_logical_path && canonical != logical => Ok(logical),
-        Ok(canonical) => Ok(canonical),
-        Err(_) => Ok(logical),
-    }
+    canonicalize_with_symlink_policy(path, false)
 }
 
 /// Canonicalize an existing path while preserving the logical absolute path
@@ -212,9 +207,34 @@ pub fn canonicalize_preserving_symlinks(path: &Path) -> std::io::Result<PathBuf>
 /// Unlike [`canonicalize_preserving_symlinks`], canonicalization failures are
 /// propagated so callers can reject invalid working directories early.
 pub fn canonicalize_existing_preserving_symlinks(path: &Path) -> std::io::Result<PathBuf> {
-    let logical = AbsolutePathBuf::from_absolute_path(path)?.into_path_buf();
-    let canonical = dunce::canonicalize(path)?;
-    if should_preserve_logical_path(&logical) && canonical != logical {
+    canonicalize_with_symlink_policy(path, true)
+}
+
+fn canonicalize_with_symlink_policy(
+    path: &Path,
+    require_existing: bool,
+) -> std::io::Result<PathBuf> {
+    let expanded = AbsolutePathBuf::maybe_expand_home_directory(path);
+    let expanded = normalize_path_for_platform(&expanded);
+    let input = if expanded.is_absolute() {
+        expanded.into_owned()
+    } else {
+        absolutize::path_with_base(expanded.as_ref(), &std::env::current_dir()?)
+    };
+    let logical = absolutize::absolutize_from(&input, Path::new("/"));
+    let canonical = match dunce::canonicalize(&input) {
+        Ok(canonical) => canonical,
+        Err(error) if require_existing => return Err(error),
+        Err(_) => return Ok(logical),
+    };
+    // Removing `symlink/..` lexically can name a different (or missing) file.
+    // In that case only the canonical result establishes filesystem identity.
+    if canonical != logical
+        && !input
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+        && should_preserve_logical_path(&logical)
+    {
         Ok(logical)
     } else {
         Ok(canonical)
@@ -256,11 +276,11 @@ pub mod test_support {
     use std::path::Path;
     use std::path::PathBuf;
 
-    /// Creates a Windows-absolute [`PathBuf`] from a slash-separated test path.
+    /// Creates a native absolute [`PathBuf`] from a slash-separated test path.
     ///
     /// On Windows, `/tmp/example` maps to `C:\tmp\example`.
     pub fn test_path_buf(test_path: &str) -> PathBuf {
-        let mut path = PathBuf::from(r"C:\");
+        let mut path = PathBuf::from(if cfg!(windows) { r"C:\" } else { "/" });
         path.extend(
             test_path
                 .trim_start_matches('/')
@@ -343,7 +363,16 @@ pub struct AbsolutePathBufGuard {
 }
 
 impl AbsolutePathBufGuard {
+    /// Set the base for synchronous deserialization on this thread.
+    ///
+    /// # Panics
+    /// Panics if `base_path` is not absolute. Validate raw bases with
+    /// [`AbsolutePathBuf::from_absolute_path_checked`] before use.
     pub fn new(base_path: &Path) -> Self {
+        assert!(
+            base_path.is_absolute(),
+            "deserialization base must be absolute"
+        );
         let previous_base =
             ABSOLUTE_PATH_BASE.with(|cell| cell.replace(Some(base_path.to_path_buf())));
         Self {
@@ -387,6 +416,93 @@ mod tests {
     use std::fs;
 
     use tempfile::tempdir;
+
+    #[test]
+    #[should_panic(expected = "path base must be absolute")]
+    fn relative_base_cannot_construct_an_absolute_path() {
+        let _ = AbsolutePathBuf::resolve_path_against_base("file.txt", "relative-base");
+    }
+
+    #[test]
+    fn invalid_guard_base_does_not_replace_outer_base() {
+        let dir = tempdir().expect("base directory");
+        let _guard = AbsolutePathBufGuard::new(dir.path());
+        assert!(
+            std::panic::catch_unwind(|| AbsolutePathBufGuard::new(Path::new("relative"))).is_err()
+        );
+        let resolved: AbsolutePathBuf =
+            serde_json::from_str(r#""file.txt""#).expect("outer base remains active");
+        assert_eq!(resolved.as_path(), dir.path().join("file.txt"));
+    }
+
+    #[test]
+    fn canonicalization_expands_home_before_checking_existence() {
+        let home = home_dir().expect("home directory");
+        let expected = canonicalize_existing_preserving_symlinks(&home).expect("existing home");
+        assert_eq!(
+            canonicalize_existing_preserving_symlinks(Path::new("~")).expect("expanded home"),
+            expected
+        );
+        assert_eq!(
+            canonicalize_preserving_symlinks(Path::new("~")).expect("expanded home"),
+            expected
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlink_parent_traversal_returns_the_path_that_was_checked() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().expect("directory");
+        let root = dir.path();
+        fs::create_dir(root.join("a")).expect("a");
+        fs::create_dir_all(root.join("b/inside")).expect("inside");
+        fs::write(root.join("b/marker"), "expected").expect("marker");
+        symlink(root.join("a"), root.join("view")).expect("view symlink");
+        symlink(root.join("b/inside"), root.join("a/inner")).expect("inner symlink");
+        let input = root.join("view/inner/../marker");
+        let expected = dunce::canonicalize(root.join("b/marker")).expect("marker path");
+        for resolved in [
+            canonicalize_preserving_symlinks(&input),
+            canonicalize_existing_preserving_symlinks(&input),
+        ] {
+            let resolved = resolved.expect("existing path");
+            assert_eq!(resolved, expected);
+            assert_eq!(
+                fs::read_to_string(resolved).expect("read returned path"),
+                "expected"
+            );
+        }
+        let logical = root.join("view/inner");
+        assert_eq!(
+            canonicalize_existing_preserving_symlinks(&logical).expect("logical path"),
+            logical
+        );
+        let missing = root.join("view/missing");
+        assert_eq!(
+            canonicalize_preserving_symlinks(&missing).expect("missing logical path"),
+            missing
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_paths_do_not_rewrite_foreign_windows_prefixes() {
+        let dir = tempdir().expect("directory");
+        let filename = r"\\?\C:\file";
+        let resolved = AbsolutePathBuf::resolve_path_against_base(filename, dir.path());
+        assert_eq!(resolved.as_path(), dir.path().join(filename));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn unsafe_verbatim_path_components_are_preserved() {
+        for raw in [r"\\?\C:\name.", r"\\?\C:\name ", r"\\?\C:\NUL"] {
+            let path =
+                AbsolutePathBuf::from_absolute_path_checked(raw).expect("absolute verbatim path");
+            assert_eq!(path.as_path(), Path::new(raw));
+        }
+    }
 
     #[test]
     fn create_with_absolute_path_ignores_base_path() {
@@ -441,6 +557,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn from_absolute_path_strips_windows_verbatim_prefix() {
         let path =
             AbsolutePathBuf::from_absolute_path_checked(r"\\?\D:\c\x\worktrees\2508\swift-base")
@@ -576,9 +693,7 @@ mod tests {
 
     #[test]
     fn home_directory_root_is_expanded_in_deserialization() {
-        let Some(home) = home_dir() else {
-            return;
-        };
+        let home = home_dir().expect("home directory");
         let temp_dir = tempdir().expect("base dir");
         let abs_path_buf = {
             let _guard = AbsolutePathBufGuard::new(temp_dir.path());
@@ -589,9 +704,7 @@ mod tests {
 
     #[test]
     fn home_directory_subpath_is_expanded_in_deserialization() {
-        let Some(home) = home_dir() else {
-            return;
-        };
+        let home = home_dir().expect("home directory");
         let temp_dir = tempdir().expect("base dir");
         let abs_path_buf = {
             let _guard = AbsolutePathBufGuard::new(temp_dir.path());
@@ -602,9 +715,7 @@ mod tests {
 
     #[test]
     fn home_directory_double_slash_is_expanded_in_deserialization() {
-        let Some(home) = home_dir() else {
-            return;
-        };
+        let home = home_dir().expect("home directory");
         let temp_dir = tempdir().expect("base dir");
         let abs_path_buf = {
             let _guard = AbsolutePathBufGuard::new(temp_dir.path());
@@ -626,9 +737,7 @@ mod tests {
 
     #[test]
     fn home_directory_backslash_subpath_is_expanded_in_deserialization() {
-        let Some(home) = home_dir() else {
-            return;
-        };
+        let home = home_dir().expect("home directory");
         let temp_dir = tempdir().expect("base dir");
         let abs_path_buf = {
             let _guard = AbsolutePathBufGuard::new(temp_dir.path());

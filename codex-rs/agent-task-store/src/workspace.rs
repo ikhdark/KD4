@@ -27,7 +27,7 @@ use crate::WorkspaceRevision;
 use crate::scope::RepositoryIdentity;
 use crate::scope::absolute_repo_path;
 use crate::scope::filesystem_paths_equal;
-use crate::scope::normalize_repo_path;
+use crate::scope::normalize_observed_path;
 use crate::scope::path_comparison_key;
 use crate::scope::relative_path_identity;
 use crate::scope::repository_identity;
@@ -93,10 +93,9 @@ pub(crate) async fn capture_revision_tx(
 ) -> StoreResult<WorkspaceRevision> {
     let repo_root = repo_root.to_path_buf();
     let (repository, normalized) = tokio::task::spawn_blocking(move || {
-        Ok::<_, StoreError>((
-            repository_identity(&repo_root)?,
-            normalize_paths(&repo_root, paths)?,
-        ))
+        let repository = repository_identity(&repo_root)?;
+        let normalized = normalize_paths(&repository.canonical_root, paths)?;
+        Ok::<_, StoreError>((repository, normalized))
     })
     .await
     .map_err(|error| StoreError::CorruptData(format!("repository task failed: {error}")))??;
@@ -225,8 +224,9 @@ pub(crate) async fn inspect_quiescence(
     pool: &SqlitePool,
     root_session_id: &str,
 ) -> StoreResult<QuiescenceStatus> {
+    let mut transaction = pool.begin().await?;
     let active_assignment_ids = query_assignment_ids(
-        pool,
+        &mut transaction,
         "SELECT DISTINCT assignments.assignment_id
          FROM assignments
          JOIN attempts USING (assignment_id)
@@ -242,14 +242,14 @@ pub(crate) async fn inspect_quiescence(
          WHERE assignments.root_session_id = ? AND validation_calls.status = '\"running\"'",
     )
     .bind(root_session_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *transaction)
     .await?;
     let running_validation_call_ids = validation_rows
         .into_iter()
         .map(|row| row.get::<String, _>("call_id"))
         .collect::<Vec<_>>();
     let pending_gate_assignment_ids = query_assignment_ids(
-        pool,
+        &mut transaction,
         "SELECT DISTINCT assignments.assignment_id
          FROM assignments
          JOIN gates USING (assignment_id)
@@ -258,7 +258,7 @@ pub(crate) async fn inspect_quiescence(
     )
     .await?;
     let active_claim_assignment_ids = query_assignment_ids(
-        pool,
+        &mut transaction,
         "SELECT DISTINCT assignments.assignment_id
          FROM assignments
          JOIN (
@@ -278,7 +278,7 @@ pub(crate) async fn inspect_quiescence(
          ORDER BY assignment_repositories.repository_id",
     )
     .bind(root_session_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *transaction)
     .await?
     .into_iter()
     .collect::<BTreeSet<_>>();
@@ -290,6 +290,10 @@ pub(crate) async fn inspect_quiescence(
              FROM assignments
              JOIN assignment_repositories USING (assignment_id)
              WHERE assignments.root_session_id <> ?
+               AND assignment_repositories.repository_id IN (
+                   SELECT r.repository_id FROM assignment_repositories r
+                   JOIN assignments a USING (assignment_id) WHERE a.root_session_id = ?
+               )
                AND (
                    EXISTS (
                        SELECT 1 FROM attempts
@@ -312,7 +316,8 @@ pub(crate) async fn inspect_quiescence(
              ORDER BY assignments.root_session_id, assignments.assignment_id",
         )
         .bind(root_session_id)
-        .fetch_all(pool)
+        .bind(root_session_id)
+        .fetch_all(&mut *transaction)
         .await?;
         for row in unrelated_assignment_rows {
             let repository_id = row.get::<String, _>("repository_id");
@@ -326,6 +331,7 @@ pub(crate) async fn inspect_quiescence(
             }
         }
     }
+    transaction.commit().await?;
     let quiescent = active_assignment_ids.is_empty()
         && running_validation_call_ids.is_empty()
         && pending_gate_assignment_ids.is_empty();
@@ -451,7 +457,7 @@ fn normalize_paths(repo_root: &Path, paths: Vec<String>) -> StoreResult<Vec<Stri
             if path == REPOSITORY_WIDE_PATH {
                 Ok(path)
             } else {
-                normalize_repo_path(repo_root, &path)
+                normalize_observed_path(repo_root, &path)
             }
         })
         .collect::<StoreResult<BTreeSet<_>>>()?
@@ -546,6 +552,22 @@ fn collect_repository_overlay_files(
     root: &Path,
     files: &mut BTreeSet<String>,
 ) -> StoreResult<CaptureProvenance> {
+    // Non-Git directories have a filesystem capture contract. Failed Git discovery
+    // retains incomplete provenance instead of silently broadening the capture.
+    if !root
+        .ancestors()
+        .any(|ancestor| ancestor.join(".git").symlink_metadata().is_ok())
+    {
+        let mut excluded_path_count = 0;
+        collect_repository_files_fallback(root, root, files, &mut excluded_path_count)?;
+        return Ok(CaptureProvenance {
+            mode: WorkspaceCaptureMode::FilesystemFallback,
+            complete: true,
+            discovery_errors: Vec::new(),
+            ignored_path_count: 0,
+            excluded_path_count,
+        });
+    }
     collect_repository_overlay_files_with(root, files, spawn_repository_overlay_command)
 }
 
@@ -858,53 +880,42 @@ async fn reconcile_entries_tx(
     let repository_wide = observed_paths
         .iter()
         .any(|path| path == REPOSITORY_WIDE_PATH);
-    let repository_wide_baseline = repository_wide
-        && sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM workspace_paths WHERE workspace_id = ? AND path = ?",
-        )
-        .bind(&repository.workspace_id)
-        .bind(REPOSITORY_WIDE_PATH)
-        .fetch_one(&mut **transaction)
-        .await?
-            != 0;
-    include_missing_observed_entries_tx(
-        transaction,
-        &repository.workspace_id,
-        &repository.canonical_root,
-        observed_paths,
-        entries,
-    )
-    .await?;
-    let current = current_epoch_tx(transaction, &repository.workspace_id).await?;
     let stored_rows = sqlx::query(
         "SELECT path, content_hash, existed FROM workspace_paths WHERE workspace_id = ?",
     )
     .bind(&repository.workspace_id)
     .fetch_all(&mut **transaction)
     .await?;
-    let stored_by_key = stored_rows
-        .into_iter()
-        .map(|row| {
-            let path = row.get::<String, _>("path");
-            (
-                path_comparison_key(&path),
-                (
-                    path,
-                    row.get::<Option<String>, _>("content_hash"),
-                    row.get::<i64, _>("existed") != 0,
-                ),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut stored_by_key: StoredWorkspaceEntries = BTreeMap::new();
+    for row in stored_rows {
+        let path = row.get::<String, _>("path");
+        stored_by_key
+            .entry(path_comparison_key(&path))
+            .or_default()
+            .push((
+                path,
+                row.get::<Option<String>, _>("content_hash"),
+                row.get::<i64, _>("existed") != 0,
+            ));
+    }
+    let repository_wide_baseline =
+        repository_wide && stored_by_key.contains_key(REPOSITORY_WIDE_PATH);
+    include_missing_observed_entries(
+        &stored_by_key,
+        &repository.canonical_root,
+        observed_paths,
+        entries,
+    )
+    .await?;
+    let current = current_epoch_tx(transaction, &repository.workspace_id).await?;
     let mut drift = Vec::new();
     for entry in entries.iter() {
-        if let Some((stored_path, hash, existed)) =
-            stored_by_key.get(&path_comparison_key(&entry.path))
-        {
-            if stored_path != &entry.path
-                || hash != &entry.content_hash
-                || *existed != entry.existed
-            {
+        if let Some(stored) = stored_by_key.get(&path_comparison_key(&entry.path)) {
+            if stored.iter().any(|(stored_path, hash, existed)| {
+                stored_path != &entry.path
+                    || hash != &entry.content_hash
+                    || *existed != entry.existed
+            }) {
                 drift.push(entry.path.clone());
             }
         } else if repository_wide_baseline && entry.path != REPOSITORY_WIDE_PATH {
@@ -938,14 +949,16 @@ async fn reconcile_entries_tx(
         None,
         AttributionConfidence::DetectionOnly,
         entries,
+        &stored_by_key,
     )
     .await?;
     Ok(epoch)
 }
 
-async fn include_missing_observed_entries_tx(
-    transaction: &mut Transaction<'_, Sqlite>,
-    workspace_id: &str,
+type StoredWorkspaceEntries = BTreeMap<String, Vec<(String, Option<String>, bool)>>;
+
+async fn include_missing_observed_entries(
+    stored_by_key: &StoredWorkspaceEntries,
     repository_root: &Path,
     observed_paths: &[String],
     entries: &mut Vec<WorkspaceManifestEntry>,
@@ -957,16 +970,12 @@ async fn include_missing_observed_entries_tx(
         .iter()
         .map(|entry| path_comparison_key(&entry.path))
         .collect::<BTreeSet<_>>();
-    let rows = sqlx::query(
-        "SELECT path, existed FROM workspace_paths
-         WHERE workspace_id = ? AND existed = 1",
-    )
-    .bind(workspace_id)
-    .fetch_all(&mut **transaction)
-    .await?;
     let mut snapshot_paths = Vec::new();
-    for row in rows {
-        let path = row.get::<String, _>("path");
+    for (path, _, existed) in stored_by_key.values().flatten() {
+        if !existed {
+            continue;
+        }
+        let path = path.clone();
         if present.contains(&path_comparison_key(&path)) {
             continue;
         }
@@ -1000,8 +1009,11 @@ async fn include_missing_observed_entries_tx(
 }
 
 fn observed_path_covers(observed: &str, path: &str) -> bool {
-    if observed == REPOSITORY_WIDE_PATH {
+    if observed == REPOSITORY_WIDE_PATH || path == REPOSITORY_WIDE_PATH {
         return false;
+    }
+    if observed == "." {
+        return true;
     }
     let observed = path_comparison_key(observed);
     let path = path_comparison_key(path);
@@ -1015,20 +1027,28 @@ async fn update_workspace_entries_tx(
     actor_id: Option<&str>,
     confidence: AttributionConfidence,
     entries: &[WorkspaceManifestEntry],
+    stored_by_key: &StoredWorkspaceEntries,
 ) -> StoreResult<()> {
-    let now = Utc::now();
-    let mut stored_paths =
-        sqlx::query_scalar::<_, String>("SELECT path FROM workspace_paths WHERE workspace_id = ?")
-            .bind(workspace_id)
-            .fetch_all(&mut **transaction)
-            .await?;
+    let now = json(&Utc::now())?;
+    let confidence = json(&confidence)?;
+    let epoch = sqlite_epoch(epoch)?;
+    let mut stored_paths = stored_by_key
+        .iter()
+        .map(|(key, rows)| {
+            (
+                key.clone(),
+                rows.iter()
+                    .map(|(path, _, _)| path.clone())
+                    .collect::<BTreeSet<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     for entry in entries {
         let comparison_key = path_comparison_key(&entry.path);
-        let conflicting_paths = stored_paths
+        let aliases = stored_paths.entry(comparison_key).or_default();
+        let conflicting_paths = aliases
             .iter()
-            .filter(|path| {
-                path.as_str() != entry.path && path_comparison_key(path) == comparison_key
-            })
+            .filter(|path| *path != &entry.path)
             .cloned()
             .collect::<Vec<_>>();
         for path in conflicting_paths {
@@ -1037,7 +1057,7 @@ async fn update_workspace_entries_tx(
                 .bind(&path)
                 .execute(&mut **transaction)
                 .await?;
-            stored_paths.retain(|stored| stored != &path);
+            aliases.remove(&path);
         }
         sqlx::query(
             "INSERT INTO workspace_paths (
@@ -1056,15 +1076,13 @@ async fn update_workspace_entries_tx(
         .bind(&entry.path)
         .bind(&entry.content_hash)
         .bind(i64::from(entry.existed))
-        .bind(sqlite_epoch(epoch)?)
+        .bind(epoch)
         .bind(actor_id)
-        .bind(json(&confidence)?)
-        .bind(json(&now)?)
+        .bind(&confidence)
+        .bind(&now)
         .execute(&mut **transaction)
         .await?;
-        if !stored_paths.iter().any(|path| path == &entry.path) {
-            stored_paths.push(entry.path.clone());
-        }
+        aliases.insert(entry.path.clone());
     }
     Ok(())
 }
@@ -1124,13 +1142,13 @@ fn sqlite_epoch(epoch: u64) -> StoreResult<i64> {
 }
 
 async fn query_assignment_ids(
-    pool: &SqlitePool,
+    transaction: &mut Transaction<'_, Sqlite>,
     query: &'static str,
     root_session_id: &str,
 ) -> StoreResult<Vec<AssignmentId>> {
     let rows = sqlx::query(query)
         .bind(root_session_id)
-        .fetch_all(pool)
+        .fetch_all(&mut **transaction)
         .await?;
     rows.into_iter()
         .map(|row| AssignmentId::parse(&row.get::<String, _>("assignment_id")))
@@ -1182,24 +1200,28 @@ mod overlay_observation_tests {
         let spawn_count = Cell::new(0usize);
         let mut files = BTreeSet::new();
 
-        collect_repository_overlay_files_with(temp.path(), &mut files, |_root, args| {
-            let role = if args.first() == Some(&"diff") {
-                "tracked"
-            } else {
-                "untracked"
-            };
-            spawn_count.set(spawn_count.get() + 1);
-            Command::new(&current_exe)
-                .arg("overlay_observation_child")
-                .arg("--ignored")
-                .env(HELPER_DIR, &helper_dir)
-                .env(HELPER_ROLE, role)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-        })
-        .expect("collect concurrent overlay observation");
+        let provenance =
+            collect_repository_overlay_files_with(temp.path(), &mut files, |_root, args| {
+                let role = if args.first() == Some(&"diff") {
+                    "tracked"
+                } else {
+                    "untracked"
+                };
+                spawn_count.set(spawn_count.get() + 1);
+                Command::new(&current_exe)
+                    .arg("overlay_observation_child")
+                    .arg("--ignored")
+                    .env(HELPER_DIR, &helper_dir)
+                    .env(HELPER_ROLE, role)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+            })
+            .expect("collect concurrent overlay observation");
 
+        assert_eq!(provenance.mode, WorkspaceCaptureMode::GitOverlay);
+        assert!(provenance.complete);
+        assert!(provenance.discovery_errors.is_empty());
         assert_eq!(spawn_count.get(), 2);
         assert!(helper_dir.join("tracked").exists());
         assert!(helper_dir.join("untracked").exists());

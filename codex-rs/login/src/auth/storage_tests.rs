@@ -369,12 +369,14 @@ fn assert_keyring_saved_auth_and_removed_fallback(
     assert_eq!(saved_value, expected_serialized);
     let old_key = compute_store_key(codex_home)?;
     assert!(
-        mock_keyring.saved_value(&old_key).is_none(),
+        mock_keyring
+            .saved_value(KEYRING_SERVICE, &old_key)
+            .is_none(),
         "legacy keyring auth entry should not be used"
     );
     let secrets_key = compute_keyring_account(codex_home);
     assert!(
-        mock_keyring.saved_value(&secrets_key).is_some(),
+        mock_keyring.saved_value("codex", &secrets_key).is_some(),
         "secrets backend should persist an encryption passphrase in the keyring"
     );
     assert!(encrypted_auth_file(codex_home).exists());
@@ -491,7 +493,7 @@ fn direct_keyring_auth_storage_saves_legacy_keyring_entry() -> anyhow::Result<()
 
     let legacy_key = compute_store_key(codex_home.path())?;
     let saved_value = mock_keyring
-        .saved_value(&legacy_key)
+        .saved_value(KEYRING_SERVICE, &legacy_key)
         .context("direct keyring auth entry should exist")?;
     assert_eq!(saved_value, serde_json::to_string(&auth)?);
     assert!(!encrypted_auth_file(codex_home.path()).exists());
@@ -522,7 +524,7 @@ fn direct_keyring_auth_storage_delete_removes_keyring_and_file() -> anyhow::Resu
     assert_eq!(storage.load()?, None, "keyring auth should be removed");
     assert!(
         mock_keyring
-            .saved_value(&compute_store_key(codex_home.path())?)
+            .saved_value(KEYRING_SERVICE, &compute_store_key(codex_home.path())?)
             .is_none(),
         "legacy keyring auth entry should be removed"
     );
@@ -548,7 +550,7 @@ fn factory_uses_secrets_backend_only_when_requested() -> anyhow::Result<()> {
     direct_storage.save(&direct_auth)?;
     assert!(
         direct_keyring
-            .saved_value(&compute_store_key(direct_home.path())?)
+            .saved_value(KEYRING_SERVICE, &compute_store_key(direct_home.path())?)
             .is_some()
     );
     assert!(!encrypted_auth_file(direct_home.path()).exists());
@@ -565,7 +567,7 @@ fn factory_uses_secrets_backend_only_when_requested() -> anyhow::Result<()> {
     secrets_storage.save(&secrets_auth)?;
     assert!(
         secrets_keyring
-            .saved_value(&compute_keyring_account(secrets_home.path()))
+            .saved_value("codex", &compute_keyring_account(secrets_home.path()))
             .is_some()
     );
     assert!(encrypted_auth_file(secrets_home.path()).exists());
@@ -586,7 +588,7 @@ fn secrets_keyring_auth_storage_save_persists_and_removes_fallback_file() -> any
         auth_mode: Some(AuthMode::Chatgpt),
         openai_api_key: None,
         tokens: Some(TokenData {
-            id_token: Default::default(),
+            id_token: id_token_with_prefix("saved"),
             access_token: "access".to_string(),
             refresh_token: "refresh".to_string(),
             account_id: Some("account".to_string()),
@@ -600,6 +602,7 @@ fn secrets_keyring_auth_storage_save_persists_and_removes_fallback_file() -> any
     storage.save(&auth)?;
 
     assert_keyring_saved_auth_and_removed_fallback(&mock_keyring, codex_home.path(), &auth)?;
+    assert_eq!(storage.load()?, Some(auth));
     Ok(())
 }
 
@@ -716,7 +719,11 @@ fn auto_auth_storage_load_falls_back_when_keyring_errors() -> anyhow::Result<()>
 
     let encrypted = auth_with_prefix("encrypted");
     seed_secrets_backend_with_auth(&mock_keyring, codex_home.path(), &encrypted)?;
-    mock_keyring.set_error(&key, KeyringError::Invalid("error".into(), "load".into()));
+    mock_keyring.set_error(
+        "codex",
+        &key,
+        KeyringError::Invalid("error".into(), "load".into()),
+    );
 
     let expected = auth_with_prefix("fallback");
     storage.file_storage.save(&expected)?;
@@ -755,7 +762,11 @@ fn auto_auth_storage_save_falls_back_when_keyring_errors() -> anyhow::Result<()>
         AuthKeyringBackendKind::Secrets,
     );
     let key = compute_keyring_account(codex_home.path());
-    mock_keyring.set_error(&key, KeyringError::Invalid("error".into(), "save".into()));
+    mock_keyring.set_error(
+        "codex",
+        &key,
+        KeyringError::Invalid("error".into(), "save".into()),
+    );
 
     let auth = auth_with_prefix("fallback");
     storage.save(&auth)?;
@@ -771,7 +782,7 @@ fn auto_auth_storage_save_falls_back_when_keyring_errors() -> anyhow::Result<()>
         .context("fallback auth should exist")?;
     assert_eq!(saved, auth);
     assert!(
-        mock_keyring.saved_value(&key).is_none(),
+        mock_keyring.saved_value("codex", &key).is_none(),
         "keyring should not contain value when save fails"
     );
     Ok(())
@@ -800,6 +811,141 @@ fn auto_auth_storage_delete_removes_keyring_and_file() -> anyhow::Result<()> {
     assert!(
         !auth_file.exists(),
         "fallback auth.json should be removed after delete"
+    );
+    Ok(())
+}
+
+#[test]
+fn auto_auth_storage_rejects_failed_replacement_of_existing_keyring_auth() -> anyhow::Result<()> {
+    for backend in [
+        AuthKeyringBackendKind::Direct,
+        AuthKeyringBackendKind::Secrets,
+    ] {
+        let home = tempdir()?;
+        let keyring = MockKeyringStore::default();
+        let storage = AutoAuthStorage::new(
+            home.path().to_path_buf(),
+            Arc::new(keyring.clone()),
+            backend,
+        );
+        let old = auth_with_prefix("old");
+        storage.save(&old)?;
+        let (service, key) = match backend {
+            AuthKeyringBackendKind::Direct => (KEYRING_SERVICE, compute_store_key(home.path())?),
+            AuthKeyringBackendKind::Secrets => ("codex", compute_keyring_account(home.path())),
+        };
+        keyring.set_error(
+            service,
+            &key,
+            KeyringError::Invalid("test".into(), "save".into()),
+        );
+        assert!(storage.save(&auth_with_prefix("new")).is_err());
+        assert_eq!(
+            storage.load()?,
+            Some(old),
+            "failed replacement must be reported honestly"
+        );
+        assert!(!get_auth_file(home.path()).exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn keyring_delete_failure_still_removes_plaintext_fallback() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    let keyring = MockKeyringStore::default();
+    let storage = AutoAuthStorage::new(
+        home.path().to_path_buf(),
+        Arc::new(keyring.clone()),
+        AuthKeyringBackendKind::Direct,
+    );
+    let old = auth_with_prefix("old");
+    storage.save(&old)?;
+    storage.file_storage.save(&auth_with_prefix("fallback"))?;
+    keyring.set_error(
+        KEYRING_SERVICE,
+        &compute_store_key(home.path())?,
+        KeyringError::Invalid("test".into(), "delete".into()),
+    );
+    assert!(storage.delete().is_err());
+    assert!(!get_auth_file(home.path()).exists());
+    assert_eq!(storage.load()?, Some(old));
+    Ok(())
+}
+
+#[test]
+fn encrypted_delete_failure_still_removes_legacy_and_plaintext_credentials() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    let keyring = Arc::new(MockKeyringStore::default());
+    let storage = SecretsKeyringAuthStorage::new(home.path().to_path_buf(), keyring);
+    storage.save(&auth_with_prefix("encrypted"))?;
+    storage.direct_storage.save(&auth_with_prefix("legacy"))?;
+    FileAuthStorage::new(home.path().to_path_buf()).save(&auth_with_prefix("fallback"))?;
+    std::fs::write(
+        encrypted_auth_file(home.path()),
+        "invalid encrypted contents",
+    )?;
+    assert!(storage.delete().is_err());
+    assert_eq!(storage.direct_storage.load()?, None);
+    assert!(!get_auth_file(home.path()).exists());
+    Ok(())
+}
+
+#[test]
+fn failed_atomic_replacement_preserves_readable_credentials() -> anyhow::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let home = tempdir()?;
+    let storage = FileAuthStorage::new(home.path().to_path_buf());
+    let old = auth_with_prefix("old");
+    storage.save(&old)?;
+    // Permit reads and in-place writes but deny replacement of this open file.
+    let reader = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .open(get_auth_file(home.path()))?;
+    assert!(storage.save(&auth_with_prefix("new")).is_err());
+    assert_eq!(storage.load()?, Some(old));
+    drop(reader);
+    let new = auth_with_prefix("new");
+    storage.save(&new)?;
+    assert_eq!(storage.load()?, Some(new));
+    assert_eq!(
+        std::fs::read_dir(home.path())?.count(),
+        1,
+        "temporary credentials must be cleaned up"
+    );
+    Ok(())
+}
+
+#[test]
+fn credential_debug_output_redacts_each_secret_owner() -> anyhow::Result<()> {
+    let mut auth = auth_with_prefix("secret-value");
+    let record: AgentIdentityAuthRecord = serde_json::from_value(json!({
+        "agent_runtime_id":"runtime-id", "agent_private_key":"private-secret",
+        "account_id":"account-id", "chatgpt_user_id":"user-id", "plan_type":"pro",
+        "chatgpt_account_is_fedramp":false
+    }))?;
+    let jwt = AgentIdentityStorage::Jwt("identity-secret".into());
+    let bedrock: BedrockApiKeyAuth =
+        serde_json::from_value(json!({"api_key":"bedrock-secret", "region":"us-east-1"}))?;
+    auth.agent_identity = Some(AgentIdentityStorage::Record(record.clone()));
+    auth.personal_access_token = Some("pat-secret".into());
+    auth.bedrock_api_key = Some(bedrock.clone());
+    let debug = format!("{auth:?} {record:?} {jwt:?} {bedrock:?}");
+    for secret in [
+        "secret-value",
+        "private-secret",
+        "identity-secret",
+        "pat-secret",
+        "bedrock-secret",
+    ] {
+        assert!(!debug.contains(secret));
+    }
+    assert!(debug.contains("AuthDotJson"));
+    assert!(debug.contains("runtime-id"));
+    assert_eq!(
+        serde_json::to_value(record)?["agent_private_key"],
+        "private-secret"
     );
     Ok(())
 }

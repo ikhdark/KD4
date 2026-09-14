@@ -48,6 +48,8 @@ pub struct OutgoingError {
 #[derive(Debug)]
 pub struct QueuedOutgoingMessage {
     pub message: OutgoingMessage,
+    /// Signals successful completion of this transport's write/flush, not peer receipt
+    /// or execution. Cancellation leaves delivery uncertain and does not establish safe replay.
     pub write_complete_tx: Option<oneshot::Sender<()>>,
 }
 

@@ -102,7 +102,8 @@ pub struct CompactionRequest {
     pub model: String,
     pub provider_name: String,
     pub raw_request_payload_id: RawPayloadId,
-    /// Full compaction response payload. `None` while running or after pre-response failures.
+    /// Full compaction response payload. `None` while running, after pre-response
+    /// failures, or when response capture was unavailable.
     pub raw_response_payload_id: Option<RawPayloadId>,
 }
 
@@ -215,6 +216,8 @@ pub enum ToolCallSummary {
 pub struct TerminalSession {
     pub terminal_id: TerminalId,
     pub thread_id: AgentThreadId,
+    /// Operation that first established this session in the trace. A first
+    /// observed write/poll does not prove it created the underlying process.
     pub created_by_operation_id: TerminalOperationId,
     pub operation_ids: Vec<TerminalOperationId>,
     /// Terminal lifetime. This can outlive the operation that created it.
@@ -225,7 +228,8 @@ pub struct TerminalSession {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TerminalOperation {
     pub operation_id: TerminalOperationId,
-    /// Runtime terminal/process ID. `None` is legal only while the operation that creates it is starting.
+    /// Runtime terminal/process ID, when observed. It can remain unavailable
+    /// after completion, including commands that never create a session.
     pub terminal_id: Option<TerminalId>,
     pub tool_call_id: ToolCallId,
     pub kind: TerminalOperationKind,
@@ -284,7 +288,8 @@ pub struct TerminalResult {
     pub chunk_id: Option<String>,
 }
 
-/// Conversation items that observed a terminal operation.
+/// Conversation items associated with a terminal operation; the source states
+/// whether the association is direct or only through an enclosing code cell.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalModelObservation {
     pub call_item_ids: Vec<ConversationItemId>,
@@ -297,6 +302,8 @@ pub struct TerminalModelObservation {
 #[serde(rename_all = "snake_case")]
 pub enum TerminalObservationSource {
     DirectToolCall,
+    /// Contextual association with the enclosing cell's output. It does not
+    /// establish that JavaScript exposed this operation's result to the model.
     CodeCellOutput,
 }
 

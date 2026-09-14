@@ -1,3 +1,4 @@
+#Requires -Version 7.5
 param(
     [switch]$NoSccache,
     [string]$WorkingDirectory,
@@ -130,16 +131,14 @@ try {
         Remove-Item Env:SCCACHE_CACHE_SIZE -ErrorAction SilentlyContinue
         $env:RUSTC_WRAPPER = ""
     }
-    elseif ([string]::IsNullOrWhiteSpace($env:RUSTC_WRAPPER) -and (Get-Command sccache -ErrorAction SilentlyContinue)) {
+    elseif (-not (Test-Path Env:RUSTC_WRAPPER) -and (Get-Command sccache -ErrorAction SilentlyContinue)) {
         Set-CodexRustSccacheEnvironment -RepoRoot $repoRoot
         $env:CARGO_INCREMENTAL = "0"
         $env:RUSTC_WRAPPER = "sccache"
-        Ensure-CodexRustSccacheServer -RepoRoot $repoRoot
     }
     elseif (Test-SccacheWrapper -Value $env:RUSTC_WRAPPER) {
         Set-CodexRustSccacheEnvironment -RepoRoot $repoRoot
         $env:CARGO_INCREMENTAL = "0"
-        Ensure-CodexRustSccacheServer -RepoRoot $repoRoot
     }
     Set-CodexRustMsvcLinkerEnvironment
 

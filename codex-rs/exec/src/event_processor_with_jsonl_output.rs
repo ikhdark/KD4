@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -18,7 +19,6 @@ use codex_app_server_protocol::WebSearchAction as AppServerWebSearchAction;
 use codex_core::config::Config;
 use codex_protocol::models::WebSearchAction;
 use codex_protocol::protocol::SessionConfiguredEvent;
-use serde_json::json;
 
 pub use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
@@ -68,6 +68,9 @@ pub struct EventProcessorWithJsonOutput {
     last_total_token_usage: Option<ThreadTokenUsage>,
     last_critical_error: Option<ThreadErrorEvent>,
     final_message: Option<String>,
+    last_agent_message_id: Option<String>,
+    output: Box<dyn Write + Send>,
+    output_error: Option<std::io::Error>,
     emit_final_message_on_shutdown: bool,
 }
 
@@ -93,6 +96,9 @@ impl EventProcessorWithJsonOutput {
             last_total_token_usage: None,
             last_critical_error: None,
             final_message: None,
+            last_agent_message_id: None,
+            output: Box::new(std::io::stdout()),
+            output_error: None,
             emit_final_message_on_shutdown: false,
         }
     }
@@ -105,18 +111,18 @@ impl EventProcessorWithJsonOutput {
         format!("item_{}", self.next_item_id.fetch_add(1, Ordering::SeqCst))
     }
 
-    #[allow(clippy::print_stdout)]
-    fn emit(&self, event: ThreadEvent) {
-        println!(
-            "{}",
-            serde_json::to_string(&event).unwrap_or_else(|err| {
-                json!({
-                    "type": "error",
-                    "message": format!("failed to serialize exec json event: {err}"),
-                })
-                .to_string()
-            })
-        );
+    fn emit(&mut self, event: ThreadEvent) {
+        if self.output_error.is_some() {
+            return;
+        }
+        let result = serde_json::to_string(&event)
+            .map_err(std::io::Error::other)
+            .and_then(|record| writeln!(self.output, "{record}"));
+        if let Err(error) = result {
+            self.output_error = Some(error);
+            self.final_message = None;
+            self.emit_final_message_on_shutdown = false;
+        }
     }
 
     fn usage_from_last_total(&self) -> Usage {
@@ -239,9 +245,8 @@ impl EventProcessorWithJsonOutput {
                     status: match status {
                         PatchApplyStatus::InProgress => ExecPatchApplyStatus::InProgress,
                         PatchApplyStatus::Completed => ExecPatchApplyStatus::Completed,
-                        PatchApplyStatus::Failed | PatchApplyStatus::Declined => {
-                            ExecPatchApplyStatus::Failed
-                        }
+                        PatchApplyStatus::Failed => ExecPatchApplyStatus::Failed,
+                        PatchApplyStatus::Declined => ExecPatchApplyStatus::Declined,
                     },
                 }),
             }),
@@ -389,11 +394,6 @@ impl EventProcessorWithJsonOutput {
     }
 
     fn map_completed_item_mut(&mut self, item: ThreadItem) -> Option<ExecThreadItem> {
-        if let ThreadItem::Reasoning { summary, .. } = &item
-            && summary.join("\n").trim().is_empty()
-        {
-            return None;
-        }
         match &item {
             ThreadItem::AgentMessage { .. } | ThreadItem::Reasoning { .. } => {
                 Self::map_item_with_id(item, || self.next_item_id())
@@ -409,6 +409,9 @@ impl EventProcessorWithJsonOutput {
         &mut self,
         turn_items: &[ThreadItem],
     ) -> Vec<ThreadEvent> {
+        if self.raw_to_exec_item_id.is_empty() {
+            return Vec::new();
+        }
         turn_items
             .iter()
             .filter_map(|item| {
@@ -529,6 +532,9 @@ impl EventProcessorWithJsonOutput {
                 CodexStatus::Running
             }
             ServerNotification::ItemCompleted(notification) => {
+                if let ThreadItem::AgentMessage { id, .. } = &notification.item {
+                    self.last_agent_message_id = Some(id.clone());
+                }
                 if let Some(item) = self.map_completed_item_mut(notification.item) {
                     if let ThreadItemDetails::AgentMessage(AgentMessageItem { text }) =
                         &item.details
@@ -578,13 +584,31 @@ impl EventProcessorWithJsonOutput {
                             final_message_from_turn_items(notification.turn.items.as_slice())
                         {
                             self.final_message = Some(final_message);
+                            if let Some(ThreadItem::AgentMessage { id, text, .. }) = notification
+                                .turn
+                                .items
+                                .iter()
+                                .rev()
+                                .find(|item| matches!(item, ThreadItem::AgentMessage { .. }))
+                                && self.last_agent_message_id.as_ref() != Some(id)
+                            {
+                                events.push(ThreadEvent::ItemCompleted(ItemCompletedEvent {
+                                    item: ExecThreadItem {
+                                        id: self.next_item_id(),
+                                        details: ThreadItemDetails::AgentMessage(
+                                            AgentMessageItem { text: text.clone() },
+                                        ),
+                                    },
+                                }));
+                                self.last_agent_message_id = Some(id.clone());
+                            }
                         }
                         self.emit_final_message_on_shutdown = true;
-                        events.push(ThreadEvent::TurnCompleted(TurnCompletedEvent {
+                        events.push(ThreadEvent::TurnCompleted(Box::new(TurnCompletedEvent {
                             usage: self.usage_from_last_total(),
                             surfaced_result: notification.surfaced_result,
                             timing: notification.timing,
-                        }));
+                        })));
                         CodexStatus::InitiateShutdown
                     }
                     TurnStatus::Failed => {
@@ -657,6 +681,10 @@ impl EventProcessorWithJsonOutput {
 }
 
 impl EventProcessor for EventProcessorWithJsonOutput {
+    fn take_output_error(&mut self) -> Option<std::io::Error> {
+        self.output_error.take()
+    }
+
     fn print_config_summary(
         &mut self,
         _: &Config,
@@ -689,6 +717,9 @@ impl EventProcessor for EventProcessorWithJsonOutput {
     }
 
     fn print_final_output(&mut self) -> std::io::Result<()> {
+        if let Some(error) = self.take_output_error() {
+            return Err(error);
+        }
         if self.emit_final_message_on_shutdown
             && let Some(path) = self.last_message_path.as_deref()
         {

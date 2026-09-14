@@ -475,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn emits_token_usage_for_imported_history() {
+    fn emits_token_usage_through_the_last_assistant_message() {
         let root = TempDir::new().expect("tempdir");
         let project_root = root.path().join("repo");
         std::fs::create_dir_all(&project_root).expect("project root");
@@ -502,7 +502,9 @@ mod tests {
             })
             .expect("token count event");
 
-        assert!(token_count.last_token_usage.total_tokens > 0);
+        // 13 bytes of user text plus 12 bytes of assistant text, rounded up
+        // at four bytes per token. The trailing user request is a local tail.
+        assert_eq!(token_count.last_token_usage.total_tokens, 7);
         assert_eq!(token_count.total_token_usage, token_count.last_token_usage);
     }
 

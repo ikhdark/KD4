@@ -498,7 +498,7 @@ async fn load_config_toml_for_required_layer(
         }
         Err(e) => {
             if e.kind() == io::ErrorKind::NotFound {
-                Ok(TomlValue::Table(toml::map::Map::new()))
+                migrate_config_toml(TomlValue::Table(toml::map::Map::new()), toml_file.as_path())
             } else {
                 Err(io::Error::new(
                     e.kind(),
@@ -511,7 +511,6 @@ async fn load_config_toml_for_required_layer(
         }
     }?;
 
-    let toml_value = migrate_config_toml(toml_value, toml_file.as_path())?;
     Ok(create_entry(toml_value))
 }
 
@@ -889,6 +888,9 @@ fn windows_program_data_dir_from_known_folder() -> io::Result<PathBuf> {
         )
     };
     if hr != 0 {
+        // SAFETY: The API requires freeing its output even on failure;
+        // CoTaskMemFree also accepts the initial null pointer.
+        unsafe { CoTaskMemFree(path_ptr.cast()) };
         return Err(io::Error::other(format!(
             "SHGetKnownFolderPath(FOLDERID_ProgramData) failed with HRESULT {hr:#010x}"
         )));
@@ -1014,11 +1016,6 @@ struct ProjectTrustContext {
     repo_root_lookup_keys: Option<Vec<String>>,
     projects_trust: ProjectLookup<TrustLevel>,
     user_config_file: AbsolutePathBuf,
-}
-
-#[derive(Deserialize)]
-struct ProjectTrustConfigToml {
-    projects: Option<std::collections::HashMap<String, ProjectConfig>>,
 }
 
 struct ProjectTrustDecision {
@@ -1180,23 +1177,25 @@ async fn project_trust_context(
     config_base_dir: &Path,
     user_config_file: &AbsolutePathBuf,
 ) -> io::Result<ProjectTrustContext> {
-    let project_trust_config: ProjectTrustConfigToml = {
+    let projects: std::collections::HashMap<String, ProjectConfig> = {
         let _guard = AbsolutePathBufGuard::new(config_base_dir);
         merged_config
-            .clone()
-            .try_into()
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?
+            .get("projects")
+            .cloned()
+            .map(TomlValue::try_into)
+            .transpose()
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
+            .unwrap_or_default()
     };
 
     let project_root = find_project_root(fs, cwd, project_root_markers).await?;
-    let projects = project_trust_config.projects.unwrap_or_default();
 
     let project_root_lookup_keys = normalized_project_lookup_keys(project_root.as_path());
     let project_root_key = project_root_lookup_keys
         .first()
         .cloned()
         .unwrap_or_else(|| project_trust_key(project_root.as_path()));
-    let checkout_root = find_git_checkout_root(fs, cwd).await;
+    let checkout_root = find_git_checkout_root(fs, cwd).await?;
     let repo_root = resolve_root_git_project_for_trust(fs, cwd).await;
     let repo_root_lookup_keys = repo_root
         .as_ref()
@@ -1250,7 +1249,22 @@ pub fn resolve_relative_paths_in_config_toml(
     // `toml::Value` into a `ConfigToml` with `AbsolutePath
     let _guard = AbsolutePathBufGuard::new(base_dir);
     let Ok(resolved) = value_from_config_toml.clone().try_into::<ConfigToml>() else {
-        return Ok(value_from_config_toml);
+        // Lower-layer errors can be overridden later. Resolve independent
+        // fields now so their surviving paths retain this layer's base directory.
+        let mut partial = value_from_config_toml;
+        if let Some(table) = partial.as_table_mut() {
+            for (key, value) in table {
+                let field =
+                    TomlValue::Table(toml::map::Map::from_iter([(key.clone(), value.clone())]));
+                if let Ok(resolved) = field.try_into::<ConfigToml>() {
+                    let resolved = TomlValue::try_from(resolved).map_err(io::Error::other)?;
+                    if let Some(resolved) = resolved.get(key) {
+                        *value = copy_shape_from_original(value, resolved);
+                    }
+                }
+            }
+        }
+        return Ok(partial);
     };
     drop(_guard);
 
@@ -1308,12 +1322,7 @@ async fn find_project_root(
     for ancestor in cwd.ancestors() {
         for marker in project_root_markers {
             let marker_path = ancestor.join(marker);
-            let marker_path_uri = PathUri::from_abs_path(&marker_path);
-            if fs
-                .get_metadata(&marker_path_uri, /*sandbox*/ None)
-                .await
-                .is_ok()
-            {
+            if discovery_metadata(fs, &marker_path).await?.is_some() {
                 return Ok(ancestor);
             }
         }
@@ -1324,25 +1333,42 @@ async fn find_project_root(
 async fn find_git_checkout_root(
     fs: &dyn ExecutorFileSystem,
     cwd: &AbsolutePathBuf,
-) -> Option<AbsolutePathBuf> {
-    let cwd_uri = PathUri::from_abs_path(cwd);
-    let base = match fs.get_metadata(&cwd_uri, /*sandbox*/ None).await {
-        Ok(metadata) if metadata.is_directory => cwd.clone(),
-        _ => cwd.parent()?,
+) -> io::Result<Option<AbsolutePathBuf>> {
+    let base = match discovery_metadata(fs, cwd).await? {
+        Some(metadata) if metadata.is_directory => cwd.clone(),
+        _ => match cwd.parent() {
+            Some(parent) => parent,
+            None => return Ok(None),
+        },
     };
 
     for dir in base.ancestors() {
-        let dot_git = dir.join(".git");
-        let dot_git_uri = PathUri::from_abs_path(&dot_git);
-        if fs
-            .get_metadata(&dot_git_uri, /*sandbox*/ None)
-            .await
-            .is_ok()
-        {
-            return Some(dir);
+        if discovery_metadata(fs, &dir.join(".git")).await?.is_some() {
+            return Ok(Some(dir));
         }
     }
-    None
+    Ok(None)
+}
+
+async fn discovery_metadata(
+    fs: &dyn ExecutorFileSystem,
+    path: &AbsolutePathBuf,
+) -> io::Result<Option<codex_file_system::FileMetadata>> {
+    match fs.get_metadata(&PathUri::from_abs_path(path), None).await {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(err) => Err(io::Error::new(
+            err.kind(),
+            format!("Failed to inspect {}: {err}", path.display()),
+        )),
+    }
 }
 
 struct LoadedProjectLayers {
@@ -1386,12 +1412,9 @@ async fn load_project_layers(
     let mut startup_warnings = Vec::new();
     for dir in dirs {
         let dot_codex_abs = dir.join(".codex");
-        let dot_codex_uri = PathUri::from_abs_path(&dot_codex_abs);
-        if !fs
-            .get_metadata(&dot_codex_uri, /*sandbox*/ None)
-            .await
-            .map(|metadata| metadata.is_directory)
-            .unwrap_or(false)
+        if !discovery_metadata(fs, &dot_codex_abs)
+            .await?
+            .is_some_and(|metadata| metadata.is_directory)
         {
             continue;
         }
@@ -1429,7 +1452,19 @@ async fn load_project_layers(
                         continue;
                     }
                 };
-                let mut config = config;
+                let mut config = match migrate_config_toml(config, config_file.as_path()) {
+                    Ok(config) => config,
+                    Err(err) if decision.is_trusted() => return Err(err),
+                    Err(_) => {
+                        layers.push(project_layer_entry(
+                            &dot_codex_abs,
+                            TomlValue::Table(toml::map::Map::new()),
+                            disabled_reason.clone(),
+                            hooks_config_folder_override.clone(),
+                        ));
+                        continue;
+                    }
+                };
                 if disabled_reason.is_none() && strict_config {
                     validate_config_toml_strictly(
                         config_file.as_path(),
@@ -1529,6 +1564,11 @@ async fn merge_root_checkout_project_hooks(
                     }
                     TomlValue::Table(toml::map::Map::new())
                 }
+            };
+            let parsed = match migrate_config_toml(parsed, hooks_config_file.as_path()) {
+                Ok(parsed) => parsed,
+                Err(err) if is_trusted => return Err(err),
+                Err(_) => TomlValue::Table(toml::map::Map::new()),
             };
             resolve_relative_paths_in_config_toml(parsed, hooks_config_folder.as_path())?
         }

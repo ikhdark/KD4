@@ -48,6 +48,7 @@ pub(crate) struct SkillsToggleView {
     items: Vec<SkillsToggleItem>,
     state: ScrollState,
     complete: bool,
+    changed: bool,
     app_event_tx: AppEventSender,
     header: Box<dyn Renderable>,
     footer_hint: Line<'static>,
@@ -72,6 +73,7 @@ impl SkillsToggleView {
             items,
             state: ScrollState::new(),
             complete: false,
+            changed: false,
             app_event_tx,
             header: Box::new(header),
             footer_hint: skills_toggle_hint_line(&keymap),
@@ -207,6 +209,7 @@ impl SkillsToggleView {
         };
 
         item.enabled = !item.enabled;
+        self.changed = true;
         self.app_event_tx.send(AppEvent::SetSkillEnabled {
             path: item.path.clone(),
             enabled: item.enabled,
@@ -219,8 +222,10 @@ impl SkillsToggleView {
         }
         self.complete = true;
         self.app_event_tx.send(AppEvent::ManageSkillsClosed);
-        self.app_event_tx
-            .list_skills(Vec::new(), /*force_reload*/ true);
+        if self.changed {
+            self.app_event_tx
+                .list_skills(Vec::new(), /*force_reload*/ true);
+        }
     }
 
     fn rows_width(total_width: u16) -> u16 {
@@ -299,8 +304,7 @@ impl BottomPaneView for SkillsToggleView {
 
 impl Renderable for SkillsToggleView {
     fn desired_height(&self, width: u16) -> u16 {
-        let rows = self.build_rows();
-        let rows_height = self.rows_height(&rows);
+        let rows_height = self.filtered_indices.len().clamp(1, MAX_POPUP_ROWS) as u16;
 
         let mut height = self.header.desired_height(width.saturating_sub(4));
         height = height.saturating_add(rows_height + 3);
@@ -451,6 +455,42 @@ mod tests {
             })
             .collect();
         lines.join("\n")
+    }
+
+    #[test]
+    fn closing_only_reloads_after_a_toggle() {
+        for toggle in [false, true] {
+            let (tx_raw, mut rx) = unbounded_channel();
+            let path = test_path_buf("/tmp/skills/repo_scout.toml").abs();
+            let mut view = SkillsToggleView::new(
+                vec![SkillsToggleItem {
+                    name: "Repo Scout".to_string(),
+                    skill_name: "repo_scout".to_string(),
+                    description: "Summarize the repo layout".to_string(),
+                    enabled: true,
+                    path: path.clone(),
+                }],
+                AppEventSender::new(tx_raw),
+                crate::keymap::RuntimeKeymap::defaults().list,
+            );
+            if toggle {
+                view.handle_key_event(KeyEvent::from(KeyCode::Char(' ')));
+                assert!(matches!(rx.try_recv(), Ok(AppEvent::SetSkillEnabled {
+                    path: actual_path, enabled: false,
+                }) if actual_path == path));
+            }
+            view.handle_key_event(KeyEvent::from(KeyCode::Esc));
+            assert!(view.is_complete());
+            assert!(matches!(rx.try_recv(), Ok(AppEvent::ManageSkillsClosed)));
+            if toggle {
+                assert!(matches!(rx.try_recv(), Ok(AppEvent::CodexOp(
+                    crate::app_command::AppCommand::ListSkills { cwds, force_reload: true }
+                )) if cwds.is_empty()));
+            }
+            assert!(rx.try_recv().is_err());
+            view.on_ctrl_c();
+            assert!(rx.try_recv().is_err(), "closing twice must not emit events");
+        }
     }
 
     #[test]

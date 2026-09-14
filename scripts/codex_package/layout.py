@@ -169,6 +169,22 @@ def build_package_dir(
     shutil.copyfile(REPO_ROOT / "NOTICE", package_dir / "NOTICE")
 
     files = package_file_inventory(package_dir, variant=variant, spec=spec)
+    if build_identity is not None:
+        build_identity = {
+            **build_identity,
+            "inputs": {
+                entry["role"]: {"size": entry["size"], "sha256": entry["sha256"]}
+                for entry in files
+                if entry["role"]
+                in {
+                    "entrypoint",
+                    "code-mode-host",
+                    "ripgrep",
+                    "command-runner",
+                    "sandbox-setup",
+                }
+            },
+        }
     bundle_id = hashlib.sha256(
         json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -239,6 +255,7 @@ def validate_package_dir(
     if not isinstance(files, list) or not files:
         raise RuntimeError("Invalid package metadata field 'files'")
     declared_paths: set[str] = set()
+    required_roles = package_file_roles(variant=variant, spec=spec)
     for entry in files:
         if not isinstance(entry, dict):
             raise RuntimeError("Invalid package file inventory entry")
@@ -249,6 +266,8 @@ def validate_package_dir(
         if relative_path.is_absolute() or ".." in relative_path.parts:
             raise RuntimeError(f"Unsafe package file inventory path: {relative}")
         declared_paths.add(relative)
+        if relative in required_roles and entry.get("role") != required_roles[relative]:
+            raise RuntimeError(f"Invalid package file role: {relative}")
         path = package_dir / relative_path
         if not path.is_file():
             raise RuntimeError(f"Missing package file: {relative}")
@@ -260,7 +279,7 @@ def validate_package_dir(
     actual_paths = {
         path.relative_to(package_dir).as_posix()
         for path in package_dir.rglob("*")
-        if path.is_file() and path.name != "codex-package.json"
+        if path.is_file() and path != metadata_path
     }
     if actual_paths != declared_paths:
         unexpected = sorted(actual_paths - declared_paths)
@@ -268,6 +287,10 @@ def validate_package_dir(
         raise RuntimeError(
             f"Package inventory mismatch: unexpected={unexpected}, missing={missing}"
         )
+
+    missing_roles = sorted(required_roles.keys() - declared_paths)
+    if missing_roles:
+        raise RuntimeError(f"Missing required package files: {missing_roles}")
 
     expected_bundle_id = hashlib.sha256(
         json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -348,10 +371,8 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def package_file_inventory(
-    package_dir: Path, *, variant: PackageVariant, spec: TargetSpec
-) -> list[dict[str, object]]:
-    roles = {
+def package_file_roles(*, variant: PackageVariant, spec: TargetSpec) -> dict[str, str]:
+    return {
         f"bin/{variant.entrypoint_name(spec)}": "entrypoint",
         f"bin/{spec.code_mode_host_name}": "code-mode-host",
         "codex-resources/codex-command-runner.exe": "command-runner",
@@ -362,9 +383,15 @@ def package_file_inventory(
         "LICENSE": "license",
         "NOTICE": "notice",
     }
+
+
+def package_file_inventory(
+    package_dir: Path, *, variant: PackageVariant, spec: TargetSpec
+) -> list[dict[str, object]]:
+    roles = package_file_roles(variant=variant, spec=spec)
     inventory = []
     for path in sorted(package_dir.rglob("*")):
-        if not path.is_file() or path.name == "codex-package.json":
+        if not path.is_file() or path == package_dir / "codex-package.json":
             continue
         relative = path.relative_to(package_dir).as_posix()
         inventory.append(
@@ -409,7 +436,9 @@ def validate_pe_targets(
         if not relative.lower().endswith(".exe"):
             continue
         machine = pe_machine(package_dir / relative)
-        if machine is not None and machine != expected_machine:
+        if machine is None:
+            raise RuntimeError(f"Invalid PE executable: {relative}")
+        if machine != expected_machine:
             raise RuntimeError(
                 f"Package executable target mismatch: {relative} has PE machine "
                 f"0x{machine:04x}, expected 0x{expected_machine:04x}"

@@ -34,60 +34,68 @@ pub(crate) struct SkillPopup {
     query: String,
     mentions: Vec<MentionItem>,
     state: ScrollState,
+    matches: Vec<(usize, Option<Vec<usize>>, i32)>,
 }
 
 impl SkillPopup {
     pub(crate) fn new(mentions: Vec<MentionItem>) -> Self {
-        Self {
+        let mut popup = Self {
             query: String::new(),
             mentions,
             state: ScrollState::new(),
-        }
+            matches: Vec::new(),
+        };
+        popup.matches = popup.filtered();
+        popup
     }
 
     pub(crate) fn set_mentions(&mut self, mentions: Vec<MentionItem>) {
         self.mentions = mentions;
+        self.matches = self.filtered();
         self.clamp_selection();
     }
 
     pub(crate) fn set_query(&mut self, query: &str) {
+        if self.query == query {
+            self.clamp_selection();
+            return;
+        }
         self.query = query.to_string();
+        self.matches = self.filtered();
         self.clamp_selection();
     }
 
     pub(crate) fn calculate_required_height(&self, _width: u16) -> u16 {
-        let rows = self.rows_from_matches(self.filtered());
-        let visible = rows.len().clamp(1, MAX_POPUP_ROWS);
+        let visible = self.matches.len().clamp(1, MAX_POPUP_ROWS);
         (visible as u16).saturating_add(2)
     }
 
     pub(crate) fn move_up(&mut self) {
-        let len = self.filtered_items().len();
+        let len = self.matches.len();
         self.state.move_up_wrap(len);
         self.state.ensure_visible(len, MAX_POPUP_ROWS.min(len));
     }
 
     pub(crate) fn move_down(&mut self) {
-        let len = self.filtered_items().len();
+        let len = self.matches.len();
         self.state.move_down_wrap(len);
         self.state.ensure_visible(len, MAX_POPUP_ROWS.min(len));
     }
 
     pub(crate) fn selected_mention(&self) -> Option<&MentionItem> {
-        let matches = self.filtered_items();
         let idx = self.state.selected_idx?;
-        let mention_idx = matches.get(idx)?;
-        self.mentions.get(*mention_idx)
+        self.mentions.get(self.matches.get(idx)?.0)
     }
 
     fn clamp_selection(&mut self) {
-        let len = self.filtered_items().len();
+        let len = self.matches.len();
         self.state.clamp_selection(len);
         self.state.ensure_visible(len, MAX_POPUP_ROWS.min(len));
     }
 
+    #[cfg(test)]
     fn filtered_items(&self) -> Vec<usize> {
-        self.filtered().into_iter().map(|(idx, _, _)| idx).collect()
+        self.matches.iter().map(|(idx, _, _)| *idx).collect()
     }
 
     fn rows_from_matches(
@@ -194,14 +202,27 @@ impl WidgetRef for SkillPopup {
         } else {
             (area, None)
         };
-        let rows = self.rows_from_matches(self.filtered());
+        let visible = MAX_POPUP_ROWS.min(list_area.height as usize);
+        let mut state = self.state;
+        state.ensure_visible(self.matches.len(), visible);
+        let start = state.scroll_top;
+        let rows = self.rows_from_matches(
+            self.matches
+                .iter()
+                .skip(start)
+                .take(visible)
+                .cloned()
+                .collect(),
+        );
+        state.selected_idx = state.selected_idx.map(|idx| idx.saturating_sub(start));
+        state.scroll_top = 0;
         render_rows_single_line(
             list_area.inset(Insets::tlbr(
                 /*top*/ 0, /*left*/ 2, /*bottom*/ 0, /*right*/ 0,
             )),
             buf,
             &rows,
-            &self.state,
+            &state,
             MAX_POPUP_ROWS,
             "no matches",
         );
@@ -272,6 +293,25 @@ mod tests {
 
     fn plugin_mention_item(display_name: &str, search_terms: &[&str]) -> MentionItem {
         ranked_mention_item(display_name, search_terms, "[Plugin]", /*sort_rank*/ 0)
+    }
+
+    #[test]
+    fn cached_matches_refresh_when_query_or_catalog_changes() {
+        let mut popup = SkillPopup::new(vec![
+            named_mention_item("alpha", &["alpha"]),
+            named_mention_item("beta", &["beta"]),
+        ]);
+        popup.set_query("");
+        assert_eq!(popup.selected_mention().unwrap().display_name, "alpha");
+        popup.set_query("beta");
+        assert_eq!(popup.selected_mention().unwrap().display_name, "beta");
+        assert_eq!(popup.calculate_required_height(72), 3);
+        popup.set_mentions(vec![named_mention_item("beta-two", &["beta"])]);
+        assert_eq!(popup.selected_mention().unwrap().display_name, "beta-two");
+        popup.set_mentions(vec![named_mention_item("other", &["other"])]);
+        assert!(popup.selected_mention().is_none());
+        popup.set_query("");
+        assert_eq!(popup.selected_mention().unwrap().display_name, "other");
     }
 
     #[test]

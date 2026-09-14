@@ -105,10 +105,10 @@ def validate_archive_output(
     archive_format = archive_format_for_path(archive_path)
     if compression not in {"default", "fast", "none"}:
         raise RuntimeError(f"Unsupported archive compression mode: {compression}")
-    if archive_format == "tar.gz" and compression == "none":
+    if archive_format in {"tar.gz", "tar.zst"} and compression == "none":
         raise RuntimeError(
-            "compression 'none' conflicts with a .tar.gz/.tgz output; "
-            "use a .tar.zst or .zip output, or a gzip compression level."
+            f"compression 'none' conflicts with a {archive_format} output; "
+            "use a .zip output or select compression."
         )
     return package_dir, archive_path, archive_format
 
@@ -151,7 +151,7 @@ def write_tar_archive(
             # a gzip filename that gzip-expecting consumers reject.
             raise RuntimeError(
                 "compression 'none' conflicts with a .tar.gz/.tgz output; "
-                "use a .tar.zst or .zip output, or a gzip compression level."
+                "use a .zip output or select compression."
             )
 
         with archive_path.open("wb") as raw:
@@ -177,10 +177,10 @@ def write_tar_zst_archive(
     entries: list[Path] | None = None,
     compression: str = "default",
 ) -> None:
-    zstd_command = resolve_zstd_command()
     if compression == "none":
-        zstd_level = "-0"
-    elif compression == "fast":
+        raise RuntimeError("compression 'none' conflicts with a .tar.zst output")
+    zstd_command = resolve_zstd_command()
+    if compression == "fast":
         zstd_level = "-1"
     else:
         zstd_level = "-19"
@@ -244,11 +244,15 @@ def write_zip_archive(
             info = zipfile.ZipInfo(member_name, date_time=(1980, 1, 1, 0, 0, 0))
             info.create_system = 3
             info.external_attr = (0o755 if path.is_dir() else 0o644) << 16
-            archive.writestr(
-                info,
-                b"" if path.is_dir() else path.read_bytes(),
-                compress_type=zip_compression,
-            )
+            info.compress_type = zip_compression
+            # Python 3.11/3.12 expose the member compression level only here.
+            info._compresslevel = 1 if compression == "fast" else None
+            if path.is_dir():
+                archive.writestr(info, b"")
+            else:
+                info.file_size = path.stat().st_size
+                with path.open("rb") as source, archive.open(info, "w") as dest:
+                    shutil.copyfileobj(source, dest, length=1024 * 1024)
 
 
 def write_tar_stream(

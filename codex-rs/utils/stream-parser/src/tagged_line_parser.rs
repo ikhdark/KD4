@@ -28,6 +28,7 @@ where
     active_tag: Option<T>,
     detect_tag: bool,
     line_buffer: String,
+    slug_start: usize,
 }
 
 impl<T> TaggedLineParser<T>
@@ -40,6 +41,7 @@ where
             active_tag: None,
             detect_tag: true,
             line_buffer: String::new(),
+            slug_start: 0,
         }
     }
 
@@ -57,11 +59,18 @@ where
                     self.finish_line(&mut segments);
                     continue;
                 }
-                let slug = self.line_buffer.trim_start();
-                if slug.is_empty() || self.is_tag_prefix(slug) {
+                if ch.is_whitespace() {
+                    if self.slug_start + ch.len_utf8() == self.line_buffer.len() {
+                        self.slug_start = self.line_buffer.len();
+                    }
+                    continue;
+                }
+                let slug = &self.line_buffer[self.slug_start..];
+                if self.is_tag_prefix(slug) {
                     continue;
                 }
                 let buffered = std::mem::take(&mut self.line_buffer);
+                self.slug_start = 0;
                 self.detect_tag = false;
                 self.push_text(buffered, &mut segments);
                 continue;
@@ -106,11 +115,13 @@ where
             push_segment(&mut segments, TaggedLineSegment::TagEnd(tag));
         }
         self.detect_tag = true;
+        self.slug_start = 0;
         segments
     }
 
     fn finish_line(&mut self, segments: &mut Vec<TaggedLineSegment<T>>) {
         let line = std::mem::take(&mut self.line_buffer);
+        self.slug_start = 0;
         let without_newline = line.strip_suffix('\n').unwrap_or(&line);
         let slug = without_newline.trim_start().trim_end();
 
@@ -145,7 +156,6 @@ where
     }
 
     fn is_tag_prefix(&self, slug: &str) -> bool {
-        let slug = slug.trim_end();
         self.specs
             .iter()
             .any(|spec| spec.open.starts_with(slug) || spec.close.starts_with(slug))

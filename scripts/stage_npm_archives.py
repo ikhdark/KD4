@@ -310,7 +310,7 @@ def cached_codex_package_archive(
             extract_tar_data(archive_path, temp_dir)
             tree_sha256 = cache_tree_digest(temp_dir)
             (temp_dir / COMPLETE_MARKER).write_text(
-                "version=2\n"
+                "version=3\n"
                 f"source={archive_path}\n"
                 f"archive_sha256={archive_sha256}\n"
                 f"tree_sha256={tree_sha256}\n",
@@ -331,7 +331,7 @@ def extracted_cache_is_complete(
 ) -> bool:
     try:
         marker = marker_path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeError):
         return False
     expected_tree = next(
         (
@@ -350,7 +350,7 @@ def extracted_cache_is_complete(
         None,
     )
     if (
-        "version=2\n" not in marker
+        "version=3\n" not in marker
         or expected_tree is None
         or expected_archive != archive_sha256
     ):
@@ -363,7 +363,7 @@ def extracted_cache_is_complete(
 
 def cache_tree_digest(root: Path) -> str:
     digest = hashlib.sha256()
-    digest.update(b"codex-extracted-archive-cache-v2\0")
+    digest.update(b"codex-extracted-archive-cache-v3\0")
     for path in sorted(
         root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()
     ):
@@ -381,9 +381,7 @@ def cache_tree_digest(root: Path) -> str:
         mode = stat.S_IMODE(path.lstat().st_mode) & 0o777
         digest.update(mode.to_bytes(4, "big"))
         if kind == b"f":
-            with path.open("rb") as handle:
-                while chunk := handle.read(1024 * 1024):
-                    digest.update(chunk)
+            digest.update(bytes.fromhex(file_sha256(path)))
     return digest.hexdigest()
 
 

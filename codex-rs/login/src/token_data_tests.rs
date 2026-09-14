@@ -214,6 +214,85 @@ fn jwt_expiration_rejects_malformed_jwt() {
 }
 
 #[test]
+fn token_data_round_trip_preserves_jwt_string_and_claim_projection() {
+    let jwt = fake_jwt(serde_json::json!({
+        "https://api.openai.com/profile": {"email": "profile@example.com"},
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "future-plan",
+            "chatgpt_user_id": "preferred-user",
+            "user_id": "fallback-user",
+            "chatgpt_account_id": "workspace-123"
+        }
+    }));
+    let stored = serde_json::json!({
+        "id_token": jwt,
+        "access_token": "access-secret",
+        "refresh_token": "refresh-secret",
+        "account_id": "workspace-123"
+    });
+    let tokens: TokenData = serde_json::from_value(stored.clone()).unwrap();
+    assert_eq!(
+        tokens.id_token.email.as_deref(),
+        Some("profile@example.com")
+    );
+    assert_eq!(
+        tokens.id_token.chatgpt_user_id.as_deref(),
+        Some("preferred-user")
+    );
+    assert_eq!(
+        tokens.id_token.get_chatgpt_plan_type_raw().as_deref(),
+        Some("future-plan")
+    );
+    assert_eq!(
+        tokens.id_token.chatgpt_account_id.as_deref(),
+        Some("workspace-123")
+    );
+    assert_eq!(serde_json::to_value(&tokens).unwrap(), stored);
+    assert_eq!(
+        serde_json::from_str::<TokenData>(&serde_json::to_string(&tokens).unwrap()).unwrap(),
+        tokens
+    );
+    let debug = format!("{tokens:?} {:?}", tokens.id_token);
+    for secret in [jwt.as_str(), "access-secret", "refresh-secret"] {
+        assert!(!debug.contains(secret), "Debug exposed a credential");
+    }
+}
+
+#[test]
+fn jwt_parsers_reject_invalid_segments_encoding_and_json() {
+    let valid = fake_jwt(serde_json::json!({"exp": 1_700_000_000}));
+    for invalid in [
+        format!("{valid}.extra"),
+        format!("{valid}."),
+        ".e30.sig".to_string(),
+        "e30..sig".to_string(),
+        "e30.e30.".to_string(),
+        "e30.!.sig".to_string(),
+        "e30.bm90LWpzb24.sig".to_string(),
+    ] {
+        assert!(
+            parse_chatgpt_jwt_claims(&invalid).is_err(),
+            "accepted {invalid}"
+        );
+        assert!(
+            parse_jwt_expiration(&invalid).is_err(),
+            "accepted {invalid}"
+        );
+    }
+}
+
+#[test]
+fn jwt_expiration_rejects_present_but_unrepresentable_timestamp() {
+    for exp in [i64::MIN, i64::MAX] {
+        let jwt = fake_jwt(serde_json::json!({"exp": exp}));
+        assert!(matches!(
+            parse_jwt_expiration(&jwt),
+            Err(IdTokenInfoError::InvalidExpiration)
+        ));
+    }
+}
+
+#[test]
 fn workspace_account_detection_matches_workspace_plans() {
     let workspace = IdTokenInfo {
         chatgpt_plan_type: Some(PlanType::Known(KnownPlan::Business)),
@@ -232,4 +311,22 @@ fn workspace_account_detection_matches_workspace_plans() {
         ..IdTokenInfo::default()
     };
     assert_eq!(personal.is_workspace_account(), false);
+}
+
+#[test]
+fn claims_preserve_email_and_user_id_precedence() {
+    let info = parse_chatgpt_jwt_claims(&fake_jwt(serde_json::json!({
+        "email": "primary", "https://api.openai.com/profile": {"email": "fallback"},
+        "https://api.openai.com/auth": {"chatgpt_user_id": "primary-id", "user_id": "fallback-id"}
+    })))
+    .unwrap();
+    assert_eq!(info.email.as_deref(), Some("primary"));
+    assert_eq!(info.chatgpt_user_id.as_deref(), Some("primary-id"));
+    let fallback = parse_chatgpt_jwt_claims(&fake_jwt(serde_json::json!({
+        "https://api.openai.com/profile": {"email": "fallback"},
+        "https://api.openai.com/auth": {"user_id": "fallback-id"}
+    })))
+    .unwrap();
+    assert_eq!(fallback.email.as_deref(), Some("fallback"));
+    assert_eq!(fallback.chatgpt_user_id.as_deref(), Some("fallback-id"));
 }

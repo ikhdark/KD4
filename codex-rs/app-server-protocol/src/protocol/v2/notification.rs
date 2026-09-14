@@ -40,8 +40,8 @@ pub struct GuardianWarningNotification {
 #[ts(export_to = "v2/")]
 pub struct ErrorNotification {
     pub error: TurnError,
-    // Set to true if the error is transient and the app-server process will automatically retry.
-    // If true, this will not interrupt a turn.
+    /// Whether the server will retry automatically. When true, the turn remains
+    /// active; clients should not initiate a duplicate retry for this notification.
     pub will_retry: bool,
     pub thread_id: String,
     pub turn_id: String,

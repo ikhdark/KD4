@@ -57,13 +57,16 @@ def test_generation_replaces_stale_artifacts_with_current_fork_contracts(tmp_pat
         api_path.read_text().replace("def thread_start(", "def stale_thread_start(")
     )
 
-    subprocess.run(
+    completed = subprocess.run(
         [sys.executable, "scripts/update_sdk_artifacts.py", "generate-types"],
         cwd=staged_sdk,
         check=True,
         timeout=120,
+        capture_output=True,
+        text=True,
     )
 
+    assert "UserWarning" not in completed.stderr, completed.stderr
     assert before == _snapshot_targets(staged_sdk), "Generated files drifted after regeneration"
 
 

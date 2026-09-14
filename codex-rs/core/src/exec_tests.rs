@@ -1633,15 +1633,17 @@ async fn build_exec_request_preserves_windows_workspace_roots() -> Result<()> {
     assert_eq!(exec_request.codex_home, codex_home);
     let mut invalid = make_params();
     invalid.command.clear();
-    let error = build_exec_request_async(
+    let result = build_exec_request_async(
         invalid,
         &PermissionProfile::Disabled,
         &cwd,
         workspace_roots.as_slice(),
     )
-    .await
-    .err()
-    .expect("empty command must not produce an executable request");
+    .await;
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("empty command must not produce an executable request"),
+    };
     assert!(matches!(error, CodexErr::Io(error) if error.kind() == io::ErrorKind::InvalidInput));
     Ok(())
 }

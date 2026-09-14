@@ -142,7 +142,7 @@ impl ChatWidget {
     fn sync_status_surface_shared_state(&mut self, selections: &StatusSurfaceSelections) {
         if !selections.uses_git_branch() {
             self.status_line_branch = None;
-            self.status_line_branch_pending = false;
+            self.status_line_branch_pending_request_id = None;
             self.status_line_branch_lookup_complete = false;
         } else {
             let cwd = self.status_line_cwd().to_path_buf();
@@ -154,7 +154,7 @@ impl ChatWidget {
 
         if !selections.uses_git_summary() {
             self.status_line_git_summary = None;
-            self.status_line_git_summary_pending = false;
+            self.status_line_git_summary_pending_request_id = None;
             self.status_line_git_summary_lookup_complete = false;
         } else {
             let cwd = self.status_line_cwd().to_path_buf();
@@ -453,12 +453,14 @@ impl ChatWidget {
                 /*include_disabled*/ true,
             )
             .iter()
-            .find_map(|layer| match &layer.name {
+            .filter_map(|layer| match &layer.name {
                 ConfigLayerSource::Project { dot_codex_folder } => {
                     dot_codex_folder.as_path().parent().map(Path::to_path_buf)
                 }
                 _ => None,
             })
+            .filter(|root| cwd.starts_with(root))
+            .max_by_key(|root| root.components().count())
     }
 
     fn status_line_project_root_name_for_cwd(&self, cwd: &Path) -> Option<String> {
@@ -518,7 +520,7 @@ impl ChatWidget {
         }
         self.status_line_branch_cwd = Some(cwd.to_path_buf());
         self.status_line_branch = None;
-        self.status_line_branch_pending = false;
+        self.status_line_branch_pending_request_id = None;
         self.status_line_branch_lookup_complete = false;
     }
 
@@ -528,43 +530,53 @@ impl ChatWidget {
         }
         self.status_line_git_summary_cwd = Some(cwd.to_path_buf());
         self.status_line_git_summary = None;
-        self.status_line_git_summary_pending = false;
+        self.status_line_git_summary_pending_request_id = None;
         self.status_line_git_summary_lookup_complete = false;
     }
 
     /// Starts an async git-branch lookup unless one is already running.
     ///
-    /// The resulting `StatusLineBranchUpdated` event carries the lookup cwd so callers can reject
+    /// The resulting event carries the request ID and cwd so callers can reject
     /// stale completions after directory changes.
     fn request_status_line_branch(&mut self, cwd: PathBuf) {
-        if self.status_line_branch_pending {
+        if self.status_line_branch_pending_request_id.is_some() {
             return;
         }
         let Some(runner) = self.workspace_command_runner.clone() else {
             self.status_line_branch_lookup_complete = true;
             return;
         };
-        self.status_line_branch_pending = true;
+        let request_id = uuid::Uuid::new_v4();
+        self.status_line_branch_pending_request_id = Some(request_id);
         let tx = self.app_event_tx.clone();
         tokio::spawn(async move {
             let branch = branch_summary::current_branch_name(runner.as_ref(), &cwd).await;
-            tx.send(AppEvent::StatusLineBranchUpdated { cwd, branch });
+            tx.send(AppEvent::StatusLineBranchUpdated {
+                request_id,
+                cwd,
+                branch,
+            });
         });
     }
 
     fn request_status_line_git_summary(&mut self, cwd: PathBuf) {
-        if self.status_line_git_summary_pending {
+        if self.status_line_git_summary_pending_request_id.is_some() {
             return;
         }
         let Some(runner) = self.workspace_command_runner.clone() else {
             self.status_line_git_summary_lookup_complete = true;
             return;
         };
-        self.status_line_git_summary_pending = true;
+        let request_id = uuid::Uuid::new_v4();
+        self.status_line_git_summary_pending_request_id = Some(request_id);
         let tx = self.app_event_tx.clone();
         tokio::spawn(async move {
             let summary = branch_summary::status_line_git_summary(runner.as_ref(), &cwd).await;
-            tx.send(AppEvent::StatusLineGitSummaryUpdated { cwd, summary });
+            tx.send(AppEvent::StatusLineGitSummaryUpdated {
+                request_id,
+                cwd,
+                summary,
+            });
         });
     }
 

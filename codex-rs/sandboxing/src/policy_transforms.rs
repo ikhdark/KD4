@@ -223,7 +223,7 @@ pub fn intersect_uri_permission_profiles(
 ) -> UriAdditionalPermissionProfile {
     let file_system = requested
         .file_system
-        .map(|requested_file_system| {
+        .and_then(|requested_file_system| {
             let granted_file_system = granted.file_system.unwrap_or_default();
             let mut entries = Vec::new();
             for entry in granted_file_system
@@ -231,9 +231,31 @@ pub fn intersect_uri_permission_profiles(
                 .iter()
                 .filter(|entry| uri_grant_is_within_request(&requested_file_system, entry, cwd))
             {
-                let entry = materialize_uri_cwd_dependent_entry(entry, cwd);
+                let entry = materialize_uri_cwd_dependent_entry(entry, cwd)?;
                 if !entries.contains(&entry) {
                     entries.push(entry);
+                }
+            }
+            let accepted_entries = entries.clone();
+            for entry in requested_file_system
+                .entries
+                .iter()
+                .chain(granted_file_system.entries.iter())
+                .filter(|entry| entry.access == FileSystemAccessMode::Read)
+            {
+                let Some(read_path) = resolve_uri_permission_path(&entry.path, cwd) else {
+                    continue;
+                };
+                if accepted_entries.iter().any(|grant| {
+                    grant.access == FileSystemAccessMode::Write
+                        && resolve_uri_permission_path(&grant.path, cwd).is_some_and(|write_path| {
+                            read_path != write_path && read_path.starts_with(&write_path)
+                        })
+                }) {
+                    let entry = materialize_uri_cwd_dependent_entry(entry, cwd)?;
+                    if !entries.contains(&entry) {
+                        entries.push(entry);
+                    }
                 }
             }
             // Extra deny entries only narrow a grant, so preserving requested and
@@ -244,12 +266,12 @@ pub fn intersect_uri_permission_profiles(
                 .chain(granted_file_system.entries.iter())
                 .filter(|entry| entry.access == FileSystemAccessMode::Deny)
             {
-                let entry = materialize_uri_cwd_dependent_entry(entry, cwd);
+                let entry = materialize_uri_cwd_dependent_entry(entry, cwd)?;
                 if !entries.contains(&entry) {
                     entries.push(entry);
                 }
             }
-            FileSystemPermissions {
+            Some(FileSystemPermissions {
                 glob_scan_max_depth: merge_glob_scan_max_depth(
                     &requested_file_system.entries,
                     requested_file_system.glob_scan_max_depth.map(usize::from),
@@ -258,7 +280,7 @@ pub fn intersect_uri_permission_profiles(
                 )
                 .and_then(NonZeroUsize::new),
                 entries,
-            }
+            })
         })
         .filter(|file_system| !file_system.is_empty());
     let network = match (requested.network, granted.network) {
@@ -283,7 +305,7 @@ pub fn intersect_uri_permission_profiles(
 fn materialize_uri_cwd_dependent_entry(
     entry: &FileSystemSandboxEntry<PathUri>,
     cwd: &PathUri,
-) -> FileSystemSandboxEntry<PathUri> {
+) -> Option<FileSystemSandboxEntry<PathUri>> {
     if matches!(
         &entry.path,
         FileSystemPath::Special {
@@ -291,12 +313,22 @@ fn materialize_uri_cwd_dependent_entry(
         }
     ) && let Some(path) = resolve_uri_permission_path(&entry.path, cwd)
     {
-        return FileSystemSandboxEntry {
+        return Some(FileSystemSandboxEntry {
             path: FileSystemPath::Path { path },
             access: entry.access,
-        };
+        });
     }
-    entry.clone()
+    if let FileSystemPath::GlobPattern { pattern } = &entry.path {
+        // Resolve using the target's convention, never the host filesystem.
+        let path = cwd.join(pattern).ok()?;
+        return Some(FileSystemSandboxEntry {
+            path: FileSystemPath::GlobPattern {
+                pattern: path.inferred_native_path_string(),
+            },
+            access: entry.access,
+        });
+    }
+    Some(entry.clone())
 }
 
 fn uri_grant_is_within_request(
@@ -307,7 +339,7 @@ fn uri_grant_is_within_request(
     if !granted.access.can_read() {
         return false;
     }
-    let FileSystemPath::Path { path: granted_path } = &granted.path else {
+    let Some(granted_path) = resolve_uri_permission_path(&granted.path, cwd) else {
         return requested.entries.iter().any(|requested_entry| {
             requested_entry.path == granted.path
                 && access_covers(requested_entry.access, granted.access)
@@ -324,13 +356,22 @@ fn uri_grant_is_within_request(
             None => matches!(&requested_entry.path, FileSystemPath::GlobPattern { .. }),
         }
     });
-    !denied
-        && requested.entries.iter().any(|requested_entry| {
-            resolve_uri_permission_path(&requested_entry.path, cwd).is_some_and(|path| {
-                granted_path.starts_with(&path)
-                    && access_covers(requested_entry.access, granted.access)
-            })
+    if denied {
+        return false;
+    }
+    // Match the native resolver: the nearest covering path wins, with
+    // FileSystemAccessMode's conflict precedence for equally specific paths.
+    requested
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            let path = resolve_uri_permission_path(&entry.path, cwd)?;
+            granted_path
+                .starts_with(&path)
+                .then_some((path, entry.access))
         })
+        .max_by_key(|(path, access)| (path.ancestors().count(), *access))
+        .is_some_and(|(_, access)| access_covers(access, granted.access))
 }
 
 fn resolve_uri_permission_path(path: &FileSystemPath<PathUri>, cwd: &PathUri) -> Option<PathUri> {
@@ -390,6 +431,29 @@ pub fn intersect_permission_profiles(
                 }
             }
             let mut entries = accepted_entries.clone();
+            for entry in requested_file_system
+                .entries
+                .iter()
+                .chain(granted_file_system.entries.iter())
+                .filter(|entry| entry.access == FileSystemAccessMode::Read)
+            {
+                let Some(read_path) = resolve_permission_path(&entry.path, cwd) else {
+                    continue;
+                };
+                if accepted_entries.iter().any(|grant| {
+                    grant.access == FileSystemAccessMode::Write
+                        && resolve_permission_path(&grant.path, cwd).is_some_and(|write_path| {
+                            read_path != write_path
+                                && read_path.as_path().starts_with(write_path.as_path())
+                        })
+                }) {
+                    let entry = materialize_cwd_dependent_entry(entry, cwd);
+                    if !entries.contains(&entry) {
+                        entries.push(entry);
+                    }
+                }
+            }
+
             let requested_retained_deny_entries = retain_constraining_deny_entries(
                 &requested_file_system.entries,
                 &accepted_entries,
@@ -537,13 +601,13 @@ fn deny_entry_constrains_accepted_grant(
         .filter(|entry| entry.access.can_read())
         .any(|entry| {
             let Some(grant_path) = resolve_permission_path(&entry.path, cwd) else {
-                return false;
+                return true;
             };
             match &deny_entry.path {
                 FileSystemPath::GlobPattern { pattern } => glob_static_prefix_path(pattern, cwd)
-                    .is_some_and(|prefix| paths_overlap(prefix.as_path(), grant_path.as_path())),
+                    .is_none_or(|prefix| paths_overlap(prefix.as_path(), grant_path.as_path())),
                 FileSystemPath::Path { .. } | FileSystemPath::Special { .. } => {
-                    resolve_permission_path(&deny_entry.path, cwd).is_some_and(|deny_path| {
+                    resolve_permission_path(&deny_entry.path, cwd).is_none_or(|deny_path| {
                         paths_overlap(deny_path.as_path(), grant_path.as_path())
                     })
                 }
@@ -734,6 +798,10 @@ pub fn effective_permission_profile(
     permission_profile: &PermissionProfile,
     additional_permissions: Option<&AdditionalPermissionProfile>,
 ) -> PermissionProfile {
+    let Some(additional_permissions) = additional_permissions else {
+        return permission_profile.clone();
+    };
+    let additional_permissions = Some(additional_permissions);
     let (file_system_policy, network_policy) = permission_profile.to_runtime_permissions();
     let effective_file_system_policy =
         effective_file_system_sandbox_policy(&file_system_policy, additional_permissions);
@@ -775,16 +843,15 @@ pub fn effective_permission_profile_uri(
                 Some(additional_file_system),
             ) = (file_system, additional_permissions.file_system.as_ref())
             {
-                let base_entries = entries.clone();
                 let base_depth = *glob_scan_max_depth;
-                *entries = merge_permission_entries(&base_entries, &additional_file_system.entries);
                 *glob_scan_max_depth = merge_glob_scan_max_depth(
-                    &base_entries,
+                    entries,
                     base_depth.map(usize::from),
                     &additional_file_system.entries,
                     additional_file_system.glob_scan_max_depth.map(usize::from),
                 )
                 .and_then(NonZeroUsize::new);
+                *entries = merge_permission_entries(entries, &additional_file_system.entries);
             }
         }
         PermissionProfile::External { network } => {

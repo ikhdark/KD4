@@ -377,7 +377,40 @@ impl ConfigLayerStack {
     }
 
     pub fn with_project_discovery_from(mut self, other: &Self) -> Self {
-        self.project_discovery.clone_from(&other.project_discovery);
+        self.project_discovery = other
+            .project_discovery
+            .as_ref()
+            .filter(|discovery| {
+                // Match the loader's inputs: project and legacy managed layers
+                // are added after discovery and cannot choose its boundary.
+                let markers = self
+                    .layers
+                    .iter()
+                    .rev()
+                    .filter(|layer| {
+                        !layer.is_disabled()
+                            && !matches!(
+                                layer.name,
+                                ConfigLayerSource::Project { .. }
+                                    | ConfigLayerSource::LegacyManagedConfigTomlFromFile { .. }
+                                    | ConfigLayerSource::LegacyManagedConfigTomlFromMdm
+                            )
+                    })
+                    .find(|layer| layer.config.get("project_root_markers").is_some())
+                    .map(|layer| {
+                        crate::project_root_markers::project_root_markers_from_config(&layer.config)
+                    })
+                    .transpose();
+                match markers {
+                    Ok(markers) => {
+                        markers.flatten().unwrap_or_else(
+                            crate::project_root_markers::default_project_root_markers,
+                        ) == discovery.project_root_markers
+                    }
+                    Err(_) => false,
+                }
+            })
+            .cloned();
         self
     }
 
@@ -544,8 +577,9 @@ impl ConfigLayerStack {
             ignore_user_and_project_exec_policy_rules: self
                 .ignore_user_and_project_exec_policy_rules,
             startup_warnings: self.startup_warnings.clone(),
-            project_discovery: self.project_discovery.clone(),
+            project_discovery: None,
         }
+        .with_project_discovery_from(self)
     }
 
     /// Returns a new stack with the user layer copied from `other`, preserving
@@ -587,8 +621,9 @@ impl ConfigLayerStack {
             ignore_user_and_project_exec_policy_rules: self
                 .ignore_user_and_project_exec_policy_rules,
             startup_warnings: self.startup_warnings.clone(),
-            project_discovery: self.project_discovery.clone(),
+            project_discovery: None,
         }
+        .with_project_discovery_from(self)
     }
 
     /// Returns the merged config-layer view.

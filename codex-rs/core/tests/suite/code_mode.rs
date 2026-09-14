@@ -3674,16 +3674,15 @@ text("done");
     .await?;
 
     let req = second_mock.single_request();
-    let notify_outputs = req
+    let has_notify_output = req
         .inputs_of_type("custom_tool_call_output")
         .into_iter()
-        .filter(|item| {
+        .any(|item| {
             item.get("call_id").and_then(serde_json::Value::as_str) == Some("call-1")
                 && item.get("name").and_then(serde_json::Value::as_str) == Some("exec")
-        })
-        .collect::<Vec<_>>();
+        });
     assert!(
-        !notify_outputs.is_empty(),
+        has_notify_output,
         "expected notify to inject an additional named exec output: {:?}",
         req.input()
     );

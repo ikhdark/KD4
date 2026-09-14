@@ -20,7 +20,6 @@ use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::ExecApprovalRequestEvent;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SurfacedToolResult;
 use codex_protocol::protocol::TurnCompleteEvent;
@@ -35,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub struct RunningRequest {
-    pub(crate) thread_id: ThreadId,
+    pub(crate) thread_id: Option<ThreadId>,
     pub(crate) turn_id: String,
     pub(crate) cancellation: CancellationToken,
 }
@@ -101,9 +100,25 @@ async fn forward_elicitation(
         return;
     }
     let params = event.request.to_mcp_create_params();
-    let pending_request = outgoing
+    let pending_request = match outgoing
         .send_request("elicitation/create", Some(params))
-        .await;
+        .await
+    {
+        Ok(pending_request) => pending_request,
+        Err(err) => {
+            tracing::error!("failed to request elicitation: {err:?}");
+            let _ = thread
+                .submit(Op::ResolveElicitation {
+                    server_name: event.server_name,
+                    request_id: event.id,
+                    decision: ElicitationAction::Cancel,
+                    content: None,
+                    meta: None,
+                })
+                .await;
+            return;
+        }
+    };
     let pending_request_id = pending_request.id;
     let receiver = pending_request.receiver;
     tokio::spawn(async move {
@@ -145,6 +160,7 @@ pub async fn run_codex_tool_session(
     config: CodexConfig,
     outgoing: Arc<OutgoingMessageSender>,
     thread_manager: Arc<ThreadManager>,
+    request: RunningRequest,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, RunningRequest>>>,
 ) {
     let NewThread {
@@ -152,16 +168,36 @@ pub async fn run_codex_tool_session(
         thread,
         session_configured,
         ..
-    } = match thread_manager.start_thread(config.clone()).await {
+    } = match thread_manager.start_thread(config).await {
         Ok(res) => res,
         Err(e) => {
             let result = CallToolResult::error(vec![Content::text(format!(
                 "Failed to start Codex session: {e}"
             ))]);
             outgoing.send_response(id.clone(), result).await;
+            running_requests_id_to_codex_uuid.lock().await.remove(&id);
             return;
         }
     };
+
+    // Attach the thread without replacing the token registered at admission.
+    if let Some(registered) = running_requests_id_to_codex_uuid.lock().await.get_mut(&id) {
+        registered.thread_id = Some(thread_id);
+    }
+    if request.cancellation.is_cancelled() {
+        outgoing
+            .send_response(
+                id.clone(),
+                create_call_tool_result_with_thread_id(
+                    thread_id,
+                    "Codex request cancelled during startup.".to_string(),
+                    Some(true),
+                ),
+            )
+            .await;
+        running_requests_id_to_codex_uuid.lock().await.remove(&id);
+        return;
+    }
 
     let session_configured_event = Event {
         // Use a fake id value for now.
@@ -178,19 +214,21 @@ pub async fn run_codex_tool_session(
         )
         .await;
 
-    // Use the original MCP request ID as the `sub_id` for the Codex submission so that
-    // any events emitted for this tool-call can be correlated with the
-    // originating `tools/call` request.
-    let sub_id = id.to_string();
-    let request = RunningRequest {
-        thread_id,
-        turn_id: sub_id.clone(),
-        cancellation: CancellationToken::new(),
-    };
-    running_requests_id_to_codex_uuid
-        .lock()
-        .await
-        .insert(id.clone(), request.clone());
+    let sub_id = request.turn_id.clone();
+    if request.cancellation.is_cancelled() {
+        outgoing
+            .send_response(
+                id.clone(),
+                create_call_tool_result_with_thread_id(
+                    thread_id,
+                    "Codex request cancelled during startup.".to_string(),
+                    Some(true),
+                ),
+            )
+            .await;
+        running_requests_id_to_codex_uuid.lock().await.remove(&id);
+        return;
+    }
     let submission = Op::UserInput {
         items: vec![UserInput::Text {
             text: initial_prompt.clone(),
@@ -238,17 +276,26 @@ pub async fn run_codex_tool_session_reply(
     outgoing: Arc<OutgoingMessageSender>,
     request_id: RequestId,
     prompt: String,
+    request: RunningRequest,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, RunningRequest>>>,
 ) {
-    let request = RunningRequest {
-        thread_id,
-        turn_id: thread.reserve_turn_id(),
-        cancellation: CancellationToken::new(),
-    };
-    running_requests_id_to_codex_uuid
-        .lock()
-        .await
-        .insert(request_id.clone(), request.clone());
+    if request.cancellation.is_cancelled() {
+        outgoing
+            .send_response(
+                request_id.clone(),
+                create_call_tool_result_with_thread_id(
+                    thread_id,
+                    "Codex request cancelled before turn start.".to_string(),
+                    Some(true),
+                ),
+            )
+            .await;
+        running_requests_id_to_codex_uuid
+            .lock()
+            .await
+            .remove(&request_id);
+        return;
+    }
     if let Err(e) = thread
         .submit_user_input_with_reserved_turn_id(
             request.turn_id.clone(),
@@ -306,6 +353,7 @@ async fn run_codex_tool_session_inner(
     let request_id_str = request_id.to_string();
     let elicitation_cancellation = CancellationToken::new();
     let _elicitation_drop_guard = elicitation_cancellation.clone().drop_guard();
+    let mut unsupported_interaction = None;
 
     // Stream events until the task needs to pause for user interaction or
     // completes.
@@ -323,36 +371,28 @@ async fn run_codex_tool_session_inner(
                     .await;
 
                 match event.msg {
+                    EventMsg::RequestUserInput(ev) => {
+                        unsupported_interaction =
+                            Some("request_user_input is not supported by the MCP server.");
+                        thread.interrupt_turn_if_active(&ev.turn_id).await;
+                    }
+                    EventMsg::RequestPermissions(ev) => {
+                        unsupported_interaction =
+                            Some("request_permissions is not supported by the MCP server.");
+                        thread.interrupt_turn_if_active(&ev.turn_id).await;
+                    }
+                    EventMsg::DynamicToolCallRequest(ev) => {
+                        unsupported_interaction =
+                            Some("Dynamic tool execution is not supported by the MCP server.");
+                        thread.interrupt_turn_if_active(&ev.turn_id).await;
+                    }
                     EventMsg::ExecApprovalRequest(ev) => {
-                        let approval_id = ev.effective_approval_id();
-                        let ExecApprovalRequestEvent {
-                            turn_id: _,
-                            environment_id: _,
-                            started_at_ms: _,
-                            command,
-                            cwd,
-                            cwd_uri: _,
-                            call_id,
-                            approval_id: _,
-                            reason: _,
-                            proposed_execpolicy_amendment: _,
-                            proposed_network_policy_amendments: _,
-                            parsed_cmd,
-                            network_approval_context: _,
-                            additional_permissions: _,
-                            available_decisions: _,
-                        } = ev;
                         handle_exec_approval_request(
-                            command,
-                            cwd.to_path_buf(),
+                            ev,
                             outgoing.clone(),
                             thread.clone(),
-                            request_id.clone(),
                             request_id_str.clone(),
                             event.id.clone(),
-                            call_id,
-                            approval_id,
-                            parsed_cmd,
                             thread_id,
                             elicitation_cancellation.clone(),
                         )
@@ -396,7 +436,9 @@ async fn run_codex_tool_session_inner(
                         elicitation_cancellation.cancel();
                         let result = create_call_tool_result_with_thread_id(
                             thread_id,
-                            "Turn aborted.".to_string(),
+                            unsupported_interaction
+                                .unwrap_or("Turn aborted.")
+                                .to_string(),
                             Some(true),
                         );
                         outgoing.send_response(request_id.clone(), result).await;
@@ -417,7 +459,6 @@ async fn run_codex_tool_session_inner(
                             changes,
                             outgoing.clone(),
                             thread.clone(),
-                            request_id.clone(),
                             request_id_str.clone(),
                             event.id.clone(),
                             thread_id,
@@ -496,9 +537,6 @@ async fn run_codex_tool_session_inner(
                     | EventMsg::ReasoningPolicyUpdated(_)
                     | EventMsg::ReasoningPolicySummary(_)
                     | EventMsg::ExitedReviewMode(_)
-                    | EventMsg::RequestUserInput(_)
-                    | EventMsg::RequestPermissions(_)
-                    | EventMsg::DynamicToolCallRequest(_)
                     | EventMsg::DynamicToolCallResponse(_)
                     | EventMsg::ContextCompacted(_)
                     | EventMsg::ModelReroute(_)

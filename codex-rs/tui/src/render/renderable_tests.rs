@@ -2,6 +2,61 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn flex_redistributes_capped_rounding_remainder_when_rendering() {
+    let mut flex = FlexRenderable::new();
+    for (text, height) in [("A", 10), ("B", 10), ("C", 2)] {
+        flex.push(
+            1,
+            RenderableItem::Owned(Box::new(Paragraph::new(vec![Line::from(text); height]))),
+        );
+    }
+    let area = Rect::new(0, 0, 1, 5);
+    let mut buffer = Buffer::empty(area);
+    flex.render(area, &mut buffer);
+    assert_eq!(buffer, Buffer::with_lines(["A", "A", "B", "C", "C"]));
+    assert_eq!(flex.desired_height(1), 22);
+}
+
+#[test]
+fn row_skips_zero_width_child_before_visible_content() {
+    let mut row = RowRenderable::new();
+    row.push(0, "hidden");
+    row.push(4, "body");
+    assert_eq!(row.desired_height(4), 1);
+    let area = Rect::new(0, 0, 4, 1);
+    let mut buffer = Buffer::empty(area);
+    row.render(area, &mut buffer);
+    assert_eq!(buffer, Buffer::with_lines(["body"]));
+}
+
+#[test]
+fn column_does_not_measure_children_beyond_viewport() {
+    struct Measured(std::cell::Cell<usize>);
+    impl Renderable for Measured {
+        fn render(&self, _area: Rect, _buf: &mut Buffer) {}
+        fn desired_height(&self, _width: u16) -> u16 {
+            self.0.set(self.0.get() + 1);
+            1
+        }
+    }
+    let offscreen = Measured(std::cell::Cell::new(0));
+    let column = ColumnRenderable::with([
+        RenderableItem::Owned(Box::new("body")),
+        RenderableItem::Borrowed(&offscreen),
+    ]);
+    let area = Rect::new(0, 0, 4, 1);
+    let mut buffer = Buffer::empty(area);
+    column.render(area, &mut buffer);
+    assert_eq!(buffer, Buffer::with_lines(["body"]));
+    assert_eq!(column.cursor_pos(area), None);
+    assert!(matches!(
+        column.cursor_style(area),
+        SetCursorStyle::DefaultUserShape
+    ));
+    assert_eq!(offscreen.0.get(), 0);
+}
+
+#[test]
 fn tall_paragraph_stays_visible_in_column_and_inset_layout() {
     let paragraph = Paragraph::new(vec![Line::from("body"); 65_536]);
     let mut column = ColumnRenderable::new();

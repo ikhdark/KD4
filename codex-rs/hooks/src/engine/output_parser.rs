@@ -80,6 +80,7 @@ pub(crate) struct InterruptOutput {
 }
 
 use crate::schema::BlockDecisionWire;
+use crate::schema::HookEventNameWire;
 use crate::schema::HookUniversalOutputWire;
 use crate::schema::InterruptCommandOutputWire;
 use crate::schema::PermissionRequestBehaviorWire;
@@ -99,6 +100,13 @@ use crate::schema::UserPromptSubmitCommandOutputWire;
 
 pub(crate) fn parse_session_start(stdout: &str) -> Option<SessionStartOutput> {
     let wire: SessionStartCommandOutputWire = parse_json(stdout)?;
+    if wire
+        .hook_specific_output
+        .as_ref()
+        .is_some_and(|output| output.hook_event_name != HookEventNameWire::SessionStart)
+    {
+        return None;
+    }
     Some(session_start_output(
         wire.universal,
         wire.hook_specific_output
@@ -108,6 +116,13 @@ pub(crate) fn parse_session_start(stdout: &str) -> Option<SessionStartOutput> {
 
 pub(crate) fn parse_subagent_start(stdout: &str) -> Option<SessionStartOutput> {
     let wire: SubagentStartCommandOutputWire = parse_json(stdout)?;
+    if wire
+        .hook_specific_output
+        .as_ref()
+        .is_some_and(|output| output.hook_event_name != HookEventNameWire::SubagentStart)
+    {
+        return None;
+    }
     Some(session_start_output(
         wire.universal,
         wire.hook_specific_output
@@ -132,6 +147,12 @@ pub(crate) fn parse_pre_tool_use(stdout: &str) -> Option<PreToolUseOutput> {
         reason,
         hook_specific_output,
     } = parse_json(stdout)?;
+    if hook_specific_output
+        .as_ref()
+        .is_some_and(|output| output.hook_event_name != HookEventNameWire::PreToolUse)
+    {
+        return None;
+    }
     let universal = UniversalOutput::from(universal_wire);
     let hook_specific_output = hook_specific_output.as_ref();
     let additional_context =
@@ -201,6 +222,13 @@ pub(crate) fn parse_pre_tool_use(stdout: &str) -> Option<PreToolUseOutput> {
 
 pub(crate) fn parse_permission_request(stdout: &str) -> Option<PermissionRequestOutput> {
     let wire: PermissionRequestCommandOutputWire = parse_json(stdout)?;
+    if wire
+        .hook_specific_output
+        .as_ref()
+        .is_some_and(|output| output.hook_event_name != HookEventNameWire::PermissionRequest)
+    {
+        return None;
+    }
     let universal = UniversalOutput::from(wire.universal);
     let hook_specific_output = wire.hook_specific_output.as_ref();
     let decision = hook_specific_output.and_then(|output| output.decision.as_ref());
@@ -224,6 +252,13 @@ pub(crate) fn parse_permission_request(stdout: &str) -> Option<PermissionRequest
 
 pub(crate) fn parse_post_tool_use(stdout: &str) -> Option<PostToolUseOutput> {
     let wire: PostToolUseCommandOutputWire = parse_json(stdout)?;
+    if wire
+        .hook_specific_output
+        .as_ref()
+        .is_some_and(|output| output.hook_event_name != HookEventNameWire::PostToolUse)
+    {
+        return None;
+    }
     let universal = UniversalOutput::from(wire.universal);
     let invalid_reason = unsupported_post_tool_use_universal(&universal).or_else(|| {
         wire.hook_specific_output
@@ -283,6 +318,13 @@ pub(crate) fn parse_interrupt(stdout: &str) -> Option<InterruptOutput> {
 
 pub(crate) fn parse_user_prompt_submit(stdout: &str) -> Option<UserPromptSubmitOutput> {
     let wire: UserPromptSubmitCommandOutputWire = parse_json(stdout)?;
+    if wire
+        .hook_specific_output
+        .as_ref()
+        .is_some_and(|output| output.hook_event_name != HookEventNameWire::UserPromptSubmit)
+    {
+        return None;
+    }
     let should_block = matches!(wire.decision, Some(BlockDecisionWire::Block));
     let invalid_block_reason = if should_block
         && match wire.reason.as_deref() {
@@ -365,14 +407,10 @@ where
     T: for<'de> serde::Deserialize<'de>,
 {
     let trimmed = stdout.trim();
-    if trimmed.is_empty() {
+    if !trimmed.starts_with('{') {
         return None;
     }
-    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
-    if !value.is_object() {
-        return None;
-    }
-    serde_json::from_value(value).ok()
+    serde_json::from_str(trimmed).ok()
 }
 
 pub(crate) fn looks_like_json(stdout: &str) -> bool {
@@ -544,6 +582,60 @@ mod tests {
     use serde_json::json;
 
     use super::parse_permission_request;
+
+    #[test]
+    fn event_specific_outputs_reject_mismatched_event_names() {
+        let stdout =
+            r#"{"hookSpecificOutput":{"hookEventName":"Stop","additionalContext":"wrong event"}}"#;
+        assert!(super::parse_session_start(stdout).is_none());
+        assert!(super::parse_subagent_start(stdout).is_none());
+        assert!(super::parse_pre_tool_use(stdout).is_none());
+        assert!(super::parse_post_tool_use(stdout).is_none());
+        assert!(super::parse_user_prompt_submit(stdout).is_none());
+        assert!(parse_permission_request(r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","decision":{"behavior":"allow"}}}"#).is_none());
+    }
+
+    #[test]
+    fn permission_request_rejects_ambiguous_protocol_fields() {
+        for stdout in [
+            r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","behavior":"allow"}}}"#,
+            r#"{"hookSpecificOutput":{"hookEventName":"Stop","hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#,
+            r#"{"continue":false,"continue":true}"#,
+            r#"{"hookSpecificOutput":null,"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#,
+            "[]",
+            "null",
+            "true",
+            "{} trailing",
+        ] {
+            assert!(
+                parse_permission_request(stdout).is_none(),
+                "accepted {stdout}"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_request_rejects_explicit_null_reserved_fields() {
+        for field in ["updatedInput", "updatedPermissions"] {
+            let parsed = parse_permission_request(
+                &json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PermissionRequest",
+                        "decision": {"behavior": "allow", field: null}
+                    }
+                })
+                .to_string(),
+            )
+            .expect("parse presence-aware output");
+            assert_eq!(parsed.decision, None);
+            assert_eq!(
+                parsed.invalid_reason,
+                Some(format!(
+                    "PermissionRequest hook returned unsupported {field}"
+                ))
+            );
+        }
+    }
 
     #[test]
     fn permission_request_rejects_reserved_updated_input_field() {

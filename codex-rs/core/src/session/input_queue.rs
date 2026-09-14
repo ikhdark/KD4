@@ -438,6 +438,10 @@ impl InputQueue {
         turn_state.lock().await.pending_input.items.split_off(0)
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Both queues must be locked before draining to preserve input if acquisition is cancelled"
+    )]
     pub(crate) async fn recover_pending_input_for_turn_state(
         &self,
         turn_state: &Mutex<TurnState>,
@@ -726,6 +730,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Hold the contested owner to assert cancellation, admission, or cleanup behavior under contention"
+    )]
     async fn cancelled_input_extraction_preserves_all_accepted_queues() {
         let input_queue = InputQueue::new();
         let active_turn = Mutex::new(Some(ActiveTurn::default()));
@@ -787,6 +795,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Hold the contested owner to assert cancellation, admission, or cleanup behavior under contention"
+    )]
     async fn task_start_transfer_preserves_queues_on_cancellation_and_rejects_stale_turns() {
         let input_queue = InputQueue::new();
         let turn = ActiveTurn::default();
@@ -865,6 +877,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Hold the contested owner to assert cancellation, admission, or cleanup behavior under contention"
+    )]
     async fn cancelled_turn_recovery_preserves_input_and_retry_moves_it_once() {
         let input_queue = InputQueue::new();
         let turn_state = Mutex::new(TurnState::default());

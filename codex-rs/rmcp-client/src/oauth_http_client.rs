@@ -16,7 +16,7 @@ use rmcp::transport::auth::OAuthHttpClientFuture;
 use rmcp::transport::auth::OAuthHttpRedirectPolicy;
 use rmcp::transport::auth::OAuthHttpRequest;
 
-const MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 static NEXT_OAUTH_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
@@ -90,12 +90,12 @@ impl OAuthHttpClientAdapter {
             stream_response: !self.buffered_responses,
         };
         let (response, body) = if self.buffered_responses {
-            let response = self
+            let mut response = self
                 .http_client
                 .http_request(params)
                 .await
                 .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
-            let body = response.body.clone().into_inner();
+            let body = std::mem::replace(&mut response.body, Vec::new().into()).into_inner();
             (response, body)
         } else {
             let (response, mut body_stream) = self

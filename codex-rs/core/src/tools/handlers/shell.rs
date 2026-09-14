@@ -766,7 +766,10 @@ async fn run_exec_like_with_exit_code_inner(
     let event_tracker = track_command_mutations.then_some(&tracker);
     let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker)
         .with_call_source(&tool_call_source);
-    emitter.begin(event_ctx).await;
+    emitter
+        .begin(event_ctx)
+        .await
+        .map_err(|error| FunctionCallError::Fatal(error.to_string()))?;
 
     // This is a preliminary resolution used only for the policy compatibility check. The runtime
     // re-proves the inspectable safety projection against its final cwd and child environment

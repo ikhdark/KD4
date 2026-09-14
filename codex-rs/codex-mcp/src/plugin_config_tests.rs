@@ -423,3 +423,25 @@ fn local_environment_placement_rejects_remote_env_vars() {
         }
     );
 }
+
+#[test]
+fn malformed_oauth_is_reported_without_losing_valid_siblings() {
+    let outcome = parse_plugin_mcp_config(
+        &plugin_root(),
+        r#"{
+        "valid": {"url": "https://example.com/mcp"},
+        "invalid": {"url": "https://example.com/mcp", "oauth": "invalid"}
+    }"#,
+    )
+    .expect("parse document");
+    assert_eq!(
+        outcome
+            .servers
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["valid"]
+    );
+    assert_eq!(outcome.errors.len(), 1);
+    assert_eq!(outcome.errors[0].name, "invalid");
+}

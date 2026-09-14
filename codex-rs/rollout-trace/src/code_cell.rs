@@ -98,21 +98,31 @@ impl CodeCellTraceContext {
     /// Records the first response returned by the public code-mode `exec` tool.
     ///
     /// A yielded response returns control to the model while the cell keeps
-    /// running. Terminal initial responses should be followed by `record_ended`
-    /// by the caller so the reducer can distinguish model-visible output from
-    /// runtime completion.
-    pub fn record_initial_response(&self, response: &RuntimeResponse) {
+    /// running. When this response also ended the live runtime, record both
+    /// lifecycle events using the same captured payload.
+    pub fn record_initial_response(&self, response: &RuntimeResponse, runtime_ended: bool) {
         let CodeCellTraceContextState::Enabled(context) = &self.state else {
             return;
         };
+        let response_payload = code_cell_response_payload(context, response);
         append_with_context_best_effort(
             context,
             RawTraceEventPayload::CodeCellInitialResponse {
                 runtime_cell_id: context.runtime_cell_id.clone(),
                 status: code_cell_status_for_runtime_response(response),
-                response_payload: code_cell_response_payload(context, response),
+                response_payload: response_payload.clone(),
             },
         );
+        if runtime_ended {
+            append_with_context_best_effort(
+                context,
+                RawTraceEventPayload::CodeCellEnded {
+                    runtime_cell_id: context.runtime_cell_id.clone(),
+                    status: code_cell_status_for_runtime_response(response),
+                    response_payload,
+                },
+            );
+        }
     }
 
     /// Records the terminal lifecycle point for a code-mode runtime cell.

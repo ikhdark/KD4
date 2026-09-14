@@ -43,7 +43,7 @@ impl CliConfigOverrides {
     }
 
     /// Parse the raw strings captured from the CLI into a list of `(path,
-    /// value)` tuples where `value` is a `serde_json::Value`.
+    /// value)` tuples where `value` is a `toml::Value`.
     pub fn parse_overrides(&self) -> Result<Vec<(String, Value)>, String> {
         self.raw_overrides
             .iter()
@@ -69,11 +69,7 @@ impl CliConfigOverrides {
                 // `-c model=o3` without the quotes.
                 let value: Value = match parse_toml_value(value_str) {
                     Ok(v) => v,
-                    Err(_) => {
-                        // Strip leading/trailing quotes if present
-                        let trimmed = value_str.trim().trim_matches(|c| c == '"' || c == '\'');
-                        Value::String(trimmed.to_string())
-                    }
+                    Err(_) => Value::String(value_str.to_string()),
                 };
 
                 Ok((canonicalize_override_key(key), value))
@@ -89,6 +85,9 @@ fn canonicalize_override_key(key: &str) -> String {
 fn parse_toml_value(raw: &str) -> Result<Value, toml::de::Error> {
     let wrapped = format!("_x_ = {raw}");
     let table: toml::Table = toml::from_str(&wrapped)?;
+    if table.len() != 1 {
+        return Err(SerdeError::custom("expected a single TOML value"));
+    }
     table
         .get("_x_")
         .cloned()
@@ -122,8 +121,27 @@ mod tests {
     #[test]
     fn parses_array() {
         let v = parse_toml_value("[1, 2, 3]").expect("parse");
-        let arr = v.as_array().expect("array");
-        assert_eq!(arr.len(), 3);
+        assert_eq!(v, Value::Array(vec![1.into(), 2.into(), 3.into()]));
+    }
+
+    #[test]
+    fn cli_overrides_preserve_invalid_literals_and_decode_valid_strings() {
+        for (raw, expected) in [
+            ("'unfinished", "'unfinished"),
+            ("\"unfinished", "\"unfinished"),
+            ("42\nignored = 7", "42\nignored = 7"),
+            ("42\n[ignored]\nx = 7", "42\n[ignored]\nx = 7"),
+            ("'quoted'", "quoted"),
+            ("\"\"\"first\nsecond\"\"\"", "first\nsecond"),
+        ] {
+            let overrides =
+                CliConfigOverrides::try_parse_from(["codex", "-c", &format!("value={raw}")])
+                    .expect("CLI override");
+            assert_eq!(
+                overrides.parse_overrides().expect("parse"),
+                vec![("value".to_string(), Value::String(expected.to_string()))]
+            );
+        }
     }
 
     #[test]

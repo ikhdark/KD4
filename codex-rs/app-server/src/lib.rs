@@ -877,6 +877,7 @@ pub async fn run_main(
                 }
 
                 tokio::select! {
+                    _ = transport_shutdown_token.cancelled() => break "outbound_delivery_failed",
                     shutdown_signal_result = shutdown_signal(), if graceful_signal_restart_enabled && !shutdown_state.forced() => {
                         let signal = match shutdown_signal_result {
                             Ok(signal) => signal,
@@ -905,14 +906,15 @@ pub async fn run_main(
                                 disconnect_sender,
                             } => {
                                 let outbound_initialized = Arc::new(AtomicBool::new(false));
+                                let outbound_experimental_api_enabled = Arc::new(AtomicBool::new(false));
                                 initialize_notification_sender
-                                    .connection_opened(
+                                    .connection_opened_with_runtime(
                                         connection_id,
                                         Arc::clone(&outbound_initialized),
+                                        Arc::clone(&outbound_experimental_api_enabled),
+                                        disconnect_sender.clone().unwrap_or_else(|| transport_shutdown_token.clone()),
                                     )
                                     .await;
-                                let outbound_experimental_api_enabled =
-                                    Arc::new(AtomicBool::new(false));
                                 let outbound_opted_out_notification_methods = Arc::new(
                                     transport::OutboundNotificationOptOuts::new(HashSet::new()),
                                 );
@@ -983,27 +985,29 @@ pub async fn run_main(
                                                 Arc::clone(&connection_state.session),
                                             )
                                             .await;
-                                        let opted_out_notification_methods_snapshot = connection_state
-                                            .session
-                                            .opted_out_notification_methods();
-                                        let experimental_api_enabled =
-                                            connection_state.session.experimental_api_enabled();
                                         let is_initialized = connection_state.session.initialized();
-                                        if !connection_state
-                                            .outbound_opted_out_notification_methods
-                                            .replace(opted_out_notification_methods_snapshot)
-                                        {
-                                            warn!(
-                                                "failed to update outbound opted-out notifications"
-                                            );
-                                        }
-                                        connection_state
-                                            .outbound_experimental_api_enabled
-                                            .store(
-                                                experimental_api_enabled,
-                                                std::sync::atomic::Ordering::Release,
-                                            );
                                         if !was_initialized && is_initialized {
+                                            let opted_out_notification_methods_snapshot = connection_state
+                                                .session
+                                                .opted_out_notification_methods();
+                                            let experimental_api_enabled =
+                                                connection_state.session.experimental_api_enabled();
+
+                                            if !connection_state
+                                                .outbound_opted_out_notification_methods
+                                                .replace(opted_out_notification_methods_snapshot)
+                                            {
+                                                warn!(
+                                                    "failed to update outbound opted-out notifications"
+                                                );
+                                            }
+                                            connection_state
+                                                .outbound_experimental_api_enabled
+                                                .store(
+                                                    experimental_api_enabled,
+                                                    std::sync::atomic::Ordering::Release,
+                                                );
+
                                             processor
                                                 .initialize_processor
                                                 .send_initialize_notifications_to_connection(

@@ -175,19 +175,6 @@ impl App {
         };
 
         let replacing_goal = matches!(mode, ThreadGoalSetMode::ReplaceExisting);
-        if replacing_goal {
-            let result = app_server.thread_goal_clear(thread_id).await;
-
-            if let Err(err) = result {
-                cleanup_materialized_goal_files(app_server, output_dir).await;
-                if self.current_displayed_thread_id() != Some(thread_id) {
-                    return;
-                }
-                self.chat_widget
-                    .add_error_message(thread_goal_error_message("replace", &err));
-                return;
-            }
-        }
 
         let (status, token_budget) = match mode {
             ThreadGoalSetMode::ConfirmIfExists | ThreadGoalSetMode::ReplaceExisting => {
@@ -200,7 +187,13 @@ impl App {
         };
 
         let result = app_server
-            .thread_goal_set(thread_id, Some(objective), Some(status), token_budget)
+            .thread_goal_set(
+                thread_id,
+                Some(objective),
+                Some(status),
+                token_budget,
+                replacing_goal,
+            )
             .await;
 
         match result {
@@ -215,7 +208,13 @@ impl App {
                 self.chat_widget.maybe_send_next_queued_input();
             }
             Err(err) => {
-                cleanup_materialized_goal_files(app_server, output_dir).await;
+                // A transport or internal error may arrive after the goal committed. Keep
+                // its attachments unless the server explicitly rejected the request.
+                if goal_set_was_rejected(&err) {
+                    cleanup_materialized_goal_files(app_server, output_dir).await;
+                } else if let Some(output_dir) = output_dir {
+                    tracing::warn!(%output_dir, "retaining goal files after an uncertain goal save");
+                }
                 if self.current_displayed_thread_id() != Some(thread_id) {
                     return;
                 }
@@ -238,6 +237,7 @@ impl App {
                 /*objective*/ None,
                 Some(status),
                 /*token_budget*/ None,
+                /*replace*/ false,
             )
             .await;
         if self.current_displayed_thread_id() != Some(thread_id) {
@@ -334,6 +334,14 @@ impl App {
     }
 }
 
+fn goal_set_was_rejected(error: &color_eyre::Report) -> bool {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<codex_app_server_client::TypedRequestError>())
+        .and_then(codex_app_server_client::TypedRequestError::server_error)
+        .is_some_and(|error| matches!(error.code, -32602..=-32600))
+}
+
 async fn cleanup_materialized_goal_files(
     app_server: &mut AppServerSession,
     output_dir: Option<goal_files::GoalFilePath>,
@@ -381,6 +389,31 @@ mod tests {
     use ratatui::layout::Rect;
 
     use super::*;
+
+    #[test]
+    fn uncertain_goal_save_errors_must_retain_attachments() {
+        for (code, rejected) in [
+            (-32600, true),
+            (-32601, true),
+            (-32602, true),
+            (-32603, false),
+        ] {
+            let error =
+                color_eyre::Report::new(codex_app_server_client::TypedRequestError::Server {
+                    method: "thread/goal/set".to_string(),
+                    source: codex_app_server_protocol::JSONRPCErrorError {
+                        code,
+                        message: "failure".to_string(),
+                        data: None,
+                    },
+                })
+                .wrap_err("goal save failed");
+            assert_eq!(goal_set_was_rejected(&error), rejected);
+        }
+        assert!(!goal_set_was_rejected(&color_eyre::eyre::eyre!(
+            "connection lost"
+        )));
+    }
 
     #[test]
     fn thread_goal_error_message_explains_temporary_session() {

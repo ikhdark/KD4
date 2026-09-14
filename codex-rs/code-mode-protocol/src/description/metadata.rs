@@ -4,7 +4,6 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 
 use super::schema_ts::render_json_schema_to_typescript;
-use crate::PUBLIC_TOOL_NAME;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,7 +51,7 @@ pub fn normalize_code_mode_identifier(tool_key: &str) -> String {
 }
 
 pub fn augment_tool_definition(mut definition: ToolDefinition) -> ToolDefinition {
-    if definition.name != PUBLIC_TOOL_NAME {
+    if is_code_mode_nested_tool(&definition.name) {
         definition.description = render_code_mode_sample_for_definition(&definition);
     }
     definition

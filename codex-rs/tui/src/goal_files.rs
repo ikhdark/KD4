@@ -40,10 +40,26 @@ pub(crate) async fn materialize_goal_draft(
     }
     let text_elements = draft.text_elements;
     if !draft.pending_pastes.is_empty() {
+        // Preserve the expansion's placeholder ordering and matching semantics,
+        // but replace each payload with only its whitespace/non-whitespace signal.
+        let validation_pastes = draft
+            .pending_pastes
+            .iter()
+            .map(|(placeholder, text)| {
+                (
+                    placeholder.clone(),
+                    if text.trim().is_empty() {
+                        String::new()
+                    } else {
+                        "x".to_string()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
         let (expanded_objective, _) = ChatComposer::expand_pending_pastes(
             &objective,
             text_elements.clone(),
-            &draft.pending_pastes,
+            &validation_pastes,
         );
         if expanded_objective.trim().is_empty() {
             bail!("Goal objective must not be empty.");

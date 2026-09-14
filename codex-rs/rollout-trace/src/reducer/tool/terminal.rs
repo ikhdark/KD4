@@ -61,6 +61,9 @@ impl TraceReducer {
                 invocation_payload.raw_payload_id
             )
         })?;
+        let Some(request) = request else {
+            return Ok(None);
+        };
         self.insert_terminal_operation(TerminalOperationStart {
             seq,
             wall_time_unix_ms,
@@ -95,6 +98,51 @@ impl TraceReducer {
                 )
             })?;
         let request = parse_protocol_terminal_request(payload, &operation_kind);
+        if let Some(operation_id) = self.rollout.tool_calls[tool_call_id]
+            .terminal_operation_id
+            .clone()
+        {
+            let operation = self
+                .rollout
+                .terminal_operations
+                .get_mut(&operation_id)
+                .context("runtime start referenced missing terminal operation")?;
+            if operation.kind != operation_kind {
+                bail!("terminal operation {operation_id} changed kind");
+            }
+            match (&operation.terminal_id, &request.terminal_id) {
+                (Some(existing), Some(incoming)) if existing != incoming => {
+                    bail!(
+                        "terminal operation {operation_id} changed process id from {existing} to {incoming}"
+                    );
+                }
+                (None, Some(incoming)) => {
+                    operation.terminal_id = Some(incoming.clone());
+                    let started_at = operation.execution.started_at_unix_ms;
+                    let started_seq = operation.execution.started_seq;
+                    self.ensure_terminal_session(
+                        thread_id,
+                        incoming,
+                        &operation_id,
+                        started_at,
+                        started_seq,
+                    )?;
+                }
+                _ => {}
+            }
+            // Dispatch preserves requested stdin and polling options; the
+            // protocol observation supplies runtime evidence for the same operation.
+            push_unique(
+                &mut self
+                    .rollout
+                    .terminal_operations
+                    .get_mut(&operation_id)
+                    .context("terminal operation disappeared")?
+                    .raw_payload_ids,
+                &runtime_payload.raw_payload_id,
+            );
+            return Ok(Some(operation_id));
+        }
         self.insert_terminal_operation(TerminalOperationStart {
             seq,
             wall_time_unix_ms,
@@ -187,6 +235,7 @@ impl TraceReducer {
             let Some(operation) = self.rollout.terminal_operations.get_mut(operation_id) else {
                 bail!("terminal end referenced unknown operation {operation_id}");
             };
+            let had_terminal_id = operation.terminal_id.is_some();
             operation.execution.ended_at_unix_ms = Some(wall_time_unix_ms);
             operation.execution.ended_seq = Some(seq);
             operation.execution.status = status;
@@ -212,7 +261,11 @@ impl TraceReducer {
             }
 
             (
-                operation.terminal_id.clone(),
+                if had_terminal_id {
+                    None
+                } else {
+                    operation.terminal_id.clone()
+                },
                 operation.execution.started_at_unix_ms,
                 operation.execution.started_seq,
             )
@@ -270,7 +323,8 @@ impl TraceReducer {
                 session.thread_id
             );
         }
-        push_unique(&mut session.operation_ids, operation_id);
+        // Called once when an operation first learns its session identity.
+        session.operation_ids.push(operation_id.to_string());
         Ok(())
     }
 
@@ -293,7 +347,18 @@ impl TraceReducer {
         let output_item_ids = tool_call.model_visible_output_item_ids.clone();
 
         if let ToolCallRequester::CodeCell { code_cell_id } = requester {
-            return self.sync_code_cell_terminal_observations(&code_cell_id);
+            let Some(cell) = self.rollout.code_cells.get(&code_cell_id) else {
+                return Ok(());
+            };
+            if cell.output_item_ids.is_empty() {
+                return Ok(());
+            }
+            return self.upsert_terminal_model_observation(
+                &operation_id,
+                vec![cell.source_item_id.clone()],
+                cell.output_item_ids.clone(),
+                TerminalObservationSource::CodeCellOutput,
+            );
         }
         if call_item_ids.is_empty() && output_item_ids.is_empty() {
             return Ok(());
@@ -443,7 +508,7 @@ fn parse_protocol_terminal_request(
     }
 }
 
-fn parse_dispatch_terminal_request(value: JsonValue) -> Result<ParsedTerminalRequest> {
+fn parse_dispatch_terminal_request(value: JsonValue) -> Result<Option<ParsedTerminalRequest>> {
     let payload: DispatchedToolTraceRequestPayload = serde_json::from_value(value)?;
     if payload.tool_name != "write_stdin" {
         bail!(
@@ -461,19 +526,23 @@ fn parse_dispatch_terminal_request(value: JsonValue) -> Result<ParsedTerminalReq
         .payload
         .arguments
         .context("write_stdin dispatch payload omitted function arguments")?;
-    let args: DispatchedWriteStdinArgs = serde_json::from_str(&arguments)
-        .context("parse write_stdin dispatch function arguments")?;
-    let terminal_id = terminal_id_from_json(&args.session_id)
-        .context("write_stdin dispatch payload omitted session_id")?;
+    // Malformed model arguments are a legitimate failed tool invocation.
+    // A malformed recorder wrapper remains an error above.
+    let Ok(args) = serde_json::from_str::<DispatchedWriteStdinArgs>(&arguments) else {
+        return Ok(None);
+    };
+    let Some(terminal_id) = terminal_id_from_json(&args.session_id) else {
+        return Ok(None);
+    };
 
-    Ok(ParsedTerminalRequest {
+    Ok(Some(ParsedTerminalRequest {
         terminal_id: Some(terminal_id),
         request: TerminalRequest::WriteStdin {
             stdin: args.chars,
             yield_time_ms: args.yield_time_ms,
             max_output_tokens: args.max_output_tokens,
         },
-    })
+    }))
 }
 
 fn parse_terminal_response_payload(
@@ -488,7 +557,13 @@ fn parse_terminal_response_payload(
             Ok(parse_protocol_terminal_response(payload))
         }
         TerminalOperationKind::WriteStdin => {
-            match serde_json::from_value::<ExecCommandEndPayload>(value.clone()) {
+            if matches!(
+                value.get("type").and_then(JsonValue::as_str),
+                Some("direct_response" | "code_mode_response" | "error")
+            ) {
+                return parse_dispatch_terminal_response(value);
+            }
+            match ExecCommandEndPayload::deserialize(&value) {
                 Ok(payload) => Ok(parse_protocol_terminal_response(payload)),
                 Err(protocol_err) => parse_dispatch_terminal_response(value).with_context(|| {
                     format!(
@@ -555,7 +630,7 @@ fn parse_dispatch_terminal_response(value: JsonValue) -> Result<ParsedTerminalRe
 }
 
 fn parse_code_mode_exec_result(value: JsonValue) -> TerminalResult {
-    match serde_json::from_value::<CodeModeExecResult>(value.clone()) {
+    match CodeModeExecResult::deserialize(&value) {
         Ok(result) => TerminalResult {
             exit_code: result.exit_code,
             stdout: result.output.clone(),

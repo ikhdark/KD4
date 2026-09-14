@@ -49,6 +49,10 @@ pub type SkillProviderFuture<'a, T> =
 /// Implementations must preserve authority boundaries: a resource listed by a
 /// provider must be read through the same provider/authority rather
 /// than converted into an ambient local path.
+/// Reads must reject foreign authorities and return the exact requested resource identity.
+/// Successful executor catalogs are stable for a selected root for the thread lifetime;
+/// turn IDs and client handles are request context, not executor snapshot invalidators.
+/// Orchestrator catalogs and contents are stable within the MCP client cache generation.
 pub trait SkillProvider: Send + Sync {
     fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog>;
 

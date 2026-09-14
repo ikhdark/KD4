@@ -51,11 +51,13 @@ enum WindowsChildTerminator {
 }
 
 struct PipeChildTerminator {
+    // Also retains admission while the control handle remains owned.
+    #[cfg_attr(not(windows), allow(dead_code))]
     managed: Arc<ManagedRootProcess>,
     #[cfg(windows)]
     windows: WindowsChildTerminator,
     #[cfg(unix)]
-    process_group_id: u32,
+    process_group: Arc<crate::process::ProcessGroupControl>,
 }
 
 impl ChildTerminator for PipeChildTerminator {
@@ -64,7 +66,7 @@ impl ChildTerminator for PipeChildTerminator {
             ProcessSignal::Interrupt => {
                 #[cfg(unix)]
                 {
-                    crate::process_group::interrupt_process_group(self.process_group_id)
+                    self.process_group.signal(signal)
                 }
                 #[cfg(not(unix))]
                 {
@@ -77,7 +79,7 @@ impl ChildTerminator for PipeChildTerminator {
     fn kill(&mut self) -> io::Result<()> {
         #[cfg(unix)]
         {
-            crate::process_group::kill_process_group(self.process_group_id)
+            self.process_group.kill()
         }
         #[cfg(windows)]
         {
@@ -96,10 +98,11 @@ impl ChildTerminator for PipeChildTerminator {
 }
 
 #[cfg(all(test, windows))]
+type DuplicateProcessHandleHook = Box<dyn FnOnce(RawHandle) -> io::Result<OwnedHandle> + Send>;
+
+#[cfg(all(test, windows))]
 thread_local! {
-    static TEST_DUPLICATE_PROCESS_HANDLE: std::cell::RefCell<Option<
-        Box<dyn FnOnce(RawHandle) -> io::Result<OwnedHandle>>
-    >> = std::cell::RefCell::new(None);
+    static TEST_DUPLICATE_PROCESS_HANDLE: std::cell::RefCell<Option<DuplicateProcessHandleHook>> = std::cell::RefCell::new(None);
 }
 
 #[cfg(windows)]
@@ -220,19 +223,27 @@ async fn spawn_process_with_stdin_mode(
     let managed = ManagedRootProcess::reserve_with_reclaim().await?;
 
     #[cfg(windows)]
-    let child = {
-        // CreateProcessW can block inside the Windows loader. Keep that synchronous call off the
-        // async runtime so timers and cancellation continue to make progress. kill_on_drop also
-        // ensures that a child returned after this future times out is terminated when the
-        // detached spawn result is discarded.
+    {
         command.kill_on_drop(true);
-        run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || command.spawn())
-            .await?
-    };
+        let runtime = tokio::runtime::Handle::current();
+        #[cfg(test)]
+        let duplicate = TEST_DUPLICATE_PROCESS_HANDLE.with(|hook| hook.borrow_mut().take());
+        // The non-cancellable native owner retains admission through creation, containment,
+        // handle setup, and waiter installation. An undeliverable session terminates on drop,
+        // while its detached waiter retains admission until the child has been reaped.
+        run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || {
+            let child = command.spawn()?;
+            #[cfg(test)]
+            TEST_DUPLICATE_PROCESS_HANDLE.with(|hook| *hook.borrow_mut() = duplicate);
+            Ok(runtime.block_on(finish_pipe_process_setup(child, managed)))
+        })
+        .await?
+    }
     #[cfg(not(windows))]
-    let child = command.spawn()?;
-
-    finish_pipe_process_setup(child, managed).await
+    {
+        let child = command.spawn()?;
+        finish_pipe_process_setup(child, managed).await
+    }
 }
 
 async fn finish_pipe_process_setup(
@@ -265,9 +276,11 @@ async fn finish_pipe_process_setup(
         WindowsChildTerminator::Job { process }
     };
     #[cfg(unix)]
-    let process_group_id = child
-        .id()
-        .ok_or_else(|| io::Error::other("missing child pid"))?;
+    let process_group = Arc::new(crate::process::ProcessGroupControl::new(
+        child
+            .id()
+            .ok_or_else(|| io::Error::other("missing child pid"))?,
+    ));
 
     let managed = Arc::new(managed);
     let stdin = child.stdin.take();
@@ -324,21 +337,31 @@ async fn finish_pipe_process_setup(
     let wait_exit_status = Arc::clone(&exit_status);
     let exit_code = Arc::new(StdMutex::new(None));
     let wait_exit_code = Arc::clone(&exit_code);
-    #[cfg(windows)]
     let wait_managed = Arc::clone(&managed);
+    #[cfg(unix)]
+    let wait_group = Arc::clone(&process_group);
     let wait_handle: JoinHandle<()> = tokio::spawn(async move {
-        let code = match child.wait().await {
-            Ok(status) => {
-                #[cfg(windows)]
-                if let Err(err) = wait_managed.preserve_descendants() {
-                    log::warn!(
-                        "Windows pipe failed to preserve descendants after root exit: {err}"
-                    );
+        // Keep admission even after request_terminate removes the control handle.
+        let _managed = wait_managed;
+        #[cfg(unix)]
+        wait_group.disarm_after_exit().await;
+        let status = match child.wait().await {
+            Ok(status) => status,
+            Err(error) => {
+                log::warn!("failed to observe pipe exit; retaining child and admission: {error}");
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    if let Ok(Some(status)) = child.try_wait() {
+                        break status;
+                    }
                 }
-                exit_code_from_status(status)
             }
-            Err(_) => -1,
         };
+        #[cfg(windows)]
+        if let Err(err) = _managed.preserve_descendants() {
+            log::warn!("Windows pipe failed to preserve descendants after root exit: {err}");
+        }
+        let code = exit_code_from_status(status);
         publish_exit_status(&wait_exit_status, &wait_exit_code, code);
         let _ = exit_tx.send(code);
     });
@@ -350,7 +373,7 @@ async fn finish_pipe_process_setup(
             #[cfg(windows)]
             windows: windows_terminator,
             #[cfg(unix)]
-            process_group_id,
+            process_group,
         }),
         reader_handle,
         reader_abort_handles,

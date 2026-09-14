@@ -14,6 +14,7 @@ pub(crate) fn fuzzy_match(haystack: &str, needle: &str) -> Option<(Vec<usize>, i
     let lowered_needle: Vec<char> = needle.to_lowercase().chars().collect();
     let mut indices: Vec<usize> = Vec::with_capacity(lowered_needle.len());
     let mut last_lower_position = None;
+    let mut first_lower_position = None;
     let mut cursor = 0usize;
     for needle_character in lowered_needle.iter().copied() {
         let mut found_at = None;
@@ -26,26 +27,18 @@ pub(crate) fn fuzzy_match(haystack: &str, needle: &str) -> Option<(Vec<usize>, i
             cursor += 1;
         }
         let position = found_at?;
+        first_lower_position.get_or_insert(position);
         indices.push(lowered_to_original[position]);
         last_lower_position = Some(position);
     }
 
-    let first_lower_position = if indices.is_empty() {
-        0
-    } else {
-        let first_original_index = indices[0];
-        lowered_to_original
-            .iter()
-            .position(|index| *index == first_original_index)
-            .unwrap_or(0)
-    };
+    let first_lower_position = first_lower_position.unwrap_or(0);
     let last_lower_position = last_lower_position.unwrap_or(first_lower_position);
     let score = subsequence_score(
         first_lower_position,
         last_lower_position,
         lowered_needle.len(),
     );
-    indices.sort_unstable();
     indices.dedup();
     Some((indices, score))
 }
@@ -70,6 +63,8 @@ mod tests {
     #[test]
     fn preserves_original_unicode_indices() {
         assert_eq!(fuzzy_match("İstanbul", "is"), Some((vec![0, 1], -99)));
+        assert_eq!(fuzzy_match("İ", "\u{307}"), Some((vec![0], 0)));
+        assert_eq!(fuzzy_match("İ", "i\u{307}"), Some((vec![0], -100)));
     }
 
     #[test]

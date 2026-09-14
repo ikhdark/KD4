@@ -103,6 +103,10 @@ impl ExecServerHandler {
         }
     }
 
+    pub(crate) fn is_initialized(&self) -> bool {
+        self.initialized.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn is_session_attached(&self) -> bool {
         self.session()
             .is_none_or(|session| session.is_session_attached())

@@ -41,7 +41,7 @@ pub(crate) struct CommandShell {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConfiguredHandler {
     pub event_name: codex_protocol::protocol::HookEventName,
-    pub matcher: Option<String>,
+    pub matcher: Option<crate::events::common::HookMatcher>,
     pub command: String,
     pub timeout_sec: u64,
     pub status_message: Option<String>,

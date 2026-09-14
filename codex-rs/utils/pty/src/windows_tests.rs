@@ -6,6 +6,7 @@ use crate::TerminalSize;
 use crate::spawn_pipe_process_no_stdin;
 use crate::spawn_pty_process;
 use std::collections::HashMap;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::time::Duration;
 
@@ -102,13 +103,11 @@ async fn assert_terminate_kills_descendant(
             .as_nanos()
     ));
     let child_code = format!(
-        "import pathlib,time; print('{READY_MARKER}',flush=True); time.sleep(1); pathlib.Path(bytes.fromhex('{}').decode()).write_text('survived')",
+        "import os,pathlib,time; pathlib.Path(bytes.fromhex('{}').decode()).write_text(str(os.getpid())); print('{READY_MARKER}',flush=True); time.sleep(60)",
         utf8_hex(&marker.to_string_lossy())
     );
-    // Exercise descendants created after the best-effort pipe assignment,
-    // without making the test depend on winning the intentionally accepted race.
     let code = format!(
-        "import subprocess,sys,time; time.sleep(0.5); code=bytes.fromhex('{}').decode(); subprocess.Popen([sys.executable,'-u','-c',code]); time.sleep(60)",
+        "import subprocess,sys,time; code=bytes.fromhex('{}').decode(); subprocess.Popen([sys.executable,'-u','-c',code]); time.sleep(60)",
         utf8_hex(&child_code)
     );
     let args = vec!["-u".to_string(), "-c".to_string(), code];
@@ -127,18 +126,24 @@ async fn assert_terminate_kills_descendant(
     };
     let (session, mut output_rx, exit_rx) = combine_spawned_output(spawned);
     wait_for_output_contains(&mut output_rx, READY_MARKER, /*timeout_ms*/ 10_000).await?;
+    let descendant = ObservedDescendant::open(std::fs::read_to_string(&marker)?.parse()?)?;
+    assert!(
+        !descendant.has_exited(),
+        "descendant must be live before termination"
+    );
     session.request_terminate()?;
     let (_, exit_code) = collect_output_until_exit(output_rx, exit_rx, /*timeout_ms*/ 10_000).await;
     assert_ne!(
         exit_code, -1,
         "{backend} root did not exit after termination"
     );
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let survived = marker.exists();
-    if survived {
-        std::fs::remove_file(&marker)?;
-    }
-    assert!(!survived, "{backend} descendant survived termination");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !descendant.has_exited() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    std::fs::remove_file(marker)?;
     Ok(())
 }
 
@@ -156,9 +161,11 @@ async fn assert_normal_exit_preserves_descendant(
     ));
     let ready_marker = marker_base.with_extension("ready");
     let survival_marker = marker_base.with_extension("survived");
+    let release_marker = marker_base.with_extension("release");
     let child_code = format!(
-        "import pathlib,time; pathlib.Path(bytes.fromhex('{}').decode()).write_text('ready'); time.sleep(1); pathlib.Path(bytes.fromhex('{}').decode()).write_text('survived')",
+        "import os,pathlib,time; pathlib.Path(bytes.fromhex('{}').decode()).write_text(str(os.getpid())); release=pathlib.Path(bytes.fromhex('{}').decode()); deadline=time.time()+20\nwhile not release.exists() and time.time()<deadline: time.sleep(.01)\nif release.exists(): pathlib.Path(bytes.fromhex('{}').decode()).write_text('survived')",
         utf8_hex(&ready_marker.to_string_lossy()),
+        utf8_hex(&release_marker.to_string_lossy()),
         utf8_hex(&survival_marker.to_string_lossy())
     );
     let code = format!(
@@ -183,11 +190,14 @@ async fn assert_normal_exit_preserves_descendant(
     let (session, output_rx, exit_rx) = combine_spawned_output(spawned);
     let (_, exit_code) = collect_output_until_exit(output_rx, exit_rx, /*timeout_ms*/ 10_000).await;
     assert_eq!(exit_code, 0, "{backend} root did not exit normally");
+    let _descendant = ObservedDescendant::open(std::fs::read_to_string(&ready_marker)?.parse()?)?;
     drop(session);
+    std::fs::write(&release_marker, "continue after session drop")?;
 
     let survived = wait_for_path(&survival_marker, Duration::from_secs(10)).await;
     let _ = std::fs::remove_file(ready_marker);
     let _ = std::fs::remove_file(survival_marker);
+    let _ = std::fs::remove_file(release_marker);
     assert!(survived, "{backend} descendant did not survive normal exit");
     Ok(())
 }
@@ -374,5 +384,41 @@ fn required_process_test_prerequisites_report_unverified_coverage() {
                  {prerequisite} is unavailable for `job_object_probe`"
             )
         );
+    }
+}
+
+struct ObservedDescendant(OwnedHandle);
+impl ObservedDescendant {
+    fn open(pid: u32) -> std::io::Result<Self> {
+        // SAFETY: OpenProcess returns a new owned handle for observation and panic cleanup.
+        let raw = unsafe {
+            winapi::um::processthreadsapi::OpenProcess(
+                winapi::um::winnt::SYNCHRONIZE | winapi::um::winnt::PROCESS_TERMINATE,
+                0,
+                pid,
+            )
+        };
+        if raw.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self(unsafe { OwnedHandle::from_raw_handle(raw.cast()) }))
+    }
+    fn has_exited(&self) -> bool {
+        // SAFETY: the owned handle has SYNCHRONIZE access.
+        unsafe {
+            winapi::um::synchapi::WaitForSingleObject(self.0.as_raw_handle().cast(), 0)
+                == winapi::um::winbase::WAIT_OBJECT_0
+        }
+    }
+}
+impl Drop for ObservedDescendant {
+    fn drop(&mut self) {
+        if !self.has_exited() {
+            // SAFETY: the owned handle has terminate and synchronize access.
+            unsafe {
+                winapi::um::processthreadsapi::TerminateProcess(self.0.as_raw_handle().cast(), 1);
+                winapi::um::synchapi::WaitForSingleObject(self.0.as_raw_handle().cast(), 5_000);
+            }
+        }
     }
 }

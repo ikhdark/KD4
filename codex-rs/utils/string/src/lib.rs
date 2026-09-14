@@ -70,10 +70,12 @@ pub fn normalize_markdown_hash_location_suffix(suffix: &str) -> Option<String> {
 
 fn parse_markdown_hash_location_point(point: &str) -> Option<(&str, Option<&str>)> {
     let point = point.strip_prefix('L')?;
-    match point.split_once('C') {
-        Some((line, column)) => Some((line, Some(column))),
-        None => Some((point, None)),
-    }
+    let (line, column) = match point.split_once('C') {
+        Some((line, column)) => (line, Some(column)),
+        None => (point, None),
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    (digits(line) && column.is_none_or(digits)).then_some((line, column))
 }
 
 #[cfg(test)]
@@ -115,5 +117,18 @@ mod tests {
             normalize_markdown_hash_location_suffix("#L74C3-L76C9"),
             Some(":74:3-76:9".to_string())
         );
+    }
+
+    #[test]
+    fn normalize_markdown_hash_location_suffix_rejects_malformed_components() {
+        for suffix in [
+            "#L", "#Labc", "#L2C", "#LC3", "#L２", "#L2C٣", "#L1-L", "#L1C2C3",
+        ] {
+            assert_eq!(
+                normalize_markdown_hash_location_suffix(suffix),
+                None,
+                "{suffix}"
+            );
+        }
     }
 }

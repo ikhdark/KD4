@@ -677,7 +677,10 @@ async fn run_owned_patch(
             &tool_ctx.call_id,
             tracker.as_ref(),
         );
-        emitter.begin(event_ctx).await;
+        emitter
+            .begin(event_ctx)
+            .await
+            .map_err(|error| FunctionCallError::Fatal(error.to_string()))?;
         let mut orchestrator = ToolOrchestrator::new();
         let mut runtime = ApplyPatchRuntime::new();
         let mutation_in_progress = runtime.mutation_in_progress();

@@ -176,6 +176,9 @@ async fn save_remote_plugin_share_with_client(
     } else {
         remote_plugin_service_url(config, &["public", "plugins", "workspace"])?
     };
+    let share_targets = access_policy.share_targets;
+    let share_targets =
+        ensure_unlisted_workspace_target(auth, access_policy.discoverability, share_targets)?;
     let plugin_path_for_archive = plugin_path.as_path().to_path_buf();
     let (filename, archive_bytes) = tokio::task::spawn_blocking(move || {
         let filename = archive_filename(&plugin_path_for_archive)?;
@@ -197,9 +200,6 @@ async fn save_remote_plugin_share_with_client(
         .etag
         .ok_or(RemotePluginCatalogError::MissingUploadEtag)?;
     put_workspace_plugin_upload(client, &upload.upload_url, archive_bytes).await?;
-    let share_targets = access_policy.share_targets;
-    let share_targets =
-        ensure_unlisted_workspace_target(auth, access_policy.discoverability, share_targets)?;
     let response = finalize_workspace_plugin_upload(
         client,
         auth,
@@ -218,15 +218,15 @@ async fn save_remote_plugin_share_with_client(
         ));
     }
 
-    if let Err(err) = local_paths::record_plugin_share_local_path(
-        codex_home,
-        &response.plugin_id,
-        plugin_path.clone(),
-    ) {
-        warn!(
-            remote_plugin_id = %response.plugin_id,
-            "failed to record plugin share local path mapping: {err}"
-        );
+    let home = codex_home.to_path_buf();
+    let remote_id = response.plugin_id.clone();
+    let local_path = plugin_path.clone();
+    let mapping_result = tokio::task::spawn_blocking(move || {
+        local_paths::record_plugin_share_local_path(&home, &remote_id, local_path)
+    })
+    .await;
+    if let Err(err) = mapping_result.unwrap_or_else(|err| Err(io::Error::other(err))) {
+        warn!(remote_plugin_id = %response.plugin_id, "failed to record plugin share local path mapping: {err}");
     }
 
     Ok(RemotePluginShareSaveResult {
@@ -257,12 +257,28 @@ pub async fn list_remote_plugin_shares(
     .into_iter()
     .map(|plugin| (plugin.plugin.id.clone(), plugin))
     .collect::<BTreeMap<_, _>>();
-    let local_plugin_paths =
-        local_paths::load_plugin_share_local_paths(codex_home).map_err(|err| {
-            RemotePluginCatalogError::UnexpectedResponse(format!(
-                "failed to load plugin share local path mapping: {err}"
-            ))
-        })?;
+    let home = codex_home.to_path_buf();
+    let local_plugin_paths = tokio::task::spawn_blocking(move || {
+        match local_paths::load_plugin_share_local_paths(&home) {
+            Ok(paths) => Ok(paths),
+            Err(err) if err.kind() == io::ErrorKind::InvalidData => {
+                warn!("ignoring malformed plugin share local path mapping: {err}");
+                Ok(BTreeMap::new())
+            }
+            Err(err) => Err(err),
+        }
+    })
+    .await
+    .map_err(|err| {
+        RemotePluginCatalogError::UnexpectedResponse(format!(
+            "failed to join plugin share mapping read: {err}"
+        ))
+    })?
+    .map_err(|err| {
+        RemotePluginCatalogError::UnexpectedResponse(format!(
+            "failed to load plugin share local path mapping: {err}"
+        ))
+    })?;
 
     created_plugins
         .into_iter()
@@ -292,20 +308,28 @@ pub fn load_plugin_share_remote_ids_by_local_path(
     codex_home: &Path,
 ) -> io::Result<BTreeMap<AbsolutePathBuf, String>> {
     let local_paths = local_paths::load_plugin_share_local_paths(codex_home)?;
-    local_paths
-        .into_iter()
-        .map(|(remote_plugin_id, local_plugin_path)| {
-            if !is_valid_remote_plugin_id(&remote_plugin_id) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "invalid remote plugin id in share local path mapping: {remote_plugin_id}"
-                    ),
-                ));
-            }
-            Ok((local_plugin_path, remote_plugin_id))
-        })
-        .collect()
+    let mut remote_ids = BTreeMap::new();
+    for (remote_plugin_id, local_plugin_path) in local_paths {
+        if !is_valid_remote_plugin_id(&remote_plugin_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid remote plugin id in share local path mapping: {remote_plugin_id}"),
+            ));
+        }
+        if remote_ids
+            .insert(local_plugin_path.clone(), remote_plugin_id)
+            .is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "multiple remote plugins map to local path {}",
+                    local_plugin_path.display()
+                ),
+            ));
+        }
+    }
+    Ok(remote_ids)
 }
 
 pub async fn delete_remote_plugin_share(
@@ -322,7 +346,13 @@ pub async fn delete_remote_plugin_share(
     let client = &config.http_clients;
     let request = authenticated_request(client.delete(&url), auth)?;
     send_and_expect_status(request, &url, &[StatusCode::NO_CONTENT]).await?;
-    if let Err(err) = local_paths::remove_plugin_share_local_path(codex_home, remote_plugin_id) {
+    let home = codex_home.to_path_buf();
+    let remote_id = remote_plugin_id.to_string();
+    let mapping_result = tokio::task::spawn_blocking(move || {
+        local_paths::remove_plugin_share_local_path(&home, &remote_id)
+    })
+    .await;
+    if let Err(err) = mapping_result.unwrap_or_else(|err| Err(io::Error::other(err))) {
         warn!(
             remote_plugin_id = %remote_plugin_id,
             "failed to remove plugin share local path mapping: {err}"

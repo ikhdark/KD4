@@ -34,6 +34,13 @@ pub trait AuthProvider: Send + Sync {
     /// used by telemetry and non-HTTP request paths.
     fn add_auth_headers(&self, headers: &mut HeaderMap);
 
+    /// Adds headers for dispatch, rejecting unavailable or malformed credentials.
+    /// Telemetry may still use the infallible projection above.
+    fn try_add_auth_headers(&self, headers: &mut HeaderMap) -> Result<(), AuthError> {
+        self.add_auth_headers(headers);
+        Ok(())
+    }
+
     /// Returns any auth headers that are available without request body access.
     fn to_auth_headers(&self) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -55,7 +62,7 @@ pub trait AuthProvider: Send + Sync {
     fn apply_auth(&self, request: Request) -> AuthProviderFuture<'_> {
         Box::pin(async move {
             let mut request = request;
-            self.add_auth_headers(&mut request.headers);
+            self.try_add_auth_headers(&mut request.headers)?;
             Ok(request)
         })
     }
@@ -79,6 +86,9 @@ pub struct AuthHeaderTelemetry {
     pub name: Option<&'static str>,
 }
 
+/// Reports authorization headers available from `add_auth_headers` only.
+/// This does not attest to authentication on the sent request: `apply_auth` may
+/// attach credentials later or replace the request entirely.
 pub fn auth_header_telemetry(auth: &dyn AuthProvider) -> AuthHeaderTelemetry {
     let mut headers = HeaderMap::new();
     auth.add_auth_headers(&mut headers);

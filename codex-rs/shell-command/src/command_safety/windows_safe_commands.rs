@@ -1,5 +1,6 @@
 use crate::command_safety::is_safe_command::is_exact_version_probe;
 use crate::command_safety::is_safe_command::is_safe_git_command;
+use crate::command_safety::is_safe_command::is_safe_ripgrep;
 use crate::command_safety::is_trusted_powershell_host;
 use crate::command_safety::powershell_parser::PowershellInvocation;
 use crate::command_safety::powershell_parser::PowershellParseAnalysis;
@@ -25,18 +26,18 @@ pub fn is_safe_command_windows(command: &[String]) -> bool {
 /// `pwsh -NoProfile -Command "Get-ChildItem | Measure-Object"` becomes two command sequences.
 fn try_parse_powershell_command_sequence(command: &[String]) -> Option<Vec<Vec<String>>> {
     let (exe, rest) = command.split_first()?;
-    if is_trusted_powershell_host(exe) {
-        let PowershellInvocation::InlineCommand {
-            script,
-            no_profile: true,
-        } = parse_powershell_invocation(rest)
-        else {
-            return None;
-        };
-        parse_powershell_script(exe, script)
-    } else {
-        None
+    let PowershellInvocation::InlineCommand {
+        script,
+        no_profile: true,
+        ..
+    } = parse_powershell_invocation(rest)
+    else {
+        return None;
+    };
+    if !is_trusted_powershell_host(exe) {
+        return None;
     }
+    parse_powershell_script(exe, script)
 }
 
 /// Tokenizes an inline PowerShell script and delegates to the command splitter.
@@ -52,7 +53,7 @@ fn parse_powershell_script(executable: &str, script: &str) -> Option<Vec<Vec<Str
 }
 
 /// Validates that a parsed PowerShell command stays within our read-only safelist.
-/// Everything before this is parsing, and rejecting things that make us feel uncomfortable.
+/// The words must come from the restricted AST parser; argument text is literal data.
 pub(crate) fn is_safe_powershell_words(words: &[String]) -> bool {
     if words.is_empty() {
         // Examples rejected here: "pwsh -Command ''" and "pwsh -Command \"\"".
@@ -61,30 +62,6 @@ pub(crate) fn is_safe_powershell_words(words: &[String]) -> bool {
 
     if is_exact_version_probe(words) {
         return true;
-    }
-
-    // Reject nested unsafe cmdlets inside parentheses or arguments
-    for w in words.iter() {
-        let inner = w
-            .trim_matches(|c| c == '(' || c == ')')
-            .trim_start_matches('-')
-            .to_ascii_lowercase();
-        if matches!(
-            inner.as_str(),
-            "set-content"
-                | "add-content"
-                | "out-file"
-                | "new-item"
-                | "remove-item"
-                | "move-item"
-                | "copy-item"
-                | "rename-item"
-                | "start-process"
-                | "stop-process"
-        ) {
-            // Examples rejected here: "Write-Output (Set-Content foo6.txt 'abc')" and "Get-Content (New-Item bar.txt)".
-            return false;
-        }
     }
 
     let command = words[0]
@@ -102,7 +79,9 @@ pub(crate) fn is_safe_powershell_words(words: &[String]) -> bool {
         "resolve-path" | "rvpa" => true,
         "select-object" | "select" => true,
         "get-item" => true,
-        "get-command" | "gcm" => true,
+        // Exact-name discovery can import modules. These semantic words do not
+        // preserve enough parameter-binding syntax to prove -ListImported is enabled.
+        "get-command" | "gcm" => false,
         "get-itemproperty" | "gp" => true,
 
         "git" => is_safe_git_command(words),
@@ -121,21 +100,6 @@ pub(crate) fn is_safe_powershell_words(words: &[String]) -> bool {
             false
         }
     }
-}
-
-/// Checks that an `rg` invocation avoids options that can spawn arbitrary executables.
-fn is_safe_ripgrep(words: &[String]) -> bool {
-    const UNSAFE_RIPGREP_OPTIONS_WITH_ARGS: &[&str] = &["--pre", "--hostname-bin"];
-    const UNSAFE_RIPGREP_OPTIONS_WITHOUT_ARGS: &[&str] = &["--search-zip", "-z"];
-
-    !words.iter().skip(1).any(|arg| {
-        let arg_lc = arg.to_ascii_lowercase();
-        // Examples rejected here: "pwsh -Command 'rg --pre cat pattern'" and "pwsh -Command 'rg --search-zip pattern'".
-        UNSAFE_RIPGREP_OPTIONS_WITHOUT_ARGS.contains(&arg_lc.as_str())
-            || UNSAFE_RIPGREP_OPTIONS_WITH_ARGS
-                .iter()
-                .any(|opt| arg_lc == *opt || arg_lc.starts_with(&format!("{opt}=")))
-    })
 }
 
 #[cfg(test)]
@@ -160,6 +124,33 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
         )
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn review_regression_ast_words_keep_literal_arguments_and_native_flags() {
+        for (script, expected) in [
+            ("Get-Content 'remove-item'", true),
+            ("Write-Output 'Start-Process'", true),
+            ("Get-Content (New-Item file.txt)", false),
+            ("rg -nz pattern", false),
+            ("rg -nZ pattern", true),
+            ("rg -e '-z'", true),
+            ("Get-Command unknown-module-command", false),
+            ("Get-Command -ListImported:0 unknown-module-command", false),
+            ("$x = '--pre'; rg $x pattern", false),
+        ] {
+            assert_eq!(
+                is_safe_command_windows(&vec_str(&[
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-Command",
+                    script
+                ])),
+                expected,
+                "{script}"
+            );
+        }
     }
 
     #[test]
@@ -244,10 +235,8 @@ mod tests {
             return;
         };
 
-        for script in [
-            "Get-Command kds",
-            r"Get-ItemProperty -Path HKCU:\Environment -Name Path",
-        ] {
+        {
+            let script = r"Get-ItemProperty -Path HKCU:\Environment -Name Path";
             assert!(
                 is_safe_command_windows(&vec_str(&[
                     powershell.as_str(),
@@ -483,6 +472,7 @@ mod tests {
         assert!(!is_safe_command_windows(&vec_str(&[
             "powershell.exe",
             "-NoLogo",
+            "-NoProfile",
             "-Command",
             "Remove-Item foo.txt",
         ])));
@@ -496,6 +486,7 @@ mod tests {
 
         assert!(!is_safe_command_windows(&vec_str(&[
             "powershell.exe",
+            "-NoProfile",
             "-Command",
             "Set-Content foo.txt 'hello'",
         ])));
@@ -503,16 +494,19 @@ mod tests {
         // Redirections are blocked
         assert!(!is_safe_command_windows(&vec_str(&[
             "powershell.exe",
+            "-NoProfile",
             "-Command",
             "echo hi > out.txt",
         ])));
         assert!(!is_safe_command_windows(&vec_str(&[
             "powershell.exe",
+            "-NoProfile",
             "-Command",
             "Get-Content x | Out-File y",
         ])));
         assert!(!is_safe_command_windows(&vec_str(&[
             "powershell.exe",
+            "-NoProfile",
             "-Command",
             "Write-Output foo 2> err.txt",
         ])));
@@ -520,6 +514,7 @@ mod tests {
         // Call operator is blocked
         assert!(!is_safe_command_windows(&vec_str(&[
             "powershell.exe",
+            "-NoProfile",
             "-Command",
             "& Remove-Item foo",
         ])));
@@ -527,23 +522,27 @@ mod tests {
         // Chained safe + unsafe must fail
         assert!(!is_safe_command_windows(&vec_str(&[
             "powershell.exe",
+            "-NoProfile",
             "-Command",
             "Get-ChildItem; Remove-Item foo",
         ])));
         // Nested unsafe cmdlet inside safe command must fail
         assert!(!is_safe_command_windows(&vec_str(&[
             "powershell.exe",
+            "-NoProfile",
             "-Command",
             "Write-Output (Set-Content foo6.txt 'abc')",
         ])));
         // Additional nested unsafe cmdlet examples must fail
         assert!(!is_safe_command_windows(&vec_str(&[
             "powershell.exe",
+            "-NoProfile",
             "-Command",
             "Write-Host (Remove-Item foo.txt)",
         ])));
         assert!(!is_safe_command_windows(&vec_str(&[
             "powershell.exe",
+            "-NoProfile",
             "-Command",
             "Get-Content (New-Item bar.txt)",
         ])));
@@ -551,6 +550,7 @@ mod tests {
         // Unsafe @ expansion.
         assert!(!is_safe_command_windows(&vec_str(&[
             "powershell.exe",
+            "-NoProfile",
             "-Command",
             "ls @(calc.exe)"
         ])));
@@ -558,6 +558,7 @@ mod tests {
         // Unsupported constructs that the AST parser refuses (no fallback to manual splitting).
         assert!(!is_safe_command_windows(&vec_str(&[
             "powershell.exe",
+            "-NoProfile",
             "-Command",
             "ls && pwd"
         ])));
@@ -565,6 +566,7 @@ mod tests {
         // Sub-expressions are rejected even if they contain otherwise safe commands.
         assert!(!is_safe_command_windows(&vec_str(&[
             "powershell.exe",
+            "-NoProfile",
             "-Command",
             "Write-Output $(Get-Content foo)"
         ])));
@@ -572,6 +574,7 @@ mod tests {
         // Empty words from the parser (e.g. '') are rejected.
         assert!(!is_safe_command_windows(&vec_str(&[
             "powershell.exe",
+            "-NoProfile",
             "-Command",
             "''"
         ])));
@@ -598,12 +601,14 @@ mod tests {
     fn rejects_dynamic_arguments() {
         assert!(!is_safe_command_windows(&vec_str(&[
             "powershell.exe",
+            "-NoProfile",
             "-Command",
             "Get-Content $foo"
         ])));
 
         assert!(!is_safe_command_windows(&vec_str(&[
             "powershell.exe",
+            "-NoProfile",
             "-Command",
             "Write-Output \"foo $bar\""
         ])));

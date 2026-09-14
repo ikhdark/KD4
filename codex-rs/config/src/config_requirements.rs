@@ -876,6 +876,60 @@ pub struct ConfigRequirementsWithSources {
 }
 
 impl ConfigRequirementsWithSources {
+    /// Whether removing source annotations would yield empty requirements.
+    pub fn is_empty(&self) -> bool {
+        self.allowed_approval_policies.is_none()
+            && self.allowed_approvals_reviewers.is_none()
+            && self.allowed_sandbox_modes.is_none()
+            && self.allowed_permission_profiles.is_none()
+            && self.default_permissions.is_none()
+            && self.allowed_web_search_modes.is_none()
+            && self.allow_managed_hooks_only.is_none()
+            && self.allow_appshots.is_none()
+            && self.allow_remote_control.is_none()
+            && self
+                .computer_use
+                .as_deref()
+                .is_none_or(ComputerUseRequirementsToml::is_empty)
+            && self
+                .windows
+                .as_deref()
+                .is_none_or(WindowsRequirementsToml::is_empty)
+            && self
+                .feature_requirements
+                .as_deref()
+                .is_none_or(FeatureRequirementsToml::is_empty)
+            && self
+                .hooks
+                .as_deref()
+                .is_none_or(ManagedHooksRequirementsToml::is_empty)
+            && self.mcp_servers.is_none()
+            && self
+                .plugins
+                .as_deref()
+                .is_none_or(|plugins| plugins.values().all(PluginRequirementsToml::is_empty))
+            && self
+                .marketplaces
+                .as_deref()
+                .is_none_or(MarketplaceRequirementsToml::is_empty)
+            && self
+                .apps
+                .as_deref()
+                .is_none_or(AppsRequirementsToml::is_empty)
+            && self.rules.is_none()
+            && self.enforce_residency.is_none()
+            && self.network.is_none()
+            && self.permissions.is_none()
+            && self
+                .models
+                .as_deref()
+                .is_none_or(ModelsRequirementsToml::is_empty)
+            && self
+                .guardian_policy_config
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+    }
+
     pub fn merge_unset_fields(&mut self, source: RequirementSource, other: ConfigRequirementsToml) {
         // For every field in `other` that is `Some`, if the corresponding field
         // in `self` is `None`, copy the value from `other` into `self`.

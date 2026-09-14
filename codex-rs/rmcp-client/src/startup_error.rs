@@ -29,12 +29,10 @@ fn client_initialize_error_requires_authentication(error: &ClientInitializeError
     error
         .error
         .downcast_ref::<StreamableHttpError<StreamableHttpClientAdapterError>>()
-        .is_some_and(|error| {
-            matches!(
-                error,
-                StreamableHttpError::Auth(auth_error)
-                    if auth_error_requires_authentication(auth_error)
-            )
+        .is_some_and(|error| match error {
+            StreamableHttpError::AuthRequired(_) => true,
+            StreamableHttpError::Auth(error) => auth_error_requires_authentication(error),
+            _ => false,
         })
 }
 
@@ -43,4 +41,36 @@ fn auth_error_requires_authentication(error: &AuthError) -> bool {
         error,
         AuthError::AuthorizationRequired | AuthError::TokenExpired
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::transport::DynamicTransportError;
+    use rmcp::transport::streamable_http_client::AuthRequiredError;
+    use std::any::TypeId;
+
+    #[test]
+    fn initialization_challenge_is_authentication_required_through_context() {
+        let error = ClientInitializeError::TransportError {
+            error: DynamicTransportError::from_parts(
+                "streamable_http",
+                TypeId::of::<()>(),
+                Box::new(
+                    StreamableHttpError::<StreamableHttpClientAdapterError>::AuthRequired(
+                        AuthRequiredError::new(
+                            "Bearer resource_metadata=\"https://example.com/resource\"".to_string(),
+                        ),
+                    ),
+                ),
+            ),
+            context: "send initialize request".into(),
+        };
+        assert!(is_authentication_required_error(
+            &Error::new(error).context("initialize server")
+        ));
+        assert!(!is_authentication_required_error(&anyhow::anyhow!(
+            "HTTP 503"
+        )));
+    }
 }

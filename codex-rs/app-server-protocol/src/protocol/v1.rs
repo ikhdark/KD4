@@ -132,7 +132,7 @@ pub struct ConversationGitInfo {
     pub origin_url: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginApiKeyParams {
     pub api_key: String,
@@ -208,7 +208,7 @@ pub struct ExecOneOffCommandParams {
     pub sandbox_policy: Option<SandboxPolicy>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct GetAuthStatusResponse {
     pub auth_method: Option<AuthMode>,
@@ -245,4 +245,25 @@ pub struct SandboxSettings {
     pub network_access: Option<bool>,
     pub exclude_tmpdir_env_var: Option<bool>,
     pub exclude_slash_tmp: Option<bool>,
+}
+
+impl std::fmt::Debug for LoginApiKeyParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginApiKeyParams")
+            .field("api_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for GetAuthStatusResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GetAuthStatusResponse")
+            .field("auth_method", &self.auth_method)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("requires_openai_auth", &self.requires_openai_auth)
+            .finish()
+    }
 }

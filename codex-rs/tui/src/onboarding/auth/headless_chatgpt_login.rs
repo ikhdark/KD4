@@ -22,8 +22,13 @@ use super::onboarding_request_id;
 
 pub(super) fn start_headless_chatgpt_login(widget: &mut AuthModeWidget) {
     let request_id = Uuid::new_v4().to_string();
-    *widget.sign_in_state.write().unwrap() =
-        SignInState::ChatGptDeviceCode(ContinueWithDeviceCodeState::pending(request_id.clone()));
+    {
+        let mut state = widget.sign_in_state.write().unwrap();
+        *state = SignInState::ChatGptDeviceCode(ContinueWithDeviceCodeState::pending(
+            request_id.clone(),
+        ));
+        *widget.error.write().unwrap() = None;
+    }
     widget.request_frame.schedule_frame();
 
     let request_handle = widget.app_server_request_handle.clone();
@@ -46,6 +51,7 @@ pub(super) fn start_headless_chatgpt_login(widget: &mut AuthModeWidget) {
                 let updated = set_device_code_state_for_active_attempt(
                     &sign_in_state,
                     &request_frame,
+                    &error,
                     &request_id,
                     ContinueWithDeviceCodeState::ready(
                         request_id.clone(),
@@ -54,9 +60,7 @@ pub(super) fn start_headless_chatgpt_login(widget: &mut AuthModeWidget) {
                         user_code,
                     ),
                 );
-                if updated {
-                    *error.write().unwrap() = None;
-                } else {
+                if !updated {
                     cancel_login_attempt(&request_handle, login_id).await;
                 }
             }
@@ -162,6 +166,7 @@ fn device_code_attempt_matches(state: &SignInState, request_id: &str) -> bool {
 fn set_device_code_state_for_active_attempt(
     sign_in_state: &std::sync::Arc<std::sync::RwLock<SignInState>>,
     request_frame: &crate::tui::FrameRequester,
+    error: &std::sync::Arc<std::sync::RwLock<Option<String>>>,
     request_id: &str,
     next_state: ContinueWithDeviceCodeState,
 ) -> bool {
@@ -171,6 +176,7 @@ fn set_device_code_state_for_active_attempt(
     }
 
     *guard = SignInState::ChatGptDeviceCode(next_state);
+    *error.write().unwrap() = None;
     drop(guard);
     request_frame.schedule_frame();
     true
@@ -189,8 +195,8 @@ fn set_device_code_error_for_active_attempt(
     }
 
     *guard = SignInState::PickMode;
-    drop(guard);
     *error.write().unwrap() = Some(message);
+    drop(guard);
     request_frame.schedule_frame();
     true
 }
@@ -226,11 +232,13 @@ mod tests {
     fn set_device_code_state_for_active_attempt_updates_only_when_active() {
         let request_frame = crate::tui::FrameRequester::test_dummy();
         let sign_in_state = pending_device_code_state("request-1");
+        let error = Arc::new(RwLock::new(Some("previous error".to_string())));
 
         assert_eq!(
             set_device_code_state_for_active_attempt(
                 &sign_in_state,
                 &request_frame,
+                &error,
                 "request-1",
                 ContinueWithDeviceCodeState::ready(
                     "request-1".to_string(),
@@ -247,10 +255,13 @@ mod tests {
         ));
 
         let sign_in_state = pending_device_code_state("request-2");
+        assert_eq!(*error.read().unwrap(), None);
+        *error.write().unwrap() = Some("new attempt error".to_string());
         assert_eq!(
             set_device_code_state_for_active_attempt(
                 &sign_in_state,
                 &request_frame,
+                &error,
                 "request-1",
                 ContinueWithDeviceCodeState::ready(
                     "request-1".to_string(),
@@ -265,6 +276,7 @@ mod tests {
             &*sign_in_state.read().unwrap(),
             SignInState::ChatGptDeviceCode(state) if state.login_id.is_none()
         ));
+        assert_eq!(error.read().unwrap().as_deref(), Some("new attempt error"));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Cross-platform async Unix domain socket helpers.
+//! Async Unix domain socket helpers for Windows.
 
 use std::io::Result as IoResult;
 use std::path::Path;
@@ -10,17 +10,16 @@ use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::ReadBuf;
 
-/// Creates `socket_dir` if needed and restricts it to the current user where
-/// the platform exposes Unix permissions.
+/// Creates `socket_dir` if needed. The caller must choose a parent directory
+/// whose Windows access controls provide the required privacy.
 pub async fn prepare_private_socket_directory(socket_dir: impl AsRef<Path>) -> IoResult<()> {
     platform::prepare_private_socket_directory(socket_dir.as_ref()).await
 }
 
-/// Returns whether `socket_path` points at a stale Unix socket rendezvous path.
+/// Returns whether a possible Unix socket rendezvous path exists.
 ///
-/// On Unix this checks the file type. On Windows, `uds_windows` represents the
-/// rendezvous as a regular path, so existence is the only useful stale-path
-/// signal available.
+/// Despite the historical name, this does not establish that the listener is dead
+/// or that the path is safe to remove. Callers must check liveness and ownership.
 pub async fn is_stale_socket_path(socket_path: impl AsRef<Path>) -> IoResult<bool> {
     platform::is_stale_socket_path(socket_path.as_ref()).await
 }

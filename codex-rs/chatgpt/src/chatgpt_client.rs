@@ -10,6 +10,8 @@ use std::time::Duration;
 
 const OAI_PRODUCT_SKU_HEADER: &str = "OAI-Product-Sku";
 const CODEX_PRODUCT_SKU: &str = "codex";
+const CHATGPT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
 
 /// Make a GET request to the ChatGPT backend API.
 pub(crate) async fn chatgpt_get_request<T: DeserializeOwned>(
@@ -23,7 +25,7 @@ pub(crate) async fn chatgpt_get_request<T: DeserializeOwned>(
         auth,
         http_clients,
         path,
-        /*timeout*/ None,
+        Some(CHATGPT_REQUEST_TIMEOUT),
     )
     .await
 }
@@ -55,7 +57,7 @@ pub(crate) async fn chatgpt_get_request_with_timeout<T: DeserializeOwned>(
         request = request.timeout(timeout);
     }
 
-    let response = request.send().await.context("Failed to send request")?;
+    let mut response = request.send().await.context("Failed to send request")?;
 
     if response.status().is_success() {
         let result: T = response
@@ -65,7 +67,23 @@ pub(crate) async fn chatgpt_get_request_with_timeout<T: DeserializeOwned>(
         Ok(result)
     } else {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let mut body = Vec::new();
+        // Stop reading once the diagnostic prefix is full, even if the server
+        // keeps sending data or never finishes its error response.
+        while body.len() < MAX_ERROR_BODY_BYTES {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    let remaining = MAX_ERROR_BODY_BYTES - body.len();
+                    body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        let truncated = body.len() == MAX_ERROR_BODY_BYTES;
+        let mut body = String::from_utf8_lossy(&body).into_owned();
+        if truncated {
+            body.push_str(" [truncated]");
+        }
         anyhow::bail!("Request failed with status {status}: {body}")
     }
 }
@@ -85,6 +103,97 @@ mod tests {
     use wiremock::MockServer;
     use wiremock::ResponseTemplate;
     use wiremock::matchers::method;
+
+    #[tokio::test]
+    async fn error_body_read_stops_at_the_limit_without_waiting_for_eof() {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let base_url = format!("http://{}", listener.local_addr().expect("address"));
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.expect("request header"));
+            }
+            // Advertise another byte, but never send it or close the response.
+            let headers = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\n\r\n",
+                MAX_ERROR_BODY_BYTES + 1
+            );
+            stream.write_all(headers.as_bytes()).await.expect("headers");
+            stream
+                .write_all(&vec![b'x'; MAX_ERROR_BODY_BYTES])
+                .await
+                .expect("body prefix");
+            std::future::pending::<()>().await;
+        });
+        let pool = create_client_pool(
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            ClientRouteClass::Api,
+        );
+        let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            chatgpt_get_request::<serde_json::Value>(&base_url, &auth, &pool, "/test".to_string()),
+        )
+        .await;
+        server.abort();
+        let error = result
+            .expect("must not wait for the rest of the error body")
+            .expect_err("HTTP 503");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Request failed with status 503 Service Unavailable: {} [truncated]",
+                "x".repeat(MAX_ERROR_BODY_BYTES)
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn short_errors_keep_diagnostics_and_large_successes_are_not_truncated() {
+        let server = MockServer::start().await;
+        let pool = create_client_pool(
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            ClientRouteClass::Api,
+        );
+        let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("settings unavailable"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = chatgpt_get_request::<serde_json::Value>(
+            &server.uri(),
+            &auth,
+            &pool,
+            "/test".to_string(),
+        )
+        .await
+        .expect_err("HTTP 503");
+        assert_eq!(
+            error.to_string(),
+            "Request failed with status 503 Service Unavailable: settings unavailable"
+        );
+        server.verify().await;
+        server.reset().await;
+        let expected = serde_json::json!({"diff": "x".repeat(MAX_ERROR_BODY_BYTES * 2)});
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&expected))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let response: serde_json::Value =
+            chatgpt_get_request(&server.uri(), &auth, &pool, "/test".to_string())
+                .await
+                .expect("large successful response");
+        assert_eq!(response, expected);
+        server.verify().await;
+    }
 
     #[tokio::test]
     async fn chatgpt_requests_retain_the_effective_proxy_policy() {

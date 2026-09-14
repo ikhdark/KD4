@@ -131,7 +131,10 @@ impl std::fmt::Debug for ToolCall {
             .field("model", &self.model)
             .field("truncation_policy", &self.truncation_policy)
             .field("source", &self.source)
-            .field("conversation_history", &self.conversation_history)
+            .field(
+                "history_item_count",
+                &self.conversation_history.items().len(),
+            )
             .field("turn_item_emitter", &"<host turn item emitter>")
             .field("cancelled", &self.cancellation_token.is_cancelled())
             .field("primary_environment_id", &self.primary_environment_id)

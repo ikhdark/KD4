@@ -250,9 +250,10 @@ fn external_agent_config_migration_status_lines_use_semantic_colors() {
                 ", ".into(),
                 "1 failed".red(),
             ]),
+            Line::from("    deployer@example [plugin_import]: install failed").red(),
             Line::from(vec![
                 "  ".into(),
-                "Run /import again to check for additional items.".dim(),
+                "Resolve the failures above, then run /import to retry.".dim(),
             ]),
         ]
     );
@@ -326,7 +327,33 @@ impl ExternalAgentConfigMigrationTerminal for MigrationTestTerminal {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::print_stdout,
+    reason = "The parent process requires this stdout marker to prove child assertions executed"
+)]
 async fn migration_flow_draw_errors_stop_before_import() -> color_eyre::Result<()> {
+    const CHILD: &str = "CODEX_MIGRATION_DRAW_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let home = tempfile::tempdir()?;
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "external_agent_config_migration_flow::tests::migration_flow_draw_errors_stop_before_import", "--nocapture"])
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .output()?;
+        assert!(
+            output.status.success(),
+            "isolated migration test failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("isolated migration assertions completed")
+        );
+        return Ok(());
+    }
+
     use crate::legacy_core::config::ConfigBuilder;
     use crate::legacy_core::config::ConfigOverrides;
     use crate::tui::TuiEvent;
@@ -360,7 +387,7 @@ async fn migration_flow_draw_errors_stop_before_import() -> color_eyre::Result<(
     let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
     let detected = app_server
         .external_agent_config_detect(ExternalAgentConfigDetectParams {
-            include_home: false,
+            include_home: true,
             cwds: Some(vec![project.clone()]),
         })
         .await?;
@@ -381,8 +408,7 @@ async fn migration_flow_draw_errors_stop_before_import() -> color_eyre::Result<(
         if let Some(event) = redraw_event {
             events.push(event);
         }
-        // Keep a regression safe even when home detection finds real items:
-        // ignored draw errors consume Escape, never an import confirmation.
+        // Ignored draw errors consume Escape, never an import confirmation.
         events.push(TuiEvent::Key(KeyEvent::new(
             KeyCode::Esc,
             KeyModifiers::NONE,
@@ -441,6 +467,7 @@ async fn migration_flow_draw_errors_stop_before_import() -> color_eyre::Result<(
         "no delayed import may change the target during shutdown"
     );
     assert_eq!(std::fs::read(&source_path)?, source_bytes);
+    println!("isolated migration assertions completed");
     Ok(())
 }
 

@@ -29,6 +29,7 @@ use crate::protocol::FsWalkParams;
 use crate::protocol::FsWriteFileParams;
 
 const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
+const INVALID_PARAMS_ERROR_CODE: i64 = -32602;
 const METHOD_NOT_FOUND_ERROR_CODE: i64 = -32601;
 const NOT_FOUND_ERROR_CODE: i64 = -32004;
 
@@ -369,7 +370,8 @@ fn map_remote_error(error: ExecServerError) -> io::Error {
         ExecServerError::Server { code, message } if code == NOT_FOUND_ERROR_CODE => {
             io::Error::new(io::ErrorKind::NotFound, message)
         }
-        ExecServerError::Server { code, message } if code == INVALID_REQUEST_ERROR_CODE => {
+        ExecServerError::Server { code: INVALID_REQUEST_ERROR_CODE | INVALID_PARAMS_ERROR_CODE, message } =>
+        {
             io::Error::new(io::ErrorKind::InvalidInput, message)
         }
         ExecServerError::Server { message, .. } => io::Error::other(message),

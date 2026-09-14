@@ -2253,6 +2253,54 @@ async fn projection_recording_keeps_executor_available_under_contention() {
     assert_eq!(counters.tool_output_omitted_section_count, 3);
 }
 
+#[tokio::test]
+async fn projection_source_dependency_recording_keeps_executor_available_under_contention() {
+    let (_clock, state) = timing();
+    for reuse in [true, false] {
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let held_state = Arc::clone(&state);
+        let holder = std::thread::spawn(move || {
+            let guard = held_state.state();
+            locked_tx.send(()).expect("announce held timing lock");
+            let released = release_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+            drop(guard);
+            released
+        });
+        locked_rx.await.expect("timing lock held");
+        let recording_state = Arc::clone(&state);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let recording = tokio::spawn(async move {
+            started_tx.send(()).expect("announce recording attempt");
+            if reuse {
+                recording_state
+                    .record_projection_source_dependencies_reuse_async()
+                    .await;
+            } else {
+                recording_state
+                    .record_projection_source_dependencies_fallback_async()
+                    .await;
+            }
+        });
+        started_rx.await.expect("recording attempt started");
+        assert!(
+            !recording.is_finished(),
+            "recording waits for the held lock"
+        );
+        release_tx
+            .send(())
+            .expect("release timing lock before timeout");
+        recording.await.expect("recording task");
+        assert!(
+            holder.join().expect("lock holder"),
+            "executor remained responsive"
+        );
+    }
+    let counters = state.complete_snapshot().protocol_timing().counters;
+    assert_eq!(counters.projection_source_dependencies_reuse_count, 1);
+    assert_eq!(counters.projection_source_dependencies_fallback_count, 1);
+}
+
 #[test]
 fn wait_and_tool_output_counters_are_additive() {
     let (_clock, state) = timing();

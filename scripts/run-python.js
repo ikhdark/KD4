@@ -25,12 +25,16 @@ for (const [command, prefixArgs] of candidates) {
       "-c",
       "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)",
     ],
-    { stdio: "ignore" },
+    { stdio: "ignore", timeout: 10000 },
   );
   if (probe.error?.code === "ENOENT") {
     continue;
   }
   if (probe.error) {
+    if (probe.error.code === "ETIMEDOUT") {
+      console.error(`Python capability probe timed out: ${command}`);
+      process.exit(1);
+    }
     console.error(`failed to probe ${command}: ${probe.error.message}`);
     process.exit(1);
   }

@@ -7,7 +7,7 @@ use std::path::PathBuf;
     about = "Generate TypeScript bindings and JSON Schemas for the Codex app-server protocol"
 )]
 struct Args {
-    /// Output directory where generated files will be written
+    /// New or empty dedicated output directory where generated files will be written
     #[arg(short = 'o', long = "out", value_name = "DIR")]
     out_dir: PathBuf,
 
@@ -22,6 +22,11 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    anyhow::ensure!(
+        !args.out_dir.exists() || std::fs::read_dir(&args.out_dir)?.next().is_none(),
+        "output directory must be new or empty: {}",
+        args.out_dir.display()
+    );
     codex_app_server_protocol::generate_ts_with_options(
         &args.out_dir,
         args.prettier.as_deref(),

@@ -15,7 +15,7 @@ use ratatui::text::Text;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
 use ratatui::widgets::Wrap;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 use url::Url;
 
@@ -169,6 +169,9 @@ pub(crate) fn remap_wrapped_line(
     wrapped: Vec<Line<'static>>,
 ) -> Vec<HyperlinkLine> {
     let mut out = plain_hyperlink_lines(wrapped);
+    if source.hyperlinks.is_empty() {
+        return out;
+    }
     let source_text = line_text(&source.line);
     let mut source_byte = 0usize;
     let mut source_column = 0usize;
@@ -187,8 +190,8 @@ pub(crate) fn remap_wrapped_line(
         };
         let mapped = &rendered[rendered_start..];
         let mut output_column = rendered[..rendered_start].width();
-        for ch in mapped.chars() {
-            let width = ch.width().unwrap_or(/*default*/ 0);
+        for grapheme in mapped.graphemes(true) {
+            let width = grapheme.width();
             if let Some(link) = source
                 .hyperlinks
                 .iter()
@@ -217,7 +220,7 @@ fn line_text(line: &Line<'_>) -> String {
 
 fn longest_suffix_matching_prefix(rendered: &str, source: &str) -> Option<usize> {
     rendered
-        .char_indices()
+        .grapheme_indices(true)
         .map(|(index, _)| index)
         .chain(std::iter::once(rendered.len()))
         .find(|index| source.starts_with(&rendered[*index..]) && *index < rendered.len())
@@ -346,6 +349,10 @@ pub(crate) fn osc8_hyperlink(destination: &str, text: &str) -> String {
     let Some(safe_destination) = terminal_destination(destination) else {
         return text.to_string();
     };
+    validated_osc8_hyperlink(&safe_destination, text)
+}
+
+fn validated_osc8_hyperlink(safe_destination: &str, text: &str) -> String {
     format!("\x1b]8;;{safe_destination}\x07{text}\x1b]8;;\x07")
 }
 
@@ -393,8 +400,8 @@ pub(crate) fn decorate_spans(line: &HyperlinkLine) -> Vec<Span<'static>> {
     let mut active_link_index = None;
     let mut active_destination: Option<String> = None;
     for span in &line.line.spans {
-        for ch in span.content.chars() {
-            let width = ch.width().unwrap_or(/*default*/ 0);
+        for grapheme in span.content.graphemes(true) {
+            let width = grapheme.width();
             while line
                 .hyperlinks
                 .get(link_index)
@@ -421,7 +428,7 @@ pub(crate) fn decorate_spans(line: &HyperlinkLine) -> Vec<Span<'static>> {
                 }
                 active_link_index = selected_link_index;
             }
-            push_styled_content(&mut out, &ch.to_string(), span.style);
+            push_styled_content(&mut out, grapheme, span.style);
             column += width;
         }
     }
@@ -453,14 +460,17 @@ pub(crate) fn mark_buffer_hyperlinks(
     lines: &[HyperlinkLine],
     scroll_rows: usize,
 ) {
-    if area.width == 0 {
+    if area.is_empty() {
         return;
     }
     let mut logical_row = 0usize;
     for line in lines {
+        if logical_row >= scroll_rows.saturating_add(usize::from(area.height)) {
+            break;
+        }
         let paragraph = Paragraph::new(Text::from(line.line.clone())).wrap(Wrap { trim: false });
         let rendered_height = paragraph.line_count(area.width).max(/*other*/ 1);
-        if line.hyperlinks.is_empty() {
+        if line.hyperlinks.is_empty() || logical_row + rendered_height <= scroll_rows {
             logical_row += rendered_height;
             continue;
         }
@@ -475,29 +485,36 @@ pub(crate) fn mark_buffer_hyperlinks(
         paragraph.render(layout_area, &mut layout);
         let rendered_lines = (0..layout_area.height)
             .map(|row| {
-                let text = (0..layout_area.width)
-                    .filter_map(|column| {
-                        let cell = &layout[(column, row)];
-                        (!cell.skip).then(|| cell.symbol())
-                    })
-                    .collect::<String>();
+                let mut text = String::new();
+                let mut column = 0;
+                while column < layout_area.width {
+                    let cell = &layout[(column, row)];
+                    if !cell.skip {
+                        text.push_str(cell.symbol());
+                    }
+                    // Wide graphemes occupy continuation cells with blank symbols.
+                    column += cell.symbol().width().max(1) as u16;
+                }
                 Line::from(text.trim_end().to_string())
             })
             .collect();
         for (row, rendered) in remap_wrapped_line(line, rendered_lines).iter().enumerate() {
+            let row = logical_row + row;
+            if row < scroll_rows || row - scroll_rows >= usize::from(area.height) {
+                continue;
+            }
             for link in &rendered.hyperlinks {
+                let Some(destination) = terminal_destination(&link.destination) else {
+                    continue;
+                };
                 for column in link.columns.clone() {
-                    let row = logical_row + row;
-                    if row < scroll_rows || row - scroll_rows >= usize::from(area.height) {
-                        continue;
-                    }
                     let x = area.x + column as u16;
                     let y = area.y + (row - scroll_rows) as u16;
                     let cell = &mut buf[(x, y)];
                     if cell.skip || cell.symbol().trim().is_empty() {
                         continue;
                     }
-                    let symbol = osc8_hyperlink(&link.destination, cell.symbol());
+                    let symbol = validated_osc8_hyperlink(&destination, cell.symbol());
                     cell.set_symbol(&symbol);
                 }
             }
@@ -524,13 +541,13 @@ fn mark_matching_cells(
     destination: &str,
     matches: impl Fn(&ratatui::buffer::Cell) -> bool,
 ) {
-    if terminal_destination(destination).is_none() {
+    let Some(destination) = terminal_destination(destination) else {
         return;
-    }
+    };
     for position in area.positions() {
         let cell = &mut buf[position];
         if !cell.skip && !cell.symbol().trim().is_empty() && matches(cell) {
-            let symbol = osc8_hyperlink(destination, cell.symbol());
+            let symbol = validated_osc8_hyperlink(&destination, cell.symbol());
             cell.set_symbol(&symbol);
         }
     }
@@ -540,6 +557,31 @@ fn mark_matching_cells(
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn joined_emoji_preserve_link_columns_and_complete_graphemes() {
+        let destination = "https://example.com/";
+        let mut source = HyperlinkLine::from("👩‍💻 ");
+        source.push_span(Span::raw("👨‍👩‍👧‍👦 link"), Some(destination));
+        source.push_span(Span::raw(" end"), None);
+        let wrapped = remap_wrapped_line(&source, vec![source.line.clone()]);
+        assert_eq!(wrapped[0].hyperlinks[0].columns, 3..10);
+        let decorated: String = decorate_spans(&wrapped[0])
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(
+            decorated,
+            format!("👩‍💻 {} end", osc8_hyperlink(destination, "👨‍👩‍👧‍👦 link"))
+        );
+        let area = Rect::new(0, 0, 20, 1);
+        let mut buffer = Buffer::empty(area);
+        Paragraph::new(source.line.clone()).render(area, &mut buffer);
+        mark_buffer_hyperlinks(&mut buffer, area, &[source], 0);
+        assert_eq!(buffer[(0, 0)].symbol(), "👩‍💻");
+        assert_eq!(buffer[(3, 0)].symbol(), osc8_hyperlink(destination, "👨‍👩‍👧‍👦"));
+        assert_eq!(buffer[(6, 0)].symbol(), osc8_hyperlink(destination, "l"));
+    }
 
     #[test]
     fn only_supported_destinations_receive_osc8() {

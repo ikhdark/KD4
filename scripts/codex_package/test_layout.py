@@ -2,6 +2,8 @@
 
 from pathlib import Path
 import json
+import hashlib
+import struct
 import sys
 import tempfile
 import unittest
@@ -16,6 +18,14 @@ from codex_package.targets import TARGET_SPECS
 
 
 class CopyFileForStagingTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # These fixtures exercise PE parsing; only launching a real Windows process is mocked.
+        launch = mock.patch.object(
+            layout.subprocess, "run", return_value=mock.Mock(stdout="codex 1.2.3")
+        )
+        launch.start()
+        self.addCleanup(launch.stop)
+
     def test_reuse_package_dir_removes_all_residue(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             package_dir = Path(temp_dir) / "package"
@@ -131,7 +141,7 @@ class CopyFileForStagingTest(unittest.TestCase):
                 "codex-windows-sandbox-setup.exe",
             ]:
                 path = root / filename
-                path.write_text(filename, encoding="utf-8")
+                write_pe(path)
                 path.chmod(0o755)
             inputs = PackageInputs(
                 entrypoint_bin=root / "codex.exe",
@@ -185,7 +195,7 @@ class CopyFileForStagingTest(unittest.TestCase):
                 "codex-windows-sandbox-setup.exe",
             ]:
                 path = root / filename
-                path.write_text(filename, encoding="utf-8")
+                write_pe(path)
                 path.chmod(0o755)
             inputs = PackageInputs(
                 entrypoint_bin=root / "codex-app-server.exe",
@@ -232,7 +242,7 @@ class CopyFileForStagingTest(unittest.TestCase):
                 "codex-command-runner.exe",
                 "codex-windows-sandbox-setup.exe",
             ]:
-                (root / filename).write_text(filename, encoding="utf-8")
+                write_pe(root / filename)
             inputs = PackageInputs(
                 entrypoint_bin=root / "codex.exe",
                 code_mode_host_bin=root / "codex-code-mode-host.exe",
@@ -251,8 +261,8 @@ class CopyFileForStagingTest(unittest.TestCase):
                 inputs,
             )
 
-            expected_script = layout.windows_apply_patch_alias_text(
-                layout.PureWindowsPath("..") / "bin" / "codex.exe"
+            expected_script = (
+                '@echo off\n"%~dp0..\\bin\\codex.exe" --codex-run-as-apply-patch %*\n'
             )
             for alias in ["apply_patch.bat", "applypatch.bat"]:
                 self.assertEqual(
@@ -284,6 +294,102 @@ class CopyFileForStagingTest(unittest.TestCase):
                     spec,
                 )
             self.assertIn("Package file digest mismatch", str(cm.exception))
+
+    def test_canonical_validation_and_staged_input_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            package = root / "package"
+            package.mkdir()
+            sources = [
+                root / name
+                for name in [
+                    "entry.exe",
+                    "host.exe",
+                    "rg.exe",
+                    "runner.exe",
+                    "setup.exe",
+                ]
+            ]
+            for source in sources:
+                write_pe(source)
+            inputs = PackageInputs(*sources)
+            variant = PACKAGE_VARIANTS["codex"]
+            spec = TARGET_SPECS["x86_64-pc-windows-msvc"]
+
+            def build():
+                layout.build_package_dir(
+                    package,
+                    "1.2.3",
+                    variant,
+                    spec,
+                    inputs,
+                    build_identity={"source": "test"},
+                )
+
+            def refresh_inventory():
+                metadata = json.loads((package / "codex-package.json").read_text())
+                metadata["files"] = layout.package_file_inventory(
+                    package, variant=variant, spec=spec
+                )
+                metadata["bundleId"] = hashlib.sha256(
+                    json.dumps(
+                        metadata["files"], sort_keys=True, separators=(",", ":")
+                    ).encode()
+                ).hexdigest()
+                layout.write_json(package / "codex-package.json", metadata)
+
+            build()
+            layout.validate_package_dir(package, variant, spec)
+            metadata = json.loads((package / "codex-package.json").read_text())
+            self.assertEqual(
+                metadata["buildIdentity"]["inputs"]["entrypoint"],
+                {
+                    "size": 128,
+                    "sha256": hashlib.sha256(sources[0].read_bytes()).hexdigest(),
+                },
+            )
+            for relative in [
+                "bin/codex.exe",
+                "bin/codex-code-mode-host.exe",
+                "codex-path/rg.exe",
+                "codex-resources/codex-command-runner.exe",
+                "codex-resources/codex-windows-sandbox-setup.exe",
+            ]:
+                with self.subTest(relative=relative):
+                    (package / relative).unlink()
+                    refresh_inventory()
+                    with self.assertRaisesRegex(
+                        RuntimeError, "Missing required package files"
+                    ):
+                        layout.validate_package_dir(package, variant, spec)
+                    build()
+                    (package / relative).write_bytes(b"not an executable")
+                    refresh_inventory()
+                    with self.assertRaisesRegex(RuntimeError, "Invalid PE executable"):
+                        layout.validate_package_dir(package, variant, spec)
+                    build()
+            nested = package / "bin" / "codex-package.json"
+            nested.write_text("nested metadata")
+            with self.assertRaisesRegex(RuntimeError, "inventory mismatch"):
+                layout.validate_package_dir(package, variant, spec)
+            build()
+            metadata = json.loads((package / "codex-package.json").read_text())
+            self.assertIn(
+                "bin/codex-package.json", [entry["path"] for entry in metadata["files"]]
+            )
+            layout.validate_package_dir(package, variant, spec)
+            nested.write_text("tampered")
+            with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
+                layout.validate_package_dir(package, variant, spec)
+
+
+def write_pe(path: Path) -> None:
+    contents = bytearray(128)
+    contents[:2] = b"MZ"
+    struct.pack_into("<I", contents, 0x3C, 64)
+    contents[64:68] = b"PE\0\0"
+    struct.pack_into("<H", contents, 68, 0x8664)
+    path.write_bytes(contents)
 
 
 if __name__ == "__main__":

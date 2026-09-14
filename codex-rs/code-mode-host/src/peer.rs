@@ -126,6 +126,9 @@ impl HostPeer {
         if self.disconnected.is_cancelled() {
             return Err("code-mode client connection closed".to_string());
         }
+        if cancellation_token.is_cancelled() {
+            return Err("code mode delegate request cancelled".to_string());
+        }
         let Ok(permit) = Arc::clone(&self.delegate_permits).try_acquire_owned() else {
             return Err("code-mode host has too many pending delegate calls".to_string());
         };
@@ -159,6 +162,7 @@ impl HostPeer {
                 request: Box::new(request),
                 dispatched_tx,
             },
+            Some(&cancellation_token),
         ) {
             self.pending
                 .lock()
@@ -232,26 +236,31 @@ impl HostPeer {
         let (initial_response_sent_tx, initial_response_sent_rx) = oneshot::channel();
         let key = (session_id, started.cell_id.clone());
         let (messages_tx, messages_rx) = mpsc::channel(CELL_MESSAGE_CAPACITY);
-        let previous = self
+        let mut routes = self
             .cell_routes
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(key.clone(), CellRoute::Active(messages_tx.clone()));
+            .unwrap_or_else(PoisonError::into_inner);
+        // Keep activation and transfer atomic with respect to callbacks so a
+        // newer message cannot overtake buffered delegates or closure.
+        let previous = routes.insert(key.clone(), CellRoute::Active(messages_tx.clone()));
         match previous {
             Some(CellRoute::Pending(messages)) => {
                 for message in messages {
                     if messages_tx.try_send(message).is_err() {
-                        self.disconnect();
+                        self.fail(
+                            "code-mode cell message queue is full during activation".to_string(),
+                        );
                         return initial_response_sent_rx;
                     }
                 }
             }
             Some(CellRoute::Active(_)) => {
-                self.disconnect();
+                self.fail("code-mode cell route is already active".to_string());
                 return initial_response_sent_rx;
             }
             None => {}
         }
+        drop(routes);
         let peer = Arc::clone(self);
         self.spawn_critical("cell forwarding", async move {
             drive_cell(
@@ -269,7 +278,7 @@ impl HostPeer {
     }
 
     pub(super) fn close_cell(&self, session_id: SessionId, cell_id: CellId) {
-        let _ = self.route_cell_message((session_id, cell_id), CellMessage::Closed);
+        let _ = self.route_cell_message((session_id, cell_id), CellMessage::Closed, None);
     }
 
     pub(super) fn disconnect(&self) {
@@ -357,15 +366,23 @@ impl HostPeer {
         &self,
         key: (SessionId, CellId),
         message: CellMessage,
+        cancellation: Option<&CancellationToken>,
     ) -> Result<(), String> {
         use std::collections::hash_map::Entry;
 
-        let result = match self
+        let mut routes = self
             .cell_routes
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(key)
-        {
+            .unwrap_or_else(PoisonError::into_inner);
+        // Closure revokes callback tokens before removing the route. Recheck
+        // under this lock to prevent late callbacks from recreating it.
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err("code mode delegate request cancelled".to_string());
+        }
+        if self.is_disconnected() {
+            return Err("code-mode client connection closed".to_string());
+        }
+        let result = match routes.entry(key) {
             Entry::Occupied(mut entry) => match entry.get_mut() {
                 CellRoute::Pending(messages) if messages.len() < CELL_MESSAGE_CAPACITY => {
                     messages.push_back(message);
@@ -381,8 +398,9 @@ impl HostPeer {
                 Ok(())
             }
         };
-        if result.is_err() {
-            self.disconnect();
+        drop(routes);
+        if let Err(reason) = &result {
+            self.fail(reason.clone());
         }
         result
     }
@@ -411,7 +429,7 @@ impl HostPeer {
         match self.outgoing_tx.try_send(frame) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
-                self.disconnect();
+                self.fail("code-mode host outgoing queue is full".to_string());
                 Err(PeerSendError::Unavailable(
                     "code-mode host outgoing queue is full".to_string(),
                 ))
@@ -466,7 +484,14 @@ async fn drive_cell(
     };
 
     if closed {
-        peer.initial_response(request_id, initial_response.await.map(Into::into));
+        let result = tokio::select! {
+            result = &mut initial_response => result,
+            _ = peer.disconnected.cancelled() => {
+                peer.remove_cell_route(&key);
+                return;
+            }
+        };
+        peer.initial_response(request_id, result.map(Into::into));
         if let Some(initial_response_sent_tx) = initial_response_sent_tx.take() {
             let _ = initial_response_sent_tx.send(());
         }

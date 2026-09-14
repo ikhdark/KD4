@@ -192,4 +192,134 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn derive_registers_actual_serialized_field_names() {
+        #[derive(serde::Serialize, ExperimentalApi)]
+        #[serde(rename_all = "camelCase")]
+        struct RenamedFields {
+            #[serde(rename = "wire_flag")]
+            #[experimental("renamed/flag")]
+            preview_mode: bool,
+            #[experimental("renamed/raw")]
+            r#type: bool,
+            #[experimental("renamed/camel")]
+            another_flag: bool,
+            #[experimental("renamed/leading")]
+            _leading_flag: bool,
+        }
+        #[derive(serde::Serialize, ExperimentalApi)]
+        struct DefaultFields {
+            #[experimental("default/flag")]
+            preview_mode: bool,
+        }
+        #[derive(serde::Serialize, ExperimentalApi)]
+        #[serde(rename_all = "snake_case")]
+        struct SnakeFields {
+            #[experimental("snake/flag")]
+            preview_mode: bool,
+        }
+
+        let renamed = RenamedFields {
+            preview_mode: true,
+            r#type: false,
+            another_flag: false,
+            _leading_flag: false,
+        };
+        assert_eq!(renamed.experimental_reason(), Some("renamed/flag"));
+        assert_eq!(
+            RenamedFields {
+                preview_mode: false,
+                r#type: false,
+                another_flag: false,
+                _leading_flag: false,
+            }
+            .experimental_reason(),
+            None
+        );
+        for (value, fields, names) in [
+            (
+                serde_json::to_value(renamed).unwrap(),
+                RenamedFields::EXPERIMENTAL_FIELDS,
+                vec!["wire_flag", "type", "anotherFlag", "leadingFlag"],
+            ),
+            (
+                serde_json::to_value(DefaultFields { preview_mode: true }).unwrap(),
+                DefaultFields::EXPERIMENTAL_FIELDS,
+                vec!["preview_mode"],
+            ),
+            (
+                serde_json::to_value(SnakeFields { preview_mode: true }).unwrap(),
+                SnakeFields::EXPERIMENTAL_FIELDS,
+                vec!["preview_mode"],
+            ),
+        ] {
+            assert_eq!(
+                fields
+                    .iter()
+                    .map(|field| field.field_name)
+                    .collect::<Vec<_>>(),
+                names
+            );
+            for field in fields {
+                assert!(
+                    value.get(field.field_name).is_some(),
+                    "registered field is absent from serialized value"
+                );
+                assert!(
+                    super::experimental_fields().contains(&field),
+                    "field must reach the schema registry"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn derive_preserves_generics_and_where_clauses() {
+        #[derive(ExperimentalApi)]
+        struct GenericFields<T>
+        where
+            T: ExperimentalApiTrait,
+        {
+            #[experimental(nested)]
+            inner: T,
+        }
+        #[derive(ExperimentalApi)]
+        struct GenericTuple<T>(#[experimental("generic/value")] Option<T>);
+        #[derive(ExperimentalApi)]
+        enum GenericEnum<T>
+        where
+            T: Copy,
+        {
+            #[experimental("generic/variant")]
+            Preview(T),
+            Stable,
+        }
+        assert_eq!(
+            GenericFields {
+                inner: Some(EnumVariantShapes::Unit)
+            }
+            .experimental_reason(),
+            Some("enum/unit")
+        );
+        assert_eq!(
+            GenericFields::<Option<EnumVariantShapes>> { inner: None }.experimental_reason(),
+            None
+        );
+        assert_eq!(
+            GenericFields::<Option<EnumVariantShapes>>::EXPERIMENTAL_FIELDS,
+            &[]
+        );
+        assert_eq!(
+            GenericTuple(Some(42)).experimental_reason(),
+            Some("generic/value")
+        );
+        assert_eq!(GenericTuple::<u8>(None).experimental_reason(), None);
+        assert_eq!(GenericTuple::<u8>::EXPERIMENTAL_FIELDS[0].field_name, "0");
+        assert_eq!(
+            GenericEnum::Preview(42).experimental_reason(),
+            Some("generic/variant")
+        );
+        assert_eq!(GenericEnum::<u8>::Stable.experimental_reason(), None);
+    }
 }

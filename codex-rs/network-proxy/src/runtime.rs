@@ -226,6 +226,7 @@ where
 pub struct NetworkProxyState {
     state: Arc<RwLock<ConfigState>>,
     reloader: Arc<dyn ConfigReloader>,
+    reload_lock: Arc<tokio::sync::Mutex<()>>,
     blocked_request_observer: Arc<RwLock<Option<Arc<dyn BlockedRequestObserver>>>>,
     credential_broker: CredentialBroker,
     audit_metadata: NetworkProxyAuditMetadata,
@@ -260,6 +261,7 @@ impl Clone for NetworkProxyState {
         Self {
             state: self.state.clone(),
             reloader: self.reloader.clone(),
+            reload_lock: self.reload_lock.clone(),
             blocked_request_observer: self.blocked_request_observer.clone(),
             credential_broker: self.credential_broker.clone(),
             audit_metadata: self.audit_metadata.clone(),
@@ -315,6 +317,7 @@ impl NetworkProxyState {
             credential_broker: CredentialBroker::new(state.config.credential_broker),
             state: Arc::new(RwLock::new(state)),
             reloader,
+            reload_lock: Arc::new(tokio::sync::Mutex::new(())),
             blocked_request_observer: Arc::new(RwLock::new(blocked_request_observer)),
             audit_metadata,
             execution_attributions: Arc::new(Mutex::new(HashMap::new())),
@@ -434,7 +437,9 @@ impl NetworkProxyState {
         Ok(guard.config.enabled)
     }
 
+    #[expect(clippy::await_holding_invalid_type, reason = "Serialize asynchronous reload and mutation transactions so stale state cannot overwrite newer policy")]
     pub async fn force_reload(&self) -> Result<()> {
+        let _reload = self.reload_lock.lock().await;
         let previous_cfg = {
             let guard = self.state.read().await;
             guard.config.clone()
@@ -464,8 +469,10 @@ impl NetworkProxyState {
         }
     }
 
+    #[expect(clippy::await_holding_invalid_type, reason = "Serialize asynchronous reload and mutation transactions so stale state cannot overwrite newer policy")]
     pub async fn replace_config_state(&self, mut new_state: ConfigState) -> Result<()> {
-        self.reload_if_needed().await?;
+        let _reload = self.reload_lock.lock().await;
+        self.reload_if_needed_locked().await?;
         self.ensure_credential_broker_enablement_unchanged(&new_state)?;
         let mut guard = self.state.write().await;
         log_policy_changes(&guard.config, &new_state.config);
@@ -490,35 +497,24 @@ impl NetworkProxyState {
 
     pub(crate) async fn record_blocked_for_request(&self, mut entry: BlockedRequest) -> Result<()> {
         entry.execution_id = self.execution_id();
-        let blocked_for_observer = entry.clone();
         let blocked_request_observer = self.blocked_request_observer.read().await.clone();
-        let violation_line = blocked_request_violation_log_line(&entry);
-        let host = entry.host.clone();
-        let reason = entry.reason.clone();
-        let decision = entry.decision.clone();
-        let source = entry.source.clone();
-        let protocol = entry.protocol.clone();
-        let port = entry.port;
-        let (total, buffered) = {
+        let blocked_for_observer =
+            blocked_request_observer.map(|observer| (observer, entry.clone()));
+        {
             let mut guard = self.state.write().await;
-            guard.blocked.push_back(entry);
             guard.blocked_total = guard.blocked_total.saturating_add(1);
-            let total = guard.blocked_total;
+            debug!(total = guard.blocked_total, host = %entry.host, reason = %entry.reason,
+                decision = ?entry.decision, source = ?entry.source, protocol = %entry.protocol,
+                port = ?entry.port, "recorded blocked request telemetry");
+            debug!("{}", blocked_request_violation_log_line(&entry));
+            guard.blocked.push_back(entry);
             while guard.blocked.len() > MAX_BLOCKED_EVENTS {
                 guard.blocked.pop_front();
             }
-            (total, guard.blocked.len())
-        };
-        debug!(
-            "recorded blocked request telemetry (\
-             total={total}, host={host}, reason={reason}, \
-             decision={decision:?}, source={source:?}, \
-             protocol={protocol}, port={port:?}, buffered={buffered})"
-        );
-        debug!("{violation_line}");
+        }
 
-        if let Some(observer) = blocked_request_observer {
-            observer.on_blocked_request(blocked_for_observer).await;
+        if let Some((observer, entry)) = blocked_for_observer {
+            observer.on_blocked_request(entry).await;
         }
         Ok(())
     }
@@ -564,9 +560,11 @@ impl NetworkProxyState {
         Ok(self.request_policy_snapshot().await?.network_mode())
     }
 
+    #[expect(clippy::await_holding_invalid_type, reason = "Serialize asynchronous reload and mutation transactions so stale state cannot overwrite newer policy")]
     pub async fn set_network_mode(&self, mode: NetworkMode) -> Result<()> {
+        let _reload = self.reload_lock.lock().await;
         loop {
-            self.reload_if_needed().await?;
+            self.reload_if_needed_locked().await?;
             let (candidate, constraints) = {
                 let guard = self.state.read().await;
                 let mut candidate = guard.config.clone();
@@ -601,14 +599,16 @@ impl NetworkProxyState {
         self.update_domain_list(host, DomainListKind::Deny).await
     }
 
+    #[expect(clippy::await_holding_invalid_type, reason = "Serialize asynchronous reload and mutation transactions so stale state cannot overwrite newer policy")]
     async fn update_domain_list(&self, host: &str, target: DomainListKind) -> Result<()> {
+        let _reload = self.reload_lock.lock().await;
         let host = Host::parse(host).context("invalid network host")?;
         let normalized_host = host.as_str().to_string();
         let list_name = target.list_name();
         let constraint_field = target.constraint_field();
 
         loop {
-            self.reload_if_needed().await?;
+            self.reload_if_needed_locked().await?;
             let (previous_cfg, constraints) = {
                 let guard = self.state.read().await;
                 (guard.config.clone(), guard.constraints.clone())
@@ -659,7 +659,13 @@ impl NetworkProxyState {
         }
     }
 
+    #[expect(clippy::await_holding_invalid_type, reason = "Serialize asynchronous reload and mutation transactions so stale state cannot overwrite newer policy")]
     async fn reload_if_needed(&self) -> Result<()> {
+        let _reload = self.reload_lock.lock().await;
+        self.reload_if_needed_locked().await
+    }
+
+    async fn reload_if_needed_locked(&self) -> Result<()> {
         match self.reloader.maybe_reload().await? {
             None => Ok(()),
             Some(mut new_state) => {
@@ -688,6 +694,34 @@ impl NetworkProxyState {
 }
 
 impl RequestPolicySnapshot {
+    pub(crate) fn explicitly_denied(&self, host: &str) -> bool {
+        globset_matches_host_or_unscoped(&self.deny_set, &normalize_host(host))
+    }
+
+    pub(crate) fn local_target(&self, host: &str) -> Option<crate::connect_policy::LocalTarget> {
+        let host = Host::parse(host).ok()?;
+        let literal = unscoped_ip_literal(host.as_str()).unwrap_or(host.as_str());
+        let target = if let Ok(ip) = literal.parse::<IpAddr>() {
+            if !is_non_public_ip(ip) {
+                return None;
+            }
+            crate::connect_policy::LocalTarget::Ip(ip)
+        } else if is_loopback_host(&host) {
+            crate::connect_policy::LocalTarget::Loopback
+        } else {
+            return None;
+        };
+        if self.explicitly_denied(host.as_str())
+            || !is_explicit_local_allowlisted(
+                &self.config.allowed_domains().unwrap_or_default(),
+                &host,
+            )
+        {
+            return None;
+        }
+        Some(target)
+    }
+
     pub(crate) fn enabled(&self) -> bool {
         self.config.enabled
     }
@@ -704,9 +738,6 @@ impl RequestPolicySnapshot {
         let deny_set = &self.deny_set;
         let allow_set = &self.allow_set;
         let allow_local_binding = self.config.allow_local_binding;
-        let allowed_domains = self.config.allowed_domains();
-        let allowed_domains_empty = allowed_domains.is_none();
-        let allowed_domains = allowed_domains.unwrap_or_default();
 
         let host_str = host.as_str();
 
@@ -740,7 +771,10 @@ impl RequestPolicySnapshot {
             };
 
             if local_literal {
-                if !is_explicit_local_allowlisted(&allowed_domains, &host) {
+                if !is_explicit_local_allowlisted(
+                    &self.config.allowed_domains().unwrap_or_default(),
+                    &host,
+                ) {
                     return Ok(HostBlockDecision::Blocked(HostBlockReason::NotAllowedLocal));
                 }
             } else if host_resolves_to_non_public_ip(
@@ -759,7 +793,7 @@ impl RequestPolicySnapshot {
             }
         }
 
-        if allowed_domains_empty || !is_allowlisted {
+        if !is_allowlisted {
             Ok(HostBlockDecision::Blocked(HostBlockReason::NotAllowed))
         } else {
             Ok(HostBlockDecision::Allowed)
@@ -1159,6 +1193,83 @@ mod tests {
             network.set_allow_unix_sockets(unix_sockets.to_vec());
         }
         network
+    }
+
+    #[tokio::test]
+    async fn concurrent_reloads_publish_in_load_order() {
+        struct OrderedReloader {
+            calls: std::sync::atomic::AtomicUsize,
+            started: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+        impl ConfigReloader for OrderedReloader {
+            fn source_label(&self) -> String {
+                "ordered test".to_string()
+            }
+            fn maybe_reload(&self) -> ConfigReloaderFuture<'_, Option<ConfigState>> {
+                Box::pin(async move {
+                    let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if call == 0 {
+                        self.started.notify_one();
+                        self.release.notified().await;
+                    }
+                    let config = NetworkProxyConfig {
+                        mode: if call == 0 {
+                            NetworkMode::Full
+                        } else {
+                            NetworkMode::Limited
+                        },
+                        ..NetworkProxyConfig::default()
+                    };
+                    Ok(Some(build_config_state(
+                        config,
+                        NetworkProxyConstraints::default(),
+                    )?))
+                })
+            }
+            fn reload_now(&self) -> ConfigReloaderFuture<'_, ConfigState> {
+                Box::pin(async { Err(anyhow::anyhow!("unused")) })
+            }
+        }
+        let reloader = Arc::new(OrderedReloader {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let state = Arc::new(NetworkProxyState::with_reloader(
+            build_config_state(
+                NetworkProxyConfig::default(),
+                NetworkProxyConstraints::default(),
+            )
+            .unwrap(),
+            reloader.clone(),
+        ));
+        let first = tokio::spawn({
+            let state = state.clone();
+            async move {
+                state
+                    .request_policy_snapshot()
+                    .await
+                    .unwrap()
+                    .network_mode()
+            }
+        });
+        reloader.started.notified().await;
+        let mut second = Box::pin(state.request_policy_snapshot());
+        use std::future::Future as _;
+        std::future::poll_fn(|cx| {
+            assert!(
+                second.as_mut().poll(cx).is_pending(),
+                "second load must wait for first publication"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(reloader.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        reloader.release.notify_one();
+        assert_eq!(first.await.unwrap(), NetworkMode::Full);
+        assert_eq!(second.await.unwrap().network_mode(), NetworkMode::Limited);
+        assert_eq!(state.state.read().await.config.mode, NetworkMode::Limited);
     }
 
     #[tokio::test]
@@ -1913,6 +2024,32 @@ mod tests {
         };
 
         assert!(validate_policy_against_constraints(&config, &constraints).is_err());
+    }
+
+    #[test]
+    fn validate_policy_against_constraints_preserves_unix_socket_case() {
+        let constraints = NetworkProxyConstraints {
+            allow_unix_sockets: Some(vec!["/run/Agent.sock".to_string()]),
+            ..NetworkProxyConstraints::default()
+        };
+        let mut config = NetworkProxyConfig::default();
+        config.set_allow_unix_sockets(vec!["/run/Agent.sock".to_string()]);
+        assert_eq!(
+            validate_policy_against_constraints(&config, &constraints),
+            Ok(())
+        );
+
+        config.set_allow_unix_sockets(vec!["/run/agent.sock".to_string()]);
+        let err = validate_policy_against_constraints(&config, &constraints)
+            .expect_err("case variant is a different socket");
+        assert_eq!(
+            err,
+            NetworkProxyConstraintError::InvalidValue {
+                field_name: "network.allow_unix_sockets",
+                candidate: "[\"/run/agent.sock\"]".to_string(),
+                allowed: "subset of managed allow_unix_sockets".to_string(),
+            }
+        );
     }
 
     #[test]

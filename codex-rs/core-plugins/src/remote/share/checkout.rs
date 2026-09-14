@@ -155,14 +155,8 @@ pub async fn checkout_remote_plugin_share(
             &remote_plugin_id,
             local_plugin_path.clone(),
         ) {
-            let err = RemotePluginCatalogError::UnexpectedResponse(format!(
-                "failed to record plugin share local path mapping: {err}"
-            ));
-            return Err(clean_up_created_checkout_path(
-                created_checkout_path,
-                &local_plugin_path,
-                err,
-            ));
+            tracing::warn!(remote_plugin_id = %remote_plugin_id,
+                "failed to record plugin share local path mapping: {err}");
         }
 
         let plugin_id = PluginId::new(plugin_name.clone(), marketplace.name.clone())
@@ -222,6 +216,17 @@ fn editable_plugin_path_for_checkout(
         && existing_path.as_path().exists()
     {
         ensure_path_can_be_listed_in_personal_marketplace(home, existing_path)?;
+        if !existing_path.as_path().is_dir()
+            || crate::manifest::load_plugin_manifest(existing_path.as_path())
+                .is_none_or(|manifest| manifest.name != plugin_name)
+        {
+            return Err(RemotePluginCatalogError::InvalidPluginPath {
+                path: existing_path.to_path_buf(),
+                reason:
+                    "existing checkout must contain a valid plugin manifest with the expected name"
+                        .to_string(),
+            });
+        }
         return Ok((existing_path.clone(), true));
     }
 
@@ -291,7 +296,16 @@ fn update_personal_marketplace(
 ) -> Result<PersonalMarketplaceUpdate, RemotePluginCatalogError> {
     let marketplace_path = home.join(PERSONAL_MARKETPLACE_RELATIVE_PATH);
     let relative_plugin_path = personal_marketplace_relative_plugin_path(home, local_plugin_path)?;
+    let _guard = codex_file_system::acquire_atomic_write_lock(marketplace_path.as_path()).map_err(
+        |err| {
+            invalid_marketplace_file(
+                marketplace_path.as_path(),
+                &format!("failed to lock personal marketplace: {err}"),
+            )
+        },
+    )?;
     let mut marketplace = read_or_create_personal_marketplace(marketplace_path.as_path())?;
+    let original_marketplace = marketplace.clone();
     let Some(marketplace_object) = marketplace.as_object_mut() else {
         return Err(invalid_marketplace_file(
             marketplace_path.as_path(),
@@ -351,11 +365,34 @@ fn update_personal_marketplace(
                 ),
             ));
         }
-        *existing_entry = new_entry;
+        // Checkout owns these fields; preserve local extensions, including nested ones.
+        existing_entry["name"] = new_entry["name"].clone();
+        for (object, fields) in [
+            ("source", &["source", "path"][..]),
+            ("policy", &["installation", "authentication"][..]),
+        ] {
+            if !existing_entry[object].is_object() {
+                existing_entry[object] = json!({});
+            }
+            for field in fields {
+                existing_entry[object][*field] = new_entry[object][*field].clone();
+            }
+        }
+        if let Some(category) = new_entry.get("category") {
+            existing_entry["category"] = category.clone();
+        } else if let Some(existing_entry) = existing_entry.as_object_mut() {
+            existing_entry.remove("category");
+        }
     } else {
         plugins.push(new_entry);
     }
 
+    if marketplace == original_marketplace && marketplace_path.as_path().is_file() {
+        return Ok(PersonalMarketplaceUpdate {
+            name: marketplace_name,
+            path: marketplace_path,
+        });
+    }
     let contents = serde_json::to_string_pretty(&marketplace)
         .map_err(|err| RemotePluginCatalogError::UnexpectedResponse(err.to_string()))?;
     write_atomically(marketplace_path.as_path(), &format!("{contents}\n")).map_err(|err| {
@@ -482,5 +519,77 @@ fn invalid_marketplace_file(path: &Path, message: &str) -> RemotePluginCatalogEr
     RemotePluginCatalogError::InvalidPluginPath {
         path: path.to_path_buf(),
         reason: message.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_checkout_preserves_marketplace_extensions() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = AbsolutePathBuf::try_from(temp.path().to_path_buf()).unwrap();
+        let plugin = home.join("plugins/demo");
+        let path = home.join(PERSONAL_MARKETPLACE_RELATIVE_PATH);
+        let contents = json!({
+            "name": "personal", "custom": "marketplace extension",
+            "plugins": [{"name": "demo", "custom": "plugin extension",
+                "source": {"source": "local", "path": "./plugins/demo", "custom": 1},
+                "policy": {"installation": "AVAILABLE", "authentication": "ON_USE", "custom": 2}}]
+        })
+        .to_string();
+        fs::create_dir_all(path.as_path().parent().unwrap()).unwrap();
+        fs::write(&path, &contents).unwrap();
+        let result = update_personal_marketplace(
+            &home,
+            "demo",
+            &plugin,
+            PluginInstallPolicy::Available,
+            PluginAuthPolicy::OnUse,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.name, "personal");
+        assert_eq!(result.path, path);
+        assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+        update_personal_marketplace(
+            &home,
+            "demo",
+            &plugin,
+            PluginInstallPolicy::InstalledByDefault,
+            PluginAuthPolicy::OnInstall,
+            Some("tools".to_string()),
+        )
+        .unwrap();
+        let updated: JsonValue = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        let mut expected: JsonValue = serde_json::from_str(&contents).unwrap();
+        expected["plugins"][0]["policy"]["installation"] = json!("INSTALLED_BY_DEFAULT");
+        expected["plugins"][0]["policy"]["authentication"] = json!("ON_INSTALL");
+        expected["plugins"][0]["category"] = json!("tools");
+        assert_eq!(updated, expected);
+    }
+
+    #[test]
+    fn existing_checkout_requires_a_matching_valid_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = AbsolutePathBuf::try_from(temp.path().to_path_buf()).unwrap();
+        let plugin = home.join("plugins/demo");
+        let paths = BTreeMap::from([("plugins_123".to_string(), plugin.clone())]);
+        fs::create_dir_all(plugin.as_path().join(".codex-plugin")).unwrap();
+        let manifest = plugin.as_path().join(".codex-plugin/plugin.json");
+        for contents in ["{", r#"{"name":"other"}"#] {
+            fs::write(&manifest, contents).unwrap();
+            assert!(matches!(
+                editable_plugin_path_for_checkout(&home, "demo", "plugins_123", &paths),
+                Err(RemotePluginCatalogError::InvalidPluginPath { .. })
+            ));
+            assert_eq!(fs::read_to_string(&manifest).unwrap(), contents);
+        }
+        fs::write(&manifest, r#"{"name":"demo"}"#).unwrap();
+        assert_eq!(
+            editable_plugin_path_for_checkout(&home, "demo", "plugins_123", &paths).unwrap(),
+            (plugin, true)
+        );
     }
 }

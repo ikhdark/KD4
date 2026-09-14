@@ -2,6 +2,41 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn streamed_exec_output_remains_active_until_terminal_event() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.bottom_pane.set_task_running(true);
+    let begin = begin_exec(&mut chat, "streaming", "echo hello");
+    chat.on_exec_command_output_delta("streaming", "hello\n");
+    let cell = chat
+        .transcript
+        .active_cell
+        .as_ref()
+        .unwrap()
+        .as_any()
+        .downcast_ref::<ExecCell>()
+        .unwrap();
+    assert!(cell.is_active());
+    assert!(!cell.should_flush());
+    assert!(cell.display_lines(80)[0].to_string().contains("Running"));
+    assert_eq!(
+        cell.transcript_lines(80).last().unwrap().to_string(),
+        "hello"
+    );
+    assert!(drain_insert_history(&mut rx).is_empty());
+    end_exec(&mut chat, begin, "hello\n", "", 0);
+    let mut transcripts = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = event {
+            transcripts.push(cell.transcript_lines(80));
+        }
+    }
+    assert_eq!(transcripts.len(), 1);
+    let transcript = &transcripts[0];
+    assert_eq!(transcript[1].to_string(), "hello");
+    assert!(transcript.last().unwrap().to_string().starts_with("✓ • "));
+}
+
+#[tokio::test]
 async fn exec_approval_emits_proposed_command_and_decision_history() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
@@ -1577,4 +1612,57 @@ async fn apply_patch_request_omits_diff_summary_from_modal() -> anyhow::Result<(
     assert!(!contents.contains("+line two"));
 
     Ok(())
+}
+
+#[tokio::test]
+async fn unified_exec_output_preview_keeps_bounded_tail_without_splitting_unicode() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    handle_turn_started(&mut chat, "turn-preview");
+    begin_unified_exec_startup(&mut chat, "call-preview", "proc-preview", "echo preview");
+    let output = (0..10_000)
+        .map(|i| format!("line {i}\n"))
+        .collect::<String>();
+    chat.on_exec_command_output_delta("call-preview", &output);
+    assert_eq!(
+        chat.unified_exec_processes[0].recent_chunks,
+        ["line 9997", "line 9998", "line 9999"]
+    );
+    chat.on_exec_command_output_delta("call-preview", &"界".repeat(100_000));
+    assert_eq!(
+        chat.unified_exec_processes[0].recent_chunks,
+        [
+            "line 9998".to_string(),
+            "line 9999".to_string(),
+            "界".repeat(341)
+        ]
+    );
+    assert!(
+        chat.unified_exec_processes[0]
+            .recent_chunks
+            .iter()
+            .all(|line| line.len() <= 1024)
+    );
+}
+
+#[tokio::test]
+async fn unified_exec_switching_waits_keeps_new_wait_status() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    handle_turn_started(&mut chat, "turn-wait-switch");
+    begin_unified_exec_startup(&mut chat, "call-first", "proc-first", "sleep 11");
+    begin_unified_exec_startup(&mut chat, "call-second", "proc-second", "sleep 22");
+    terminal_interaction(&mut chat, "poll-first", "proc-first", "");
+    terminal_interaction(&mut chat, "poll-second", "proc-second", "");
+    let popup = render_bottom_popup(&chat, 80);
+    assert!(popup.contains("Waiting for background terminal"), "{popup}");
+    assert!(popup.contains("sleep 22"), "{popup}");
+    assert_eq!(
+        chat.status_state.terminal_title_status_kind,
+        TerminalTitleStatusKind::WaitingForBackgroundTerminal
+    );
+    let history = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<String>();
+    assert!(history.contains("sleep 11"), "{history}");
+    assert!(!history.contains("sleep 22"), "{history}");
 }

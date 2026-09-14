@@ -139,20 +139,7 @@ impl ChatWidget {
     }
 
     pub(super) fn dispatch_command(&mut self, cmd: SlashCommand) {
-        if !self.ensure_slash_command_allowed_in_side_conversation(cmd) {
-            return;
-        }
-        if !self.ensure_side_command_allowed_outside_review(cmd) {
-            return;
-        }
-        if self.slash_command_blocked_by_active_task(cmd) {
-            let message = format!(
-                "'/{}' is disabled while a task is in progress.",
-                cmd.command()
-            );
-            self.add_to_history(history_cell::new_error_event(message));
-            self.bottom_pane.drain_pending_submission_state();
-            self.request_redraw();
+        if !self.ensure_slash_command_allowed(cmd, SlashCommandDispatchSource::Live) {
             return;
         }
 
@@ -384,6 +371,7 @@ impl ChatWidget {
             }
             SlashCommand::Diff => {
                 self.add_diff_in_progress();
+                let thread_id = self.thread_id;
                 let tx = self.app_event_tx.clone();
                 let runner = self.workspace_command_runner.clone();
                 let cwd = self
@@ -405,7 +393,11 @@ impl ChatWidget {
                         None => "Failed to compute diff: workspace command runner unavailable"
                             .to_string(),
                     };
-                    tx.send(AppEvent::DiffResult(text));
+                    tx.send(AppEvent::DiffResult {
+                        thread_id,
+                        cwd,
+                        text,
+                    });
                 });
             }
             SlashCommand::Mention => {
@@ -538,26 +530,13 @@ impl ChatWidget {
         args: String,
         text_elements: Vec<TextElement>,
     ) {
-        if !self.ensure_slash_command_allowed_in_side_conversation(cmd) {
-            return;
-        }
-        if !self.ensure_side_command_allowed_outside_review(cmd) {
+        if !self.ensure_slash_command_allowed(cmd, SlashCommandDispatchSource::Live) {
             return;
         }
         if !cmd.supports_inline_args() {
             self.dispatch_command(cmd);
             return;
         }
-        if self.slash_command_blocked_by_active_task(cmd) {
-            let message = format!(
-                "'/{}' is disabled while a task is in progress.",
-                cmd.command()
-            );
-            self.add_to_history(history_cell::new_error_event(message));
-            self.request_redraw();
-            return;
-        }
-
         let trimmed = args.trim();
         if trimmed.is_empty() {
             self.dispatch_command(cmd);
@@ -645,6 +624,18 @@ impl ChatWidget {
     }
 
     fn dispatch_prepared_command_with_args(
+        &mut self,
+        cmd: SlashCommand,
+        prepared: PreparedSlashCommandArgs,
+    ) {
+        let source = prepared.source;
+        self.handle_prepared_command_with_args(cmd, prepared);
+        if source == SlashCommandDispatchSource::Live && cmd != SlashCommand::Goal {
+            self.bottom_pane.drain_pending_submission_state();
+        }
+    }
+
+    fn handle_prepared_command_with_args(
         &mut self,
         cmd: SlashCommand,
         prepared: PreparedSlashCommandArgs,
@@ -885,9 +876,6 @@ impl ChatWidget {
             }
             _ => self.dispatch_command(cmd),
         }
-        if source == SlashCommandDispatchSource::Live && cmd != SlashCommand::Goal {
-            self.bottom_pane.drain_pending_submission_state();
-        }
     }
 
     pub(super) fn submit_queued_slash_prompt(
@@ -940,6 +928,12 @@ impl ChatWidget {
             );
             return QueueDrain::Continue;
         };
+
+        if let SlashCommandItem::Builtin(cmd) = &command
+            && !self.ensure_slash_command_allowed(*cmd, SlashCommandDispatchSource::Queued)
+        {
+            return QueueDrain::Continue;
+        }
 
         if rest.is_empty() {
             return match command {
@@ -1115,6 +1109,30 @@ impl ChatWidget {
             .collect()
     }
 
+    fn ensure_slash_command_allowed(
+        &mut self,
+        cmd: SlashCommand,
+        source: SlashCommandDispatchSource,
+    ) -> bool {
+        let allowed = if !self.ensure_slash_command_allowed_in_side_conversation(cmd)
+            || !self.ensure_side_command_allowed_outside_review(cmd)
+        {
+            false
+        } else if self.slash_command_blocked_by_active_task(cmd) {
+            self.add_error_message(format!(
+                "'/{}' is disabled while a task is in progress.",
+                cmd.command()
+            ));
+            false
+        } else {
+            true
+        };
+        if !allowed && source == SlashCommandDispatchSource::Live {
+            self.bottom_pane.drain_pending_submission_state();
+        }
+        allowed
+    }
+
     fn ensure_slash_command_allowed_in_side_conversation(&mut self, cmd: SlashCommand) -> bool {
         if !self.active_side_conversation || cmd.available_in_side_conversation() {
             return true;
@@ -1123,7 +1141,6 @@ impl ChatWidget {
             "'/{}' is unavailable in side conversations. {SIDE_SLASH_COMMAND_UNAVAILABLE_HINT}",
             cmd.command()
         ));
-        self.bottom_pane.drain_pending_submission_state();
         false
     }
 
@@ -1136,7 +1153,6 @@ impl ChatWidget {
         self.add_error_message(format!(
             "'/{command}' is unavailable while code review is running."
         ));
-        self.bottom_pane.drain_pending_submission_state();
         false
     }
 }

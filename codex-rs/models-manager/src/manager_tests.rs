@@ -84,6 +84,7 @@ fn assert_models_contain(actual: &[ModelInfo], expected: &[ModelInfo]) {
 struct TestModelsEndpoint {
     has_command_auth: bool,
     uses_codex_backend: bool,
+    eligibility_count: AtomicUsize,
     responses: Mutex<VecDeque<Vec<ModelInfo>>>,
     fetch_count: AtomicUsize,
     observed_proxy_policy: Mutex<Option<OutboundProxyPolicy>>,
@@ -94,6 +95,7 @@ impl TestModelsEndpoint {
         Arc::new(Self {
             has_command_auth: false,
             uses_codex_backend: true,
+            eligibility_count: AtomicUsize::new(0),
             responses: Mutex::new(responses.into()),
             fetch_count: AtomicUsize::new(0),
             observed_proxy_policy: Mutex::new(None),
@@ -104,6 +106,7 @@ impl TestModelsEndpoint {
         Arc::new(Self {
             has_command_auth: false,
             uses_codex_backend: false,
+            eligibility_count: AtomicUsize::new(0),
             responses: Mutex::new(responses.into()),
             fetch_count: AtomicUsize::new(0),
             observed_proxy_policy: Mutex::new(None),
@@ -128,7 +131,7 @@ impl TestModelsEndpoint {
             .lock()
             .expect("responses lock should not be poisoned")
             .pop_front()
-            .unwrap_or_default();
+            .expect("unexpected model fetch: no response queued");
         Ok((models, None))
     }
 }
@@ -171,7 +174,10 @@ impl ModelsEndpointClient for TestModelsEndpoint {
     }
 
     fn uses_codex_backend(&self) -> ModelsEndpointFuture<'_, bool> {
-        Box::pin(async { self.uses_codex_backend })
+        Box::pin(async {
+            self.eligibility_count.fetch_add(1, Ordering::SeqCst);
+            self.uses_codex_backend
+        })
     }
 
     fn list_models<'a>(
@@ -244,17 +250,17 @@ impl ModelsEndpointClient for ControlledModelsEndpoint {
     ) -> ModelsEndpointFuture<'a, CoreResult<(Vec<ModelInfo>, Option<String>)>> {
         Box::pin(async move {
             self.fetch_count.fetch_add(1, Ordering::SeqCst);
-            self.release
-                .acquire()
-                .await
-                .expect("controlled endpoint should remain open")
-                .forget();
             let response = self
                 .responses
                 .lock()
                 .expect("responses lock should not be poisoned")
                 .pop_front()
                 .expect("controlled response");
+            self.release
+                .acquire()
+                .await
+                .expect("controlled endpoint should remain open")
+                .forget();
             match response {
                 ControlledResponse::Models(models, etag) => Ok((models, etag)),
                 ControlledResponse::Failure => {
@@ -302,6 +308,149 @@ impl ModelsEndpointClient for NotModifiedModelsEndpoint {
             Ok(ModelsFetchResult::NotModified)
         })
     }
+}
+
+#[tokio::test]
+async fn same_manager_serializes_refresh_and_cache_publication() {
+    let codex_home = tempdir().expect("temp dir");
+    let endpoint = ControlledModelsEndpoint::new(vec![
+        ControlledResponse::Models(
+            vec![remote_model("ordered-model", "Older", 1)],
+            Some("older".into()),
+        ),
+        ControlledResponse::Models(
+            vec![remote_model("ordered-model", "Newer", 1)],
+            Some("newer".into()),
+        ),
+    ]);
+    let manager = Arc::new(openai_manager_for_tests(
+        codex_home.path().to_path_buf(),
+        endpoint.clone(),
+    ));
+    let first = tokio::spawn({
+        let manager = Arc::clone(&manager);
+        async move {
+            manager
+                .refresh_models_for_background(DEFAULT_HTTP_CLIENT_FACTORY)
+                .await
+        }
+    });
+    endpoint.wait_for_fetches(1).await;
+
+    // Drive the competing public entry point while the first fetch is suspended.
+    // One poll alone could stop at filesystem I/O without testing refresh ordering.
+    let second = manager.list_models(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY);
+    tokio::pin!(second);
+    assert!(
+        timeout(Duration::from_millis(100), second.as_mut())
+            .await
+            .is_err()
+    );
+    assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 1);
+
+    let cached = manager.list_models(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY);
+    tokio::pin!(cached);
+    assert!(
+        timeout(Duration::from_millis(100), cached.as_mut())
+            .await
+            .is_err()
+    );
+    endpoint.release_one();
+    first.await.expect("first task").expect("first refresh");
+    endpoint.release_one();
+    second.await.expect("second refresh");
+    cached.await.expect("cache load after publication");
+
+    let model = manager
+        .get_model_info("ordered-model", &ModelsManagerConfig::default())
+        .await;
+    assert_eq!(model.display_name, "Newer");
+    assert_eq!(manager.get_etag().await.as_deref(), Some("newer"));
+    assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 2);
+    let persisted = manager
+        .cache_manager
+        .load_fresh(&crate::client_version_to_whole())
+        .await
+        .expect("cache read")
+        .expect("cache");
+    assert_eq!(persisted.models[0].display_name, "Newer");
+    assert_eq!(persisted.etag.as_deref(), Some("newer"));
+}
+
+#[tokio::test]
+async fn online_if_uncached_recovers_corruption_but_offline_preserves_the_error() {
+    for contents in [
+        b"{not-json".to_vec(),
+        serde_json::to_vec(&json!({
+            "client_version": crate::client_version_to_whole(), "models": "invalid"
+        }))
+        .expect("json"),
+    ] {
+        let codex_home = tempdir().expect("temp dir");
+        std::fs::write(codex_home.path().join(MODEL_CACHE_FILE), contents).expect("corrupt cache");
+        let endpoint =
+            TestModelsEndpoint::new(vec![vec![remote_model("recovered-model", "Recovered", 1)]]);
+        let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
+        assert!(
+            matches!(manager.list_models(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY).await,
+            Err(CodexErr::Io(err)) if err.kind() == std::io::ErrorKind::InvalidData)
+        );
+        assert_eq!(endpoint.fetch_count(), 0);
+        let models = manager
+            .list_models(
+                RefreshStrategy::OnlineIfUncached,
+                DEFAULT_HTTP_CLIENT_FACTORY,
+            )
+            .await
+            .expect("recover online");
+        assert!(models.iter().any(|model| model.model == "recovered-model"));
+        assert_eq!(endpoint.fetch_count(), 1);
+        let cache = manager
+            .cache_manager
+            .load_fresh(&crate::client_version_to_whole())
+            .await
+            .expect("read repaired cache")
+            .expect("fresh cache");
+        assert_eq!(cache.models[0].slug, "recovered-model");
+    }
+}
+
+#[tokio::test]
+async fn metadata_keeps_catalog_policy_with_personality_and_accepts_unknown_window_override() {
+    use codex_protocol::config_types::Personality;
+    let mut model = remote_model("gpt-5.2-codex", "Personality", 1);
+    model.base_instructions = "Catalog operating policy".into();
+    let manager = static_manager_for_tests(ModelsResponse {
+        models: vec![model],
+    });
+    let config = ModelsManagerConfig {
+        personality_enabled: true,
+        ..Default::default()
+    };
+    let info = manager.get_model_info("gpt-5.2-codex", &config).await;
+    assert_eq!(
+        info.get_model_instructions(Some(Personality::Friendly)),
+        "You optimize for team morale and being a supportive teammate as much as code quality.\n\nCatalog operating policy"
+    );
+    let disabled = manager
+        .get_model_info("gpt-5.2-codex", &ModelsManagerConfig::default())
+        .await;
+    assert_eq!(
+        disabled.get_model_instructions(None),
+        "Catalog operating policy"
+    );
+    let unknown = manager
+        .get_model_info(
+            "unknown-model",
+            &ModelsManagerConfig {
+                model_context_window: Some(500_000),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(unknown.used_fallback_model_metadata);
+    assert_eq!(unknown.context_window, Some(500_000));
+    assert_eq!(unknown.max_context_window, None);
 }
 
 #[tokio::test]
@@ -662,9 +811,10 @@ async fn offline_refresh_checks_cache_identity_once_before_the_cache_read() {
     let codex_home = tempdir().expect("temp dir");
     let identity_reads = Arc::new(AtomicUsize::new(0));
     let identity_reads_for_cache = Arc::clone(&identity_reads);
+    let endpoint = TestModelsEndpoint::without_refresh(Vec::new());
     let manager = OpenAiModelsManager::new(
         codex_home.path().to_path_buf(),
-        TestModelsEndpoint::without_refresh(Vec::new()),
+        endpoint.clone(),
         None,
         Arc::new(move || {
             identity_reads_for_cache.fetch_add(1, Ordering::SeqCst);
@@ -673,12 +823,40 @@ async fn offline_refresh_checks_cache_identity_once_before_the_cache_read() {
     );
     identity_reads.store(0, Ordering::SeqCst);
 
-    manager
-        .refresh_available_models(RefreshStrategy::Offline, &DEFAULT_HTTP_CLIENT_FACTORY)
-        .await
-        .expect("offline cache refresh should succeed");
+    let catalog = ModelsManager::raw_model_catalog(
+        &manager,
+        RefreshStrategy::Offline,
+        DEFAULT_HTTP_CLIENT_FACTORY,
+    )
+    .await
+    .expect("offline cache refresh should succeed");
 
     assert_eq!(identity_reads.load(Ordering::SeqCst), 2);
+    assert_eq!(endpoint.eligibility_count.load(Ordering::SeqCst), 0);
+    assert!(catalog.models.iter().any(|model| model.slug == "gpt-5.4"));
+}
+
+#[tokio::test]
+#[expect(clippy::await_holding_invalid_type, reason = "Holds a reader to prove model lookup needs no exclusive state access")]
+async fn unchanged_identity_model_lookup_does_not_need_exclusive_state_access() {
+    let codex_home = tempdir().expect("temp dir");
+    let manager = openai_manager_for_tests(
+        codex_home.path().to_path_buf(),
+        TestModelsEndpoint::without_refresh(Vec::new()),
+    );
+    let _reader = manager.state.read().await;
+    let config = ModelsManagerConfig::default();
+    let lookup = manager.get_model_info("gpt-5.4", &config);
+    tokio::pin!(lookup);
+    let model = std::future::poll_fn(|cx| match lookup.as_mut().poll(cx) {
+        std::task::Poll::Ready(model) => std::task::Poll::Ready(model),
+        std::task::Poll::Pending => {
+            panic!("unchanged identity lookup must allow concurrent readers")
+        }
+    })
+    .await;
+    assert_eq!(model.slug, "gpt-5.4");
+    assert!(!model.used_fallback_model_metadata);
 }
 
 fn static_manager_for_tests(model_catalog: ModelsResponse) -> StaticModelsManager {
@@ -1277,6 +1455,7 @@ async fn refresh_available_models_keeps_merging_for_api_auth() {
     let endpoint = Arc::new(TestModelsEndpoint {
         has_command_auth: true,
         uses_codex_backend: false,
+        eligibility_count: AtomicUsize::new(0),
         responses: Mutex::new(vec![remote_models.clone()].into()),
         fetch_count: AtomicUsize::new(0),
         observed_proxy_policy: Mutex::new(None),
@@ -1869,7 +2048,7 @@ impl TestAuthAwareModelsEndpoint {
             .lock()
             .expect("responses lock should not be poisoned")
             .pop_front()
-            .unwrap_or_default();
+            .expect("unexpected authenticated model fetch: no response queued");
         Ok((models, None))
     }
 }

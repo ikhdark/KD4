@@ -68,6 +68,7 @@ mod backfill;
 mod external_agent_config_imports;
 mod goals;
 mod logs;
+pub use logs::LogReader;
 pub(crate) use logs::LogRetentionScope;
 mod memories;
 mod recovery;
@@ -222,44 +223,34 @@ impl StateRuntime {
         let goals_path = GOALS_DB.path(codex_home.as_path());
         let memories_path = MEMORIES_DB.path(codex_home.as_path());
         let telemetry = telemetry_override.as_deref();
-        let pool = match open_state_sqlite(&state_path, &state_migrator, telemetry).await {
-            Ok(db) => Arc::new(db),
-            Err(err) => {
-                warn!("failed to open state db at {}: {err}", state_path.display());
-                return Err(err);
+        // These migrations touch only their own database. Await every opener
+        // so failure cleanup also closes pools that succeeded concurrently.
+        let results = tokio::join!(
+            open_state_sqlite(&state_path, &state_migrator, telemetry),
+            open_logs_sqlite(&logs_path, &logs_migrator, telemetry),
+            open_goals_sqlite(&goals_path, &goals_migrator, telemetry),
+            open_memories_sqlite(&memories_path, &memories_migrator, telemetry),
+        );
+        let results = [results.0, results.1, results.2, results.3];
+        if results.iter().any(Result::is_err) {
+            for pool in results.iter().filter_map(|result| result.as_ref().ok()) {
+                pool.close().await;
             }
-        };
-        let logs_pool = match open_logs_sqlite(&logs_path, &logs_migrator, telemetry).await {
-            Ok(db) => Arc::new(db),
-            Err(err) => {
-                warn!("failed to open logs db at {}: {err}", logs_path.display());
-                close_sqlite_pools(&[pool.as_ref()]).await;
-                return Err(err);
-            }
-        };
-        let goals_pool = match open_goals_sqlite(&goals_path, &goals_migrator, telemetry).await {
-            Ok(db) => Arc::new(db),
-            Err(err) => {
-                warn!("failed to open goals db at {}: {err}", goals_path.display());
-                close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref()]).await;
-                return Err(err);
-            }
-        };
-        let memories_pool =
-            match open_memories_sqlite(&memories_path, &memories_migrator, telemetry).await {
-                Ok(db) => Arc::new(db),
-                Err(err) => {
-                    warn!(
-                        "failed to open memories db at {}: {err}",
-                        memories_path.display()
-                    );
-                    close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref(), goals_pool.as_ref()])
-                        .await;
-                    return Err(err);
-                }
-            };
+        }
+        let [pool, logs_pool, goals_pool, memories_pool] = results;
+        let (pool, logs_pool, goals_pool, memories_pool) =
+            (Arc::new(pool?), Arc::new(logs_pool?), Arc::new(goals_pool?), Arc::new(memories_pool?));
         let started = Instant::now();
-        let backfill_state_result = ensure_backfill_state_row_in_pool(pool.as_ref()).await;
+        let backfill_state_result = ensure_backfill_state_row_in_pool(pool.as_ref())
+            .await
+            .map_err(|source| {
+                anyhow::Error::new(recovery::RuntimeDbInitError::new(
+                    STATE_DB.label,
+                    "ensure backfill state",
+                    &state_path,
+                    source,
+                ))
+            });
         crate::telemetry::record_init_result(
             telemetry,
             DbKind::State,
@@ -288,7 +279,14 @@ SELECT
             )
             .fetch_one(pool.as_ref())
             .await
-            .map_err(anyhow::Error::from);
+            .map_err(|source| {
+                anyhow::Error::new(recovery::RuntimeDbInitError::new(
+                    STATE_DB.label,
+                    "initialize thread timestamps",
+                    &state_path,
+                    source.into(),
+                ))
+            });
         crate::telemetry::record_init_result(
             telemetry,
             DbKind::State,
@@ -326,7 +324,13 @@ SELECT
                 memories_pool.as_ref(),
             ])
             .await;
-            return Err(err);
+            return Err(recovery::RuntimeDbInitError::new(
+                STATE_DB.label,
+                "register agent job runner",
+                &state_path,
+                err,
+            )
+            .into());
         }
         let (agent_job_runner_heartbeat_shutdown, heartbeat_shutdown_rx) =
             tokio::sync::watch::channel(false);
@@ -350,12 +354,6 @@ SELECT
             thread_updated_at_millis: Arc::new(AtomicI64::new(thread_updated_at_millis)),
             thread_recency_at_millis: Arc::new(AtomicI64::new(thread_recency_at_millis)),
         });
-        if let Err(err) = runtime.run_logs_startup_maintenance().await {
-            warn!(
-                "failed to run startup maintenance for logs db at {}: {err}",
-                logs_path.display(),
-            );
-        }
         Ok(runtime)
     }
 

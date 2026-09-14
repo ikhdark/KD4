@@ -40,6 +40,7 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
             text=True,
             capture_output=True,
             check=False,
+            timeout=120,
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -77,7 +78,7 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
             self.assertEqual(target.read_bytes(), fake_codex.read_bytes())
-            self.assertFalse((install_dir / "backups").exists())
+            self.assertFalse((install_dir.parent / "publisher-backups").exists())
             self.assert_proof_value(result.stdout, "sourceBuildStale", "False")
             self.assert_proof_value(result.stdout, "sourceSha256Mode", "hashed")
             self.assert_proof_value(result.stdout, "binaryChanged", "false")
@@ -135,7 +136,13 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 result.stdout, "codeModeHostPostPublishVerify", "sha256 ok"
             )
             self.assert_proof_value(result.stdout, "restartRequired", "true")
-            self.assertFalse((install_dir / "backups").exists())
+            self.assertEqual(
+                {
+                    path.name
+                    for path in (install_dir.parent / "publisher-backups").iterdir()
+                },
+                {".codex-local-publish-backups"},
+            )
             self.assert_no_publish_temps(install_dir)
 
     def test_same_size_mtime_different_content_requires_replacement(self) -> None:
@@ -770,6 +777,10 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
             os.utime(target, (source_timestamp, source_timestamp))
             self.install_matching_publish_helpers(install_dir)
 
+            observed = {
+                name: temp_path / (name + ".called")
+                for name in ("Write-ProofLine", "Get-AppxPackage")
+            }
             result = self.run_script(
                 "-DryRun",
                 "-SkipBuild",
@@ -778,8 +789,11 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 str(fake_codex),
                 "-InstallDir",
                 str(install_dir),
+                observe_commands=observed,
             )
 
+            self.assertTrue(observed["Write-ProofLine"].exists(), result.stderr)
+            self.assertFalse(observed["Get-AppxPackage"].exists())
             self.assertEqual(
                 result.returncode,
                 0,
@@ -808,6 +822,10 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
             os.utime(target, (source_timestamp, source_timestamp))
             self.install_matching_publish_helpers(install_dir)
 
+            observed = {
+                name: temp_path / (name + ".called")
+                for name in ("Write-ProofLine", "Invoke-DoctorForPublish")
+            }
             result = self.run_script(
                 "-SkipBuild",
                 "-RunDoctor",
@@ -815,8 +833,11 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 str(fake_codex),
                 "-InstallDir",
                 str(install_dir),
+                observe_commands=observed,
             )
 
+            self.assertTrue(observed["Write-ProofLine"].exists(), result.stderr)
+            self.assertFalse(observed["Invoke-DoctorForPublish"].exists())
             self.assertEqual(
                 result.returncode,
                 0,

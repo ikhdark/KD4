@@ -3,7 +3,7 @@ use rand::RngCore;
 use sha2::Digest;
 use sha2::Sha256;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PkceCodes {
     pub code_verifier: String,
     pub code_challenge: String,

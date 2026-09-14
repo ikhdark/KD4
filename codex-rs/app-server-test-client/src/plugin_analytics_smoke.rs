@@ -1,5 +1,9 @@
 use super::CodexClient;
 use super::loopback_responses_server::LoopbackResponsesServer;
+use super::plugin_analytics_capture::is_string_array;
+use super::plugin_analytics_capture::read_capture_events;
+use super::plugin_analytics_capture::require_field_type;
+use super::plugin_analytics_capture::validate_capability_metadata;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
@@ -65,24 +69,28 @@ pub(super) fn run(
     ];
     let mut client = CodexClient::spawn_stdio_with_env(codex_bin, &overrides, &child_environment)?;
     wait_until_capture_is_ready(&capture_path)?;
-    client.initialize()?;
+    let expected =
+        client.with_operation_deadline(Instant::now() + PLUGIN_READY_TIMEOUT, |client| {
+            client.initialize()?;
 
-    let installed = plugin_installed(&mut client)?;
-    let expected = expected_plugin(&installed, plugin_id)?;
-    write_plugin_enabled(
-        &mut client,
-        temporary_config.path(),
-        plugin_id,
-        /*enabled*/ false,
-    )?;
-    write_plugin_enabled(
-        &mut client,
-        temporary_config.path(),
-        plugin_id,
-        /*enabled*/ true,
-    )?;
+            let installed = plugin_installed(client)?;
+            let expected = expected_plugin(&installed, plugin_id)?;
+            write_plugin_enabled(
+                client,
+                temporary_config.path(),
+                plugin_id,
+                /*enabled*/ false,
+            )?;
+            write_plugin_enabled(
+                client,
+                temporary_config.path(),
+                plugin_id,
+                /*enabled*/ true,
+            )?;
+            Ok(expected)
+        })?;
 
-    wait_for_plugin_usage(
+    let (thread_id, turn_id) = wait_for_plugin_usage(
         &mut client,
         &capture_path,
         &expected,
@@ -91,6 +99,12 @@ pub(super) fn run(
 
     let events = wait_for_plugin_events(&capture_path, plugin_id)?;
     let validated = validate_plugin_events(events, &expected)?;
+    for event in &validated {
+        if event["event_type"] == "codex_plugin_used" {
+            require_string(&event["event_params"], "thread_id", &thread_id)?;
+            require_string(&event["event_params"], "turn_id", &turn_id)?;
+        }
+    }
     println!(
         "\n[plugin analytics smoke validated]\n{}",
         serde_json::to_string_pretty(&validated)?
@@ -99,7 +113,10 @@ pub(super) fn run(
     Ok(())
 }
 
-fn run_plugin_turn(client: &mut CodexClient, expected: &ExpectedPlugin) -> Result<String> {
+fn run_plugin_turn(
+    client: &mut CodexClient,
+    expected: &ExpectedPlugin,
+) -> Result<(String, String)> {
     let thread = client.thread_start(ThreadStartParams {
         model: Some(MOCK_MODEL_SLUG.to_string()),
         model_provider: Some(MOCK_PROVIDER_ID.to_string()),
@@ -125,7 +142,7 @@ fn run_plugin_turn(client: &mut CodexClient, expected: &ExpectedPlugin) -> Resul
             client.last_turn_error_message
         );
     }
-    Ok(turn.turn.id)
+    Ok((thread.thread.id, turn.turn.id))
 }
 
 fn wait_for_plugin_usage(
@@ -133,8 +150,8 @@ fn wait_for_plugin_usage(
     capture_path: &Path,
     expected: &ExpectedPlugin,
     deadline: Instant,
-) -> Result<()> {
-    client.with_stdio_deadline(deadline, |client| {
+) -> Result<(String, String)> {
+    client.with_operation_deadline(deadline, |client| {
         wait_for_plugin_usage_until(client, capture_path, expected, deadline)
     })
 }
@@ -144,26 +161,27 @@ fn wait_for_plugin_usage_until(
     capture_path: &Path,
     expected: &ExpectedPlugin,
     deadline: Instant,
-) -> Result<()> {
+) -> Result<(String, String)> {
     let mut attempts = 0;
     loop {
         if Instant::now() >= deadline {
             bail!("plugin usage deadline expired before another turn attempt");
         }
         attempts += 1;
-        let turn_id = run_plugin_turn(client, expected)?;
+        let (thread_id, turn_id) = run_plugin_turn(client, expected)?;
         // Turn completion is queued after plugin usage, so its captured event is the
         // barrier that tells us whether this attempt resolved the plugin.
         let events = wait_for_turn_analytics(capture_path, &turn_id, deadline)?;
         if events.iter().any(|event| {
             event["event_type"] == "codex_plugin_used"
                 && event["event_params"]["turn_id"].as_str() == Some(turn_id.as_str())
+                && event["event_params"]["thread_id"].as_str() == Some(thread_id.as_str())
                 && event["event_params"]["plugin_id"].as_str() == Some(expected.plugin_id.as_str())
         }) {
             if attempts > 1 {
                 println!("remote plugin bundle became ready after {attempts} turn attempts");
             }
-            return Ok(());
+            return Ok((thread_id, turn_id));
         }
         if Instant::now() >= deadline {
             bail!(
@@ -309,6 +327,11 @@ pub(super) fn prepare_capture_file(path: &Path) -> Result<()> {
     let parent = path
         .parent()
         .context("capture file must have a parent directory")?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
     if !parent.is_dir() {
         bail!(
             "capture file parent directory does not exist: {}",
@@ -407,34 +430,6 @@ fn read_plugin_events(path: &Path, plugin_id: &str) -> Result<Vec<Value>> {
         .collect())
 }
 
-fn read_capture_events(path: &Path) -> Result<Vec<Value>> {
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(err).with_context(|| format!("read capture file {}", path.display()));
-        }
-    };
-    let mut captured = Vec::new();
-    for (index, line) in contents.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let payload: Value = serde_json::from_str(line).with_context(|| {
-            format!(
-                "parse analytics capture line {} from {}",
-                index + 1,
-                path.display()
-            )
-        })?;
-        let events = payload["events"]
-            .as_array()
-            .context("analytics capture payload is missing events")?;
-        captured.extend(events.iter().cloned());
-    }
-    Ok(captured)
-}
-
 fn validate_plugin_events(events: Vec<Value>, expected: &ExpectedPlugin) -> Result<Vec<Value>> {
     let mut validated = Vec::new();
     for event_type in required_event_types() {
@@ -483,18 +478,10 @@ fn validate_identity(event: &Value, expected: &ExpectedPlugin) -> Result<()> {
 
 fn validate_used_metadata(event: &Value) -> Result<()> {
     let params = &event["event_params"];
-    for field in [
-        "has_skills",
-        "mcp_server_count",
-        "connector_ids",
-        "mcp_server_names",
-        "thread_id",
-        "turn_id",
-        "model_slug",
-    ] {
-        if params.get(field).is_none_or(Value::is_null) {
-            bail!("codex_plugin_used event has null or missing `{field}`");
-        }
+    validate_capability_metadata(params)?;
+    require_field_type(params, "mcp_server_names", is_string_array)?;
+    for field in ["thread_id", "turn_id", "model_slug"] {
+        require_field_type(params, field, Value::is_string)?;
     }
     require_string(params, "model_slug", MOCK_MODEL_SLUG)
 }
@@ -604,7 +591,7 @@ mod deadline_tests {
         assert!(start.elapsed() < Duration::from_secs(1));
         let event =
             json!({"event_type":"codex_turn_event", "event_params":{"turn_id":"expected-turn"}});
-        std::fs::write(&capture, json!({"events":[event.clone()]}).to_string())
+        std::fs::write(&capture, json!({"events":[event]}).to_string())
             .expect("actual capture event");
         let events = wait_for_turn_analytics(
             &capture,
@@ -615,8 +602,24 @@ mod deadline_tests {
         assert_eq!(events, vec![event]);
     }
     #[test]
+    fn capture_preparation_accepts_a_bare_relative_filename() {
+        let capture = tempfile::NamedTempFile::new_in(".")
+            .unwrap()
+            .into_temp_path();
+        let relative = Path::new(capture.file_name().unwrap());
+        assert!(relative.is_file());
+        prepare_capture_file(relative).unwrap();
+        assert!(!relative.exists(), "the previous capture must be removed");
+    }
+
+    #[test]
     fn smoke_deadline_reaches_turn_stream_and_capture_through_normal_usage() {
-        for (complete_turn, capture_usage) in [(false, false), (true, false), (true, true)] {
+        for (complete_turn, capture_usage, matching_thread) in [
+            (false, false, true),
+            (true, false, true),
+            (true, true, true),
+            (true, true, false),
+        ] {
             let temp = tempfile::tempdir().expect("normal usage peer root");
             let log = temp.path().join("requests.jsonl");
             let thread_result = json!({
@@ -657,7 +660,7 @@ mod deadline_tests {
             if capture_usage {
                 std::fs::write(&capture, json!({"events":[
                     {"event_type":"codex_turn_event", "event_params":{"turn_id":"fixture-turn"}},
-                    {"event_type":"codex_plugin_used", "event_params":{"turn_id":"fixture-turn", "plugin_id":"fixture-plugin"}}
+                    {"event_type":"codex_plugin_used", "event_params":{"turn_id":"fixture-turn", "thread_id": if matching_thread { "fixture-thread" } else { "other-thread" }, "plugin_id":"fixture-plugin"}}
                 ]}).to_string()).expect("actual matching capture records");
             } else {
                 std::fs::write(&capture, "").expect("real empty capture");
@@ -669,8 +672,11 @@ mod deadline_tests {
                 &expected,
                 start + Duration::from_millis(800),
             );
-            if capture_usage {
-                result.expect("normal usage resolves the matching captured turn and plugin");
+            if capture_usage && matching_thread {
+                assert_eq!(
+                    result.expect("normal usage resolves the matching captured turn and plugin"),
+                    ("fixture-thread".into(), "fixture-turn".into())
+                );
                 assert_eq!(client.last_turn_status, Some(TurnStatus::Completed));
             } else {
                 let error =
@@ -686,14 +692,18 @@ mod deadline_tests {
                 .lines()
                 .map(|line| serde_json::from_str::<Value>(line).expect("RPC request"))
                 .collect::<Vec<_>>();
-            assert_eq!(
-                requests
-                    .iter()
-                    .map(|request| request["method"].as_str().expect("method"))
-                    .collect::<Vec<_>>(),
-                vec!["thread/start", "turn/start"],
-                "expiry must not admit another complete turn attempt"
-            );
+            let methods = requests
+                .iter()
+                .map(|request| request["method"].as_str().expect("method"))
+                .collect::<Vec<_>>();
+            assert!(methods.starts_with(&["thread/start", "turn/start"]));
+            if matching_thread {
+                assert_eq!(
+                    methods.len(),
+                    2,
+                    "expiry must not admit another complete turn attempt"
+                );
+            }
             assert_eq!(requests[1]["params"]["threadId"], "fixture-thread");
             assert_eq!(
                 requests[1]["params"]["input"][0]["path"],

@@ -551,7 +551,7 @@ async fn remote_control_pairing_status_preserves_decode_error_context() {
     )));
     assert!(err.contains("request-id: request-123"));
     assert!(err.contains("cf-ray: ray-123"));
-    assert!(err.contains("body: {"));
+    assert!(err.contains("body: <omitted non-JSON response body>"));
     assert!(err.contains("decode error:"));
 }
 
@@ -884,7 +884,7 @@ async fn start_remote_control_pairing_preserves_backend_error_context() {
     assert_eq!(
         err,
         format!(
-            "remote control pairing failed at `{expected_pair_url}`: HTTP 503 Service Unavailable, request-id: request-123, cf-ray: ray-123, body: pairing unavailable"
+            "remote control pairing failed at `{expected_pair_url}`: HTTP 503 Service Unavailable, request-id: request-123, cf-ray: ray-123, body: <omitted non-JSON response body>"
         )
     );
 }
@@ -897,7 +897,7 @@ async fn start_remote_control_pairing_preserves_decode_error_context() {
     )));
     assert!(err.contains("request-id: request-123"));
     assert!(err.contains("cf-ray: ray-123"));
-    assert!(err.contains("body: {"));
+    assert!(err.contains("body: <omitted non-JSON response body>"));
     assert!(err.contains("decode error:"));
 }
 
@@ -953,6 +953,15 @@ async fn remote_control_handle_disable_keeps_current_enrollment() {
 
 #[tokio::test]
 async fn remote_control_handle_reenrolls_after_stale_pairing_enrollment() {
+    pairing_reenrollment(false).await;
+}
+
+#[tokio::test]
+async fn pairing_replaces_a_stale_enrollment_only_once() {
+    pairing_reenrollment(true).await;
+}
+
+async fn pairing_reenrollment(retry_not_found: bool) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("listener should bind");
@@ -1035,6 +1044,13 @@ async fn remote_control_handle_reenrolls_after_stale_pairing_enrollment() {
                 "Bearer {TEST_REFRESHED_REMOTE_CONTROL_SERVER_TOKEN}"
             ))
         );
+        if retry_not_found {
+            respond_with_status(refreshed_pairing_request.stream, "404 Not Found", "").await;
+            timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .expect_err("a failed retry must not create another enrollment");
+            return;
+        }
         respond_with_json(
             refreshed_pairing_request.stream,
             pairing_response_json(
@@ -1049,11 +1065,28 @@ async fn remote_control_handle_reenrolls_after_stale_pairing_enrollment() {
             RemoteControlPairingStartParams::default(),
             /*app_server_client_name*/ None,
         )
-        .await
-        .expect("pairing should re-enroll after stale enrollment");
+        .await;
     server_task.await.expect("server task should finish");
 
-    assert_eq!(response, pairing_response("env_refreshed"));
+    if retry_not_found {
+        assert_eq!(
+            response.expect_err("second 404 should fail").kind(),
+            io::ErrorKind::InvalidInput
+        );
+    } else {
+        assert_eq!(
+            response.expect("pairing should re-enroll after stale enrollment"),
+            pairing_response("env_refreshed")
+        );
+    }
+    assert_eq!(
+        remote_handle
+            .current_enrollment
+            .snapshot()
+            .expect("replacement should remain")
+            .server_id,
+        "srv_e_refreshed"
+    );
     assert_eq!(
         state_db
             .get_remote_control_enrollment(
@@ -1136,4 +1169,44 @@ async fn remote_control_handle_discards_pairing_response_after_auth_change() {
             .to_string(),
         "remote control pairing is unavailable until enrollment completes"
     );
+}
+
+#[tokio::test]
+async fn invalid_pairing_status_does_not_load_or_enroll() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let handle = remote_control_handle_with_current_enrollment(
+        &remote_control_url_for_listener(&listener),
+        remote_control_auth_manager(),
+    );
+    *handle.current_enrollment.lock().await = None;
+    let err = handle
+        .pairing_status(RemoteControlPairingStatusParams {
+            pairing_code: None,
+            manual_pairing_code: None,
+        })
+        .await
+        .expect_err("missing code should fail before enrollment");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(handle.current_enrollment.snapshot().is_none());
+    timeout(Duration::from_millis(100), listener.accept())
+        .await
+        .expect_err("invalid input must not start a request");
+}
+
+#[tokio::test]
+async fn pairing_errors_do_not_disclose_malformed_or_scalar_credentials() {
+    for body in [
+        r#"{"pairing_code":"secret-credential","#,
+        r#""secret-credential""#,
+    ] {
+        let (err, url) = pairing_error("200 OK", body).await;
+        assert!(err.contains(&url));
+        assert!(err.contains("request-id: request-123"));
+        assert!(err.contains("cf-ray: ray-123"));
+        assert!(err.contains("body: <omitted"));
+        assert!(err.contains("decode error:"));
+        assert!(!err.contains("secret-credential"));
+    }
 }

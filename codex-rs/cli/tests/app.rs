@@ -3,7 +3,7 @@
 use predicates::prelude::*;
 
 #[test]
-fn app_reports_installer_override_launch_failure() -> anyhow::Result<()> {
+fn app_reports_installation_probe_failure_without_launching_installer() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let codex_home = temp_dir.path().join("home");
     std::fs::create_dir(&codex_home)?;
@@ -26,8 +26,9 @@ fn app_reports_installer_override_launch_failure() -> anyhow::Result<()> {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "failed to open https://installer.invalid/codex.exe",
+            "failed to check Codex Desktop installation",
         ))
-        .stderr(predicate::str::contains("After installing").not());
+        .stderr(predicate::str::contains("After installing").not())
+        .stderr(predicate::str::contains("opening Windows installer").not());
     Ok(())
 }

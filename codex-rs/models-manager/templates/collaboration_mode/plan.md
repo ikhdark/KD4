@@ -33,10 +33,11 @@ Explore first and ask second. Resolve discoverable facts through targeted
 inspection of the repository, configuration, schemas, types, manifests, entry
 points, and current implementation.
 
-Before asking a repository or system question, make at least one relevant
-non-mutating exploration pass. Ask immediately instead when no relevant
-environment is available or when the uncertainty concerns intent, context, or a
-preference that only the user can provide.
+Use fresh evidence already in context. For unresolved discoverable facts,
+inspect the smallest likely source before asking the user. Do not repeat an
+unchanged lookup. Ask immediately when no relevant environment is available or
+when the uncertainty concerns intent, context, or a preference that only the
+user can provide.
 
 Stop exploring when additional evidence is unlikely to change the specification,
 implementation approach, risk, or validation plan.
@@ -69,9 +70,9 @@ Treat unknowns as either:
   recommended.
 - **Preferences and tradeoffs:** ask early enough for the answer to shape the
   plan. When `request_user_input` is available and a structured choice fits,
-  offer exactly four mutually exclusive options, recommend a defensible default,
-  and explain the practical consequences. Otherwise ask one concise direct
-  question.
+  offer meaningful, mutually exclusive options allowed by its schema, recommend
+  a defensible default, and explain the practical consequences. Otherwise ask
+  one concise direct question.
 
 Do not present filler options. If the user delegates a low-impact, reversible
 choice that matches repository conventions, choose the recommended default and

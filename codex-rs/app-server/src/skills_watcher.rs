@@ -261,13 +261,100 @@ impl SkillsWatcher {
                 if event.is_none() {
                     break;
                 }
-                outgoing
-                    .send_server_notification(ServerNotification::SkillsChanged(
-                        SkillsChangedNotification {},
-                    ))
-                    .await;
+                tokio::select! {
+                    biased;
+                    _ = shutdown_token.cancelled() => break,
+                    result = tokio::time::timeout(
+                        crate::outgoing_message::RESOURCE_DELIVERY_TIMEOUT,
+                        outgoing.send_server_notification(ServerNotification::SkillsChanged(
+                            SkillsChangedNotification {},
+                        )),
+                    ) => {
+                        if result.is_err() {
+                            warn!("timed out enqueueing skills change notification");
+                        }
+                    }
+                }
             }
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn backpressured_notifications_allow_later_invalidation_and_shutdown() {
+        let home = tempfile::tempdir().expect("temporary home");
+        let roots = tempfile::tempdir().expect("temporary skills");
+        let skill_dir = roots.path().join("watched");
+        std::fs::create_dir(&skill_dir).expect("create skill directory");
+        let skill_path = skill_dir.join("SKILL.md");
+        let write_skill = |description: &str| {
+            std::fs::write(
+                &skill_path,
+                format!("---\nname: watched\ndescription: {description}\n---\nInstructions\n"),
+            )
+            .expect("write skill");
+        };
+        write_skill("initial");
+        let root = AbsolutePathBuf::from_absolute_path(roots.path()).expect("absolute root");
+        let skills = Arc::new(SkillsService::new(
+            AbsolutePathBuf::from_absolute_path(home.path()).expect("absolute home"),
+            false,
+        ));
+        skills.set_extra_roots(vec![root.clone()]);
+        let input = SkillsLoadInput::new(
+            root.clone(),
+            Vec::new(),
+            codex_config::ConfigLayerStack::default(),
+            false,
+        );
+        let initial = skills.snapshot_for_config(&input, None).await;
+        assert_eq!(initial.outcome().skills[0].description, "initial");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        assert!(
+            outgoing.try_send_server_notification(ServerNotification::SkillsChanged(
+                SkillsChangedNotification {},
+            ))
+        );
+        let watcher = SkillsWatcher::new(Arc::clone(&skills), Arc::clone(&outgoing));
+        watcher
+            .register_runtime_extra_roots(&[root])
+            .expect("watch skills");
+
+        // Observe real cache invalidation while the outgoing queue remains full.
+        for description in ["first change", "second change"] {
+            write_skill(description);
+            tokio::time::timeout(Duration::from_secs(8), async {
+                loop {
+                    let snapshot = skills.snapshot_for_config(&input, None).await;
+                    if snapshot.outcome().skills[0].description == description {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("notification backpressure must not indefinitely block invalidation");
+            // Let the throttled notification reach the already full transport.
+            tokio::time::sleep(WATCHER_THROTTLE_INTERVAL * 2).await;
+        }
+        watcher.shutdown();
+        drop(watcher);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&outgoing) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown must release the event loop despite a full queue");
+        assert_eq!(rx.len(), 1);
     }
 }

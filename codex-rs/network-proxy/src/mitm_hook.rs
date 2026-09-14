@@ -251,8 +251,9 @@ pub(crate) fn evaluate_mitm_hooks(
         return HookEvaluation::NoHooksForHost;
     };
 
+    let mut query_values = None;
     for hook in hooks {
-        if hook_matches(hook, req) {
+        if hook_matches(hook, req, &mut query_values) {
             return HookEvaluation::Matched {
                 actions: hook.actions.clone(),
             };
@@ -370,8 +371,9 @@ where
     };
 
     let prefix = header.prefix.clone().unwrap_or_default();
-    let value = HeaderValue::from_str(&format!("{prefix}{secret}"))
+    let mut value = HeaderValue::from_str(&format!("{prefix}{secret}"))
         .with_context(|| format!("invalid value for injected header {}", header.name))?;
+    value.set_sensitive(true);
 
     Ok(ResolvedInjectedHeader {
         name,
@@ -380,7 +382,11 @@ where
     })
 }
 
-fn hook_matches(hook: &MitmHook, req: &Request) -> bool {
+fn hook_matches(
+    hook: &MitmHook,
+    req: &Request,
+    query_values: &mut Option<BTreeMap<String, Vec<String>>>,
+) -> bool {
     let method = req.method().as_str().to_ascii_uppercase();
     if !hook
         .matcher
@@ -396,26 +402,33 @@ fn hook_matches(hook: &MitmHook, req: &Request) -> bool {
         return false;
     }
 
-    if !query_matches(&hook.matcher.query, req) {
+    if !query_matches(&hook.matcher.query, req, query_values) {
         return false;
     }
 
     headers_match(&hook.matcher.headers, req)
 }
 
-fn query_matches(query_constraints: &[QueryConstraint], req: &Request) -> bool {
+fn query_matches(
+    query_constraints: &[QueryConstraint],
+    req: &Request,
+    query_values: &mut Option<BTreeMap<String, Vec<String>>>,
+) -> bool {
     if query_constraints.is_empty() {
         return true;
     }
 
-    let actual_query = req.uri().query().unwrap_or_default();
-    let mut actual_values: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (name, value) in form_urlencoded::parse(actual_query.as_bytes()) {
-        actual_values
-            .entry(name.into_owned())
-            .or_default()
-            .push(value.into_owned());
-    }
+    let actual_values = query_values.get_or_insert_with(|| {
+        let actual_query = req.uri().query().unwrap_or_default();
+        let mut values: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (name, value) in form_urlencoded::parse(actual_query.as_bytes()) {
+            values
+                .entry(name.into_owned())
+                .or_default()
+                .push(value.into_owned());
+        }
+        values
+    });
 
     query_constraints.iter().all(|constraint| {
         actual_values.get(&constraint.name).is_some_and(|actual| {

@@ -34,3 +34,41 @@ async fn seeds_instructions_without_overwriting_existing_file() {
         "custom instructions"
     );
 }
+
+#[tokio::test]
+async fn concurrent_seeders_observe_complete_instructions() {
+    let home = TempDir::new().unwrap();
+    let root = home.path().join("memories");
+    let path = memory_extensions_root(&root).join("ad_hoc/instructions.md");
+    let seed = || async {
+        seed_instructions(&root).await.unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            INSTRUCTIONS
+        );
+    };
+    tokio::join!(seed(), seed(), seed(), seed());
+    assert_eq!(
+        std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn failed_seeding_does_not_publish_instructions() {
+    let home = TempDir::new().unwrap();
+    let root = home.path().join("memories");
+    let extensions = memory_extensions_root(&root);
+    tokio::fs::create_dir_all(&extensions).await.unwrap();
+    tokio::fs::write(extensions.join("ad_hoc"), "blocking file")
+        .await
+        .unwrap();
+    assert!(seed_instructions(&root).await.is_err());
+    assert!(!extensions.join("ad_hoc/instructions.md").exists());
+    assert_eq!(
+        tokio::fs::read_to_string(extensions.join("ad_hoc"))
+            .await
+            .unwrap(),
+        "blocking file"
+    );
+}

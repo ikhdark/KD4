@@ -79,11 +79,10 @@ async fn save_writes_signed_payload_and_loads_for_matching_identity() {
     let cache_file: CloudConfigBundleCacheFile =
         serde_json::from_slice(&std::fs::read(cache.path()).expect("read cache"))
             .expect("parse cache");
-    assert!(
-        cache_file.signed_payload.expires_at
-            <= cache_file.signed_payload.cached_at + ChronoDuration::minutes(60)
+    assert_eq!(
+        cache_file.signed_payload.expires_at - cache_file.signed_payload.cached_at,
+        ChronoDuration::hours(1)
     );
-    assert!(cache_file.signed_payload.expires_at > cache_file.signed_payload.cached_at);
     assert_eq!(
         cache_file,
         signed_cache_file(CloudConfigBundleCacheSignedPayload {
@@ -202,5 +201,54 @@ async fn load_rejects_unsupported_cache_version() {
     assert_eq!(
         cache.load(Some("user-12345"), Some("account-12345")).await,
         Err(CacheLoadStatus::CacheVersionUnsupported(2))
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn failed_replacement_preserves_previous_snapshot() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let codex_home = tempdir().expect("tempdir");
+    let cache = create_test_cache(codex_home.path());
+    cache
+        .save(
+            Some("user-12345".into()),
+            Some("account-12345".into()),
+            test_bundle(),
+        )
+        .await
+        .expect("initial snapshot");
+    let previous = std::fs::read(cache.path()).expect("previous bytes");
+    // Deny deletion so the real rename fails after writing the temporary file.
+    // Reading and writing are permitted: a direct overwrite would succeed.
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .open(cache.path())
+        .expect("hold destination");
+    let result = cache
+        .save(
+            Some("user-12345".into()),
+            Some("account-12345".into()),
+            CloudConfigBundle::default(),
+        )
+        .await;
+    drop(held);
+    assert!(matches!(
+        result,
+        Err(CloudConfigBundleCacheError::Replace(_))
+    ));
+    assert_eq!(
+        std::fs::read(cache.path()).expect("retained bytes"),
+        previous
+    );
+    assert_eq!(
+        cache
+            .load(Some("user-12345"), Some("account-12345"))
+            .await
+            .expect("retained valid snapshot")
+            .bundle,
+        test_bundle()
     );
 }

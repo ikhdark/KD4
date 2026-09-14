@@ -188,6 +188,20 @@ pub(crate) async fn repair_legacy_validation_index_migration_order(
     pool: &SqlitePool,
     migrator: &Migrator,
 ) -> anyhow::Result<()> {
+    repair_legacy_validation_index_migration_order_inner(
+        pool,
+        migrator,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn repair_legacy_validation_index_migration_order_inner(
+    pool: &SqlitePool,
+    migrator: &Migrator,
+    #[cfg(test)] after_preflight: Option<&tokio::sync::Barrier>,
+) -> anyhow::Result<()> {
     let Some(validation_migration) = migrator
         .migrations
         .iter()
@@ -217,6 +231,25 @@ pub(crate) async fn repair_legacy_validation_index_migration_order(
     )
     .fetch_all(pool)
     .await?;
+    if !rows.iter().any(|(version, checksum)| {
+        *version == 41 && !matching_line_endings(index_migration, checksum).is_empty()
+    }) {
+        return Ok(());
+    }
+
+    #[cfg(test)]
+    if let Some(barrier) = after_preflight {
+        barrier.wait().await;
+    }
+
+    // Preflight is advisory: another initializer may repair the ledger while
+    // we wait for the writer. Recognize and mutate the same protected state.
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let rows = sqlx::query_as::<_, (i64, Vec<u8>)>(
+        "SELECT version, checksum FROM _sqlx_migrations WHERE version IN (41, 42) ORDER BY version",
+    )
+    .fetch_all(&mut *transaction)
+    .await?;
     let checksum_41 = rows
         .iter()
         .find_map(|(version, checksum)| (*version == 41).then_some(checksum.as_slice()));
@@ -237,7 +270,6 @@ pub(crate) async fn repair_legacy_validation_index_migration_order(
         );
     }
 
-    let mut transaction = pool.begin().await?;
     if version_42_is_legacy_validation {
         sqlx::query("UPDATE _sqlx_migrations SET version = -41 WHERE version = 41")
             .execute(&mut *transaction)

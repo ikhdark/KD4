@@ -266,8 +266,9 @@ fn has_rate_limit_data(snapshot: &RateLimitSnapshot) -> bool {
 }
 
 fn header_name_to_limit_id(header_name: &str) -> Option<String> {
-    let suffix = "-primary-used-percent";
-    let prefix = header_name.strip_suffix(suffix)?;
+    let prefix = header_name
+        .strip_suffix("-primary-used-percent")
+        .or_else(|| header_name.strip_suffix("-secondary-used-percent"))?;
     let limit = prefix.strip_prefix("x-")?;
     Some(normalize_limit_id(limit.to_string()))
 }
@@ -281,6 +282,39 @@ mod tests {
     use super::*;
     use http::HeaderValue;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn discovers_secondary_only_families_and_deduplicates_both_windows() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-example-secondary-used-percent",
+            HeaderValue::from_static("42"),
+        );
+        headers.insert(
+            "x-example-secondary-window-minutes",
+            HeaderValue::from_static("60"),
+        );
+        headers.insert(
+            "x-example-secondary-reset-at",
+            HeaderValue::from_static("123"),
+        );
+        let snapshots = parse_all_rate_limits(&headers);
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[1].limit_id.as_deref(), Some("example"));
+        assert!(snapshots[1].primary.is_none());
+        let secondary = snapshots[1].secondary.as_ref().unwrap();
+        assert_eq!(secondary.used_percent, 42.0);
+        assert_eq!(secondary.window_minutes, Some(60));
+        assert_eq!(secondary.resets_at, Some(123));
+        headers.insert(
+            "x-example-primary-used-percent",
+            HeaderValue::from_static("12"),
+        );
+        let snapshots = parse_all_rate_limits(&headers);
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[1].primary.as_ref().unwrap().used_percent, 12.0);
+        assert_eq!(snapshots[1].secondary.as_ref().unwrap().used_percent, 42.0);
+    }
 
     #[test]
     fn parse_rate_limit_for_limit_defaults_to_codex_headers() {

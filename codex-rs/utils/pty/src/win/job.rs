@@ -205,4 +205,15 @@ mod tests {
         assert_eq!(*job.state.lock().unwrap(), JobState::Terminated);
         Ok(())
     }
+
+    #[test]
+    fn failed_termination_cannot_be_overridden_by_preservation() -> io::Result<()> {
+        let mut job = JobObject::create()?;
+        job.restrict_to_query_access_for_test()?;
+        assert!(job.terminate().is_err());
+        job.preserve_descendants()?;
+        assert_eq!(*job.state.lock().unwrap(), JobState::TerminationRequested);
+        assert!(job.terminate().is_err());
+        Ok(())
+    }
 }

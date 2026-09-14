@@ -149,7 +149,7 @@ impl CommandPopup {
             &rows,
             &self.state,
             MAX_POPUP_ROWS,
-            width,
+            width.saturating_sub(2),
             COMMAND_COLUMN_WIDTH,
         )
     }

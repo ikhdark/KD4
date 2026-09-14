@@ -29,7 +29,6 @@ pub const CODEX_SANDBOX_ENV_VAR: &str = "CODEX_SANDBOX";
 #[derive(Debug, Clone, Copy)]
 pub enum StdioPolicy {
     RedirectForShellTool,
-    Inherit,
 }
 
 /// Spawns the appropriate child process for the exec params and sandbox settings,
@@ -99,12 +98,6 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
             cmd.stdin(Stdio::null());
 
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        }
-        StdioPolicy::Inherit => {
-            // Inherit stdin, stdout, and stderr from the parent process.
-            cmd.stdin(Stdio::inherit())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit());
         }
     }
 

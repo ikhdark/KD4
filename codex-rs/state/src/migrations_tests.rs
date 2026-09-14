@@ -479,9 +479,14 @@ fn legacy_validation_index_migrator(include_validation: bool) -> Migrator {
 
 #[tokio::test]
 async fn repairs_swapped_validation_and_index_migration_versions() {
+    let temp = tempfile::tempdir().expect("tempdir");
     let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
+        .max_connections(2)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(temp.path().join("legacy.sqlite"))
+                .create_if_missing(true),
+        )
         .await
         .expect("legacy in-memory database should open");
     legacy_validation_index_migrator(true)
@@ -500,9 +505,22 @@ INSERT INTO validation_history_aggregates (
     .await
     .expect("legacy validation data should insert");
 
-    repair_legacy_validation_index_migration_order(&pool, &STATE_MIGRATOR)
-        .await
-        .expect("recognized legacy ledger should repair");
+    // Both initializers observe the swapped ledger before either can repair it.
+    let barrier = tokio::sync::Barrier::new(2);
+    let (first, second) = tokio::join!(
+        super::repair_legacy_validation_index_migration_order_inner(
+            &pool,
+            &STATE_MIGRATOR,
+            Some(&barrier)
+        ),
+        super::repair_legacy_validation_index_migration_order_inner(
+            &pool,
+            &STATE_MIGRATOR,
+            Some(&barrier)
+        ),
+    );
+    first.expect("first repair");
+    second.expect("overlapping repair");
     repair_legacy_validation_index_migration_order(&pool, &STATE_MIGRATOR)
         .await
         .expect("ledger repair should be idempotent");
@@ -535,6 +553,7 @@ INSERT INTO validation_history_aggregates (
         .expect("validation data should remain"),
         7
     );
+    pool.close().await;
 }
 
 #[tokio::test]

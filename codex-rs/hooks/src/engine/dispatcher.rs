@@ -15,7 +15,6 @@ use super::CommandShell;
 use super::ConfiguredHandler;
 use super::command_runner::CommandRunResult;
 use super::command_runner::run_command;
-use crate::events::common::matches_matcher;
 
 #[derive(Debug)]
 pub(crate) struct ParsedHandler<T> {
@@ -54,11 +53,17 @@ pub(crate) fn select_handlers_for_matcher_inputs(
             | HookEventName::PreCompact
             | HookEventName::PostCompact => {
                 if matcher_inputs.is_empty() {
-                    matches_matcher(handler.matcher.as_deref(), /*input*/ None)
+                    handler
+                        .matcher
+                        .as_ref()
+                        .is_none_or(|matcher| matcher.matches(None))
                 } else {
-                    matcher_inputs
-                        .iter()
-                        .any(|input| matches_matcher(handler.matcher.as_deref(), Some(input)))
+                    matcher_inputs.iter().any(|input| {
+                        handler
+                            .matcher
+                            .as_ref()
+                            .is_none_or(|matcher| matcher.matches(Some(input)))
+                    })
                 }
             }
             HookEventName::UserPromptSubmit | HookEventName::Stop | HookEventName::Interrupt => {
@@ -98,10 +103,10 @@ pub(crate) async fn execute_handlers<T>(
 ) -> Vec<ParsedHandler<T>> {
     let mut pending = FuturesUnordered::new();
     for (configured_order, handler) in handlers.into_iter().enumerate() {
-        let input_json = input_json.clone();
+        let input_json = input_json.as_str();
         let turn_id = turn_id.clone();
         pending.push(async move {
-            let result = run_command(shell, &handler, configured_order, &input_json, cwd).await;
+            let result = run_command(shell, &handler, configured_order, input_json, cwd).await;
             (configured_order, parse(&handler, result, turn_id))
         });
     }
@@ -198,7 +203,9 @@ mod tests {
     ) -> ConfiguredHandler {
         ConfiguredHandler {
             event_name,
-            matcher: matcher.map(str::to_owned),
+            matcher: matcher.map(|pattern| {
+                crate::events::common::HookMatcher::new(pattern).expect("valid matcher")
+            }),
             command: command.to_string(),
             timeout_sec: 5,
             status_message: None,

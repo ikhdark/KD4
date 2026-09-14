@@ -23,6 +23,12 @@ impl ThreadRequestProcessor {
                             .thread_delete_response(params, &mut deleted_thread_ids)
                             .await
                     };
+                    if !deleted_thread_ids.is_empty()
+                        && let Some(log_db) = processor.log_db.as_ref()
+                        && let Err(err) = log_db.flush().await
+                    {
+                        tracing::warn!(%err, "failed to flush SQLite logs");
+                    }
                     match result {
                         Ok(response) => {
                             processor
@@ -228,9 +234,6 @@ impl ThreadRequestProcessor {
 
     async fn prepare_thread_for_delete(&self, thread_id: ThreadId) {
         self.prepare_thread_for_removal(thread_id, "delete").await;
-        if let Some(log_db) = self.log_db.as_ref() {
-            log_db.flush().await;
-        }
     }
 }
 

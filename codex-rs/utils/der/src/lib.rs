@@ -1,6 +1,8 @@
 //! Minimal DER boundary parsing shared by certificate consumers.
 
-/// Returns the first complete top-level DER item, excluding trailing data.
+/// Returns the leading encoded item with a one-octet tag and definite length.
+/// Checks length boundaries only, excluding trailing data; does not validate
+/// the tag, contents, or canonical DER encoding.
 pub fn first_der_item(der: &[u8]) -> Option<&[u8]> {
     der_item_length(der).map(|length| &der[..length])
 }

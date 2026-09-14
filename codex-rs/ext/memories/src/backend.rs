@@ -109,6 +109,8 @@ pub struct MemorySearchMatch {
     pub match_line_number: usize,
     pub content_start_line_number: usize,
     pub content: String,
+    /// Whether size limits omitted any requested excerpt text. Independent of result pagination.
+    pub content_truncated: bool,
     pub matched_queries: Vec<String>,
 }
 

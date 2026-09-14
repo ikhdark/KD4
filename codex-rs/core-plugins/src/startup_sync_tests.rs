@@ -25,6 +25,125 @@ fn test_http_clients() -> RouteAwareClientPool {
     )
 }
 
+#[test]
+fn plugin_command_output_snapshot_does_not_move_writer_cursor() {
+    let capture = tempfile::NamedTempFile::new().unwrap();
+    let mut writer = capture.as_file().try_clone().unwrap();
+    writer.write_all(b"first").unwrap();
+    assert_eq!(read_captured_output(&capture, true).unwrap(), b"first");
+    writer.write_all(b"second").unwrap();
+    assert_eq!(
+        read_captured_output(&capture, true).unwrap(),
+        b"firstsecond"
+    );
+    writer.set_len(COMMAND_MAX_OUTPUT_BYTES + 1).unwrap();
+    assert!(
+        read_captured_output(&capture, true)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds")
+    );
+    assert_eq!(
+        read_captured_output(&capture, false).unwrap().len() as u64,
+        COMMAND_MAX_OUTPUT_BYTES
+    );
+}
+
+#[test]
+fn zip_extraction_rejects_excessive_entries_before_writing_files() {
+    let mut zip = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for index in 0..=CURATED_PLUGINS_MAX_ARCHIVE_ENTRIES {
+        zip.add_directory(format!("root/{index}/"), SimpleFileOptions::default())
+            .unwrap();
+    }
+    let bytes = zip.finish().unwrap().into_inner();
+    let destination = tempdir().unwrap();
+    let error = extract_zipball_to_dir(&bytes, destination.path()).unwrap_err();
+    assert!(error.contains("entries"), "{error}");
+    assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn plugin_http_response_bounds_body_and_error_diagnostics() {
+    let server = MockServer::start().await;
+    for status in [200, 503] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{status}")))
+            .respond_with(ResponseTemplate::new(status).set_body_bytes(vec![b'x'; 9000]))
+            .mount(&server)
+            .await;
+        let url = format!("{}/{status}", server.uri());
+        let response = test_http_clients().get(&url).send().await.unwrap();
+        let error = crate::remote::read_plugin_http_response(response, 32)
+            .await
+            .unwrap_err();
+        match error {
+            crate::remote::PluginHttpResponseError::TooLarge { max_bytes } => {
+                assert_eq!(status, 200);
+                assert_eq!(max_bytes, 32);
+            }
+            crate::remote::PluginHttpResponseError::Status { status, body } => {
+                assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
+                assert!(body.starts_with(&"x".repeat(8192)));
+                assert!(body.ends_with("[response body truncated after 8192 bytes]"));
+                assert!(body.len() < 8300);
+            }
+            error => panic!("unexpected error: {error}"),
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn plugin_command_rejects_excessive_output() {
+    let mut command = Command::new("powershell.exe");
+    command.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "[Console]::Out.Write(('x' * 9437184)); Start-Sleep -Seconds 30",
+    ]);
+    let started = std::time::Instant::now();
+    let error = run_git_command_with_timeout(
+        &mut command,
+        "output limit fixture",
+        Duration::from_secs(10),
+    )
+    .unwrap_err();
+    assert!(error.contains("exceeds"), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(15));
+}
+
+#[cfg(unix)]
+#[test]
+fn zip_extraction_restores_executable_permission_without_special_bits() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut zip = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    zip.start_file(
+        "root/run",
+        SimpleFileOptions::default().unix_permissions(0o755),
+    )
+    .unwrap();
+    zip.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+    let bytes = zip.finish().unwrap().into_inner();
+    let destination = tempdir().unwrap();
+    extract_zipball_to_dir(&bytes, destination.path()).unwrap();
+    assert_eq!(
+        std::fs::metadata(destination.path().join("run"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o755
+    );
+    assert!(
+        Command::new(destination.path().join("run"))
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn plugin_git_unix_exit_poll_retains_root_identity_until_cleanup() {
@@ -152,6 +271,8 @@ async fn plugin_git_large_output_startup_sync() {
     let tmp = tempdir().expect("temp directory");
     let repo = curated_plugins_repo_path(tmp.path());
     std::fs::create_dir_all(repo.join(".git")).expect("existing checkout");
+    write_openai_curated_marketplace(&repo, &[]);
+    write_curated_plugins_sha(&curated_plugins_sha_path(tmp.path()), "stale-sha").unwrap();
     std::fs::write(repo.join("retained"), "installed plugin").expect("installed plugin");
     let sha = "0123456789abcdef0123456789abcdef01234567";
     let stdout_path = tmp.path().join("stdout.txt");
@@ -178,6 +299,7 @@ async fn plugin_git_large_output_startup_sync() {
     .expect("startup Git sync must finish without falling back to HTTP");
 
     assert_eq!(result, sha);
+    assert_eq!(read_curated_plugins_sha(tmp.path()).as_deref(), Some(sha));
     assert_eq!(
         std::fs::read_to_string(repo.join("retained")).expect("installed plugin"),
         "installed plugin"
@@ -788,6 +910,45 @@ async fn sync_openai_plugins_repo_skips_archive_download_when_sha_matches() {
 
     assert_eq!(read_curated_plugins_sha(tmp.path()).as_deref(), Some(sha));
     assert!(repo_path.join(".agents/plugins/marketplace.json").is_file());
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| !request.url.path().contains("zipball"))
+    );
+}
+
+#[tokio::test]
+async fn sync_openai_plugins_repo_repairs_missing_manifest_despite_matching_sha() {
+    let tmp = tempdir().unwrap();
+    let repo = curated_plugins_repo_path(tmp.path());
+    std::fs::create_dir_all(&repo).unwrap();
+    write_curated_plugin_sha(tmp.path());
+    let server = MockServer::start().await;
+    mount_github_repo_and_ref(&server, TEST_CURATED_PLUGIN_SHA).await;
+    mount_github_zipball(
+        &server,
+        TEST_CURATED_PLUGIN_SHA,
+        curated_repo_zipball_bytes(TEST_CURATED_PLUGIN_SHA),
+    )
+    .await;
+    let sha = run_http_sync(tmp.path().to_path_buf(), server.uri())
+        .await
+        .unwrap();
+    assert_eq!(sha, TEST_CURATED_PLUGIN_SHA);
+    assert_curated_gmail_repo(&repo);
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path().contains("zipball"))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -856,6 +1017,14 @@ async fn sync_openai_plugins_repo_skips_export_archive_when_snapshot_exists() {
     .expect_err("existing snapshot should suppress export fallback");
 
     assert!(err.contains("export archive fallback skipped"));
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| !request.url.path().contains("/export/"))
+    );
     assert_eq!(
         std::fs::read_to_string(&plugin_manifest_path).expect("read plugin manifest after sync"),
         original_manifest

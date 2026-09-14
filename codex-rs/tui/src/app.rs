@@ -356,7 +356,6 @@ impl AppExitInfo {
     }
 
     pub fn format_exit_messages(self, color_enabled: bool) -> Vec<String> {
-        let is_fatal = matches!(&self.exit_reason, ExitReason::Fatal(_));
         let Self {
             token_usage,
             thread_id,
@@ -376,7 +375,7 @@ impl AppExitInfo {
                 resume_cmd
             };
             lines.push(format!("To continue this session, run {command}"));
-        } else if is_fatal && let Some(thread_id) = thread_id {
+        } else if let Some(thread_id) = thread_id {
             lines.push(format!("Session ID: {thread_id}"));
         }
 
@@ -401,17 +400,22 @@ async fn session_summary(
     thread_id: Option<ThreadId>,
     thread_name: Option<String>,
     rollout_path: Option<&Path>,
+    remote_workspace: bool,
 ) -> Option<SessionSummary> {
     let usage_line = (!token_usage.is_zero()).then(|| format_token_usage(token_usage));
-    let resume_hint = resume_hint_for_resumable_thread(thread_id, thread_name, rollout_path).await;
+    let resume_hint =
+        resume_hint_for_resumable_thread(thread_id, thread_name, rollout_path, remote_workspace)
+            .await;
+    let remote_thread_id = remote_workspace.then_some(thread_id).flatten();
 
-    if usage_line.is_none() && resume_hint.is_none() {
+    if usage_line.is_none() && resume_hint.is_none() && remote_thread_id.is_none() {
         return None;
     }
 
     Some(SessionSummary {
         usage_line,
         resume_hint,
+        remote_thread_id,
     })
 }
 
@@ -440,7 +444,11 @@ async fn resume_hint_for_resumable_thread(
     thread_id: Option<ThreadId>,
     thread_name: Option<String>,
     rollout_path: Option<&Path>,
+    remote_workspace: bool,
 ) -> Option<String> {
+    if remote_workspace {
+        return None;
+    }
     let thread = resumable_thread(thread_id, thread_name, rollout_path).await?;
     codex_utils_cli::resume_hint(thread.thread_name.as_deref(), Some(thread.thread_id))
 }
@@ -464,18 +472,37 @@ fn errors_for_cwd(cwd: &Path, response: &SkillsListResponse) -> Vec<SkillErrorIn
 struct SessionSummary {
     usage_line: Option<String>,
     resume_hint: Option<String>,
+    remote_thread_id: Option<ThreadId>,
+}
+
+impl SessionSummary {
+    fn into_lines(self) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        if let Some(usage_line) = self.usage_line {
+            lines.push(usage_line.into());
+        }
+        if let Some(command) = self.resume_hint {
+            lines.push(vec!["To continue this session, run ".into(), command.cyan()].into());
+        } else if let Some(thread_id) = self.remote_thread_id {
+            lines.push(format!("Session ID: {thread_id}").into());
+        }
+        lines
+    }
 }
 
 #[derive(Debug, Default)]
 struct InitialHistoryReplayBuffer {
     retained_lines: VecDeque<crate::terminal_hyperlinks::HyperlinkLine>,
     render_from_transcript_tail: bool,
+    transcript_start: usize,
 }
+
+#[cfg(test)]
+type DesktopThreadOpenCommand = Box<dyn FnOnce(&str) -> tokio::process::Command + Send + Sync>;
 
 pub(crate) struct App {
     #[cfg(test)]
-    desktop_thread_open_command_for_test:
-        Option<Box<dyn FnOnce(&str) -> tokio::process::Command + Send + Sync>>,
+    desktop_thread_open_command_for_test: Option<DesktopThreadOpenCommand>,
     model_catalog: Arc<ModelCatalog>,
     pub(crate) session_telemetry: SessionTelemetry,
     pub(crate) app_event_tx: AppEventSender,
@@ -525,8 +552,6 @@ pub(crate) struct App {
     feedback_audience: FeedbackAudience,
     environment_manager: Arc<EnvironmentManager>,
     app_server_target: AppServerTarget,
-    /// Set when the user confirms an update; propagated on exit.
-    pub(crate) pending_update_action: Option<UpdateAction>,
 
     /// Tracks the thread we intentionally shut down while exiting the app.
     ///
@@ -611,6 +636,7 @@ fn spawn_startup_thread_start(
     let request_handle = app_server.request_handle();
     let thread_params_mode = app_server.thread_params_mode();
     let remote_cwd_override = app_server.remote_cwd_override().map(Path::to_path_buf);
+    let config = app_server.session_config_with_effective_service_tier(&config);
     tokio::spawn(async move {
         let result = crate::app_server_session::start_thread_with_request_handle(
             request_handle,
@@ -752,12 +778,22 @@ impl App {
         environment_manager: Arc<EnvironmentManager>,
         startup_elapsed_before_app: Duration,
         startup_bootstrap: Option<AppServerBootstrap>,
-        startup_hooks_browser: Option<HooksListEntry>,
+        startup_hooks_browser: std::result::Result<Option<HooksListEntry>, String>,
+        #[cfg(not(debug_assertions))] upgrade_version: Option<String>,
     ) -> Result<AppExitInfo> {
         use tokio_stream::StreamExt;
         let startup_started_at = Instant::now();
         let (app_event_tx, mut app_event_rx) = unbounded_channel();
         let app_event_tx = AppEventSender::new(app_event_tx);
+        let startup_hooks_browser = match startup_hooks_browser {
+            Ok(entry) => entry,
+            Err(warning) => {
+                app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                    history_cell::new_warning_event(warning),
+                )));
+                None
+            }
+        };
         emit_app_server_runtime_warnings(
             &app_event_tx,
             app_server.initialize_response().runtime_warnings(),
@@ -991,9 +1027,6 @@ Fix the config and retry.\n\
 See the Codex keymap documentation for supported actions and examples."
             )
         })?;
-        #[cfg(not(debug_assertions))]
-        let upgrade_version = crate::updates::get_upgrade_version(&config).await;
-
         let mut app = Self {
             #[cfg(test)]
             desktop_thread_open_command_for_test: None,
@@ -1029,7 +1062,6 @@ See the Codex keymap documentation for supported actions and examples."
             feedback_audience,
             environment_manager,
             app_server_target,
-            pending_update_action: None,
             pending_shutdown_exit_thread_id: None,
             windows_sandbox: WindowsSandboxState::default(),
             thread_event_channels: HashMap::new(),
@@ -1102,6 +1134,7 @@ See the Codex keymap documentation for supported actions and examples."
             app.chat_widget.prefetch_rate_limits();
         }
         let mut listen_for_app_server_events = true;
+        let mut listen_for_tui_events = true;
         let mut waiting_for_initial_session_configured = wait_for_initial_session_configured;
 
         #[cfg(not(debug_assertions))]
@@ -1155,13 +1188,14 @@ See the Codex keymap documentation for supported actions and examples."
                         }
                         AppRunControl::Continue
                     }
-                    event = tui_events.next() => {
+                    event = tui_events.next(), if listen_for_tui_events => {
                         if let Some(event) = event {
                             match app.handle_tui_event(tui, &mut app_server, event).await {
                                 Ok(control) => control,
                                 Err(err) => break Err(err),
                             }
                         } else {
+                            listen_for_tui_events = false;
                             tracing::warn!("terminal input stream closed; shutting down active thread");
                             app.handle_exit_mode(&mut app_server, ExitMode::ShutdownFirst).await
                         }
@@ -1189,6 +1223,7 @@ See the Codex keymap documentation for supported actions and examples."
                 }
             }
         };
+        let remote_workspace = app_server.uses_remote_workspace();
         if let Err(err) = app_server.shutdown().await {
             tracing::warn!(error = %err, "failed to shut down embedded app server");
         }
@@ -1215,13 +1250,14 @@ See the Codex keymap documentation for supported actions and examples."
             thread_id,
             app.chat_widget.thread_name(),
             app.chat_widget.rollout_path().as_deref(),
+            remote_workspace,
         )
         .await;
         Ok(AppExitInfo {
             token_usage: app.token_usage(),
             thread_id,
             resume_hint,
-            update_action: app.pending_update_action,
+            update_action: None,
             exit_reason,
         })
     }
@@ -1247,7 +1283,7 @@ See the Codex keymap documentation for supported actions and examples."
                     // Windows terminals can convert pasted newlines to \r, but
                     // tui-textarea expects \n. Normalize CR to LF.
                     // [tui-textarea]: https://github.com/rhysd/tui-textarea/blob/4d18622eeac13b309e0ff6a55a46ac6706da68cf/src/textarea.rs#L782-L783
-                    let pasted = pasted.replace("\r", "\n");
+                    let pasted = pasted.replace("\r\n", "\n").replace('\r', "\n");
                     self.chat_widget.handle_paste(pasted);
                 }
                 TuiEvent::Draw | TuiEvent::Resize => {

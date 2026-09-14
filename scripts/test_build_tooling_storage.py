@@ -7,7 +7,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -25,6 +24,122 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 class BuildToolingStorageTest(unittest.TestCase):
+    def test_configured_lane_root_and_nested_disk_accounting(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            lanes = repo / "codex-rs" / "target" / "nested" / "lanes"
+            with mock.patch.dict(os.environ, {"CODEX_CARGO_LANES_ROOT": str(lanes)}):
+                with rust_build_status.reserve_cargo_lane(
+                    repo_root=repo, requested_lane="check", command=["cargo", "check"]
+                ) as (_, target):
+                    self.assertEqual(target.parent, lanes)
+                    (target / "artifact").write_bytes(b"0123456789")
+                    outside = lanes.parent / "outside"
+                    outside.write_bytes(b"abc")
+                    size, errors = rust_build_status_support.target_non_lane_size_bytes(
+                        repo_root=repo, lane_root=lanes
+                    )
+                    self.assertEqual((size, errors), (3, 0))
+
+    def test_disk_metadata_failure_is_counted(self):
+        entry = mock.Mock()
+        entry.is_junction.side_effect = OSError("denied")
+        entries = mock.MagicMock()
+        entries.__enter__.return_value = iter([entry])
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            mock.patch.object(
+                rust_build_status_support.os, "scandir", return_value=entries
+            ),
+        ):
+            self.assertEqual(
+                rust_build_status_support.directory_size_bytes(Path(temp)), (0, 1)
+            )
+
+    def test_lane_rejects_reserved_trash_namespace_before_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "lanes"
+            with self.assertRaisesRegex(ValueError, "invalid Cargo lane"):
+                with rust_build_status.reserve_cargo_lane(
+                    repo_root=Path(directory),
+                    requested_lane="active.trash-20260102030405000",
+                    command=["cargo", "check"],
+                    lane_root=root,
+                ):
+                    self.fail("reserved a trash path")
+            self.assertFalse(root.exists())
+
+    def test_build_aliases_and_nextest_list_receive_target(self):
+        target = Path("lane").resolve()
+        for arguments in (
+            [name]
+            for name in (
+                "b",
+                "c",
+                "t",
+                "r",
+                "d",
+                "clean",
+                "rustdoc",
+                "package",
+                "install",
+                "publish",
+            )
+        ):
+            command = ["cargo", *arguments]
+            self.assertEqual(
+                rust_build_status._cargo_command_with_target_dir(command, target),
+                [*command, "--target-dir", str(target)],
+            )
+        self.assertEqual(
+            rust_build_status._cargo_command_with_target_dir(
+                ["cargo", "nextest", "list"], target
+            ),
+            ["cargo", "nextest", "list", "--target-dir", str(target)],
+        )
+        with self.assertRaisesRegex(ValueError, "Unsupported Cargo command"):
+            rust_build_status._cargo_command_with_target_dir(
+                ["cargo", "local-alias"], target
+            )
+
+    def test_every_watch_exec_and_default_obey_reserved_target(self):
+        target = Path("lane").resolve()
+        updated = rust_build_status._cargo_command_with_target_dir(
+            ["cargo", "watch", "-x", "test --", "--exec=check", "--"], target
+        )
+        self.assertEqual(
+            updated,
+            [
+                "cargo",
+                "watch",
+                "-x",
+                f"test --target-dir {target} --",
+                f"--exec=check --target-dir {target}",
+                "--",
+            ],
+        )
+        self.assertEqual(
+            rust_build_status._cargo_command_with_target_dir(
+                ["cargo", "watch", "--"], target
+            ),
+            ["cargo", "watch", "-x", f"check --target-dir {target}", "--"],
+        )
+        with self.assertRaisesRegex(ValueError, "--shell"):
+            rust_build_status._cargo_command_with_target_dir(
+                ["cargo", "watch", "-x", "check", "-s", "cargo test"], target
+            )
+
+    def test_process_lane_patterns_accept_powershell_forms(self):
+        for command, expected in [
+            ("powershell -lane:core-", "core-"),
+            ('powershell -LANE "quoted"', "quoted"),
+            ("powershell -Lane:'quoted-'", "quoted-"),
+            ("just cargo-lane core-", "core-"),
+        ]:
+            self.assertEqual(
+                rust_build_status._lane_name_from_command_line(command), expected
+            )
+
     def test_run_lane_holds_reservation_without_exporting_cargo_target_env(
         self,
     ) -> None:
@@ -541,16 +656,16 @@ class BuildToolingStorageTest(unittest.TestCase):
             def stat(self, *, follow_symlinks: bool):
                 raise AssertionError("junction probe should be sufficient")
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with (
-                mock.patch.object(rust_build_status_support.os, "name", "nt"),
-                mock.patch.object(
-                    rust_build_status_support.os,
-                    "scandir",
-                    return_value=contextlib.nullcontext([FakeReparseEntry()]),
-                ),
-            ):
-                size, errors = rust_build_status.directory_size_bytes(Path(temp_dir))
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch.object(rust_build_status_support.os, "name", "nt"),
+            mock.patch.object(
+                rust_build_status_support.os,
+                "scandir",
+                return_value=contextlib.nullcontext([FakeReparseEntry()]),
+            ),
+        ):
+            size, errors = rust_build_status.directory_size_bytes(Path(temp_dir))
 
         self.assertEqual((size, errors), (0, 0))
 
@@ -829,13 +944,15 @@ class BuildToolingStorageTest(unittest.TestCase):
             remove_tree.assert_not_called()
             self.assertTrue(stray.exists())
 
-    def test_prune_stale_lanes_keeps_two_newest_warm_lanes_per_base(self) -> None:
+    def test_prune_stale_lanes_keeps_two_lowest_ranked_warm_lanes_per_base(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_root = Path(temp_dir)
             lane_root = repo_root / "codex-rs" / "target" / "lanes"
-            newest = lane_root / "codex-core"
+            newest = lane_root / "codex-core-3"
             middle = lane_root / "codex-core-2"
-            oldest = lane_root / "codex-core-3"
+            oldest = lane_root / "codex-core"
             for lane in (newest, middle, oldest):
                 lane.mkdir(parents=True)
                 (lane / "artifact.txt").write_text(lane.name, encoding="utf-8")
@@ -844,12 +961,16 @@ class BuildToolingStorageTest(unittest.TestCase):
                 repo_root=repo_root,
                 processes=[],
                 keep_warm_per_base=2,
+                now_timestamp=400.0,
+                lane_mtime=lambda path: {newest: 300.0, middle: 200.0, oldest: 100.0}[
+                    path
+                ],
             )
 
             self.assertEqual([path.name for path in removed], ["codex-core-3"])
-            self.assertTrue(newest.exists())
+            self.assertFalse(newest.exists())
             self.assertTrue(middle.exists())
-            self.assertFalse(oldest.exists())
+            self.assertTrue(oldest.exists())
 
     def test_prune_stale_lanes_removes_timestamped_lanes_even_with_warm_budget(
         self,

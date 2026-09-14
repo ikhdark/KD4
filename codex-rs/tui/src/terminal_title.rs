@@ -112,6 +112,9 @@ fn sanitize_terminal_title(title: &str) -> String {
     let mut pending_space = false;
 
     for ch in title.chars() {
+        if chars_written >= MAX_TERMINAL_TITLE_CHARS {
+            break;
+        }
         if ch.is_whitespace() {
             // Only set pending if we've already written content; this
             // strips leading whitespace without an extra trim pass.
@@ -130,10 +133,6 @@ fn sanitize_terminal_title(title: &str) -> String {
                 chars_written += 1;
                 pending_space = false;
             }
-        }
-
-        if chars_written >= MAX_TERMINAL_TITLE_CHARS {
-            break;
         }
 
         sanitized.push(ch);

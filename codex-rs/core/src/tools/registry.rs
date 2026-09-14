@@ -525,7 +525,9 @@ pub(crate) async fn install_synthetic_terminal_projection(
         /*source_dependencies_override*/ None,
         /*force_inline_carrier*/ false,
         /*track_for_admission*/ false,
-    ) {
+    )
+    .await
+    {
         Some(input) => project_model_output(input).await,
         None => None,
     };
@@ -1525,12 +1527,13 @@ impl ToolRegistry {
                 let phase_started = Instant::now();
                 let projection_input = prepare_model_projection(
                     &invocation,
-                    &result,
+                    &mut result,
                     parsed_function_arguments.as_ref(),
                     rewritten_source_dependencies.as_ref(),
                     force_inline_carrier,
                     projection_admission_required,
-                );
+                )
+                .await;
                 let admission_tracking_required =
                     projection_admission_required && projection_input.is_some();
                 let model_projection = match projection_input {
@@ -1779,8 +1782,8 @@ fn precomputed_projection_source_dependencies()
         .ok()
 }
 
-fn resolve_projection_source_dependencies<F>(
-    turn_timing_state: &TurnTimingState,
+async fn resolve_projection_source_dependencies<F>(
+    turn_timing_state: &Arc<TurnTimingState>,
     authoritative_override: Option<
         std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
     >,
@@ -1794,16 +1797,22 @@ where
         // A PreToolUse rewrite invalidates analysis of the original payload.
         // Count the final-payload analysis as fallback work even though it was
         // performed immediately after rebuilding the invocation.
-        turn_timing_state.record_projection_source_dependencies_fallback();
+        turn_timing_state
+            .record_projection_source_dependencies_fallback_async()
+            .await;
         return source_dependencies;
     }
     match precomputed {
         Some(source_dependencies) => {
-            turn_timing_state.record_projection_source_dependencies_reuse();
+            turn_timing_state
+                .record_projection_source_dependencies_reuse_async()
+                .await;
             source_dependencies
         }
         None => {
-            turn_timing_state.record_projection_source_dependencies_fallback();
+            turn_timing_state
+                .record_projection_source_dependencies_fallback_async()
+                .await;
             fallback()
         }
     }
@@ -1827,9 +1836,9 @@ struct ProjectionSelectionFacts {
     partial_ids: Vec<String>,
 }
 
-fn prepare_model_projection(
+async fn prepare_model_projection(
     invocation: &ToolInvocation,
-    result: &AnyToolResult,
+    result: &mut AnyToolResult,
     parsed_function_arguments: Option<&ParsedFunctionArguments>,
     source_dependencies_override: Option<
         &std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
@@ -2009,7 +2018,7 @@ fn prepare_model_projection(
         }
     };
     let source_dependencies = resolve_projection_source_dependencies(
-        invocation.step_context.turn.turn_timing_state.as_ref(),
+        &invocation.step_context.turn.turn_timing_state,
         source_dependencies_override.cloned(),
         precomputed_projection_source_dependencies(),
         || {
@@ -2020,7 +2029,8 @@ fn prepare_model_projection(
                 invocation.step_context.turn.config.cwd.as_path(),
             )
         },
-    );
+    )
+    .await;
     let original_output_sha256 = crate::tool_history::sha256(original_output_text.as_bytes());
     let original_output_tokens = if generic_projection.was_truncated {
         canonical

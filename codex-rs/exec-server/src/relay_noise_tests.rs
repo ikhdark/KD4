@@ -34,6 +34,52 @@ use crate::server::ConnectionProcessor;
 const ENVIRONMENT_ID: &str = "environment-1";
 const EXECUTOR_REGISTRATION_ID: &str = "registration-1";
 
+async fn read_reset<S>(
+    websocket: &mut tokio_tungstenite::WebSocketStream<S>,
+) -> Result<RelayMessageFrame>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    timeout(Duration::from_secs(1), async {
+        loop {
+            match websocket.next().await {
+                Some(Ok(Message::Binary(payload))) => {
+                    let frame = decode_relay_message_frame(&payload)?;
+                    assert_eq!(frame.validate()?, RelayFrameBodyKind::Reset);
+                    return Ok(frame);
+                }
+                Some(Ok(Message::Ping(payload))) => websocket.send(Message::Pong(payload)).await?,
+                Some(Ok(Message::Pong(_) | Message::Frame(_))) => {}
+                other => anyhow::bail!("expected reset, got {other:?}"),
+            }
+        }
+    })
+    .await?
+}
+
+async fn expect_budget_exhausted<S>(
+    mut task: tokio::task::JoinHandle<RendezvousDisconnectReason>,
+    websocket: &mut tokio_tungstenite::WebSocketStream<S>,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let reason = timeout(Duration::from_secs(1), async {
+        loop {
+            tokio::select! {
+                result = &mut task => return result,
+                message = websocket.next() => match message {
+                    Some(Ok(Message::Ping(payload))) => { let _ = websocket.send(Message::Pong(payload)).await; }
+                    Some(Ok(_)) => {}
+                    _ => return task.await,
+                }
+            }
+        }
+    }).await??;
+    assert_eq!(reason, RendezvousDisconnectReason::HandshakeBudgetExhausted);
+    Ok(())
+}
+
 #[tokio::test]
 async fn missing_pong_disconnects_physical_relay() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -59,6 +105,140 @@ async fn missing_pong_disconnects_physical_relay() -> Result<()> {
         timeout(Duration::from_secs(1), environment_task).await??,
         RendezvousDisconnectReason::PongTimeout
     );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn full_handshake_reply_queue_preserves_existing_stream() -> Result<()> {
+    use crate::relay_proto::relay_message_frame::Body;
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    // A small duplex buffer makes outgoing backpressure deterministic.
+    let (harness_io, environment_io) = tokio::io::duplex(64);
+    let mut harness = WebSocketStream::from_raw_socket(harness_io, Role::Client, None).await;
+    let environment = WebSocketStream::from_raw_socket(environment_io, Role::Server, None).await;
+    let identity = NoiseChannelIdentity::generate()?;
+    let harness_identity = NoiseChannelIdentity::generate()?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(Notify::new());
+    let mut task = tokio::spawn(run_multiplexed_environment(
+        environment,
+        ConnectionProcessor::new(ExecServerRuntimePaths::new(std::env::current_exe()?)?),
+        ENVIRONMENT_ID.into(),
+        EXECUTOR_REGISTRATION_ID.into(),
+        identity.clone(),
+        BlockingValidator {
+            calls: calls.clone(),
+            release: release.clone(),
+        },
+    ));
+    let (handshake, request) = InitiatorHandshake::start(
+        &harness_identity,
+        &identity.public_key(),
+        &noise_channel_prologue(ENVIRONMENT_ID, EXECUTOR_REGISTRATION_ID, "existing"),
+        b"authorization",
+    )?;
+    harness
+        .send(Message::Binary(
+            encode_relay_message_frame(&RelayMessageFrame::handshake("existing".into(), request))
+                .into(),
+        ))
+        .await?;
+    timeout(Duration::from_secs(1), async {
+        while calls.load(Ordering::SeqCst) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    release.notify_one();
+    let Message::Binary(response) = harness.next().await.expect("handshake response")? else {
+        anyhow::bail!("expected binary handshake reply");
+    };
+    let Some(Body::Handshake(response)) = decode_relay_message_frame(&response)?.body else {
+        anyhow::bail!("expected handshake reply");
+    };
+    let mut transport = handshake.finish(&response.payload)?;
+
+    // Unknown stream data queues resets without charging the handshake budget.
+    for i in 0..crate::connection::CHANNEL_CAPACITY * 2 {
+        harness
+            .send(Message::Binary(
+                encode_relay_message_frame(&RelayMessageFrame::data(
+                    format!("unknown-{i}"),
+                    0,
+                    vec![0],
+                ))
+                .into(),
+            ))
+            .await?;
+    }
+    let (_, request) = InitiatorHandshake::start(
+        &harness_identity,
+        &identity.public_key(),
+        &noise_channel_prologue(ENVIRONMENT_ID, EXECUTOR_REGISTRATION_ID, "new"),
+        b"authorization",
+    )?;
+    harness
+        .send(Message::Binary(
+            encode_relay_message_frame(&RelayMessageFrame::handshake("new".into(), request)).into(),
+        ))
+        .await?;
+    timeout(Duration::from_secs(1), async {
+        while calls.load(Ordering::SeqCst) != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    release.notify_one();
+    // Give validation completion a turn while keeping the writer blocked.
+    // This is shorter than the physical write deadline (100 ms in tests).
+    assert!(timeout(Duration::from_millis(50), &mut task).await.is_err());
+
+    let request = serde_json::to_vec(&serde_json::json!({
+        "id": 7, "method": "queue-probe"
+    }))?;
+    let mut framed = (request.len() as u32).to_be_bytes().to_vec();
+    framed.extend_from_slice(&request);
+    let payload = transport.encrypt(&framed)?;
+    harness
+        .send(Message::Binary(
+            encode_relay_message_frame(&RelayMessageFrame::data("existing".into(), 0, payload))
+                .into(),
+        ))
+        .await?;
+    let response = timeout(Duration::from_secs(1), async {
+        loop {
+            match harness.next().await {
+                Some(Ok(Message::Binary(payload))) => {
+                    let frame = decode_relay_message_frame(&payload)?;
+                    if frame.stream_id == "existing" {
+                        let Some(Body::Data(data)) = frame.body else {
+                            anyhow::bail!("existing stream reset");
+                        };
+                        let plaintext = transport.decrypt(&data.payload)?;
+                        assert!(plaintext.len() >= 4);
+                        let length = u32::from_be_bytes(plaintext[..4].try_into()?) as usize;
+                        assert_eq!(length, plaintext.len() - 4);
+                        return Ok::<_, anyhow::Error>(
+                            serde_json::from_slice::<serde_json::Value>(&plaintext[4..])?,
+                        );
+                    }
+                }
+                Some(Ok(Message::Ping(payload))) => harness.send(Message::Pong(payload)).await?,
+                other => anyhow::bail!("expected existing stream response, got {other:?}"),
+            }
+        }
+    })
+    .await??;
+    assert_eq!(response["id"], 7);
+    assert_eq!(response["error"]["code"], -32601);
+    assert_eq!(
+        response["error"]["message"],
+        "exec-server stub does not implement `queue-probe` yet"
+    );
+    task.abort();
+    let _ = task.await;
     Ok(())
 }
 
@@ -240,19 +420,7 @@ async fn duplicate_handshakes_exhaust_failure_budget() -> Result<()> {
         harness_websocket
             .send(Message::Binary(encoded.clone().into()))
             .await?;
-        let payload = timeout(Duration::from_secs(1), async {
-            loop {
-                match harness_websocket.next().await {
-                    Some(Ok(Message::Binary(payload))) => break Ok(payload),
-                    Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
-                    Some(Ok(message)) => anyhow::bail!("expected reset frame, got {message:?}"),
-                    Some(Err(error)) => break Err(error.into()),
-                    None => anyhow::bail!("environment closed before sending reset"),
-                }
-            }
-        })
-        .await??;
-        let reset = decode_relay_message_frame(payload.as_ref())?;
+        let reset = read_reset(&mut harness_websocket).await?;
         assert_eq!(reset.stream_id, stream_id);
         assert_eq!(reset.validate()?, RelayFrameBodyKind::Reset);
     }
@@ -269,7 +437,7 @@ async fn duplicate_handshakes_exhaust_failure_budget() -> Result<()> {
     harness_websocket
         .send(Message::Binary(encoded.into()))
         .await?;
-    timeout(Duration::from_secs(1), environment_task).await??;
+    expect_budget_exhausted(environment_task, &mut harness_websocket).await?;
     release.notify_waiters();
     Ok(())
 }
@@ -312,13 +480,7 @@ async fn oversized_harness_authorization_is_rejected_before_validation() -> Resu
         .send(Message::Binary(encode_relay_message_frame(&frame).into()))
         .await?;
 
-    let Message::Binary(payload) = timeout(Duration::from_secs(1), harness_websocket.next())
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("environment closed before sending reset"))??
-    else {
-        anyhow::bail!("expected binary reset frame");
-    };
-    let reset = decode_relay_message_frame(payload.as_ref())?;
+    let reset = read_reset(&mut harness_websocket).await?;
     assert_eq!(reset.validate()?, RelayFrameBodyKind::Reset);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 
@@ -361,18 +523,27 @@ async fn repeated_malformed_handshakes_close_the_physical_relay() -> Result<()> 
         )?;
         let last_byte = request.last_mut().expect("handshake request is not empty");
         *last_byte ^= 1;
-        let frame = RelayMessageFrame::handshake(stream_id, request);
+        let frame = RelayMessageFrame::handshake(stream_id.clone(), request);
         harness_websocket
             .send(Message::Binary(encode_relay_message_frame(&frame).into()))
             .await?;
+        if attempt + 1 < MAX_FAILED_NOISE_HANDSHAKES {
+            assert_eq!(
+                read_reset(&mut harness_websocket).await?.stream_id,
+                stream_id
+            );
+            assert!(!environment_task.is_finished());
+        }
     }
 
-    timeout(Duration::from_secs(1), environment_task).await??;
+    expect_budget_exhausted(environment_task, &mut harness_websocket).await?;
     Ok(())
 }
 
+#[test_case::test_case(false; "early_data")]
+#[test_case::test_case(true; "reset")]
 #[tokio::test]
-async fn repeated_early_data_during_validation_closes_the_physical_relay() -> Result<()> {
+async fn repeated_cancellation_during_validation_exhausts_budget(reset: bool) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let websocket_url = format!("ws://{}", listener.local_addr()?);
     let harness_connection = tokio::spawn(connect_async(websocket_url));
@@ -382,6 +553,7 @@ async fn repeated_early_data_during_validation_closes_the_physical_relay() -> Re
 
     let environment_identity = NoiseChannelIdentity::generate()?;
     let harness_identity = NoiseChannelIdentity::generate()?;
+    let calls = Arc::new(AtomicUsize::new(0));
     let environment_task = tokio::spawn(run_multiplexed_environment(
         environment_websocket,
         ConnectionProcessor::new(ExecServerRuntimePaths::new(std::env::current_exe()?)?),
@@ -389,7 +561,7 @@ async fn repeated_early_data_during_validation_closes_the_physical_relay() -> Re
         EXECUTOR_REGISTRATION_ID.to_string(),
         environment_identity.clone(),
         BlockingValidator {
-            calls: Arc::new(AtomicUsize::new(0)),
+            calls: Arc::clone(&calls),
             release: Arc::new(Notify::new()),
         },
     ));
@@ -403,16 +575,32 @@ async fn repeated_early_data_during_validation_closes_the_physical_relay() -> Re
             &prologue,
             b"authorization",
         )?;
-        for frame in [
-            RelayMessageFrame::handshake(stream_id.clone(), request),
-            RelayMessageFrame::data(stream_id, /*seq*/ 0, vec![0]),
-        ] {
-            harness_websocket
-                .send(Message::Binary(encode_relay_message_frame(&frame).into()))
-                .await?;
+        let frame = RelayMessageFrame::handshake(stream_id.clone(), request);
+        harness_websocket
+            .send(Message::Binary(encode_relay_message_frame(&frame).into()))
+            .await?;
+        timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) != attempt + 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let frame = if reset {
+            RelayMessageFrame::reset(stream_id.clone(), String::new())
+        } else {
+            RelayMessageFrame::data(stream_id.clone(), 0, vec![0])
+        };
+        harness_websocket
+            .send(Message::Binary(encode_relay_message_frame(&frame).into()))
+            .await?;
+        if !reset && attempt + 1 < MAX_FAILED_NOISE_HANDSHAKES {
+            assert_eq!(
+                read_reset(&mut harness_websocket).await?.stream_id,
+                stream_id
+            );
         }
     }
 
-    timeout(Duration::from_secs(1), environment_task).await??;
+    expect_budget_exhausted(environment_task, &mut harness_websocket).await?;
     Ok(())
 }

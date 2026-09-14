@@ -443,13 +443,17 @@ async fn websocket_auth_failure_does_not_clear_rotated_server_token() {
 }
 
 async fn accept_test_websocket(listener: &TcpListener) -> WebSocketStream<TcpStream> {
-    let (stream, _) = timeout(TEST_HTTP_ACCEPT_TIMEOUT, listener.accept())
-        .await
-        .expect("websocket request should arrive in time")
-        .expect("listener accept should succeed");
-    accept_async(stream)
-        .await
-        .expect("websocket handshake should succeed")
+    tokio::time::timeout(TEST_HTTP_ACCEPT_TIMEOUT, async {
+        let (stream, _) = timeout(TEST_HTTP_ACCEPT_TIMEOUT, listener.accept())
+            .await
+            .expect("websocket request should arrive in time")
+            .expect("listener accept should succeed");
+        accept_async(stream)
+            .await
+            .expect("websocket handshake should succeed")
+    })
+    .await
+    .expect("test exchange should finish in time")
 }
 
 async fn assert_no_connection_until_connect_finishes(
@@ -457,6 +461,7 @@ async fn assert_no_connection_until_connect_finishes(
     mut connect_done_rx: oneshot::Receiver<()>,
 ) {
     tokio::select! {
+        biased;
         accepted = listener.accept() => {
             accepted.expect("unexpected websocket connection should be accepted");
             panic!("required refresh failure must not proceed to websocket connect");
@@ -465,4 +470,22 @@ async fn assert_no_connection_until_connect_finishes(
             connect_done.expect("connect completion should be reported");
         }
     }
+}
+
+#[tokio::test]
+async fn no_connection_assertion_rejects_a_connection_queued_before_completion() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let _stream = TcpStream::connect(listener.local_addr().expect("listener address"))
+        .await
+        .expect("connection should queue");
+    let (done_tx, done_rx) = oneshot::channel();
+    done_tx.send(()).expect("completion receiver should exist");
+    let result = tokio::spawn(async move {
+        assert_no_connection_until_connect_finishes(&listener, done_rx).await;
+    })
+    .await
+    .expect_err("queued connection must fail the assertion even when completion is ready");
+    assert!(result.is_panic());
 }

@@ -591,8 +591,18 @@ impl BottomPaneView for MultiSelectPicker {
 
 impl Renderable for MultiSelectPicker {
     fn desired_height(&self, width: u16) -> u16 {
-        let rows = self.build_rows();
-        let rows_height = self.rows_height(&rows);
+        let row_count = self
+            .filtered_indices
+            .iter()
+            .enumerate()
+            .map(|(visible_idx, actual_idx)| {
+                let item = &self.items[*actual_idx];
+                1 + usize::from(
+                    item.section_break_after && visible_idx + 1 < self.filtered_indices.len(),
+                )
+            })
+            .sum::<usize>();
+        let rows_height = row_count.clamp(1, MAX_POPUP_ROWS) as u16;
         let preview_height = if self.preview_line.is_some() { 1 } else { 0 };
 
         let mut height = self.header.desired_height(width.saturating_sub(4));

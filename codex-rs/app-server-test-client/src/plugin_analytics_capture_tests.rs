@@ -11,6 +11,44 @@ use std::time::SystemTime;
 const REMOTE_PLUGIN_ID: &str = "plugins~Plugin_test";
 
 #[test]
+fn rejects_wrong_metadata_types() {
+    for (field, value) in [
+        ("has_skills", json!("true")),
+        ("mcp_server_count", json!(-1)),
+        ("mcp_server_count", json!(0.5)),
+        ("connector_ids", json!([1])),
+        ("product_client_id", json!(false)),
+    ] {
+        let mut installed = mutation_event("codex_plugin_installed");
+        installed["event_params"][field] = value;
+        let error = validate_mutation_events(vec![installed], expected_identity()).unwrap_err();
+        assert!(error.to_string().contains(field), "{error}");
+    }
+}
+
+#[test]
+fn tolerates_only_incomplete_final_capture_records() {
+    let path = unique_capture_path("partial");
+    let installed = mutation_event("codex_plugin_installed");
+    let complete = json!({"events": [installed]}).to_string();
+    for tail in ["{", "{\"events\":[{\"name\":\"part"] {
+        fs::write(&path, format!("{complete}\n{tail}")).unwrap();
+        assert_eq!(
+            read_events_for_remote_plugin(&path, REMOTE_PLUGIN_ID).unwrap(),
+            vec![installed.clone()]
+        );
+    }
+    for tail in ["{\n", "{oops", "{\"events\":false}\n"] {
+        fs::write(&path, format!("{complete}\n{tail}")).unwrap();
+        assert!(
+            read_events_for_remote_plugin(&path, REMOTE_PLUGIN_ID).is_err(),
+            "{tail}"
+        );
+    }
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn reads_and_validates_remote_plugin_mutation_events() {
     let path = unique_capture_path("valid");
     let installed = mutation_event("codex_plugin_installed");

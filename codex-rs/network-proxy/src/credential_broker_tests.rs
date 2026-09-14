@@ -41,6 +41,65 @@ fn assert_credential_shape(real_value: &str, dummy_value: &str, prefix: &str) {
 }
 
 #[test]
+fn virtualize_child_env_preserves_only_public_openai_prefixes() {
+    for (real_value, prefix) in [
+        (
+            "sk-SYNTHETIC_PRIVATE_SEGMENT-abcdefghijklmnopqrstuvwxyz0123456789",
+            "sk-",
+        ),
+        (
+            "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH",
+            "sk-proj-",
+        ),
+        (
+            "sk-svcacct-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH",
+            "sk-svcacct-",
+        ),
+    ] {
+        let broker = CredentialBroker::new(/*enabled*/ true);
+        let mut env = env_map([("OPENAI_API_KEY", real_value)]);
+        broker.virtualize_child_env(&mut env);
+        let dummy = &env["OPENAI_API_KEY"];
+        assert!(dummy.starts_with(prefix));
+        assert!(!dummy.contains("SYNTHETIC_PRIVATE_SEGMENT"));
+        assert_ne!(dummy, real_value);
+        let mut headers = headers_with_bearer(dummy);
+        broker.inject_request_headers("api.openai.com", &mut headers);
+        assert_eq!(
+            authorization(&headers),
+            Some(format!("Bearer {real_value}").as_str())
+        );
+        assert!(headers[AUTHORIZATION].is_sensitive());
+    }
+}
+
+#[test]
+fn virtualize_child_env_randomizes_degenerate_and_unsupported_templates() {
+    for real_value in [
+        format!("ghp_{}", "_".repeat(36)),
+        format!("ghp_{}a", "_".repeat(35)),
+        format!("ghp_{}", ".".repeat(36)),
+        format!("ghp_{}", "é".repeat(18)),
+    ] {
+        let broker = CredentialBroker::new(/*enabled*/ true);
+        let mut env = env_map([("GH_TOKEN", real_value.as_str())]);
+        broker.virtualize_child_env(&mut env);
+        let dummy = &env["GH_TOKEN"];
+        assert_eq!(dummy.len(), real_value.len());
+        assert!(dummy.starts_with("ghp_"));
+        assert!(dummy[4..].bytes().all(|byte| byte.is_ascii_alphanumeric()));
+        assert_ne!(dummy, &real_value);
+        let mut headers = headers_with_bearer(dummy);
+        broker.inject_request_headers("api.github.com", &mut headers);
+        assert_eq!(
+            headers[AUTHORIZATION].as_bytes(),
+            format!("Bearer {real_value}").as_bytes()
+        );
+        assert!(headers[AUTHORIZATION].is_sensitive());
+    }
+}
+
+#[test]
 fn virtualize_child_env_replaces_supported_credentials() {
     let broker = CredentialBroker::new(/*enabled*/ true);
     let github_token = "github_pat_11AA0bbCC_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH";
@@ -217,4 +276,38 @@ fn github_enterprise_credentials_bind_to_gh_host() {
     assert_eq!(authorization(&headers), Some("Bearer ghp-enterprise-real"));
     assert!(broker.host_requires_mitm("github.example.com"));
     assert!(!broker.host_requires_mitm("api.github.com"));
+}
+
+#[test]
+fn credential_injection_matches_complete_provider_authorization_only() {
+    let broker = CredentialBroker::new(true);
+    let mut env = env_map([("GITHUB_TOKEN", "ghp-real-token")]);
+    broker.virtualize_child_env(&mut env);
+    let dummy = &env["GITHUB_TOKEN"];
+    for value in [
+        format!("Bearer prefix{dummy}"),
+        format!("Bearer {dummy}suffix"),
+        format!("Basic {dummy}"),
+        format!("Bearer {dummy}, other"),
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_str(&value).unwrap());
+        broker.inject_request_headers("api.github.com", &mut headers);
+        assert_eq!(authorization(&headers), Some(value.as_str()));
+    }
+    let mut headers = headers_with_bearer(dummy);
+    headers.append(AUTHORIZATION, HeaderValue::from_static("Bearer unrelated"));
+    broker.inject_request_headers("api.github.com", &mut headers);
+    assert_eq!(headers.get_all(AUTHORIZATION).iter().count(), 2);
+    assert_eq!(
+        authorization(&headers),
+        Some(format!("Bearer {dummy}").as_str())
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("tOkEn {dummy}")).unwrap(),
+    );
+    broker.inject_request_headers("api.github.com", &mut headers);
+    assert_eq!(authorization(&headers), Some("Bearer ghp-real-token"));
 }

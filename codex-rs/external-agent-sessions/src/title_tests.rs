@@ -121,3 +121,28 @@ fn bounds_fallback_titles_to_120_characters() {
     assert_eq!(title.chars().count(), SESSION_TITLE_MAX_LEN);
     assert_eq!(title, format!("{}...", "x".repeat(117)));
 }
+
+#[test]
+fn preserves_malformed_recognized_wrappers() {
+    for message in [
+        "<system-reminder>unclosed",
+        "<system-reminder>wrong</command-message> Fix auth",
+    ] {
+        assert_eq!(
+            fallback_title_from_user_message(message),
+            Some(message.to_string())
+        );
+    }
+}
+
+#[test]
+fn truncates_multibyte_titles_at_character_boundaries() {
+    assert_eq!(
+        fallback_title_from_user_message(&"界".repeat(120)),
+        Some("界".repeat(120))
+    );
+    assert_eq!(
+        fallback_title_from_user_message(&"界".repeat(121)),
+        Some(format!("{}...", "界".repeat(117)))
+    );
+}

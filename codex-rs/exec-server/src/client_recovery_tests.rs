@@ -236,3 +236,31 @@ async fn recovery_adds_sandbox_denial_to_pending_exit_event() {
         })
     );
 }
+
+#[tokio::test]
+async fn recovery_rejects_ambiguous_gap_before_publishing_false_exit() {
+    let state = SessionState::new(true);
+    let mut events = state.subscribe_events();
+    let error = state
+        .recover_events(ReadResponse {
+            chunks: vec![ProcessOutputChunk {
+                seq: 2,
+                stream: ExecOutputStream::Stdout,
+                chunk: b"retained".to_vec().into(),
+            }],
+            next_seq: 5,
+            exited: true,
+            exit_code: Some(0),
+            closed: true,
+            failure: None,
+            sandbox_denied: false,
+        })
+        .expect_err("multiple missing positions cannot identify an exit");
+    assert!(error.to_string().contains("no longer retained"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), events.recv())
+            .await
+            .is_err(),
+        "invalid replay must not publish an invented exit"
+    );
+}

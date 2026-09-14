@@ -3,6 +3,10 @@ use std::collections::HashMap;
 use codex_network_proxy::ManagedNetworkSandboxContext;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath;
+use codex_protocol::permissions::FileSystemSandboxEntry;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
@@ -48,15 +52,24 @@ fn native_request_preserves_native_launch_fields() {
 
 #[test]
 fn windows_restricted_token_request_prepares_session_launch() {
-    let cwd: AbsolutePathBuf = std::env::current_dir()
-        .expect("current directory")
-        .try_into()
-        .expect("absolute cwd");
+    let temp = tempfile::tempdir().expect("temporary cwd");
+    let cwd = AbsolutePathBuf::from_absolute_path(temp.path()).expect("absolute cwd");
+    let denied = cwd.join("restricted");
+    std::fs::create_dir(denied.as_path()).expect("denied directory");
+    let mut policy = PermissionProfile::workspace_write().file_system_sandbox_policy();
+    policy.entries.push(FileSystemSandboxEntry {
+        path: FileSystemPath::Path {
+            path: denied.clone(),
+        },
+        access: FileSystemAccessMode::Deny,
+    });
+    let permissions =
+        PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted);
     let cwd_uri = PathUri::from_abs_path(&cwd);
     let self_exe = std::env::current_exe().expect("current executable");
     let runtime_paths = ExecServerRuntimePaths::new(self_exe.clone()).expect("runtime paths");
     let mut sandbox = FileSystemSandboxContext::from_permission_profile_with_cwd(
-        PermissionProfile::workspace_write(),
+        permissions.clone(),
         cwd_uri.clone(),
     );
     sandbox.windows_sandbox_level = WindowsSandboxLevel::RestrictedToken;
@@ -96,8 +109,7 @@ fn windows_restricted_token_request_prepares_session_launch() {
         .expect("Windows session launch metadata");
     assert_eq!(
         windows_sandbox.permission_profile,
-        PermissionProfile::workspace_write()
-            .materialize_project_roots_with_workspace_roots(std::slice::from_ref(&cwd))
+        permissions.materialize_project_roots_with_workspace_roots(std::slice::from_ref(&cwd))
     );
     assert_eq!(windows_sandbox.workspace_roots, vec![cwd]);
     assert_eq!(
@@ -106,6 +118,11 @@ fn windows_restricted_token_request_prepares_session_launch() {
     );
     assert!(windows_sandbox.proxy_enforced);
     assert!(windows_sandbox.use_private_desktop);
+    let overrides = windows_sandbox
+        .filesystem_overrides
+        .as_ref()
+        .expect("filesystem overrides");
+    assert_eq!(overrides.additional_deny_read_paths, vec![denied]);
 
     assert_eq!(
         windows_sandbox_command(

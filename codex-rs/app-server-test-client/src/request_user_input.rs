@@ -28,18 +28,19 @@ fn prompt_for_answers_with(
     output: &mut impl Write,
     params: &ToolRequestUserInputParams,
 ) -> Result<ToolRequestUserInputResponse> {
+    if params.questions.iter().any(|question| question.is_secret) {
+        bail!("request_user_input secret questions are unsupported by this terminal client");
+    }
+    if params.auto_resolution_ms.is_some() {
+        bail!(
+            "request_user_input timed questions require cancellable input, which this terminal client does not support"
+        );
+    }
     writeln!(
         output,
         "\n[request_user_input for thread {}, turn {}]",
         params.thread_id, params.turn_id
     )?;
-    if let Some(auto_resolution_ms) = params.auto_resolution_ms {
-        writeln!(
-            output,
-            "The app-server may auto-resolve this request after {auto_resolution_ms} ms."
-        )?;
-    }
-
     let mut answers = HashMap::new();
     for question in &params.questions {
         writeln!(output, "\n{}: {}", question.header, question.question)?;

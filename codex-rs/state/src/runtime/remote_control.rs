@@ -165,6 +165,57 @@ mod tests {
     use std::borrow::Cow;
 
     #[tokio::test]
+    async fn reenrollment_preserves_explicit_preference_and_updates_server_metadata() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = StateRuntime::init(temp.path().to_path_buf(), "test-provider".to_string())
+            .await
+            .expect("runtime");
+        let mut record = RemoteControlEnrollmentRecord {
+            websocket_url: "wss://example.test/control".to_string(),
+            account_id: "account".to_string(),
+            app_server_client_name: Some("desktop".to_string()),
+            server_id: "old-server".to_string(),
+            environment_id: "old-environment".to_string(),
+            server_name: "old-name".to_string(),
+            remote_control_enabled: Some(true),
+        };
+        runtime
+            .upsert_remote_control_enrollment(&record)
+            .await
+            .expect("enroll");
+        assert_eq!(
+            runtime
+                .set_remote_control_enabled(
+                    &record.websocket_url,
+                    &record.account_id,
+                    record.app_server_client_name.as_deref(),
+                    false
+                )
+                .await
+                .expect("disable"),
+            1
+        );
+        record.server_id = "new-server".to_string();
+        record.environment_id = "new-environment".to_string();
+        record.server_name = "new-name".to_string();
+        runtime
+            .upsert_remote_control_enrollment(&record)
+            .await
+            .expect("reenroll");
+        let actual = runtime
+            .get_remote_control_enrollment(
+                &record.websocket_url,
+                &record.account_id,
+                record.app_server_client_name.as_deref(),
+            )
+            .await
+            .expect("lookup");
+        record.remote_control_enabled = Some(false);
+        assert_eq!(actual, Some(record));
+        runtime.close().await;
+    }
+
+    #[tokio::test]
     async fn remote_control_enrollment_round_trips_by_target_and_account() {
         let codex_home = unique_temp_dir();
         let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
@@ -326,12 +377,20 @@ mod tests {
 
     #[tokio::test]
     async fn migration_preserves_legacy_remote_control_preference_as_null() {
-        let codex_home = unique_temp_dir();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let codex_home = temp.path().to_path_buf();
         tokio::fs::create_dir_all(&codex_home)
             .await
             .expect("create codex home");
         let old_state_migrator = Migrator {
-            migrations: Cow::Owned(STATE_MIGRATOR.migrations[..36].to_vec()),
+            migrations: Cow::Owned(
+                STATE_MIGRATOR
+                    .migrations
+                    .iter()
+                    .filter(|migration| migration.version < 37)
+                    .cloned()
+                    .collect(),
+            ),
             ignore_missing: false,
             locking: true,
             no_tx: false,
@@ -376,6 +435,6 @@ mod tests {
             .expect("legacy enrollment should remain");
         assert_eq!(actual.remote_control_enabled, None);
 
-        let _ = tokio::fs::remove_dir_all(codex_home).await;
+        runtime.close().await;
     }
 }

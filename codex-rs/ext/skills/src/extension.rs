@@ -187,6 +187,12 @@ where
                 return Vec::new();
             };
             let config = thread_state.config();
+            if !config.include_instructions {
+                return vec![executor_skills_world_state_section(
+                    &SkillCatalog::default(),
+                    false,
+                )];
+            }
             let catalog = thread_state
                 .estimate_executor_catalog_snapshot(
                     &self.providers,
@@ -274,7 +280,7 @@ where
 {
     fn contribute<'a>(
         &'a self,
-        input: TurnInputContext,
+        input: &'a TurnInputContext,
         session_store: &'a ExtensionData,
         thread_store: &'a ExtensionData,
         turn_store: &'a ExtensionData,
@@ -299,16 +305,16 @@ where
             if !input.ready_selected_capability_roots.is_empty() {
                 catalog.extend(
                     thread_state
-                        .estimate_executor_catalog_snapshot(
+                        .executor_catalog_snapshot(
                             &self.providers,
                             SkillListQuery {
                                 turn_id: input.turn_id.clone(),
                                 executor_roots: input.ready_selected_capability_roots.clone(),
                                 host_snapshot: None,
                                 include_host_skills: false,
-                                include_bundled_skills: false,
+                                include_bundled_skills: config.bundled_skills_enabled,
                                 include_orchestrator_skills: false,
-                                mcp_resources: None,
+                                mcp_resources: session_store.get::<McpResourceClient>(),
                             },
                         )
                         .await,

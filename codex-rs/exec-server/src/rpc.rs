@@ -46,6 +46,8 @@ pub(crate) enum RpcCallError {
     TimedOut { method: String, timeout: Duration },
     /// The client already has the maximum number of regular RPC calls in flight.
     PendingRequestLimitExceeded { limit: usize },
+    /// No unused request ID remains for this connection.
+    RequestIdExhausted,
 }
 
 type PendingRequest = oneshot::Sender<Result<Value, RpcCallError>>;
@@ -280,13 +282,11 @@ impl RpcClient {
                         if let Err(err) =
                             handle_server_message(&pending_for_reader, &event_tx, message).await
                         {
-                            let _ = err;
-                            break None;
+                            break Some(err);
                         }
                     }
                     JsonRpcConnectionEvent::MalformedMessage { reason } => {
-                        let _ = reason;
-                        break None;
+                        break Some(reason);
                     }
                     JsonRpcConnectionEvent::Disconnected { reason } => {
                         break reason;
@@ -296,12 +296,13 @@ impl RpcClient {
 
             closed_for_reader.store(true, Ordering::Release);
             drain_pending(&pending_for_reader).await;
+            // Transport cleanup must not wait for the event consumer to catch up.
+            transport_for_reader.terminate();
             let _ = event_tx
                 .send(RpcClientEvent::Disconnected {
                     reason: disconnect_reason,
                 })
                 .await;
-            transport_for_reader.terminate();
         });
 
         (
@@ -387,6 +388,16 @@ impl RpcClient {
         self.call_inner(method, params, RpcCallTimeout::None).await
     }
 
+    #[tracing::instrument(
+        name = "codex.exec_server.request",
+        level = "info",
+        skip_all,
+        fields(
+            otel.kind = "client",
+            otel.name = method,
+            method,
+        )
+    )]
     pub(crate) async fn call_with_timeout<P, T>(
         &self,
         method: &str,
@@ -449,7 +460,12 @@ impl RpcClient {
         P: Serialize,
         T: DeserializeOwned,
     {
-        let request_id = RequestId::Integer(self.next_request_id.fetch_add(1, Ordering::SeqCst));
+        // Keep the exhausted counter unchanged so no later call can reuse an ID.
+        let request_id = RequestId::Integer(
+            self.next_request_id
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
+                .map_err(|_| RpcCallError::RequestIdExhausted)?,
+        );
         let (response_tx, response_rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().await;
@@ -459,7 +475,12 @@ impl RpcClient {
             if self.closed.load(Ordering::Acquire) || *self.disconnected_rx.borrow() {
                 return Err(RpcCallError::Closed);
             }
-            pending.retain(|_, response_tx| !response_tx.is_closed());
+            // Cancelled calls release admission but can leave routing entries.
+            // Reap only under pressure, bounding retention without scanning the
+            // table on every registration.
+            if pending.len() >= MAX_IN_FLIGHT_REGULAR_CALLS {
+                pending.retain(|_, response_tx| !response_tx.is_closed());
+            }
             pending.insert(request_id.clone(), response_tx);
         }
 
@@ -619,15 +640,11 @@ where
     P: DeserializeOwned,
 {
     let params = params.unwrap_or(Value::Null);
-    match serde_json::from_value(params.clone()) {
+    let retry_as_null = matches!(&params, Value::Object(map) if map.is_empty());
+    match serde_json::from_value(params) {
         Ok(params) => Ok(params),
-        Err(err) => {
-            if matches!(params, Value::Object(ref map) if map.is_empty()) {
-                serde_json::from_value(Value::Null).map_err(|_| err)
-            } else {
-                Err(err)
-            }
-        }
+        Err(err) if retry_as_null => serde_json::from_value(Value::Null).map_err(|_| err),
+        Err(err) => Err(err),
     }
 }
 
@@ -842,6 +859,79 @@ mod tests {
         if let Err(err) = server.await {
             panic!("server task failed: {err}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_id_exhaustion_preserves_pending_rpc_correlation() {
+        let (client_stdin, server_reader) = tokio::io::duplex(4096);
+        let (mut server_writer, client_stdout) = tokio::io::duplex(4096);
+        let connection =
+            JsonRpcConnection::from_stdio(client_stdout, client_stdin, "id-exhaustion".to_string());
+        let (client, _events_rx) = RpcClient::new(connection);
+        client
+            .next_request_id
+            .store(i64::MAX - 1, std::sync::atomic::Ordering::SeqCst);
+        let client = Arc::new(client);
+        let pending_client = Arc::clone(&client);
+        let pending_call = tokio::spawn(async move {
+            pending_client
+                .call::<_, serde_json::Value>("retained", &serde_json::json!({"input": 7}))
+                .await
+        });
+        let mut lines = BufReader::new(server_reader).lines();
+        let JSONRPCMessage::Request(request) = read_jsonrpc_line(&mut lines).await else {
+            panic!("expected retained RPC request");
+        };
+        assert_eq!(request.id, RequestId::Integer(i64::MAX - 1));
+        assert_eq!(request.method, "retained");
+
+        for _ in 0..2 {
+            let rejected = timeout(
+                Duration::from_secs(1),
+                client.call::<_, serde_json::Value>("rejected", &()),
+            )
+            .await
+            .expect("exhaustion must fail without a response");
+            assert!(matches!(rejected, Err(RpcCallError::RequestIdExhausted)));
+        }
+        let cleanup = client
+            .call_for_cleanup::<_, serde_json::Value>("cleanup", &(), Duration::from_secs(1))
+            .await;
+        assert!(matches!(cleanup, Err(RpcCallError::RequestIdExhausted)));
+        let timed = client
+            .call_with_timeout::<_, serde_json::Value>("timed", &(), Duration::from_secs(1))
+            .await;
+        assert!(matches!(timed, Err(RpcCallError::RequestIdExhausted)));
+        assert_eq!(client.pending_request_count().await, 1);
+        assert!(
+            timeout(Duration::from_millis(1), lines.next_line())
+                .await
+                .is_err(),
+            "rejected requests must never reach the transport"
+        );
+
+        let expected = serde_json::json!({"retained_result": 42});
+        write_jsonrpc_line(
+            &mut server_writer,
+            JSONRPCMessage::Response(JSONRPCResponse {
+                id: request.id,
+                result: expected.clone(),
+            }),
+        )
+        .await;
+        let actual = timeout(Duration::from_secs(1), pending_call)
+            .await
+            .expect("retained response must arrive")
+            .expect("retained call task must finish")
+            .expect("retained request must still succeed");
+        assert_eq!(actual, expected);
+        assert_eq!(client.pending_request_count().await, 0);
+        assert_eq!(
+            client
+                .next_request_id
+                .load(std::sync::atomic::Ordering::SeqCst),
+            i64::MAX
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1141,8 +1231,11 @@ mod tests {
         }
     }
 
+    #[test_case::test_case(0; "ordinary")]
+    #[test_case::test_case(1; "timed")]
+    #[test_case::test_case(2; "cleanup")]
     #[tokio::test(flavor = "current_thread")]
-    async fn rpc_client_propagates_current_trace_context() {
+    async fn rpc_client_propagates_current_trace_context(entrypoint: u8) {
         let span_exporter = InMemorySpanExporter::default();
         let tracer_provider = SdkTracerProvider::builder()
             .with_simple_exporter(span_exporter)
@@ -1182,11 +1275,26 @@ mod tests {
             request.trace
         });
 
-        let response = client
-            .call::<_, serde_json::Value>("traced", &serde_json::json!({}))
-            .instrument(parent_span)
-            .await
-            .expect("RPC response");
+        let response = async {
+            let params = serde_json::json!({});
+            match entrypoint {
+                0 => client.call::<_, serde_json::Value>("traced", &params).await,
+                1 => {
+                    client
+                        .call_with_timeout("traced", &params, Duration::from_secs(1))
+                        .await
+                }
+                2 => {
+                    client
+                        .call_for_cleanup("traced", &params, Duration::from_secs(1))
+                        .await
+                }
+                _ => unreachable!(),
+            }
+        }
+        .instrument(parent_span)
+        .await
+        .expect("RPC response");
         assert_eq!(response, serde_json::json!({}));
         let trace = server.await.expect("server task").expect("trace context");
         let expected_traceparent = expected_trace
@@ -1199,5 +1307,168 @@ mod tests {
         assert_eq!(parts[1], expected_parts[1]);
         assert_ne!(parts[2], expected_parts[2]);
         assert_eq!(trace.tracestate, expected_trace.tracestate);
+    }
+
+    #[test_case::test_case(false; "malformed_message")]
+    #[test_case::test_case(true; "unexpected_request")]
+    #[tokio::test]
+    async fn rpc_client_terminates_before_delivering_disconnect_to_full_queue(
+        unexpected_request: bool,
+    ) {
+        timeout(Duration::from_secs(5), async {
+            let (outgoing_tx, _outgoing_rx) = tokio::sync::mpsc::channel(1);
+            let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel(1);
+            let (_disconnected_tx, disconnected_rx) = tokio::sync::watch::channel(false);
+            let (transport, mut terminate_rx, _terminated_tx) = JsonRpcTransport::pending_supervisor_for_test();
+            let (client, mut events_rx) = RpcClient::new(JsonRpcConnection {
+                outgoing_tx, incoming_rx, disconnected_rx,
+                task_handles: Vec::new(), transport,
+            });
+            let params = serde_json::json!({});
+            let mut call = Box::pin(client.call::<_, serde_json::Value>("pending", &params));
+            assert!(futures::poll!(call.as_mut()).is_pending());
+            for _ in 0..events_rx.max_capacity() {
+                incoming_tx.send(JsonRpcConnectionEvent::Message(JSONRPCMessage::Notification(
+                    JSONRPCNotification { method: "queued".to_string(), params: None },
+                ))).await.expect("notification enters reader");
+            }
+            let reason = if unexpected_request {
+                "unexpected JSON-RPC request from remote server: unexpected"
+            } else {
+                "invalid JSON-RPC envelope"
+            };
+            let terminal = if unexpected_request {
+                JsonRpcConnectionEvent::Message(JSONRPCMessage::Request(codex_exec_server_protocol::JSONRPCRequest {
+                    id: RequestId::Integer(999), method: "unexpected".to_string(), params: None, trace: None,
+                }))
+            } else {
+                JsonRpcConnectionEvent::MalformedMessage { reason: reason.to_string() }
+            };
+            incoming_tx.send(terminal).await.expect("terminal event enters reader");
+            terminate_rx.changed().await.expect("transport termination requested without draining events");
+            assert!(*terminate_rx.borrow());
+            assert!(matches!(call.await, Err(RpcCallError::Closed)));
+            assert_eq!(client.pending_request_count().await, 0);
+            for _ in 0..events_rx.max_capacity() {
+                assert!(matches!(events_rx.recv().await, Some(super::RpcClientEvent::Notification(notification)) if notification.method == "queued"));
+            }
+            match events_rx.recv().await {
+                Some(super::RpcClientEvent::Disconnected { reason: actual }) => assert_eq!(actual.as_deref(), Some(reason)),
+                other => panic!("expected disconnect with reason, got {other:?}"),
+            }
+        }).await.expect("shutdown must not wait for event capacity");
+    }
+
+    #[tokio::test]
+    async fn rpc_client_reaps_cancelled_calls_under_pressure_without_losing_live_calls() {
+        let (outgoing_tx, _outgoing_rx) = tokio::sync::mpsc::channel(1);
+        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel(1);
+        let (_disconnected_tx, disconnected_rx) = tokio::sync::watch::channel(false);
+        let (client, _events_rx) = RpcClient::new(JsonRpcConnection {
+            outgoing_tx,
+            incoming_rx,
+            disconnected_rx,
+            task_handles: Vec::new(),
+            transport: JsonRpcTransport::Plain,
+        });
+        let params = serde_json::json!({});
+        let mut live = Box::pin(client.call::<_, serde_json::Value>("live", &params));
+        assert!(futures::poll!(live.as_mut()).is_pending());
+        for _ in 0..MAX_IN_FLIGHT_REGULAR_CALLS * 2 {
+            let mut cancelled = Box::pin(client.call::<_, serde_json::Value>("cancelled", &params));
+            assert!(futures::poll!(cancelled.as_mut()).is_pending());
+            drop(cancelled);
+            assert!(client.pending_request_count().await <= MAX_IN_FLIGHT_REGULAR_CALLS);
+        }
+        incoming_tx
+            .send(JsonRpcConnectionEvent::Message(JSONRPCMessage::Response(
+                JSONRPCResponse {
+                    id: RequestId::Integer(1),
+                    result: serde_json::json!({"live": true}),
+                },
+            )))
+            .await
+            .expect("live response enters reader");
+        assert_eq!(
+            timeout(Duration::from_secs(1), live)
+                .await
+                .expect("live call completes")
+                .expect("live response"),
+            serde_json::json!({"live": true})
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_router_preserves_parameter_decoding_compatibility() {
+        let mut router = super::RpcRouter::<()>::new();
+        router.request("unit", |_, (): ()| async { Ok("unit") });
+        router.request(
+            "object",
+            |_, params: serde_json::Map<String, serde_json::Value>| async { Ok(params) },
+        );
+        router.request("string", |_, params: String| async { Ok(params) });
+        for (method, params, result) in [
+            ("unit", None, serde_json::json!("unit")),
+            (
+                "unit",
+                Some(serde_json::Value::Null),
+                serde_json::json!("unit"),
+            ),
+            (
+                "unit",
+                Some(serde_json::json!({})),
+                serde_json::json!("unit"),
+            ),
+            ("object", Some(serde_json::json!({})), serde_json::json!({})),
+            (
+                "object",
+                Some(serde_json::json!({"data": "payload"})),
+                serde_json::json!({"data": "payload"}),
+            ),
+            (
+                "string",
+                Some(serde_json::json!("payload")),
+                serde_json::json!("payload"),
+            ),
+        ] {
+            let (_, route) = router.request_route(method).expect("registered route");
+            let response = route(
+                Arc::new(()),
+                codex_exec_server_protocol::JSONRPCRequest {
+                    id: RequestId::Integer(1),
+                    method: method.to_string(),
+                    params,
+                    trace: None,
+                },
+            )
+            .await;
+            assert_eq!(
+                response,
+                Some(super::RpcServerOutboundMessage::Response {
+                    request_id: RequestId::Integer(1),
+                    result
+                })
+            );
+        }
+        let (_, route) = router.request_route("string").expect("registered route");
+        let response = route(
+            Arc::new(()),
+            codex_exec_server_protocol::JSONRPCRequest {
+                id: RequestId::Integer(2),
+                method: "string".to_string(),
+                params: Some(serde_json::json!({})),
+                trace: None,
+            },
+        )
+        .await;
+        let original_error = serde_json::from_value::<String>(serde_json::json!({}))
+            .expect_err("object is not a string");
+        assert_eq!(
+            response,
+            Some(super::RpcServerOutboundMessage::Error {
+                request_id: RequestId::Integer(2),
+                error: super::invalid_params(original_error.to_string()),
+            })
+        );
     }
 }

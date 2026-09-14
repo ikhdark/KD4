@@ -1039,7 +1039,7 @@ async fn review_uses_overridden_cwd_for_base_branch_merge_base() {
     let input = body["input"].as_array().expect("input array");
 
     let expected_prompt = format!(
-        "Review the code changes against the base branch 'main'. The merge base commit for this comparison is {head_sha}. Run `git diff {head_sha}` to inspect the changes relative to main. Provide prioritized, actionable findings."
+        "Review the code changes against the base branch 'main'. The merge base commit for this comparison is {head_sha}. Run `git diff {head_sha}` to inspect tracked changes relative to main, including staged and unstaged edits. Provide prioritized, actionable findings."
     );
     assert!(
         input

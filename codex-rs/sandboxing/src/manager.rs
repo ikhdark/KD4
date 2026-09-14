@@ -268,52 +268,35 @@ pub fn transform(
         windows_sandbox_private_desktop,
     } = request;
     let additional_permissions = command.additional_permissions.take();
-    let managed_mitm_ca_trust_bundle_path =
-        network.and_then(NetworkProxy::managed_mitm_ca_trust_bundle_path);
-    let base_effective_permission_profile =
-        effective_permission_profile(permissions, additional_permissions.as_ref());
-    let pending_sandboxed_request = PendingSandboxedExecRequest::new(
-        &command.cwd,
-        sandbox_policy_cwd,
-        base_effective_permission_profile.clone(),
-        managed_mitm_ca_trust_bundle_path.as_ref(),
-    );
-    let (base_file_system_policy, base_network_policy) =
-        base_effective_permission_profile.to_runtime_permissions();
+    let effective = effective_permission_profile(permissions, additional_permissions.as_ref());
+    let (permission_profile, file_system_sandbox_policy, network_sandbox_policy) = match sandbox {
+        // Transport requests can carry foreign URIs. Only the selected sandbox
+        // needs host-native paths and the proxy CA readability overlay.
+        SandboxType::None => {
+            let (file_system, network) = effective.to_runtime_permissions();
+            (effective, file_system, network)
+        }
+        SandboxType::WindowsRestrictedToken => {
+            let ca_path = network.and_then(NetworkProxy::managed_mitm_ca_trust_bundle_path);
+            let pending = PendingSandboxedExecRequest::new(
+                &command.cwd,
+                sandbox_policy_cwd,
+                effective,
+                ca_path.as_ref(),
+            )?;
+            (
+                pending.effective_permission_profile,
+                pending.effective_file_system_policy,
+                pending.effective_network_policy,
+            )
+        }
+    };
     let mut argv = Vec::with_capacity(1 + command.args.len());
     argv.push(command.program);
     argv.extend(command.args.into_iter().map(OsString::from));
 
-    let (argv, arg0_override, pending_sandboxed_request) = match sandbox {
-        SandboxType::None => (os_argv_to_strings(argv), None, None),
-        SandboxType::WindowsRestrictedToken => (
-            os_argv_to_strings(argv),
-            None,
-            Some(pending_sandboxed_request?),
-        ),
-    };
-
-    // Unsandboxed exec-server requests may have foreign cwd values that cannot be prepared
-    // locally, but their effective permissions must still be preserved. In that case, carry
-    // forward the base profile and its derived runtime policies.
-    let (permission_profile, file_system_sandbox_policy, network_sandbox_policy) =
-        pending_sandboxed_request.map_or(
-            (
-                base_effective_permission_profile,
-                base_file_system_policy,
-                base_network_policy,
-            ),
-            |pending| {
-                (
-                    pending.effective_permission_profile,
-                    pending.effective_file_system_policy,
-                    pending.effective_network_policy,
-                )
-            },
-        );
-
     Ok(SandboxExecRequest {
-        command: argv,
+        command: os_argv_to_strings(argv),
         cwd: command.cwd,
         sandbox_policy_cwd: sandbox_policy_cwd.clone(),
         env: command.env,
@@ -325,13 +308,16 @@ pub fn transform(
         permission_profile,
         file_system_sandbox_policy,
         network_sandbox_policy,
-        arg0: arg0_override,
+        arg0: None,
     })
 }
 
 pub fn transform_for_direct_spawn(
     request: SandboxDirectSpawnTransformRequest<'_>,
 ) -> Result<SandboxExecRequest, SandboxTransformError> {
+    if request.transform.sandbox == SandboxType::None {
+        return transform(request.transform);
+    }
     let codex_home = codex_utils_home_dir::find_codex_home()
         .map_err(|err| SandboxTransformError::WindowsSandboxPreparation(err.to_string()))?;
     transform_for_direct_spawn_with_codex_home(request, codex_home.as_path())

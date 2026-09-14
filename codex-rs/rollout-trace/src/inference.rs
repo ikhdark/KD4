@@ -88,7 +88,8 @@ struct TracedResponseStreamOutput<'a> {
     response_id: Option<&'a str>,
     upstream_request_id: Option<&'a str>,
     token_usage: Option<&'a TokenUsage>,
-    output_items: Vec<JsonValue>,
+    #[serde(serialize_with = "serialize_trace_response_items")]
+    output_items: &'a [ResponseItem],
 }
 
 impl InferenceTraceContext {
@@ -185,6 +186,7 @@ impl InferenceTraceAttempt {
             RawPayloadKind::InferenceRequest,
             request,
         ) else {
+            attempt.terminal_recorded.store(true, Ordering::Release);
             return;
         };
 
@@ -217,15 +219,13 @@ impl InferenceTraceAttempt {
         let Some(attempt) = self.take_terminal_attempt() else {
             return;
         };
-        let Some(response_payload) = write_response_payload_best_effort(
+        let response_payload = write_response_payload_best_effort(
             attempt,
             Some(response_id),
             upstream_request_id,
             token_usage.as_ref(),
             output_items,
-        ) else {
-            return;
-        };
+        );
 
         append_with_context_best_effort(
             &attempt.context,
@@ -318,6 +318,22 @@ impl InferenceTraceAttempt {
     }
 }
 
+/// Streams trace evidence one item at a time instead of retaining a second history tree.
+pub(crate) fn serialize_trace_response_items<S>(
+    items: &[ResponseItem],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeSeq;
+    let mut sequence = serializer.serialize_seq(Some(items.len()))?;
+    for item in items {
+        sequence.serialize_element(&trace_response_item_json(item))?;
+    }
+    sequence.end()
+}
+
 /// Serializes a response item for trace evidence rather than future request construction.
 ///
 /// The protocol serializer intentionally omits some readable reasoning content
@@ -372,7 +388,7 @@ fn write_response_payload_best_effort(
         response_id,
         upstream_request_id,
         token_usage,
-        output_items: output_items.iter().map(trace_response_item_json).collect(),
+        output_items,
     };
     write_json_payload_best_effort(
         &attempt.context.writer,

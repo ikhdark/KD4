@@ -21,6 +21,10 @@ pub(crate) fn sign_request(
     request: AwsRequestToSign,
     time: SystemTime,
 ) -> Result<AwsSignedRequest, AwsAuthError> {
+    let uri = Uri::from_str(&request.url).map_err(AwsAuthError::InvalidUri)?;
+    if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.authority().is_none() {
+        return Err(AwsAuthError::InvalidSigningUrl);
+    }
     let signable_headers = request
         .headers
         .iter()
@@ -52,7 +56,6 @@ pub(crate) fn sign_request(
         .map_err(AwsAuthError::SigningFailure)?
         .into_parts();
 
-    let uri = Uri::from_str(&request.url).map_err(AwsAuthError::InvalidUri)?;
     let mut http_request = Request::builder()
         .method(request.method)
         .uri(uri)
@@ -61,9 +64,10 @@ pub(crate) fn sign_request(
     *http_request.headers_mut() = request.headers;
     instructions.apply_to_request_http1x(&mut http_request);
 
+    let (parts, ()) = http_request.into_parts();
     Ok(AwsSignedRequest {
-        url: http_request.uri().to_string(),
-        headers: http_request.headers().clone(),
+        url: parts.uri.to_string(),
+        headers: parts.headers,
     })
 }
 

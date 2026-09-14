@@ -137,7 +137,7 @@ pub(crate) fn external_agent_config_migration_finished_lines(
         .iter()
         .map(|type_result| type_result.failures.len())
         .sum::<usize>();
-    let failed_count = if failed_count == 0 {
+    let failed_summary = if failed_count == 0 {
         format!("{failed_count} failed").green()
     } else {
         format!("{failed_count} failed").red()
@@ -148,7 +148,7 @@ pub(crate) fn external_agent_config_migration_finished_lines(
             "Claude Code import finished: ".into(),
             format!("{imported_count} imported").green(),
             ", ".into(),
-            failed_count,
+            failed_summary,
             ".".into(),
         ]
         .into(),
@@ -173,13 +173,44 @@ pub(crate) fn external_agent_config_migration_finished_lines(
             .into()
         }));
     }
-    lines.push(
-        vec![
-            "  ".into(),
-            "Run /import again to check for additional items.".dim(),
-        ]
-        .into(),
-    );
+    for failure in notification
+        .item_type_results
+        .iter()
+        .flat_map(|result| &result.failures)
+        .take(5)
+    {
+        let bounded = |value: &str| {
+            value
+                .chars()
+                .take(200)
+                .map(|ch| if ch.is_control() { ' ' } else { ch })
+                .collect::<String>()
+        };
+        lines.push(
+            Line::from(format!(
+                "    {} [{}]: {}",
+                bounded(failure.source.as_deref().unwrap_or("Import")),
+                bounded(&failure.failure_stage),
+                bounded(&failure.message)
+            ))
+            .red(),
+        );
+    }
+    if failed_count > 5 {
+        lines.push(
+            Line::from(format!(
+                "    {} additional failures omitted.",
+                failed_count - 5
+            ))
+            .dim(),
+        );
+    }
+    let next_step = if failed_count == 0 {
+        "Run /import again to check for additional items."
+    } else {
+        "Resolve the failures above, then run /import to retry."
+    };
+    lines.push(vec!["  ".into(), next_step.dim()].into());
     lines
 }
 

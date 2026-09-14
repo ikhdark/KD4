@@ -52,16 +52,19 @@ impl FrameRequester {
 
     /// Schedule a frame draw as soon as possible.
     pub fn schedule_frame(&self) {
-        self.schedule_at(Instant::now());
+        self.schedule_at(tokio::time::Instant::now().into_std());
     }
 
     /// Schedule a frame draw to occur after the specified duration.
     pub fn schedule_frame_in(&self, dur: Duration) {
-        self.schedule_at(Instant::now() + dur);
+        self.schedule_at(tokio::time::Instant::now().into_std() + dur);
     }
 
     fn schedule_at(&self, draw_at: Instant) {
-        let mut pending = self.pending_deadline.lock().unwrap();
+        let mut pending = self
+            .pending_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *pending = Some(pending.map_or(draw_at, |current| current.min(draw_at)));
         // A full wake slot already guarantees the scheduler will read this minimum.
         // Keep the update and notification together so a racing receiver cannot miss it.
@@ -117,7 +120,8 @@ impl FrameScheduler {
         const ONE_YEAR: Duration = Duration::from_secs(60 * 60 * 24 * 365);
         let mut next_deadline: Option<Instant> = None;
         loop {
-            let target = next_deadline.unwrap_or_else(|| Instant::now() + ONE_YEAR);
+            let target =
+                next_deadline.unwrap_or_else(|| tokio::time::Instant::now().into_std() + ONE_YEAR);
             let deadline = tokio::time::sleep_until(target.into());
             tokio::pin!(deadline);
 
@@ -127,7 +131,7 @@ impl FrameScheduler {
                         // All senders dropped; exit the scheduler.
                         break
                     };
-                    let Some(draw_at) = self.pending_deadline.lock().unwrap().take() else {
+                    let Some(draw_at) = self.pending_deadline.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() else {
                         continue;
                     };
                     let draw_at = self.rate_limiter.clamp_deadline(draw_at);
@@ -141,7 +145,7 @@ impl FrameScheduler {
                 _ = &mut deadline => {
                     if next_deadline.is_some() {
                         next_deadline = None;
-                        self.rate_limiter.mark_emitted(target);
+                        self.rate_limiter.mark_emitted(tokio::time::Instant::now().into_std());
                         let _ = self.draw_tx.send(());
                     }
                 }
@@ -155,6 +159,21 @@ mod tests {
     use super::*;
     use tokio::time;
     use tokio_util::time::FutureExt;
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn late_emission_still_spaces_the_next_request() {
+        let (draw_tx, mut draw_rx) = broadcast::channel(16);
+        let requester = FrameRequester::new(draw_tx);
+        requester.schedule_frame_in(Duration::from_millis(10));
+        tokio::task::yield_now().await;
+        // Wake the scheduler well after its requested deadline.
+        time::advance(Duration::from_millis(100)).await;
+        draw_rx.recv().await.unwrap();
+        let emitted_at = time::Instant::now();
+        requester.schedule_frame();
+        draw_rx.recv().await.unwrap();
+        assert!(time::Instant::now() - emitted_at >= MIN_FRAME_INTERVAL);
+    }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn request_burst_keeps_earliest_deadline_without_growing_admission() {

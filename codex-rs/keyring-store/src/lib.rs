@@ -117,52 +117,56 @@ pub mod tests {
     use std::sync::Mutex;
     use std::sync::PoisonError;
 
+    type MockCredentials = HashMap<(String, String), Arc<MockCredential>>;
+
     #[derive(Default, Clone, Debug)]
     pub struct MockKeyringStore {
-        credentials: Arc<Mutex<HashMap<String, Arc<MockCredential>>>>,
+        credentials: Arc<Mutex<MockCredentials>>,
     }
 
     impl MockKeyringStore {
-        pub fn credential(&self, account: &str) -> Arc<MockCredential> {
+        pub fn credential(&self, service: &str, account: &str) -> Arc<MockCredential> {
             let mut guard = self
                 .credentials
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             guard
-                .entry(account.to_string())
+                .entry((service.to_string(), account.to_string()))
                 .or_insert_with(|| Arc::new(MockCredential::default()))
                 .clone()
         }
 
-        pub fn saved_value(&self, account: &str) -> Option<String> {
+        pub fn saved_value(&self, service: &str, account: &str) -> Option<String> {
             let credential = {
                 let guard = self
                     .credentials
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                guard.get(account).cloned()
+                guard
+                    .get(&(service.to_string(), account.to_string()))
+                    .cloned()
             }?;
             credential.get_password().ok()
         }
 
-        pub fn set_error(&self, account: &str, error: KeyringError) {
-            let credential = self.credential(account);
+        pub fn set_error(&self, service: &str, account: &str, error: KeyringError) {
+            let credential = self.credential(service, account);
             credential.set_error(error);
         }
 
-        pub fn contains(&self, account: &str) -> bool {
+        pub fn contains(&self, service: &str, account: &str) -> bool {
             let guard = self
                 .credentials
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            guard.contains_key(account)
+            guard.contains_key(&(service.to_string(), account.to_string()))
         }
     }
 
     impl KeyringStore for MockKeyringStore {
         fn load(
             &self,
-            _service: &str,
+            service: &str,
             account: &str,
         ) -> Result<Option<String>, CredentialStoreError> {
             let credential = {
@@ -170,7 +174,9 @@ pub mod tests {
                     .credentials
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                guard.get(account).cloned()
+                guard
+                    .get(&(service.to_string(), account.to_string()))
+                    .cloned()
             };
 
             let Some(credential) = credential else {
@@ -186,24 +192,29 @@ pub mod tests {
 
         fn save(
             &self,
-            _service: &str,
+            service: &str,
             account: &str,
             value: &str,
         ) -> Result<(), CredentialStoreError> {
-            let credential = self.credential(account);
+            let mut guard = self
+                .credentials
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let credential = guard
+                .entry((service.to_string(), account.to_string()))
+                .or_insert_with(|| Arc::new(MockCredential::default()));
             credential
                 .set_password(value)
                 .map_err(CredentialStoreError::new)
         }
 
-        fn delete(&self, _service: &str, account: &str) -> Result<bool, CredentialStoreError> {
-            let credential = {
-                let guard = self
-                    .credentials
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                guard.get(account).cloned()
-            };
+        fn delete(&self, service: &str, account: &str) -> Result<bool, CredentialStoreError> {
+            let mut guard = self
+                .credentials
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let key = (service.to_string(), account.to_string());
+            let credential = guard.get(&key);
 
             let Some(credential) = credential else {
                 return Ok(false);
@@ -215,12 +226,27 @@ pub mod tests {
                 Err(error) => Err(CredentialStoreError::new(error)),
             }?;
 
-            let mut guard = self
-                .credentials
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            guard.remove(account);
+            guard.remove(&key);
             Ok(removed)
         }
+    }
+
+    #[test]
+    fn mock_keyring_separates_services_for_the_same_account() {
+        let store = MockKeyringStore::default();
+        store.save("first", "account", "one").unwrap();
+        store.save("second", "account", "two").unwrap();
+        assert_eq!(store.load("first", "account").unwrap(), Some("one".into()));
+        assert_eq!(store.saved_value("second", "account"), Some("two".into()));
+        store.set_error(
+            "first",
+            "account",
+            KeyringError::Invalid("test".into(), "load".into()),
+        );
+        assert!(store.load("first", "account").is_err());
+        assert_eq!(store.load("second", "account").unwrap(), Some("two".into()));
+        assert!(store.delete("first", "account").unwrap());
+        assert!(!store.contains("first", "account"));
+        assert_eq!(store.load("second", "account").unwrap(), Some("two".into()));
     }
 }

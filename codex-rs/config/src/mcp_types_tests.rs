@@ -532,3 +532,58 @@ fn deserialize_rejects_inline_bearer_token_field() {
         "unexpected error: {err}"
     );
 }
+#[test]
+fn mcp_timeout_conversion_boundaries() {
+    for field in ["startup_timeout_sec", "tool_timeout_sec"] {
+        for (valid, millis) in [("0", 0), ("1.5", 1500)] {
+            let input = format!("command = 'server'\n{field} = {valid}");
+            let config: McpServerConfig = toml::from_str(&input).unwrap();
+            let duration = if field == "startup_timeout_sec" {
+                config.startup_timeout_sec
+            } else {
+                config.tool_timeout_sec
+            };
+            assert_eq!(duration, Some(std::time::Duration::from_millis(millis)));
+        }
+        for invalid in ["-1", "nan", "inf", "-inf"] {
+            let input = format!("command = 'server'\n{field} = {invalid}");
+            assert!(
+                toml::from_str::<McpServerConfig>(&input).is_err(),
+                "{input}"
+            );
+        }
+    }
+    let config: McpServerConfig =
+        toml::from_str("command = 'server'\nstartup_timeout_sec = 1.5\nstartup_timeout_ms = 9000")
+            .unwrap();
+    assert_eq!(
+        config.startup_timeout_sec,
+        Some(std::time::Duration::from_millis(1500))
+    );
+    let legacy: McpServerConfig =
+        toml::from_str("command = 'server'\nstartup_timeout_ms = 9000").unwrap();
+    assert_eq!(
+        legacy.startup_timeout_sec,
+        Some(std::time::Duration::from_secs(9))
+    );
+}
+
+#[test]
+fn mcp_authentication_requires_http_transport() {
+    for mode in ["oauth", "chatgpt"] {
+        let http: McpServerConfig =
+            toml::from_str(&format!("url = 'https://example.com/mcp'\nauth = '{mode}'")).unwrap();
+        assert_eq!(
+            http.auth,
+            if mode == "oauth" {
+                super::McpServerAuth::OAuth
+            } else {
+                super::McpServerAuth::ChatGpt
+            }
+        );
+        let error =
+            toml::from_str::<McpServerConfig>(&format!("command = 'server'\nauth = '{mode}'"))
+                .unwrap_err();
+        assert!(error.to_string().contains("auth"), "{error}");
+    }
+}

@@ -7,7 +7,7 @@ use tempfile::TempDir;
 use super::TestModelsEndpoint;
 use super::openai_manager_for_tests;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn offline_model_info_without_tool_output_override() {
     let codex_home = TempDir::new().expect("create temp dir");
     let config = ModelsManagerConfig::default();
@@ -24,7 +24,7 @@ async fn offline_model_info_without_tool_output_override() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn offline_model_info_with_tool_output_override() {
     let codex_home = TempDir::new().expect("create temp dir");
     let config = ModelsManagerConfig {
@@ -41,5 +41,10 @@ async fn offline_model_info_with_tool_output_override() {
     assert_eq!(
         model_info.truncation_policy,
         TruncationPolicyConfig::tokens(/*limit*/ 123)
+    );
+    let byte_model_info = manager.get_model_info("gpt-5.2", &config).await;
+    assert_eq!(
+        byte_model_info.truncation_policy,
+        TruncationPolicyConfig::bytes(492)
     );
 }

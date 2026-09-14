@@ -66,11 +66,47 @@ impl<'de> Deserialize<'de> for KeybindingSpec {
 /// An empty list explicitly unbinds the action in that scope. Because an
 /// explicit empty list is still a configured value, runtime resolution must not
 /// fall through to global or built-in defaults for that action.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(untagged)]
 pub enum KeybindingsSpec {
     One(KeybindingSpec),
     Many(Vec<KeybindingSpec>),
+}
+
+impl<'de> Deserialize<'de> for KeybindingsSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct BindingsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for BindingsVisitor {
+            type Value = KeybindingsSpec;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a keybinding string or a list of keybinding strings")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                normalize_keybinding_spec(value)
+                    .map(|spec| KeybindingsSpec::One(KeybindingSpec(spec)))
+                    .map_err(E::custom)
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut specs = Vec::new();
+                while let Some(spec) = seq.next_element::<KeybindingSpec>()? {
+                    specs.push(spec);
+                }
+                Ok(KeybindingsSpec::Many(specs))
+            }
+        }
+
+        deserializer.deserialize_any(BindingsVisitor)
+    }
 }
 
 impl KeybindingsSpec {
@@ -192,6 +228,7 @@ pub struct TuiEditorKeymap {
 /// be specified as `shift-a` in config; the runtime matcher handles
 /// cross-terminal shift-reporting differences automatically.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct TuiVimNormalKeymap {
     /// Enter insert mode at cursor (`i`).
@@ -253,6 +290,7 @@ pub struct TuiVimNormalKeymap {
 /// `Esc` cancels the pending operator and returns to normal mode without
 /// modifying text.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct TuiVimOperatorKeymap {
     /// Repeat delete operator to delete the whole line (`dd`).
@@ -539,6 +577,7 @@ fn normalize_key_name(key: &str, original: &str) -> Result<String, String> {
             | "backspace"
             | "esc"
             | "delete"
+            | "insert"
             | "up"
             | "down"
             | "left"
@@ -557,13 +596,13 @@ fn normalize_key_name(key: &str, original: &str) -> Result<String, String> {
         && let Ok(number) = number.parse::<u8>()
         && (1..=MAX_FUNCTION_KEY).contains(&number)
     {
-        return Ok(alias.to_string());
+        return Ok(format!("f{number}"));
     }
 
     Err(format!(
         "unknown key `{key}` in keybinding `{original}`. \
 Use a printable character (for example `a`), function keys (`f1`-`f{MAX_FUNCTION_KEY}`), \
-or one of: enter, tab, backspace, esc, delete, arrows, home/end, page-up/page-down, space, minus.\n\
+or one of: enter, tab, backspace, esc, delete, insert, arrows, home/end, page-up/page-down, space, minus.\n\
 See the Codex keymap documentation for supported actions and examples."
     ))
 }
@@ -649,7 +688,10 @@ mod tests {
             open_transcript = "ctrl-s"
         "#;
         let keymap: TuiKeymap = toml::from_str(toml_input).expect("valid config");
-        assert!(keymap.global.open_transcript.is_some());
+        assert_eq!(
+            keymap.global.open_transcript,
+            Some(KeybindingsSpec::One(KeybindingSpec("ctrl-s".to_string())))
+        );
     }
 
     #[test]
@@ -683,5 +725,41 @@ mod tests {
         assert_eq!(normalize_keybinding_spec("F13"), Ok("f13".to_string()));
         assert_eq!(normalize_keybinding_spec("f24"), Ok("f24".to_string()));
         assert!(normalize_keybinding_spec("f25").is_err());
+    }
+    #[test]
+    fn vim_contexts_reject_misspelled_actions() {
+        for context in ["vim_normal", "vim_operator"] {
+            let err = toml::from_str::<TuiKeymap>(&format!("[{context}]\nmove_lefft = 'h'"))
+                .expect_err("unknown action");
+            assert!(err.to_string().contains("move_lefft"), "{err}");
+        }
+    }
+
+    #[test]
+    fn binding_values_preserve_normalization_order_and_diagnostics() {
+        for (value, expected) in [
+            (
+                "'f01'",
+                KeybindingsSpec::One(KeybindingSpec("f1".to_string())),
+            ),
+            (
+                "['f01', 'ctrl-a']",
+                KeybindingsSpec::Many(vec![
+                    KeybindingSpec("f1".to_string()),
+                    KeybindingSpec("ctrl-a".to_string()),
+                ]),
+            ),
+            ("[]", KeybindingsSpec::Many(vec![])),
+        ] {
+            let keymap =
+                toml::from_str::<TuiKeymap>(&format!("[global]\nopen_transcript = {value}"))
+                    .unwrap();
+            assert_eq!(keymap.global.open_transcript, Some(expected));
+        }
+        for value in ["'notakey'", "['ctrl-a', 'notakey']"] {
+            let err = toml::from_str::<TuiKeymap>(&format!("[global]\nopen_transcript = {value}"))
+                .unwrap_err();
+            assert!(err.to_string().contains("unknown key `notakey`"), "{err}");
+        }
     }
 }

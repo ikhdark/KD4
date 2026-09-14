@@ -115,7 +115,7 @@ async fn initial_noise_connection_refreshes_bundle_after_unauthorized_handshake(
 }
 
 #[tokio::test]
-async fn stdio_command_uses_declared_environment_and_managed_process_tree() -> Result<()> {
+async fn stdio_command_uses_declared_environment_and_allocates_managed_root() -> Result<()> {
     let program = std::env::var("SystemRoot")
         .map(std::path::PathBuf::from)?
         .join("System32")
@@ -153,7 +153,7 @@ fn assert_websocket_deadline_covers_tls_preparation(noise: bool) -> Result<()> {
         .build()?;
     runtime.block_on(async {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let websocket_url = format!("ws://{}", listener.local_addr()?);
+        let websocket_url = format!("wss://{}", listener.local_addr()?);
         let deadline = Duration::from_millis(20);
         let (release, held) = std::sync::mpsc::channel::<()>();
         let (started, ready) = tokio::sync::oneshot::channel();
@@ -203,4 +203,70 @@ fn websocket_deadline_covers_tls_preparation_without_network_side_effects() -> R
 #[test]
 fn noise_websocket_deadline_covers_tls_preparation_without_network_side_effects() -> Result<()> {
     assert_websocket_deadline_covers_tls_preparation(true)
+}
+
+#[test]
+fn plain_websockets_connect_while_tls_worker_is_occupied() -> Result<()> {
+    use crate::{NoiseRendezvousConnectArgs, RemoteExecServerConnectArgs};
+    use std::time::Duration;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()?;
+    runtime.block_on(async {
+        for noise in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let websocket_url = format!("ws://{}", listener.local_addr()?);
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = started.send(());
+                let _ = held.recv();
+            });
+            ready.await?;
+            let server = async {
+                let (socket, _) = listener.accept().await?;
+                tokio_tungstenite::accept_async(socket)
+                    .await
+                    .map_err(anyhow::Error::from)
+            };
+            let connect = async {
+                if noise {
+                    ExecServerClient::open_noise_rendezvous_connection(NoiseRendezvousConnectArgs {
+                        bundle: test_bundle(websocket_url.clone())?,
+                        harness_identity: NoiseChannelIdentity::generate()?,
+                        client_name: "plain-test".into(),
+                        connect_timeout: Duration::from_secs(1),
+                        initialize_timeout: Duration::from_secs(1),
+                        resume_session_id: None,
+                    })
+                    .await
+                    .map(|(connection, _)| connection)
+                    .map_err(anyhow::Error::from)
+                } else {
+                    ExecServerClient::open_websocket_connection(&RemoteExecServerConnectArgs::new(
+                        websocket_url,
+                        "plain-test".into(),
+                    ))
+                    .await
+                    .map_err(anyhow::Error::from)
+                }
+            };
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::try_join!(server, connect)
+            })
+            .await;
+            drop(release);
+            blocker.await?;
+            let (_socket, connection) = result??;
+            assert!(
+                !*connection.disconnected_rx.borrow(),
+                "plain connection must be open"
+            );
+            for task in connection.task_handles {
+                task.abort();
+            }
+        }
+        anyhow::Ok(())
+    })
 }

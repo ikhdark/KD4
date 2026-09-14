@@ -32,6 +32,11 @@ use crate::UpdateThreadMetadataParams;
 pub type ThreadStoreFuture<'a, T> = Pin<Box<dyn Future<Output = ThreadStoreResult<T>> + Send + 'a>>;
 
 /// Storage-neutral thread persistence boundary.
+///
+/// `LiveThread` serializes mutations and durability barriers per live handle. Stores must
+/// preserve submission order for accepted operations, including work that continues after
+/// cancellation. An error or cancelled future does not prove that no items were accepted;
+/// callers must not blindly replay an append batch.
 pub trait ThreadStore: Any + Send + Sync {
     /// Return this store as [`Any`] for implementation-owned escape hatches.
     fn as_any(&self) -> &dyn Any;
@@ -117,6 +122,8 @@ pub trait ThreadStore: Any + Send + Sync {
     fn discard_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>;
 
     /// Loads persisted history for resume, fork, rollback, and memory jobs.
+    /// Queued ordered appends may be absent until a successful persistence barrier. Recovery
+    /// callers must establish that barrier before trusting negative history evidence.
     fn load_history(
         &self,
         params: LoadThreadHistoryParams,

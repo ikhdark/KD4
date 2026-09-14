@@ -198,6 +198,7 @@ pub(crate) struct InlineAutoCompactReuse<'a> {
         Option<&'a Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
 }
 
+#[expect(clippy::too_many_arguments, reason = "Preserve explicit compaction context, publication options, and cancellation")]
 pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,

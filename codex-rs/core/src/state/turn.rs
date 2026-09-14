@@ -11,7 +11,6 @@ use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::sync::OwnedMutexGuard;
 use tokio::task::AbortHandle;
-use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::Span;
@@ -95,7 +94,6 @@ pub(crate) struct RunningTask {
     pub(crate) auxiliary_cancellation_token: CancellationToken,
     pub(crate) auxiliary_tasks: JoinSet<()>,
     pub(crate) worker_abort_handle: AbortHandle,
-    pub(crate) _supervisor_handle: JoinHandle<()>,
     pub(crate) task_span: Span,
     pub(crate) turn_context: Arc<TurnContext>,
     pub(crate) _agent_execution_guard: Option<AgentExecutionGuard>,
@@ -717,7 +715,11 @@ impl TurnState {
     }
 
     #[cfg(test)]
-    pub(crate) fn has_pending_elicitation(&self, server_name: &str, request_id: &RequestId) -> bool {
+    pub(crate) fn has_pending_elicitation(
+        &self,
+        server_name: &str,
+        request_id: &RequestId,
+    ) -> bool {
         self.pending_elicitations
             .contains_key(&(server_name.to_string(), request_id.clone()))
     }

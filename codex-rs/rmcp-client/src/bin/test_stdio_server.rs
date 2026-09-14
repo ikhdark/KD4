@@ -215,14 +215,14 @@ impl TestToolServer {
         let schema: JsonObject = serde_json::from_value(json!({
             "type": "object",
             "properties": {
-                "sleep_before_ms": { "type": "number" },
-                "sleep_after_ms": { "type": "number" },
+                "sleep_before_ms": { "type": "integer", "minimum": 0 },
+                "sleep_after_ms": { "type": "integer", "minimum": 0 },
                 "barrier": {
                     "type": "object",
                     "properties": {
                         "id": { "type": "string" },
-                        "participants": { "type": "number" },
-                        "timeout_ms": { "type": "number" }
+                        "participants": { "type": "integer", "minimum": 1 },
+                        "timeout_ms": { "type": "integer", "minimum": 1 }
                     },
                     "required": ["id", "participants"],
                     "additionalProperties": false
@@ -594,11 +594,10 @@ impl ServerHandler for TestToolServer {
                     }
                 };
 
-                let env_snapshot: HashMap<String, String> = std::env::vars().collect();
                 let env_name = args.env_var.as_deref().unwrap_or("MCP_TEST_VALUE");
                 let structured_content = json!({
                     "echo": format!("ECHOING: {}", args.message),
-                    "env": env_snapshot.get(env_name),
+                    "env": std::env::var(env_name).ok(),
                 });
 
                 Ok(Self::structured_result(structured_content))
@@ -625,15 +624,18 @@ impl ServerHandler for TestToolServer {
                 )]))
             }
             "image_scenario" => {
-                let args = Self::parse_call_args::<ImageScenarioArgs>(&request, "image_scenario")?;
+                let args = Self::parse_call_args::<ImageScenarioArgs>(
+                    request.arguments,
+                    "image_scenario",
+                )?;
                 Self::image_scenario_result(args)
             }
             "sync" => {
-                let args = Self::parse_call_args::<SyncArgs>(&request, "sync")?;
+                let args = Self::parse_call_args::<SyncArgs>(request.arguments, "sync")?;
                 Self::sync_result(args).await
             }
             "sync_readonly" => {
-                let args = Self::parse_call_args::<SyncArgs>(&request, "sync_readonly")?;
+                let args = Self::parse_call_args::<SyncArgs>(request.arguments, "sync_readonly")?;
                 Self::sync_result(args).await
             }
             other => Err(McpError::invalid_params(
@@ -646,14 +648,12 @@ impl ServerHandler for TestToolServer {
 
 impl TestToolServer {
     fn parse_call_args<T: for<'de> Deserialize<'de>>(
-        request: &CallToolRequestParams,
+        arguments: Option<JsonObject>,
         tool_name: &'static str,
     ) -> Result<T, McpError> {
-        match request.arguments.as_ref() {
-            Some(arguments) => serde_json::from_value(serde_json::Value::Object(
-                arguments.clone().into_iter().collect(),
-            ))
-            .map_err(|err| McpError::invalid_params(err.to_string(), None)),
+        match arguments {
+            Some(arguments) => serde_json::from_value(serde_json::Value::Object(arguments))
+                .map_err(|err| McpError::invalid_params(err.to_string(), None)),
             None => Err(McpError::invalid_params(
                 format!("missing arguments for {tool_name} tool"),
                 None,
@@ -855,4 +855,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Drain background tasks to ensure clean shutdown.
     task::yield_now().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn echo_and_sync_contracts_work_through_mcp() {
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let (server, client) =
+            tokio::join!(TestToolServer::new().serve(server_io), ().serve(client_io));
+        let server = server.unwrap();
+        let client = client.unwrap();
+        let tools = client.list_all_tools().await.unwrap();
+        for name in ["sync", "sync_readonly"] {
+            let tool = tools.iter().find(|tool| tool.name == name).unwrap();
+            let schema = serde_json::to_value(&tool.input_schema).unwrap();
+            assert_eq!(
+                schema["properties"]["sleep_before_ms"],
+                json!({"type": "integer", "minimum": 0})
+            );
+            assert_eq!(
+                schema["properties"]["barrier"]["properties"]["participants"],
+                json!({"type": "integer", "minimum": 1})
+            );
+            assert_eq!(
+                schema["properties"]["barrier"]["properties"]["timeout_ms"],
+                json!({"type": "integer", "minimum": 1})
+            );
+            let mut request = CallToolRequestParams::new(name);
+            request.arguments =
+                Some(serde_json::from_value(json!({"sleep_before_ms": 0.5})).unwrap());
+            assert!(client.call_tool(request).await.is_err());
+        }
+        let mut request = CallToolRequestParams::new("echo");
+        request.arguments =
+            Some(serde_json::from_value(json!({"message": "hello", "env_var": "PATH"})).unwrap());
+        let result = client.call_tool(request).await.unwrap();
+        assert_eq!(
+            result.structured_content,
+            Some(json!({"echo": "ECHOING: hello", "env": std::env::var("PATH").ok()}))
+        );
+        let mut request = CallToolRequestParams::new("sync");
+        request.arguments = Some(serde_json::from_value(json!({"sleep_before_ms": 0})).unwrap());
+        let result = client.call_tool(request).await.unwrap();
+        assert_eq!(result.structured_content, Some(json!({"result": "ok"})));
+        client.cancel().await.unwrap();
+        server.cancel().await.unwrap();
+    }
 }

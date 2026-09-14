@@ -142,6 +142,17 @@ impl Request {
     /// not repeat JSON serialization or compression. Request-signing auth also
     /// sees the same final headers and bytes that the transport will send.
     pub fn into_prepared(mut self) -> Result<Self, String> {
+        if let Some(RequestBody::EncodedJson(body)) = &self.body
+            && body.prepared
+        {
+            self.prepare_body_for_send()?;
+            return Ok(self);
+        }
+        if let Some(RequestBody::Json(body)) = &self.body {
+            self.body = Some(RequestBody::EncodedJson(
+                EncodedJsonBody::encode(body).map_err(|err| err.to_string())?,
+            ));
+        }
         let is_json = matches!(
             self.body,
             Some(RequestBody::Json(_) | RequestBody::EncodedJson(_))
@@ -150,11 +161,9 @@ impl Request {
             && tracing::enabled!(target: "codex_http_client::transport", tracing::Level::TRACE)
         {
             match self.body.as_ref() {
-                Some(RequestBody::Json(body)) => Some(Bytes::from(
-                    serde_json::to_vec(body).map_err(|err| err.to_string())?,
-                )),
                 Some(RequestBody::EncodedJson(body)) => Some(body.bytes.clone()),
-                Some(RequestBody::Raw(_) | RequestBody::InvalidJson(_)) | None => None,
+                Some(RequestBody::Json(_) | RequestBody::Raw(_) | RequestBody::InvalidJson(_))
+                | None => None,
             }
         } else {
             None
@@ -210,6 +219,9 @@ impl Request {
         body: &EncodedJsonBody,
     ) -> Result<PreparedRequestBody, String> {
         if body.prepared {
+            if self.compression != RequestCompression::None {
+                return Err("cannot change compression of an already prepared body".to_string());
+            }
             return Ok(PreparedRequestBody {
                 headers,
                 body: Some(body.bytes.clone()),
@@ -238,6 +250,12 @@ impl Request {
             let compression_duration = compression_start.elapsed();
 
             headers.insert(http::header::CONTENT_ENCODING, content_encoding);
+            if headers.contains_key(http::header::CONTENT_LENGTH) {
+                headers.insert(
+                    http::header::CONTENT_LENGTH,
+                    HeaderValue::from(post_compression_bytes),
+                );
+            }
 
             tracing::debug!(
                 pre_compression_bytes,
@@ -327,6 +345,10 @@ mod tests {
         let mut request =
             Request::new(Method::POST, "https://example.com/v1/responses".to_string())
                 .with_compression(RequestCompression::Zstd);
+        request.headers.insert(
+            http::header::CONTENT_LENGTH,
+            HeaderValue::from(body.as_bytes().len()),
+        );
         request.body = Some(RequestBody::EncodedJson(body));
         let request = request.into_prepared().expect("body should prepare");
         let Some(RequestBody::EncodedJson(body)) = request.body.as_ref() else {
@@ -335,6 +357,27 @@ mod tests {
         let decompressed = zstd::stream::decode_all(std::io::Cursor::new(body.as_bytes()))
             .expect("body should decompress");
 
+        assert_eq!(
+            request.headers[http::header::CONTENT_LENGTH],
+            HeaderValue::from(body.as_bytes().len())
+        );
+        assert!(
+            request
+                .clone()
+                .with_compression(RequestCompression::Zstd)
+                .into_prepared()
+                .is_err()
+        );
+        assert_eq!(
+            request
+                .clone()
+                .into_prepared()
+                .expect("repeat preparation")
+                .prepare_body_for_send()
+                .unwrap()
+                .body,
+            request.prepare_body_for_send().unwrap().body
+        );
         assert_eq!(decompressed, br#"{"model":"test-model"}"#);
         assert_eq!(request.compression, RequestCompression::None);
         assert_eq!(
@@ -352,6 +395,27 @@ mod tests {
                 .expect("prepared body should remain readable")
                 .body
                 .map(|body| body.len() as u64)
+        );
+    }
+    #[test]
+    fn repeated_preparation_keeps_original_trace_bytes() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::io::sink)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let mut request = Request::new(Method::POST, "https://example.com/".to_string())
+            .with_compression(RequestCompression::Zstd);
+        request.body = Some(RequestBody::Json(json!({"message":"trace-original"})));
+        let prepared = request.into_prepared().unwrap().into_prepared().unwrap();
+        let Some(RequestBody::EncodedJson(body)) = prepared.body else {
+            panic!("expected JSON");
+        };
+        assert_eq!(body.trace_bytes(), br#"{"message":"trace-original"}"#);
+        assert_ne!(body.as_bytes(), body.trace_bytes());
+        assert_eq!(
+            zstd::stream::decode_all(body.as_bytes()).unwrap(),
+            body.trace_bytes()
         );
     }
 }

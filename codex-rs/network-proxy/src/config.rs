@@ -245,12 +245,9 @@ impl NetworkProxyConfig {
         domains
             .entries
             .retain(|entry| entry.permission != permission);
+        let mut seen = std::collections::HashSet::new();
         for entry in entries {
-            if !domains
-                .entries
-                .iter()
-                .any(|existing| existing.pattern == entry && existing.permission == permission)
-            {
+            if seen.insert(entry.clone()) {
                 domains.entries.push(NetworkDomainPermissionEntry {
                     pattern: entry,
                     permission,
@@ -283,8 +280,8 @@ pub enum NetworkMode {
     /// blocked unless MITM is enabled so the proxy can enforce method policy on inner requests.
     /// SOCKS5 UDP and non-HTTPS SOCKS5 TCP remain blocked in limited mode.
     Limited,
-    /// Full network access: all HTTP methods are allowed. HTTPS CONNECTs are tunneled directly.
-    /// MITM hooks do not currently make full mode enter MITM.
+    /// Full network access: all HTTP methods are allowed. HTTPS CONNECTs are tunneled directly
+    /// unless host-specific hooks or brokered credentials require interception.
     #[default]
     Full,
 }
@@ -501,7 +498,10 @@ fn parse_host_port(url: &str, default_port: u16) -> Result<SocketAddressParts> {
         }
         return Ok(SocketAddressParts {
             host: host.to_string(),
-            port: parsed.port().unwrap_or(default_port),
+            // Url removes explicit scheme-default ports; recover the supplied authority port.
+            port: parsed
+                .port()
+                .unwrap_or(parse_host_port_fallback(trimmed, default_port)?.port),
         });
     }
 
@@ -513,7 +513,10 @@ fn parse_host_port_fallback(input: &str, default_port: u16) -> Result<SocketAddr
         .split_once("://")
         .map(|(_, rest)| rest)
         .unwrap_or(input);
-    let host_port = without_scheme.split('/').next().unwrap_or(without_scheme);
+    let host_port = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(without_scheme);
     let host_port = host_port
         .rsplit_once('@')
         .map(|(_, rest)| rest)
@@ -576,6 +579,18 @@ mod tests {
             );
         }
         settings
+    }
+
+    #[test]
+    fn explicit_scheme_default_ports_override_proxy_default() {
+        for (url, port) in [
+            ("http://127.0.0.1:80", 80),
+            ("https://[::1]:443/path", 443),
+            ("127.0.0.1:80?x=1", 80),
+            ("http://127.0.0.1", 3128),
+        ] {
+            assert_eq!(parse_host_port(url, 3128).unwrap().port, port, "{url}");
+        }
     }
 
     #[test]

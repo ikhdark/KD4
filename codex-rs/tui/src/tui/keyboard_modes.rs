@@ -5,11 +5,15 @@
 //! reporting if a terminal misses the normal stack pop.
 
 use std::fmt;
+use std::io::Write;
 use std::io::stdout;
 
 use crossterm::Command;
+#[cfg(not(windows))]
 use crossterm::event::KeyboardEnhancementFlags;
+#[cfg(not(windows))]
 use crossterm::event::PopKeyboardEnhancementFlags;
+#[cfg(not(windows))]
 use crossterm::event::PushKeyboardEnhancementFlags;
 use ratatui::crossterm::execute;
 
@@ -49,9 +53,11 @@ pub(super) fn enable_keyboard_enhancement() {
         return;
     }
 
+    let _ = execute!(stdout(), DisableModifyOtherKeys);
+    // Windows reads native input records and must not enable escape-sequence input.
+    #[cfg(not(windows))]
     let _ = execute!(
         stdout(),
-        DisableModifyOtherKeys,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
@@ -61,20 +67,21 @@ pub(super) fn enable_keyboard_enhancement() {
 }
 
 pub(super) fn restore_keyboard_enhancement_stack() {
-    let _ = execute!(
-        stdout(),
-        PopKeyboardEnhancementFlags,
-        DisableModifyOtherKeys
-    );
+    let _ = restore_keyboard_reporting(&mut stdout(), false);
 }
 
 pub(super) fn reset_keyboard_reporting_after_exit() {
-    let _ = execute!(
-        stdout(),
-        PopKeyboardEnhancementFlags,
-        ResetKeyboardEnhancementFlags,
-        DisableModifyOtherKeys
-    );
+    let _ = restore_keyboard_reporting(&mut stdout(), true);
+}
+
+fn restore_keyboard_reporting(writer: &mut impl Write, final_exit: bool) -> std::io::Result<()> {
+    // No stack level is pushed on Windows; its crossterm pop also returns Unsupported.
+    #[cfg(not(windows))]
+    execute!(writer, PopKeyboardEnhancementFlags)?;
+    if final_exit {
+        execute!(writer, ResetKeyboardEnhancementFlags)?;
+    }
+    execute!(writer, DisableModifyOtherKeys)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,9 +89,10 @@ struct ResetKeyboardEnhancementFlags;
 
 impl Command for ResetKeyboardEnhancementFlags {
     fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        f.write_str("\x1b[<u")
+        f.write_str("\x1b[=0u")
     }
 
+    #[cfg(windows)]
     fn execute_winapi(&self) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -92,8 +100,9 @@ impl Command for ResetKeyboardEnhancementFlags {
         ))
     }
 
+    #[cfg(windows)]
     fn is_ansi_code_supported(&self) -> bool {
-        false
+        true
     }
 }
 
@@ -105,6 +114,7 @@ impl Command for DisableModifyOtherKeys {
         f.write_str("\x1b[>4;0m")
     }
 
+    #[cfg(windows)]
     fn execute_winapi(&self) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -112,8 +122,9 @@ impl Command for DisableModifyOtherKeys {
         ))
     }
 
+    #[cfg(windows)]
     fn is_ansi_code_supported(&self) -> bool {
-        false
+        true
     }
 }
 
@@ -152,8 +163,19 @@ mod tests {
     }
 
     #[test]
-    fn reset_keyboard_enhancement_flags_clears_all_pushed_levels() {
-        assert_eq!(ansi_for(ResetKeyboardEnhancementFlags), "\x1b[<u");
+    fn reset_keyboard_enhancement_flags_disables_current_reporting() {
+        assert_eq!(ansi_for(ResetKeyboardEnhancementFlags), "\x1b[=0u");
+    }
+
+    #[test]
+    fn cleanup_dispatch_writes_resets_only_on_final_exit() {
+        for final_exit in [false, true] {
+            let mut output = Vec::new();
+            super::restore_keyboard_reporting(&mut output, final_exit).unwrap();
+            let pop = if cfg!(windows) { "" } else { "\x1b[<1u" };
+            let reset = if final_exit { "\x1b[=0u" } else { "" };
+            assert_eq!(output, format!("{pop}{reset}\x1b[>4;0m").into_bytes());
+        }
     }
 
     #[test]

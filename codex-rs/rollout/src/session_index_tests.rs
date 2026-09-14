@@ -600,3 +600,47 @@ fn scan_index_finds_latest_match_among_mixed_entries() -> std::io::Result<()> {
     assert_eq!(found_other_by_id, Some(expected_other));
     Ok(())
 }
+
+#[tokio::test]
+async fn append_repairs_torn_tail_and_blank_latest_name_stays_cleared() -> std::io::Result<()> {
+    let temp = TempDir::new()?;
+    let path = session_index_path(temp.path());
+    std::fs::write(&path, b"{\"id\":")?;
+    let mut entry = SessionIndexEntry {
+        id: ThreadId::new(),
+        thread_name: "old name".into(),
+        updated_at: "2026-01-01T00:00:00Z".into(),
+    };
+    append_session_index_entry(temp.path(), &entry).await?;
+    assert_eq!(
+        find_thread_name_by_id(temp.path(), &entry.id).await?,
+        Some("old name".into())
+    );
+    entry.thread_name = " ".into();
+    append_session_index_entry(temp.path(), &entry).await?;
+    assert_eq!(
+        find_thread_name_by_id(temp.path(), &entry.id).await?,
+        Some(" ".into())
+    );
+    assert!(scan_index_from_end_by_ids(&path, &HashSet::from([entry.id]))?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn closed_name_receiver_stops_before_reading_older_nonmatches() -> std::io::Result<()> {
+    let temp = TempDir::new()?;
+    let path = session_index_path(temp.path());
+    let entry = SessionIndexEntry {
+        id: ThreadId::new(),
+        thread_name: "unrelated".into(),
+        updated_at: "2026-01-01T00:00:00Z".into(),
+    };
+    write_index(&path, &vec![entry; 1000])?;
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    drop(rx);
+    reset_session_index_reverse_bytes_read();
+    stream_thread_ids_from_end_by_name(&path, "target", tx)?;
+    assert!(session_index_reverse_bytes_read() <= READ_CHUNK_SIZE);
+    assert!(session_index_reverse_bytes_read() < std::fs::metadata(&path)?.len() as usize);
+    Ok(())
+}

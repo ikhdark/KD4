@@ -165,7 +165,11 @@ pub(crate) fn server_error_data_from_report<T: DeserializeOwned>(
 fn is_thread_settings_update_unsupported(source: &JSONRPCErrorError) -> bool {
     source.code == JSONRPC_METHOD_NOT_FOUND
         || (source.code == JSONRPC_INVALID_REQUEST
-            && source.message.contains(THREAD_SETTINGS_UPDATE_METHOD))
+            && (source.message
+                == format!("{THREAD_SETTINGS_UPDATE_METHOD} requires experimentalApi capability")
+                || source.message.starts_with(&format!(
+                    "Invalid request: unknown variant `{THREAD_SETTINGS_UPDATE_METHOD}`"
+                ))))
 }
 
 /// Data collected during the TUI bootstrap phase that the main event loop
@@ -287,35 +291,46 @@ impl AppServerSession {
         let started_at = Instant::now();
         let account = self.read_account().await?;
         let requirements_request_id = self.next_request_id();
-        let requirements: ConfigRequirementsReadResponse = self
-            .client
-            .request_typed(ClientRequest::ConfigRequirementsRead {
-                request_id: requirements_request_id,
-                params: None,
-            })
-            .await
-            .map_err(|err| {
-                bootstrap_request_error("configRequirements/read failed during TUI bootstrap", err)
-            })?;
+        let model_request_id = self.next_request_id();
+        let request_handle = self.request_handle();
+        // Preserve account initialization ordering, then overlap independent catalog reads.
+        let (requirements, models) = tokio::try_join!(
+            async {
+                request_handle
+                    .request_typed::<ConfigRequirementsReadResponse>(
+                        ClientRequest::ConfigRequirementsRead {
+                            request_id: requirements_request_id,
+                            params: None,
+                        },
+                    )
+                    .await
+                    .map_err(|err| {
+                        bootstrap_request_error(
+                            "configRequirements/read failed during TUI bootstrap",
+                            err,
+                        )
+                    })
+            },
+            async {
+                request_handle
+                    .request_typed::<ModelListResponse>(ClientRequest::ModelList {
+                        request_id: model_request_id,
+                        params: ModelListParams {
+                            cursor: None,
+                            limit: None,
+                            include_hidden: Some(true),
+                        },
+                    })
+                    .await
+                    .map_err(|err| {
+                        bootstrap_request_error("model/list failed during TUI bootstrap", err)
+                    })
+            }
+        )?;
         self.managed_new_thread_defaults = requirements
             .requirements
             .and_then(|requirements| requirements.models)
             .and_then(|models| models.new_thread);
-        let model_request_id = self.next_request_id();
-        let models: ModelListResponse = self
-            .client
-            .request_typed(ClientRequest::ModelList {
-                request_id: model_request_id,
-                params: ModelListParams {
-                    cursor: None,
-                    limit: None,
-                    include_hidden: Some(true),
-                },
-            })
-            .await
-            .map_err(|err| {
-                bootstrap_request_error("model/list failed during TUI bootstrap", err)
-            })?;
         let available_models = models
             .data
             .into_iter()
@@ -604,7 +619,7 @@ impl AppServerSession {
         self.thread_params_mode
     }
 
-    fn session_config_with_effective_service_tier(&self, config: &Config) -> Config {
+    pub(crate) fn session_config_with_effective_service_tier(&self, config: &Config) -> Config {
         let Some(model) = config.model.as_deref().or(self.default_model.as_deref()) else {
             return config.clone();
         };
@@ -1000,6 +1015,7 @@ impl AppServerSession {
         objective: Option<String>,
         status: Option<ThreadGoalStatus>,
         token_budget: Option<Option<i64>>,
+        replace: bool,
     ) -> Result<ThreadGoalSetResponse> {
         let request_id = self.next_request_id();
         self.client
@@ -1007,6 +1023,7 @@ impl AppServerSession {
                 request_id,
                 params: ThreadGoalSetParams {
                     thread_id: thread_id.to_string(),
+                    replace,
                     objective,
                     status,
                     token_budget,
@@ -1947,6 +1964,11 @@ mod tests {
                 true,
             ),
             (JSONRPC_INVALID_REQUEST, "invalid thread id", false),
+            (
+                JSONRPC_INVALID_REQUEST,
+                "thread/settings/update: invalid thread id",
+                false,
+            ),
         ];
 
         for (code, message, expected) in cases {

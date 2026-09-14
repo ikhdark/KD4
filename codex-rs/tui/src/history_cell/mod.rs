@@ -106,7 +106,6 @@ use unicode_width::UnicodeWidthStr;
 use url::Url;
 
 const RAW_DIFF_SUMMARY_WIDTH: usize = 10_000;
-const RAW_TOOL_OUTPUT_WIDTH: usize = 10_000;
 
 mod approvals;
 mod base;
@@ -275,7 +274,7 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
             .wrap(Wrap { trim: false })
             .line_count(width)
             .try_into()
-            .unwrap_or(0)
+            .unwrap_or(u16::MAX)
     }
 
     fn is_stream_continuation(&self) -> bool {
@@ -300,7 +299,10 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
 impl Renderable for Box<dyn HistoryCell> {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let hyperlink_lines = self.display_hyperlink_lines(area.width);
-        let lines = visible_lines(hyperlink_lines.clone());
+        let lines: Vec<_> = hyperlink_lines
+            .iter()
+            .map(|line| line.line.clone())
+            .collect();
         let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
         let y = if area.height == 0 {
             0

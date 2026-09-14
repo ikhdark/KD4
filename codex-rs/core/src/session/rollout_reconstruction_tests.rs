@@ -99,9 +99,15 @@ async fn reconstruct_history_ignores_tool_manifest_records() {
         ]
     });
     let mut writer = codex_rollout::ToolManifestDictionary::default();
-    let first_item = writer.encode("first".to_string(), first.clone());
-    let second_item = writer.encode("second".to_string(), second.clone());
-    let second_reference = writer.encode("second".to_string(), second.clone());
+    let first_item = writer
+        .encode("first".to_string(), first.clone())
+        .expect("valid manifest");
+    let second_item = writer
+        .encode("second".to_string(), second.clone())
+        .expect("valid manifest");
+    let second_reference = writer
+        .encode("second".to_string(), second.clone())
+        .expect("valid manifest");
     let user = user_message("hello");
     let rollout_items = vec![
         RolloutItem::ToolManifest(first_item),

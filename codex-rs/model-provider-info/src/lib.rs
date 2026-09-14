@@ -226,21 +226,41 @@ impl ModelProviderInfo {
         let mut headers = HeaderMap::with_capacity(capacity);
         if let Some(extra) = &self.http_headers {
             for (k, v) in extra {
-                if let (Ok(name), Ok(value)) = (HeaderName::try_from(k), HeaderValue::try_from(v)) {
-                    headers.insert(name, value);
-                }
+                let name = HeaderName::try_from(k).map_err(|_| {
+                    CodexErr::InvalidRequest(format!("invalid provider HTTP header name {k:?}"))
+                })?;
+                let value = HeaderValue::try_from(v).map_err(|_| {
+                    CodexErr::InvalidRequest(format!(
+                        "invalid value for provider HTTP header {k:?}"
+                    ))
+                })?;
+                headers.insert(name, value);
             }
         }
 
         if let Some(env_headers) = &self.env_http_headers {
             for (header, env_var) in env_headers {
-                if let Ok(val) = std::env::var(env_var)
-                    && !val.trim().is_empty()
-                    && let (Ok(name), Ok(value)) =
-                        (HeaderName::try_from(header), HeaderValue::try_from(val))
-                {
-                    headers.insert(name, value);
-                }
+                let name = HeaderName::try_from(header).map_err(|_| {
+                    CodexErr::InvalidRequest(format!(
+                        "invalid provider HTTP header name {header:?}"
+                    ))
+                })?;
+                let val = match std::env::var(env_var) {
+                    Ok(val) if val.trim().is_empty() => continue,
+                    Ok(val) => val,
+                    Err(std::env::VarError::NotPresent) => continue,
+                    Err(std::env::VarError::NotUnicode(_)) => {
+                        return Err(CodexErr::InvalidRequest(format!(
+                            "invalid value in environment variable {env_var:?} for provider HTTP header {header:?}"
+                        )));
+                    }
+                };
+                let value = HeaderValue::try_from(val).map_err(|_| {
+                    CodexErr::InvalidRequest(format!(
+                        "invalid value in environment variable {env_var:?} for provider HTTP header {header:?}"
+                    ))
+                })?;
+                headers.insert(name, value);
             }
         }
 
@@ -415,11 +435,15 @@ impl ModelProviderInfo {
 
     pub fn uses_openai_actor_authorization(&self) -> bool {
         !self.requires_openai_auth
-            && self.http_headers.as_ref().is_some_and(|headers| {
-                headers.iter().any(|(name, value)| {
-                    name.eq_ignore_ascii_case(OPENAI_ACTOR_AUTHORIZATION_HEADER)
-                        && !value.trim().is_empty()
-                })
+            && self.build_header_map().is_ok_and(|headers| {
+                headers
+                    .get(OPENAI_ACTOR_AUTHORIZATION_HEADER)
+                    .is_some_and(|value| {
+                        value
+                            .as_bytes()
+                            .iter()
+                            .any(|byte| !byte.is_ascii_whitespace())
+                    })
             })
     }
 

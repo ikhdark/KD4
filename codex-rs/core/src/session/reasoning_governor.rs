@@ -4875,7 +4875,7 @@ mod tests {
             );
             let mut wrapper_args = shell_flags
                 .iter()
-                .map(|arg| arg.to_string())
+                .map(ToString::to_string)
                 .collect::<Vec<_>>();
             wrapper_args.push(script.clone());
             for arguments in [

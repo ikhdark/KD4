@@ -1,6 +1,6 @@
 use ratatui::text::Line;
 use ratatui::text::Span;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 pub(crate) fn line_width(line: &Line<'_>) -> usize {
@@ -43,12 +43,12 @@ pub(crate) fn truncate_line_to_width(line: Line<'static>, max_width: usize) -> L
         let style = span.style;
         let text = span.content.as_ref();
         let mut end_idx = 0usize;
-        for (idx, ch) in text.char_indices() {
-            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        for (idx, grapheme) in text.grapheme_indices(true) {
+            let ch_width = UnicodeWidthStr::width(grapheme);
             if used + ch_width > max_width {
                 break;
             }
-            end_idx = idx + ch.len_utf8();
+            end_idx = idx + grapheme.len();
             used += ch_width;
         }
 
@@ -96,5 +96,31 @@ pub(crate) fn truncate_line_with_ellipsis_if_overflow(
         style,
         alignment,
         spans,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::style::Color;
+    use ratatui::style::Style;
+
+    #[test]
+    fn cutoff_preserves_graphemes_and_styles() {
+        let style = Style::default().fg(Color::Red);
+        for (input, width, expected) in [
+            ("👩‍💻abc", 2, "👩‍💻"),
+            ("e\u{301}xy", 1, "e\u{301}"),
+            ("👩‍💻x", 1, ""),
+        ] {
+            let actual = truncate_line_to_width(Line::from(Span::styled(input, style)), width);
+            assert_eq!(actual.to_string(), expected);
+            assert!(line_width(&actual) <= width);
+            if !expected.is_empty() {
+                assert_eq!(actual.spans[0].style, style);
+            }
+        }
+        let actual = truncate_line_with_ellipsis_if_overflow(Line::from("👩‍💻abc"), 3);
+        assert_eq!(actual.to_string(), "👩‍💻…");
     }
 }

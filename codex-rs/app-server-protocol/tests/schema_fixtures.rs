@@ -207,3 +207,20 @@ fn read_tree(root: &Path, label: &str) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
         )
     })
 }
+
+#[test]
+fn export_cli_rejects_existing_output_without_modifying_it() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sentinel = dir.path().join("Obsolete.ts");
+    std::fs::write(&sentinel, "keep existing output")?;
+    let binary = codex_utils_cargo_bin::cargo_bin("export")?;
+    let output = std::process::Command::new(binary)
+        .arg("--out")
+        .arg(dir.path())
+        .output()?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("new or empty"));
+    assert_eq!(std::fs::read_to_string(sentinel)?, "keep existing output");
+    assert_eq!(std::fs::read_dir(dir.path())?.count(), 1);
+    Ok(())
+}

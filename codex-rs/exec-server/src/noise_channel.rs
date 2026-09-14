@@ -69,6 +69,16 @@ impl NoiseChannelPublicKey {
                 "unsupported Noise channel suite",
             ));
         }
+        if self.x25519_public_key.len() > 32_usize.div_ceil(3) * 4 {
+            return Err(NoiseChannelError::InvalidPublicKey(
+                "invalid X25519 public key length",
+            ));
+        }
+        if self.mlkem768_public_key.len() > MlKem768PublicKey::LENGTH.div_ceil(3) * 4 {
+            return Err(NoiseChannelError::InvalidPublicKey(
+                "invalid ML-KEM-768 public key length",
+            ));
+        }
         let dh = STANDARD
             .decode(&self.x25519_public_key)
             .map_err(|_| NoiseChannelError::InvalidPublicKey("invalid X25519 public key"))?;

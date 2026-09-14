@@ -14,6 +14,9 @@ pub struct TurnInputEnvironment {
 }
 
 /// Turn facts supplied before the host records turn-local model input items.
+///
+/// The host owns this snapshot and lends it to each turn-input contributor for the duration of
+/// dispatch. Contributors should clone only the fields they need to retain beyond that call.
 #[derive(Debug, Clone)]
 pub struct TurnInputContext {
     /// Stable host-owned turn identifier.

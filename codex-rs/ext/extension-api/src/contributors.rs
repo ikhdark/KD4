@@ -75,8 +75,11 @@ pub trait McpServerContributor<C: Sync>: Send + Sync {
 /// fragment: thread/session context for stable inputs, and turn context for
 /// fragments that depend on turn-local host state.
 pub trait ContextContributor: Send + Sync {
-    /// Read-only preview used by pre-turn context accounting. Implementations that emit events or
-    /// mutate extension stores in `contribute_thread_context` must override this method.
+    /// Read-only preview used by pre-turn context accounting.
+    ///
+    /// Estimation must not mutate extension state, consume pending work, emit events, or schedule
+    /// follow-up work. The default is valid only when `contribute_thread_context` is side-effect-free;
+    /// otherwise implementations must override this method while preserving accurate accounting.
     fn estimate_thread_context<'a>(
         &'a self,
         session_store: &'a ExtensionData,
@@ -99,6 +102,10 @@ pub trait ContextContributor: Send + Sync {
     }
 
     /// Read-only preview used by pre-turn context accounting.
+    ///
+    /// Estimation must not mutate extension state, consume pending work, emit events, or schedule
+    /// follow-up work. The default is valid only when `contribute_turn_context` is side-effect-free;
+    /// otherwise implementations must override this method while preserving accurate accounting.
     fn estimate_turn_context<'a>(
         &'a self,
         input: TurnContextContributionInput<'a>,
@@ -126,8 +133,11 @@ pub trait ContextContributor: Send + Sync {
         &[]
     }
 
-    /// Read-only preview used by pre-turn context accounting. Implementations that mutate the
-    /// turn store in `contribute_world_state` must override this method.
+    /// Read-only preview used by pre-turn context accounting.
+    ///
+    /// Estimation must not mutate extension state, consume pending work, emit events, or schedule
+    /// follow-up work. The default is valid only when `contribute_world_state` is side-effect-free;
+    /// otherwise implementations must override this method while preserving accurate accounting.
     fn estimate_world_state<'a>(
         &'a self,
         input: WorldStateContributionInput<'a>,
@@ -238,9 +248,12 @@ pub trait TurnLifecycleContributor: Send + Sync {
 /// host, not in this input.
 pub trait TurnInputContributor: Send + Sync {
     /// Returns additional contextual fragments for one submitted turn.
+    ///
+    /// The host shares one input snapshot across contributors. Clone only the data that must be
+    /// retained after this contribution completes.
     fn contribute<'a>(
         &'a self,
-        input: TurnInputContext,
+        input: &'a TurnInputContext,
         session_store: &'a ExtensionData,
         thread_store: &'a ExtensionData,
         turn_store: &'a ExtensionData,
@@ -286,11 +299,13 @@ pub trait TokenUsageContributor: Send + Sync {
 
 /// Extension contribution that exposes native tools owned by a feature.
 pub trait ToolContributor: Send + Sync {
-    /// Cheap identity for state that changes the contributor's model-visible tool surface.
+    /// Cheap identity for state that invalidates the contributor's cached tool surface.
     ///
-    /// Stateful contributors must change this value whenever a fresh `tools` call could return a
-    /// different set or exposure. Hosts use it to avoid constructing executor vectors merely to
-    /// decide whether an already-built router remains valid.
+    /// Change this value whenever rebuilding would change any host-cached tool specification
+    /// (including schemas and descriptions), exposure, or routing/executor binding. Keep it stable
+    /// for state changes that do not invalidate those cached results. Hosts use it to avoid
+    /// constructing executor vectors merely to decide whether an already-built router remains valid.
+    /// The revision stored with a router must describe the state used to construct that router.
     fn surface_revision(
         &self,
         _session_store: &ExtensionData,

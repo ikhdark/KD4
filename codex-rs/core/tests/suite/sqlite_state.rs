@@ -809,7 +809,7 @@ async fn tool_call_logs_include_thread_id() -> Result<()> {
         let _entered = span.enter();
         tracing::info!("ToolCall: shell_command {{\"command\":\"echo hello\"}}");
     });
-    log_db_layer.flush().await;
+    log_db_layer.flush().await.expect("flush SQLite logs");
 
     let mut found = None;
     for _ in 0..80 {

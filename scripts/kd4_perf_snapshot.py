@@ -126,7 +126,7 @@ def _installed_codex_path(install_dir: Path | None = None) -> Path:
         publish_dir = (
             Path(configured_publish_dir)
             if configured_publish_dir
-            else Path.home() / "Desktop" / "LOCAL-KD"
+            else Path.home() / "Desktop" / "LOCAL-KD" / "bin"
         )
     return publish_dir / "codex.exe"
 
@@ -265,12 +265,12 @@ def measure_scenario(
     samples: list[Sample] = []
     reason: str | None = None
     for _ in range(count):
-        started = time.perf_counter_ns()
         with (
             tempfile.TemporaryFile() as stdout_file,
             tempfile.TemporaryFile() as stderr_file,
         ):
             try:
+                started = time.perf_counter_ns()
                 completed = subprocess.run(
                     scenario.command,
                     cwd=scenario.cwd,
@@ -279,6 +279,7 @@ def measure_scenario(
                     timeout=timeout_seconds,
                     check=False,
                 )
+                elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
             except (OSError, subprocess.TimeoutExpired) as exc:
                 _stdout_bytes, stdout_tail = _output_size_and_tail(stdout_file)
                 _stderr_bytes, stderr_tail = _output_size_and_tail(stderr_file)
@@ -286,7 +287,6 @@ def measure_scenario(
                 break
             stdout_bytes, stdout_tail = _output_size_and_tail(stdout_file)
             stderr_bytes, stderr_tail = _output_size_and_tail(stderr_file)
-        elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
         samples.append(
             Sample(
                 elapsed_ms=round(elapsed_ms, 3),
@@ -478,7 +478,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not args.json:
             print(
                 f"[{result.status.upper()}] {name}: "
-                f"cold={result.cold_ms}ms warm_p50={result.warm_p50_ms}ms "
+                f"first_invocation={result.cold_ms}ms warm_p50={result.warm_p50_ms}ms "
                 f"p95={result.p95_ms}ms"
             )
 

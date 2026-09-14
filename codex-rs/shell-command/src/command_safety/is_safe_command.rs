@@ -11,24 +11,13 @@ use crate::command_safety::windows_safe_commands::is_safe_command_windows;
 use crate::command_safety::windows_safe_commands::is_safe_powershell_words as is_safe_powershell_words_windows;
 
 pub fn is_known_safe_command(command: &[String]) -> bool {
-    let command: Vec<String> = command
-        .iter()
-        .map(|s| {
-            if s == "zsh" {
-                "bash".to_string()
-            } else {
-                s.clone()
-            }
-        })
-        .collect();
-
     {
-        if is_safe_command_windows(&command) {
+        if is_safe_command_windows(command) {
             return true;
         }
     }
 
-    if is_safe_to_call_with_exec(&command) {
+    if is_safe_to_call_with_exec(command) {
         return true;
     }
 
@@ -38,7 +27,7 @@ pub fn is_known_safe_command(command: &[String]) -> bool {
     // introduce side effects ( "&&", "||", ";", and "|" ). If every
     // individual command in the script is itself a known‑safe command, then
     // the composite expression is considered safe.
-    if let Some(all_commands) = parse_shell_lc_plain_commands(&command)
+    if let Some(all_commands) = parse_shell_lc_plain_commands(command)
         && !all_commands.is_empty()
         && all_commands
             .iter()
@@ -55,8 +44,8 @@ pub fn is_known_safe_direct_argv(command: &[String]) -> bool {
     is_safe_to_call_with_exec(command)
 }
 
-/// Returns whether already-tokenized PowerShell words are read-only enough to
-/// be auto-approved by the Windows safelist.
+/// Returns whether words from the restricted PowerShell AST parser are read-only
+/// enough to be auto-approved. Raw script tokens do not satisfy this precondition.
 pub fn is_safe_powershell_words(command: &[String]) -> bool {
     is_safe_powershell_words_windows(command)
 }
@@ -93,7 +82,6 @@ fn is_safe_to_call_with_exec(command: &[String]) -> bool {
             "tr" |
             "true" |
             "uname" |
-            "uniq" |
             "wc" |
             "which" |
             "whoami") => {
@@ -130,27 +118,7 @@ fn is_safe_to_call_with_exec(command: &[String]) -> bool {
         }
 
         // Ripgrep
-        Some("rg") => {
-            const UNSAFE_RIPGREP_OPTIONS_WITH_ARGS: &[&str] = &[
-                // Takes an arbitrary command that is executed for each match.
-                "--pre",
-                // Takes a command that can be used to obtain the local hostname.
-                "--hostname-bin",
-            ];
-            const UNSAFE_RIPGREP_OPTIONS_WITHOUT_ARGS: &[&str] = &[
-                // Calls out to other decompression tools, so do not auto-approve
-                // out of an abundance of caution.
-                "--search-zip",
-                "-z",
-            ];
-
-            !command.iter().any(|arg| {
-                UNSAFE_RIPGREP_OPTIONS_WITHOUT_ARGS.contains(&arg.as_str())
-                    || UNSAFE_RIPGREP_OPTIONS_WITH_ARGS
-                        .iter()
-                        .any(|&opt| arg == opt || arg.starts_with(&format!("{opt}=")))
-            })
-        }
+        Some("rg") => is_safe_ripgrep(command),
 
         // Git
         Some("git") => is_safe_git_command(command),
@@ -161,6 +129,9 @@ fn is_safe_to_call_with_exec(command: &[String]) -> bool {
                 command.len() <= 4
                     && command.get(1).map(String::as_str) == Some("-n")
                     && is_valid_sed_n_arg(command.get(2).map(String::as_str))
+                    && command
+                        .get(3)
+                        .is_none_or(|arg| !arg.starts_with('-') || arg == "-")
             } =>
         {
             true
@@ -169,6 +140,80 @@ fn is_safe_to_call_with_exec(command: &[String]) -> bool {
         // ── anything else ─────────────────────────────────────────────────
         _ => false,
     }
+}
+
+/// Inspect native options with their case-sensitive spelling and short-option values.
+pub(crate) fn is_safe_ripgrep(words: &[String]) -> bool {
+    let mut args = words.iter().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            let (name, inline) = long
+                .split_once('=')
+                .map_or((long, false), |(name, _)| (name, true));
+            if matches!(name, "pre" | "hostname-bin" | "search-zip") {
+                return false;
+            }
+            if !inline
+                && matches!(
+                    name,
+                    "after-context"
+                        | "before-context"
+                        | "context"
+                        | "context-separator"
+                        | "encoding"
+                        | "engine"
+                        | "field-context-separator"
+                        | "field-match-separator"
+                        | "file"
+                        | "glob"
+                        | "iglob"
+                        | "ignore-file"
+                        | "max-columns"
+                        | "max-count"
+                        | "max-depth"
+                        | "max-filesize"
+                        | "path-separator"
+                        | "pre-glob"
+                        | "regexp"
+                        | "replace"
+                        | "sort"
+                        | "sortr"
+                        | "threads"
+                        | "type"
+                        | "type-not"
+                        | "type-add"
+                        | "type-clear"
+                        | "colors"
+                        | "color"
+                        | "hyperlink-format"
+                        | "dfa-size-limit"
+                        | "regex-size-limit"
+                )
+            {
+                args.next();
+            }
+        } else if let Some(short) = arg.strip_prefix('-') {
+            let mut flags = short.chars().peekable();
+            while let Some(flag) = flags.next() {
+                if flag == 'z' {
+                    return false;
+                }
+                if matches!(
+                    flag,
+                    'A' | 'B' | 'C' | 'E' | 'M' | 'e' | 'f' | 'g' | 'j' | 'm' | 'r' | 't' | 'T'
+                ) {
+                    if flags.peek().is_none() {
+                        args.next();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    true
 }
 
 pub(crate) fn is_safe_git_command(command: &[String]) -> bool {
@@ -338,6 +383,44 @@ mod tests {
 
     fn vec_str(args: &[&str]) -> Vec<String> {
         args.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn review_regressions_reject_writers_and_grouped_decompression() {
+        for argv in [
+            vec!["uniq", "input.txt", "output.txt"],
+            vec!["sed", "-n", "1p", "-ew output.txt"],
+            vec!["rg", "-nz", "pattern"],
+            vec!["rg", "-nze", "pattern"],
+        ] {
+            assert!(!is_known_safe_direct_argv(&vec_str(&argv)), "{argv:?}");
+        }
+        for argv in [
+            vec!["rg", "-ne-z"],
+            vec!["rg", "-e", "-z"],
+            vec!["rg", "--regexp", "-z"],
+            vec!["rg", "--", "-z"],
+            vec!["rg", "-g*.zip", "pattern"],
+            vec!["rg", "-nZ", "pattern"],
+            vec!["sed", "-n", "1p", "-"],
+        ] {
+            assert!(is_known_safe_direct_argv(&vec_str(&argv)), "{argv:?}");
+        }
+        for source in [
+            r"git diff --out\put=result.txt",
+            "cat *.txt",
+            r"c\at file.txt",
+        ] {
+            assert!(
+                !is_known_safe_command(&vec_str(&["bash", "-lc", source])),
+                "{source}"
+            );
+        }
+        assert!(is_known_safe_command(&vec_str(&[
+            "zsh",
+            "-lc",
+            "cat file.txt"
+        ])));
     }
 
     #[test]

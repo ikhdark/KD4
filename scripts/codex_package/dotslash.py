@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import stat
 import tarfile
@@ -73,7 +74,13 @@ def fetch_dotslash_executable(
         _FETCHED_EXECUTABLES[cache_key_tuple] = None
         return None
 
-    cache_dir = default_cache_root() / cache_key
+    identity = hashlib.sha256(
+        json.dumps(
+            [artifact.digest, artifact.archive_format, artifact.archive_member],
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    cache_dir = default_cache_root() / cache_key / identity
     archive_path = cache_dir / archive_filename(artifact.url)
     dest = cache_dir / dest_name
 
@@ -90,7 +97,6 @@ def fetch_dotslash_executable(
             raise
 
     extract_archive_member(archive_path, artifact, dest, artifact_label)
-    write_extracted_member_stamp(dest, artifact)
     _FETCHED_EXECUTABLES[cache_key_tuple] = (dest, artifact)
     return dest
 
@@ -325,7 +331,10 @@ def extracted_member_is_valid(dest: Path, artifact: DotSlashArtifact) -> bool:
     ) and stamp.get("sha256") == sha256_file(dest)
 
 
-def write_extracted_member_stamp(dest: Path, artifact: DotSlashArtifact) -> None:
+def write_extracted_member_stamp(
+    dest: Path, artifact: DotSlashArtifact, *, source: Path | None = None
+) -> None:
+    source = dest if source is None else source
     write_json_stamp(
         extracted_member_stamp_path(dest),
         {
@@ -334,8 +343,8 @@ def write_extracted_member_stamp(dest: Path, artifact: DotSlashArtifact) -> None
             "archive_format": artifact.archive_format,
             "archive_member": artifact.archive_member,
             "url": artifact.url,
-            "sha256": sha256_file(dest),
-            "file": file_stamp(dest),
+            "sha256": sha256_file(source),
+            "file": file_stamp(source),
         },
     )
 
@@ -383,10 +392,15 @@ def read_json_stamp(path: Path) -> dict | None:
 
 
 def write_json_stamp(path: Path, value: dict) -> None:
-    path.write_text(
-        json.dumps(value, sort_keys=True, indent=2) + "\n", encoding="utf-8"
-    )
-    _JSON_STAMP_CACHE[path] = (stamp_cache_key(path), value)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            out.write(json.dumps(value, sort_keys=True, indent=2) + "\n")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+        _JSON_STAMP_CACHE.pop(path, None)
 
 
 def extract_archive_member(
@@ -450,6 +464,8 @@ def extract_archive_member(
                 f"Unsupported {artifact_label} archive format "
                 f"{artifact.archive_format!r}; expected tar.gz or zip"
             )
+        # Stamp this operation's bytes before publication, never another writer's dest.
+        write_extracted_member_stamp(dest, artifact, source=temp_path)
         temp_path.replace(dest)
     finally:
         temp_path.unlink(missing_ok=True)

@@ -20,7 +20,15 @@ pub(super) struct RemoteControlConnectionAuth {
 impl RemoteControlConnectionAuth {
     pub(super) fn request_headers(&self) -> io::Result<HeaderMap> {
         let mut headers = HeaderMap::new();
-        self.auth_provider.add_auth_headers(&mut headers);
+        self.auth_provider
+            .try_add_auth_headers(&mut headers)
+            .map_err(|error| {
+                let kind = match &error {
+                    codex_api::AuthError::Build(_) => ErrorKind::InvalidInput,
+                    codex_api::AuthError::Transient(_) => ErrorKind::WouldBlock,
+                };
+                io::Error::new(kind, error)
+            })?;
         headers.insert(
             REMOTE_CONTROL_ACCOUNT_ID_HEADER,
             HeaderValue::from_str(&self.account_id).map_err(|err| {
@@ -115,13 +123,13 @@ pub(super) fn mark_recovery_auth_change_seen(
     auth_change_rx: &mut watch::Receiver<u64>,
     auth_change_revision_before_recovery: u64,
 ) {
-    let auth_change_revision_after_recovery = *auth_change_rx.borrow();
-    if auth_change_revision_after_recovery == auth_change_revision_before_recovery.wrapping_add(1) {
+    let auth_change_revision_after_recovery = *auth_change_rx.borrow_and_update();
+    if auth_change_revision_after_recovery != auth_change_revision_before_recovery.wrapping_add(1) {
         // Recovery updated the same watch that wakes the outer reconnect
         // loop. Mark only that single revision seen; if more revisions
         // arrived while recovery was in flight, leave them pending so the
         // reconnect loop still reacts to the later external auth change.
-        auth_change_rx.borrow_and_update();
+        auth_change_rx.mark_changed();
     }
 }
 

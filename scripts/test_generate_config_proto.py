@@ -264,6 +264,46 @@ class GenerateConfigProtoTest(unittest.TestCase):
             )
             self.assert_locked_lane_args(fixture)
 
+    def test_failed_replacement_preserves_binding_and_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = create_fixture(
+                Path(temp_dir),
+                generated_contents=EXPECTED_GENERATED.replace("Generated;", "Changed;"),
+            )
+            generated_before = fixture.checked_generated.read_bytes()
+            lock_before = fixture.cargo_lock.read_bytes()
+            target = "'" + str(fixture.checked_generated).replace("'", "''") + "'"
+            script = "'" + str(fixture.script).replace("'", "''") + "'"
+            # Permit direct writes but deny deletion/replacement, so this also
+            # distinguishes an unsafe overwrite from atomic publication.
+            command = (
+                f"$held = [IO.File]::Open({target}, 'Open', 'Read', 'ReadWrite'); "
+                f"try {{ & {script} }} finally {{ $held.Dispose() }}"
+            )
+            result = subprocess.run(
+                [
+                    self.shell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    command,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=30,
+                env=fixture.env,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("Replace", result.stderr)
+            self.assertEqual(fixture.checked_generated.read_bytes(), generated_before)
+            self.assertEqual(fixture.cargo_lock.read_bytes(), lock_before)
+            self.assertEqual(list(fixture.checked_generated.parent.glob(".*.tmp*")), [])
+            self.assert_locked_lane_args(fixture)
+
     def test_just_recipes_expose_write_arguments_and_named_check(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
         windows_recipe = justfile.split("[windows]\ngenerate-config-proto *args:", 1)[1]

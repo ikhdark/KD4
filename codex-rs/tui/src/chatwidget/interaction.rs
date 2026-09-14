@@ -138,6 +138,13 @@ impl ChatWidget {
             && self.has_queued_follow_up_messages()
             && self.bottom_pane.no_modal_or_popup_active()
         {
+            if !self.bottom_pane.composer_is_empty() {
+                self.add_info_message(
+                    "Send or clear the current draft before editing queued input.".to_string(),
+                    None,
+                );
+                return false;
+            }
             if let Some(composer) = self.pop_latest_queued_composer_state() {
                 self.restore_composer_state(composer);
                 self.refresh_pending_input_preview();
@@ -295,12 +302,11 @@ impl ChatWidget {
     /// Inner implementation with an injectable clipboard backend for testing.
     pub(super) fn copy_last_agent_markdown_with(
         &mut self,
-        copy_fn: impl FnOnce(&str) -> Result<Option<crate::clipboard_copy::ClipboardLease>, String>,
+        copy_fn: impl FnOnce(&str) -> Result<(), String>,
     ) {
         match self.transcript.last_agent_markdown.clone() {
             Some(markdown) if !markdown.is_empty() => match copy_fn(&markdown) {
-                Ok(lease) => {
-                    self.clipboard_lease = lease;
+                Ok(()) => {
                     self.add_to_history(history_cell::new_info_event(
                         "Copied last message to clipboard".into(),
                         /*hint*/ None,

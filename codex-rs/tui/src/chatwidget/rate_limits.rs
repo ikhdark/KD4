@@ -227,8 +227,9 @@ impl ChatWidget {
             {
                 self.codex_spend_control_reached = snapshot.spend_control_reached;
             }
-            if (is_codex_limit && matches!(source, RateLimitSnapshotSource::AccountUsage))
-                || snapshot.rate_limit_reached_type.is_some()
+            if is_codex_limit
+                && (matches!(source, RateLimitSnapshotSource::AccountUsage)
+                    || snapshot.rate_limit_reached_type.is_some())
             {
                 self.codex_rate_limit_reached_type = snapshot.rate_limit_reached_type;
             }
@@ -295,6 +296,16 @@ impl ChatWidget {
                         .map(|w| f64::from(w.used_percent) >= RATE_LIMIT_SWITCH_PROMPT_THRESHOLD)
                         .unwrap_or(false));
 
+            if is_codex_limit
+                && matches!(source, RateLimitSnapshotSource::AccountUsage)
+                && !high_usage
+                && matches!(
+                    self.rate_limit_switch_prompt,
+                    RateLimitSwitchPromptState::Pending
+                )
+            {
+                self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Idle;
+            }
             if high_usage
                 && !has_workspace_credits
                 && !self.rate_limit_switch_prompt_hidden()
@@ -323,6 +334,12 @@ impl ChatWidget {
             }
         } else {
             self.rate_limit_snapshots_by_limit_id.clear();
+            if matches!(
+                self.rate_limit_switch_prompt,
+                RateLimitSwitchPromptState::Pending
+            ) {
+                self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Idle;
+            }
             self.codex_rate_limit_reached_type = None;
             self.codex_spend_control_reached = None;
         }
@@ -363,7 +380,7 @@ impl ChatWidget {
     }
 
     pub(super) fn maybe_show_pending_rate_limit_prompt(&mut self) {
-        if self.rate_limit_switch_prompt_hidden() {
+        if self.rate_limit_switch_prompt_hidden() || self.current_model() == NUDGE_MODEL_SLUG {
             self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Idle;
             return;
         }
@@ -512,6 +529,9 @@ impl ChatWidget {
         &mut self,
         credit_type: AddCreditsNudgeCreditType,
     ) -> bool {
+        if self.add_credits_nudge_email_in_flight.is_some() {
+            return false;
+        }
         self.add_credits_nudge_email_in_flight = Some(credit_type);
         true
     }

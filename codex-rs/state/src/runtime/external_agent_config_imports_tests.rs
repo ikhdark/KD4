@@ -1,10 +1,11 @@
 use super::*;
-use crate::runtime::test_support::unique_temp_dir;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
 async fn records_completion_by_import_id() -> anyhow::Result<()> {
-    let runtime = StateRuntime::init(unique_temp_dir(), "test-provider".to_string()).await?;
+    let temp = tempfile::tempdir()?;
+    let runtime =
+        StateRuntime::init(temp.path().to_path_buf(), "test-provider".to_string()).await?;
 
     runtime
         .record_external_agent_config_import_completed(
@@ -115,12 +116,15 @@ async fn records_completion_by_import_id() -> anyhow::Result<()> {
         )]
     );
 
+    runtime.close().await;
     Ok(())
 }
 
 #[tokio::test]
 async fn reads_all_history_records() -> anyhow::Result<()> {
-    let runtime = StateRuntime::init(unique_temp_dir(), "test-provider".to_string()).await?;
+    let temp = tempfile::tempdir()?;
+    let runtime =
+        StateRuntime::init(temp.path().to_path_buf(), "test-provider".to_string()).await?;
 
     runtime
         .record_external_agent_config_import_completed("import-1", &[], &[])
@@ -129,17 +133,26 @@ async fn reads_all_history_records() -> anyhow::Result<()> {
         .record_external_agent_config_import_completed("import-2", &[], &[])
         .await?;
 
-    let mut records = runtime
+    runtime
+        .record_external_agent_config_import_completed("import-3", &[], &[])
+        .await?;
+    sqlx::query("UPDATE external_agent_config_imports SET completed_at_ms = CASE import_id WHEN 'import-1' THEN 10 ELSE 20 END")
+        .execute(runtime.pool.as_ref()).await?;
+    let records = runtime
         .external_agent_config_import_history_records()
         .await?;
-    records.sort_by(|left, right| left.import_id.cmp(&right.import_id));
     assert_eq!(
         records
             .into_iter()
             .map(|record| record.import_id)
             .collect::<Vec<_>>(),
-        vec!["import-1".to_string(), "import-2".to_string()]
+        vec![
+            "import-2".to_string(),
+            "import-3".to_string(),
+            "import-1".to_string()
+        ]
     );
 
+    runtime.close().await;
     Ok(())
 }

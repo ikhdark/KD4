@@ -791,10 +791,6 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
         }
         EventMsg::Error(ev) => {
-            thread_watch_manager
-                .note_system_error(&conversation_id.to_string())
-                .await;
-
             let message = ev.message.clone();
             let codex_error_info = ev.codex_error_info.clone();
             // If this error belongs to an in-flight `thread/rollback` request, fail that request
@@ -817,6 +813,9 @@ pub(crate) async fn apply_bespoke_event_handling(
             if !ev.affects_turn_status() {
                 return;
             }
+            thread_watch_manager
+                .note_system_error(&conversation_id.to_string())
+                .await;
 
             let turn_error = TurnError {
                 message: ev.message,
@@ -1542,15 +1541,16 @@ async fn handle_error_notification(
 
 async fn on_request_user_input_response(
     event_turn_id: String,
-    pending_request_id: RequestId,
+    pending_request_id: Option<RequestId>,
     receiver: oneshot::Receiver<ClientRequestResult>,
     conversation: Arc<CodexThread>,
     thread_state: Arc<Mutex<ThreadState>>,
     user_input_guard: ThreadWatchActiveGuard,
 ) {
     let response = receiver.await;
-    if let Err(error) =
-        resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await
+    if let Some(pending_request_id) = pending_request_id
+        && let Err(error) =
+            resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await
     {
         error!(
             ?error,
@@ -1623,15 +1623,16 @@ fn request_user_input_response_from_client_result(
 async fn on_mcp_server_elicitation_response(
     server_name: String,
     request_id: codex_protocol::mcp::RequestId,
-    pending_request_id: RequestId,
+    pending_request_id: Option<RequestId>,
     receiver: oneshot::Receiver<ClientRequestResult>,
     conversation: Arc<CodexThread>,
     thread_state: Arc<Mutex<ThreadState>>,
     permission_guard: ThreadWatchActiveGuard,
 ) {
     let response = receiver.await;
-    if let Err(error) =
-        resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await
+    if let Some(pending_request_id) = pending_request_id
+        && let Err(error) =
+            resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await
     {
         error!(
             ?error,
@@ -1711,8 +1712,9 @@ async fn on_request_permissions_response(
         request_permissions_guard,
     } = pending_response;
     let response = receiver.await;
-    if let Err(error) =
-        resolve_server_request_on_thread_listener(&thread_state, pending_request_id.clone()).await
+    if let Some(pending_request_id) = pending_request_id.clone()
+        && let Err(error) =
+            resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await
     {
         error!(
             ?error,
@@ -1747,7 +1749,10 @@ async fn on_request_permissions_response(
             return;
         }
     };
-    outgoing.track_effective_permissions_approval_response(pending_request_id, response.clone());
+    if let Some(pending_request_id) = pending_request_id {
+        outgoing
+            .track_effective_permissions_approval_response(pending_request_id, response.clone());
+    }
 
     if let Err(err) = conversation
         .submit(Op::RequestPermissionsResponse {
@@ -1766,7 +1771,7 @@ struct PendingRequestPermissionsResponse {
     turn_id: String,
     requested_permissions: CoreRequestPermissionProfile,
     request_cwd: PathUri,
-    pending_request_id: RequestId,
+    pending_request_id: Option<RequestId>,
     outgoing: ThreadScopedOutgoingMessageSender,
     receiver: oneshot::Receiver<ClientRequestResult>,
     request_permissions_guard: ThreadWatchActiveGuard,
@@ -1847,15 +1852,16 @@ fn map_file_change_approval_decision(decision: FileChangeApprovalDecision) -> Re
 #[allow(clippy::too_many_arguments)]
 async fn on_file_change_request_approval_response(
     item_id: String,
-    pending_request_id: RequestId,
+    pending_request_id: Option<RequestId>,
     receiver: oneshot::Receiver<ClientRequestResult>,
     codex: Arc<CodexThread>,
     thread_state: Arc<Mutex<ThreadState>>,
     permission_guard: ThreadWatchActiveGuard,
 ) {
     let response = receiver.await;
-    if let Err(error) =
-        resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await
+    if let Some(pending_request_id) = pending_request_id
+        && let Err(error) =
+            resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await
     {
         error!(
             ?error,
@@ -1904,7 +1910,7 @@ async fn on_command_execution_request_approval_response(
     approval_id: Option<String>,
     item_id: String,
     completion_item: Option<CommandExecutionCompletionItem>,
-    pending_request_id: RequestId,
+    pending_request_id: Option<RequestId>,
     receiver: oneshot::Receiver<ClientRequestResult>,
     conversation: Arc<CodexThread>,
     outgoing: ThreadScopedOutgoingMessageSender,
@@ -1912,8 +1918,9 @@ async fn on_command_execution_request_approval_response(
     permission_guard: ThreadWatchActiveGuard,
 ) {
     let response = receiver.await;
-    if let Err(error) =
-        resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await
+    if let Some(pending_request_id) = pending_request_id
+        && let Err(error) =
+            resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await
     {
         error!(
             ?error,

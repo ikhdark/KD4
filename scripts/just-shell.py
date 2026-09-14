@@ -40,6 +40,7 @@ TOOL_RUN_TIMEOUT_SECONDS = 2.0
 # cold-start can take ~10s; with a short timeout the success was never cached
 # and every recipe line paid the full stall.
 SCCACHE_PROBE_TIMEOUT_SECONDS = 15.0
+SCCACHE_PROBE_COOLDOWN_SECONDS = 30.0
 CARGO_GIT_CLI_ENV_VAR = "CARGO_NET_GIT_FETCH_WITH_CLI"
 PYTHON_CPU_COUNT_ENV_VAR = "PYTHON_CPU_COUNT"
 MAX_DEFAULT_PYTHON_CPU_COUNT = 30
@@ -87,7 +88,6 @@ def main() -> int:
                 repo_root=repo_root,
             )
         )
-        ensure_sccache_server_env(os.environ, which=which, cache_dir=cache_dir)
 
     try:
         return run_powershell(
@@ -261,8 +261,23 @@ def ensure_sccache_server_env(
         return False
 
     cache_key = sccache_env_ok_cache_key(sccache, cache_size)
+    cache_key.extend(
+        f"{key}={value}"
+        for key, value in sorted(env.items())
+        if key.upper().startswith("SCCACHE_") and key.upper() != "SCCACHE_CACHE_SIZE"
+    )
     if read_cached_tool_run(cache_key, cache_dir) is True:
         return False
+    cooldown_key = [*cache_key, "inconclusive-probe-cooldown"]
+    if (
+        read_cached_tool_run(
+            cooldown_key, cache_dir, ttl_seconds=SCCACHE_PROBE_COOLDOWN_SECONDS
+        )
+        is False
+    ):
+        return False
+    # This is a retry cooldown only; it never asserts server health.
+    write_cached_tool_run(cooldown_key, cache_dir, False)
 
     try:
         stats = run(
@@ -464,12 +479,17 @@ def sanitize_cache_part(part: str) -> str:
     return "".join(safe).strip("_")[:64] or "empty"
 
 
-def read_cached_tool_run(command: list[str], cache_dir: Path | None) -> bool | None:
+def read_cached_tool_run(
+    command: list[str],
+    cache_dir: Path | None,
+    *,
+    ttl_seconds: float = PROBE_CACHE_TTL_SECONDS,
+) -> bool | None:
     if cache_dir is None:
         return None
     path = tool_run_cache_path(command, cache_dir)
     try:
-        if time.time() - path.stat().st_mtime > PROBE_CACHE_TTL_SECONDS:
+        if time.time() - path.stat().st_mtime > ttl_seconds:
             return None
         value = path.read_text(encoding="utf-8").strip()
     except OSError:
@@ -569,7 +589,7 @@ def run_powershell(
         pwsh, can_run=can_run, cache_dir=cache_dir
     ):
         print(
-            "PowerShell 7.4 or newer is required for Windows just recipes. "
+            "PowerShell 7.5 or newer is required for Windows just recipes. "
             "Upgrade pwsh or run 'just install'.",
             file=stderr,
         )
@@ -607,7 +627,7 @@ def powershell_supports_command_with_args(
         "-NoLogo",
         "-NoProfile",
         "-Command",
-        "if ($PSVersionTable.PSVersion -lt [version]'7.4') { exit 1 }",
+        "if ($PSVersionTable.PSVersion -lt [version]'7.5') { exit 1 }",
     ]
     if can_run is None:
         return cached_tool_runs(command, cache_dir=cache_dir)

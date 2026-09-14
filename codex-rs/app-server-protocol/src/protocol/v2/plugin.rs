@@ -457,17 +457,17 @@ pub struct SkillMetadata {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct SkillInterface {
-    #[ts(optional)]
+    #[ts(optional = nullable)]
     pub display_name: Option<String>,
-    #[ts(optional)]
+    #[ts(optional = nullable)]
     pub short_description: Option<String>,
-    #[ts(optional)]
+    #[ts(optional = nullable)]
     pub icon_small: Option<AbsolutePathBuf>,
-    #[ts(optional)]
+    #[ts(optional = nullable)]
     pub icon_large: Option<AbsolutePathBuf>,
-    #[ts(optional)]
+    #[ts(optional = nullable)]
     pub brand_color: Option<String>,
-    #[ts(optional)]
+    #[ts(optional = nullable)]
     pub default_prompt: Option<String>,
 }
 

@@ -96,6 +96,18 @@ async fn token_condition_stale_reclaim_and_three_attempt_exhaustion() {
     assert_eq!(second.attempt_count, 2);
     assert_ne!(first.claim_token, second.claim_token);
     assert!(
+        !store
+            .commit_classification(created.id, &first.claim_token, classification())
+            .await
+            .expect("reject former owner commit")
+    );
+    assert!(
+        !store
+            .release_failure(created.id, &first.claim_token, BugFailureCategory::Provider)
+            .await
+            .expect("reject former owner release")
+    );
+    assert!(
         store
             .release_failure(
                 created.id,
@@ -151,6 +163,17 @@ async fn success_is_atomic_token_conditioned_and_submission_is_immutable() {
         .expect("claim")
         .expect("row");
     assert!(
+        store
+            .release_failure(created.id, &claim.claim_token, BugFailureCategory::Provider)
+            .await
+            .expect("record failed attempt")
+    );
+    let claim = store
+        .claim_by_id(created.id)
+        .await
+        .expect("reclaim")
+        .expect("row");
+    assert!(
         !store
             .commit_classification(created.id, "wrong-token", classification())
             .await
@@ -162,7 +185,7 @@ async fn success_is_atomic_token_conditioned_and_submission_is_immutable() {
             .await
             .expect("commit")
     );
-    let row = sqlx::query("SELECT status, raw_text, summary, claim_token FROM bugs WHERE id = ?")
+    let row = sqlx::query("SELECT * FROM bugs WHERE id = ?")
         .bind(created.id)
         .fetch_one(&store.pool)
         .await
@@ -171,6 +194,23 @@ async fn success_is_atomic_token_conditioned_and_submission_is_immutable() {
     assert_eq!(row.get::<String, _>("raw_text"), "immutable");
     assert_eq!(row.get::<String, _>("summary"), "summary");
     assert_eq!(row.get::<Option<String>, _>("claim_token"), None);
+    assert_eq!(row.get::<Option<i64>, _>("claim_timestamp"), None);
+    assert_eq!(row.get::<Option<String>, _>("failure_category"), None);
+    for (column, expected) in [
+        ("severity", "high"),
+        ("failure_mechanism", "crashes"),
+        ("affected_components", "[\"src/main.rs\"]"),
+        ("stated_cause", "overflow"),
+        ("required_repair", "check bounds"),
+        ("classifier_provider_id", "provider"),
+        ("classifier_requested_model", "requested"),
+        ("classifier_resolved_model", "resolved"),
+        ("classifier_reasoning_effort", "low"),
+        ("classifier_schema_version", "schema-v1"),
+        ("classifier_prompt_version", "prompt-v1"),
+    ] {
+        assert_eq!(row.get::<String, _>(column), expected, "{column}");
+    }
     assert!(
         sqlx::query("UPDATE bugs SET raw_text = 'changed' WHERE id = ?")
             .bind(created.id)
@@ -184,16 +224,31 @@ async fn success_is_atomic_token_conditioned_and_submission_is_immutable() {
 async fn older_claim_excludes_new_id_and_orders_by_creation_then_id() {
     let home = tempfile::tempdir().expect("temporary SQLite home");
     let store = BugStore::open(home.path()).await.expect("store");
-    let oldest = store.create(params("oldest", "one")).await.expect("oldest");
-    let _next = store.create(params("next", "two")).await.expect("next");
-    let new = store.create(params("new", "three")).await.expect("new");
-    let claimed = store
-        .claim_next_older(new.id)
-        .await
-        .expect("older claim")
-        .expect("older row");
-    assert_eq!(claimed.id, oldest.id);
-    assert_ne!(claimed.id, new.id);
+    let later = store.create(params("later", "one")).await.expect("later");
+    let oldest = store.create(params("oldest", "two")).await.expect("oldest");
+    let tied = store.create(params("tied", "three")).await.expect("tied");
+    let new = store.create(params("excluded", "four")).await.expect("new");
+    for (id, created_at) in [
+        (later.id, 200),
+        (oldest.id, 100),
+        (tied.id, 100),
+        (new.id, 0),
+    ] {
+        sqlx::query("UPDATE bugs SET created_at = ? WHERE id = ?")
+            .bind(created_at)
+            .bind(id)
+            .execute(&store.pool)
+            .await
+            .expect("set creation order");
+    }
+    for expected_id in [oldest.id, tied.id, later.id] {
+        let claimed = store
+            .claim_next_older(new.id)
+            .await
+            .expect("older claim")
+            .expect("row");
+        assert_eq!(claimed.id, expected_id);
+    }
 
     let only_new_home = tempfile::tempdir().expect("second SQLite home");
     let only_new_store = BugStore::open(only_new_home.path()).await.expect("store");

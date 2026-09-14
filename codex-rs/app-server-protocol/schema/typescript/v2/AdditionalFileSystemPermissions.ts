@@ -12,4 +12,8 @@ read: Array<LegacyAppPathString> | null,
 /**
  * This will be removed in favor of `entries`.
  */
-write: Array<LegacyAppPathString> | null, globScanMaxDepth?: number, entries?: Array<FileSystemSandboxEntry>, };
+write: Array<LegacyAppPathString> | null, globScanMaxDepth?: number,
+/**
+ * When present, replaces legacy `read` and `write`, including when empty.
+ */
+entries?: Array<FileSystemSandboxEntry>, };

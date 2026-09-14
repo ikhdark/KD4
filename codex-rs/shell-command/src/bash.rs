@@ -44,6 +44,13 @@ pub fn try_parse_shell(shell_lc_arg: &str) -> Option<Tree> {
 /// (parentheses, redirections, substitutions, control flow, etc.). Otherwise
 /// returns `None`.
 pub fn try_parse_word_only_commands_sequence(tree: &Tree, src: &str) -> Option<Vec<Vec<String>>> {
+    try_parse_word_only_commands_with_operators(tree, src).map(|(commands, _)| commands)
+}
+
+pub(crate) fn try_parse_word_only_commands_with_operators(
+    tree: &Tree,
+    src: &str,
+) -> Option<(Vec<Vec<String>>, Vec<String>)> {
     if tree.root_node().has_error() {
         return None;
     }
@@ -100,6 +107,17 @@ pub fn try_parse_word_only_commands_sequence(tree: &Tree, src: &str) -> Option<V
     // Walk uses a stack (LIFO), so re-sort by position to restore source order.
     command_nodes.sort_by_key(Node::start_byte);
 
+    let operators = command_nodes
+        .windows(2)
+        .map(|nodes| {
+            let gap = src[nodes[0].end_byte()..nodes[1].start_byte()].trim();
+            if gap.is_empty() {
+                ";".to_string()
+            } else {
+                gap.to_string()
+            }
+        })
+        .collect();
     let mut commands = Vec::new();
     for node in command_nodes {
         if let Some(words) = parse_plain_command_from_node(node, src) {
@@ -108,7 +126,7 @@ pub fn try_parse_word_only_commands_sequence(tree: &Tree, src: &str) -> Option<V
             return None;
         }
     }
-    Some(commands)
+    Some((commands, operators))
 }
 
 /// Parses a shell script consisting only of plain commands joined by safe operators.
@@ -149,6 +167,26 @@ pub fn parse_shell_lc_single_command_prefix(command: &[String]) -> Option<Vec<St
     if root.has_error() {
         return None;
     }
+    let mut cursor = root.walk();
+    let statements: Vec<_> = root
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() != "comment")
+        .collect();
+    let [statement] = statements.as_slice() else {
+        return None;
+    };
+    if !matches!(statement.kind(), "command" | "redirected_statement") {
+        return None;
+    }
+    if statement.kind() == "redirected_statement" {
+        let mut cursor = statement.walk();
+        if statement
+            .named_children(&mut cursor)
+            .any(|node| !matches!(node.kind(), "command" | "heredoc_redirect" | "comment"))
+        {
+            return None;
+        }
+    }
     if !has_named_descendant_kind(root, "heredoc_redirect") {
         return None;
     }
@@ -178,10 +216,10 @@ fn parse_plain_command_from_node(cmd: tree_sitter::Node, src: &str) -> Option<Ve
                 if word_node.kind() != "word" {
                     return None;
                 }
-                words.push(word_node.utf8_text(src.as_bytes()).ok()?.to_owned());
+                words.push(parse_literal_word(word_node, src)?);
             }
             "word" | "number" => {
-                words.push(child.utf8_text(src.as_bytes()).ok()?.to_owned());
+                words.push(parse_literal_word(child, src)?);
             }
             "string" => {
                 let parsed = parse_double_quoted_string(child, src)?;
@@ -198,8 +236,7 @@ fn parse_plain_command_from_node(cmd: tree_sitter::Node, src: &str) -> Option<Ve
                 for part in child.named_children(&mut concat_cursor) {
                     match part.kind() {
                         "word" | "number" => {
-                            concatenated
-                                .push_str(part.utf8_text(src.as_bytes()).ok()?.to_owned().as_str());
+                            concatenated.push_str(&parse_literal_word(part, src)?);
                         }
                         "string" => {
                             let parsed = parse_double_quoted_string(part, src)?;
@@ -239,13 +276,13 @@ fn parse_heredoc_command_words(cmd: Node<'_>, src: &str) -> Option<Vec<String>> 
                 {
                     return None;
                 }
-                words.push(word_node.utf8_text(src.as_bytes()).ok()?.to_owned());
+                words.push(parse_literal_word(word_node, src)?);
             }
             "word" | "number" => {
                 if !is_literal_word_or_number(child) {
                     return None;
                 }
-                words.push(child.utf8_text(src.as_bytes()).ok()?.to_owned());
+                words.push(parse_literal_word(child, src)?);
             }
             // Allow heredoc constructs that attach stdin to a single command
             // without changing argv matching semantics for the executable
@@ -258,6 +295,19 @@ fn parse_heredoc_command_words(cmd: Node<'_>, src: &str) -> Option<Vec<String>> 
     }
 
     if words.is_empty() { None } else { Some(words) }
+}
+
+fn parse_literal_word(node: Node<'_>, src: &str) -> Option<String> {
+    if !is_literal_word_or_number(node) {
+        return None;
+    }
+    let text = node.utf8_text(src.as_bytes()).ok()?;
+    // These unquoted forms need escape decoding or runtime expansion. Preserve
+    // the outer shell invocation rather than claiming their source is exact argv.
+    if text.contains(['\\', '*', '?', '[', ']', '{', '}', '~']) {
+        return None;
+    }
+    Some(text.to_string())
 }
 
 fn is_literal_word_or_number(node: Node<'_>) -> bool {
@@ -385,6 +435,31 @@ mod tests {
 
     fn parse_seq(src: &str) -> Option<Vec<Vec<String>>> {
         parse_shell_script_into_commands(src)
+    }
+
+    #[test]
+    fn review_regression_heredoc_prefix_requires_a_plain_outer_statement() {
+        for script in [
+            "export PATH=/tmp; cat <<'EOF'\ndata\nEOF",
+            "f() { cat <<'EOF'\ndata\nEOF\n}",
+            "if true; then cat <<'EOF'\ndata\nEOF\nfi",
+            "cat *.txt <<'EOF'\ndata\nEOF",
+            "c\\at <<'EOF'\ndata\nEOF",
+        ] {
+            assert_eq!(
+                parse_shell_lc_single_command_prefix(&["bash".into(), "-lc".into(), script.into()]),
+                None,
+                "{script}"
+            );
+        }
+        assert_eq!(
+            parse_shell_lc_single_command_prefix(&[
+                "bash".into(),
+                "-lc".into(),
+                "cat <<'EOF'\ndata\nEOF".into()
+            ]),
+            Some(vec!["cat".into()])
+        );
     }
 
     #[test]

@@ -125,7 +125,7 @@ pub(crate) enum OutgoingEnvelope {
 pub(crate) struct OutgoingMessageSender {
     next_server_request_id: AtomicI64,
     sender: mpsc::Sender<OutgoingEnvelope>,
-    active_connections: Arc<Mutex<HashMap<ConnectionId, Arc<AtomicBool>>>>,
+    active_connections: Arc<Mutex<HashMap<ConnectionId, ActiveConnection>>>,
     request_id_to_callback: Arc<StdMutex<HashMap<RequestId, PendingCallbackEntry>>>,
     /// Incoming requests that are still waiting on a final response or error.
     /// We keep them here because this is where responses, errors, and
@@ -138,6 +138,12 @@ pub(crate) struct OutgoingMessageSender {
     delivery_accepting: Mutex<bool>,
 }
 
+struct ActiveConnection {
+    initialized: Arc<AtomicBool>,
+    experimental_api_enabled: Arc<AtomicBool>,
+    delivery_failure: CancellationToken,
+}
+
 #[derive(Clone)]
 pub(crate) struct ThreadScopedOutgoingMessageSender {
     outgoing: Arc<OutgoingMessageSender>,
@@ -148,7 +154,7 @@ pub(crate) struct ThreadScopedOutgoingMessageSender {
 
 #[derive(Default)]
 struct ComponentNotificationCache {
-    token_usage: HashMap<(ConnectionId, String, String), ThreadTokenUsageUpdatedNotification>,
+    token_usage: HashMap<(ConnectionId, String), ThreadTokenUsageUpdatedNotification>,
     rate_limits: HashMap<ConnectionId, RateLimitSnapshot>,
 }
 
@@ -164,11 +170,7 @@ impl ComponentNotificationCache {
             .copied()
             .filter(|connection_id| match notification {
                 ServerNotification::ThreadTokenUsageUpdated(notification) => {
-                    let key = (
-                        *connection_id,
-                        notification.thread_id.clone(),
-                        notification.turn_id.clone(),
-                    );
+                    let key = (*connection_id, notification.thread_id.clone());
                     if !force && self.token_usage.get(&key) == Some(notification) {
                         return false;
                     }
@@ -192,7 +194,7 @@ impl ComponentNotificationCache {
 
     fn remove_connection(&mut self, connection_id: ConnectionId) {
         self.token_usage
-            .retain(|(cached_connection_id, _, _), _| *cached_connection_id != connection_id);
+            .retain(|(cached_connection_id, _), _| *cached_connection_id != connection_id);
         self.rate_limits.remove(&connection_id);
     }
 }
@@ -341,19 +343,29 @@ impl ThreadScopedOutgoingMessageSender {
         }
     }
 
+    /// Failed admission has no callback ID, but still completes the response path.
     pub(crate) async fn send_request(
         &self,
         payload: ServerRequestPayload,
-    ) -> (RequestId, oneshot::Receiver<ClientRequestResult>) {
+    ) -> (Option<RequestId>, oneshot::Receiver<ClientRequestResult>) {
         let connection_ids = match &payload {
             ServerRequestPayload::DynamicToolCall(_) => {
                 self.experimental_api_connection_ids.as_slice()
             }
             _ => self.connection_ids.as_slice(),
         };
-        self.outgoing
+        match self
+            .outgoing
             .send_request_to_connections(Some(connection_ids), payload, Some(self.thread_id))
             .await
+        {
+            Ok((id, receiver)) => (Some(id), receiver),
+            Err(error) => {
+                let (sender, receiver) = oneshot::channel();
+                let _ = sender.send(Err(error));
+                (None, receiver)
+            }
+        }
     }
 
     pub(crate) fn track_effective_permissions_approval_response(
@@ -471,19 +483,54 @@ impl OutgoingMessageSender {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn connection_opened(
         &self,
         connection_id: ConnectionId,
         initialized: Arc<AtomicBool>,
     ) {
+        self.connection_opened_with_runtime(
+            connection_id,
+            initialized,
+            Arc::new(AtomicBool::new(false)),
+            CancellationToken::new(),
+        )
+        .await;
+    }
+
+    pub(crate) async fn connection_opened_with_runtime(
+        &self,
+        connection_id: ConnectionId,
+        initialized: Arc<AtomicBool>,
+        experimental_api_enabled: Arc<AtomicBool>,
+        delivery_failure: CancellationToken,
+    ) {
         self.component_notification_cache
             .lock()
             .await
             .remove_connection(connection_id);
+        self.active_connections.lock().await.insert(
+            connection_id,
+            ActiveConnection {
+                initialized,
+                experimental_api_enabled,
+                delivery_failure,
+            },
+        );
+    }
+
+    async fn experimental_api_enabled(&self, connection_id: ConnectionId) -> bool {
         self.active_connections
             .lock()
             .await
-            .insert(connection_id, initialized);
+            .get(&connection_id)
+            .is_some_and(|connection| connection.experimental_api_enabled.load(Ordering::Acquire))
+    }
+
+    pub(crate) async fn fail_connection_delivery(&self, connection_id: ConnectionId) {
+        if let Some(connection) = self.active_connections.lock().await.get(&connection_id) {
+            connection.delivery_failure.cancel();
+        }
     }
 
     pub(crate) async fn connection_closed(&self, connection_id: ConnectionId) {
@@ -604,6 +651,7 @@ impl OutgoingMessageSender {
             .len()
     }
 
+    #[cfg(test)]
     pub(crate) async fn send_request(
         &self,
         request: ServerRequestPayload,
@@ -612,10 +660,36 @@ impl OutgoingMessageSender {
             /*connection_ids*/ None, request, /*thread_id*/ None,
         )
         .await
+        .expect("test request ID should be available")
     }
 
-    fn next_request_id(&self) -> RequestId {
-        RequestId::Integer(self.next_server_request_id.fetch_add(1, Ordering::Relaxed))
+    fn next_request_id(&self) -> std::result::Result<RequestId, JSONRPCErrorError> {
+        self.next_server_request_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map(RequestId::Integer)
+            .map_err(|_| internal_error("app-server request IDs are exhausted"))
+    }
+
+    /// Keep callback cleanup owned by the operation during both delivery and
+    /// response waiting, including when a caller's deadline drops this future.
+    pub(crate) async fn send_request_to_connections_and_wait(
+        &self,
+        connection_ids: Option<&[ConnectionId]>,
+        request: ServerRequestPayload,
+        thread_id: Option<ThreadId>,
+    ) -> std::result::Result<ClientRequestResult, oneshot::error::RecvError> {
+        let (request_id, receiver) = match self
+            .send_request_to_connections(connection_ids, request, thread_id)
+            .await
+        {
+            Ok(pending) => pending,
+            Err(error) => return Ok(Err(error)),
+        };
+        let _registration = PendingCallbackRegistration {
+            callbacks: Arc::clone(&self.request_id_to_callback),
+            request_id: Some(request_id),
+        };
+        receiver.await
     }
 
     pub(crate) async fn send_request_to_connections(
@@ -623,15 +697,16 @@ impl OutgoingMessageSender {
         connection_ids: Option<&[ConnectionId]>,
         request: ServerRequestPayload,
         thread_id: Option<ThreadId>,
-    ) -> (RequestId, oneshot::Receiver<ClientRequestResult>) {
-        let id = self.next_request_id();
+    ) -> std::result::Result<(RequestId, oneshot::Receiver<ClientRequestResult>), JSONRPCErrorError>
+    {
+        let id = self.next_request_id()?;
         let outgoing_message_id = id.clone();
         if matches!(&request, ServerRequestPayload::ExecCommandApproval(_)) {
             let (tx_approve, rx_approve) = oneshot::channel();
             let _ = tx_approve.send(Err(internal_error(
                 LEGACY_EXEC_COMMAND_APPROVAL_EMISSION_ERROR,
             )));
-            return (outgoing_message_id, rx_approve);
+            return Ok((outgoing_message_id, rx_approve));
         }
         let request = request.request_with_id(outgoing_message_id.clone());
         let explicit_recipients = connection_ids.is_some();
@@ -646,13 +721,14 @@ impl OutgoingMessageSender {
                 .filter(|connection_id| {
                     active_connections
                         .get(connection_id)
-                        .is_some_and(|initialized| initialized.load(Ordering::Acquire))
+                        .is_some_and(|connection| connection.initialized.load(Ordering::Acquire))
                 })
                 .collect::<Vec<_>>(),
             None => active_connections
                 .iter()
                 .filter_map(|(connection_id, initialized)| {
                     initialized
+                        .initialized
                         .load(Ordering::Acquire)
                         .then_some(*connection_id)
                 })
@@ -668,7 +744,7 @@ impl OutgoingMessageSender {
                 NO_INITIALIZED_CONNECTIONS_ERROR
             };
             let _ = tx_approve.send(Err(internal_error(message)));
-            return (outgoing_message_id, rx_approve);
+            return Ok((outgoing_message_id, rx_approve));
         }
         {
             let mut request_id_to_callback = self
@@ -775,7 +851,7 @@ impl OutgoingMessageSender {
             }
         }
         pending_registration.disarm();
-        (outgoing_message_id, rx_approve)
+        Ok((outgoing_message_id, rx_approve))
     }
 
     pub(crate) async fn replay_requests_to_connection_for_thread(
@@ -788,7 +864,7 @@ impl OutgoingMessageSender {
             let active_connections = Arc::clone(&self.active_connections).lock_owned().await;
             let is_active = active_connections
                 .get(&connection_id)
-                .is_some_and(|initialized| initialized.load(Ordering::Acquire));
+                .is_some_and(|connection| connection.initialized.load(Ordering::Acquire));
             if !is_active {
                 return;
             }
@@ -824,7 +900,7 @@ impl OutgoingMessageSender {
             let active_connections = Arc::clone(&self.active_connections).lock_owned().await;
             if !active_connections
                 .get(&connection_id)
-                .is_some_and(|initialized| initialized.load(Ordering::Acquire))
+                .is_some_and(|connection| connection.initialized.load(Ordering::Acquire))
             {
                 return;
             }
@@ -909,10 +985,6 @@ impl OutgoingMessageSender {
                 warn!("could not find callback for {id:?}");
             }
         }
-    }
-
-    pub(crate) async fn cancel_request(&self, id: &RequestId) -> bool {
-        self.cancel_request_sync(id)
     }
 
     pub(crate) fn cancel_request_sync(&self, id: &RequestId) -> bool {
@@ -1077,8 +1149,18 @@ impl OutgoingMessageSender {
         thread_originator: String,
         commit: impl std::future::Future<Output = std::result::Result<Option<G>, JSONRPCErrorError>>,
     ) -> bool {
-        let serialized = ClientResponsePayload::from(response)
-            .into_jsonrpc_parts_and_payload(request_id.request_id.clone());
+        let response = ClientResponsePayload::from(response);
+        let experimental_api_enabled = self
+            .experimental_api_enabled(request_id.connection_id)
+            .await;
+        let serialized = response
+            .into_jsonrpc_parts_and_payload(request_id.request_id.clone())
+            .map(|(id, mut result, payload)| {
+                if !experimental_api_enabled && let Some(payload) = &payload {
+                    project_response_history(payload, &mut result);
+                }
+                (id, result, payload)
+            });
         let (id, result, analytics_response) = match serialized {
             Ok(parts) => parts,
             Err(error) => {
@@ -1117,6 +1199,8 @@ impl OutgoingMessageSender {
             reserve.await
         };
         let Some(permit) = permit else {
+            self.fail_connection_delivery(request_id.connection_id)
+                .await;
             return false;
         };
         let commit_result = tokio::select! {
@@ -1161,9 +1245,13 @@ impl OutgoingMessageSender {
     ) {
         let connection_id = request_id.connection_id;
         let request_id_for_analytics = request_id.request_id.clone();
+        let experimental_api_enabled = self.experimental_api_enabled(connection_id).await;
         let serialized_response = response
             .into_jsonrpc_parts_and_payload(request_id.request_id.clone())
-            .map(|(id, result, response)| {
+            .map(|(id, mut result, response)| {
+                if !experimental_api_enabled && let Some(response) = &response {
+                    project_response_history(response, &mut result);
+                }
                 if let Some(response) = response {
                     match thread_originator {
                         Some(thread_originator) => {
@@ -1325,6 +1413,7 @@ impl OutgoingMessageSender {
             "app-server terminal event: {notification}"
         );
         let dispatch_started = Instant::now();
+        let delivery_deadline = tokio::time::Instant::now() + RESOURCE_DELIVERY_TIMEOUT;
         let receipt_deadline = tokio::time::Instant::now() + TURN_DELIVERY_RECEIPT_TIMEOUT;
         let post_core_dispatch_latency_ms = core_completed_at_ms
             .map(|completed_at_ms| now_unix_timestamp_ms().saturating_sub(completed_at_ms));
@@ -1333,13 +1422,21 @@ impl OutgoingMessageSender {
 
         for connection_id in target_connection_ids {
             let (write_complete_tx, write_complete_rx) = oneshot::channel();
-            let send_result = self.sender.try_send(OutgoingEnvelope::ToConnection {
+            let send = self.sender.send(OutgoingEnvelope::ToConnection {
                 connection_id,
                 message: outgoing_message.clone(),
                 write_complete_tx: Some(write_complete_tx),
             });
-            let immediate_outcome = if let Err(err) = send_result {
-                warn!("failed to dispatch terminal notification to {connection_id:?}: {err:?}");
+            let send_result = tokio::select! {
+                biased;
+                _ = self.delivery_shutdown.cancelled() => None,
+                result = tokio::time::timeout_at(delivery_deadline, send) => Some(result),
+            };
+            let immediate_outcome = if !matches!(send_result, Some(Ok(Ok(())))) {
+                warn!(
+                    "failed to dispatch terminal notification to {connection_id:?}: {send_result:?}"
+                );
+                self.fail_connection_delivery(connection_id).await;
                 Some(TurnDeliveryOutcomeKind::Failure)
             } else {
                 None
@@ -1545,6 +1642,9 @@ impl OutgoingMessageSender {
             send_fut.await
         };
 
+        if !matches!(&send_result, Some(Ok(Ok(())))) {
+            self.fail_connection_delivery(connection_id).await;
+        }
         match send_result {
             Some(Ok(Ok(()))) => {}
             Some(Ok(Err(err))) => warn!("failed to send {message_kind} to client: {err:?}"),
@@ -1554,6 +1654,64 @@ impl OutgoingMessageSender {
                 "timed out enqueueing {message_kind}"
             ),
             None => {}
+        }
+    }
+}
+
+// Response identity is still available here. Only visit protocol-owned turn
+// locations; application-owned JSON inside items must remain untouched.
+fn project_response_history(payload: &ClientResponsePayload, result: &mut serde_json::Value) {
+    let paths: &[&str] = match payload {
+        ClientResponsePayload::ThreadResume(_) => &["/thread/turns", "/initialTurnsPage/data"],
+        ClientResponsePayload::ThreadStart(_)
+        | ClientResponsePayload::ThreadFork(_)
+        | ClientResponsePayload::ThreadRead(_)
+        | ClientResponsePayload::ThreadRollback(_)
+        | ClientResponsePayload::ThreadMetadataUpdate(_)
+        | ClientResponsePayload::ThreadUnarchive(_) => &["/thread/turns"],
+        ClientResponsePayload::ThreadTurnsList(_) => &["/data"],
+        ClientResponsePayload::TurnStart(_) => {
+            if let Some(turn) = result
+                .get_mut("turn")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                turn.remove("reasoningPolicyHistory");
+            }
+            return;
+        }
+        ClientResponsePayload::ThreadList(_) | ClientResponsePayload::ThreadSearch(_) => {
+            if let Some(threads) = result
+                .get_mut("data")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for thread in threads {
+                    let thread = if matches!(payload, ClientResponsePayload::ThreadSearch(_)) {
+                        thread.get_mut("thread")
+                    } else {
+                        Some(thread)
+                    };
+                    if let Some(turns) = thread.and_then(|thread| thread.get_mut("turns")) {
+                        strip_turn_histories(turns);
+                    }
+                }
+            }
+            return;
+        }
+        _ => return,
+    };
+    for path in paths {
+        if let Some(turns) = result.pointer_mut(path) {
+            strip_turn_histories(turns);
+        }
+    }
+}
+
+fn strip_turn_histories(turns: &mut serde_json::Value) {
+    if let Some(turns) = turns.as_array_mut() {
+        for turn in turns {
+            if let Some(turn) = turn.as_object_mut() {
+                turn.remove("reasoningPolicyHistory");
+            }
         }
     }
 }
@@ -2341,8 +2499,159 @@ mod tests {
                 .send(())
                 .expect("receipt collector should still be waiting");
         }
-        assert!(rx.try_recv().is_err(), "no duplicate dispatch is allowed");
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "no duplicate dispatch is allowed"
+        );
         outgoing.shutdown_delivery_tasks().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_dispatch_waits_for_temporary_queue_saturation() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            AnalyticsEventsClient::disabled(),
+        ));
+        let thread_id = ThreadId::new();
+        outgoing
+            .send_server_notification(turn_completed_notification(thread_id, "previous"))
+            .await;
+        let scoped = ThreadScopedOutgoingMessageSender::new(
+            outgoing.clone(),
+            vec![ConnectionId(1)],
+            thread_id,
+        );
+        let dispatch = scoped.send_server_notification_with_receipts(
+            turn_completed_notification(thread_id, "current"),
+            None,
+        );
+        tokio::pin!(dispatch);
+        assert!(
+            futures::poll!(&mut dispatch).is_pending(),
+            "terminal delivery must wait for capacity"
+        );
+        rx.try_recv().expect("remove previous message");
+        timeout(Duration::from_secs(1), dispatch)
+            .await
+            .expect("dispatch completes after capacity is available");
+        let OutgoingEnvelope::ToConnection {
+            message:
+                OutgoingMessage::AppServerNotification(ServerNotification::TurnCompleted(notification)),
+            write_complete_tx,
+            ..
+        } = rx.try_recv().expect("terminal notification was retained")
+        else {
+            panic!("expected terminal notification");
+        };
+        assert_eq!(notification.turn.id, "current");
+        write_complete_tx
+            .expect("receipt")
+            .send(())
+            .expect("collector waiting");
+        outgoing.shutdown_delivery_tasks().await;
+    }
+
+    #[tokio::test]
+    async fn token_usage_retains_only_latest_turn_and_delivers_each_turn() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            AnalyticsEventsClient::disabled(),
+        ));
+        let thread_id = ThreadId::new();
+        let scoped = ThreadScopedOutgoingMessageSender::new(
+            outgoing.clone(),
+            vec![ConnectionId(1)],
+            thread_id,
+        );
+        for index in 0..20 {
+            let turn_id = format!("turn-{index}");
+            let usage = json!({"totalTokens": 1, "inputTokens": 1, "cachedInputTokens": 0, "outputTokens": 0, "reasoningOutputTokens": 0});
+            let notification = ServerNotification::ThreadTokenUsageUpdated(
+                serde_json::from_value(json!({
+                    "threadId": thread_id.to_string(), "turnId": turn_id,
+                    "tokenUsage": {"total": usage, "last": usage, "modelContextWindow": null}
+                }))
+                .expect("usage notification"),
+            );
+            scoped
+                .send_component_notification_if_changed(notification.clone())
+                .await;
+            let OutgoingEnvelope::ToConnection {
+                message: OutgoingMessage::AppServerNotification(delivered),
+                ..
+            } = rx.try_recv().expect("new turn must be delivered")
+            else {
+                panic!("expected targeted usage");
+            };
+            assert_eq!(
+                serde_json::to_value(delivered).unwrap(),
+                serde_json::to_value(&notification).unwrap()
+            );
+            scoped
+                .send_component_notification_if_changed(notification)
+                .await;
+            assert!(matches!(
+                rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            assert_eq!(
+                outgoing
+                    .component_notification_cache
+                    .lock()
+                    .await
+                    .token_usage
+                    .len(),
+                1
+            );
+        }
+        outgoing.connection_closed(ConnectionId(1)).await;
+        assert!(
+            outgoing
+                .component_notification_cache
+                .lock()
+                .await
+                .token_usage
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn response_admission_timeout_fails_the_connection() {
+        let (tx, _rx) = mpsc::channel(1);
+        let outgoing = OutgoingMessageSender::new(tx, AnalyticsEventsClient::disabled());
+        let failure = CancellationToken::new();
+        outgoing
+            .connection_opened_with_runtime(
+                ConnectionId(1),
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(false)),
+                failure.clone(),
+            )
+            .await;
+        let thread_id = ThreadId::new();
+        outgoing
+            .send_server_notification(turn_completed_notification(thread_id, "fill"))
+            .await;
+        outgoing
+            .send_response(
+                ConnectionRequestId {
+                    connection_id: ConnectionId(1),
+                    request_id: RequestId::Integer(1),
+                },
+                codex_app_server_protocol::TurnStartResponse {
+                    turn: serde_json::from_value(
+                        json!({"id":"turn-1", "items":[], "status":"completed"}),
+                    )
+                    .expect("valid turn"),
+                },
+            )
+            .await;
+        assert!(
+            failure.is_cancelled(),
+            "pending requests must be settled by connection shutdown"
+        );
     }
 
     #[test]
@@ -2493,6 +2802,106 @@ mod tests {
             .expect("wait should not time out")
             .expect("waiter should receive a callback");
         assert_eq!(result, Err(error));
+    }
+
+    #[tokio::test]
+    async fn request_id_exhaustion_preserves_pending_app_server_correlation() {
+        let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(1);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let connection_id = ConnectionId(1);
+        outgoing
+            .connection_opened(connection_id, Arc::new(AtomicBool::new(true)))
+            .await;
+        let thread_id = ThreadId::new();
+        let scoped = ThreadScopedOutgoingMessageSender::new(
+            Arc::clone(&outgoing),
+            vec![connection_id],
+            thread_id,
+        );
+        let request = || {
+            ServerRequestPayload::FileChangeRequestApproval(FileChangeRequestApprovalParams {
+                thread_id: thread_id.to_string(),
+                turn_id: "retained-turn".to_string(),
+                item_id: "retained-item".to_string(),
+                started_at_ms: 0,
+                reason: None,
+                grant_root: None,
+            })
+        };
+        outgoing
+            .next_server_request_id
+            .store(i64::MAX - 1, Ordering::Relaxed);
+        let (pending_id, pending_response) = scoped.send_request(request()).await;
+        let pending_id = pending_id.expect("last request before exhaustion must be admitted");
+        let OutgoingEnvelope::ToConnection {
+            connection_id: recipient,
+            message: OutgoingMessage::Request(emitted),
+            ..
+        } = rx.recv().await.expect("request emitted")
+        else {
+            panic!("expected targeted approval request");
+        };
+        assert_eq!(recipient, connection_id);
+        assert_eq!(pending_id, RequestId::Integer(i64::MAX - 1));
+        assert_eq!(emitted.id(), &pending_id);
+
+        let expected_error = internal_error("app-server request IDs are exhausted");
+        for _ in 0..2 {
+            let (rejected_id, rejected_response) = scoped.send_request(request()).await;
+            assert_eq!(
+                rejected_id, None,
+                "rejection must not fabricate a callback identity"
+            );
+            assert_eq!(
+                rejected_response.await.expect("rejection must resolve"),
+                Err(expected_error.clone())
+            );
+            assert_eq!(outgoing.pending_callback_count().await, 1);
+            assert!(matches!(
+                rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+        let direct_error = outgoing
+            .send_request_to_connections(Some(&[connection_id]), request(), Some(thread_id))
+            .await
+            .expect_err("direct caller must observe exhaustion");
+        assert_eq!(direct_error, expected_error);
+        assert_eq!(
+            outgoing
+                .send_request_to_connections_and_wait(
+                    Some(&[connection_id]),
+                    request(),
+                    Some(thread_id)
+                )
+                .await
+                .expect("wait wrapper must return its internal error"),
+            Err(expected_error)
+        );
+        assert_eq!(outgoing.pending_callback_count().await, 1);
+
+        let expected = json!({"decision": "accept"});
+        outgoing
+            .notify_client_response(connection_id, pending_id, expected.clone())
+            .await;
+        assert_eq!(
+            pending_response
+                .await
+                .expect("retained response must arrive"),
+            Ok(expected)
+        );
+        assert_eq!(outgoing.pending_callback_count().await, 0);
+        assert_eq!(
+            outgoing.next_server_request_id.load(Ordering::Relaxed),
+            i64::MAX
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
@@ -2776,6 +3185,7 @@ mod tests {
                 },
             ))
             .await;
+        let request_id = request_id.expect("request admitted");
         let _original_delivery = rx.recv().await.expect("original request delivery");
 
         outgoing
@@ -2844,6 +3254,7 @@ mod tests {
                 AttestationGenerateParams {},
             ))
             .await;
+        let request_id = request_id.expect("request admitted");
 
         let replay_outgoing = Arc::clone(&outgoing);
         let replay_task = tokio::spawn(async move {
@@ -2959,6 +3370,7 @@ mod tests {
                     /*thread_id*/ None,
                 )
                 .await
+                .expect("request admitted")
         });
         let first_delivery = timeout(Duration::from_secs(1), rx.recv())
             .await
@@ -3032,6 +3444,7 @@ mod tests {
             send_outgoing
                 .send_request_to_connections(Some(&[connection_id]), request, Some(thread_id))
                 .await
+                .expect("request admitted")
         });
         timeout(Duration::from_secs(1), async {
             while outgoing.pending_callback_count().await != 1 {
@@ -3108,6 +3521,7 @@ mod tests {
             send_outgoing
                 .send_request_to_connections(Some(&[first, second]), request, Some(thread_id))
                 .await
+                .expect("request admitted")
         });
         timeout(Duration::from_secs(1), async {
             while rx.len() != 1 {
@@ -3199,7 +3613,8 @@ mod tests {
         outgoing.connection_closed(second).await;
         let (request_id, result) = timeout(Duration::from_secs(7), initial)
             .await
-            .expect("last initial target remains blocked until delivery timeout");
+            .expect("last initial target remains blocked until delivery timeout")
+            .expect("request admitted");
         assert_eq!(outgoing.pending_callback_count().await, 1);
         assert!(matches!(
             rx.recv().await,
@@ -3250,7 +3665,8 @@ mod tests {
                 }),
                 Some(thread_id),
             )
-            .await;
+            .await
+            .expect("request admitted");
         let mut replay =
             Box::pin(outgoing.replay_requests_to_connection_for_thread(replayed, thread_id, true));
         assert!(futures::poll!(replay.as_mut()).is_pending());
@@ -3313,6 +3729,7 @@ mod tests {
                     /*thread_id*/ None,
                 )
                 .await
+                .expect("request admitted")
         });
         timeout(Duration::from_secs(1), async {
             while outgoing.pending_callback_count().await == 0 {
@@ -3438,6 +3855,7 @@ mod tests {
                 },
             ))
             .await;
+        let request_id = request_id.expect("request admitted");
 
         let delivery = rx.recv().await.expect("dynamic tool request delivery");
         let OutgoingEnvelope::ToConnection { connection_id, .. } = delivery else {
@@ -3511,6 +3929,7 @@ mod tests {
                 },
             ))
             .await;
+        let dynamic_tool_request_id = dynamic_tool_request_id.expect("request admitted");
         let (first_request_id, _first_waiter) = thread_outgoing
             .send_request(ServerRequestPayload::ToolRequestUserInput(
                 ToolRequestUserInputParams {
@@ -3522,6 +3941,7 @@ mod tests {
                 },
             ))
             .await;
+        let first_request_id = first_request_id.expect("request admitted");
         let (second_request_id, _second_waiter) = thread_outgoing
             .send_request(ServerRequestPayload::FileChangeRequestApproval(
                 FileChangeRequestApprovalParams {
@@ -3534,6 +3954,7 @@ mod tests {
                 },
             ))
             .await;
+        let second_request_id = second_request_id.expect("request admitted");
         let pending_requests = outgoing.pending_requests_for_thread(thread_id).await;
         assert_eq!(
             pending_requests
@@ -3637,7 +4058,8 @@ mod tests {
                 }),
                 /*thread_id*/ None,
             )
-            .await;
+            .await
+            .expect("request admitted");
 
         outgoing
             .notify_client_response(other_connection, request_id.clone(), json!({"answers": {}}))

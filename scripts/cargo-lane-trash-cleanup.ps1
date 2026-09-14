@@ -100,6 +100,13 @@ function Get-SafeTrashDirectory {
             Write-CleanupLog ("skipped trash directory outside lanes root: {0}" -f $item.FullName)
             return $null
         }
+        foreach ($name in @(".lane-active.lock", ".cargo-lock")) {
+            $activeLock = Join-Path $item.FullName $name
+            if (Test-Path -LiteralPath $activeLock) {
+                $probe = [IO.File]::Open($activeLock, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+                $probe.Dispose()
+            }
+        }
         return $item
     }
     catch [System.Management.Automation.ItemNotFoundException] {
@@ -134,6 +141,11 @@ try {
         $lockStream.Flush()
     }
     catch {
+        $cause = $_.Exception
+        while ($null -ne $cause.InnerException) { $cause = $cause.InnerException }
+        if (($cause.HResult -band 0xffff) -notin @(32, 33)) {
+            Write-CleanupLog ("could not acquire cleanup worker lock: {0}" -f $_.Exception.Message)
+        }
         exit 0
     }
 

@@ -58,7 +58,7 @@ impl ExecServerClient {
         {
             Ok(response) => response,
             Err(error) => {
-                self.inner.remove_http_body_stream(&request_id).await;
+                self.inner.abandon_http_body_stream(&request_id).await;
                 registration.disarm();
                 return Err(error);
             }

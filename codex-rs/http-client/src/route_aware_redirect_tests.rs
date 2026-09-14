@@ -108,7 +108,10 @@ fn redirects_match_reqwest_method_and_body_rules() {
             original.headers().clone(),
             original.version(),
             original.timeout().copied(),
-            original.try_clone(),
+            match body_behavior {
+                RedirectBodyBehavior::Drop => None,
+                RedirectBodyBehavior::Preserve => original.try_clone(),
+            },
             redirected_url.clone(),
         )
         .expect("supported redirect should be followed");

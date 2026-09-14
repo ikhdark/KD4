@@ -46,10 +46,7 @@ pub(crate) struct CommitTickOutput {
 }
 
 impl Default for CommitTickOutput {
-    /// Creates an output that represents "no commit performed".
-    ///
-    /// This is used when a tick is intentionally suppressed, for example when
-    /// the scope is [`CommitTickScope::CatchUpOnly`] and policy is not in catch-up mode.
+    /// Creates an output for a tick with no controllers.
     fn default() -> Self {
         Self {
             cells: Vec::new(),
@@ -80,7 +77,11 @@ pub(crate) fn run_commit_tick(
     );
     let decision = resolve_chunking_plan(policy, snapshot, now);
     if scope == CommitTickScope::CatchUpOnly && decision.mode != ChunkingMode::CatchUp {
-        return CommitTickOutput::default();
+        return CommitTickOutput {
+            cells: Vec::new(),
+            has_controller: stream_controller.is_some() || plan_stream_controller.is_some(),
+            all_idle: snapshot.queued_lines == 0,
+        };
     }
 
     apply_commit_tick_plan(
@@ -210,5 +211,53 @@ fn max_duration(lhs: Option<Duration>, rhs: Option<Duration>) -> Option<Duration
         (Some(left), None) => Some(left),
         (None, Some(right)) => Some(right),
         (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history_cell::HistoryRenderMode;
+    use codex_config::types::UriBasedFileOpener;
+
+    #[test]
+    fn suppressed_tick_reports_controller_and_queue_without_draining() {
+        let mut controller = StreamController::new(
+            Some(80),
+            &std::env::temp_dir(),
+            UriBasedFileOpener::None,
+            HistoryRenderMode::Rich,
+        );
+        controller.push("first\nsecond\n");
+        controller.flush_render_for_frame();
+        let queued = controller.queued_lines();
+        assert!(queued > 0);
+        let mut policy = AdaptiveChunkingPolicy::default();
+        let output = run_commit_tick(
+            &mut policy,
+            Some(&mut controller),
+            None,
+            CommitTickScope::CatchUpOnly,
+            Instant::now(),
+        );
+        assert!(output.has_controller);
+        assert!(!output.all_idle);
+        assert!(output.cells.is_empty());
+        assert_eq!(controller.queued_lines(), queued);
+
+        let output = run_commit_tick(
+            &mut policy,
+            Some(&mut controller),
+            None,
+            CommitTickScope::AnyMode,
+            Instant::now(),
+        );
+        assert_eq!(output.cells.len(), 1);
+        let text: String = output.cells[0]
+            .transcript_lines(80)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect();
+        assert!(text.contains("first"), "expected first queued line: {text}");
     }
 }

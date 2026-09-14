@@ -63,20 +63,23 @@ fn hybrid_ik_roundtrip_authenticates_both_endpoints() {
     );
 }
 
-#[test]
-fn initiator_rejects_wrong_responder_key() {
+#[test_case::test_case(true; "wrong_dh")]
+#[test_case::test_case(false; "wrong_kem")]
+fn initiator_rejects_wrong_responder_key(wrong_dh: bool) {
     let initiator = NoiseChannelIdentity::generate().expect("generate initiator identity");
     let expected_responder = NoiseChannelIdentity::generate().expect("generate expected identity");
     let actual_responder = NoiseChannelIdentity::generate().expect("generate actual identity");
+    let mut expected_key = actual_responder.public_key();
+    if wrong_dh {
+        expected_key.x25519_public_key = expected_responder.public_key().x25519_public_key;
+    } else {
+        expected_key.mlkem768_public_key = expected_responder.public_key().mlkem768_public_key;
+    }
     let prologue = noise_channel_prologue("env-1", "registration-1", "stream-1");
 
-    let (_initiator_handshake, request) = InitiatorHandshake::start(
-        &initiator,
-        &expected_responder.public_key(),
-        &prologue,
-        b"authorization",
-    )
-    .expect("start initiator handshake");
+    let (_initiator_handshake, request) =
+        InitiatorHandshake::start(&initiator, &expected_key, &prologue, b"authorization")
+            .expect("start initiator handshake");
 
     assert!(
         PendingResponderHandshake::read_request(&actual_responder, &prologue, &request).is_err()
@@ -206,6 +209,26 @@ fn public_key_serializes_with_expected_suite() {
     let json = serde_json::to_value(key).expect("serialize key");
 
     assert_eq!(json["suite"], NOISE_CHANNEL_SUITE);
+}
+
+#[test_case::test_case(true; "dh")]
+#[test_case::test_case(false; "kem")]
+fn handshake_rejects_oversized_encoded_keys_before_decoding(dh: bool) {
+    let initiator = NoiseChannelIdentity::generate().expect("initiator");
+    let mut key = NoiseChannelIdentity::generate()
+        .expect("responder")
+        .public_key();
+    let expected = if dh {
+        key.x25519_public_key = "!".repeat(4096);
+        "invalid X25519 public key length"
+    } else {
+        key.mlkem768_public_key = "!".repeat(4096);
+        "invalid ML-KEM-768 public key length"
+    };
+    assert!(matches!(
+        InitiatorHandshake::start(&initiator, &key, b"prologue", b""),
+        Err(NoiseChannelError::InvalidPublicKey(message)) if message == expected
+    ));
 }
 
 #[test]

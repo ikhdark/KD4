@@ -26,8 +26,8 @@ use serde::Serialize;
 use super::ConfiguredHandler;
 use super::HookListEntry;
 use crate::config_rules::hook_states_from_stack;
+use crate::events::common::HookMatcher;
 use crate::events::common::matcher_pattern_for_event;
-use crate::events::common::validate_matcher_pattern;
 use codex_protocol::protocol::HookHandlerType;
 use codex_protocol::protocol::HookSource;
 use codex_protocol::protocol::HookTrustStatus;
@@ -461,15 +461,17 @@ fn append_matcher_groups(
 ) {
     for (group_index, group) in groups.into_iter().enumerate() {
         let matcher = matcher_pattern_for_event(event_name, group.matcher.as_deref());
-        if let Some(matcher) = matcher
-            && let Err(err) = validate_matcher_pattern(matcher)
-        {
-            warnings.push(format!(
-                "invalid matcher {matcher:?} in {}: {err}",
-                source.path.display()
-            ));
-            continue;
-        }
+        let compiled_matcher = match matcher.map(HookMatcher::new).transpose() {
+            Ok(matcher) => matcher,
+            Err(err) => {
+                warnings.push(format!(
+                    "invalid matcher {:?} in {}: {err}",
+                    matcher.unwrap_or_default(),
+                    source.path.display()
+                ));
+                continue;
+            }
+        };
         for (handler_index, handler) in group.hooks.iter().cloned().enumerate() {
             match handler {
                 HookHandlerConfig::Command {
@@ -513,11 +515,7 @@ fn append_matcher_groups(
                         r#async,
                         status_message: status_message.clone(),
                     };
-                    let current_hash =
-                        command_hook_hash(event_name, matcher, &group, normalized_handler);
-                    let command = source.env.iter().fold(command, |command, (key, value)| {
-                        command.replace(&format!("${{{key}}}"), value)
-                    });
+                    let current_hash = command_hook_hash(event_name, matcher, normalized_handler);
                     // TODO(abhinav): replace this positional suffix with a durable hook id.
                     let key =
                         crate::hook_key(&source.key_source, event_name, group_index, handler_index);
@@ -552,7 +550,7 @@ fn append_matcher_groups(
                     {
                         handlers.push(ConfiguredHandler {
                             event_name,
-                            matcher: matcher.map(ToOwned::to_owned),
+                            matcher: compiled_matcher.clone(),
                             command,
                             timeout_sec,
                             status_message,
@@ -589,12 +587,12 @@ struct NormalizedHookIdentity {
 fn command_hook_hash(
     event_name: codex_protocol::protocol::HookEventName,
     matcher: Option<&str>,
-    group: &MatcherGroup,
     normalized_handler: HookHandlerConfig,
 ) -> String {
-    let mut group = group.clone();
-    group.matcher = matcher.map(ToOwned::to_owned);
-    group.hooks = vec![normalized_handler];
+    let group = MatcherGroup {
+        matcher: matcher.map(ToOwned::to_owned),
+        hooks: vec![normalized_handler],
+    };
     let identity = NormalizedHookIdentity {
         event_name: crate::hook_event_key_label(event_name),
         group,
@@ -685,6 +683,7 @@ mod tests {
 
     use super::ConfiguredHandler;
     use super::append_matcher_groups;
+    use crate::events::common::HookMatcher;
     use codex_config::HookHandlerConfig;
     use codex_config::HookStateToml;
     use codex_config::MatcherGroup;
@@ -858,7 +857,7 @@ mod tests {
             handlers,
             vec![ConfiguredHandler {
                 event_name: HookEventName::PreToolUse,
-                matcher: Some("^Bash$".to_string()),
+                matcher: Some(HookMatcher::new("^Bash$").expect("valid matcher")),
                 command: "echo hello".to_string(),
                 timeout_sec: 600,
                 status_message: None,
@@ -995,7 +994,10 @@ mod tests {
 
         assert_eq!(warnings, Vec::<String>::new());
         assert_eq!(handlers.len(), 1);
-        assert_eq!(handlers[0].matcher.as_deref(), Some("*"));
+        assert_eq!(
+            handlers[0].matcher.as_ref().map(HookMatcher::as_str),
+            Some("*")
+        );
     }
 
     #[test]
@@ -1019,7 +1021,10 @@ mod tests {
         assert_eq!(warnings, Vec::<String>::new());
         assert_eq!(handlers.len(), 1);
         assert_eq!(handlers[0].event_name, HookEventName::PostToolUse);
-        assert_eq!(handlers[0].matcher.as_deref(), Some("Edit|Write"));
+        assert_eq!(
+            handlers[0].matcher.as_ref().map(HookMatcher::as_str),
+            Some("Edit|Write")
+        );
     }
 
     #[test]
@@ -1084,7 +1089,14 @@ mod tests {
 
         assert_eq!(warnings, Vec::<String>::new());
         assert_eq!(handlers.len(), 1);
-        assert_eq!(handlers[0].command, "echo windows");
+        assert_eq!(
+            handlers[0].command,
+            if cfg!(windows) {
+                "echo windows"
+            } else {
+                "echo unix"
+            }
+        );
     }
 
     fn config_with_malformed_state_and_session_start_hook() -> TomlValue {

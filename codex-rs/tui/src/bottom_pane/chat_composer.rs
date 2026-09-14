@@ -255,7 +255,6 @@ use crate::clipboard_paste::normalize_pasted_path;
 use crate::clipboard_paste::pasted_image_format;
 use crate::history_cell;
 use crate::skills_helpers::skill_display_name;
-use crate::tui::FrameRequester;
 use crate::ui_consts::LIVE_PREFIX_COLS;
 use codex_connectors::AppInfo;
 use codex_core_skills::injection::is_mention_name_char;
@@ -341,6 +340,8 @@ pub(crate) struct ChatComposerConfig {
     pub(crate) slash_commands_enabled: bool,
     /// Whether pasting a file path can attach local images.
     pub(crate) image_paste_enabled: bool,
+    /// Enable ordinary recall and search history.
+    pub(crate) history_enabled: bool,
 }
 
 impl Default for ChatComposerConfig {
@@ -349,6 +350,7 @@ impl Default for ChatComposerConfig {
             popups_enabled: true,
             slash_commands_enabled: true,
             image_paste_enabled: true,
+            history_enabled: true,
         }
     }
 }
@@ -363,6 +365,7 @@ impl ChatComposerConfig {
             popups_enabled: false,
             slash_commands_enabled: false,
             image_paste_enabled: false,
+            history_enabled: false,
         }
     }
 }
@@ -373,7 +376,6 @@ pub(crate) struct ChatComposer {
     app_event_tx: AppEventSender,
     history: ChatComposerHistory,
     footer: FooterState,
-    frame_requester: Option<FrameRequester>,
     attachments: AttachmentState,
     placeholder_text: String,
     is_task_running: bool,
@@ -548,7 +550,6 @@ impl ChatComposer {
                 reasoning_down_key: primary_binding(&default_keymap.chat.decrease_reasoning_effort),
                 reasoning_up_key: primary_binding(&default_keymap.chat.increase_reasoning_effort),
             },
-            frame_requester: None,
             attachments: AttachmentState::default(),
             placeholder_text,
             is_task_running: false,
@@ -585,17 +586,15 @@ impl ChatComposer {
         this
     }
 
-    pub(crate) fn set_frame_requester(&mut self, frame_requester: FrameRequester) {
-        self.frame_requester = Some(frame_requester);
-    }
-
     pub fn set_skill_mentions(&mut self, skills: Option<Vec<SkillMetadata>>) {
         self.skills = skills;
+        self.refresh_mention_catalog();
         self.sync_popups();
     }
 
     pub fn set_plugin_mentions(&mut self, plugins: Option<Vec<PluginCapabilitySummary>>) {
         self.plugins = plugins;
+        self.refresh_mention_catalog();
         self.sync_popups();
     }
 
@@ -879,6 +878,7 @@ impl ChatComposer {
     /// In all cases, clears any paste-burst Enter suppression state so a real paste cannot affect
     /// the next user Enter key, then syncs popup state.
     pub fn handle_paste(&mut self, pasted: String) -> bool {
+        self.history.invalidate_pending_navigation();
         let pasted = pasted.replace("\r\n", "\n").replace('\r', "\n");
         let pasted = sanitize_user_text(&pasted);
         let char_count = pasted.chars().count();
@@ -956,6 +956,7 @@ impl ChatComposer {
     /// are renumbered to `[Image #M+1]..[Image #N]` (where `M` is the number of
     /// remote images). Cursor is placed at the end after rebuilding elements.
     pub(crate) fn apply_external_edit(&mut self, text: String) {
+        self.history.invalidate_pending_navigation();
         self.draft.pending_pastes.clear();
         let (text, _) = self.imported_text_for_textarea(text, Vec::new());
 
@@ -1039,6 +1040,9 @@ impl ChatComposer {
     /// commands, not as candidate literal paste text. It also resets transient
     /// footer mode so the visible hints match the new editing surface.
     pub(crate) fn set_vim_enabled(&mut self, enabled: bool) {
+        if let Some(pasted) = self.draft.paste_burst.flush_before_modified_input() {
+            self.handle_paste(pasted);
+        }
         self.draft.textarea.set_vim_enabled(enabled);
         self.draft.paste_burst.clear_after_explicit_paste();
         self.footer.mode = reset_mode_after_activity(self.footer.mode);
@@ -1598,7 +1602,9 @@ impl ChatComposer {
             return self.handle_history_search_key(key_event);
         }
 
-        if Self::is_history_search_key(&key_event, &self.history_search_previous_keys) {
+        if self.config.history_enabled
+            && Self::is_history_search_key(&key_event, &self.history_search_previous_keys)
+        {
             return self.begin_history_search();
         }
 
@@ -2585,7 +2591,7 @@ impl ChatComposer {
             return None;
         }
         self.draft.recent_submission_mention_bindings = original_mention_bindings.clone();
-        if record_history && (!text.is_empty() || !self.attachments.is_empty()) {
+        if record_history && self.config.history_enabled {
             self.history.record_local_submission(HistoryEntry {
                 text: text.clone(),
                 text_elements: text_elements.clone(),
@@ -3010,7 +3016,7 @@ impl ChatComposer {
                 self.editor_keymap.move_down.is_pressed(key_event),
             )
         };
-        if history_up_pressed || history_down_pressed {
+        if self.config.history_enabled && (history_up_pressed || history_down_pressed) {
             if self
                 .history
                 .should_handle_navigation(&self.current_text(), self.history_navigation_cursor())
@@ -3022,8 +3028,8 @@ impl ChatComposer {
                 };
                 if let Some(entry) = replace_entry {
                     self.apply_history_entry(entry);
-                    return (InputResult::None, true);
                 }
+                return (InputResult::None, true);
             }
             return self.handle_input_basic(key_event);
         }
@@ -3086,6 +3092,8 @@ impl ChatComposer {
         input: KeyEvent,
         now: Instant,
     ) -> (InputResult, bool) {
+        self.history.invalidate_pending_navigation();
+
         // If we have a buffered non-bracketed paste burst and enough time has
         // elapsed since the last char, flush it before handling a new input.
         self.handle_paste_burst_flush(now);
@@ -3500,34 +3508,38 @@ impl ChatComposer {
             return;
         }
 
-        if query.is_empty() {
-            self.app_event_tx
-                .send(AppEvent::StartFileSearch(String::new()));
-            self.popups.current_file_query = None;
-        } else {
-            self.app_event_tx
-                .send(AppEvent::StartFileSearch(query.clone()));
-            self.popups.current_file_query = Some(query.clone());
-        }
-
-        let candidates = super::mentions_v2::build_search_catalog(
-            self.skills.as_deref(),
-            self.plugins.as_deref(),
-        );
-
         match &mut self.popups.active {
-            ActivePopup::MentionV2(popup) => {
-                popup.set_query(&query);
-                popup.set_candidates(candidates);
-            }
+            ActivePopup::MentionV2(popup) => popup.set_query(&query),
             _ => {
+                let candidates = super::mentions_v2::build_search_catalog(
+                    self.skills.as_deref(),
+                    self.plugins.as_deref(),
+                );
                 let mut popup = MentionV2Popup::new(candidates);
                 popup.set_query(&query);
                 self.popups.active = ActivePopup::MentionV2(popup);
             }
         }
+        let searches_files =
+            matches!(&self.popups.active, ActivePopup::MentionV2(popup) if popup.searches_files());
+        let file_query = (searches_files && !query.is_empty()).then_some(query);
+        if self.popups.current_file_query != file_query {
+            self.app_event_tx.send(AppEvent::StartFileSearch(
+                file_query.clone().unwrap_or_default(),
+            ));
+            self.popups.current_file_query = file_query;
+        }
 
         self.popups.dismissed_mention_token = None;
+    }
+
+    fn refresh_mention_catalog(&mut self) {
+        if let ActivePopup::MentionV2(popup) = &mut self.popups.active {
+            popup.set_candidates(super::mentions_v2::build_search_catalog(
+                self.skills.as_deref(),
+                self.plugins.as_deref(),
+            ));
+        }
     }
 
     fn mention_items(&self) -> Vec<MentionItem> {
@@ -7165,6 +7177,68 @@ mod tests {
     /// Behavior: enabling `disable_paste_burst` flushes any held first character (flicker
     /// suppression) and then inserts subsequent chars immediately without creating burst state.
     #[test]
+    fn enabling_vim_flushes_held_input() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let mut composer =
+            ChatComposer::new(true, AppEventSender::new(tx), false, String::new(), false);
+        composer.handle_key_event(KeyEvent::from(KeyCode::Char('a')));
+        assert!(composer.is_in_paste_burst());
+        assert_eq!(composer.current_text(), "");
+        composer.set_vim_enabled(true);
+        assert_eq!(composer.current_text(), "a");
+        assert!(!composer.is_in_paste_burst());
+    }
+
+    #[test]
+    fn mention_navigation_only_searches_when_file_query_changes() {
+        let (tx, mut rx) = unbounded_channel::<AppEvent>();
+        let mut composer =
+            ChatComposer::new(true, AppEventSender::new(tx), false, String::new(), true);
+        type_chars_humanlike(&mut composer, &['@', 'f']);
+        assert!(matches!(rx.try_recv(), Ok(AppEvent::StartFileSearch(query)) if query == "f"));
+        assert!(rx.try_recv().is_err());
+        composer.handle_key_event(KeyEvent::from(KeyCode::Down));
+        composer.handle_key_event(KeyEvent::from(KeyCode::Up));
+        assert!(rx.try_recv().is_err());
+        // Results -> Tools cancels the outstanding file search.
+        composer.handle_key_event(KeyEvent::from(KeyCode::Left));
+        assert!(matches!(rx.try_recv(), Ok(AppEvent::StartFileSearch(query)) if query.is_empty()));
+        composer.handle_key_event(KeyEvent::from(KeyCode::Char('i')));
+        assert_eq!(composer.current_text(), "@fi");
+        assert!(rx.try_recv().is_err());
+        // Tools -> Results starts a search for the updated query.
+        composer.handle_key_event(KeyEvent::from(KeyCode::Right));
+        assert!(matches!(rx.try_recv(), Ok(AppEvent::StartFileSearch(query)) if query == "fi"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn delayed_history_lookup_does_not_replace_new_input() {
+        for paste in [false, true] {
+            let (tx, mut rx) = unbounded_channel::<AppEvent>();
+            let mut composer =
+                ChatComposer::new(true, AppEventSender::new(tx), false, String::new(), true);
+            composer.set_history_metadata(ThreadId::new(), 42, 1);
+            composer.handle_key_event(KeyEvent::from(KeyCode::Up));
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(AppEvent::LookupMessageHistoryEntry {
+                    log_id: 42,
+                    offset: 0,
+                    ..
+                })
+            ));
+            if paste {
+                composer.handle_paste("x".to_string());
+            } else {
+                composer.handle_key_event(KeyEvent::from(KeyCode::Char('x')));
+            }
+            assert!(!composer.on_history_entry_response(42, 0, Some("old".to_string())));
+            assert_eq!(composer.current_text(), "x");
+        }
+    }
+
+    #[test]
     fn disable_paste_burst_flushes_pending_first_char_and_inserts_immediately() {
         use crossterm::event::KeyCode;
         use crossterm::event::KeyEvent;
@@ -7869,28 +7943,18 @@ mod tests {
     }
 
     fn flush_after_paste_burst(composer: &mut ChatComposer) -> bool {
-        std::thread::sleep(PasteBurst::recommended_active_flush_delay());
-        composer.flush_paste_burst_if_due()
+        composer
+            .handle_paste_burst_flush(Instant::now() + PasteBurst::recommended_active_flush_delay())
     }
 
-    // Test helper: simulate human typing with a brief delay and flush the paste-burst buffer
+    // Exercise public key routing with burst detection disabled; timed burst tests use synthetic time.
     fn type_chars_humanlike(composer: &mut ChatComposer, chars: &[char]) {
-        use crossterm::event::KeyCode;
-        use crossterm::event::KeyEvent;
-        use crossterm::event::KeyEventKind;
-        use crossterm::event::KeyModifiers;
+        let was_disabled = composer.draft.disable_paste_burst;
+        composer.set_disable_paste_burst(true);
         for &ch in chars {
             let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
-            std::thread::sleep(ChatComposer::recommended_paste_flush_delay());
-            let _ = composer.flush_paste_burst_if_due();
-            if ch == ' ' {
-                let _ = composer.handle_key_event(KeyEvent::new_with_kind(
-                    KeyCode::Char(' '),
-                    KeyModifiers::NONE,
-                    KeyEventKind::Release,
-                ));
-            }
         }
+        composer.set_disable_paste_burst(was_disabled);
     }
 
     #[test]
@@ -8916,23 +8980,11 @@ mod tests {
             ("y".repeat(LARGE_PASTE_CHAR_THRESHOLD + 7), true),
         ];
 
-        // Expected states after each paste
-        let mut expected_text = String::new();
-        let mut expected_pending_count = 0;
-
-        // Apply all pastes and build expected state
         let states: Vec<_> = test_cases
             .iter()
-            .map(|(content, is_large)| {
+            .map(|(content, _)| {
                 composer.handle_paste(content.clone());
-                if *is_large {
-                    let placeholder = format!("[Pasted Content {} chars]", content.chars().count());
-                    expected_text.push_str(&placeholder);
-                    expected_pending_count += 1;
-                } else {
-                    expected_text.push_str(content);
-                }
-                (expected_text.clone(), expected_pending_count)
+                (composer.current_text(), composer.draft.pending_pastes.len())
             })
             .collect();
 
@@ -10857,6 +10909,45 @@ mod tests {
 
         assert_eq!(composer.current_text(), "");
         assert_eq!(composer.text_elements(), Vec::<TextElement>::new());
+    }
+
+    #[test]
+    fn remote_image_count_changes_preserve_local_image_order() {
+        let (mut composer, _rx) = new_test_composer();
+        composer.attach_image(PathBuf::from("first.png"));
+        composer.insert_str(" ");
+        composer.attach_image(PathBuf::from("second.png"));
+
+        composer.set_remote_image_urls(vec!["https://example.com/image.png".to_string()]);
+        assert_eq!(composer.current_text(), "[Image #2] [Image #3]");
+        assert_eq!(
+            composer.attachments.local_images[0].placeholder,
+            "[Image #2]"
+        );
+        assert_eq!(
+            composer.attachments.local_images[0].path,
+            PathBuf::from("first.png")
+        );
+        assert_eq!(
+            composer.attachments.local_images[1].placeholder,
+            "[Image #3]"
+        );
+        assert_eq!(
+            composer.attachments.local_images[1].path,
+            PathBuf::from("second.png")
+        );
+
+        composer.set_remote_image_urls(Vec::new());
+        assert_eq!(composer.current_text(), "[Image #1] [Image #2]");
+        let text = composer.current_text();
+        assert_eq!(
+            composer
+                .text_elements()
+                .iter()
+                .map(|element| element.placeholder(&text).unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec!["[Image #1]", "[Image #2]"]
+        );
     }
 
     #[test]

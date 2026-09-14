@@ -26,7 +26,6 @@ use codex_protocol::protocol::TurnAbortReason;
 use serde::Serialize;
 use std::time::Duration;
 
-use crate::AgentThreadId;
 use crate::CodexTurnId;
 use crate::ExecutionStatus;
 use crate::RawPayloadKind;
@@ -38,7 +37,7 @@ pub(crate) struct CodexTurnTraceEvent {
 }
 
 pub(crate) fn codex_turn_trace_event(
-    thread_id: AgentThreadId,
+    thread_id: &str,
     default_turn_id: &str,
     event: &EventMsg,
 ) -> Option<CodexTurnTraceEvent> {
@@ -49,7 +48,7 @@ pub(crate) fn codex_turn_trace_event(
                 context_turn_id: codex_turn_id.clone(),
                 payload: RawTraceEventPayload::CodexTurnStarted {
                     codex_turn_id,
-                    thread_id,
+                    thread_id: thread_id.to_string(),
                 },
             })
         }

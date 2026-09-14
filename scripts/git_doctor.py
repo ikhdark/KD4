@@ -52,7 +52,7 @@ class GitStatusResult:
 
 
 def run_git(
-    args: Sequence[str], *, timeout: float = 5.0
+    args: Sequence[str], *, timeout: float = 5.0, discard_stdout: bool = False
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", *args],
@@ -60,7 +60,7 @@ def run_git(
         text=True,
         encoding="utf-8",
         errors="replace",
-        stdout=subprocess.PIPE,
+        stdout=subprocess.DEVNULL if discard_stdout else subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=timeout,
         check=False,
@@ -70,15 +70,24 @@ def run_git(
 def git_config(name: str) -> str | None:
     try:
         completed = run_git(["config", "--get", name])
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RepositoryProbeError(f"could not read Git config {name}: {exc}") from exc
+    if (
+        completed.returncode == 1
+        and not completed.stdout.strip()
+        and not completed.stderr.strip()
+    ):
         return None
+    if completed.returncode != 0:
+        detail = bounded_error(completed.stderr) or f"exit {completed.returncode}"
+        raise RepositoryProbeError(f"could not read Git config {name}: {detail}")
     value = completed.stdout.strip()
     return value or None
 
 
 def path_kind(path: Path) -> str:
     del path
-    return "windows"
+    return "windows" if os.name == "nt" else "posix"
 
 
 def fsmonitor_enabled(value: str | None) -> bool:
@@ -106,7 +115,9 @@ def timed_status(timeout: float) -> GitStatusResult:
     started = time.monotonic()
     try:
         completed = run_git(
-            ["status", "--short", "--untracked-files=no"], timeout=timeout
+            ["status", "--short", "--untracked-files=no"],
+            timeout=timeout,
+            discard_stdout=True,
         )
     except subprocess.TimeoutExpired as exc:
         return GitStatusResult(None, True, None, bounded_error(str(exc)))

@@ -20,8 +20,15 @@ pub struct CollaborationModeMask {
     pub name: String,
     pub mode: Option<ModeKind>,
     pub model: Option<String>,
-    #[serde(rename = "reasoning_effort")]
+    #[serde(
+        rename = "reasoning_effort",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::protocol::serde_helpers::deserialize_double_option",
+        serialize_with = "crate::protocol::serde_helpers::serialize_double_option"
+    )]
     #[ts(rename = "reasoning_effort")]
+    #[ts(optional = nullable)]
     pub reasoning_effort: Option<Option<ReasoningEffort>>,
 }
 
@@ -42,4 +49,37 @@ impl From<CoreCollaborationModeMask> for CollaborationModeMask {
 #[ts(export_to = "v2/")]
 pub struct CollaborationModeListResponse {
     pub data: Vec<CollaborationModeMask>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn reasoning_effort_preserves_absent_null_and_value() {
+        for (effort, wire) in [
+            (None, json!({"name": "test", "mode": null, "model": null})),
+            (
+                Some(None),
+                json!({"name": "test", "mode": null, "model": null, "reasoning_effort": null}),
+            ),
+            (
+                Some(Some(ReasoningEffort::High)),
+                json!({"name": "test", "mode": null, "model": null, "reasoning_effort": "high"}),
+            ),
+        ] {
+            let mask = CollaborationModeMask {
+                name: "test".into(),
+                mode: None,
+                model: None,
+                reasoning_effort: effort,
+            };
+            assert_eq!(serde_json::to_value(&mask).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<CollaborationModeMask>(wire).unwrap(),
+                mask
+            );
+        }
+    }
 }

@@ -39,11 +39,14 @@ Let each validation run finish before fixing failures. Review the complete resul
 
 ## Routing and task scope
 
-- Before reading `SOURCEMAP.md` broadly, query the smallest named owner slice:
+- Reuse known owner paths and current evidence for clear local tasks. When
+  ownership or a relevant relationship is unresolved, query the smallest named
+  owner slice before reading `SOURCEMAP.md` broadly:
   `python scripts/source_owners.py slice --owner <owner-id> --focus "<task
-description>" --max-relationships 32`. Require an untruncated result with no
-  omitted relationships or material unknowns, then read its exact evidence
-  locations. Use its representative scenario and focused validation to replace
+description>" --max-relationships 32`. Resolve material unknowns and expand
+  truncated or omitted relationships only when they could affect the requested
+  change, then read the relevant exact evidence locations. Use its
+  representative scenario and focused validation to replace
   broad test searches; confirm the scenario enters through the normal boundary
   and asserts an effect. Examples: the inventory benchmark independently expects
   `TOTAL: 5`; its duration verifier distinguishes `1s` from `1 s` and ASCII from

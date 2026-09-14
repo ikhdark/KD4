@@ -9,6 +9,7 @@ use codex_config::types::MemoriesConfig;
 use codex_core::Prompt;
 use codex_core::RolloutRecorder;
 use codex_core::config::Config;
+#[cfg(test)]
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
@@ -68,8 +69,7 @@ struct StageOneOutput {
 /// 3) run stage-1 extraction jobs in parallel
 /// 4) emit metrics and logs
 pub async fn run(context: Arc<MemoryStartupContext>, config: Arc<Config>) {
-    let stage_one_context = build_request_context(context.as_ref(), config.as_ref()).await;
-    let _phase_one_e2e_timer = stage_one_context.start_timer(MEMORY_PHASE_ONE_E2E_MS);
+    let _phase_one_e2e_timer = context.start_timer(MEMORY_PHASE_ONE_E2E_MS);
 
     // 1. Claim startup job.
     let Some(claimed_candidates) = claim_startup_jobs(context.as_ref(), &config.memories).await
@@ -77,13 +77,15 @@ pub async fn run(context: Arc<MemoryStartupContext>, config: Arc<Config>) {
         return;
     };
     if claimed_candidates.is_empty() {
-        stage_one_context.counter(
+        context.counter(
             MEMORY_PHASE_ONE_JOBS,
             /*inc*/ 1,
             &[("status", "skipped_no_candidates")],
         );
         return;
     }
+
+    let stage_one_context = build_request_context(context.as_ref(), config.as_ref()).await;
 
     // 3. Run the parallel sampling.
     let outcomes = run_jobs(
@@ -231,12 +233,14 @@ mod job {
         stage_one_context: &StageOneRequestContext,
     ) -> JobResult {
         let claimed_thread = claim.thread;
-        let (stage_one_output, token_usage) = match sample(
+        let mut token_usage = None;
+        let stage_one_output = match sample(
             context,
             config,
             &claimed_thread.rollout_path,
             &claimed_thread.cwd,
             stage_one_context,
+            &mut token_usage,
         )
         .await
         {
@@ -251,7 +255,7 @@ mod job {
                 .await;
                 return JobResult {
                     outcome: JobOutcome::Failed,
-                    token_usage: None,
+                    token_usage,
                 };
             }
         };
@@ -286,7 +290,8 @@ mod job {
         rollout_path: &Path,
         rollout_cwd: &Path,
         stage_one_context: &StageOneRequestContext,
-    ) -> anyhow::Result<(StageOneOutput, Option<TokenUsage>)> {
+        known_usage: &mut Option<TokenUsage>,
+    ) -> anyhow::Result<StageOneOutput> {
         let rollout_contents =
             serialize_filtered_rollout_response_items_from_path(rollout_path).await?;
 
@@ -306,6 +311,7 @@ mod job {
             internal_chat_message_metadata_passthrough: None,
         }]
         .into();
+        drop(rollout_contents);
         prompt.base_instructions = BaseInstructions {
             text: crate::stage_one::PROMPT.to_string(),
         };
@@ -316,12 +322,13 @@ mod job {
             .stream_stage_one_prompt(config, &prompt, stage_one_context)
             .await?;
 
+        *known_usage = token_usage;
         let mut output: StageOneOutput = serde_json::from_str(&result)?;
         output.raw_memory = redact_secrets(output.raw_memory);
         output.rollout_summary = redact_secrets(output.rollout_summary);
         output.rollout_slug = output.rollout_slug.map(redact_secrets);
 
-        Ok((output, token_usage))
+        Ok(output)
     }
 
     mod result {
@@ -429,29 +436,40 @@ mod job {
     pub(super) async fn serialize_filtered_rollout_response_items_from_path(
         rollout_path: &Path,
     ) -> anyhow::Result<String> {
-        let mut filtered = Vec::new();
-        RolloutRecorder::for_each_rollout_item(rollout_path, |item| match item {
-            RolloutItem::ResponseItem(item) => {
-                if let Some(item) = sanitize_owned_response_item_for_memories(item) {
-                    filtered.push(item);
+        let mut serialized = Vec::from(b"[".as_slice());
+        let mut error = None;
+        let mut first = true;
+        RolloutRecorder::for_each_rollout_item(rollout_path, |item| {
+            if error.is_some() {
+                return;
+            }
+            let item = match item {
+                RolloutItem::ResponseItem(item) => sanitize_owned_response_item_for_memories(item),
+                RolloutItem::InterAgentCommunication(communication) => {
+                    Some(communication.to_model_input_item())
+                }
+                _ => None,
+            };
+            if let Some(item) = item {
+                if !first {
+                    serialized.push(b',');
+                }
+                first = false;
+                if let Err(err) = serde_json::to_writer(&mut serialized, &item) {
+                    error = Some(err);
                 }
             }
-            RolloutItem::InterAgentCommunication(communication) => {
-                filtered.push(communication.to_model_input_item());
-            }
-            RolloutItem::SessionMeta(_)
-            | RolloutItem::ToolManifest(_)
-            | RolloutItem::SamplingBoundary(_)
-            | RolloutItem::InterAgentCommunicationMetadata { .. }
-            | RolloutItem::Compacted(_)
-            | RolloutItem::TurnContext(_)
-            | RolloutItem::WorldState(_)
-            | RolloutItem::EventMsg(_) => {}
         })
         .await?;
-        Ok(serialize_filtered_response_items(filtered)?)
+        if let Some(err) = error {
+            return Err(err.into());
+        }
+        serialized.push(b']');
+        // Redact the complete serialization before applying the head/tail prompt budget.
+        Ok(redact_secrets(String::from_utf8(serialized)?))
     }
 
+    #[cfg(test)]
     fn serialize_filtered_response_items(
         filtered: Vec<ResponseItem>,
     ) -> codex_protocol::error::Result<String> {
@@ -853,6 +871,9 @@ mod tests {
             .expect("stream rollout");
 
         assert_eq!(actual, expected);
+        let retained: serde_json::Value = serde_json::from_str(&actual).expect("valid JSON");
+        assert_eq!(retained.as_array().unwrap().len(), 1);
+        assert_eq!(retained[0]["call_id"], "call_123");
         assert!(!actual.contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
         assert!(!actual.contains(&"x".repeat(1024)));
     }

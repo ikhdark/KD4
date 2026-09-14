@@ -74,10 +74,6 @@ impl WelcomeWidget {
 impl WidgetRef for &WelcomeWidget {
     fn render_ref(&self, area: Rect, buf: &mut Buffer) {
         Clear.render(area, buf);
-        if self.animations_enabled && !self.animations_suppressed.get() {
-            self.animation.schedule_next_frame();
-        }
-
         let layout_area = self.layout_area.get().unwrap_or(area);
         // Skip the animation entirely when the viewport is too small so we don't clip frames.
         let show_animation = self.animations_enabled
@@ -87,6 +83,7 @@ impl WidgetRef for &WelcomeWidget {
 
         let mut lines: Vec<Line> = Vec::new();
         if show_animation {
+            self.animation.schedule_next_frame();
             let frame = self.animation.current_frame();
             lines.extend(frame.lines().map(Into::into));
             lines.push("".into());
@@ -152,11 +149,12 @@ mod tests {
         assert_eq!(welcome_row, Some(frame_lines + 1));
     }
 
-    #[test]
-    fn welcome_skips_animation_below_height_breakpoint() {
+    #[tokio::test(start_paused = true)]
+    async fn welcome_skips_animation_below_height_breakpoint() {
+        let (draw_tx, mut draw_rx) = tokio::sync::broadcast::channel(4);
         let widget = WelcomeWidget::new(
             /*is_logged_in*/ false,
-            FrameRequester::test_dummy(),
+            FrameRequester::new(draw_tx),
             /*animations_enabled*/ true,
         );
         let area = Rect::new(0, 0, MIN_ANIMATION_WIDTH, MIN_ANIMATION_HEIGHT - 1);
@@ -165,6 +163,17 @@ mod tests {
 
         let welcome_row = row_containing(&buf, "Welcome");
         assert_eq!(welcome_row, Some(0));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), draw_rx.recv())
+                .await
+                .is_err()
+        );
+        let area = Rect::new(0, 0, MIN_ANIMATION_WIDTH, MIN_ANIMATION_HEIGHT);
+        (&widget).render(area, &mut Buffer::empty(area));
+        tokio::time::timeout(std::time::Duration::from_secs(1), draw_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

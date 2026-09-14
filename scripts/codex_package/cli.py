@@ -4,7 +4,6 @@ import argparse
 import json
 import os
 import re
-import shutil
 import tempfile
 import uuid
 from collections.abc import Iterator
@@ -15,6 +14,7 @@ from time import perf_counter
 
 from .archive import activate_archive
 from .archive import package_entries
+from .archive import resolve_zstd_command
 from .archive import validate_archive_output
 from .archive import write_archive
 from .cargo import SourceBuildOutputs
@@ -158,22 +158,22 @@ def parse_args() -> argparse.Namespace:
         "--reuse-source-builds",
         action="store_true",
         help=(
-            "Reuse already-built Cargo package binaries from the package target "
-            "lane when all expected outputs exist."
+            "Reuse Cargo package binaries when source, recipe, and output "
+            "fingerprints match; build missing or stale outputs."
         ),
     )
     parser.add_argument(
         "--skip-build-if-present",
         action="store_true",
         help=(
-            "Skip Cargo when all expected source-built binaries already exist for "
-            "the selected target/profile."
+            "Skip Cargo only when source, recipe, and output fingerprints match; "
+            "otherwise fail."
         ),
     )
     parser.add_argument(
         "--force-source-rebuild",
         action="store_true",
-        help="Force Cargo package binary rebuilds even with --reuse-source-builds.",
+        help="Invoke Cargo even when a reusable package-build stamp exists.",
     )
     parser.add_argument(
         "--skip-validate",
@@ -183,7 +183,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reuse-package-dir",
         action="store_true",
-        help="Allow copying into an existing non-empty package directory.",
+        help="Allow replacing an existing package directory. Existing contents are discarded.",
     )
     parser.add_argument(
         "--archive-compression",
@@ -223,7 +223,7 @@ def main() -> int:
         validate_package_input_roles(inputs)
     reuse_package_dir = getattr(args, "reuse_package_dir", False)
     with staged_package_destination(
-        package_dir, reuse_existing=reuse_package_dir
+        package_dir, reuse_existing=reuse_package_dir, force=args.force
     ) as staged_package_dir:
         with timed_step("package-dir", timings):
             prepare_package_dir(
@@ -233,7 +233,6 @@ def main() -> int:
             )
             build_identity = {
                 "packagingSource": source_tree_fingerprint(),
-                "inputs": package_input_identity(inputs),
             }
             build_package_dir(
                 staged_package_dir,
@@ -281,7 +280,7 @@ def main() -> int:
 
 @contextmanager
 def staged_package_destination(
-    package_dir: Path, *, reuse_existing: bool
+    package_dir: Path, *, reuse_existing: bool, force: bool = False
 ) -> Iterator[Path]:
     """Build beside the destination and activate only after successful validation."""
     package_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -292,10 +291,16 @@ def staged_package_destination(
     backup_dir: Path | None = None
     committed = False
     try:
-        if reuse_existing and package_dir.exists():
-            shutil.copytree(package_dir, staged_dir)
         yield staged_dir
 
+        validate_package_dir_destination(package_dir, force=force, reuse=reuse_existing)
+        if not (force or reuse_existing):
+            # rmdir fails if another writer populated the previously empty directory.
+            if package_dir.exists():
+                package_dir.rmdir()
+            staged_dir.rename(package_dir)
+            committed = True
+            return
         if package_dir.exists():
             backup_dir = package_dir.with_name(
                 f".{package_dir.name}.backup-{uuid.uuid4().hex}"
@@ -400,17 +405,19 @@ def resolve_package_inputs(
     spec: TargetSpec,
     variant: PackageVariant,
 ) -> tuple[str, PackageInputs]:
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    version = getattr(args, "release_version", None) or read_workspace_version()
+    # Validate explicit local inputs before starting the expensive source build.
+    rg_bin = resolve_rg_bin(spec, args.rg_bin) if args.rg_bin is not None else None
+    with ThreadPoolExecutor(max_workers=2) as executor:
         source_outputs_future = executor.submit(
             resolve_source_outputs, args, spec, variant
         )
-        version_future = executor.submit(
-            lambda: getattr(args, "release_version", None) or read_workspace_version()
+        rg_future = (
+            executor.submit(resolve_rg_bin, spec, None) if rg_bin is None else None
         )
-        rg_future = executor.submit(resolve_rg_bin, spec, args.rg_bin)
         source_outputs = source_outputs_future.result()
-        version = version_future.result()
-        rg_bin = rg_future.result()
+        if rg_future is not None:
+            rg_bin = rg_future.result()
     return (
         version,
         PackageInputs(
@@ -472,7 +479,10 @@ def validate_cli_request(
     if (
         release_version is not None
         and re.fullmatch(
-            r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?",
+            r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+            r"(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+            r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?"
+            r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?",
             release_version,
         )
         is None
@@ -488,8 +498,9 @@ def validate_cli_request(
     ):
         raise RuntimeError("Distributable archives require --cargo-profile release")
     seen_outputs: set[Path] = set()
+    needs_zstd = False
     for archive_output in getattr(args, "archive_output", []):
-        _, resolved_output, _ = validate_archive_output(
+        _, resolved_output, archive_format = validate_archive_output(
             package_dir,
             archive_output,
             force=force,
@@ -500,6 +511,9 @@ def validate_cli_request(
                 f"Archive output was specified more than once: {resolved_output}"
             )
         seen_outputs.add(resolved_output)
+        needs_zstd |= archive_format == "tar.zst"
+    if needs_zstd:
+        resolve_zstd_command()
 
 
 def resolve_source_outputs(
@@ -556,24 +570,6 @@ def resolve_source_outputs(
         force_rebuild=getattr(args, "force_source_rebuild", False),
         release_version=getattr(args, "release_version", None),
     )
-
-
-def package_input_identity(inputs: PackageInputs) -> dict[str, dict[str, object]]:
-    paths = {
-        "entrypoint": inputs.entrypoint_bin,
-        "code-mode-host": inputs.code_mode_host_bin,
-        "ripgrep": inputs.rg_bin,
-        "command-runner": inputs.codex_command_runner_bin,
-        "sandbox-setup": inputs.codex_windows_sandbox_setup_bin,
-    }
-    return {
-        role: {
-            "size": path.stat().st_size,
-            "sha256": sha256_file(path),
-        }
-        for role, path in paths.items()
-        if path is not None
-    }
 
 
 def write_release_manifests(

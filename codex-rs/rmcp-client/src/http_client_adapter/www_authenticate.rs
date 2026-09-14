@@ -100,6 +100,9 @@ fn parse_bearer_insufficient_scope(header: &str) -> Option<BearerInsufficientSco
     let mut bearer_challenge: Option<BearerChallenge> = None;
 
     for segment in segments {
+        if segment.trim().is_empty() {
+            continue;
+        }
         if let Some((name, value)) = parse_auth_param(segment) {
             if let Some(challenge) = bearer_challenge.as_mut() {
                 challenge.add_parameter(name, value);

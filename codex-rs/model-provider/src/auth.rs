@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 use codex_agent_identity::AgentIdentityKey;
 use codex_agent_identity::authorization_header_for_agent_task;
 use codex_api::AgentIdentityTelemetry;
+use codex_api::AuthError;
 use codex_api::AuthProvider;
 use codex_api::SharedAuthProvider;
 use codex_login::AuthHeaders;
@@ -258,29 +259,30 @@ struct AgentIdentityAuthProvider {
 
 impl AuthProvider for AgentIdentityAuthProvider {
     fn add_auth_headers(&self, headers: &mut HeaderMap) {
+        let _ = self.try_add_auth_headers(headers);
+    }
+
+    fn try_add_auth_headers(&self, headers: &mut HeaderMap) -> Result<(), AuthError> {
         let record = self.auth.record();
-        let header_value = authorization_header_for_agent_task(
+        let value = authorization_header_for_agent_task(
             AgentIdentityKey {
                 agent_runtime_id: &record.agent_runtime_id,
                 private_key_pkcs8_base64: &record.agent_private_key,
             },
             self.auth.run_task_id(),
         )
-        .map_err(std::io::Error::other);
-
-        if let Ok(header_value) = header_value
-            && let Ok(header) = HeaderValue::from_str(&header_value)
-        {
-            let _ = headers.insert(http::header::AUTHORIZATION, header);
-        }
-
-        if let Ok(header) = HeaderValue::from_str(self.auth.account_id()) {
-            let _ = headers.insert("ChatGPT-Account-ID", header);
-        }
-
+        .map_err(|error| AuthError::Build(format!("failed to build agent assertion: {error}")))?;
+        let mut authorization = HeaderValue::from_str(&value)
+            .map_err(|_| AuthError::Build("invalid agent authorization header".into()))?;
+        authorization.set_sensitive(true);
+        let account = HeaderValue::from_str(self.auth.account_id())
+            .map_err(|_| AuthError::Build("invalid agent account header".into()))?;
+        headers.insert(http::header::AUTHORIZATION, authorization);
+        headers.insert("ChatGPT-Account-ID", account);
         if self.auth.is_fedramp_account() {
-            let _ = headers.insert("X-OpenAI-Fedramp", HeaderValue::from_static("true"));
+            headers.insert("X-OpenAI-Fedramp", HeaderValue::from_static("true"));
         }
+        Ok(())
     }
 }
 
@@ -304,20 +306,51 @@ struct AuthManagerAuthProvider {
 
 impl AuthProvider for AuthManagerAuthProvider {
     fn add_auth_headers(&self, headers: &mut HeaderMap) {
-        let Some(auth) = self
+        if self.try_add_auth_headers(headers).is_err() {
+            headers.remove(http::header::AUTHORIZATION);
+            headers.remove("ChatGPT-Account-ID");
+            headers.remove("X-OpenAI-Fedramp");
+        }
+    }
+
+    fn try_add_auth_headers(&self, headers: &mut HeaderMap) -> Result<(), AuthError> {
+        let auth = self
             .auth_manager
             .auth_cached()
             .filter(CodexAuth::uses_codex_backend)
-        else {
-            return;
-        };
-        // The caller's account-scoped state was built for the expected
-        // identity. Follow token refreshes for that identity, but never cross
-        // an account or workspace boundary without rebuilding that state.
+            .ok_or_else(|| {
+                AuthError::Build("managed authentication is no longer available".into())
+            })?;
+        // Follow refreshes only within the identity that owns the caller's state.
         if ProviderAccountScope::from_auth(Some(&auth)) != self.expected_scope {
-            return;
+            return Err(AuthError::Build(
+                "managed authentication account scope changed; rebuild request state".into(),
+            ));
         }
-        auth_provider_from_auth(&auth).add_auth_headers(headers);
+        auth_provider_from_auth(&auth).try_add_auth_headers(headers)
+    }
+}
+
+// Preserve token retrieval failures until the fallible dispatch boundary.
+struct SnapshotBearerAuthProvider {
+    auth: CodexAuth,
+}
+
+impl AuthProvider for SnapshotBearerAuthProvider {
+    fn add_auth_headers(&self, headers: &mut HeaderMap) {
+        let _ = self.try_add_auth_headers(headers);
+    }
+
+    fn try_add_auth_headers(&self, headers: &mut HeaderMap) -> Result<(), AuthError> {
+        let token = self.auth.get_token().map_err(|error| {
+            AuthError::Build(format!("failed to read authentication token: {error}"))
+        })?;
+        BearerAuthProvider {
+            token: Some(token),
+            account_id: self.auth.get_account_id(),
+            is_fedramp_account: self.auth.is_fedramp_account(),
+        }
+        .try_add_auth_headers(headers)
     }
 }
 
@@ -460,11 +493,9 @@ pub fn auth_provider_from_auth(auth: &CodexAuth) -> SharedAuthProvider {
         CodexAuth::ApiKey(_)
         | CodexAuth::Chatgpt(_)
         | CodexAuth::ChatgptAuthTokens(_)
-        | CodexAuth::PersonalAccessToken(_) => Arc::new(BearerAuthProvider {
-            token: auth.get_token().ok(),
-            account_id: auth.get_account_id(),
-            is_fedramp_account: auth.is_fedramp_account(),
-        }),
+        | CodexAuth::PersonalAccessToken(_) => {
+            Arc::new(SnapshotBearerAuthProvider { auth: auth.clone() })
+        }
     }
 }
 
@@ -891,6 +922,14 @@ mod tests {
             Some(&HeaderValue::from_static("Bearer header.e30.reloaded"))
         );
 
+        let request =
+            codex_http_client::Request::new(http::Method::GET, "https://example.com".into());
+        let request = provider
+            .apply_auth(request)
+            .await
+            .expect("refreshed auth should dispatch");
+        assert_eq!(request.headers[AUTHORIZATION], "Bearer header.e30.reloaded");
+
         login_with_chatgpt_auth_tokens(
             &codex_home,
             "header.e30.other-account",
@@ -901,6 +940,19 @@ mod tests {
         auth_manager.reload().await;
 
         assert!(provider.to_auth_headers().is_empty());
+        let request =
+            codex_http_client::Request::new(http::Method::GET, "https://example.com".into());
+        assert!(
+            matches!(provider.apply_auth(request).await, Err(AuthError::Build(message)) if message.contains("scope changed"))
+        );
+        let mut stale_headers = HeaderMap::new();
+        stale_headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer stale"));
+        stale_headers.insert(
+            "ChatGPT-Account-ID",
+            HeaderValue::from_static("test-account"),
+        );
+        provider.add_auth_headers(&mut stale_headers);
+        assert!(stale_headers.is_empty());
     }
 
     #[tokio::test]
@@ -944,6 +996,7 @@ mod tests {
         let provider = auth_provider_from_auth(&CodexAuth::AgentIdentity(auth));
 
         let headers = provider.to_auth_headers();
+        assert!(headers[AUTHORIZATION].is_sensitive());
 
         assert!(
             headers

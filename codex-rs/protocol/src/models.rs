@@ -66,10 +66,21 @@ impl SandboxPermissions {
     }
 }
 
-#[derive(Debug, Clone, Eq, Hash, PartialEq, JsonSchema, TS)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq, TS)]
+#[ts(as = "FileSystemPermissionsDe<PathType>")]
 pub struct FileSystemPermissions<PathType = AbsolutePathBuf> {
     pub entries: Vec<FileSystemSandboxEntry<PathType>>,
     pub glob_scan_max_depth: Option<NonZeroUsize>,
+}
+
+impl<PathType: JsonSchema> JsonSchema for FileSystemPermissions<PathType> {
+    fn schema_name() -> String {
+        format!("FileSystemPermissions_for_{}", PathType::schema_name())
+    }
+
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        FileSystemPermissionsDe::<PathType>::json_schema(generator)
+    }
 }
 
 impl From<FileSystemPermissions<AbsolutePathBuf>> for FileSystemPermissions<PathUri> {
@@ -183,31 +194,34 @@ impl<PathType> FileSystemPermissions<PathType> {
     }
 }
 
-#[derive(Debug, Clone, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(deny_unknown_fields)]
 #[serde(bound(deserialize = "PathType: Deserialize<'de>"))]
 struct LegacyFileSystemPermissions<PathType = AbsolutePathBuf> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
     read: Option<Vec<PathType>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
     write: Option<Vec<PathType>>,
 }
 
-#[derive(Debug, Clone, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(deny_unknown_fields)]
 #[serde(bound(deserialize = "PathType: Deserialize<'de>"))]
 struct CanonicalFileSystemPermissions<PathType = AbsolutePathBuf> {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     entries: Vec<FileSystemSandboxEntry<PathType>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
     glob_scan_max_depth: Option<NonZeroUsize>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema, TS)]
 #[serde(untagged)]
 enum FileSystemPermissionsDe<PathType = AbsolutePathBuf> {
-    Canonical(CanonicalFileSystemPermissions<PathType>),
-    Legacy(LegacyFileSystemPermissions<PathType>),
+    Canonical(#[ts(inline)] CanonicalFileSystemPermissions<PathType>),
+    Legacy(#[ts(inline)] LegacyFileSystemPermissions<PathType>),
 }
 
 impl<PathType> Serialize for FileSystemPermissions<PathType>
@@ -1571,6 +1585,7 @@ pub fn local_image_content_items_with_label_number(
             ImageProcessingError::Read { .. }
             | ImageProcessingError::Encode { .. }
             | ImageProcessingError::InvalidDataUrl { .. }
+            | ImageProcessingError::InvalidResizeLimits
             | ImageProcessingError::ImageTooLarge { .. } => {
                 vec![local_image_error_placeholder(path, &err)]
             }
@@ -2186,19 +2201,17 @@ impl CallToolResult {
             }
         }
 
-        let serialized_content = match serde_json::to_string(&self.content) {
-            Ok(serialized_content) => serialized_content,
-            Err(err) => {
-                return FunctionCallOutputPayload {
-                    body: FunctionCallOutputBody::Text(err.to_string()),
-                    success: Some(false),
-                };
-            }
-        };
-
         let body = match content_items {
             Some(content_items) => FunctionCallOutputBody::ContentItems(content_items),
-            None => FunctionCallOutputBody::Text(serialized_content),
+            None => match serde_json::to_string(&self.content) {
+                Ok(serialized_content) => FunctionCallOutputBody::Text(serialized_content),
+                Err(err) => {
+                    return FunctionCallOutputPayload {
+                        body: FunctionCallOutputBody::Text(err.to_string()),
+                        success: Some(false),
+                    };
+                }
+            },
         };
 
         FunctionCallOutputPayload {
@@ -2243,7 +2256,7 @@ fn convert_mcp_content_to_items(
     let mut items = Vec::with_capacity(contents.len());
 
     for content in contents {
-        let item = match serde_json::from_value::<McpContent>(content.clone()) {
+        let item = match McpContent::deserialize(content) {
             Ok(McpContent::Text { text, meta }) => {
                 if meta
                     .as_ref()
@@ -2849,6 +2862,50 @@ mod tests {
                 NetworkSandboxPolicy::Restricted
             )
         );
+        Ok(())
+    }
+
+    #[test]
+    fn file_system_permissions_contract_describes_both_wire_shapes() -> Result<()> {
+        let schema = schemars::r#gen::SchemaSettings::draft07()
+            .with(|settings| settings.inline_subschemas = true)
+            .into_generator()
+            .into_root_schema_for::<FileSystemPermissions<String>>();
+        let schema = serde_json::to_value(schema)?;
+        let alternatives = schema["anyOf"].as_array().expect("wire alternatives");
+        assert_eq!(alternatives.len(), 2);
+        assert_eq!(alternatives[0]["properties"]["entries"]["type"], "array");
+        assert_eq!(
+            alternatives[0]["properties"]["glob_scan_max_depth"]["minimum"].as_f64(),
+            Some(1.0)
+        );
+        assert_eq!(
+            alternatives[1]["properties"]["read"]["items"]["type"],
+            "string"
+        );
+        assert_eq!(
+            alternatives[1]["properties"]["write"]["items"]["type"],
+            "string"
+        );
+        for alternative in alternatives {
+            assert_eq!(alternative["additionalProperties"], false);
+            assert!(alternative.get("required").is_none());
+        }
+
+        let declaration = FileSystemPermissions::<String>::decl();
+        assert!(declaration.contains("entries?:"), "{declaration}");
+        assert!(declaration.contains("read?:"), "{declaration}");
+        assert!(declaration.contains("write?:"), "{declaration}");
+        assert!(declaration.contains("} | {"), "{declaration}");
+
+        for wire in [
+            serde_json::json!({}),
+            serde_json::json!({"read": ["/workspace"]}),
+            serde_json::json!({"glob_scan_max_depth": 2}),
+        ] {
+            let permissions: FileSystemPermissions<String> = serde_json::from_value(wire.clone())?;
+            assert_eq!(serde_json::to_value(permissions)?, wire);
+        }
         Ok(())
     }
 

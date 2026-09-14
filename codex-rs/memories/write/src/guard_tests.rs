@@ -78,3 +78,23 @@ fn startup_check_skips_when_limit_is_reached() {
         &snapshot, /*min_remaining_percent*/ 25,
     ));
 }
+
+#[test]
+fn quota_selection_requires_explicit_codex_identity() {
+    let codex = snapshot(Some(95.0), None);
+    let mut other = snapshot(Some(10.0), None);
+    other.limit_id = Some("other".to_string());
+    for snapshots in [
+        [codex.clone(), other.clone()],
+        [other.clone(), codex.clone()],
+    ] {
+        let selected = codex_snapshot(&snapshots).unwrap();
+        assert_eq!(selected, &codex);
+        assert!(!snapshot_allows_startup(selected, 10));
+    }
+    assert!(codex_snapshot(&[other]).is_none());
+    let mut anonymous = codex;
+    anonymous.limit_id = None;
+    assert!(codex_snapshot(&[anonymous]).is_none());
+    assert!(codex_snapshot(&[]).is_none());
+}

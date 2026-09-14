@@ -66,12 +66,16 @@ pub fn resolve_configured_marketplace_root(
     marketplace: &toml::Value,
     default_install_root: &Path,
 ) -> Option<PathBuf> {
-    match marketplace.get("source_type").and_then(toml::Value::as_str) {
-        Some("local") => marketplace
+    match marketplace.get("source_type") {
+        Some(toml::Value::String(source_type)) if source_type == "local" => marketplace
             .get("source")
             .and_then(toml::Value::as_str)
             .filter(|source| !source.is_empty())
             .map(PathBuf::from),
-        _ => Some(default_install_root.join(marketplace_name)),
+        None => Some(default_install_root.join(marketplace_name)),
+        Some(toml::Value::String(source_type)) if source_type == "git" => {
+            Some(default_install_root.join(marketplace_name))
+        }
+        _ => None,
     }
 }

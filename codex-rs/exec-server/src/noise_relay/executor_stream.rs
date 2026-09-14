@@ -47,10 +47,28 @@ pub(crate) struct ClosedNoiseVirtualStream {
 pub(crate) struct NoiseVirtualStream {
     incoming_tx: mpsc::Sender<JsonRpcConnectionEvent>,
     disconnected_tx: watch::Sender<bool>,
-    transport: Arc<Mutex<NoiseTransport>>,
+    transport: Arc<Mutex<Option<NoiseTransport>>>,
     inbound_ciphertexts: OrderedCiphertextFrames,
     inbound_decoder: JsonRpcMessageDecoder,
+    writer_abort: tokio::task::AbortHandle,
     pub(crate) instance_id: u64,
+}
+
+impl Drop for NoiseVirtualStream {
+    fn drop(&mut self) {
+        // Fence the writer immediately when this routing ID is removed. Frames
+        // already queued precede any replacement handshake on the shared FIFO;
+        // this writer must never enqueue more frames after that handshake.
+        self.writer_abort.abort();
+        // A writer already running on another worker can finish a ready send
+        // before observing abort. Clearing transport under the enqueue lock
+        // also fences those sends before a replacement handshake is queued.
+        let _ = self
+            .transport
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
 }
 
 impl NoiseVirtualStream {
@@ -70,9 +88,13 @@ impl NoiseVirtualStream {
                     .transport
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                transport.decrypt(&ciphertext).map_err(|error| {
-                    ExecServerError::Protocol(format!("Noise relay decryption failed: {error}"))
-                })?
+                transport
+                    .as_mut()
+                    .ok_or(ExecServerError::Closed)?
+                    .decrypt(&ciphertext)
+                    .map_err(|error| {
+                        ExecServerError::Protocol(format!("Noise relay decryption failed: {error}"))
+                    })?
             };
             for message in self.inbound_decoder.push(&plaintext)? {
                 self.incoming_tx
@@ -103,7 +125,7 @@ pub(crate) fn spawn_noise_virtual_stream(
     let (json_outgoing_tx, mut json_outgoing_rx) = mpsc::channel(CHANNEL_CAPACITY);
     let (incoming_tx, incoming_rx) = mpsc::channel(CHANNEL_CAPACITY);
     let (disconnected_tx, disconnected_rx) = watch::channel(false);
-    let transport = Arc::new(Mutex::new(transport));
+    let transport = Arc::new(Mutex::new(Some(transport)));
     let writer_transport = Arc::clone(&transport);
     let processor_stream_id = stream_id.clone();
     let processor_closed_stream_tx = closed_stream_tx.clone();
@@ -119,7 +141,11 @@ pub(crate) fn spawn_noise_virtual_stream(
                     break;
                 }
             };
+            drop(message);
             for plaintext_record in framed.chunks(NOISE_RECORD_PLAINTEXT_LEN) {
+                let Ok(permit) = physical_outgoing_tx.reserve().await else {
+                    break 'writer;
+                };
                 let seq = match take_next_sequence(&mut next_seq) {
                     Ok(seq) => seq,
                     Err(error) => {
@@ -127,26 +153,22 @@ pub(crate) fn spawn_noise_virtual_stream(
                         break 'writer;
                     }
                 };
-                let ciphertext = {
-                    let mut transport = writer_transport
+                {
+                    let mut guard = writer_transport
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    transport.encrypt(plaintext_record)
-                };
-                let ciphertext = match ciphertext {
-                    Ok(ciphertext) => ciphertext,
-                    Err(error) => {
-                        warn!("failed to encrypt Noise virtual stream payload: {error}");
+                    let Some(transport) = guard.as_mut() else {
                         break 'writer;
-                    }
-                };
-                let frame = RelayMessageFrame::data(writer_stream_id.clone(), seq, ciphertext);
-                if physical_outgoing_tx
-                    .send(encode_relay_message_frame(&frame))
-                    .await
-                    .is_err()
-                {
-                    break 'writer;
+                    };
+                    let ciphertext = match transport.encrypt(plaintext_record) {
+                        Ok(ciphertext) => ciphertext,
+                        Err(error) => {
+                            warn!("failed to encrypt Noise virtual stream payload: {error}");
+                            break 'writer;
+                        }
+                    };
+                    let frame = RelayMessageFrame::data(writer_stream_id.clone(), seq, ciphertext);
+                    permit.send(encode_relay_message_frame(&frame));
                 }
             }
         }
@@ -158,10 +180,18 @@ pub(crate) fn spawn_noise_virtual_stream(
         };
         let reset =
             RelayMessageFrame::reset(writer_stream_id, NOISE_RELAY_RESET_REASON.to_string());
-        let _ = physical_outgoing_tx.try_send(encode_relay_message_frame(&reset));
+        {
+            let guard = writer_transport
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.is_some() {
+                let _ = physical_outgoing_tx.try_send(encode_relay_message_frame(&reset));
+            }
+        }
         let _ = closed_stream_tx.send(closed_stream).await;
     });
 
+    let writer_abort = writer_task.abort_handle();
     let connection = JsonRpcConnection {
         outgoing_tx: json_outgoing_tx,
         incoming_rx,
@@ -187,6 +217,7 @@ pub(crate) fn spawn_noise_virtual_stream(
         transport,
         inbound_ciphertexts: OrderedCiphertextFrames::default(),
         inbound_decoder: JsonRpcMessageDecoder::default(),
+        writer_abort,
         instance_id,
     }
 }

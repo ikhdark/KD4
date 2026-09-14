@@ -29,16 +29,20 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::Duration;
 
-pub(crate) fn build_header_map(headers: &std::collections::HashMap<String, String>) -> HeaderMap {
+pub(crate) fn build_header_map(
+    headers: &std::collections::HashMap<String, String>,
+) -> Result<HeaderMap, Box<dyn Error>> {
     let mut header_map = HeaderMap::new();
     for (key, value) in headers {
-        if let Ok(name) = HeaderName::from_bytes(key.as_bytes())
-            && let Ok(val) = HeaderValue::from_str(value)
-        {
-            header_map.insert(name, val);
+        let name = HeaderName::from_bytes(key.as_bytes())
+            .map_err(|_| config_error(format!("invalid OTLP header name {key:?}")))?;
+        let value = HeaderValue::from_str(value)
+            .map_err(|_| config_error(format!("invalid OTLP header value for {key:?}")))?;
+        if header_map.insert(name, value).is_some() {
+            return Err(config_error(format!("duplicate OTLP header name {key:?}")));
         }
     }
-    header_map
+    Ok(header_map)
 }
 
 pub(crate) fn build_grpc_tls_config(
@@ -360,11 +364,40 @@ mod tests {
         let address = listener.local_addr().expect("test listener address");
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("test request should connect");
-            let mut request = [0_u8; 4096];
-            let bytes_read = stream.read(&mut request).expect("test request should read");
-            let request = String::from_utf8_lossy(&request[..bytes_read]);
-            assert!(request.starts_with("POST /v1/traces HTTP/1.1"));
-            assert!(request.to_ascii_lowercase().contains("x-otel-test: shared"));
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let header_end = loop {
+                assert!(request.len() < 8192, "request headers exceed fixture limit");
+                let mut byte = [0];
+                stream
+                    .read_exact(&mut byte)
+                    .expect("complete request headers");
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break request.len();
+                }
+            };
+            let headers = std::str::from_utf8(&request).unwrap().to_ascii_lowercase();
+            assert!(headers.starts_with("post /v1/traces http/1.1\r\n"));
+            assert!(headers.lines().any(|line| line == "x-otel-test: shared"));
+            let length: usize = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .expect("content length")
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(length, b"payload".len());
+            request.resize(header_end + length, 0);
+            stream
+                .read_exact(&mut request[header_end..])
+                .expect("complete request body");
+            assert_eq!(&request[header_end..], b"payload");
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nx-otel-response: ok\r\n\r\nok")
                 .expect("test response should write");
@@ -377,6 +410,7 @@ mod tests {
         let (url, server) = spawn_http_response_server();
         let client = OtlpAsyncHttpClient(
             HttpClientBuilder::new()
+                .timeout(Duration::from_secs(5))
                 .build_direct()
                 .expect("shared async client"),
         );
@@ -398,6 +432,7 @@ mod tests {
         let (url, server) = spawn_http_response_server();
         let client = OtlpBlockingHttpClient(
             BlockingHttpClientBuilder::new()
+                .timeout(Duration::from_secs(5))
                 .build_direct()
                 .expect("shared blocking client"),
         );

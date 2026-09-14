@@ -164,7 +164,7 @@ impl ShellSnapshot {
             let snapshot =
                 ShellSnapshot::try_create_remote(&config, &cwd, &shell, environment).await;
             let success_tag = if snapshot.is_ok() { "true" } else { "false" };
-            let _ = timer.map(|timer| timer.record(&[("success", success_tag)]));
+            let _ = timer.map(|timer| timer.finish(&[("success", success_tag)]));
             let mut counter_tags = vec![("success", success_tag)];
             if let Some(failure_reason) = snapshot.as_ref().err() {
                 counter_tags.push(("failure_reason", *failure_reason));
@@ -198,7 +198,7 @@ impl ShellSnapshot {
             )
             .await;
             let success_tag = if snapshot.is_ok() { "true" } else { "false" };
-            let _ = timer.map(|timer| timer.record(&[("success", success_tag)]));
+            let _ = timer.map(|timer| timer.finish(&[("success", success_tag)]));
             let mut counter_tags = vec![("success", success_tag)];
             if let Some(failure_reason) = snapshot.as_ref().err() {
                 counter_tags.push(("failure_reason", *failure_reason));
@@ -266,24 +266,37 @@ impl ShellSnapshot {
             temp_path.display()
         );
 
+        let snapshot = ShellSnapshotFile {
+            location: ShellSnapshotLocation::Local(temp_path.clone()),
+            contents,
+        };
         if let Err(err) =
             validate_snapshot(shell, &temp_path, session_cwd, environment_variables).await
         {
             tracing::error!("Shell snapshot validation failed: {err:?}");
-            remove_snapshot_file(&temp_path).await;
             return Err("validation_failed");
         }
 
-        if let Err(err) = fs::rename(&temp_path, &path).await {
-            tracing::warn!("Failed to finalize shell snapshot: {err:?}");
-            remove_snapshot_file(&temp_path).await;
-            return Err("write_failed");
-        }
-
-        Ok(ShellSnapshotFile {
-            location: ShellSnapshotLocation::Local(path),
-            contents,
+        // The worker owns the file across rename, so cancellation cannot drop a
+        // cleanup guard for the old path after the new path has been published.
+        match tokio::task::spawn_blocking(move || {
+            let mut snapshot = snapshot;
+            std::fs::rename(&temp_path, &path)?;
+            snapshot.location = ShellSnapshotLocation::Local(path);
+            Ok::<_, std::io::Error>(snapshot)
         })
+        .await
+        {
+            Ok(Ok(snapshot)) => Ok(snapshot),
+            Ok(Err(err)) => {
+                tracing::warn!("Failed to finalize shell snapshot: {err:?}");
+                Err("write_failed")
+            }
+            Err(err) => {
+                tracing::warn!("Shell snapshot finalization worker failed: {err:?}");
+                Err("write_failed")
+            }
+        }
     }
 
     async fn try_create_remote(
@@ -354,6 +367,14 @@ impl ShellSnapshot {
             tracing::warn!("Failed to write remote shell snapshot: {err:?}");
             return Err("write_failed");
         }
+        // Own the published file before validation can yield or be cancelled.
+        let snapshot = ShellSnapshotFile {
+            location: ShellSnapshotLocation::Remote {
+                path: path.clone(),
+                filesystem,
+            },
+            contents,
+        };
         if let Err(err) = validate_snapshot_remote(
             shell,
             &path,
@@ -366,23 +387,10 @@ impl ShellSnapshot {
         .await
         {
             tracing::warn!("Remote shell snapshot validation failed: {err:?}");
-            let _ = filesystem
-                .remove(
-                    &path,
-                    RemoveOptions {
-                        recursive: false,
-                        force: true,
-                    },
-                    None,
-                )
-                .await;
             return Err("validation_failed");
         }
 
-        Ok(ShellSnapshotFile {
-            location: ShellSnapshotLocation::Remote { path, filesystem },
-            contents,
-        })
+        Ok(snapshot)
     }
 }
 

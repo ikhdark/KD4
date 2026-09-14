@@ -78,6 +78,9 @@ function Invoke-ParseRequest {
 
     foreach ($statement in $ast.EndBlock.Statements) {
         if ($statement -is [System.Management.Automation.Language.AssignmentStatementAst]) {
+            if ($statement.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals) {
+                return @{ id = $RequestId; status = 'unsupported' }
+            }
             if (Add-LocalScalarConstant $statement $localConstants) {
                 $name = $statement.Left.VariablePath.UserPath.ToLowerInvariant()
                 $null = $commandOutputVariables.Remove($name)
@@ -188,6 +191,7 @@ function Resolve-ApplicationAgainstState {
     $previousLocation = Get-Location
     $previousPath = $env:PATH
     $previousPathExt = $env:PATHEXT
+    $previousAutoLoadingPreference = $global:PSModuleAutoLoadingPreference
     try {
         $env:PATH = [string]$Resolution.path
         $env:PATHEXT = [string]$Resolution.pathext
@@ -198,7 +202,10 @@ function Resolve-ApplicationAgainstState {
 
         # Do not filter by CommandType while resolving: the first PowerShell-visible command must
         # itself be an application, otherwise an alias, function, cmdlet, or builtin shadows it.
-        $matches = @(Microsoft.PowerShell.Core\Get-Command -Name $CommandName -All -ErrorAction Stop)
+        # Lookup must never import a module and execute its initialization code.
+        # Get-Command's discovery consults global session state, not this function's scope.
+        $global:PSModuleAutoLoadingPreference = 'None'
+        $matches = @(Microsoft.PowerShell.Core\Get-Command -Name $CommandName -ErrorAction Stop)
         if ($matches.Count -eq 0 -or $matches[0].CommandType -ne 'Application') {
             return $null
         }
@@ -211,6 +218,7 @@ function Resolve-ApplicationAgainstState {
     } catch {
         return $null
     } finally {
+        $global:PSModuleAutoLoadingPreference = $previousAutoLoadingPreference
         if ($previousPath -eq $null) {
             Remove-Item Env:PATH -ErrorAction SilentlyContinue
         } else {
@@ -221,12 +229,9 @@ function Resolve-ApplicationAgainstState {
         } else {
             $env:PATHEXT = $previousPathExt
         }
-        try {
-            Set-Location -LiteralPath $previousLocation.Path
-        } catch {
-            # A failed restoration invalidates the long-lived parser host. Surface no proof and
-            # let the Rust caller's next request fail closed if the provider state is unusable.
-        }
+        # A restoration error must escape the request and terminate this host. Rust
+        # discards a broken transport rather than receiving proof from altered state.
+        Set-Location -LiteralPath $previousLocation.Path -ErrorAction Stop
     }
 }
 
@@ -277,8 +282,8 @@ function Add-LocalScalarConstant {
     if ($commandExpression.Redirections.Count -gt 0) {
         return $false
     }
-    $value = Convert-ScalarConstantExpression $commandExpression.Expression
-    if ($value -eq $null -or $value.Count -ne 1) {
+    $value = @(Convert-ScalarConstantExpression $commandExpression.Expression)
+    if ($value.Count -ne 1 -or $null -eq $value[0]) {
         return $false
     }
 
@@ -367,19 +372,19 @@ function Convert-CommandElement {
         }
 
         if ($element.Argument -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
-            return @('-' + $element.ParameterName, $element.Argument.Value)
+            return @(('-' + $element.ParameterName), $element.Argument.Value)
         }
 
         if ($element.Argument -is [System.Management.Automation.Language.ConstantExpressionAst]) {
-            return @('-' + $element.ParameterName, $element.Argument.Value.ToString())
+            return @(('-' + $element.ParameterName), $element.Argument.Value.ToString())
         }
 
         if ($element.Argument -is [System.Management.Automation.Language.VariableExpressionAst]) {
-            $value = Convert-CommandElement $element.Argument $localConstants
-            if ($value -eq $null -or $value.Count -ne 1) {
+            $value = @(Convert-CommandElement $element.Argument $localConstants)
+            if ($value.Count -ne 1 -or $null -eq $value[0]) {
                 return $null
             }
-            return @('-' + $element.ParameterName, $value[0])
+            return @(('-' + $element.ParameterName), $value[0])
         }
 
         return $null
@@ -464,19 +469,19 @@ function Get-DirectArgvCandidate {
         return $null
     }
 
-    $argv = @()
+    $argv = [System.Collections.ArrayList]::new()
     foreach ($element in $command.CommandElements) {
         $converted = Convert-DirectCommandElement $element
         if ($converted -eq $null) {
             return $null
         }
-        $argv += $converted
+        foreach ($word in @($converted)) { $null = $argv.Add($word) }
     }
     if ($argv.Count -eq 0 -or [string]::IsNullOrEmpty($argv[0])) {
         return $null
     }
     # Prevent PowerShell's function-output unrolling from turning a one-token argv into a scalar.
-    return ,$argv
+    return ,$argv.ToArray()
 }
 
 function Convert-PipelineElement {
@@ -496,13 +501,25 @@ function Convert-PipelineElement {
             return $null
         }
 
-        $parts = @()
+        $parts = [System.Collections.ArrayList]::new()
         foreach ($commandElement in $element.CommandElements) {
             $converted = Convert-CommandElement $commandElement $localConstants
             if ($converted -eq $null) {
                 return $null
             }
-            $parts += $converted
+            foreach ($word in @($converted)) { $null = $parts.Add($word) }
+        }
+        # Common parameters can overwrite bindings during pipeline execution, even
+        # when the cmdlet itself only reads files. Reject their aliases and abbreviated
+        # forms rather than substituting stale values later in this script.
+        foreach ($commandElement in $element.CommandElements) {
+            if ($localConstants.Count -gt 0 -and $commandElement -is [System.Management.Automation.Language.CommandParameterAst]) {
+                $parameter = $commandElement.ParameterName.ToLowerInvariant()
+                if ($parameter -in @('ov', 'ev', 'wv', 'iv', 'pv') -or
+                    @('outvariable', 'errorvariable', 'warningvariable', 'informationvariable', 'pipelinevariable').Where({ $_.StartsWith($parameter) }).Count -gt 0) {
+                    return $null
+                }
+            }
         }
         return $parts
     }

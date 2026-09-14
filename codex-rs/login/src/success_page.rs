@@ -79,19 +79,21 @@ pub(crate) fn compose_success_url(
         .get("chatgpt_plan_type")
         .and_then(|value| value.as_str())
         .unwrap_or("");
-    let platform_url = if issuer == DEFAULT_ISSUER {
+    let platform_url = if issuer.trim_end_matches('/') == DEFAULT_ISSUER {
         "https://platform.openai.com"
     } else {
         "https://platform.api.openai.org"
     };
     let mut params = vec![
-        ("id_token", id_token.to_string()),
         ("needs_setup", needs_setup.to_string()),
         ("org_id", org_id.to_string()),
         ("project_id", project_id.to_string()),
         ("plan_type", plan_type.to_string()),
         ("platform_url", platform_url.to_string()),
     ];
+    if needs_setup {
+        params.push(("id_token", id_token.to_string()));
+    }
     if codex_streamlined_login {
         params.push(("codex_streamlined_login", "true".to_string()));
     }
@@ -101,17 +103,18 @@ pub(crate) fn compose_success_url(
 
 pub(crate) fn jwt_auth_claims(jwt: &str) -> serde_json::Map<String, serde_json::Value> {
     let mut parts = jwt.split('.');
-    let (_header, payload, _signature) = match (parts.next(), parts.next(), parts.next()) {
-        (Some(header), Some(payload), Some(signature))
-            if !header.is_empty() && !payload.is_empty() && !signature.is_empty() =>
-        {
-            (header, payload, signature)
-        }
-        _ => {
-            eprintln!("Invalid JWT format while extracting claims");
-            return serde_json::Map::new();
-        }
-    };
+    let (_header, payload, _signature) =
+        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(header), Some(payload), Some(signature), None)
+                if !header.is_empty() && !payload.is_empty() && !signature.is_empty() =>
+            {
+                (header, payload, signature)
+            }
+            _ => {
+                eprintln!("Invalid JWT format while extracting claims");
+                return serde_json::Map::new();
+            }
+        };
     match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) {
         Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
             Ok(mut value) => {

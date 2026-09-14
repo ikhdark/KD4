@@ -538,8 +538,8 @@ fn command_execution_request_approval_localization_rejects_relative_additional_p
 
 #[test]
 fn permissions_request_approval_uses_request_permission_profile() {
-    let read_only_path = r"C:\tmp\read-only";
-    let read_write_path = r"C:\tmp\read-write";
+    let read_only_path = absolute_path_string("tmp/read-only");
+    let read_write_path = absolute_path_string("tmp/read-write");
     let params = serde_json::from_value::<PermissionsRequestApprovalParams>(json!({
         "threadId": "thr_123",
         "turnId": "turn_123",
@@ -791,8 +791,8 @@ fn legacy_current_working_directory_special_path_deserializes_as_project_roots()
 
 #[test]
 fn permissions_request_approval_response_uses_granted_permission_profile_without_macos() {
-    let read_only_path = r"C:\tmp\read-only";
-    let read_write_path = r"C:\tmp\read-write";
+    let read_only_path = absolute_path_string("tmp/read-only");
+    let read_write_path = absolute_path_string("tmp/read-write");
     let response = serde_json::from_value::<PermissionsRequestApprovalResponse>(json!({
         "permissions": {
             "network": {
@@ -994,8 +994,8 @@ fn thread_fork_last_turn_id_round_trips() {
     })
     .expect("thread/fork params without last turn id serialize");
     assert_eq!(
-        omitted["lastTurnId"],
-        serde_json::Value::Null,
+        omitted.get("lastTurnId"),
+        Some(&serde_json::Value::Null),
         "optional lastTurnId should serialize as null when omitted"
     );
 }
@@ -1316,6 +1316,9 @@ fn process_spawn_params_distinguish_omitted_null_and_value_limits() {
     let decoded =
         serde_json::from_value::<ProcessSpawnParams>(base).expect("deserialize omitted limits");
     assert_eq!(decoded, expected_omitted);
+    let serialized = serde_json::to_value(&decoded).expect("serialize omitted limits");
+    assert_eq!(serialized.get("outputBytesCap"), None);
+    assert_eq!(serialized.get("timeoutMs"), None);
 
     let decoded = serde_json::from_value::<ProcessSpawnParams>(json!({
         "command": ["sleep", "30"],
@@ -1325,6 +1328,9 @@ fn process_spawn_params_distinguish_omitted_null_and_value_limits() {
         "timeoutMs": null,
     }))
     .expect("deserialize disabled limits");
+    let serialized = serde_json::to_value(&decoded).expect("serialize disabled limits");
+    assert_eq!(serialized.get("outputBytesCap"), Some(&JsonValue::Null));
+    assert_eq!(serialized.get("timeoutMs"), Some(&JsonValue::Null));
     assert_eq!(
         decoded,
         ProcessSpawnParams {
@@ -1342,6 +1348,9 @@ fn process_spawn_params_distinguish_omitted_null_and_value_limits() {
         "timeoutMs": 456,
     }))
     .expect("deserialize explicit limits");
+    let serialized = serde_json::to_value(&decoded).expect("serialize explicit limits");
+    assert_eq!(serialized.get("outputBytesCap"), Some(&json!(123)));
+    assert_eq!(serialized.get("timeoutMs"), Some(&json!(456)));
     assert_eq!(
         decoded,
         ProcessSpawnParams {
@@ -2024,7 +2033,7 @@ fn mcp_server_elicitation_response_round_trips_rmcp_result() {
         content: Some(json!({
             "confirmed": true,
         })),
-        meta: None,
+        meta: Some(serde_json::from_value(json!({"persist": "always"})).unwrap()),
     };
 
     let v2_response = McpServerElicitationRequestResponse::from(rmcp_result.clone());
@@ -2035,13 +2044,27 @@ fn mcp_server_elicitation_response_round_trips_rmcp_result() {
             content: Some(json!({
                 "confirmed": true,
             })),
-            meta: None,
+            meta: Some(json!({"persist": "always"})),
         }
     );
     assert_eq!(
-        rmcp::model::CreateElicitationResult::from(v2_response),
-        rmcp_result
+        serde_json::to_value(&v2_response).unwrap().get("_meta"),
+        Some(&json!({"persist": "always"})),
     );
+    assert_eq!(
+        rmcp::model::CreateElicitationResult::from(v2_response.clone()),
+        rmcp_result,
+    );
+    for meta in [None, Some(json!("unsupported")), Some(json!([1]))] {
+        let converted =
+            rmcp::model::CreateElicitationResult::from(McpServerElicitationRequestResponse {
+                meta,
+                ..v2_response.clone()
+            });
+        assert_eq!(converted.meta, None);
+        assert_eq!(converted.action, rmcp_result.action);
+        assert_eq!(converted.content, rmcp_result.content);
+    }
 }
 
 #[test]
@@ -3112,7 +3135,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
     });
 
     assert_eq!(
-        ThreadItem::from(completed_mcp_tool_call_item),
+        ThreadItem::from(completed_mcp_tool_call_item.clone()),
         ThreadItem::McpToolCall {
             id: "mcp-2".to_string(),
             server: "server".to_string(),
@@ -3131,6 +3154,27 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
             duration_ms: Some(42),
         }
     );
+
+    let TurnItem::McpToolCall(mut failed) = completed_mcp_tool_call_item else {
+        panic!("expected MCP tool call");
+    };
+    failed.status = CoreMcpToolCallStatus::Failed;
+    let result = failed.result.as_mut().expect("tool result");
+    result.is_error = Some(true);
+    result.content = vec![json!({"type": "text", "text": "tool error"})];
+    result.structured_content = Some(json!({"error": "rate_limited"}));
+    let value = serde_json::to_value(ThreadItem::from(TurnItem::McpToolCall(failed)))
+        .expect("serialize failed MCP item");
+    assert_eq!(value["status"], json!("failed"));
+    assert_eq!(
+        value["result"]["content"],
+        json!([{"type": "text", "text": "tool error"}])
+    );
+    assert_eq!(
+        value["result"]["structuredContent"],
+        json!({"error": "rate_limited"})
+    );
+    assert_eq!(value["result"]["_meta"], json!({"trace": "1"}));
 }
 
 #[test]
@@ -3270,6 +3314,51 @@ fn user_input_into_core_preserves_image_detail() {
 }
 
 #[test]
+fn optional_skill_interface_and_image_detail_fields_serialize_as_null() {
+    let interface_ts = <SkillInterface as ts_rs::TS>::decl();
+    for field in [
+        "displayName?: string | null",
+        "shortDescription?: string | null",
+        "iconSmall?: AbsolutePathBuf | null",
+        "iconLarge?: AbsolutePathBuf | null",
+        "brandColor?: string | null",
+        "defaultPrompt?: string | null",
+    ] {
+        assert!(
+            interface_ts.contains(field),
+            "missing nullable field: {field}"
+        );
+    }
+    assert_eq!(
+        <UserInput as ts_rs::TS>::decl()
+            .matches("detail?: ImageDetail | null")
+            .count(),
+        2,
+    );
+    let interface: SkillInterface = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(
+        serde_json::to_value(interface).unwrap(),
+        json!({
+            "displayName": null,
+            "shortDescription": null,
+            "iconSmall": null,
+            "iconLarge": null,
+            "brandColor": null,
+            "defaultPrompt": null,
+        })
+    );
+    for input in [
+        json!({"type": "image", "url": "https://example.com/image.png"}),
+        json!({"type": "localImage", "path": "image.png"}),
+    ] {
+        let decoded: UserInput = serde_json::from_value(input.clone()).unwrap();
+        let mut expected = input;
+        expected["detail"] = JsonValue::Null;
+        assert_eq!(serde_json::to_value(decoded).unwrap(), expected);
+    }
+}
+
+#[test]
 fn skills_list_params_serialization_uses_force_reload() {
     assert_eq!(
         serde_json::to_value(SkillsListParams {
@@ -3316,8 +3405,7 @@ fn skills_extra_roots_set_params_rejects_relative_roots() {
 
 #[test]
 fn plugin_source_serializes_local_git_npm_and_remote_variants() {
-    let local_path = r"C:\plugins\linear";
-    let local_path = AbsolutePathBuf::try_from(PathBuf::from(local_path)).unwrap();
+    let local_path = absolute_path("plugins/linear");
     let local_path_json = local_path.as_path().display().to_string();
 
     assert_eq!(
@@ -3450,11 +3538,9 @@ fn plugin_marketplace_entry_serializes_remote_only_path_as_null() {
 
 #[test]
 fn plugin_interface_serializes_local_paths_and_remote_urls_separately() {
-    let composer_icon = r"C:\plugins\linear\icon.png";
-    let composer_icon = AbsolutePathBuf::try_from(PathBuf::from(composer_icon)).unwrap();
+    let composer_icon = absolute_path("plugins/linear/icon.png");
     let composer_icon_json = composer_icon.as_path().display().to_string();
-    let logo_dark = r"C:\plugins\linear\logo-dark.png";
-    let logo_dark = AbsolutePathBuf::try_from(PathBuf::from(logo_dark)).unwrap();
+    let logo_dark = absolute_path("plugins/linear/logo-dark.png");
     let logo_dark_json = logo_dark.as_path().display().to_string();
 
     let interface = PluginInterface {
@@ -3570,8 +3656,7 @@ fn plugin_installed_params_serializes_install_suggestion_names() {
 
 #[test]
 fn plugin_read_params_serialization_uses_install_source_fields() {
-    let marketplace_path = r"C:\plugins\marketplace.json";
-    let marketplace_path = AbsolutePathBuf::try_from(PathBuf::from(marketplace_path)).unwrap();
+    let marketplace_path = absolute_path("plugins/marketplace.json");
     let marketplace_path_json = marketplace_path.as_path().display().to_string();
     assert_eq!(
         serde_json::to_value(PluginReadParams {
@@ -3617,8 +3702,7 @@ fn plugin_read_params_serialization_uses_install_source_fields() {
 
 #[test]
 fn plugin_install_params_serialization_omits_force_remote_sync() {
-    let marketplace_path = r"C:\plugins\marketplace.json";
-    let marketplace_path = AbsolutePathBuf::try_from(PathBuf::from(marketplace_path)).unwrap();
+    let marketplace_path = absolute_path("plugins/marketplace.json");
     let marketplace_path_json = marketplace_path.as_path().display().to_string();
     assert_eq!(
         serde_json::to_value(PluginInstallParams {
@@ -3682,8 +3766,7 @@ fn plugin_skill_read_params_serialization_uses_remote_plugin_id() {
 
 #[test]
 fn plugin_share_params_and_response_serialization_use_camel_case_fields() {
-    let plugin_path = r"C:\plugins\gmail";
-    let plugin_path = AbsolutePathBuf::try_from(PathBuf::from(plugin_path)).unwrap();
+    let plugin_path = absolute_path("plugins/gmail");
     let plugin_path_json = plugin_path.as_path().display().to_string();
 
     assert_eq!(
@@ -3811,11 +3894,9 @@ fn plugin_share_params_and_response_serialization_use_camel_case_fields() {
         }),
     );
 
-    let plugin_path = r"C:\Users\me\plugins\gmail";
-    let plugin_path = AbsolutePathBuf::try_from(PathBuf::from(plugin_path)).unwrap();
+    let plugin_path = absolute_path("Users/me/plugins/gmail");
     let plugin_path_json = plugin_path.as_path().display().to_string();
-    let marketplace_path = r"C:\Users\me\.agents\plugins\marketplace.json";
-    let marketplace_path = AbsolutePathBuf::try_from(PathBuf::from(marketplace_path)).unwrap();
+    let marketplace_path = absolute_path("Users/me/.agents/plugins/marketplace.json");
     let marketplace_path_json = marketplace_path.as_path().display().to_string();
     assert_eq!(
         serde_json::to_value(PluginShareCheckoutResponse {
@@ -3980,8 +4061,7 @@ fn plugin_uninstall_params_serialization_omits_force_remote_sync() {
 
 #[test]
 fn marketplace_remove_response_serializes_nullable_installed_root() {
-    let installed_root = r"C:\marketplaces\debug";
-    let installed_root = AbsolutePathBuf::try_from(PathBuf::from(installed_root)).unwrap();
+    let installed_root = absolute_path("marketplaces/debug");
     let installed_root_json = installed_root.as_path().display().to_string();
     assert_eq!(
         serde_json::to_value(MarketplaceRemoveResponse {
@@ -4010,8 +4090,7 @@ fn marketplace_remove_response_serializes_nullable_installed_root() {
 
 #[test]
 fn marketplace_upgrade_response_serializes_camel_case_fields() {
-    let upgraded_root = r"C:\marketplaces\debug";
-    let upgraded_root = AbsolutePathBuf::try_from(PathBuf::from(upgraded_root)).unwrap();
+    let upgraded_root = absolute_path("marketplaces/debug");
     let upgraded_root_json = upgraded_root.as_path().display().to_string();
 
     assert_eq!(
@@ -4422,7 +4501,11 @@ fn turn_start_params_round_trip_environments() {
     // Use a path foreign to the test host so this exercises syntax preservation instead of the
     // host-native conversion performed by test_absolute_path().
 
-    let raw_cwd = "/workspace";
+    let raw_cwd = if cfg!(windows) {
+        "/workspace"
+    } else {
+        r"C:\workspace"
+    };
 
     let cwd: LegacyAppPathString =
         serde_json::from_value(json!(raw_cwd)).expect("API path should deserialize");

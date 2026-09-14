@@ -407,7 +407,15 @@ impl ResponsesWebsocketConnection {
                 reason = "the guard serializes exclusive use of the websocket stream for the lifetime of the response stream"
             )]
             async move {
-                let mut guard = stream.lock().await;
+                let mut guard = tokio::select! {
+                    biased;
+                    _ = tx_event.closed() => return,
+                    guard = stream.lock() => guard,
+                };
+                // Abandon queued work without invalidating an unused connection.
+                if tx_event.is_closed() {
+                    return;
+                }
                 let result = 'response: {
                     let Some(ws_stream) = guard.as_mut() else {
                         let _ = tx_send_complete.send(());
@@ -420,14 +428,19 @@ impl ResponsesWebsocketConnection {
                     };
 
                     dispatch_ready(encoded_request);
-                    let send_result = send_websocket_request(
-                        ws_stream,
-                        request_text,
-                        idle_timeout,
-                        telemetry.as_ref(),
-                        connection_reused,
-                    )
-                    .await;
+                    let send_result = tokio::select! {
+                        biased;
+                        _ = tx_event.closed() => Err(ApiError::Stream(
+                            "response event consumer dropped".to_string(),
+                        )),
+                        result = send_websocket_request(
+                            ws_stream,
+                            request_text,
+                            idle_timeout,
+                            telemetry.as_ref(),
+                            connection_reused,
+                        ) => result,
+                    };
                     let send_succeeded = send_result.is_ok();
                     if send_succeeded {
                         stream_established();
@@ -485,8 +498,8 @@ pub struct ResponsesWebsocketClient {
 /// Close frame information captured by a handshake probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResponsesWebsocketClose {
-    /// WebSocket close code returned by the server.
-    pub code: String,
+    /// WebSocket close code returned by the server, absent for an empty close frame.
+    pub code: Option<String>,
     /// Human-readable close reason returned by the server.
     pub reason: String,
 }
@@ -535,7 +548,9 @@ impl ResponsesWebsocketClient {
 
         let mut headers =
             merge_request_headers(&self.provider.headers, extra_headers, default_headers);
-        self.auth.add_auth_headers(&mut headers);
+        self.auth
+            .try_add_auth_headers(&mut headers)
+            .map_err(TransportError::from)?;
 
         let connected =
             connect_websocket(ws_url, headers, http_client_factory, turn_state.clone()).await?;
@@ -568,7 +583,9 @@ impl ResponsesWebsocketClient {
 
         let mut headers =
             merge_request_headers(&self.provider.headers, extra_headers, default_headers);
-        self.auth.add_auth_headers(&mut headers);
+        self.auth
+            .try_add_auth_headers(&mut headers)
+            .map_err(TransportError::from)?;
 
         let connected = connect_websocket(
             ws_url.clone(),
@@ -578,15 +595,21 @@ impl ResponsesWebsocketClient {
         )
         .await?;
         let mut stream = connected.stream;
-        let immediate_close = tokio::time::timeout(immediate_close_timeout, stream.next())
-            .await
-            .ok()
-            .flatten()
-            .transpose()
-            .map_err(|err| {
-                ApiError::Stream(format!("failed to read websocket probe event: {err}"))
-            })?
-            .and_then(immediate_close_from_message);
+        let deadline = Instant::now() + immediate_close_timeout;
+        let immediate_close = loop {
+            if Instant::now() >= deadline {
+                break None;
+            }
+            let message = match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(message)) => message.map_err(|err| {
+                    ApiError::Stream(format!("failed to read websocket probe event: {err}"))
+                })?,
+                Ok(None) | Err(_) => break None,
+            };
+            if let Some(close) = immediate_close_from_message(message) {
+                break Some(close);
+            }
+        };
 
         Ok(ResponsesWebsocketProbe {
             url: ws_url.to_string(),
@@ -603,12 +626,19 @@ fn immediate_close_from_message(message: Message) -> Option<ResponsesWebsocketCl
     let Message::Close(frame) = message else {
         return None;
     };
-    frame.map(close_frame_to_probe)
+    Some(
+        frame
+            .map(close_frame_to_probe)
+            .unwrap_or(ResponsesWebsocketClose {
+                code: None,
+                reason: String::new(),
+            }),
+    )
 }
 
 fn close_frame_to_probe(frame: CloseFrame) -> ResponsesWebsocketClose {
     ResponsesWebsocketClose {
-        code: frame.code.to_string(),
+        code: Some(frame.code.to_string()),
         reason: frame.reason.to_string(),
     }
 }
@@ -640,7 +670,7 @@ async fn connect_websocket(
     http_client_factory: &HttpClientFactory,
     turn_state: Option<Arc<OnceLock<String>>>,
 ) -> Result<ConnectedWebsocket, ApiError> {
-    info!("connecting to websocket: {url}");
+    info!("connecting to responses websocket");
 
     let mut request = url
         .as_str()
@@ -662,13 +692,13 @@ async fn connect_websocket(
     let (stream, response) = match response {
         Ok((stream, response)) => {
             info!(
-                "successfully connected to websocket: {url}, headers: {:?}",
-                response.headers()
+                status = %response.status(),
+                "successfully connected to responses websocket"
             );
             (stream, response)
         }
         Err(err) => {
-            error!("failed to connect to websocket: {err}, url: {url}");
+            error!("failed to connect to responses websocket");
             return Err(map_ws_error(err, &url));
         }
     };
@@ -795,9 +825,14 @@ async fn run_websocket_response_stream(
     let mut interpreter = ResponsesEventInterpreter::new(&metadata, turn_state);
     loop {
         let poll_start = Instant::now();
-        let response = tokio::time::timeout(idle_timeout, ws_stream.next())
-            .await
-            .map_err(|_| ApiError::Stream("idle timeout waiting for websocket".into()));
+        let response = tokio::select! {
+            biased;
+            _ = tx_event.closed() => return Err(ApiError::Stream(
+                "response event consumer dropped".to_string(),
+            )),
+            response = tokio::time::timeout(idle_timeout, ws_stream.next()) => response,
+        }
+        .map_err(|_| ApiError::Stream("idle timeout waiting for websocket".into()));
         if let Some(t) = telemetry.as_ref() {
             t.on_ws_event(&response, poll_start.elapsed());
         }
@@ -826,9 +861,18 @@ async fn run_websocket_response_stream(
                 let events = match interpreter.process_payload(&text) {
                     Ok(events) => events,
                     Err(ResponsesEventError::Parse(error)) => {
-                        debug!("failed to parse websocket event: {error}, data: {text}");
+                        debug!(
+                            payload_bytes = text.len(),
+                            category = ?error.classify(),
+                            line = error.line(),
+                            column = error.column(),
+                            "failed to parse websocket event"
+                        );
                         return Err(ApiError::Stream(format!(
-                            "failed to parse websocket event: {error}"
+                            "failed to parse websocket event: {:?} at line {} column {}",
+                            error.classify(),
+                            error.line(),
+                            error.column()
                         )));
                     }
                     Err(ResponsesEventError::Api(error)) => return Err(error),
@@ -916,6 +960,72 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
+
+    #[tokio::test]
+    async fn responses_connect_and_probe_reject_auth_before_network() {
+        struct RejectedAuth;
+        impl crate::auth::AuthProvider for RejectedAuth {
+            fn add_auth_headers(&self, _: &mut HeaderMap) {}
+            fn try_add_auth_headers(
+                &self,
+                _: &mut HeaderMap,
+            ) -> Result<(), crate::auth::AuthError> {
+                Err(crate::auth::AuthError::Build(
+                    "credentials unavailable".into(),
+                ))
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = ResponsesWebsocketClient::new(
+            Provider {
+                name: "auth-test".into(),
+                base_url: format!("http://{}", listener.local_addr().unwrap()),
+                query_params: None,
+                headers: HeaderMap::new(),
+                retry: crate::provider::RetryConfig {
+                    max_retries: 0,
+                    base_delay: Duration::ZERO,
+                    retry_429: false,
+                    retry_5xx: false,
+                    retry_transport: false,
+                },
+                stream_idle_timeout: Duration::from_secs(1),
+            },
+            Arc::new(RejectedAuth),
+        );
+        let factory =
+            HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault);
+        for probe in [false, true] {
+            let result = tokio::time::timeout(Duration::from_secs(1), async {
+                if probe {
+                    client
+                        .probe_handshake(
+                            &factory,
+                            HeaderMap::new(),
+                            HeaderMap::new(),
+                            Duration::from_millis(1),
+                        )
+                        .await
+                        .map(|_| ())
+                } else {
+                    client
+                        .connect(&factory, HeaderMap::new(), HeaderMap::new(), None, None)
+                        .await
+                        .map(|_| ())
+                }
+            })
+            .await
+            .expect("auth rejection must precede handshake");
+            assert!(
+                matches!(result, Err(ApiError::Transport(TransportError::Build(message))) if message == "credentials unavailable")
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn responses_connect_and_probe_cancel_tls_preparation_before_network() {
@@ -1160,7 +1270,7 @@ mod tests {
         let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(1);
         let (_tx_message, rx_message) = ws_ingress_channel(1, 1024);
         let (tx_dispatched, rx_dispatched) = oneshot::channel();
-        let (tx_release_send, rx_release_send) = oneshot::channel();
+        let (mut tx_release_send, rx_release_send) = oneshot::channel::<()>();
         let dispatches = Arc::new(AtomicUsize::new(0));
         let observed_dispatches = Arc::clone(&dispatches);
         let pump_task = tokio::spawn(async move {
@@ -1170,7 +1280,7 @@ mod tests {
             observed_dispatches.fetch_add(1, Ordering::SeqCst);
             tx_dispatched.send(()).expect("dispatch observer");
             rx_release_send.await.expect("release external send");
-            tx_result.send(Ok(())).expect("send completion receiver");
+            let _ = tx_result.send(Ok(()));
             while let Some(WsCommand::Send { tx_result, .. }) = rx_command.recv().await {
                 observed_dispatches.fetch_add(1, Ordering::SeqCst);
                 let _ = tx_result.send(Ok(()));
@@ -1186,7 +1296,7 @@ mod tests {
                 pending_failure: None,
                 pump_task,
             },
-            Duration::from_secs(1),
+            Duration::from_secs(60),
             ResponsesStreamMetadata::from_headers(&headers),
             None,
         ));
@@ -1231,12 +1341,14 @@ mod tests {
             .expect("dispatch signal");
         caller.abort();
         assert!(matches!(caller.await, Err(error) if error.is_cancelled()));
-        tx_release_send.send(()).expect("release blocked send");
+        tokio::time::timeout(Duration::from_secs(1), tx_release_send.closed())
+            .await
+            .expect("cancellation must stop the pump before send completes");
 
         assert!(
             tokio::time::timeout(Duration::from_secs(1), connection.is_closed())
                 .await
-                .expect("metadata failure must release connection lock")
+                .expect("cancellation must release connection lock")
         );
         let mut second = connection
             .stream_request_with_dispatch_ready(&request, true, None, || {}, |_| {}, || {})
@@ -1252,6 +1364,193 @@ mod tests {
         );
         assert!(second.next().await.is_none());
         assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    #[expect(clippy::await_holding_invalid_type, reason = "Hold the active response lock across cancellation to prove a queued caller cannot dispatch")]
+    async fn canceled_queued_request_leaves_connection_reusable_without_dispatch() {
+        let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(1);
+        let (tx_message, rx_message) = ws_ingress_channel(2, 1024);
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let observed_dispatches = Arc::clone(&dispatches);
+        let pump_task = tokio::spawn(async move {
+            while let Some(WsCommand::Send { message, tx_result }) = rx_command.recv().await {
+                observed_dispatches.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(
+                    serde_json::from_str::<Value>(message.to_text().unwrap()).unwrap()["model"],
+                    "live-request"
+                );
+                let _ = tx_result.send(Ok(()));
+                tx_message
+                    .try_send(Message::Text(
+                        json!({"type": "response.completed", "response": {"id": "live-response"}})
+                            .to_string()
+                            .into(),
+                    ))
+                    .unwrap();
+            }
+        });
+        let connection = ResponsesWebsocketConnection::new(
+            WsStream {
+                tx_command,
+                rx_message,
+                rx_failure: None,
+                pending_failure: None,
+                pump_task,
+            },
+            Duration::from_secs(60),
+            ResponsesStreamMetadata::default(),
+            None,
+        );
+        // Hold the same lock an active response owns while another request queues.
+        let guard = connection.stream.lock().await;
+        let abandoned_request = test_response_request("abandoned-request");
+        let mut abandoned = Box::pin(connection.stream_request(abandoned_request, true, None));
+        assert!(futures::poll!(&mut abandoned).is_pending());
+        tokio::task::yield_now().await;
+        drop(abandoned);
+        drop(guard);
+
+        let mut live = tokio::time::timeout(
+            Duration::from_secs(1),
+            connection.stream_request(test_response_request("live-request"), true, None),
+        )
+        .await
+        .expect("live request must acquire the reusable connection")
+        .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), live.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(event, ResponseEvent::Completed { response_id, .. } if response_id == "live-response")
+        );
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+        assert!(!connection.is_closed().await);
+    }
+
+    #[tokio::test]
+    async fn consumer_dropped_while_waiting_for_frame_closes_socket_without_metadata() {
+        let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(1);
+        let (_tx_message, rx_message) = ws_ingress_channel(1, 1024);
+        let (mut tx_pump_lifetime, rx_pump_lifetime) = oneshot::channel::<()>();
+        let pump_task = tokio::spawn(async move {
+            let Some(WsCommand::Send { tx_result, .. }) = rx_command.recv().await else {
+                panic!("request must dispatch");
+            };
+            tx_result.send(Ok(())).unwrap();
+            let _ = rx_pump_lifetime.await;
+        });
+        let connection = ResponsesWebsocketConnection::new(
+            WsStream {
+                tx_command,
+                rx_message,
+                rx_failure: None,
+                pending_failure: None,
+                pump_task,
+            },
+            Duration::from_secs(60),
+            ResponsesStreamMetadata::default(),
+            None,
+        );
+        let mut response = connection
+            .stream_request(test_response_request("gpt-test"), false, None)
+            .await
+            .unwrap();
+        assert!(futures::poll!(response.next()).is_pending());
+        drop(response);
+        tokio::time::timeout(Duration::from_secs(1), tx_pump_lifetime.closed())
+            .await
+            .expect("consumer loss must dispose of the idle socket promptly");
+        assert!(connection.is_closed().await);
+    }
+
+    fn test_response_request(model: &str) -> ResponsesWsRequest {
+        ResponsesWsRequest::ResponseCreate(ResponseCreateWsRequest {
+            model: model.to_string(),
+            instructions: String::new(),
+            previous_response_id: None,
+            input: Vec::new().into(),
+            tools: None,
+            tool_choice: "auto".to_string(),
+            parallel_tool_calls: true,
+            reasoning: None,
+            store: false,
+            stream: true,
+            stream_options: None,
+            include: Vec::new(),
+            service_tier: None,
+            prompt_cache_key: None,
+            text: None,
+            generate: None,
+            client_metadata: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn handshake_probe_observes_close_after_text_with_or_without_status() {
+        struct NoAuth;
+        impl crate::auth::AuthProvider for NoAuth {
+            fn add_auth_headers(&self, _: &mut HeaderMap) {}
+        }
+        for frame in [
+            Some(CloseFrame {
+                code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                reason: "policy rejection".into(),
+            }),
+            None,
+        ] {
+            let expected = ResponsesWebsocketClose {
+                code: frame.as_ref().map(|frame| frame.code.to_string()),
+                reason: frame
+                    .as_ref()
+                    .map(|frame| frame.reason.to_string())
+                    .unwrap_or_default(),
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                websocket.send(Message::Text("hello".into())).await.unwrap();
+                websocket.send(Message::Close(frame)).await.unwrap();
+            });
+            let client = ResponsesWebsocketClient::new(
+                Provider {
+                    name: "probe-test".to_string(),
+                    base_url: format!("http://{address}"),
+                    query_params: None,
+                    headers: HeaderMap::new(),
+                    retry: crate::provider::RetryConfig {
+                        max_retries: 0,
+                        base_delay: Duration::ZERO,
+                        retry_429: false,
+                        retry_5xx: false,
+                        retry_transport: false,
+                    },
+                    stream_idle_timeout: Duration::from_secs(1),
+                },
+                Arc::new(NoAuth),
+            );
+            let factory =
+                HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault);
+            let probe = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.probe_handshake(
+                    &factory,
+                    HeaderMap::new(),
+                    HeaderMap::new(),
+                    Duration::from_secs(1),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(probe.status, StatusCode::SWITCHING_PROTOCOLS);
+            assert_eq!(probe.immediate_close, Some(expected));
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]

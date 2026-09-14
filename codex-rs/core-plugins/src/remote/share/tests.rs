@@ -34,6 +34,70 @@ fn test_auth() -> CodexAuth {
     CodexAuth::create_dummy_chatgpt_auth_for_testing()
 }
 
+#[test]
+fn share_local_path_reverse_lookup_rejects_collisions() {
+    let home = TempDir::new().unwrap();
+    let plugin_path = AbsolutePathBuf::try_from(home.path().join("plugin")).unwrap();
+    local_paths::record_plugin_share_local_path(home.path(), "plugins_123", plugin_path.clone())
+        .unwrap();
+    assert_eq!(
+        load_plugin_share_remote_ids_by_local_path(home.path()).unwrap(),
+        BTreeMap::from([(plugin_path.clone(), "plugins_123".to_string())])
+    );
+    local_paths::record_plugin_share_local_path(home.path(), "plugins_456", plugin_path).unwrap();
+    assert_eq!(
+        load_plugin_share_remote_ids_by_local_path(home.path())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+}
+
+#[test]
+fn share_local_path_no_op_updates_preserve_file_contents() {
+    let home = TempDir::new().unwrap();
+    let plugin_path = AbsolutePathBuf::try_from(home.path().join("plugin")).unwrap();
+    let path = home.path().join(".tmp/plugin-share-local-paths-v1.json");
+    let contents =
+        json!({"localPluginPathsByRemotePluginId": {"plugins_123": plugin_path}}).to_string();
+    write_file(&path, &contents);
+    local_paths::record_plugin_share_local_path(home.path(), "plugins_123", plugin_path).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+    local_paths::remove_plugin_share_local_path(home.path(), "plugins_absent").unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+    local_paths::remove_plugin_share_local_path(home.path(), "plugins_123").unwrap();
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn list_remote_plugin_shares_ignores_malformed_optional_local_paths() {
+    let home = TempDir::new().unwrap();
+    let mapping_path = home.path().join(".tmp/plugin-share-local-paths-v1.json");
+    write_file(&mapping_path, "{");
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/backend-api/ps/plugins/workspace/created"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "plugins": [remote_plugin_json_with_share_url_and_principals("plugins_123", None, json!([]))],
+            "pagination": empty_pagination_json()
+        }))).expect(1).mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/ps/plugins/installed"))
+        .and(query_param("scope", "WORKSPACE"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "plugins": [], "pagination": empty_pagination_json()
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let result = list_remote_plugin_shares(&test_config(&server), Some(&test_auth()), home.path())
+        .await
+        .unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].summary.remote_plugin_id, "plugins_123");
+    assert_eq!(result[0].local_plugin_path, None);
+    assert_eq!(fs::read_to_string(mapping_path).unwrap(), "{");
+}
+
 fn write_file(path: &Path, contents: &str) {
     fs::create_dir_all(path.parent().expect("file should have a parent")).unwrap();
     fs::write(path, contents).unwrap();
@@ -74,20 +138,21 @@ fn write_plugin_share_local_path_mapping(
 fn archive_file_entries(archive_bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
     let decoder = flate2::read::GzDecoder::new(archive_bytes);
     let mut archive = tar::Archive::new(decoder);
-    archive
-        .entries()
-        .unwrap()
-        .filter_map(|entry| {
-            let mut entry = entry.unwrap();
-            if !entry.header().entry_type().is_file() {
-                return None;
-            }
-            let path = entry.path().unwrap().to_string_lossy().into_owned();
-            let mut contents = Vec::new();
-            entry.read_to_end(&mut contents).unwrap();
-            Some((path, contents))
-        })
-        .collect()
+    let mut files = BTreeMap::new();
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let path = entry.path().unwrap().to_string_lossy().into_owned();
+        let mut contents = Vec::new();
+        entry.read_to_end(&mut contents).unwrap();
+        assert!(
+            files.insert(path.clone(), contents).is_none(),
+            "duplicate archive path: {path}"
+        );
+    }
+    files
 }
 
 fn remote_plugin_json(plugin_id: &str) -> serde_json::Value {

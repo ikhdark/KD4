@@ -8,17 +8,24 @@
 //! attaching exactly the same JSON a user could copy from the CLI.
 
 use std::collections::BTreeMap;
+use std::io;
+use std::process::Output;
+use std::process::Stdio;
 use std::time::Duration;
 
 use codex_core::config::Config;
 use codex_feedback::DOCTOR_REPORT_ATTACHMENT_FILENAME;
 use codex_feedback::FeedbackAttachment;
 use serde_json::Value;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::warn;
 
 const DOCTOR_FEEDBACK_REPORT_TIMEOUT: Duration = Duration::from_secs(25);
+const MAX_DOCTOR_STDOUT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_DOCTOR_STDERR_BYTES: usize = 64 * 1024;
 const MAX_DOCTOR_TAG_VALUE_LEN: usize = 256;
 
 /// Redacted doctor report data that can be merged into a feedback upload.
@@ -42,8 +49,14 @@ pub(crate) async fn doctor_feedback_report(config: &Config) -> Option<DoctorFeed
 
     let mut command = Command::new(&executable);
     command.arg("doctor").arg("--json");
-    command.kill_on_drop(/*kill_on_drop*/ true);
-    let output = match timeout(DOCTOR_FEEDBACK_REPORT_TIMEOUT, command.output()).await {
+    command.current_dir(config.cwd.as_path());
+    command.env("CODEX_HOME", config.codex_home.as_path());
+    let output = match timeout(
+        DOCTOR_FEEDBACK_REPORT_TIMEOUT,
+        capture_doctor_output(&mut command),
+    )
+    .await
+    {
         Ok(Ok(output)) => output,
         Ok(Err(err)) => {
             warn!(
@@ -95,6 +108,45 @@ pub(crate) async fn doctor_feedback_report(config: &Config) -> Option<DoctorFeed
             buffer: pretty,
         },
     })
+}
+
+// Read both pipes concurrently and stop as soon as either exceeds its budget.
+// Keeping the child in this future makes overflow and timeout kill it on drop.
+#[expect(
+    clippy::expect_used,
+    reason = "Both child pipes are configured immediately before successful spawn"
+)]
+async fn capture_doctor_output(command: &mut Command) -> io::Result<Output> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn()?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (stdout, stderr, status) = tokio::try_join!(
+        read_bounded_output(stdout, MAX_DOCTOR_STDOUT_BYTES),
+        read_bounded_output(stderr, MAX_DOCTOR_STDERR_BYTES),
+        child.wait(),
+    )?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+async fn read_bounded_output(reader: impl AsyncRead + Unpin, limit: usize) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() > limit {
+        return Err(io::Error::other("doctor output exceeded its capture limit"));
+    }
+    Ok(bytes)
 }
 
 fn doctor_report_tags(report: &Value) -> BTreeMap<String, String> {
@@ -176,6 +228,70 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+
+    fn output_command(script: &str) -> Command {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("powershell.exe");
+            command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", script]);
+            command
+        };
+        command.kill_on_drop(true);
+        command
+    }
+
+    #[tokio::test]
+    async fn doctor_capture_preserves_output_from_unsuccessful_exit() {
+        #[cfg(windows)]
+        let script = "[Console]::Out.Write('{\"overallStatus\":\"fail\"}'); [Console]::Error.Write('diagnostic'); exit 1";
+        #[cfg(not(windows))]
+        let script = "printf '%s' '{\"overallStatus\":\"fail\"}'; printf diagnostic >&2; exit 1";
+        let output = capture_doctor_output(&mut output_command(script))
+            .await
+            .expect("capture");
+        assert!(!output.status.success());
+        assert_eq!(output.stdout, br#"{"overallStatus":"fail"}"#);
+        assert_eq!(output.stderr, b"diagnostic");
+    }
+
+    #[tokio::test]
+    async fn doctor_capture_rejects_overflow_on_either_pipe() {
+        for stderr in [false, true] {
+            #[cfg(windows)]
+            let script = format!(
+                "[Console]::{}.Write(('x' * {}))",
+                if stderr { "Error" } else { "Out" },
+                if stderr {
+                    MAX_DOCTOR_STDERR_BYTES + 1
+                } else {
+                    MAX_DOCTOR_STDOUT_BYTES + 1
+                }
+            );
+            #[cfg(not(windows))]
+            let script = format!(
+                "head -c {} /dev/zero {}",
+                if stderr {
+                    MAX_DOCTOR_STDERR_BYTES + 1
+                } else {
+                    MAX_DOCTOR_STDOUT_BYTES + 1
+                },
+                if stderr { ">&2" } else { "" }
+            );
+            let error = capture_doctor_output(&mut output_command(&script))
+                .await
+                .expect_err("overflow must fail");
+            assert_eq!(
+                error.to_string(),
+                "doctor output exceeded its capture limit"
+            );
+        }
+    }
 
     #[test]
     fn doctor_report_tags_summarize_status_counts() {

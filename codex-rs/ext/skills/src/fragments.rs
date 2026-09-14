@@ -62,8 +62,8 @@ impl ContextualUserFragment for SkillInstructions {
     }
 
     fn body(&self) -> String {
-        let name = &self.name;
-        let path = &self.path;
+        let name = escape_metadata(&self.name);
+        let path = escape_metadata(&self.path);
         let contents = &self.contents;
         let scope = self
             .source_scope
@@ -71,4 +71,11 @@ impl ContextualUserFragment for SkillInstructions {
             .unwrap_or_default();
         format!("\n<name>{name}</name>\n<path>{path}</path>{scope}\n{contents}\n")
     }
+}
+
+fn escape_metadata(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }

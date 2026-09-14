@@ -7,6 +7,7 @@ use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FreeformTool {
@@ -96,24 +97,22 @@ pub fn coalesce_loadable_tool_specs(
     specs: impl IntoIterator<Item = LoadableToolSpec>,
 ) -> Vec<LoadableToolSpec> {
     let mut coalesced_specs = Vec::new();
+    let mut namespace_indices = HashMap::<String, usize>::new();
     for spec in specs {
         match spec {
             LoadableToolSpec::Function(tool) => {
                 coalesced_specs.push(LoadableToolSpec::Function(tool));
             }
             LoadableToolSpec::Namespace(mut namespace) => {
-                if let Some(existing_namespace) =
-                    coalesced_specs.iter_mut().find_map(|spec| match spec {
-                        LoadableToolSpec::Namespace(existing_namespace)
-                            if existing_namespace.name == namespace.name =>
-                        {
-                            Some(existing_namespace)
-                        }
-                        LoadableToolSpec::Function(_) | LoadableToolSpec::Namespace(_) => None,
-                    })
-                {
+                if let Some(&index) = namespace_indices.get(&namespace.name) {
+                    let LoadableToolSpec::Namespace(existing_namespace) =
+                        &mut coalesced_specs[index]
+                    else {
+                        unreachable!("namespace index must point to a namespace");
+                    };
                     existing_namespace.tools.append(&mut namespace.tools);
                 } else {
+                    namespace_indices.insert(namespace.name.clone(), coalesced_specs.len());
                     coalesced_specs.push(LoadableToolSpec::Namespace(namespace));
                 }
             }

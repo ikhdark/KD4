@@ -50,10 +50,8 @@ fn host_binding(_: &HashMap<String, String>) -> Option<CredentialHostBinding> {
 }
 
 fn openai_api_key_prefix(value: &str) -> &str {
-    let Some(suffix) = value.strip_prefix("sk-") else {
-        return "sk-";
-    };
-    suffix
-        .find('-')
-        .map_or("sk-", |separator| &value[..separator + 4])
+    ["sk-proj-", "sk-svcacct-"]
+        .into_iter()
+        .find(|prefix| value.starts_with(prefix))
+        .unwrap_or("sk-")
 }

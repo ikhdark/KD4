@@ -122,7 +122,9 @@ impl LiveCommandOutput {
                     .map(|line| Cow::Borrowed(line.as_str()))
                     .chain(
                         self.has_partial_line
-                            .then(|| Cow::Owned(self.render_partial_line())),
+                            .then_some(())
+                            .into_iter()
+                            .map(|()| Cow::Owned(self.render_partial_line())),
                     ),
             )
         } else {
@@ -150,7 +152,9 @@ impl LiveCommandOutput {
                     .chain(self.tail.iter().map(|line| Cow::Borrowed(line.as_str())))
                     .chain(
                         self.has_partial_line
-                            .then(|| Cow::Owned(self.render_partial_line())),
+                            .then_some(())
+                            .into_iter()
+                            .map(|()| Cow::Owned(self.render_partial_line())),
                     ),
             )
         } else {

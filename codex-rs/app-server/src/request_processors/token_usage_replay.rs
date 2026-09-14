@@ -16,12 +16,11 @@ use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::ThreadTokenUsage;
 use codex_app_server_protocol::ThreadTokenUsageUpdatedNotification;
 use codex_app_server_protocol::Turn;
-use codex_app_server_protocol::TurnStatus;
-use codex_core::CodexThread;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::TokenUsageInfo;
 use codex_rollout::is_persisted_rollout_item;
 
 use crate::outgoing_message::ConnectionId;
@@ -38,16 +37,12 @@ pub(super) async fn send_thread_token_usage_update_to_connection(
     outgoing: &Arc<OutgoingMessageSender>,
     connection_id: ConnectionId,
     thread_id: ThreadId,
-    conversation: &CodexThread,
-    token_usage_turn_id: String,
+    replay: TokenUsageReplaySnapshot,
 ) {
-    let Some(info) = conversation.token_usage_info().await else {
-        return;
-    };
     let notification = ThreadTokenUsageUpdatedNotification {
         thread_id: thread_id.to_string(),
-        turn_id: token_usage_turn_id,
-        token_usage: ThreadTokenUsage::from(info),
+        turn_id: replay.turn_id,
+        token_usage: ThreadTokenUsage::from(replay.info),
     };
     outgoing
         .send_initial_component_notification_to_connection(
@@ -66,14 +61,23 @@ struct TokenUsageTurnOwner {
     position: Option<usize>,
 }
 
+pub(super) struct TokenUsageReplaySnapshot {
+    pub(super) turn_id: String,
+    pub(super) info: TokenUsageInfo,
+}
+
 #[derive(Default)]
 pub(super) struct TokenUsageReplay {
     turn_owner: Option<TokenUsageTurnOwner>,
+    info: Option<TokenUsageInfo>,
 }
 
 impl TokenUsageReplay {
     fn observe_rollout_item(&mut self, builder: &ThreadHistoryBuilder, item: &RolloutItem) {
-        if matches!(item, RolloutItem::EventMsg(EventMsg::TokenCount(_))) {
+        if let RolloutItem::EventMsg(EventMsg::TokenCount(event)) = item
+            && let Some(info) = &event.info
+        {
+            self.info = Some(info.clone());
             self.turn_owner = builder.active_turn_id().map(|id| TokenUsageTurnOwner {
                 id: id.to_string(),
                 position: builder.active_turn_position(),
@@ -81,10 +85,11 @@ impl TokenUsageReplay {
         }
     }
 
-    pub(super) fn into_turn_id(self, turns: &[Turn]) -> String {
-        self.turn_owner
-            .and_then(|owner| owner.resolve(turns))
-            .unwrap_or_else(|| latest_token_usage_turn_id(turns))
+    pub(super) fn into_snapshot(self, turns: &[Turn]) -> Option<TokenUsageReplaySnapshot> {
+        Some(TokenUsageReplaySnapshot {
+            turn_id: self.turn_owner?.resolve(turns)?,
+            info: self.info?,
+        })
     }
 }
 
@@ -117,26 +122,12 @@ pub(super) fn build_turns_with_token_usage_replay(
     (builder.finish(), token_usage_replay)
 }
 
-/// Chooses a fallback turn id that should own a replayed token usage update.
-///
-/// Normal replay derives the owner from the rollout position of the latest
-/// `TokenCount` event. This fallback only preserves a stable wire shape for
-/// unusual histories where that rollout information cannot be read.
-fn latest_token_usage_turn_id(turns: &[Turn]) -> String {
-    turns
-        .iter()
-        .rev()
-        .find(|turn| matches!(turn.status, TurnStatus::Completed | TurnStatus::Failed))
-        .or_else(|| turns.last())
-        .map(|turn| turn.id.clone())
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use codex_protocol::protocol::AgentMessageEvent;
     use codex_protocol::protocol::TokenCountEvent;
+    use codex_protocol::protocol::TokenUsage;
     use codex_protocol::protocol::UserMessageEvent;
     use pretty_assertions::assert_eq;
 
@@ -145,7 +136,10 @@ mod tests {
         let rollout_items = token_usage_history();
         let (turns, replay) = build_turns_with_token_usage_replay(&rollout_items);
 
-        assert_eq!(replay.into_turn_id(&turns), turns[0].id);
+        let snapshot = replay.into_snapshot(&turns).expect("usage snapshot");
+        assert_eq!(snapshot.turn_id, turns[0].id);
+        assert_eq!(snapshot.info.total_token_usage.total_tokens, 150);
+        assert_eq!(snapshot.info.last_token_usage.total_tokens, 90);
     }
 
     #[test]
@@ -154,7 +148,29 @@ mod tests {
         let (mut turns, replay) = build_turns_with_token_usage_replay(&rollout_items);
         turns[0].id = "rebuilt-turn-id".to_string();
 
-        assert_eq!(replay.into_turn_id(&turns), "rebuilt-turn-id");
+        assert_eq!(
+            replay
+                .into_snapshot(&turns)
+                .expect("usage snapshot")
+                .turn_id,
+            "rebuilt-turn-id"
+        );
+    }
+
+    #[test]
+    fn replay_without_an_attributable_turn_is_suppressed() {
+        let items = vec![RolloutItem::EventMsg(EventMsg::TokenCount(
+            TokenCountEvent {
+                info: Some(TokenUsageInfo {
+                    total_token_usage: TokenUsage::default(),
+                    last_token_usage: TokenUsage::default(),
+                    model_context_window: None,
+                }),
+                rate_limits: None,
+            },
+        ))];
+        let (turns, replay) = build_turns_with_token_usage_replay(&items);
+        assert!(replay.into_snapshot(&turns).is_none());
     }
 
     fn token_usage_history() -> Vec<RolloutItem> {
@@ -173,7 +189,17 @@ mod tests {
                 memory_citation: None,
             })),
             RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
-                info: None,
+                info: Some(TokenUsageInfo {
+                    total_token_usage: TokenUsage {
+                        total_tokens: 150,
+                        ..Default::default()
+                    },
+                    last_token_usage: TokenUsage {
+                        total_tokens: 90,
+                        ..Default::default()
+                    },
+                    model_context_window: None,
+                }),
                 rate_limits: None,
             })),
             RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
@@ -183,6 +209,10 @@ mod tests {
                 local_images: Vec::new(),
                 text_elements: Vec::new(),
                 ..Default::default()
+            })),
+            RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+                info: None,
+                rate_limits: None,
             })),
         ]
     }

@@ -1,4 +1,4 @@
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 /// A single visual row produced by RowBuilder.
@@ -15,7 +15,8 @@ impl Row {
     }
 }
 
-/// Incrementally wraps input text into visual rows of at most `width` cells.
+/// Incrementally wraps input text at grapheme boundaries. A single grapheme
+/// wider than `width` occupies its own row so no input is lost.
 ///
 /// Step 1: plain-text only. ANSI-carry and styled spans will be added later.
 pub struct RowBuilder {
@@ -40,7 +41,11 @@ impl RowBuilder {
     }
 
     pub fn set_width(&mut self, width: usize) {
-        self.target_width = width.max(1);
+        let width = width.max(1);
+        if self.target_width == width {
+            return;
+        }
+        self.target_width = width;
         // Rewrap everything we have (simple approach for Step 1).
         let mut all = String::new();
         for row in self.rows.drain(..) {
@@ -107,11 +112,7 @@ impl RowBuilder {
         }
         let to_commit = display_count - max_keep;
         let commit_count = to_commit.min(self.rows.len());
-        let mut drained = Vec::with_capacity(commit_count);
-        for _ in 0..commit_count {
-            drained.push(self.rows.remove(0));
-        }
-        drained
+        self.rows.drain(..commit_count).collect()
     }
 
     fn flush_current_line(&mut self, explicit_break: bool) {
@@ -141,38 +142,24 @@ impl RowBuilder {
     }
 
     fn wrap_current_line(&mut self) {
-        // While the current_line exceeds width, cut a prefix.
-        loop {
-            if self.current_line.is_empty() {
-                break;
-            }
-            let (prefix, suffix, taken) =
-                take_prefix_by_width(&self.current_line, self.target_width);
-            if taken == 0 {
-                // Avoid infinite loop on pathological inputs; take one scalar and continue.
-                if let Some((i, ch)) = self.current_line.char_indices().next() {
-                    let len = i + ch.len_utf8();
-                    let p = self.current_line[..len].to_string();
-                    self.rows.push(Row {
-                        text: p,
-                        explicit_break: false,
-                    });
-                    self.current_line = self.current_line[len..].to_string();
-                    continue;
-                }
-                break;
-            }
-            if suffix.is_empty() {
-                // Fits entirely; keep in buffer (do not push yet) so we can append more later.
-                break;
-            } else {
-                // Emit wrapped prefix as a non-explicit row and continue with the remainder.
+        let mut start = 0;
+        let mut width = 0usize;
+        for (idx, grapheme) in self.current_line.grapheme_indices(true) {
+            let next_width = grapheme.width();
+            if idx > start && width.saturating_add(next_width) > self.target_width {
                 self.rows.push(Row {
-                    text: prefix,
+                    text: self.current_line[start..idx].to_string(),
                     explicit_break: false,
                 });
-                self.current_line = suffix.to_string();
+                start = idx;
+                width = 0;
             }
+            width += next_width;
+        }
+        // Keep the last row, including its final grapheme, available for the
+        // next fragment (which may extend it with an accent or emoji joiner).
+        if start > 0 {
+            self.current_line.drain(..start);
         }
     }
 }
@@ -185,16 +172,13 @@ pub fn take_prefix_by_width(text: &str, max_cols: usize) -> (String, &str, usize
     }
     let mut cols = 0usize;
     let mut end_idx = 0usize;
-    for (i, ch) in text.char_indices() {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+    for (i, grapheme) in text.grapheme_indices(true) {
+        let ch_width = grapheme.width();
         if cols.saturating_add(ch_width) > max_cols {
             break;
         }
         cols += ch_width;
-        end_idx = i + ch.len_utf8();
-        if cols == max_cols {
-            break;
-        }
+        end_idx = i + grapheme.len();
     }
     let prefix = text[..end_idx].to_string();
     let suffix = &text[end_idx..];
@@ -258,6 +242,13 @@ mod tests {
         }
         let chunk_rows = rb_chunks.rows().to_vec();
 
+        assert_eq!(
+            all_rows
+                .iter()
+                .map(|row| row.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ABCDEFG", "HIJKLMN", "OPQRSTU"]
+        );
         assert_eq!(all_rows, chunk_rows);
     }
 
@@ -266,20 +257,63 @@ mod tests {
         let mut rb = RowBuilder::new(/*target_width*/ 10);
         rb.push_fragment("hello\nworld");
         let rows = rb.display_rows();
-        assert!(rows.iter().any(|r| r.explicit_break));
-        assert_eq!(rows[0].text, "hello");
-        // Second row should begin with 'world'
-        assert!(rows.iter().any(|r| r.text.starts_with("world")));
+        assert_eq!(
+            rows,
+            vec![
+                Row {
+                    text: "hello".into(),
+                    explicit_break: true
+                },
+                Row {
+                    text: "world".into(),
+                    explicit_break: false
+                }
+            ]
+        );
     }
 
     #[test]
     fn rewrap_on_width_change() {
         let mut rb = RowBuilder::new(/*target_width*/ 10);
         rb.push_fragment("abcdefghijK");
-        assert!(!rb.rows().is_empty());
+        assert_eq!(rb.rows()[0].text, "abcdefghij");
         rb.set_width(/*width*/ 5);
-        for r in rb.rows() {
-            assert!(r.width() <= 5);
+        assert_eq!(
+            rb.display_rows()
+                .iter()
+                .map(|row| row.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["abcde", "fghij", "K"]
+        );
+    }
+    #[test]
+    fn fragmented_graphemes_and_oversized_glyphs_keep_all_text() {
+        let mut builder = RowBuilder::new(2);
+        for fragment in ["👩", "‍", "💻", "e", "\u{301}", "x", "\n"] {
+            builder.push_fragment(fragment);
         }
+        assert_eq!(
+            builder
+                .display_rows()
+                .iter()
+                .map(|row| row.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["👩‍💻", "e\u{301}x"]
+        );
+        let mut builder = RowBuilder::new(1);
+        builder.push_fragment("你a\n");
+        assert_eq!(
+            builder
+                .display_rows()
+                .iter()
+                .map(|row| row.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["你", "a"]
+        );
+        assert_eq!(
+            take_prefix_by_width("e\u{301}x", 1),
+            ("e\u{301}".to_string(), "x", 1)
+        );
+        assert_eq!(take_prefix_by_width("👩‍💻x", 2), ("👩‍💻".to_string(), "x", 2));
     }
 }

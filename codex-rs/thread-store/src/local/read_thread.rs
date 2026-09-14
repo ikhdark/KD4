@@ -30,40 +30,47 @@ pub(super) async fn read_thread(
     params: ReadThreadParams,
 ) -> ThreadStoreResult<StoredThread> {
     let thread_id = params.thread_id;
-    if let Some(metadata) = read_sqlite_metadata(store, thread_id).await
-        && (params.include_archived
+    if let Some(mut metadata) = read_sqlite_metadata(store, thread_id).await {
+        resolve_sqlite_rollout_location(store, &mut metadata).await?;
+        if params.include_archived
             || (metadata.archived_at.is_none()
                 && !rollout_path_is_archived(
                     store.config.codex_home.as_path(),
                     metadata.rollout_path.as_path(),
-                )))
-    {
-        let preloaded_history = if params.include_history {
-            load_history_items_for_thread(&metadata.rollout_path, thread_id).await
-        } else {
-            None
-        };
-        if params.include_history && preloaded_history.is_none() {
-            // SQLite metadata can outlive a moved/recreated rollout path. Fall through to the
-            // canonical path resolver when the single history read does not match this thread.
-        } else {
+                ))
+        {
+            let rollout_path = metadata.rollout_path.clone();
             let mut thread = stored_thread_from_sqlite_metadata(store, metadata).await?;
-            if !params.include_history
-                && let Some(rollout_path) = thread.rollout_path.clone()
-                && let Ok(rollout_thread) = read_thread_from_rollout_path(store, rollout_path).await
-                && rollout_thread.thread_id == thread_id
-                && (params.include_archived || rollout_thread.archived_at.is_none())
-                && !rollout_thread.preview.is_empty()
-            {
-                // Preview extraction can be newer than the last SQLite flush, but the SQLite-backed
-                // object remains authoritative for every persisted metadata field.
-                thread.preview = rollout_thread.preview;
-            }
             reject_paginated_history(&thread, params.include_history)?;
-            if let Some(items) = preloaded_history {
-                thread.history = Some(StoredThreadHistory { thread_id, items });
+            let preloaded_history = if params.include_history {
+                load_history_items_for_thread(&rollout_path, thread_id).await
+            } else {
+                None
+            };
+            if params.include_history && preloaded_history.is_none() {
+                // SQLite metadata can outlive a moved/recreated rollout path. Fall through to the
+                // canonical path resolver when the single history read does not match this thread.
+            } else {
+                if !params.include_history
+                    && let Some(rollout_path) = thread.rollout_path.clone()
+                    && let Some(item) = read_thread_item_from_rollout(rollout_path).await
+                    && item.thread_id == Some(thread_id)
+                    && let Some(rollout_thread) = stored_thread_from_rollout_item(
+                        item,
+                        false,
+                        &store.config.default_model_provider_id,
+                    )
+                    && !rollout_thread.preview.is_empty()
+                {
+                    // Preview extraction can be newer than the last SQLite flush, but the SQLite-backed
+                    // object remains authoritative for every persisted metadata field.
+                    thread.preview = rollout_thread.preview;
+                }
+                if let Some(items) = preloaded_history {
+                    thread.history = Some(StoredThreadHistory { thread_id, items });
+                }
+                return Ok(thread);
             }
-            return Ok(thread);
         }
     }
 
@@ -78,6 +85,14 @@ pub(super) async fn read_thread(
     .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
 
     let mut thread = read_thread_from_rollout_path(store, path).await?;
+    if thread.thread_id != thread_id {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!(
+                "rollout session metadata id mismatch: expected {thread_id}, found {}",
+                thread.thread_id
+            ),
+        });
+    }
     if !params.include_archived && thread.archived_at.is_some() {
         return Err(ThreadStoreError::InvalidRequest {
             message: format!("thread {} is archived", thread.thread_id),
@@ -190,7 +205,14 @@ async fn attach_history_if_requested(
             message: format!("failed to load thread history for thread {thread_id}"),
         });
     };
-    let items = load_history_items(&path).await?;
+    let items = load_history_items_for_thread(&path, thread_id)
+        .await
+        .ok_or_else(|| ThreadStoreError::Internal {
+            message: format!(
+                "failed to load matching thread history {} for {thread_id}",
+                path.display()
+            ),
+        })?;
     thread.history = Some(StoredThreadHistory { thread_id, items });
     Ok(())
 }
@@ -213,6 +235,11 @@ async fn read_thread_from_rollout_path(
     })?;
     thread.rollout_path = Some(codex_rollout::plain_rollout_path(path.as_path()));
     let meta_line = read_required_session_meta_line(path.as_path()).await?;
+    if meta_line.meta.id != thread.thread_id {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!("rollout session metadata id mismatch in {}", path.display()),
+        });
+    }
     thread.forked_from_id = meta_line.meta.forked_from_id;
     thread.parent_thread_id = meta_line.meta.parent_thread_id;
     thread.history_mode = meta_line.meta.history_mode;
@@ -231,15 +258,25 @@ async fn read_thread_from_rollout_path(
     Ok(thread)
 }
 
-async fn load_history_items(
-    path: &std::path::Path,
-) -> ThreadStoreResult<Vec<codex_protocol::protocol::RolloutItem>> {
-    let (items, _, _) = RolloutRecorder::load_rollout_items(path)
+// Resolve only missing indexed paths. Lazily materialized rows remain readable when no
+// rollout exists, while completed archive moves take effect even if index maintenance failed.
+pub(super) async fn resolve_sqlite_rollout_location(
+    store: &LocalThreadStore,
+    metadata: &mut ThreadMetadata,
+) -> ThreadStoreResult<()> {
+    if codex_rollout::existing_rollout_path(&metadata.rollout_path)
         .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to load thread history {}: {err}", path.display()),
-        })?;
-    Ok(items)
+        .is_none()
+        && let Some(resolved) = resolve_rollout_path(store, metadata.id, true, true).await?
+    {
+        metadata.rollout_path = resolved.path;
+        metadata.archived_at = if resolved.archived {
+            Some(metadata.archived_at.unwrap_or(metadata.updated_at))
+        } else {
+            None
+        };
+    }
+    Ok(())
 }
 
 async fn read_sqlite_metadata(
@@ -262,12 +299,21 @@ pub(super) async fn stored_thread_from_sqlite_metadata(
             .flatten()
             .filter(|title| !title.trim().is_empty()),
     };
+    stored_thread_from_sqlite_metadata_with_name(store, metadata, name).await
+}
+
+pub(super) async fn stored_thread_from_sqlite_metadata_with_name(
+    store: &LocalThreadStore,
+    metadata: ThreadMetadata,
+    name: Option<String>,
+) -> ThreadStoreResult<StoredThread> {
     // SQLite owns the persisted projection. Session metadata only supplements fields that are
     // not stored in the row, so an unavailable or malformed rollout must not discard the row.
     let session_meta = read_session_meta_line(metadata.rollout_path.as_path())
         .await
         .ok()
-        .map(|meta_line| meta_line.meta);
+        .map(|meta_line| meta_line.meta)
+        .filter(|meta| meta.id == metadata.id);
     let rollout_path = codex_rollout::plain_rollout_path(metadata.rollout_path.as_path());
     let forked_from_id = session_meta.as_ref().and_then(|meta| meta.forked_from_id);
     let parent_thread_id = session_meta.as_ref().and_then(|meta| meta.parent_thread_id);
@@ -1058,8 +1104,17 @@ mod tests {
         let rollout_path =
             write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("session file");
         let other_uuid = Uuid::from_u128(222);
-        let stale_path = write_session_file(external.path(), "2025-01-04T12-00-00", other_uuid)
-            .expect("other session file");
+        let stale_path = write_session_file_with_fork(
+            external.path(),
+            external.path().join("sessions/2025/01/04"),
+            "2025-01-04T12-00-00",
+            other_uuid,
+            "Other preview",
+            Some("other-provider"),
+            Some(Uuid::from_u128(9996)),
+            codex_protocol::protocol::ThreadHistoryMode::Paginated,
+        )
+        .expect("other session file");
         let runtime = codex_state::StateRuntime::init(
             config.sqlite_home.clone(),
             config.default_model_provider_id.clone(),
@@ -1076,6 +1131,21 @@ mod tests {
             .upsert_thread(&metadata)
             .await
             .expect("state db upsert should succeed");
+
+        let summary = store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived: true,
+                include_history: false,
+            })
+            .await
+            .expect("metadata read");
+        assert_eq!(summary.forked_from_id, None);
+        assert_eq!(
+            summary.history_mode,
+            codex_protocol::protocol::ThreadHistoryMode::Legacy
+        );
+        assert_eq!(summary.preview, "wrong sqlite preview");
 
         let thread = store
             .read_thread(ReadThreadParams {

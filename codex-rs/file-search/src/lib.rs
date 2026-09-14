@@ -421,6 +421,10 @@ fn walker_worker(
     override_matcher: Option<ignore::overrides::Override>,
     injector: Injector<Arc<str>>,
 ) {
+    if inner.cancelled.load(Ordering::Relaxed) || inner.shutdown.load(Ordering::Relaxed) {
+        let _ = inner.work_tx.send(WorkSignal::WalkComplete);
+        return;
+    }
     let Some(first_root) = inner.search_directories.first() else {
         let _ = inner.work_tx.send(WorkSignal::WalkComplete);
         return;
@@ -451,6 +455,7 @@ fn walker_worker(
     let filter_directories_seen = Arc::clone(&directories_seen);
     let filter_walk_limit_hit = Arc::clone(&walk_limit_hit);
     let walk_limits = inner.walk_limits;
+    let filter_inner = Arc::clone(&inner);
     walk_builder
         // Allow hidden entries.
         .hidden(false)
@@ -461,6 +466,11 @@ fn walker_worker(
         .require_git(true)
         .max_depth(Some(walk_limits.max_depth.saturating_add(1)))
         .filter_entry(move |entry| {
+            if filter_inner.cancelled.load(Ordering::Relaxed)
+                || filter_inner.shutdown.load(Ordering::Relaxed)
+            {
+                return false;
+            }
             let is_directory = entry
                 .file_type()
                 .is_some_and(|file_type| file_type.is_dir());
@@ -502,10 +512,11 @@ fn walker_worker(
         walk_builder.overrides(override_matcher);
     }
 
-    const CHECK_INTERVAL: usize = 1024;
-    let mut n = 0;
     for entry in walk_builder.build() {
-        if walk_limit_hit.load(Ordering::Relaxed) {
+        if walk_limit_hit.load(Ordering::Relaxed)
+            || inner.cancelled.load(Ordering::Relaxed)
+            || inner.shutdown.load(Ordering::Relaxed)
+        {
             break;
         }
         let entry = match entry {
@@ -525,13 +536,6 @@ fn walker_worker(
             injector.push(Arc::from(full_path), |_, cols| {
                 cols[0] = Utf32String::from(relative_path);
             });
-        }
-        n += 1;
-        if n >= CHECK_INTERVAL {
-            if inner.cancelled.load(Ordering::Relaxed) || inner.shutdown.load(Ordering::Relaxed) {
-                break;
-            }
-            n = 0;
         }
     }
     let _ = inner.work_tx.send(WorkSignal::WalkComplete);
@@ -557,12 +561,16 @@ fn matcher_worker(
     let cancel_requested = || inner.cancelled.load(Ordering::Relaxed);
     let shutdown_requested = || inner.shutdown.load(Ordering::Relaxed);
 
-    let mut last_query = String::new();
+    let mut last_query: Option<String> = None;
+    let mut metadata_changed = false;
     let mut next_notify = never();
     let mut will_notify = false;
     let mut walk_complete = false;
 
     loop {
+        if cancel_requested() || shutdown_requested() {
+            break;
+        }
         select! {
             recv(work_rx) -> signal => {
                 let Ok(signal) = signal else {
@@ -571,7 +579,7 @@ fn matcher_worker(
                 match signal {
                     WorkSignal::QueryUpdated => {
                         let query = inner.latest_query.read_for_worker();
-                        let append = query.starts_with(&last_query);
+                        let append = last_query.as_ref().is_some_and(|last| query.starts_with(last));
                         nucleo.pattern.reparse(
                             0,
                             &query,
@@ -579,7 +587,8 @@ fn matcher_worker(
                             Normalization::Smart,
                             append,
                         );
-                        last_query = query;
+                        last_query = Some(query);
+                        metadata_changed = true;
                         will_notify = true;
                         next_notify = after(Duration::from_millis(0));
                     }
@@ -592,6 +601,7 @@ fn matcher_worker(
                     }
                     WorkSignal::WalkComplete => {
                         walk_complete = true;
+                        metadata_changed = true;
                         if !will_notify {
                             will_notify = true;
                             next_notify = after(Duration::from_millis(0));
@@ -605,7 +615,13 @@ fn matcher_worker(
             recv(next_notify) -> _ => {
                 will_notify = false;
                 let status = nucleo.tick(TICK_TIMEOUT_MS);
-                if status.changed {
+                // A running match can still expose the previous query's snapshot.
+                // Compare the parsed pattern while allowing updates during the walk.
+                metadata_changed |= status.changed;
+                let Some(query) = last_query.as_ref() else { continue; };
+                let current_pattern = &nucleo.pattern.column_pattern(0).atoms;
+                let snapshot_pattern = &nucleo.snapshot().pattern().column_pattern(0).atoms;
+                if metadata_changed && current_pattern == snapshot_pattern {
                     let snapshot = nucleo.snapshot();
                     let limit = inner.limit.min(snapshot.matched_item_count() as usize);
                     let pattern = snapshot.pattern().column_pattern(0);
@@ -643,16 +659,17 @@ fn matcher_worker(
                         .collect();
 
                     let snapshot = FileSearchSnapshot {
-                        query: last_query.clone(),
+                        query: query.clone(),
                         matches,
                         total_match_count: snapshot.matched_item_count() as usize,
                         scanned_file_count: snapshot.item_count() as usize,
                         walk_complete,
                     };
                     inner.reporter.on_update(&snapshot);
+                    metadata_changed = false;
                 }
                 if !status.running && walk_complete {
-                    inner.reporter.on_complete(&last_query);
+                    inner.reporter.on_complete(query);
                 }
             }
             default(Duration::from_millis(100)) => {
@@ -666,7 +683,9 @@ fn matcher_worker(
     }
 
     // If we cancelled or otherwise exited the loop, make sure the reporter is notified.
-    inner.reporter.on_complete(&last_query);
+    inner
+        .reporter
+        .on_complete(last_query.as_deref().unwrap_or_default());
 
     Ok(())
 }
@@ -925,8 +944,15 @@ mod tests {
         snapshot
     }
 
+    #[cfg(windows)]
     fn try_symlink_directory(target: &Path, link: &Path) -> bool {
         std::os::windows::fs::symlink_dir(target, link).is_ok()
+    }
+
+    #[cfg(unix)]
+    fn try_symlink_directory(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).expect("create directory symlink");
+        true
     }
 
     #[test]
@@ -950,6 +976,12 @@ mod tests {
                 .iter()
                 .all(|file_match| !file_match.path.starts_with("nested"))
         );
+        assert!(
+            depth_snapshot
+                .matches
+                .iter()
+                .any(|m| m.path == Path::new("root-needle.txt"))
+        );
 
         let directory_snapshot = run_with_walk_limits(
             "needle",
@@ -966,6 +998,22 @@ mod tests {
                 .iter()
                 .all(|file_match| !file_match.path.starts_with("nested"))
         );
+        let allowed_root = tempfile::tempdir().unwrap();
+        fs::write(allowed_root.path().join("allowed-needle.txt"), "allowed").unwrap();
+        let allowed_snapshot = run_with_walk_limits(
+            "needle",
+            vec![allowed_root.path().to_path_buf()],
+            FileSearchWalkLimits {
+                max_depth: 0,
+                max_directories: 1,
+                max_entries: 1,
+            },
+        );
+        assert_eq!(allowed_snapshot.matches.len(), 1);
+        assert_eq!(
+            allowed_snapshot.matches[0].path,
+            Path::new("allowed-needle.txt")
+        );
 
         let entry_root = tempfile::tempdir().unwrap();
         fs::write(entry_root.path().join("a-needle.txt"), "a").unwrap();
@@ -979,7 +1027,7 @@ mod tests {
                 max_entries: 1,
             },
         );
-        assert!(entry_snapshot.matches.len() <= 1);
+        assert_eq!(entry_snapshot.matches.len(), 1);
     }
 
     #[test]
@@ -1046,22 +1094,76 @@ mod tests {
 
     #[test]
     fn session_streams_updates_before_walk_complete() {
-        let dir = create_temp_tree(/*file_count*/ 600);
+        let dir = create_temp_tree(/*file_count*/ 1);
+        let reporter = Arc::new(RecordingReporter::default());
+        // Hold WalkComplete until a real injected match has been published.
+        let (work_tx, work_rx) = unbounded();
+        let queued = Arc::new(AtomicBool::new(false));
+        let nucleo = Nucleo::new(
+            Config::DEFAULT.match_paths(),
+            coalescing_nucleo_notify(work_tx.clone(), queued.clone()),
+            Some(1),
+            1,
+        );
+        let injector = nucleo.injector();
+        let inner = Arc::new(SessionInner {
+            search_directories: vec![dir.path().to_path_buf()],
+            limit: 20,
+            compute_indices: false,
+            respect_gitignore: true,
+            walk_limits: FILE_SEARCH_WALK_LIMITS,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            reporter: reporter.clone(),
+            work_tx: work_tx.clone(),
+            latest_query: LatestQuery::default(),
+        });
+        let matcher_inner = inner.clone();
+        let worker = thread::spawn(move || matcher_worker(matcher_inner, work_rx, queued, nucleo));
+        let session = FileSearchSession { inner };
+        let path = dir.path().join("file-0000.txt");
+        injector.push(Arc::from(path.to_str().unwrap()), |_, cols| {
+            cols[0] = Utf32String::from("file-0000.txt");
+        });
+        session.update_query("file-0");
+        assert!(reporter.wait_for_updates_at_least(1, Duration::from_secs(5)));
+        let snapshot = reporter.snapshot();
+        assert!(!snapshot.walk_complete);
+        assert_eq!(snapshot.query, "file-0");
+        assert_eq!(snapshot.matches.len(), 1);
+        assert_eq!(snapshot.matches[0].path, Path::new("file-0000.txt"));
+        work_tx.send(WorkSignal::WalkComplete).unwrap();
+        let completed = reporter.wait_for_complete(Duration::from_secs(5));
+        assert!(completed);
+        assert!(reporter.snapshot().walk_complete);
+        assert_eq!(reporter.snapshot().matches, snapshot.matches);
+        drop(session);
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn session_waits_for_submitted_query_including_empty_query() {
+        let dir = create_temp_tree(1);
         let reporter = Arc::new(RecordingReporter::default());
         let session = create_session(
             vec![dir.path().to_path_buf()],
             FileSearchOptions::default(),
             reporter.clone(),
-            /*cancel_flag*/ None,
+            None,
         )
-        .expect("session");
-
-        session.update_query("file-0");
-        let completed = reporter.wait_for_complete(Duration::from_secs(5));
-
-        assert!(completed);
-        let updates = reporter.updates();
-        assert!(updates.iter().any(|snapshot| !snapshot.walk_complete));
+        .unwrap();
+        assert!(!reporter.wait_for_complete(Duration::from_millis(100)));
+        assert!(reporter.updates().is_empty());
+        session.update_query("");
+        assert!(reporter.wait_for_complete(Duration::from_secs(5)));
+        let snapshot = reporter.snapshot();
+        assert!(snapshot.walk_complete);
+        assert!(
+            snapshot
+                .matches
+                .iter()
+                .any(|m| m.path == Path::new("file-0000.txt"))
+        );
     }
 
     #[test]

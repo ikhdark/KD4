@@ -15,6 +15,8 @@ use thiserror::Error;
 pub enum AmendError {
     #[error("prefix rule requires at least one token")]
     EmptyPrefix,
+    #[error("prefix rule tokens cannot be empty or whitespace-only")]
+    EmptyPrefixToken,
     #[error("invalid network rule: {0}")]
     InvalidNetworkRule(String),
     #[error("policy path has no parent: {path}")]
@@ -53,11 +55,6 @@ pub enum AmendError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("failed to read metadata for policy file {path}: {source}")]
-    PolicyMetadata {
-        path: PathBuf,
-        source: std::io::Error,
-    },
 }
 
 /// Note this thread uses advisory file locking and performs blocking I/O, so it should be used with
@@ -69,6 +66,9 @@ pub fn blocking_append_allow_prefix_rule(
     if prefix.is_empty() {
         return Err(AmendError::EmptyPrefix);
     }
+    if prefix.iter().any(|token| token.trim().is_empty()) {
+        return Err(AmendError::EmptyPrefixToken);
+    }
 
     let tokens = prefix
         .iter()
@@ -77,7 +77,7 @@ pub fn blocking_append_allow_prefix_rule(
         .map_err(|source| AmendError::SerializePrefix { source })?;
     let pattern = format!("[{}]", tokens.join(", "));
     let rule = format!(r#"prefix_rule(pattern={pattern}, decision="allow")"#);
-    append_rule_line(policy_path, &rule)
+    append_rule_line(policy_path, &rule, true)
 }
 
 /// Note this function uses advisory file locking and performs blocking I/O, so it should be used
@@ -121,10 +121,11 @@ pub fn blocking_append_network_rule(
         args.push(format!("justification={justification}"));
     }
     let rule = format!("network_rule({})", args.join(", "));
-    append_rule_line(policy_path, &rule)
+    // Network rules are ordered: an earlier identical rule may have been overridden.
+    append_rule_line(policy_path, &rule, false)
 }
 
-fn append_rule_line(policy_path: &Path, rule: &str) -> Result<(), AmendError> {
+fn append_rule_line(policy_path: &Path, rule: &str, deduplicate: bool) -> Result<(), AmendError> {
     let dir = policy_path
         .parent()
         .ok_or_else(|| AmendError::MissingParent {
@@ -141,10 +142,10 @@ fn append_rule_line(policy_path: &Path, rule: &str) -> Result<(), AmendError> {
         }
     }
 
-    append_locked_line(policy_path, rule)
+    append_locked_line(policy_path, rule, deduplicate)
 }
 
-fn append_locked_line(policy_path: &Path, line: &str) -> Result<(), AmendError> {
+fn append_locked_line(policy_path: &Path, line: &str, deduplicate: bool) -> Result<(), AmendError> {
     let mut file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -171,7 +172,7 @@ fn append_locked_line(policy_path: &Path, line: &str) -> Result<(), AmendError> 
             source,
         })?;
 
-    if contents.lines().any(|existing| existing == line) {
+    if deduplicate && contents.lines().any(|existing| existing == line) {
         return Ok(());
     }
 

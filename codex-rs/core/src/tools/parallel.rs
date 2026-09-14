@@ -5925,10 +5925,12 @@ mod tests {
 
     impl CoreToolRuntime for DispatchTraceOutcomeHandler {}
 
+    type LifecycleProbeRecords = Vec<(&'static str, &'static str, Option<ToolCallOutcome>)>;
+
     struct LifecyclePanicProbe {
         label: &'static str,
         panic_at: Option<&'static str>,
-        records: Arc<std::sync::Mutex<Vec<(&'static str, &'static str, Option<ToolCallOutcome>)>>>,
+        records: Arc<std::sync::Mutex<LifecycleProbeRecords>>,
     }
 
     impl codex_extension_api::ToolLifecycleContributor for LifecyclePanicProbe {
@@ -6641,7 +6643,10 @@ mod tests {
             });
             entered_rx.await.expect("sampling caller started");
             caller.abort();
-            assert!(caller.await.err().expect("caller aborted").is_cancelled());
+            match caller.await {
+                Err(error) => assert!(error.is_cancelled()),
+                Ok(_) => panic!("caller must be aborted"),
+            }
             assert!(
                 batch.accepts_call("actual-mutation"),
                 "outer runtime Drop must not seal a shared nested generation"
@@ -6694,7 +6699,10 @@ mod tests {
                 .expect("generation capture must start after draining the batch");
             assert!(!batch.accepts_call("actual-mutation"));
             caller.abort();
-            assert!(caller.await.err().expect("caller aborted").is_cancelled());
+            match caller.await {
+                Err(error) => assert!(error.is_cancelled()),
+                Ok(_) => panic!("caller must be aborted"),
+            }
         }
         let barrier = session.flush_rollout_after_ordered_commits(&turn);
         tokio::pin!(barrier);

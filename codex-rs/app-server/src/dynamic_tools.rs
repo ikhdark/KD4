@@ -109,6 +109,7 @@ mod tests {
         };
 
         let core_response = into_core_response(response);
+        assert_eq!(core_response.content_items.len(), 1);
         let CoreDynamicToolCallOutputContentItem::InputText { text } =
             &core_response.content_items[0]
         else {
@@ -116,6 +117,7 @@ mod tests {
         };
 
         assert!(core_response.success);
+        assert_eq!(text, "owned dynamic tool response");
         assert_eq!(
             text.as_ptr(),
             text_ptr,

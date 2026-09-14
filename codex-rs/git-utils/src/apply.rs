@@ -625,7 +625,8 @@ fn unescape_c_string(input: &str) -> String {
     String::from_utf8_lossy(&unescape_c_bytes(input)).into_owned()
 }
 
-fn unescape_c_bytes(input: &str) -> Vec<u8> {
+/// Decode the contents of a Git C-quoted pathname, excluding its surrounding quotes.
+pub fn unescape_c_bytes(input: &str) -> Vec<u8> {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;

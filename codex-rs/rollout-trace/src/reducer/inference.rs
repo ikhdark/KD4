@@ -153,7 +153,7 @@ impl TraceReducer {
                     ExecutionStatus::Completed,
                     response_id,
                     upstream_request_id,
-                    Some(response_payload),
+                    response_payload,
                 ),
                 RawTraceEventPayload::InferenceFailed {
                     inference_call_id,

@@ -276,8 +276,7 @@ impl RequestUserInputOverlay {
 
         // Question prompt text.
         let question_y = sections.question_area.y;
-        let answered =
-            self.is_question_answered(self.current_index(), &self.composer.current_text());
+        let answered = self.is_question_answered(self.current_index());
         for (offset, line) in sections.question_lines.iter().enumerate() {
             if question_y.saturating_add(offset as u16)
                 >= sections.question_area.y + sections.question_area.height

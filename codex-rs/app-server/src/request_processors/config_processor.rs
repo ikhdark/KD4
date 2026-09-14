@@ -136,7 +136,7 @@ impl ConfigRequestProcessor {
         &self,
         params: ConfigValueWriteParams,
     ) -> Result<ClientResponsePayload, JSONRPCErrorError> {
-        self.handle_config_mutation_result(self.write_value(params).await)
+        self.write_value(params)
             .await
             .map(ClientResponsePayload::ConfigValueWrite)
     }
@@ -145,7 +145,7 @@ impl ConfigRequestProcessor {
         &self,
         params: ConfigBatchWriteParams,
     ) -> Result<ClientResponsePayload, JSONRPCErrorError> {
-        self.handle_config_mutation_result(self.batch_write_inner(params).await)
+        self.batch_write_inner(params)
             .await
             .map(ClientResponsePayload::ConfigBatchWrite)
     }
@@ -155,9 +155,7 @@ impl ConfigRequestProcessor {
         request_id: ConnectionRequestId,
         params: ExperimentalFeatureEnablementSetParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        let response = self
-            .handle_config_mutation_result(self.set_experimental_feature_enablement(params).await)
-            .await?;
+        let response = self.set_experimental_feature_enablement(params).await?;
         self.outgoing
             .send_response_as(
                 request_id,
@@ -180,18 +178,9 @@ impl ConfigRequestProcessor {
         })
     }
 
-    pub(crate) async fn handle_config_mutation(&self) {
+    pub(crate) fn handle_config_mutation(&self) {
         self.thread_manager.plugins_manager().clear_cache();
         self.thread_manager.skills_service().clear_cache();
-    }
-
-    async fn handle_config_mutation_result<T>(
-        &self,
-        result: std::result::Result<T, JSONRPCErrorError>,
-    ) -> Result<T, JSONRPCErrorError> {
-        let response = result?;
-        self.handle_config_mutation().await;
-        Ok(response)
     }
 
     async fn load_latest_config(
@@ -216,6 +205,7 @@ impl ConfigRequestProcessor {
             .write_value(params)
             .await
             .map_err(map_error)?;
+        self.handle_config_mutation();
         self.emit_plugin_toggle_events(pending_changes).await;
         Ok(response)
     }
@@ -237,6 +227,7 @@ impl ConfigRequestProcessor {
             .batch_write(params)
             .await
             .map_err(map_error)?;
+        self.handle_config_mutation();
         self.emit_plugin_toggle_events(pending_changes).await;
         if reload_user_config {
             self.reload_user_config(&refreshed_features).await;
@@ -278,6 +269,7 @@ impl ConfigRequestProcessor {
                     .map(|(name, enabled)| (name.clone(), *enabled)),
             )
             .map_err(|_| internal_error("failed to update feature enablement"))?;
+        self.handle_config_mutation();
 
         self.load_latest_config(/*fallback_cwd*/ None).await?;
         self.reload_user_config(&refreshed_features).await;

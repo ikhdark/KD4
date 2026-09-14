@@ -3,11 +3,20 @@
 use super::*;
 
 /// Renders a completed (or interrupted) request_user_input exchange in history.
-#[derive(Debug)]
 pub(crate) struct RequestUserInputResultCell {
     pub(crate) questions: Vec<ToolRequestUserInputQuestion>,
     pub(crate) answers: HashMap<String, ToolRequestUserInputAnswer>,
     pub(crate) interrupted: bool,
+}
+
+impl std::fmt::Debug for RequestUserInputResultCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestUserInputResultCell")
+            .field("question_count", &self.questions.len())
+            .field("answer_count", &self.answers.len())
+            .field("interrupted", &self.interrupted)
+            .finish()
+    }
 }
 
 impl HistoryCell for RequestUserInputResultCell {
@@ -140,7 +149,12 @@ impl HistoryCell for RequestUserInputResultCell {
                             .map(|option| Line::from(format!("answer: {option}"))),
                     );
                     if let Some(note) = note {
-                        lines.push(Line::from(format!("note: {note}")));
+                        let label = if question.options.is_some() {
+                            "note"
+                        } else {
+                            "answer"
+                        };
+                        lines.push(Line::from(format!("{label}: {note}")));
                     }
                 }
             } else {
@@ -184,4 +198,55 @@ fn split_request_user_input_answer(
         }
     }
     (options, note)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn freeform_answers_keep_their_label_and_secrets_stay_redacted() {
+        let mut cell = RequestUserInputResultCell {
+            questions: vec![ToolRequestUserInputQuestion {
+                id: "q".into(),
+                header: "Input".into(),
+                question: "Enter a value".into(),
+                is_other: false,
+                is_secret: false,
+                options: None,
+            }],
+            answers: HashMap::from([(
+                "q".into(),
+                ToolRequestUserInputAnswer {
+                    answers: vec!["user_note: sensitive-value".into()],
+                },
+            )]),
+            interrupted: false,
+        };
+        let raw = cell
+            .raw_lines()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            raw,
+            vec![
+                "Questions 1/1 answered",
+                "Enter a value",
+                "answer: sensitive-value"
+            ]
+        );
+        cell.questions[0].is_secret = true;
+        assert_eq!(
+            cell.raw_lines().last().unwrap().to_string(),
+            "answer: ******"
+        );
+        assert!(
+            !cell
+                .display_lines(80)
+                .iter()
+                .any(|line| line.to_string().contains("sensitive-value"))
+        );
+        assert!(!format!("{cell:?}").contains("sensitive-value"));
+    }
 }

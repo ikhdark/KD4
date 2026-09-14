@@ -272,6 +272,7 @@ impl AgentTaskCoordinator {
         Ok(admitted)
     }
 
+    #[expect(clippy::await_holding_invalid_type, reason = "Serialize durable binding writes and their cache publication")]
     pub(crate) async fn bind_agent_task(
         &self,
         draft: AgentTaskBindingDraft,
@@ -283,6 +284,7 @@ impl AgentTaskCoordinator {
         Ok(binding)
     }
 
+    #[expect(clippy::await_holding_invalid_type, reason = "Serialize durable binding removal and cache invalidation")]
     pub(crate) async fn remove_agent_task_binding(
         &self,
         assignment_id: AssignmentId,
@@ -369,6 +371,7 @@ impl AgentTaskCoordinator {
         self.refresh_binding(assignment_id).await
     }
 
+    #[expect(clippy::await_holding_invalid_type, reason = "Serialize durable binding reads and cache publication against updates")]
     pub(crate) async fn refresh_binding(
         &self,
         assignment_id: AssignmentId,

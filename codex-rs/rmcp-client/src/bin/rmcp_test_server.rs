@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use rmcp::ErrorData as McpError;
@@ -122,11 +121,10 @@ impl ServerHandler for TestToolServer {
                     }
                 };
 
-                let env_snapshot: HashMap<String, String> = std::env::vars().collect();
                 let env_name = args.env_var.as_deref().unwrap_or("MCP_TEST_VALUE");
                 let structured_content = json!({
                     "echo": args.message,
-                    "env": env_snapshot.get(env_name),
+                    "env": std::env::var(env_name).ok(),
                 });
 
                 let mut result = CallToolResult::success(Vec::new());
@@ -154,4 +152,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Drain background tasks to ensure clean shutdown.
     task::yield_now().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::ServiceExt;
+
+    #[tokio::test]
+    async fn echo_preserves_requested_environment_value() {
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let (server, client) =
+            tokio::join!(TestToolServer::new().serve(server_io), ().serve(client_io));
+        let server = server.unwrap();
+        let client = client.unwrap();
+        for env_var in ["PATH", "CODEX_NONEXISTENT_ECHO_TEST_VARIABLE"] {
+            let mut request = CallToolRequestParams::new("echo");
+            request.arguments = Some(
+                serde_json::from_value(json!({
+                    "message": "hello", "env_var": env_var
+                }))
+                .unwrap(),
+            );
+            let result = client.call_tool(request).await.unwrap();
+            assert_eq!(
+                result.structured_content,
+                Some(json!({
+                    "echo": "hello", "env": std::env::var(env_var).ok()
+                }))
+            );
+        }
+        client.cancel().await.unwrap();
+        server.cancel().await.unwrap();
+    }
 }

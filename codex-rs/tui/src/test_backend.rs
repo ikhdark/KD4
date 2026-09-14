@@ -34,6 +34,10 @@ impl VT100Backend {
     }
 
     /// Fail one external raw write of this payload; all other bytes still reach VT100.
+    #[allow(
+        dead_code,
+        reason = "Shared backend is included by integration targets; raw-write fault injection is exercised by TUI library tests"
+    )]
     pub fn fail_next_write_of(&mut self, payload: &[u8]) {
         self.fail_next_write_of = Some(payload.to_vec());
     }
@@ -83,7 +87,8 @@ impl Backend for VT100Backend {
     }
 
     fn get_cursor_position(&mut self) -> io::Result<Position> {
-        Ok(self.vt100().screen().cursor_position().into())
+        let (row, col) = self.vt100().screen().cursor_position();
+        Ok(Position::new(col, row))
     }
 
     fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
@@ -109,7 +114,7 @@ impl Backend for VT100Backend {
 
     fn window_size(&mut self) -> io::Result<WindowSize> {
         Ok(WindowSize {
-            columns_rows: self.vt100().screen().size().into(),
+            columns_rows: self.size()?,
             // Arbitrary size, we don't rely on this in testing.
             pixels: Size {
                 width: 640,
@@ -133,4 +138,16 @@ impl Backend for VT100Backend {
     ) -> io::Result<()> {
         self.crossterm_backend.scroll_region_down(region, scroll_by)
     }
+}
+
+#[test]
+fn backend_preserves_cursor_and_dimension_axes() {
+    let mut backend = VT100Backend::new(80, 24);
+    backend.set_cursor_position(Position::new(17, 5)).unwrap();
+    assert_eq!(backend.get_cursor_position().unwrap(), Position::new(17, 5));
+    assert_eq!(backend.size().unwrap(), Size::new(80, 24));
+    assert_eq!(
+        backend.window_size().unwrap().columns_rows,
+        Size::new(80, 24)
+    );
 }

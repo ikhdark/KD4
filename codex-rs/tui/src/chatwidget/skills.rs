@@ -77,19 +77,19 @@ impl ChatWidget {
         let items: Vec<SkillsToggleItem> = self
             .skills_all
             .iter()
-            .filter_map(|skill| {
-                let core_skill = protocol_skill_to_core(skill)?;
+            .map(|skill| {
+                let core_skill = protocol_skill_to_core(skill);
                 let display_name = skill_display_name(&core_skill);
                 let description = skill_description(&core_skill).to_string();
                 let name = core_skill.name.clone();
                 let path = core_skill.path_to_skills_md;
-                Some(SkillsToggleItem {
+                SkillsToggleItem {
                     name: display_name,
                     skill_name: name,
                     description,
                     enabled: skill.enabled,
                     path,
-                })
+                }
             })
             .collect();
 
@@ -144,7 +144,9 @@ impl ChatWidget {
     }
 
     pub(crate) fn set_skills_from_response(&mut self, response: &SkillsListResponse) {
-        let skills = skills_for_cwd(&self.config.cwd, &response.data);
+        let Some(skills) = skills_for_cwd(&self.config.cwd, &response.data) else {
+            return;
+        };
         self.skills_all = skills;
         self.set_skills(Some(enabled_skills_for_mentions(&self.skills_all)));
     }
@@ -182,35 +184,32 @@ impl ChatWidget {
 fn skills_for_cwd(
     cwd: &AbsolutePathBuf,
     skills_entries: &[SkillsListEntry],
-) -> Vec<ProtocolSkillMetadata> {
+) -> Option<Vec<ProtocolSkillMetadata>> {
     skills_entries
         .iter()
         .find(|entry| entry.cwd.as_path() == cwd.as_path())
         .map(|entry| entry.skills.clone())
-        .unwrap_or_default()
 }
 
 fn enabled_skills_for_mentions(skills: &[ProtocolSkillMetadata]) -> Vec<SkillMetadata> {
     skills
         .iter()
         .filter(|skill| skill.enabled)
-        .filter_map(protocol_skill_to_core)
+        .map(protocol_skill_to_core)
         .collect()
 }
 
-fn protocol_skill_to_core(skill: &ProtocolSkillMetadata) -> Option<SkillMetadata> {
-    let scope = serde_json::to_value(skill.scope)
-        .and_then(serde_json::from_value)
-        .inspect_err(|err| {
-            tracing::warn!(
-                skill_name = %skill.name,
-                %err,
-                "Failed to map app-server skill scope"
-            );
-        })
-        .ok()?;
+fn protocol_skill_to_core(skill: &ProtocolSkillMetadata) -> SkillMetadata {
+    let scope = match skill.scope {
+        codex_app_server_protocol::SkillScope::User => codex_protocol::protocol::SkillScope::User,
+        codex_app_server_protocol::SkillScope::Repo => codex_protocol::protocol::SkillScope::Repo,
+        codex_app_server_protocol::SkillScope::System => {
+            codex_protocol::protocol::SkillScope::System
+        }
+        codex_app_server_protocol::SkillScope::Admin => codex_protocol::protocol::SkillScope::Admin,
+    };
 
-    Some(SkillMetadata {
+    SkillMetadata {
         name: skill.name.clone(),
         description: skill.description.clone(),
         short_description: skill.short_description.clone(),
@@ -243,7 +242,7 @@ fn protocol_skill_to_core(skill: &ProtocolSkillMetadata) -> Option<SkillMetadata
         path_to_skills_md: skill.path.clone(),
         scope,
         plugin_id: None,
-    })
+    }
 }
 
 pub(crate) fn collect_tool_mentions(
@@ -302,7 +301,10 @@ pub(crate) fn find_skill_mentions_with_tool_mentions(
         if seen_paths.contains(&skill.path_to_skills_md) {
             continue;
         }
-        if mentions.names.contains(&skill.name) && seen_names.insert(skill.name.clone()) {
+        if mentions.names.contains(&skill.name)
+            && !mentions.linked_paths.contains_key(&skill.name)
+            && seen_names.insert(skill.name.clone())
+        {
             seen_paths.insert(skill.path_to_skills_md.clone());
             matches.push(skill.clone());
         }
@@ -316,11 +318,9 @@ pub(crate) fn find_app_mentions(
     apps: &[AppInfo],
     skill_names_lower: &HashSet<String>,
 ) -> Vec<AppInfo> {
-    let mut explicit_names = HashSet::new();
     let mut selected_ids = HashSet::new();
-    for (name, path) in &mentions.linked_paths {
+    for path in mentions.linked_paths.values() {
         if let Some(connector_id) = app_id_from_path(path) {
-            explicit_names.insert(name.clone());
             selected_ids.insert(connector_id.to_string());
         }
     }
@@ -335,7 +335,7 @@ pub(crate) fn find_app_mentions(
         let slug = codex_connectors::metadata::connector_mention_slug(app);
         let slug_count = slug_counts.get(&slug).copied().unwrap_or(0);
         if mentions.names.contains(&slug)
-            && !explicit_names.contains(&slug)
+            && !mentions.linked_paths.contains_key(&slug)
             && slug_count == 1
             && !skill_names_lower.contains(&slug)
         {
@@ -362,6 +362,97 @@ pub(crate) struct ToolMentions {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[tokio::test]
+    async fn skill_responses_preserve_other_cwds_and_clear_matching_empty_results() {
+        let (mut chat, _rx, _op_rx) =
+            crate::chatwidget::tests::helpers::make_chatwidget_manual(None).await;
+        let skill = ProtocolSkillMetadata {
+            name: "cached".to_string(),
+            description: String::new(),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            path: AbsolutePathBuf::from_absolute_path(
+                std::env::temp_dir().join("cached").join("SKILL.md"),
+            )
+            .unwrap(),
+            scope: codex_app_server_protocol::SkillScope::User,
+            enabled: true,
+        };
+        let response = |cwd, skills| SkillsListResponse {
+            data: vec![SkillsListEntry {
+                cwd,
+                skills,
+                errors: Vec::new(),
+            }],
+        };
+        let cwd = chat.config.cwd.as_path().to_path_buf();
+        chat.set_skills_from_response(&response(cwd.clone(), vec![skill.clone()]));
+        chat.set_skills_from_response(&response(cwd.join("other-project"), Vec::new()));
+        assert_eq!(chat.skills_all, vec![skill.clone()]);
+        chat.set_skills_from_response(&response(cwd.clone(), Vec::new()));
+        assert!(chat.skills_all.is_empty());
+
+        chat.set_skills_from_response(&response(cwd, vec![skill.clone()]));
+        chat.skills_initial_state = Some(HashMap::from([(skill.path, true)]));
+        chat.set_skills(None);
+        assert!(chat.skills_all.is_empty());
+        assert!(chat.skills_initial_state.is_none());
+    }
+
+    fn skill(name: &str) -> SkillMetadata {
+        SkillMetadata {
+            name: name.to_string(),
+            description: String::new(),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            policy: None,
+            path_to_skills_md: AbsolutePathBuf::from_absolute_path(
+                std::env::temp_dir().join(name).join("SKILL.md"),
+            )
+            .unwrap(),
+            scope: codex_protocol::protocol::SkillScope::User,
+            plugin_id: None,
+        }
+    }
+
+    #[test]
+    fn explicit_mention_identity_prevents_name_fallback() {
+        let skills = vec![skill("shared")];
+        let apps = vec![app("shared-app", "Shared")];
+        for path in [
+            "app://missing",
+            "skill://missing/SKILL.md",
+            "mcp://server/tool",
+        ] {
+            let mentions = collect_tool_mentions(
+                "$shared",
+                &HashMap::from([("shared".to_string(), path.to_string())]),
+            );
+            assert!(find_skill_mentions_with_tool_mentions(&mentions, &skills).is_empty());
+            assert!(find_app_mentions(&mentions, &apps, &HashSet::new()).is_empty());
+        }
+        let mentions = collect_tool_mentions("$shared", &HashMap::new());
+        assert_eq!(
+            find_skill_mentions_with_tool_mentions(&mentions, &skills),
+            skills
+        );
+        assert_eq!(find_app_mentions(&mentions, &apps, &HashSet::new()), apps);
+    }
+
+    #[test]
+    fn explicit_app_mention_does_not_select_same_named_skill() {
+        let skills = vec![skill("shared")];
+        let apps = vec![app("shared-app", "Shared")];
+        let mentions = collect_tool_mentions(
+            "$shared",
+            &HashMap::from([("shared".to_string(), "app://shared-app".to_string())]),
+        );
+        assert!(find_skill_mentions_with_tool_mentions(&mentions, &skills).is_empty());
+        assert_eq!(find_app_mentions(&mentions, &apps, &HashSet::new()), apps);
+    }
 
     fn app(id: &str, name: &str) -> AppInfo {
         AppInfo {

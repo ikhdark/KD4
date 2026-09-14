@@ -84,7 +84,11 @@ pub fn thread_manager_with_models_provider(
     auth: CodexAuth,
     provider: ModelProviderInfo,
 ) -> ThreadManager {
-    ThreadManager::with_models_provider_for_tests(auth, provider)
+    ThreadManager::with_models_provider_for_tests(
+        auth,
+        provider,
+        Arc::new(EmptyUserInstructionsProvider),
+    )
 }
 
 pub fn thread_manager_with_models_provider_and_home(
@@ -98,6 +102,7 @@ pub fn thread_manager_with_models_provider_and_home(
         provider,
         codex_home,
         environment_manager,
+        Arc::new(EmptyUserInstructionsProvider),
     )
 }
 
@@ -126,6 +131,7 @@ pub fn thread_manager_with_models_provider_home_and_state(
         codex_home,
         environment_manager,
         state_db,
+        Arc::new(EmptyUserInstructionsProvider),
     )
 }
 

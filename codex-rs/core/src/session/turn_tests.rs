@@ -2415,7 +2415,9 @@ struct TurnInputBudgetContributor {
     text: String,
 }
 
-struct EnvironmentEchoContributor;
+struct EnvironmentEchoContributor {
+    input_addresses: std::sync::Mutex<Vec<usize>>,
+}
 
 struct CountingTurnInputContributor {
     poll_count: Arc<AtomicUsize>,
@@ -2499,7 +2501,7 @@ impl TurnItemContributor for RewriteAgentMessageContributor {
 impl TurnInputContributor for TurnInputBudgetContributor {
     fn contribute<'a>(
         &'a self,
-        _input: TurnInputContext,
+        _input: &'a TurnInputContext,
         _session_store: &'a ExtensionData,
         _thread_store: &'a ExtensionData,
         _turn_store: &'a ExtensionData,
@@ -2521,7 +2523,7 @@ impl TurnInputContributor for TurnInputBudgetContributor {
 impl TurnInputContributor for EnvironmentEchoContributor {
     fn contribute<'a>(
         &'a self,
-        input: TurnInputContext,
+        input: &'a TurnInputContext,
         _session_store: &'a ExtensionData,
         _thread_store: &'a ExtensionData,
         _turn_store: &'a ExtensionData,
@@ -2530,6 +2532,10 @@ impl TurnInputContributor for EnvironmentEchoContributor {
         Vec<Box<dyn codex_extension_api::ContextualUserFragment + Send>>,
     > {
         Box::pin(async move {
+            self.input_addresses
+                .lock()
+                .expect("input addresses lock")
+                .push(std::ptr::from_ref(input) as usize);
             let environment = input
                 .environments
                 .first()
@@ -2550,7 +2556,7 @@ impl TurnInputContributor for EnvironmentEchoContributor {
 impl TurnInputContributor for CountingTurnInputContributor {
     fn contribute<'a>(
         &'a self,
-        _input: TurnInputContext,
+        _input: &'a TurnInputContext,
         _session_store: &'a ExtensionData,
         _thread_store: &'a ExtensionData,
         _turn_store: &'a ExtensionData,
@@ -2903,7 +2909,11 @@ async fn extension_turn_input_contributors_receive_foreign_environment_uris() {
             environment.shell,
         );
     let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
-    builder.turn_input_contributor(Arc::new(EnvironmentEchoContributor));
+    let contributor = Arc::new(EnvironmentEchoContributor {
+        input_addresses: std::sync::Mutex::new(Vec::new()),
+    });
+    builder.turn_input_contributor(contributor.clone());
+    builder.turn_input_contributor(contributor.clone());
     session.services.extensions = Arc::new(builder.build());
     let session = Arc::new(session);
     let step_context = StepContext::for_test(Arc::new(turn_context));
@@ -2916,7 +2926,16 @@ async fn extension_turn_input_contributors_receive_foreign_environment_uris() {
 
     assert_eq!(
         texts,
-        vec![format!("extension-environment:remote:{foreign_cwd}:true")]
+        vec![format!("extension-environment:remote:{foreign_cwd}:true"); 2]
+    );
+    let addresses = contributor
+        .input_addresses
+        .lock()
+        .expect("input addresses lock");
+    assert_eq!(addresses.len(), 2);
+    assert_eq!(
+        addresses[0], addresses[1],
+        "contributors must share one input snapshot"
     );
 }
 
@@ -3325,6 +3344,10 @@ fn registered_tool_completion_survives_worker_abort_before_history_commit() -> R
     )
 }
 
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Hold the contested owner to assert cancellation, admission, or cleanup behavior under contention"
+)]
 async fn registered_tool_completion_survives_worker_abort_before_history_commit_impl() -> Result<()>
 {
     use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
@@ -3366,6 +3389,7 @@ async fn registered_tool_completion_survives_worker_abort_before_history_commit_
         config.model_provider.clone(),
         home.path().to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let mut options = manager.start_thread_options(config);
     options.dynamic_tools = vec![DynamicToolSpec::Function(DynamicToolFunctionSpec {
@@ -6319,10 +6343,13 @@ async fn plan_prose_prefix_survives_worker_abort_during_item_start_impl() -> Res
         config.model_provider.clone(),
         home.path().to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     // The local store supports Legacy history; compare its persisted AgentMessage
     // conversion with the live ItemCompleted payload below.
-    let started = manager.start_thread_with_options(manager.start_thread_options(config)).await?;
+    let started = manager
+        .start_thread_with_options(manager.start_thread_options(config))
+        .await?;
     let thread = started.thread;
     let session = Arc::clone(&thread.codex.session);
     let (reached, reached_rx) = async_channel::bounded(1);
@@ -6434,8 +6461,11 @@ async fn plan_prose_prefix_survives_worker_abort_during_item_start_impl() -> Res
         );
         let starts = events.iter().filter(|event| matches!(event,
             EventMsg::ItemStarted(event) if matches!(&event.item, TurnItem::AgentMessage(item) if item.id == "plan-prefix-message"))).count();
-        assert_eq!(starts, if name == "live" { 1 } else { 0 },
-            "deferred start is delivered once and remains transient in physical history");
+        assert_eq!(
+            starts,
+            if name == "live" { 1 } else { 0 },
+            "deferred start is delivered once and remains transient in physical history"
+        );
     }
     let deltas = live
         .iter()

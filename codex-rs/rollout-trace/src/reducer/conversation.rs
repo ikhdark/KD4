@@ -10,6 +10,8 @@ use anyhow::Ok;
 use anyhow::Result;
 use anyhow::bail;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::collections::HashSet;
 
 use self::normalize::NormalizedConversationItem;
 use super::TraceReducer;
@@ -19,6 +21,7 @@ use crate::model::ConversationItem;
 use crate::model::ConversationItemKind;
 use crate::model::ConversationPart;
 use crate::model::ConversationRole;
+use crate::model::ExecutionStatus;
 use crate::model::InferenceCallId;
 use crate::model::ProducerRef;
 use crate::payload::RawPayloadRef;
@@ -143,11 +146,17 @@ impl TraceReducer {
             );
         };
 
-        let Some((thread_id, codex_turn_id)) = self
+        let Some((thread_id, codex_turn_id, closed)) = self
             .rollout
             .inference_calls
             .get(inference_call_id)
-            .map(|inference| (inference.thread_id.clone(), inference.codex_turn_id.clone()))
+            .map(|inference| {
+                (
+                    inference.thread_id.clone(),
+                    inference.codex_turn_id.clone(),
+                    inference.execution.status != ExecutionStatus::Running,
+                )
+            })
         else {
             bail!("inference response referenced unknown call {inference_call_id}");
         };
@@ -159,25 +168,43 @@ impl TraceReducer {
             .thread_conversation_snapshots
             .get(&thread_id)
             .map_or(0, Vec::len);
-        let response_item_ids = self.reconcile_conversation_items(
-            items,
-            ReconcileItems {
-                thread_id: &thread_id,
-                codex_turn_id: &codex_turn_id,
-                wall_time_unix_ms,
-                produced_by: vec![ProducerRef::Inference {
-                    inference_call_id: inference_call_id.clone(),
-                }],
-                start_index: append_at,
-                mode: ReconcileMode::AppendOnly,
-                snapshot_override: None,
-            },
-        )?;
+        let response_item_ids = if closed {
+            // Late evidence belongs to the closed call, not a newer live request.
+            self.reconcile_detached_conversation_items(
+                items,
+                DetachedReconcileItems {
+                    thread_id: &thread_id,
+                    codex_turn_id: &codex_turn_id,
+                    wall_time_unix_ms,
+                    produced_by: vec![ProducerRef::Inference {
+                        inference_call_id: inference_call_id.clone(),
+                    }],
+                    candidates: Vec::new(),
+                },
+            )?
+        } else {
+            self.reconcile_conversation_items(
+                items,
+                ReconcileItems {
+                    thread_id: &thread_id,
+                    codex_turn_id: &codex_turn_id,
+                    wall_time_unix_ms,
+                    produced_by: vec![ProducerRef::Inference {
+                        inference_call_id: inference_call_id.clone(),
+                    }],
+                    start_index: append_at,
+                    mode: ReconcileMode::AppendOnly,
+                    snapshot_override: None,
+                },
+            )?
+        };
         self.append_thread_conversation_items(&thread_id, &response_item_ids)?;
-        self.thread_conversation_snapshots
-            .entry(thread_id)
-            .or_default()
-            .extend(response_item_ids.clone());
+        if !closed {
+            self.thread_conversation_snapshots
+                .entry(thread_id)
+                .or_default()
+                .extend(response_item_ids.clone());
+        }
 
         if let Some(usage) = payload
             .get("token_usage")
@@ -205,16 +232,20 @@ impl TraceReducer {
             <[_]>::to_vec,
         );
         let mut item_ids = Vec::with_capacity(items.len());
+        let mut used_item_ids = HashSet::with_capacity(items.len());
+        let mut call_items = self.conversation_items_by_call_id(context.thread_id);
 
         for (offset, item) in items.into_iter().enumerate() {
             let index = context.start_index + offset;
             let tool_link_item = item.clone();
-            self.ensure_call_id_consistency(context.thread_id, &item)?;
+            self.ensure_call_id_consistency(&call_items, &item)?;
             let item_id = if let Some(previous_item_id) = previous_snapshot.get(index) {
-                if self.item_matches(previous_item_id, &item) {
+                if !used_item_ids.contains(previous_item_id)
+                    && self.item_matches(previous_item_id, &item)
+                {
                     previous_item_id.clone()
                 } else if matches!(context.mode, ReconcileMode::FullSnapshot) {
-                    self.find_matching_snapshot_item(&previous_snapshot, &item_ids, &item)
+                    self.find_matching_snapshot_item(&previous_snapshot, &used_item_ids, &item)
                         .unwrap_or_else(|| {
                             self.create_conversation_item(
                                 context.thread_id,
@@ -234,7 +265,7 @@ impl TraceReducer {
                     );
                 }
             } else if matches!(context.mode, ReconcileMode::FullSnapshot) {
-                self.find_matching_snapshot_item(&previous_snapshot, &item_ids, &item)
+                self.find_matching_snapshot_item(&previous_snapshot, &used_item_ids, &item)
                     .unwrap_or_else(|| {
                         self.create_conversation_item(
                             context.thread_id,
@@ -269,6 +300,14 @@ impl TraceReducer {
                 &tool_link_item.kind,
             )?;
             self.resolve_pending_agent_edges_for_item(&item_id)?;
+            if used_item_ids.insert(item_id.clone())
+                && let Some(call_id) = tool_link_item.call_id
+            {
+                    let ids = call_items.entry(call_id).or_default();
+                    if !ids.contains(&item_id) {
+                        ids.push(item_id.clone());
+                    }
+            }
             item_ids.push(item_id);
         }
 
@@ -297,8 +336,9 @@ impl TraceReducer {
         let replacement_items =
             normalize::normalize_model_items(replacement_history, checkpoint_payload)?;
         let input_candidates = self
-            .thread_conversation_snapshots
+            .pending_compaction_replacement_item_ids
             .get(thread_id)
+            .or_else(|| self.thread_conversation_snapshots.get(thread_id))
             .cloned()
             .unwrap_or_default();
         let input_item_ids = self.reconcile_detached_conversation_items(
@@ -323,6 +363,8 @@ impl TraceReducer {
                 channel: None,
                 kind: ConversationItemKind::CompactionMarker,
                 agent_message: None,
+                tool_name: None,
+                tool_namespace: None,
                 // The summary is a separate model/provider-visible item. Keep the marker body
                 // empty so transcript renderers cannot mistake the boundary for prompt content.
                 body: ConversationBody { parts: Vec::new() },
@@ -363,12 +405,14 @@ impl TraceReducer {
         context: DetachedReconcileItems<'_>,
     ) -> Result<Vec<String>> {
         let mut item_ids = Vec::with_capacity(items.len());
+        let mut used_item_ids = HashSet::with_capacity(items.len());
+        let mut call_items = self.conversation_items_by_call_id(context.thread_id);
 
         for item in items {
             let tool_link_item = item.clone();
-            self.ensure_call_id_consistency(context.thread_id, &item)?;
+            self.ensure_call_id_consistency(&call_items, &item)?;
             let item_id = self
-                .find_matching_snapshot_item(&context.candidates, &item_ids, &item)
+                .find_matching_snapshot_item(&context.candidates, &used_item_ids, &item)
                 .unwrap_or_else(|| {
                     self.create_conversation_item(
                         context.thread_id,
@@ -394,6 +438,14 @@ impl TraceReducer {
                 &tool_link_item.kind,
             )?;
             self.resolve_pending_agent_edges_for_item(&item_id)?;
+            if used_item_ids.insert(item_id.clone())
+                && let Some(call_id) = tool_link_item.call_id
+            {
+                    let ids = call_items.entry(call_id).or_default();
+                    if !ids.contains(&item_id) {
+                        ids.push(item_id.clone());
+                    }
+            }
             item_ids.push(item_id);
         }
 
@@ -421,6 +473,8 @@ impl TraceReducer {
                 channel: item.channel,
                 kind: item.kind,
                 agent_message: item.agent_message,
+                tool_name: item.tool_name,
+                tool_namespace: item.tool_namespace,
                 body: item.body,
                 call_id: item.call_id,
                 produced_by,
@@ -456,8 +510,9 @@ impl TraceReducer {
         item_ids: &[String],
     ) -> Result<()> {
         let thread = self.thread_mut(thread_id)?;
+        let mut known: HashSet<_> = thread.conversation_item_ids.iter().cloned().collect();
         for item_id in item_ids {
-            if !thread.conversation_item_ids.contains(item_id) {
+            if known.insert(item_id.clone()) {
                 thread.conversation_item_ids.push(item_id.clone());
             }
         }
@@ -467,31 +522,46 @@ impl TraceReducer {
     fn find_matching_snapshot_item(
         &self,
         previous_snapshot: &[String],
-        used_item_ids: &[String],
+        used_item_ids: &HashSet<String>,
         normalized: &NormalizedConversationItem,
     ) -> Option<String> {
         previous_snapshot
             .iter()
             .find(|item_id| {
-                !used_item_ids.contains(item_id) && self.item_matches(item_id, normalized)
+                !used_item_ids.contains(*item_id) && self.item_matches(item_id, normalized)
             })
             .cloned()
     }
 
+    fn conversation_items_by_call_id(&self, thread_id: &str) -> HashMap<String, Vec<String>> {
+        let mut by_call: HashMap<String, Vec<String>> = HashMap::new();
+        for item in self
+            .rollout
+            .conversation_items
+            .values()
+            .filter(|item| item.thread_id == thread_id)
+        {
+            if let Some(call_id) = &item.call_id {
+                by_call
+                    .entry(call_id.clone())
+                    .or_default()
+                    .push(item.item_id.clone());
+            }
+        }
+        by_call
+    }
+
     fn ensure_call_id_consistency(
         &self,
-        thread_id: &str,
+        call_items: &HashMap<String, Vec<String>>,
         normalized: &NormalizedConversationItem,
     ) -> Result<()> {
         let Some(call_id) = normalized.call_id.as_deref() else {
             return Ok(());
         };
-        for item in self.rollout.conversation_items.values() {
-            if item.thread_id == thread_id
-                && item.call_id.as_deref() == Some(call_id)
-                && item.kind == normalized.kind
-                && !conversation_item_matches(item, normalized)
-            {
+        for item_id in call_items.get(call_id).into_iter().flatten() {
+            let item = &self.rollout.conversation_items[item_id];
+            if item.kind == normalized.kind && !self.item_matches(item_id, normalized) {
                 bail!("model-visible call id {call_id} was reused with different content");
             }
         }
@@ -582,6 +652,8 @@ fn conversation_item_matches(
         && item.channel == normalized.channel
         && item.kind == normalized.kind
         && item.agent_message == normalized.agent_message
+        && item.tool_name == normalized.tool_name
+        && item.tool_namespace == normalized.tool_namespace
         && body_matches
         && item.call_id == normalized.call_id
 }
@@ -595,14 +667,14 @@ fn conversation_body_matches(left: &ConversationBody, right: &ConversationBody) 
             .all(|(left, right)| match (left, right) {
                 (
                     ConversationPart::Json {
-                        summary: left_summary,
-                        raw_payload_id: _,
+                        content_sha256: left_identity,
+                        ..
                     },
                     ConversationPart::Json {
-                        summary: right_summary,
-                        raw_payload_id: _,
+                        content_sha256: right_identity,
+                        ..
                     },
-                ) => left_summary == right_summary,
+                ) => !left_identity.is_empty() && left_identity == right_identity,
                 _ => left == right,
             })
 }

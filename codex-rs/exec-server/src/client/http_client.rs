@@ -5,7 +5,7 @@
 //! - [`ReqwestHttpClient`] preserves the historical public name while executing requests through
 //!   `codex-http-client`
 //! - [`ExecServerClient`] forwards requests over the JSON-RPC transport
-//! - [`HttpResponseBodyStream`] presents buffered local bodies and streamed
+//! - [`HttpResponseBodyStream`] presents streamed local bodies and remote
 //!   remote `http/request/bodyDelta` notifications through one byte-stream API
 //!
 //! Runtime split:

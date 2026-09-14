@@ -14,6 +14,34 @@ from scripts import rollout_snapshot
 
 
 class RolloutSnapshotTest(unittest.TestCase):
+    def test_cli_rejects_hardlink_to_live_rollout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "live.jsonl"
+            alias = Path(temp) / "alias.jsonl"
+            path.write_bytes(b"original")
+            alias.hardlink_to(path)
+            snapshot = rollout_snapshot.read_rollout_snapshot(path)
+            path.write_bytes(b"original appended")
+            with (
+                mock.patch.object(
+                    rollout_snapshot, "read_rollout_snapshot", return_value=snapshot
+                ),
+                self.assertRaisesRegex(ValueError, "must not overwrite"),
+            ):
+                rollout_snapshot.main([str(path), "--output", str(alias)])
+            self.assertEqual(path.read_bytes(), b"original appended")
+
+    def test_audit_excludes_nonobjects_and_partial_utf8(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "rollout.jsonl"
+            path.write_bytes(b'[]\n{"payload": {}}\n\xe2\x82')
+            report = kd4_turn_latency_audit.analyze_session_path(path, Path(temp))
+            self.assertEqual(report["coverage"]["parseErrorCount"], 2)
+            self.assertEqual(
+                report["coverage"]["snapshots"][0]["sha256"],
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+
     def test_snapshot_stays_fixed_after_open_writer_appends(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "rollout.jsonl"

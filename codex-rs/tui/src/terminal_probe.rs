@@ -4,8 +4,8 @@
 //! TUI startup and resume, where unsupported terminals should simply fall back to conservative
 //! defaults.
 //! This module sends the same kinds of optional terminal queries with a caller-provided deadline,
-//! prefers duplicated stdio handles, falls back to the controlling terminal path when stdio is
-//! unavailable, and reports `None` when a response is unavailable.
+//! borrows Windows standard console handles, falls back to the console palette, and reports
+//! `None` when neither source is available.
 //!
 //! Probes run only while the crossterm event stream is absent or paused, so they do not share
 //! crossterm's internal skipped-event queue. Bytes read while looking for probe responses are
@@ -37,13 +37,15 @@ mod imp {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
     use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
-    use windows_sys::Win32::Storage::FileSystem::ReadFile;
     use windows_sys::Win32::Storage::FileSystem::WriteFile;
     use windows_sys::Win32::System::Console::CONSOLE_SCREEN_BUFFER_INFOEX;
     use windows_sys::Win32::System::Console::ENABLE_VIRTUAL_TERMINAL_INPUT;
     use windows_sys::Win32::System::Console::GetConsoleMode;
     use windows_sys::Win32::System::Console::GetConsoleScreenBufferInfoEx;
     use windows_sys::Win32::System::Console::GetStdHandle;
+    use windows_sys::Win32::System::Console::INPUT_RECORD;
+    use windows_sys::Win32::System::Console::KEY_EVENT;
+    use windows_sys::Win32::System::Console::ReadConsoleInputW;
     use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
     use windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE;
     use windows_sys::Win32::System::Console::SetConsoleMode;
@@ -182,6 +184,8 @@ mod imp {
         Ok(())
     }
 
+    const MAX_RESPONSE_BYTES: usize = 4096;
+
     fn read_until<T>(
         handle: HANDLE,
         timeout: Duration,
@@ -195,7 +199,7 @@ mod imp {
             }
 
             let now = Instant::now();
-            if now >= deadline {
+            if now >= deadline || buffer.len() >= MAX_RESPONSE_BYTES {
                 return Ok(None);
             }
             let timeout_ms = deadline
@@ -212,24 +216,52 @@ mod imp {
     }
 
     fn read_once(handle: HANDLE, buffer: &mut Vec<u8>) -> io::Result<()> {
-        let mut chunk = [0_u8; 256];
+        // SAFETY: INPUT_RECORD is a C struct whose fields permit zero initialization.
+        let mut records = unsafe { std::mem::zeroed::<[INPUT_RECORD; 256]>() };
         let mut read = 0;
-        // SAFETY: The borrowed input handle, chunk, and read remain live for the synchronous call.
-        // The requested length fits chunk, and no OVERLAPPED is used.
-        let ok = unsafe {
-            ReadFile(
+        // SAFETY: The caller exclusively owns input and has just waited for unread records.
+        // ReadConsoleInputW consumes available records, including non-key events, without
+        // waiting for a character or newline as ReadFile can. Both output buffers are valid.
+        if unsafe {
+            ReadConsoleInputW(
                 handle,
-                chunk.as_mut_ptr().cast(),
-                chunk.len() as u32,
+                records.as_mut_ptr(),
+                records.len() as u32,
                 &mut read,
-                std::ptr::null_mut(),
             )
-        };
-        if ok == 0 {
+        } == 0
+        {
             return Err(io::Error::last_os_error());
         }
-        buffer.extend_from_slice(&chunk[..read as usize]);
+        append_response_records(buffer, &records[..read as usize]);
         Ok(())
+    }
+
+    fn append_response_records(buffer: &mut Vec<u8>, records: &[INPUT_RECORD]) {
+        for record in records {
+            if record.EventType != KEY_EVENT as u16 {
+                continue;
+            }
+            // SAFETY: EventType identifies the active union member.
+            let key = unsafe { record.Event.KeyEvent };
+            if key.bKeyDown == 0 {
+                continue;
+            }
+            // SAFETY: ReadConsoleInputW initializes the UnicodeChar member.
+            let character = unsafe { key.uChar.UnicodeChar };
+            if character == 0 {
+                continue;
+            }
+            // OSC color responses are ASCII. Preserve a boundary for unrelated Unicode input.
+            let byte = if character <= 0x7f {
+                character as u8
+            } else {
+                b'?'
+            };
+            let count =
+                usize::from(key.wRepeatCount).min(MAX_RESPONSE_BYTES.saturating_sub(buffer.len()));
+            buffer.extend(std::iter::repeat_n(byte, count));
+        }
     }
 
     #[cfg(test)]
@@ -237,6 +269,26 @@ mod imp {
         use super::*;
         use pretty_assertions::assert_eq;
         use windows_sys::Win32::System::Console::COMMON_LVB_REVERSE_VIDEO;
+
+        #[test]
+        fn response_records_ignore_non_characters_and_bound_repeated_input() {
+            // SAFETY: All fields permit zero initialization.
+            let mut record = unsafe { std::mem::zeroed::<INPUT_RECORD>() };
+            let mut bytes = Vec::new();
+            append_response_records(&mut bytes, &[record]);
+            assert!(bytes.is_empty());
+            record.EventType = KEY_EVENT as u16;
+            // SAFETY: The zeroed record contains a valid zeroed KEY_EVENT_RECORD.
+            let mut key = unsafe { record.Event.KeyEvent };
+            key.bKeyDown = 1;
+            key.wRepeatCount = u16::MAX;
+            key.uChar.UnicodeChar = u16::from(b'x');
+            record.Event.KeyEvent = key;
+            append_response_records(&mut bytes, &[record]);
+            assert_eq!(bytes, vec![b'x'; MAX_RESPONSE_BYTES]);
+            append_response_records(&mut bytes, &[record]);
+            assert_eq!(bytes.len(), MAX_RESPONSE_BYTES);
+        }
 
         fn color_table() -> [u32; 16] {
             [
@@ -301,12 +353,17 @@ mod imp {
 
 fn parse_osc_color(buffer: &[u8], slot: u8) -> Option<(u8, u8, u8)> {
     let prefix = format!("\x1B]{slot};");
-    let start = find_subslice(buffer, prefix.as_bytes())?;
-    let payload_start = start + prefix.len();
-    let rest = &buffer[payload_start..];
-    let (payload_end, _terminator_len) = osc_payload_end(rest)?;
-    let payload = std::str::from_utf8(&rest[..payload_end]).ok()?;
-    parse_osc_rgb(payload)
+    let mut remaining = buffer;
+    while let Some(start) = find_subslice(remaining, prefix.as_bytes()) {
+        remaining = &remaining[start + prefix.len()..];
+        if let Some((end, _)) = osc_payload_end(remaining)
+            && let Ok(payload) = std::str::from_utf8(&remaining[..end])
+            && let Some(color) = parse_osc_rgb(payload)
+        {
+            return Some(color);
+        }
+    }
+    None
 }
 
 fn parse_default_colors(buffer: &[u8]) -> Option<DefaultColors> {
@@ -368,6 +425,14 @@ mod tests {
 
     #[test]
     fn parses_osc_colors_with_bel_and_st() {
+        assert_eq!(
+            parse_osc_color(b"\x1b]10;bad\x07\x1b]10;rgb:01/02/03\x07", 10),
+            Some((1, 2, 3))
+        );
+        assert_eq!(
+            parse_osc_color(b"\x1b]10;partial\x1b]10;rgb:01/02/03\x07", 10),
+            Some((1, 2, 3))
+        );
         assert_eq!(
             parse_osc_color(b"\x1B]10;rgb:ffff/8000/0000\x07", /*slot*/ 10),
             Some((255, 127, 0))

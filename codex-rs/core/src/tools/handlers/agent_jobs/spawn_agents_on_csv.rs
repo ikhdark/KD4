@@ -263,13 +263,12 @@ pub async fn handle(
                     false
                 }
             };
-            if !cancelled {
-                if let Err(error) = db
+            if !cancelled
+                && let Err(error) = db
                     .mark_agent_job_failed(job_id.as_str(), error_message.as_str())
                     .await
                 {
                     failure_details.push_str(&format!("; failed to persist job failure: {error}"));
-                }
             }
             let cleanup_reason = if cancelled {
                 "job cancelled before worker completion"

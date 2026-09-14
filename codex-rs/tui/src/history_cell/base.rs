@@ -115,6 +115,20 @@ impl HistoryCell for CompositeHistoryCell {
         out
     }
 
+    fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut out = Vec::new();
+        for part in &self.parts {
+            let lines = part.transcript_lines(width);
+            if !lines.is_empty() {
+                if !out.is_empty() {
+                    out.push(Line::from(""));
+                }
+                out.extend(lines);
+            }
+        }
+        out
+    }
+
     fn display_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
         let mut out = Vec::new();
         let mut first = true;

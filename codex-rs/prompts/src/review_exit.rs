@@ -14,8 +14,13 @@ static REVIEW_EXIT_SUCCESS_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
 });
 
 pub fn render_review_exit_success(results: &str) -> String {
+    // Reviewer output is raw text, not markup belonging to the user-action envelope.
+    let results = results
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
     REVIEW_EXIT_SUCCESS_TEMPLATE
-        .render([("results", results)])
+        .render([("results", results.as_str())])
         .unwrap_or_else(|err| panic!("review exit success template must render: {err}"))
 }
 

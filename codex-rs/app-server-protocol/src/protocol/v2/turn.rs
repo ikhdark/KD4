@@ -94,9 +94,9 @@ pub struct TurnStartParams {
     pub additional_context: Option<IndexMap<String, AdditionalContextEntry>>,
     /// Optional environments for this turn and subsequent turns.
     ///
-    /// Omitted uses the thread sticky environments. Empty disables
-    /// environment access for this turn. Non-empty selects the first
-    /// environment as the current turn environment for this turn.
+    /// Omitted preserves the thread's environment selection. Empty disables
+    /// environment access; non-empty selects the first environment as current.
+    /// Explicit selections persist for subsequent turns until replaced.
     #[experimental("turn/start.environments")]
     #[ts(optional = nullable)]
     pub environments: Option<Vec<TurnEnvironmentParams>>,
@@ -305,13 +305,13 @@ pub enum UserInput {
     },
     Image {
         #[serde(default)]
-        #[ts(optional)]
+        #[ts(optional = nullable)]
         detail: Option<ImageDetail>,
         url: String,
     },
     LocalImage {
         #[serde(default)]
-        #[ts(optional)]
+        #[ts(optional = nullable)]
         detail: Option<ImageDetail>,
         path: PathBuf,
     },

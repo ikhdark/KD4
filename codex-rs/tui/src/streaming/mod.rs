@@ -30,7 +30,6 @@ struct QueuedLine {
 pub(crate) struct StreamState {
     pub(crate) collector: MarkdownStreamCollector,
     queued_lines: VecDeque<QueuedLine>,
-    pub(crate) has_seen_delta: bool,
 }
 
 impl StreamState {
@@ -42,14 +41,12 @@ impl StreamState {
         Self {
             collector: MarkdownStreamCollector::new(width, cwd),
             queued_lines: VecDeque::new(),
-            has_seen_delta: false,
         }
     }
     /// Resets collector and queue state for the next stream lifecycle.
     pub(crate) fn clear(&mut self) {
         self.collector.clear();
         self.queued_lines.clear();
-        self.has_seen_delta = false;
     }
     /// Drains one queued line from the front of the queue.
     pub(crate) fn step(&mut self) -> Vec<HyperlinkLine> {

@@ -262,7 +262,7 @@ async fn consume_timeout_releases_account_auth_queue() -> Result<()> {
     assert_eq!(consume_error.error.code, INTERNAL_ERROR_CODE);
     assert_eq!(
         consume_error.error.message,
-        "rate limit reset consume timed out"
+        "rate limit reset consume timed out; the outcome is unknown. Any retry must use the same idempotencyKey and the same credit selection"
     );
 
     timeout(

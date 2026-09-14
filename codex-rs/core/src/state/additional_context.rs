@@ -98,6 +98,7 @@ fn render_entry(key: &str, entry: &AdditionalContextEntry) -> ResponseInputItem 
     }
 }
 
+#[expect(clippy::expect_used, reason = "Additional context contains only text messages with infallible JSON serialization")]
 fn serialized_item_bytes(item: &ResponseInputItem) -> usize {
     // These messages contain only strings and InputText, whose JSON serialization
     // is infallible. Count actual escaping instead of assuming a fixed envelope.

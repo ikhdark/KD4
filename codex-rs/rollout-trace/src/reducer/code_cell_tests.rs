@@ -66,7 +66,7 @@ fn code_cell_terminal_observation_links_nested_tools_waits_and_outputs() -> anyh
         inference_call_id: "inference-1".to_string(),
         response_id: Some("resp-1".to_string()),
         upstream_request_id: None,
-        response_payload: response,
+        response_payload: Some(response),
     })?;
     writer.append_with_context(
         trace_context("turn-1"),
@@ -244,7 +244,7 @@ fn fast_code_cell_lifecycle_waits_for_source_item() -> anyhow::Result<()> {
         provider_name: "test-provider".to_string(),
         request_payload: request,
     })?;
-    writer.append_with_context(
+    let started = writer.append_with_context(
         trace_context("turn-1"),
         RawTraceEventPayload::CodeCellStarted {
             runtime_cell_id: "1".to_string(),
@@ -252,7 +252,7 @@ fn fast_code_cell_lifecycle_waits_for_source_item() -> anyhow::Result<()> {
             source_js: "not valid js".to_string(),
         },
     )?;
-    writer.append_with_context(
+    let initial = writer.append_with_context(
         trace_context("turn-1"),
         RawTraceEventPayload::CodeCellInitialResponse {
             runtime_cell_id: "1".to_string(),
@@ -260,7 +260,7 @@ fn fast_code_cell_lifecycle_waits_for_source_item() -> anyhow::Result<()> {
             response_payload: None,
         },
     )?;
-    writer.append_with_context(
+    let ended = writer.append_with_context(
         trace_context("turn-1"),
         RawTraceEventPayload::CodeCellEnded {
             runtime_cell_id: "1".to_string(),
@@ -284,13 +284,25 @@ fn fast_code_cell_lifecycle_waits_for_source_item() -> anyhow::Result<()> {
         inference_call_id: "inference-1".to_string(),
         response_id: Some("resp-1".to_string()),
         upstream_request_id: None,
-        response_payload: response,
+        response_payload: Some(response),
     })?;
 
     let rollout = replay_bundle(temp.path())?;
     let code_cell_id = test_reduced_code_cell_id("call-code");
     let cell = &rollout.code_cells[&code_cell_id];
 
+    assert_eq!(cell.execution.started_seq, started.seq);
+    assert_eq!(cell.execution.started_at_unix_ms, started.wall_time_unix_ms);
+    assert_eq!(cell.initial_response_seq, Some(initial.seq));
+    assert_eq!(
+        cell.initial_response_at_unix_ms,
+        Some(initial.wall_time_unix_ms)
+    );
+    assert_eq!(cell.execution.ended_seq, Some(ended.seq));
+    assert_eq!(
+        cell.execution.ended_at_unix_ms,
+        Some(ended.wall_time_unix_ms)
+    );
     assert_eq!(cell.thread_id, "thread-root");
     assert_eq!(cell.runtime_status, CodeCellRuntimeStatus::Failed);
     assert_eq!(cell.execution.status, ExecutionStatus::Failed);
@@ -305,66 +317,126 @@ fn fast_code_cell_lifecycle_waits_for_source_item() -> anyhow::Result<()> {
 
 #[test]
 fn cancelled_turn_terminates_unfinished_code_cell() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    let writer = create_started_writer(&temp)?;
-    start_turn(&writer, "turn-1")?;
+    for pending_source in [false, true] {
+        let temp = TempDir::new()?;
+        let writer = create_started_writer(&temp)?;
+        start_turn(&writer, "turn-1")?;
 
-    let request = writer.write_json_payload(
-        RawPayloadKind::InferenceRequest,
-        &json!({
-            "input": [message("user", "count files")]
-        }),
-    )?;
-    writer.append(RawTraceEventPayload::InferenceStarted {
-        inference_call_id: "inference-1".to_string(),
-        thread_id: "thread-root".to_string(),
-        codex_turn_id: "turn-1".to_string(),
-        model: "gpt-test".to_string(),
-        provider_name: "test-provider".to_string(),
-        request_payload: request,
-    })?;
-    let response = writer.write_json_payload(
-        RawPayloadKind::InferenceResponse,
-        &json!({
-            "response_id": "resp-1",
-            "output_items": [{
-                "type": "custom_tool_call",
-                "name": "exec",
-                "call_id": "call-code",
-                "input": "await tools.exec_command({cmd: 'slow'});"
-            }]
-        }),
-    )?;
-    writer.append(RawTraceEventPayload::InferenceCompleted {
-        inference_call_id: "inference-1".to_string(),
-        response_id: Some("resp-1".to_string()),
-        upstream_request_id: None,
-        response_payload: response,
-    })?;
-    writer.append_with_context(
-        trace_context("turn-1"),
-        RawTraceEventPayload::CodeCellStarted {
-            runtime_cell_id: "1".to_string(),
-            model_visible_call_id: "call-code".to_string(),
-            source_js: "await tools.exec_command({cmd: 'slow'});".to_string(),
-        },
-    )?;
-    let turn_end = writer.append_with_context(
-        trace_context("turn-1"),
-        RawTraceEventPayload::CodexTurnEnded {
+        let request = writer.write_json_payload(
+            RawPayloadKind::InferenceRequest,
+            &json!({
+                "input": [message("user", "count files")]
+            }),
+        )?;
+        writer.append(RawTraceEventPayload::InferenceStarted {
+            inference_call_id: "inference-1".to_string(),
+            thread_id: "thread-root".to_string(),
             codex_turn_id: "turn-1".to_string(),
-            status: ExecutionStatus::Cancelled,
-        },
-    )?;
+            model: "gpt-test".to_string(),
+            provider_name: "test-provider".to_string(),
+            request_payload: request,
+        })?;
+        let response = writer.write_json_payload(
+            RawPayloadKind::InferenceResponse,
+            &json!({
+                "response_id": "resp-1",
+                "output_items": [{
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "call_id": "call-code",
+                    "input": "await tools.exec_command({cmd: 'slow'});"
+                }]
+            }),
+        )?;
+        if !pending_source {
+            writer.append(RawTraceEventPayload::InferenceCompleted {
+                inference_call_id: "inference-1".to_string(),
+                response_id: Some("resp-1".to_string()),
+                upstream_request_id: None,
+                response_payload: Some(response.clone()),
+            })?;
+        }
+        writer.append_with_context(
+            trace_context("turn-1"),
+            RawTraceEventPayload::CodeCellStarted {
+                runtime_cell_id: "1".to_string(),
+                model_visible_call_id: "call-code".to_string(),
+                source_js: "await tools.exec_command({cmd: 'slow'});".to_string(),
+            },
+        )?;
+        // The queued cell must retain both wait links and turn-end cancellation.
+        let wait_request = writer.write_json_payload(
+            RawPayloadKind::ToolInvocation,
+            &json!({
+                "tool_name": "wait", "payload": {"arguments": "{\"cell_id\":\"1\"}"}
+            }),
+        )?;
+        writer.append_with_context(
+            trace_context("turn-1"),
+            RawTraceEventPayload::ToolCallStarted {
+                tool_call_id: "wait-tool".to_string(),
+                model_visible_call_id: Some("wait-call".to_string()),
+                code_mode_runtime_tool_id: None,
+                requester: RawToolCallRequester::Model,
+                kind: ToolCallKind::Other {
+                    name: "wait".to_string(),
+                },
+                summary: crate::reducer::test_support::generic_summary("wait"),
+                invocation_payload: Some(wait_request),
+            },
+        )?;
+        let turn_end = writer.append_with_context(
+            trace_context("turn-1"),
+            RawTraceEventPayload::CodexTurnEnded {
+                codex_turn_id: "turn-1".to_string(),
+                status: ExecutionStatus::Cancelled,
+            },
+        )?;
 
-    let rollout = replay_bundle(temp.path())?;
-    let code_cell_id = test_reduced_code_cell_id("call-code");
-    let cell = &rollout.code_cells[&code_cell_id];
+        let initial = writer.append_with_context(
+            trace_context("turn-1"),
+            RawTraceEventPayload::CodeCellInitialResponse {
+                runtime_cell_id: "1".to_string(),
+                status: CodeCellRuntimeStatus::Yielded,
+                response_payload: None,
+            },
+        )?;
+        writer.append_with_context(
+            trace_context("turn-1"),
+            RawTraceEventPayload::CodeCellEnded {
+                runtime_cell_id: "1".to_string(),
+                status: CodeCellRuntimeStatus::Completed,
+                response_payload: None,
+            },
+        )?;
 
-    assert_eq!(cell.runtime_status, CodeCellRuntimeStatus::Terminated);
-    assert_eq!(cell.execution.status, ExecutionStatus::Cancelled);
-    assert_eq!(cell.execution.ended_seq, Some(turn_end.seq));
+        if pending_source {
+            writer.append(RawTraceEventPayload::InferenceCompleted {
+                inference_call_id: "inference-1".to_string(),
+                response_id: Some("resp-1".to_string()),
+                upstream_request_id: None,
+                response_payload: Some(response.clone()),
+            })?;
+        }
+        let rollout = replay_bundle(temp.path())?;
+        let code_cell_id = test_reduced_code_cell_id("call-code");
+        let cell = &rollout.code_cells[&code_cell_id];
 
+        assert_eq!(cell.runtime_status, CodeCellRuntimeStatus::Terminated);
+        assert_eq!(cell.execution.status, ExecutionStatus::Cancelled);
+        assert_eq!(cell.execution.ended_seq, Some(turn_end.seq));
+
+        assert_eq!(
+            cell.execution.ended_at_unix_ms,
+            Some(turn_end.wall_time_unix_ms)
+        );
+        // Turn-end supplies the first response boundary; late yield evidence
+        // remains visible without moving that boundary or reopening execution.
+        assert_eq!(cell.initial_response_seq, Some(turn_end.seq));
+        assert_eq!(cell.yielded_seq, Some(initial.seq));
+        assert_eq!(cell.yielded_at_unix_ms, Some(initial.wall_time_unix_ms));
+        assert_eq!(cell.wait_tool_call_ids, vec!["wait-tool"]);
+    }
     Ok(())
 }
 
@@ -427,13 +499,18 @@ fn runtime_code_cell_ids_can_repeat_across_threads() -> anyhow::Result<()> {
             inference_call_id: inference_call_id.to_string(),
             response_id: Some(format!("resp-{thread_id}")),
             upstream_request_id: None,
-            response_payload: response,
+            response_payload: Some(response),
         })?;
+    }
+    for (thread_id, turn_id, status) in [
+        ("thread-root", "turn-root", CodeCellRuntimeStatus::Completed),
+        ("thread-child", "turn-child", CodeCellRuntimeStatus::Failed),
+    ] {
         writer.append_with_context(
             trace_context_for_thread(thread_id, turn_id),
             RawTraceEventPayload::CodeCellEnded {
                 runtime_cell_id: "1".to_string(),
-                status: CodeCellRuntimeStatus::Completed,
+                status,
                 response_payload: None,
             },
         )?;
@@ -443,6 +520,14 @@ fn runtime_code_cell_ids_can_repeat_across_threads() -> anyhow::Result<()> {
     let root_cell_id = test_reduced_code_cell_id("call-root");
     let child_cell_id = test_reduced_code_cell_id("call-child");
 
+    assert_eq!(
+        rollout.code_cells[&root_cell_id].execution.status,
+        ExecutionStatus::Completed
+    );
+    assert_eq!(
+        rollout.code_cells[&child_cell_id].execution.status,
+        ExecutionStatus::Failed
+    );
     assert_eq!(rollout.code_cells[&root_cell_id].thread_id, "thread-root");
     assert_eq!(rollout.code_cells[&child_cell_id].thread_id, "thread-child");
     assert_eq!(

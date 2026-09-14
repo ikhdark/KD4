@@ -33,7 +33,7 @@ pub async fn start_stdio_connection(
         transport_event_tx,
         stdio_handles,
         initialize_client_name_tx,
-        spawn_stdin_line_reader(),
+        spawn_stdin_line_reader()?,
         NativeStdout::new()?,
     )
     .await
@@ -194,12 +194,12 @@ impl AsyncWrite for NativeStdout {
     }
 }
 
-fn spawn_stdin_line_reader() -> mpsc::Receiver<IoResult<String>> {
+fn spawn_stdin_line_reader() -> IoResult<mpsc::Receiver<IoResult<String>>> {
     // Tokio's stdin reader uses an uncancellable blocking read that runtime shutdown waits for.
     // Keep that read on a detached OS thread so closing the async receiver lets this transport and
     // its runtime finish even when the client deliberately leaves stdin open.
     let (line_tx, line_rx) = mpsc::channel(CHANNEL_CAPACITY);
-    if let Err(err) = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("codex-app-server-stdin".to_string())
         .spawn(move || {
             let stdin = std::io::stdin();
@@ -222,11 +222,8 @@ fn spawn_stdin_line_reader() -> mpsc::Receiver<IoResult<String>> {
                     }
                 }
             }
-        })
-    {
-        error!("Failed to start stdin reader thread: {err}");
-    }
-    line_rx
+        })?;
+    Ok(line_rx)
 }
 
 async fn start_stdio_connection_with_io<W>(
@@ -267,7 +264,8 @@ where
             };
             match line {
                 Some(Ok(line)) => {
-                    if let Some(client_name) = stdio_initialize_client_name(&line)
+                    if initialize_client_name_tx.is_some()
+                        && let Some(client_name) = stdio_initialize_client_name(&line)
                         && let Some(initialize_client_name_tx) = initialize_client_name_tx.take()
                     {
                         let _ = initialize_client_name_tx.send(client_name);
@@ -396,6 +394,38 @@ mod tests {
     use super::*;
     use crate::outgoing_message::OutgoingMessage;
     use crate::outgoing_message::OutgoingResponse;
+
+    #[tokio::test]
+    async fn stdio_forwards_messages_after_initialize_name_handoff() {
+        timeout(Duration::from_secs(2), async {
+            let (events_tx, mut events_rx) = mpsc::channel(CHANNEL_CAPACITY);
+            let (lines_tx, lines_rx) = mpsc::channel(CHANNEL_CAPACITY);
+            let (initialize_tx, initialize_rx) = oneshot::channel();
+            let mut handles = Vec::new();
+            start_stdio_connection_with_io(events_tx, &mut handles, initialize_tx, lines_rx, tokio::io::sink()).await.unwrap();
+            assert!(matches!(events_rx.recv().await, Some(TransportEvent::ConnectionOpened { .. })));
+            let initialize = json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"first-client","version":"1"}}});
+            lines_tx.send(Ok(initialize.to_string())).await.unwrap();
+            assert_eq!(initialize_rx.await.unwrap(), "first-client");
+            let later = json!({"id":2,"method":"config/read","params":{"includeLayers":false}});
+            lines_tx.send(Ok(later.to_string())).await.unwrap();
+            for expected in [initialize, later] {
+                match events_rx.recv().await.unwrap() {
+                    TransportEvent::IncomingMessage { message, .. } => {
+                        let expected: JSONRPCMessage = serde_json::from_value(expected).unwrap();
+                        assert_eq!(message, expected);
+                    }
+                    event => panic!("expected unchanged forwarded message: {event:?}"),
+                }
+            }
+            drop(lines_tx);
+            for handle in handles {
+                handle.await.unwrap();
+            }
+            assert!(matches!(events_rx.recv().await, Some(TransportEvent::ConnectionClosed { .. })));
+            assert!(events_rx.recv().await.is_none());
+        }).await.expect("stdio must forward messages and finish on EOF");
+    }
 
     #[test]
     fn native_stdio_eof_releases_runtime_with_unread_stdout() {

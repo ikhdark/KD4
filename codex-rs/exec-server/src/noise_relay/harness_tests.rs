@@ -82,7 +82,7 @@ async fn fragmented_writes_yield_to_keepalive_and_queued_pong() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(start_paused = true)]
 async fn post_deadline_drain_stops_before_frame_33() -> Result<()> {
     let (mut connection, mut control, mut outbound_rx) = connected_controlled_harness().await?;
 
@@ -105,7 +105,7 @@ async fn post_deadline_drain_stops_before_frame_33() -> Result<()> {
 
     // Keep the current-thread runtime from consuming the queued frames until the
     // Pong deadline and every frame are ready together.
-    std::thread::sleep(WEBSOCKET_PONG_TIMEOUT + Duration::from_millis(10));
+    tokio::time::advance(WEBSOCKET_PONG_TIMEOUT + Duration::from_millis(10)).await;
 
     let event = timeout(Duration::from_secs(1), connection.incoming_rx.recv()).await?;
     let Some(JsonRpcConnectionEvent::Disconnected { reason }) = event else {
@@ -215,7 +215,7 @@ async fn pong_keeps_harness_alive_until_peer_stops_responding() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn application_event_delivery_is_bounded() -> Result<()> {
     let (incoming_tx, _incoming_rx) = mpsc::channel(1);
     incoming_tx
@@ -224,16 +224,37 @@ async fn application_event_delivery_is_bounded() -> Result<()> {
         })
         .await?;
 
-    let result = send_incoming_event(
-        &incoming_tx,
-        JsonRpcConnectionEvent::MalformedMessage {
-            reason: "blocked event".to_string(),
-        },
-        Instant::now() + Duration::from_millis(10),
+    let result = timeout(
+        Duration::from_secs(1),
+        send_incoming_event(
+            &incoming_tx,
+            JsonRpcConnectionEvent::MalformedMessage {
+                reason: "blocked event".to_string(),
+            },
+            Instant::now() + Duration::from_millis(10),
+        ),
     )
-    .await;
+    .await?;
 
     assert!(matches!(result, Err(ExecServerError::Closed)));
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn keepalive_flush_is_bounded_without_starting_pong_clock() -> Result<()> {
+    let (mut websocket, _control, mut outbound_rx) = ControlledWebSocket::new(1);
+    websocket.block_flush = true;
+    let mut watchdog = WebSocketPongWatchdog::new(WEBSOCKET_PONG_TIMEOUT);
+    let deadline = tokio::time::sleep(WEBSOCKET_PONG_TIMEOUT);
+    tokio::pin!(deadline);
+    let result = timeout(
+        WEBSOCKET_PONG_TIMEOUT + Duration::from_secs(1),
+        send_keepalive_ping(&mut websocket, &mut watchdog, deadline.as_mut()),
+    )
+    .await?;
+    assert_eq!(result, Err("websocket write timed out".to_string()));
+    assert!(matches!(outbound_rx.try_recv()?, Message::Ping(_)));
+    assert_eq!(watchdog.deadline(), None);
     Ok(())
 }
 
@@ -308,6 +329,7 @@ struct ControlledWebSocket {
     write_waiting: bool,
     blocked_writes: usize,
     inbound_reads: Arc<AtomicUsize>,
+    block_flush: bool,
 }
 
 struct ControlledWebSocketHandle {
@@ -344,6 +366,7 @@ impl ControlledWebSocket {
                 write_waiting: false,
                 blocked_writes: 0,
                 inbound_reads: Arc::clone(&inbound_reads),
+                block_flush: false,
             },
             ControlledWebSocketHandle {
                 inbound_tx,
@@ -418,6 +441,9 @@ impl Sink<Message> for ControlledWebSocket {
         self: Pin<&mut Self>,
         _cx: &mut TaskContext<'_>,
     ) -> Poll<Result<(), Self::Error>> {
+        if self.block_flush {
+            return Poll::Pending;
+        }
         Poll::Ready(Ok(()))
     }
 

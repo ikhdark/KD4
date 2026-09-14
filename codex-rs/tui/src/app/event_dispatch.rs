@@ -189,6 +189,7 @@ impl App {
                     self.chat_widget.thread_id(),
                     self.chat_widget.thread_name(),
                     self.chat_widget.rollout_path().as_deref(),
+                    app_server.uses_remote_workspace(),
                 )
                 .await;
                 self.chat_widget
@@ -207,18 +208,8 @@ impl App {
                             {
                                 Ok(()) => {
                                     if let Some(summary) = summary {
-                                        let mut lines: Vec<Line<'static>> = Vec::new();
-                                        if let Some(usage_line) = summary.usage_line {
-                                            lines.push(usage_line.into());
-                                        }
-                                        if let Some(command) = summary.resume_hint {
-                                            let spans = vec![
-                                                "To continue this session, run ".into(),
-                                                command.cyan(),
-                                            ];
-                                            lines.push(spans.into());
-                                        }
-                                        self.chat_widget.add_plain_history_lines(lines);
+                                        self.chat_widget
+                                            .add_plain_history_lines(summary.into_lines());
                                     }
                                 }
                                 Err(err) => {
@@ -481,7 +472,16 @@ impl App {
                 self.enqueue_thread_history_entry_response(thread_id, event)
                     .await?;
             }
-            AppEvent::DiffResult(text) => {
+            AppEvent::DiffResult {
+                thread_id,
+                cwd,
+                text,
+            } => {
+                if self.chat_widget.thread_id() != thread_id
+                    || self.chat_widget.config_ref().cwd.as_path() != cwd.as_path()
+                {
+                    return Ok(AppRunControl::Continue);
+                }
                 // Clear the in-progress state in the bottom pane
                 self.chat_widget.on_diff_complete();
                 // Enter alternate screen using TUI helper and build pager lines
@@ -904,7 +904,7 @@ impl App {
                         }
                         RateLimitRefreshOrigin::StatusCommand { request_id } => {
                             self.chat_widget
-                                .finish_status_rate_limit_refresh(request_id, snapshots);
+                                .finish_status_rate_limit_refresh(request_id, Ok(snapshots));
                         }
                         RateLimitRefreshOrigin::UsageMenu { request_id } => {
                             self.chat_widget.finish_usage_menu_rate_limit_refresh(
@@ -949,7 +949,7 @@ impl App {
                         }
                         RateLimitRefreshOrigin::StatusCommand { request_id } => {
                             self.chat_widget
-                                .finish_status_rate_limit_refresh(request_id, Vec::new());
+                                .finish_status_rate_limit_refresh(request_id, Err(()));
                         }
                         RateLimitRefreshOrigin::UsageMenu { request_id } => {
                             self.chat_widget.finish_usage_menu_rate_limit_refresh(
@@ -1103,12 +1103,18 @@ impl App {
                     .await;
             }
             AppEvent::OpenWorldWritableWarningConfirmation {
+                origin,
                 preset,
                 profile_selection,
                 sample_paths,
                 extra_count,
                 failed_scan,
             } => {
+                if origin.is_some_and(|origin| {
+                    origin != crate::app_event::WorldWritableScanOrigin::from_config(&self.config)
+                }) {
+                    return Ok(AppRunControl::Continue);
+                }
                 self.chat_widget.open_world_writable_warning_confirmation(
                     preset,
                     profile_selection,
@@ -1145,7 +1151,7 @@ impl App {
             }
             AppEvent::LaunchExternalEditor => {
                 if self.chat_widget.external_editor_state() == ExternalEditorState::Active {
-                    self.launch_external_editor(tui).await;
+                    self.launch_external_editor(tui).await?;
                 }
             }
             AppEvent::OpenWindowsSandboxEnablePrompt {
@@ -1430,6 +1436,7 @@ impl App {
                                 ));
                                 self.app_event_tx.send(
                                     AppEvent::OpenWorldWritableWarningConfirmation {
+                                        origin: None,
                                         preset: Some(preset.clone()),
                                         profile_selection: profile_selection.clone(),
                                         sample_paths,
@@ -1904,6 +1911,13 @@ impl App {
                 match crate::config_update::write_config_batch(app_server.request_handle(), edits)
                     .await
                 {
+                    Ok(response) if response.status == WriteStatus::OkOverridden => {
+                        self.chat_widget.refresh_connectors(/*force_refetch*/ true);
+                        self.chat_widget.add_info_message(
+                            "App setting was saved but is overridden by a higher-priority configuration.".to_string(),
+                            None,
+                        );
+                    }
                     Ok(_) => {
                         self.chat_widget.update_connector_enabled(&id, enabled);
                     }
@@ -2064,12 +2078,22 @@ impl App {
                     }
                 }
             }
-            AppEvent::StatusLineBranchUpdated { cwd, branch } => {
-                self.chat_widget.set_status_line_branch(cwd, branch);
+            AppEvent::StatusLineBranchUpdated {
+                request_id,
+                cwd,
+                branch,
+            } => {
+                self.chat_widget
+                    .set_status_line_branch(request_id, cwd, branch);
                 self.refresh_status_line();
             }
-            AppEvent::StatusLineGitSummaryUpdated { cwd, summary } => {
-                self.chat_widget.set_status_line_git_summary(cwd, summary);
+            AppEvent::StatusLineGitSummaryUpdated {
+                request_id,
+                cwd,
+                summary,
+            } => {
+                self.chat_widget
+                    .set_status_line_git_summary(request_id, cwd, summary);
                 self.refresh_status_line();
             }
             AppEvent::StatusLineWorkspaceHeadlineUpdated { request_id, result } => {

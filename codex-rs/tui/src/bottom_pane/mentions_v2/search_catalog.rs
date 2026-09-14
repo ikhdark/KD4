@@ -89,7 +89,9 @@ fn plugin_mention_name(plugin_name: &str, display_name: &str) -> String {
                 result.push(separator);
             }
         }
-        return result;
+        if result.eq_ignore_ascii_case(plugin_name) {
+            return result;
+        }
     }
 
     title_case_plugin_name(plugin_name)
@@ -191,6 +193,37 @@ fn optional_skill_description(skill: &SkillMetadata) -> Option<String> {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn catalog_preserves_plugin_name_separators_in_inserted_mentions() {
+        let plugins = [
+            PluginCapabilitySummary {
+                config_name: "mcp--search@test".to_string(),
+                display_name: "MCP Search".to_string(),
+                ..Default::default()
+            },
+            PluginCapabilitySummary {
+                config_name: "_sample@test".to_string(),
+                display_name: "Sample".to_string(),
+                ..Default::default()
+            },
+        ];
+        let catalog = build_search_catalog(None, Some(&plugins));
+        assert_eq!(
+            catalog[0].selection,
+            Selection::Tool {
+                insert_text: "@Mcp--Search".to_string(),
+                path: Some("plugin://mcp--search@test".to_string()),
+            }
+        );
+        assert_eq!(
+            catalog[1].selection,
+            Selection::Tool {
+                insert_text: "@_Sample".to_string(),
+                path: Some("plugin://_sample@test".to_string()),
+            }
+        );
+    }
 
     #[test]
     fn plugin_mention_name_uses_display_segments_when_they_match_plugin_name() {

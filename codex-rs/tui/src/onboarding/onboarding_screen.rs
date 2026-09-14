@@ -291,10 +291,8 @@ impl KeyboardHandler for OnboardingScreen {
         if should_quit {
             if self.is_auth_in_progress() {
                 self.cancel_auth_if_active();
-                // If the user cancels the auth menu, exit the app rather than
-                // leave the user at a prompt in an unauthed state.
-                self.should_exit = true;
             }
+            self.should_exit = true;
             self.is_done = true;
         } else {
             if let Some(Step::Welcome(widget)) = self
@@ -411,14 +409,11 @@ impl WidgetRef for &OnboardingScreen {
             step.render_ref(scratch_area, &mut scratch);
             let h = used_rows(&scratch, width, max_h).min(max_h);
             if h > 0 {
-                let target = Rect {
-                    x: area.x,
-                    y,
-                    width,
-                    height: h,
-                };
-                Clear.render(target, buf);
-                step.render_ref(target, buf);
+                for row in 0..h {
+                    for column in 0..width {
+                        buf[(area.x + column, y + row)] = scratch[(column, row)].clone();
+                    }
+                }
                 y = y.saturating_add(h);
             }
             i += 1;
@@ -521,7 +516,7 @@ pub(crate) async fn run_onboarding_app(
                                 })
                             {
                                 // Reset any lingering SGR (underline/color) before clearing
-                                let _ = ratatui::crossterm::execute!(
+                                ratatui::crossterm::execute!(
                                     std::io::stdout(),
                                     ratatui::crossterm::style::SetAttribute(
                                         ratatui::crossterm::style::Attribute::Reset
@@ -535,15 +530,18 @@ pub(crate) async fn run_onboarding_app(
                                     ratatui::crossterm::style::SetBackgroundColor(
                                         ratatui::crossterm::style::Color::Reset
                                     )
-                                );
-                                let _ = tui.terminal.clear();
+                                )?;
+                                tui.terminal.clear()?;
                                 did_full_clear_after_success = true;
                             }
-                            let _ = tui.draw(u16::MAX, |frame| {
+                            tui.draw(u16::MAX, |frame| {
                                 frame.render_widget_ref(&onboarding_screen, frame.area());
-                            });
+                            })?;
                         }
                     }
+                } else {
+                    onboarding_screen.cancel_auth_if_active();
+                    return Err(color_eyre::eyre::eyre!("terminal event stream ended during onboarding"));
                 }
             }
             event = async {
@@ -563,6 +561,8 @@ pub(crate) async fn run_onboarding_app(
                         AppServerEvent::Lagged { .. }
                         | AppServerEvent::ServerRequest(_) => {}
                     }
+                } else {
+                    return Err(color_eyre::eyre::eyre!("app-server event stream ended during onboarding"));
                 }
             }
         }
@@ -623,6 +623,7 @@ async fn persist_selected_trust(
 #[cfg(test)]
 mod tests {
     use super::ApiKeyEntryContext;
+    use super::KeyboardHandler;
     use super::OnboardingScreen;
     use super::Step;
     use super::StepStateProvider;
@@ -636,6 +637,68 @@ mod tests {
     use crossterm::event::KeyModifiers;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
+
+    fn trust_screen() -> OnboardingScreen {
+        OnboardingScreen {
+            request_frame: FrameRequester::test_dummy(),
+            steps: vec![Step::TrustDirectory(TrustDirectoryWidget {
+                cwd: PathBuf::from("/workspace/project"),
+                trust_target: PathBuf::from("/workspace/project"),
+                show_windows_create_sandbox_hint: false,
+                should_quit: false,
+                selection: None,
+                highlighted: TrustDirectorySelection::Trust,
+                error: None,
+            })],
+            is_done: false,
+            should_exit: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn quit_from_trust_exits_without_granting_trust() {
+        for key in [
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        ] {
+            let mut screen = trust_screen();
+            screen.handle_key_event(key);
+            assert!(screen.is_done());
+            assert!(screen.should_exit());
+            let Step::TrustDirectory(widget) = &screen.steps[0] else {
+                panic!("missing trust step")
+            };
+            assert_eq!(widget.selection, None);
+            assert!(!persist_selected_trust(&mut screen, None).await);
+        }
+    }
+
+    #[test]
+    fn measured_screen_cells_are_translated_to_the_viewport() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::WidgetRef;
+        let screen = trust_screen();
+        let origin = Rect::new(0, 0, 80, 30);
+        let offset = Rect::new(3, 5, 80, 30);
+        let mut expected = Buffer::empty(origin);
+        let mut actual = Buffer::empty(Rect::new(0, 0, 90, 40));
+        (&screen).render_ref(origin, &mut expected);
+        (&screen).render_ref(offset, &mut actual);
+        let text: String = expected
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(text.contains("/workspace/project"));
+        for y in 0..origin.height {
+            for x in 0..origin.width {
+                assert_eq!(&actual[(x + offset.x, y + offset.y)], &expected[(x, y)]);
+            }
+        }
+        assert_eq!(actual[(0, 0)].symbol(), " ");
+    }
 
     #[test]
     fn suppresses_printable_quit_key_during_api_key_entry() {

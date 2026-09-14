@@ -1,7 +1,7 @@
 {
-  "index_sha256": "7d44dc695c462972f06c8298e0b4a5b9b99ccefadcaeafda5590f5e875f95a0c",
+  "index_sha256": "d52a9a163fcd736c4e26ae83ef9e5a6b620d6d80fe2a1113b1e1ba41ec4dfa76",
   "index_version": 1,
-  "manifest_sha256": "970064dd145368343bb8a85a1c55dd1b1c452df24acc19f7db563ee4b0e99708",
+  "manifest_sha256": "da7a4cd9da9e872f5c317ecc7800c0730d10a77758b4d7deccf4602696ce3f93",
   "omitted": {
     "relationships": 0
   },
@@ -108,7 +108,6 @@
       ],
       "primary_entries": [
         {
-          "ambiguous": true,
           "path": "codex-rs/app-server-protocol/src/bin/write_schema_fixtures.rs",
           "symbol": "main"
         }
@@ -199,7 +198,6 @@
         {
           "evidence": [
             {
-              "ambiguous": true,
               "path": "codex-rs/app-server-test-client/src/main.rs",
               "symbol": "main"
             }
@@ -214,7 +212,6 @@
         {
           "evidence": [
             {
-              "ambiguous": true,
               "path": "codex-rs/app-server-test-client/src/main.rs",
               "symbol": "main"
             }
@@ -229,7 +226,6 @@
       ],
       "primary_entries": [
         {
-          "ambiguous": true,
           "path": "codex-rs/app-server-test-client/src/main.rs",
           "symbol": "main"
         }
@@ -287,7 +283,6 @@
       ],
       "primary_entries": [
         {
-          "ambiguous": true,
           "path": "codex-rs/cli/src/main.rs",
           "symbol": "main"
         }
@@ -1061,12 +1056,10 @@
       ],
       "primary_entries": [
         {
-          "ambiguous": true,
           "path": "codex-rs/core/benches/turn_latency.rs",
           "symbol": "main"
         },
         {
-          "ambiguous": true,
           "path": "scripts/kd4_live_agent_benchmark.py",
           "symbol": "main"
         }
@@ -1266,7 +1259,6 @@
       ],
       "primary_entries": [
         {
-          "ambiguous": true,
           "path": "scripts/source_owners.py",
           "symbol": "main"
         }
@@ -2289,6 +2281,23 @@
       "target": "owner:feature-registry"
     },
     {
+      "category": "runtime_registration",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/core/src/tools/spec_plan.rs",
+          "symbol": "build_tool_specs_and_registry"
+        },
+        {
+          "path": "codex-rs/core/src/tools/registry.rs",
+          "symbol": "from_unique_registered_tools"
+        }
+      ],
+      "kind": "registers",
+      "source": "owner:core-agent-runtime",
+      "target": "path:codex-rs/core/src/tools/registry.rs"
+    },
+    {
       "category": "tests_contracts",
       "confidence": "declared",
       "evidence": [
@@ -2345,6 +2354,27 @@
       "kind": "consumed_by",
       "source": "owner:feature-registry",
       "target": "owner:core-agent-runtime"
+    },
+    {
+      "category": "runtime_registration",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/features/src/lib.rs",
+          "symbol": "define_features"
+        },
+        {
+          "path": "codex-rs/features/src/lib.rs",
+          "symbol": "with_defaults"
+        },
+        {
+          "path": "codex-rs/features/src/lib.rs",
+          "symbol": "canonical_feature_for_key"
+        }
+      ],
+      "kind": "registers",
+      "source": "owner:feature-registry",
+      "target": "path:codex-rs/features/src/lib.rs"
     },
     {
       "category": "callers_consumers",
@@ -2462,6 +2492,23 @@
       "kind": "consumed_by",
       "source": "owner:planning-architecture-runtime",
       "target": "path:codex-rs/core/src/session/reasoning_governor.rs"
+    },
+    {
+      "category": "control_flow",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/core/src/tools/handlers/plan.rs",
+          "symbol": "handle_call"
+        },
+        {
+          "path": "codex-rs/core/src/plan_store.rs",
+          "symbol": "impl PlanStore"
+        }
+      ],
+      "kind": "calls",
+      "source": "owner:planning-architecture-runtime",
+      "target": "path:codex-rs/core/src/plan_store.rs"
     },
     {
       "category": "runtime_registration",
@@ -3524,7 +3571,7 @@
       "target": "path:codex-rs/windows-sandbox-rs/src/winutil.rs"
     }
   ],
-  "repository_revision": "manifest:970064dd145368343bb8a85a1c55dd1b1c452df24acc19f7db563ee4b0e99708:sources:5dfbece92e7f9500c8071fdec337f1fd396a3fe0deb7bb1987a3eb8bc38259c8",
+  "repository_revision": "manifest:da7a4cd9da9e872f5c317ecc7800c0730d10a77758b4d7deccf4602696ce3f93:sources:c2cbf9a54fb0c388972ac80a77684f883d5b2862b35814a325b48da9410956fa",
   "schema_version": 2,
   "status": "complete",
   "unresolved": []

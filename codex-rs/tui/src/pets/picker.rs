@@ -50,7 +50,11 @@ pub(crate) fn build_pet_picker_params(
 ) -> SelectionViewParams {
     let preferred_pet = current_pet.unwrap_or(DEFAULT_PET_ID);
     let mut entries = available_pet_entries(codex_home);
-    entries.sort_by(|left, right| left.display_name.cmp(&right.display_name));
+    entries.sort_by(|left, right| {
+        left.display_name
+            .cmp(&right.display_name)
+            .then_with(|| left.selector.cmp(&right.selector))
+    });
     if let Some(disabled_idx) = entries
         .iter()
         .position(|entry| entry.selector == DISABLED_PET_ID)
@@ -173,6 +177,9 @@ fn custom_pet_entries(codex_home: &Path) -> Vec<PetPickerEntry> {
                 continue;
             }
             let selector = custom_pet_selector(id);
+            if entries_by_selector.contains_key(&selector) {
+                continue;
+            }
             let Ok(pet) =
                 Pet::load_with_codex_home(&selector, /*codex_home*/ Some(codex_home))
             else {
@@ -182,7 +189,7 @@ fn custom_pet_entries(codex_home: &Path) -> Vec<PetPickerEntry> {
                 selector.clone(),
                 PetPickerEntry {
                     selector,
-                    legacy_selector: Some(id.to_string()),
+                    legacy_selector: catalog::builtin_pet(id).is_none().then(|| id.to_string()),
                     display_name: pet.display_name,
                     description: (!pet.description.is_empty()).then_some(pet.description),
                 },
@@ -196,6 +203,32 @@ fn custom_pet_entries(codex_home: &Path) -> Vec<PetPickerEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_id_collision_has_one_current_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        write_pet(dir.path(), "codex", "Custom Codex");
+        for selector in ["codex", "custom:codex"] {
+            let params = build_pet_picker_params(
+                Some(selector),
+                dir.path(),
+                PetPickerPreviewState::default(),
+            );
+            let current = params
+                .items
+                .iter()
+                .filter(|item| item.is_current)
+                .collect::<Vec<_>>();
+            assert_eq!(current.len(), 1);
+            assert_eq!(current[0].search_value.as_deref(), Some(selector));
+            assert_eq!(
+                params.items[params.initial_selected_idx.unwrap()]
+                    .search_value
+                    .as_deref(),
+                Some(selector)
+            );
+        }
+    }
 
     fn write_pet(dir: &Path, folder_name: &str, display_name: &str) {
         let pet_dir = dir.join("pets").join(folder_name);

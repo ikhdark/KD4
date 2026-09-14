@@ -36,7 +36,7 @@ pub(super) async fn acquire_persistence_lock(lock: &Semaphore) -> SemaphorePermi
 }
 
 pub(super) fn desired_state_from_persisted_enrollment(
-    enrollment: Option<RemoteControlEnrollmentRecord>,
+    enrollment: Option<&RemoteControlEnrollmentRecord>,
 ) -> RemoteControlDesiredState {
     if enrollment.and_then(|enrollment| enrollment.remote_control_enabled) == Some(true) {
         RemoteControlDesiredState::Enabled {
@@ -74,6 +74,7 @@ impl RemoteControlHandle {
         let auth = super::auth::load_remote_control_auth(&self.auth_manager).await?;
         let remote_control_target = normalize_remote_control_url(&self.remote_control_url)?;
         let app_server_client_name = self.pairing_persistence_key(app_server_client_name)?;
+        let mut current_enrollment = self.current_enrollment.lock().await;
         let enrollment = state_db
             .get_remote_control_enrollment(
                 &remote_control_target.websocket_url,
@@ -82,7 +83,22 @@ impl RemoteControlHandle {
             )
             .await
             .map_err(io::Error::other)?;
-        let desired_state = desired_state_from_persisted_enrollment(enrollment);
+        let desired_state = desired_state_from_persisted_enrollment(enrollment.as_ref());
+        if desired_state.is_enabled()
+            && matches!(
+                *self.desired_state_tx.borrow(),
+                RemoteControlDesiredState::Unknown
+            )
+        {
+            *current_enrollment = enrollment.map(|record| {
+                super::enroll::RemoteControlEnrollment::from_persisted(
+                    &remote_control_target,
+                    record,
+                )
+            });
+        }
+        // Publish the account scope before making its durable preference usable by connect.
+        drop(current_enrollment);
         self.desired_state_tx.send_if_modified(|state| {
             if !matches!(*state, RemoteControlDesiredState::Unknown) {
                 return false;

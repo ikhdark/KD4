@@ -171,6 +171,7 @@ fn thread_manager() -> ThreadManager {
     ThreadManager::with_models_provider_for_tests(
         CodexAuth::from_api_key("dummy"),
         built_in_model_providers(/* openai_base_url */ /*openai_base_url*/ None)["openai"].clone(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     )
 }
 
@@ -409,6 +410,7 @@ async fn spawn_agent_uses_bedrock_qualified_default_model_and_reasoning() {
     let manager = ThreadManager::with_models_provider_for_tests(
         CodexAuth::from_api_key("dummy"),
         provider_info,
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let root = manager
         .start_thread((*turn.config).clone())
@@ -844,6 +846,7 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         Some(state_runtime.clone()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let root = manager
         .start_thread(config.clone())
@@ -1237,6 +1240,7 @@ async fn multi_agent_v2_spawn_reuses_completed_explorer_result() {
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         Some(state_runtime),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let root = manager
         .start_thread(config.clone())
@@ -1383,6 +1387,7 @@ async fn multi_agent_v2_typed_spawn_admits_overlapping_write_claims() {
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         Some(state_runtime),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let root = manager
         .start_thread(config.clone())
@@ -5619,6 +5624,7 @@ async fn multi_agent_v2_interrupt_agent_accepts_unloaded_task_name_target() {
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         Some(state_db.clone()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let root = manager
         .start_thread(config.clone())

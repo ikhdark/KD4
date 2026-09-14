@@ -3,6 +3,44 @@ use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 
 #[test]
+fn search_results_defer_functions_and_namespace_children_without_output_schemas() {
+    let function = ResponsesApiTool {
+        name: "lookup".to_string(),
+        description: "Look up a record".to_string(),
+        strict: true,
+        defer_loading: Some(false),
+        parameters: JsonSchema::string(Some("Record ID".to_string())),
+        output_schema: Some(serde_json::json!({"type": "string", "description": "Record"})),
+    };
+    let mut expected_function = function.clone();
+    expected_function.defer_loading = Some(true);
+    expected_function.output_schema = None;
+    let namespace = crate::ResponsesApiNamespace {
+        name: "records".to_string(),
+        description: "Record tools".to_string(),
+        tools: vec![ResponsesApiNamespaceTool::Function(function.clone())],
+    };
+    let mut expected_namespace = namespace.clone();
+    expected_namespace.tools = vec![ResponsesApiNamespaceTool::Function(
+        expected_function.clone(),
+    )];
+
+    for (spec, expected) in [
+        (
+            ToolSpec::Function(function),
+            LoadableToolSpec::Function(expected_function),
+        ),
+        (
+            ToolSpec::Namespace(namespace),
+            LoadableToolSpec::Namespace(expected_namespace),
+        ),
+    ] {
+        let info = ToolSearchInfo::from_tool_spec(spec, None).expect("searchable tool");
+        assert_eq!(info.entry.output, expected);
+    }
+}
+
+#[test]
 fn default_search_text_uses_model_visible_namespace_metadata_once() {
     let mut schedule_schema = JsonSchema::object(
         BTreeMap::from([(

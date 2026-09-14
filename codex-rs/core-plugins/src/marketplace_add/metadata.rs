@@ -185,23 +185,25 @@ impl MarketplaceInstallMetadata {
             == Some(self.config_source_type())
             && marketplace.get("source").and_then(toml::Value::as_str)
                 == Some(self.config_source().as_str())
-            && marketplace.get("ref").and_then(toml::Value::as_str) == self.ref_name()
-            && config_sparse_paths(marketplace) == self.sparse_paths()
+            && match marketplace.get("ref") {
+                None => self.ref_name().is_none(),
+                Some(value) => value
+                    .as_str()
+                    .is_some_and(|value| Some(value) == self.ref_name()),
+            }
+            && config_sparse_paths(marketplace).as_deref() == Some(self.sparse_paths())
     }
 }
 
-fn config_sparse_paths(marketplace: &toml::Value) -> Vec<String> {
-    marketplace
-        .get("sparse_paths")
-        .and_then(toml::Value::as_array)
-        .map(|paths| {
-            paths
-                .iter()
-                .filter_map(toml::Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+fn config_sparse_paths(marketplace: &toml::Value) -> Option<Vec<String>> {
+    match marketplace.get("sparse_paths") {
+        None => Some(Vec::new()),
+        Some(paths) => paths
+            .as_array()?
+            .iter()
+            .map(|path| path.as_str().map(str::to_string))
+            .collect(),
+    }
 }
 
 fn utc_timestamp_now() -> Result<String, MarketplaceAddError> {
@@ -244,6 +246,62 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
+
+    #[test]
+    fn installed_marketplace_lookup_does_not_reuse_malformed_metadata() {
+        let home = TempDir::new().unwrap();
+        let install_root = home.path().join("marketplaces");
+        let root = install_root.join("debug");
+        fs::create_dir_all(root.join(".agents/plugins")).unwrap();
+        fs::write(
+            root.join(".agents/plugins/marketplace.json"),
+            r#"{"name":"debug","plugins":[]}"#,
+        )
+        .unwrap();
+        let metadata = MarketplaceInstallMetadata::from_source(
+            &MarketplaceSource::Git {
+                url: "https://example.com/repo.git".to_string(),
+                ref_name: None,
+            },
+            &[],
+        );
+        let base =
+            "[marketplaces.debug]\nsource_type = 'git'\nsource = 'https://example.com/repo.git'\n";
+        for (extra, expected) in [
+            ("", Some(root)),
+            ("ref = 123", None),
+            ("sparse_paths = 'plugins'", None),
+            ("sparse_paths = [123]", None),
+        ] {
+            fs::write(
+                home.path().join(CONFIG_TOML_FILE),
+                format!("{base}{extra}\n"),
+            )
+            .unwrap();
+            assert_eq!(
+                installed_marketplace_root_for_source(home.path(), &install_root, &metadata)
+                    .unwrap(),
+                expected,
+                "{extra}"
+            );
+        }
+        let metadata = MarketplaceInstallMetadata::from_source(
+            &MarketplaceSource::Git {
+                url: "https://example.com/repo.git".to_string(),
+                ref_name: None,
+            },
+            &["plugins".to_string()],
+        );
+        fs::write(
+            home.path().join(CONFIG_TOML_FILE),
+            format!("{base}sparse_paths = ['plugins', 123]\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            installed_marketplace_root_for_source(home.path(), &install_root, &metadata).unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn utc_timestamp_formats_unix_epoch_as_rfc3339_utc() {

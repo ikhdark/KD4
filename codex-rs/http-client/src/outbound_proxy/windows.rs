@@ -61,17 +61,40 @@ pub(super) fn resolve(request_url: &str, origin: &RequestOrigin) -> SystemProxyD
         }
     };
 
+    resolve_with_config(
+        request_url,
+        origin,
+        ie_config,
+        resolve_with_pac_url,
+        resolve_with_auto_detect,
+    )
+}
+
+fn resolve_with_config(
+    request_url: &str,
+    origin: &RequestOrigin,
+    ie_config: IeProxyConfig,
+    resolve_pac: impl FnOnce(&str, &RequestOrigin, &str) -> SystemProxyDecision,
+    resolve_auto: impl FnOnce(&str, &RequestOrigin) -> SystemProxyDecision,
+) -> SystemProxyDecision {
+    // Preserve the first specific failure in configuration preference order;
+    // a generic discovery failure must not erase a PAC TLS/timeout diagnostic.
+    let mut failure = RouteFailureClass::ProxyResolutionUnavailable;
     if let Some(pac_url) = ie_config.auto_config_url.as_deref() {
-        let decision = resolve_with_pac_url(request_url, origin, pac_url);
-        if !matches!(decision, SystemProxyDecision::Unavailable { .. }) {
-            return decision;
+        match resolve_pac(request_url, origin, pac_url) {
+            SystemProxyDecision::Unavailable { failure: reason } => failure = reason,
+            decision => return decision,
         }
     }
 
     if ie_config.auto_detect {
-        let decision = resolve_with_auto_detect(request_url, origin);
-        if !matches!(decision, SystemProxyDecision::Unavailable { .. }) {
-            return decision;
+        match resolve_auto(request_url, origin) {
+            SystemProxyDecision::Unavailable { failure: reason } => {
+                if failure == RouteFailureClass::ProxyResolutionUnavailable {
+                    failure = reason;
+                }
+            }
+            decision => return decision,
         }
     }
 
@@ -83,13 +106,18 @@ pub(super) fn resolve(request_url: &str, origin: &RequestOrigin) -> SystemProxyD
         {
             return SystemProxyDecision::Direct;
         }
-        return proxy_list_decision(proxy, origin);
+        return match proxy_list_decision(proxy, origin) {
+            SystemProxyDecision::Unavailable { .. }
+                if failure != RouteFailureClass::ProxyResolutionUnavailable =>
+            {
+                SystemProxyDecision::Unavailable { failure }
+            }
+            decision => decision,
+        };
     }
 
     if ie_config.auto_config_url.is_some() || ie_config.auto_detect {
-        SystemProxyDecision::Unavailable {
-            failure: RouteFailureClass::ProxyResolutionUnavailable,
-        }
+        SystemProxyDecision::Unavailable { failure }
     } else {
         SystemProxyDecision::Direct
     }

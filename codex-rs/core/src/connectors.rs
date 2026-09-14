@@ -36,7 +36,6 @@ use codex_mcp::McpConnectionManager;
 use codex_mcp::McpRuntimeContext;
 use codex_mcp::ToolInfo;
 use codex_mcp::ToolPluginProvenance;
-use codex_mcp::codex_apps_tools_cache_key;
 use codex_mcp::compute_auth_statuses;
 use codex_mcp::effective_mcp_servers;
 use codex_mcp::tool_plugin_provenance;
@@ -101,7 +100,7 @@ pub async fn list_cached_accessible_connectors_from_mcp_tools(
     config: &Config,
 ) -> Option<Vec<AppInfo>> {
     let tools_cache = CodexAppsToolsCache::shared();
-    list_cached_accessible_connectors_from_tools_cache(config, &tools_cache).await
+    list_cached_accessible_connectors_from_tools_cache(config, &tools_cache, None).await
 }
 
 pub async fn list_cached_accessible_connectors_from_mcp_tools_with_mcp_manager(
@@ -109,12 +108,14 @@ pub async fn list_cached_accessible_connectors_from_mcp_tools_with_mcp_manager(
     mcp_manager: &McpManager,
 ) -> Option<Vec<AppInfo>> {
     let tools_cache = mcp_manager.codex_apps_tools_cache();
-    list_cached_accessible_connectors_from_tools_cache(config, &tools_cache).await
+    list_cached_accessible_connectors_from_tools_cache(config, &tools_cache, Some(mcp_manager))
+        .await
 }
 
 async fn list_cached_accessible_connectors_from_tools_cache(
     config: &Config,
     tools_cache: &CodexAppsToolsCache,
+    mcp_manager: Option<&McpManager>,
 ) -> Option<Vec<AppInfo>> {
     let auth_manager =
         AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
@@ -125,14 +126,20 @@ async fn list_cached_accessible_connectors_from_tools_cache(
     {
         return Some(Vec::new());
     }
+    let standalone_manager;
+    let mcp_manager = match mcp_manager {
+        Some(manager) => manager,
+        None => {
+            standalone_manager =
+                McpManager::new(connector_discovery_plugins_manager(config, &auth_manager));
+            &standalone_manager
+        }
+    };
+    let mcp_config = mcp_manager.runtime_config(config).await;
     tools_cache
         .current_snapshot(
             config.codex_home.to_path_buf(),
-            codex_apps_tools_cache_key(
-                auth.as_ref(),
-                &config.chatgpt_base_url,
-                config.apps_mcp_product_sku.as_deref(),
-            ),
+            mcp_config.codex_apps_tools_cache_key(auth.as_ref()),
         )
         .await
         .map(|snapshot| accessible_connectors_status_from_tools_snapshot(&snapshot).connectors)
@@ -218,11 +225,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
     }
     let tools_cache = mcp_manager.codex_apps_tools_cache();
     let mcp_config = mcp_manager.runtime_config(config).await;
-    let tools_cache_key = codex_apps_tools_cache_key(
-        auth.as_ref(),
-        &mcp_config.chatgpt_base_url,
-        mcp_config.apps_mcp_product_sku.as_deref(),
-    );
+    let tools_cache_key = mcp_config.codex_apps_tools_cache_key(auth.as_ref());
     let tool_plugin_provenance = tool_plugin_provenance(&mcp_config);
     if !force_refetch
         && let Some(snapshot) = tools_cache

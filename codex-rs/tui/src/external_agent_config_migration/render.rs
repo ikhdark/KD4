@@ -23,7 +23,10 @@ impl ExternalAgentConfigMigrationScreen {
         let visible_rows = area.height as usize;
         let mut start_idx = self.scroll_top.min(rows.len().saturating_sub(1));
         if let Some(selected_item_idx) = self.selected_item_idx {
-            let selected_render_idx = self.selected_render_line_index(selected_item_idx);
+            let selected_render_idx = rows
+                .iter()
+                .position(|entry| entry.item_idx == Some(selected_item_idx))
+                .unwrap_or(selected_item_idx);
             if selected_render_idx < start_idx {
                 start_idx = selected_render_idx;
             } else if visible_rows > 0 {
@@ -75,7 +78,19 @@ impl WidgetRef for &ExternalAgentConfigMigrationScreen {
         Clear.render(area, buf);
 
         let inner_area = area.inset(Insets::vh(/*v*/ 1, /*h*/ 2));
-        let error_height = u16::from(self.error.is_some());
+        if inner_area.is_empty() {
+            return;
+        }
+        let error_paragraph = self
+            .error
+            .as_deref()
+            .map(|error| Paragraph::new(error).red().wrap(Wrap { trim: false }));
+        let error_height = error_paragraph.as_ref().map_or(0, |paragraph| {
+            paragraph
+                .line_count(inner_area.width)
+                .try_into()
+                .unwrap_or(u16::MAX)
+        });
         let intro_lines = match self.view {
             MigrationView::Summary => vec![
                 Line::from("Bring over your setup, current project, and recent chats."),
@@ -89,10 +104,23 @@ impl WidgetRef for &ExternalAgentConfigMigrationScreen {
                 Line::from("Your existing Claude Code setup will not be changed."),
             ],
         };
-        let intro_height = intro_lines.len() as u16;
+        let intro_paragraph = Paragraph::new(intro_lines).wrap(Wrap { trim: false });
+        let intro_height = intro_paragraph
+            .line_count(inner_area.width)
+            .try_into()
+            .unwrap_or(u16::MAX);
         let actions = self.available_actions();
         let actions_height = actions.len() as u16 + 1;
-        let fixed_height = 1u16 + intro_height + error_height + 1u16 + actions_height + 1u16;
+        let fixed_height = 3u16
+            .saturating_add(intro_height)
+            .saturating_add(error_height)
+            .saturating_add(actions_height);
+        if inner_area.height < fixed_height
+            && let Some(paragraph) = error_paragraph
+        {
+            paragraph.render(inner_area, buf);
+            return;
+        }
         let list_height =
             self.render_line_count()
                 .max(1)
@@ -125,14 +153,10 @@ impl WidgetRef for &ExternalAgentConfigMigrationScreen {
         let heading = Line::from(vec!["> ".into(), title.bold()]);
         heading.render(header_area, buf);
 
-        Paragraph::new(intro_lines)
-            .wrap(Wrap { trim: false })
-            .render(intro_area, buf);
+        intro_paragraph.render(intro_area, buf);
 
-        if let Some(error) = &self.error {
-            Paragraph::new(error.clone().red().to_string())
-                .wrap(Wrap { trim: false })
-                .render(error_area, buf);
+        if let Some(paragraph) = error_paragraph {
+            paragraph.render(error_area, buf);
         }
 
         self.render_items(list_area, buf);

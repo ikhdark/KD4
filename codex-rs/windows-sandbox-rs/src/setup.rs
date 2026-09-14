@@ -1095,13 +1095,37 @@ fn is_user_profile_root_exclusion(root: &Path, user_profile: &Path) -> bool {
         .any(|excluded| child_name.eq_ignore_ascii_case(excluded))
 }
 
-fn filter_ssh_config_dependency_roots(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
+fn filter_ssh_config_dependency_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
     let Ok(user_profile) = std::env::var("USERPROFILE") else {
         return roots;
     };
-    let user_profile = Path::new(&user_profile);
-    let dependency_paths = ssh_config_dependency_paths(user_profile);
-    roots.retain(|root| !is_ssh_config_dependency_root(root, user_profile, &dependency_paths));
+    filter_ssh_config_dependency_roots_for(roots, Path::new(&user_profile))
+}
+
+fn filter_ssh_config_dependency_roots_for(
+    mut roots: Vec<PathBuf>,
+    user_profile: &Path,
+) -> Vec<PathBuf> {
+    match ssh_config_dependency_paths(user_profile) {
+        Ok(dependency_paths) => {
+            roots.retain(|root| {
+                !is_ssh_config_dependency_root(root, user_profile, &dependency_paths)
+            });
+        }
+        Err(err) => {
+            log_note(
+                &format!("SSH dependency discovery failed; excluding user profile roots: {err}"),
+                None,
+            );
+            // An incomplete dependency list cannot safely identify which profile children
+            // hold SSH credentials. Keep unrelated roots, but grant no profile children.
+            let profile_key = canonical_path_key(user_profile);
+            roots.retain(|root| {
+                canonical_path_key(root) != profile_key
+                    && user_profile_child_name(root, user_profile).is_none()
+            });
+        }
+    }
     roots
 }
 
@@ -1608,7 +1632,8 @@ mod tests {
         fs::write(key_dir.join("id_ed25519"), "").expect("write key");
         fs::write(include_dir.join("config"), "User git\n").expect("write included config");
 
-        let dependency_paths = super::ssh_config_dependency_paths(&user_profile);
+        let dependency_paths =
+            super::ssh_config_dependency_paths(&user_profile).expect("discover SSH dependencies");
 
         assert!(!super::is_ssh_config_dependency_root(
             &documents,
@@ -1630,6 +1655,32 @@ mod tests {
             &user_profile,
             &dependency_paths
         ));
+        assert_eq!(
+            super::filter_ssh_config_dependency_roots_for(
+                vec![documents.clone(), key_dir, include_dir, other_root.clone()],
+                &user_profile,
+            ),
+            vec![documents, other_root]
+        );
+    }
+
+    #[test]
+    fn ssh_discovery_failure_excludes_profile_roots() {
+        let tmp = TempDir::new().expect("tempdir");
+        let user_profile = tmp.path().join("user-profile");
+        let documents = user_profile.join("Documents");
+        let other_root = tmp.path().join("other-root");
+        fs::create_dir_all(user_profile.join(".ssh/config"))
+            .expect("make config unreadable as a file");
+        fs::create_dir_all(&documents).expect("create documents");
+        fs::create_dir_all(&other_root).expect("create other root");
+        assert_eq!(
+            super::filter_ssh_config_dependency_roots_for(
+                vec![user_profile.clone(), documents, other_root.clone()],
+                &user_profile,
+            ),
+            vec![other_root]
+        );
     }
 
     #[test]

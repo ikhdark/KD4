@@ -139,18 +139,13 @@ async fn branch_diff_stats_to_default_branch(
     runner: &dyn WorkspaceCommandExecutor,
     cwd: &Path,
 ) -> Option<GitBranchDiffStats> {
-    let git_dir = run_git_command(runner, cwd, &["rev-parse", "--git-dir"])
-        .await
-        .ok()?;
-    if !git_dir.success() {
-        return None;
-    }
+    let head_sha = current_head_sha(runner, cwd).await?;
 
     let default_branch = get_default_branch(runner, cwd).await?;
     let merge_base = run_git_command(
         runner,
         cwd,
-        &["merge-base", "HEAD", &default_branch.merge_ref],
+        &["merge-base", &head_sha, &default_branch.merge_ref],
     )
     .await
     .ok()?;
@@ -162,7 +157,7 @@ async fn branch_diff_stats_to_default_branch(
         return None;
     }
 
-    let range = format!("{merge_base}..HEAD");
+    let range = format!("{merge_base}..{head_sha}");
     let numstat = run_git_command(runner, cwd, &["diff", "--numstat", &range])
         .await
         .ok()?;
@@ -226,8 +221,7 @@ async fn get_default_branch(
             return Some(branch);
         }
 
-        if let Some(branch) = get_remote_default_branch_from_remote_show(runner, cwd, &remote).await
-        {
+        if let Some(branch) = get_remote_default_branch_from_ls_remote(runner, cwd, &remote).await {
             return Some(branch);
         }
     }
@@ -265,17 +259,14 @@ async fn get_remote_default_branch_from_symbolic_ref(
     })
 }
 
-/// Parses `git remote show` output to discover a remote's default branch ref.
-///
-/// This is a fallback for repositories where `refs/remotes/<remote>/HEAD` is not configured but
-/// `git remote show` can still report the upstream HEAD branch. The concrete remote-tracking ref
-/// must already exist locally before it is accepted.
-async fn get_remote_default_branch_from_remote_show(
+/// Resolves the remote's symbolic HEAD when no local remote HEAD is configured.
+/// The concrete remote-tracking ref must already exist locally before it is accepted.
+async fn get_remote_default_branch_from_ls_remote(
     runner: &dyn WorkspaceCommandExecutor,
     cwd: &Path,
     remote: &str,
 ) -> Option<DefaultBranch> {
-    let output = run_git_command(runner, cwd, &["remote", "show", remote])
+    let output = run_git_command(runner, cwd, &["ls-remote", "--symref", remote, "HEAD"])
         .await
         .ok()?;
     if !output.success() {
@@ -283,11 +274,12 @@ async fn get_remote_default_branch_from_remote_show(
     }
 
     for line in output.stdout.lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix("HEAD branch:") else {
+        let Some(name) = line
+            .strip_prefix("ref: refs/heads/")
+            .and_then(|line| line.strip_suffix("\tHEAD"))
+        else {
             continue;
         };
-        let name = rest.trim();
         let remote_ref = format!("refs/remotes/{remote}/{name}");
         if !name.is_empty() && git_ref_exists(runner, cwd, &remote_ref).await {
             return Some(DefaultBranch {
@@ -434,16 +426,20 @@ fn pull_request_from_view_output(stdout: &str) -> Option<StatusLinePullRequest> 
         })
 }
 
-/// Parses the GitHub REST commit-to-PR response and returns the first open PR.
+/// Parses the GitHub REST commit-to-PR response and returns an unambiguous open PR.
 fn pull_request_from_api_output(stdout: &str) -> Option<StatusLinePullRequest> {
-    serde_json::from_str::<Vec<GhPullRequestApiItem>>(stdout)
+    let mut matches = serde_json::from_str::<Vec<GhPullRequestApiItem>>(stdout)
         .ok()?
         .into_iter()
-        .find(|pull_request| pull_request.state.eq_ignore_ascii_case("open"))
-        .map(|pull_request| StatusLinePullRequest {
-            number: pull_request.number,
-            url: pull_request.url,
-        })
+        .filter(|pull_request| pull_request.state.eq_ignore_ascii_case("open"));
+    let pull_request = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(StatusLinePullRequest {
+        number: pull_request.number,
+        url: pull_request.url,
+    })
 }
 
 /// Parses `gh repo view` output into the repository search order for fallback PR lookup.
@@ -481,7 +477,9 @@ async fn run_git_command(
         .run(
             WorkspaceCommand::new(argv)
                 .cwd(cwd.to_path_buf())
-                .env("GIT_OPTIONAL_LOCKS", "0"),
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GCM_INTERACTIVE", "Never"),
         )
         .await
 }
@@ -518,12 +516,74 @@ mod tests {
     use std::sync::Mutex;
 
     #[tokio::test]
+    async fn remote_default_head_uses_symref_and_requires_local_tracking_ref() {
+        for (code, expected) in [
+            (
+                0,
+                Some(DefaultBranch {
+                    merge_ref: "refs/remotes/origin/trunk".to_string(),
+                }),
+            ),
+            (1, None),
+        ] {
+            let runner = FakeRunner::new(vec![
+                response(
+                    &["git", "ls-remote", "--symref", "origin", "HEAD"],
+                    0,
+                    "ref: refs/heads/trunk\tHEAD\nabc123\tHEAD\n",
+                ),
+                response(
+                    &[
+                        "git",
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        "refs/remotes/origin/trunk",
+                    ],
+                    code,
+                    "abc123\n",
+                ),
+            ]);
+            assert_eq!(
+                get_remote_default_branch_from_ls_remote(&runner, Path::new("/repo"), "origin")
+                    .await,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn commit_lookup_rejects_ambiguous_open_pull_requests() {
+        assert_eq!(
+            pull_request_from_api_output(
+                r#"[
+            {"number":1,"html_url":"https://example.com/1","state":"open"},
+            {"number":2,"html_url":"https://example.com/2","state":"open"}
+        ]"#
+            ),
+            None
+        );
+        assert_eq!(
+            pull_request_from_api_output(
+                r#"[
+            {"number":1,"html_url":"https://example.com/1","state":"closed"},
+            {"number":2,"html_url":"https://example.com/2","state":"open"}
+        ]"#
+            ),
+            Some(StatusLinePullRequest {
+                number: 2,
+                url: "https://example.com/2".to_string()
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn branch_diff_stats_prefers_remote_default_ref_over_stale_local_branch() {
         let runner = FakeRunner::new(vec![
             response(
-                &["git", "rev-parse", "--git-dir"],
+                &["git", "rev-parse", "HEAD"],
                 /*exit_code*/ 0,
-                ".git\n",
+                "head-sha\n",
             ),
             response(&["git", "remote"], /*exit_code*/ 0, "origin\n"),
             response(
@@ -543,12 +603,12 @@ mod tests {
                 "remote-main-sha\n",
             ),
             response(
-                &["git", "merge-base", "HEAD", "refs/remotes/origin/main"],
+                &["git", "merge-base", "head-sha", "refs/remotes/origin/main"],
                 /*exit_code*/ 0,
                 "base-sha\n",
             ),
             response(
-                &["git", "diff", "--numstat", "base-sha..HEAD"],
+                &["git", "diff", "--numstat", "base-sha..head-sha"],
                 /*exit_code*/ 0,
                 "1\t0\tfile\n",
             ),
@@ -565,7 +625,7 @@ mod tests {
                 deletions: 0,
             }
         );
-        assert!(runner.saw(&["git", "merge-base", "HEAD", "refs/remotes/origin/main"]));
+        assert!(runner.saw(&["git", "merge-base", "head-sha", "refs/remotes/origin/main"]));
     }
 
     #[tokio::test]
@@ -707,6 +767,17 @@ mod tests {
                 .expect("seen lock")
                 .iter()
                 .any(|seen| seen == &argv)
+        }
+    }
+
+    impl Drop for FakeRunner {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                assert!(
+                    self.responses.get_mut().expect("responses lock").is_empty(),
+                    "required probe was skipped"
+                );
+            }
         }
     }
 

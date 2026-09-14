@@ -34,19 +34,12 @@ fn build_request_plugin_install_elicitation_request_uses_expected_shape() {
     assert_eq!(
         request,
         ElicitationRequest::Form {
-            meta: Some(json!(RequestPluginInstallMeta {
-                codex_approval_kind: REQUEST_PLUGIN_INSTALL_APPROVAL_KIND_VALUE,
-                persist: REQUEST_PLUGIN_INSTALL_PERSIST_ALWAYS_VALUE,
-                tool_type: DiscoverableToolType::Connector,
-                suggest_type: DiscoverableToolAction::Install,
-                suggest_reason: "Plan and reference events from your calendar",
-                tool_id: "connector_2128aebfecb84f64a069897515042a44",
-                tool_name: "Google Calendar",
-                install_url: Some(
-                    "https://chatgpt.com/apps/google-calendar/connector_2128aebfecb84f64a069897515042a44"
-                ),
-                remote_plugin_id: None,
-                app_connector_ids: None,
+            meta: Some(json!({
+                "codex_approval_kind": "tool_suggestion", "persist": "always",
+                "tool_type": "connector", "suggest_type": "install",
+                "suggest_reason": "Plan and reference events from your calendar",
+                "tool_id": "connector_2128aebfecb84f64a069897515042a44", "tool_name": "Google Calendar",
+                "install_url": "https://chatgpt.com/apps/google-calendar/connector_2128aebfecb84f64a069897515042a44"
             })),
             message: "Plan and reference events from your calendar".to_string(),
             requested_schema: json!({
@@ -143,7 +136,7 @@ fn build_request_plugin_install_meta_uses_expected_shape() {
 
 #[test]
 fn verified_connector_install_completed_requires_accessible_connector() {
-    let accessible_connectors = vec![AppInfo {
+    let mut accessible_connectors = vec![AppInfo {
         id: "calendar".to_string(),
         name: "Google Calendar".to_string(),
         description: None,
@@ -168,6 +161,11 @@ fn verified_connector_install_completed_requires_accessible_connector() {
     assert!(!verified_connector_install_completed(
         "gmail",
         &accessible_connectors,
+    ));
+    accessible_connectors[0].is_accessible = false;
+    assert!(!verified_connector_install_completed(
+        "calendar",
+        &accessible_connectors
     ));
 }
 

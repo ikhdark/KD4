@@ -29,7 +29,6 @@ impl ElicitationRequestKey {
 // only replay if they are still pending. This state is updated from:
 // - inbound events (`note_event`)
 // - outbound ops that resolve a prompt (`note_outbound_op`)
-// - buffer eviction (`note_evicted_event`)
 //
 // We keep both fast lookup sets (for snapshot filtering by call_id/request key) and
 // turn-indexed queues/vectors so turn completion or interruption can clear
@@ -70,13 +69,9 @@ enum PendingInteractiveRequest {
 }
 
 impl PendingInteractiveReplayState {
-    pub(super) fn op_can_change_state<T>(op: T) -> bool
-    where
-        T: Into<AppCommand>,
-    {
-        let op: AppCommand = op.into();
+    pub(super) fn op_can_change_state(op: &AppCommand) -> bool {
         matches!(
-            &op,
+            op,
             AppCommand::ExecApproval { .. }
                 | AppCommand::PatchApproval { .. }
                 | AppCommand::ResolveElicitation { .. }
@@ -85,12 +80,8 @@ impl PendingInteractiveReplayState {
         )
     }
 
-    pub(super) fn note_outbound_op<T>(&mut self, op: T)
-    where
-        T: Into<AppCommand>,
-    {
-        let op: AppCommand = op.into();
-        match &op {
+    pub(super) fn note_outbound_op(&mut self, op: &AppCommand) {
+        match op {
             AppCommand::ExecApproval { id, turn_id, .. } => {
                 self.exec_approval_call_ids.remove(id);
                 if let Some(turn_id) = turn_id {
@@ -280,75 +271,6 @@ impl PendingInteractiveReplayState {
         }
     }
 
-    pub(super) fn note_evicted_server_request(&mut self, request: &ServerRequest) {
-        match request {
-            ServerRequest::CommandExecutionRequestApproval { params, .. } => {
-                let approval_id = params
-                    .approval_id
-                    .clone()
-                    .unwrap_or_else(|| params.item_id.clone());
-                self.exec_approval_call_ids.remove(&approval_id);
-                Self::remove_call_id_from_turn_map_entry(
-                    &mut self.exec_approval_call_ids_by_turn_id,
-                    &params.turn_id,
-                    &approval_id,
-                );
-            }
-            ServerRequest::FileChangeRequestApproval { params, .. } => {
-                self.patch_approval_call_ids.remove(&params.item_id);
-                Self::remove_call_id_from_turn_map_entry(
-                    &mut self.patch_approval_call_ids_by_turn_id,
-                    &params.turn_id,
-                    &params.item_id,
-                );
-            }
-            ServerRequest::McpServerElicitationRequest { request_id, params } => {
-                self.elicitation_requests
-                    .remove(&ElicitationRequestKey::new(
-                        params.server_name.clone(),
-                        request_id.clone(),
-                    ));
-            }
-            ServerRequest::ToolRequestUserInput { params, .. } => {
-                self.request_user_input_call_ids.remove(&params.item_id);
-                let mut remove_turn_entry = false;
-                if let Some(call_ids) = self
-                    .request_user_input_call_ids_by_turn_id
-                    .get_mut(&params.turn_id)
-                {
-                    call_ids.retain(|call_id| call_id != &params.item_id);
-                    if call_ids.is_empty() {
-                        remove_turn_entry = true;
-                    }
-                }
-                if remove_turn_entry {
-                    self.request_user_input_call_ids_by_turn_id
-                        .remove(&params.turn_id);
-                }
-            }
-            ServerRequest::PermissionsRequestApproval { params, .. } => {
-                self.request_permissions_call_ids.remove(&params.item_id);
-                let mut remove_turn_entry = false;
-                if let Some(call_ids) = self
-                    .request_permissions_call_ids_by_turn_id
-                    .get_mut(&params.turn_id)
-                {
-                    call_ids.retain(|call_id| call_id != &params.item_id);
-                    if call_ids.is_empty() {
-                        remove_turn_entry = true;
-                    }
-                }
-                if remove_turn_entry {
-                    self.request_permissions_call_ids_by_turn_id
-                        .remove(&params.turn_id);
-                }
-            }
-            _ => {}
-        }
-        self.pending_requests_by_request_id
-            .retain(|_, pending| !Self::request_matches_server_request(pending, request));
-    }
-
     pub(super) fn should_replay_snapshot_request(&self, request: &ServerRequest) -> bool {
         match request {
             ServerRequest::CommandExecutionRequestApproval { params, .. } => self
@@ -521,41 +443,6 @@ impl PendingInteractiveReplayState {
             }
         }
     }
-
-    fn request_matches_server_request(
-        pending: &PendingInteractiveRequest,
-        request: &ServerRequest,
-    ) -> bool {
-        match (pending, request) {
-            (
-                PendingInteractiveRequest::ExecApproval {
-                    turn_id,
-                    approval_id,
-                },
-                ServerRequest::CommandExecutionRequestApproval { params, .. },
-            ) => {
-                turn_id == &params.turn_id
-                    && approval_id == params.approval_id.as_ref().unwrap_or(&params.item_id)
-            }
-            (
-                PendingInteractiveRequest::PatchApproval { turn_id, item_id },
-                ServerRequest::FileChangeRequestApproval { params, .. },
-            ) => turn_id == &params.turn_id && item_id == &params.item_id,
-            (
-                PendingInteractiveRequest::Elicitation(key),
-                ServerRequest::McpServerElicitationRequest { request_id, params },
-            ) => key.server_name == params.server_name && key.request_id == *request_id,
-            (
-                PendingInteractiveRequest::RequestPermissions { turn_id, item_id },
-                ServerRequest::PermissionsRequestApproval { params, .. },
-            ) => turn_id == &params.turn_id && item_id == &params.item_id,
-            (
-                PendingInteractiveRequest::RequestUserInput { turn_id, item_id },
-                ServerRequest::ToolRequestUserInput { params, .. },
-            ) => turn_id == &params.turn_id && item_id == &params.item_id,
-            _ => false,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -589,7 +476,7 @@ mod tests {
 
     fn request_user_input_request(call_id: &str, turn_id: &str) -> ServerRequest {
         ServerRequest::ToolRequestUserInput {
-            request_id: AppServerRequestId::Integer(1),
+            request_id: AppServerRequestId::String(call_id.to_string()),
             params: ToolRequestUserInputParams {
                 thread_id: "thread-1".to_string(),
                 turn_id: turn_id.to_string(),
@@ -737,7 +624,9 @@ mod tests {
         let mut store = ThreadEventStore::new(/*capacity*/ 8);
         store.push_request(request_user_input_request("call-1", "turn-1"));
 
-        store.push_notification(request_resolved(AppServerRequestId::Integer(1)));
+        store.push_notification(request_resolved(AppServerRequestId::String(
+            "call-1".to_string(),
+        )));
 
         let snapshot = store.snapshot();
         assert!(
@@ -930,6 +819,26 @@ mod tests {
         store.push_request(request_user_input_request("call-1", "turn-1"));
 
         assert_eq!(store.has_pending_thread_approvals(), false);
+    }
+
+    #[test]
+    fn pending_approval_survives_transcript_eviction_until_resolved() {
+        let mut store = ThreadEventStore::new(1);
+        store.push_request(exec_approval_request("call-1", None, "turn-1"));
+        store.push_request(request_user_input_request("input-1", "turn-1"));
+        assert_eq!(store.buffer.len(), 1);
+        assert!(store.has_pending_thread_approvals());
+        assert_eq!(store.pending_replay_requests().len(), 2);
+        assert_eq!(store.snapshot().events.len(), 2);
+        store.push_notification(request_resolved(AppServerRequestId::Integer(2)));
+        assert!(!store.has_pending_thread_approvals());
+        let pending = store.pending_replay_requests();
+        assert!(
+            matches!(pending.as_slice(), [ServerRequest::ToolRequestUserInput { params, .. }]
+            if params.item_id == "input-1")
+        );
+        store.push_notification(thread_closed());
+        assert!(store.pending_replay_requests().is_empty());
     }
 
     #[test]

@@ -57,6 +57,7 @@ pub(crate) fn load_cached_directory_connectors_from_disk(
             return CachedConnectorDirectoryDiskLoad::Invalid;
         }
     };
+    // Reject the bytes we read without deleting a pathname another writer may have replaced.
     let cache: ConnectorDirectoryDiskCache = match serde_json::from_slice(&bytes) {
         Ok(cache) => cache,
         Err(err) => {
@@ -64,12 +65,10 @@ pub(crate) fn load_cached_directory_connectors_from_disk(
                 cache_path = %cache_path.display(),
                 "failed to parse connector directory disk cache: {err}"
             );
-            let _ = std::fs::remove_file(cache_path);
             return CachedConnectorDirectoryDiskLoad::Invalid;
         }
     };
     if cache.schema_version != CONNECTOR_DIRECTORY_DISK_CACHE_SCHEMA_VERSION {
-        let _ = std::fs::remove_file(cache_path);
         return CachedConnectorDirectoryDiskLoad::Invalid;
     }
 
@@ -83,21 +82,22 @@ pub(crate) fn write_cached_directory_connectors_to_disk(
     connectors: &[AppInfo],
 ) {
     let cache_path = cache_context.cache_path();
-    if let Some(parent) = cache_path.parent()
-        && std::fs::create_dir_all(parent).is_err()
-    {
-        return;
-    }
-    let Ok(bytes) = serde_json::to_vec_pretty(&ConnectorDirectoryDiskCache {
+    let Ok(bytes) = serde_json::to_vec(&ConnectorDirectoryDiskCacheRef {
         schema_version: CONNECTOR_DIRECTORY_DISK_CACHE_SCHEMA_VERSION,
-        connectors: connectors.to_vec(),
+        connectors,
     }) else {
         return;
     };
-    let _ = std::fs::write(cache_path, bytes);
+    let _ = codex_file_system::write_bytes_atomically(&cache_path, &bytes);
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize)]
+struct ConnectorDirectoryDiskCacheRef<'a> {
+    schema_version: u8,
+    connectors: &'a [AppInfo],
+}
+
+#[derive(Deserialize)]
 struct ConnectorDirectoryDiskCache {
     schema_version: u8,
     connectors: Vec<AppInfo>,

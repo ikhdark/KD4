@@ -33,7 +33,7 @@ def _timing(*, valid: bool = True, complete: bool = True) -> dict:
         "classificationComplete": complete,
         "startedAtUnixMs": 1_786_924_800_000,
         "completedAtUnixMs": 1_786_924_801_000,
-        "inclusiveDurationNs": 1000,
+        "inclusiveDurationNs": 1_000_000_000,
         "milestones": {
             "firstUsefulActionMs": 12.5,
             "firstInfrastructureActionMs": 2.5,
@@ -41,32 +41,32 @@ def _timing(*, valid: bool = True, complete: bool = True) -> dict:
             "firstDomainActionMs": 12.5,
             "firstSuccessfulDomainActionMs": 15.0,
         },
-        "machineDurationNs": 900,
+        "machineDurationNs": 900_000_000,
         "exclusive": {
-            "modelOnlyNs": 600,
-            "toolOnlyNs": 200,
+            "modelOnlyNs": 600_000_000,
+            "toolOnlyNs": 200_000_000,
             "modelPlusToolNs": 0,
-            "orchestrationNs": 100,
-            "interactiveOnlyWaitNs": 100,
+            "orchestrationNs": 100_000_000,
+            "interactiveOnlyWaitNs": 100_000_000,
         },
         "unions": {
-            "modelActiveUnionNs": 600,
-            "modelRequestWaitUnionNs": 10,
-            "modelStreamWaitUnionNs": 590,
-            "modelStreamProcessingUnionNs": 20,
-            "interactiveWaitUnionNs": 150,
+            "modelActiveUnionNs": 600_000_000,
+            "modelRequestWaitUnionNs": 10_000_000,
+            "modelStreamWaitUnionNs": 590_000_000,
+            "modelStreamProcessingUnionNs": 20_000_000,
+            "interactiveWaitUnionNs": 150_000_000,
         },
         "local": {
-            "preparationUnionNs": 11,
-            "planningUnionNs": 23,
-            "planningExclusiveUnionNs": 17,
-            "planningCompactionOverlapUnionNs": 6,
-            "compactionUnionNs": 9,
-            "persistenceUnionNs": 13,
-            "serializationUnionNs": 7,
-            "routerBuildUnionNs": 5,
-            "startupPrewarmWaitUnionNs": 3,
-            "executorReadinessWaitUnionNs": 2,
+            "preparationUnionNs": 11_000_000,
+            "planningUnionNs": 23_000_000,
+            "planningExclusiveUnionNs": 17_000_000,
+            "planningCompactionOverlapUnionNs": 6_000_000,
+            "compactionUnionNs": 9_000_000,
+            "persistenceUnionNs": 13_000_000,
+            "serializationUnionNs": 7_000_000,
+            "routerBuildUnionNs": 5_000_000,
+            "startupPrewarmWaitUnionNs": 3_000_000,
+            "executorReadinessWaitUnionNs": 2_000_000,
         },
         "counters": {
             "logicalGenerationCount": 2,
@@ -85,10 +85,10 @@ def _timing(*, valid: bool = True, complete: bool = True) -> dict:
                 "generationIndex": 0,
                 "attemptKind": "primary",
                 "generationPurpose": "deterministic_tool_continuation",
-                "modelStreamWaitNs": 300,
-                "decisionLatencyNs": 250,
+                "modelStreamWaitNs": 300_000_000,
+                "decisionLatencyNs": 250_000_000,
                 "toolCallCount": 1,
-                "toolActiveUnionNs": 100,
+                "toolActiveUnionNs": 100_000_000,
                 "unchangedRelevantState": True,
                 "nextStructuredActionChanged": False,
                 "outputTokens": 15,
@@ -105,14 +105,14 @@ def _timing(*, valid: bool = True, complete: bool = True) -> dict:
                     "localInputEstimate": 100,
                     "repeatedUnchangedContext": 70,
                 },
-                "dispatchMs": 10,
-                "completedMs": 20,
+                "dispatchMs": 0,
+                "completedMs": 310,
             },
             {
                 "generationIndex": 1,
                 "attemptKind": "primary",
                 "generationPurpose": "implementation",
-                "modelStreamWaitNs": 290,
+                "modelStreamWaitNs": 290_000_000,
                 "decisionLatencyNs": None,
                 "unchangedRelevantState": False,
                 "nextStructuredActionChanged": True,
@@ -130,8 +130,8 @@ def _timing(*, valid: bool = True, complete: bool = True) -> dict:
                     "localInputEstimate": 110,
                     "repeatedUnchangedContext": 80,
                 },
-                "dispatchMs": 30,
-                "completedMs": 40,
+                "dispatchMs": 320,
+                "completedMs": 620,
             },
         ],
         "toolCalls": [
@@ -167,15 +167,15 @@ def _timing(*, valid: bool = True, complete: bool = True) -> dict:
         ],
         "toolCallTimingOverflow": 0,
         "preFirstModelOutput": {
-            "clientCriticalPathNs": 80,
-            "attributedClientUnionNs": 65,
-            "unattributedPreOutputNs": 15,
-            "historySnapshotNs": 10,
-            "normalizationNs": 8,
-            "promptConstructionNs": 20,
-            "requestTransformationNs": 7,
-            "serializationNs": 5,
-            "transportReadinessNs": 15,
+            "clientCriticalPathNs": 80_000_000,
+            "attributedClientUnionNs": 65_000_000,
+            "unattributedPreOutputNs": 15_000_000,
+            "historySnapshotNs": 10_000_000,
+            "normalizationNs": 8_000_000,
+            "promptConstructionNs": 20_000_000,
+            "requestTransformationNs": 7_000_000,
+            "serializationNs": 5_000_000,
+            "transportReadinessNs": 15_000_000,
         },
         "observationalNonprogressTokens": {
             "logicalGenerations": 1,
@@ -188,16 +188,52 @@ def _timing(*, valid: bool = True, complete: bool = True) -> dict:
         "observationalNonprogressLatency": {
             "logicalGenerations": 1,
             "physicalAttempts": 1,
-            "modelStreamWaitNs": 300,
+            "modelStreamWaitNs": 300_000_000,
             "decisionReadyAttempts": 1,
-            "decisionLatencyNs": 250,
+            "decisionLatencyNs": 250_000_000,
             "toolCalls": 1,
-            "toolActiveUnionNs": 100,
+            "toolActiveUnionNs": 100_000_000,
         },
     }
 
 
 class Kd4TurnLatencyAuditTest(unittest.TestCase):
+    def test_overlapping_children_use_elapsed_union_and_missing_bounds_are_uncertain(
+        self,
+    ):
+        records = [{"turnId": "turn", "callId": "parent"}]
+        parent = {
+            "_turnId": "turn",
+            "callId": "parent",
+            "acceptedAtMs": 0,
+            "outputModelVisibleAtMs": 100,
+        }
+        child = {
+            "_turnId": "turn",
+            "parentCallId": "parent",
+            "processSpawnedAtMs": 10,
+            "processExitedAtMs": 60,
+        }
+        kd4_turn_latency_audit._apply_detailed_tool_timing(
+            records, [parent, {**child, "callId": "a"}, {**child, "callId": "b"}]
+        )
+        self.assertEqual(records[0]["reportedChildWorkNs"], 100_000_000)
+        self.assertEqual(records[0]["orchestrationGapLowerBoundNs"], 50_000_000)
+        kd4_turn_latency_audit._apply_detailed_tool_timing(
+            records,
+            [
+                parent,
+                {**child, "callId": "a"},
+                {"_turnId": "turn", "parentCallId": "parent", "callId": "b"},
+            ],
+        )
+        self.assertEqual(records[0]["orchestrationGapLowerBoundNs"], 0)
+        self.assertEqual(records[0]["timingConfidence"], "low")
+        tokens = kd4_turn_latency_audit._diagnostic_token_report(
+            [{"inputTokens": 100, "cachedInputTokens": 90, "visibleOutputTokens": 10}]
+        )
+        self.assertEqual(tokens["observedBillableTokens"], 110)
+
     def test_population_report_omits_retired_validation_counters(self) -> None:
         timing = _timing()
         timing["counters"].update(
@@ -630,6 +666,62 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertEqual(relay["dominantPhaseOwner"], "PostToolUse")
         self.assertEqual(relay["dominantPhaseMs"], 99_000)
 
+    def test_summary_cli_caps_turns_and_intervals_without_truncating_totals(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            rollout = root / "rollout.jsonl"
+            lines = [_meta(str(root))]
+            for turn_index in range(21):
+                timing = _timing()
+                timing["modelRequests"] = [
+                    {
+                        **_timing()["modelRequests"][0],
+                        "generationIndex": index,
+                        "dispatchMs": index * 40,
+                        "completedMs": index * 40 + 35,
+                        "modelStreamWaitNs": 30_000_000,
+                        "decisionLatencyNs": 20_000_000,
+                        "toolActiveUnionNs": 0,
+                        "toolCallCount": 0,
+                    }
+                    for index in range(17)
+                ]
+                timing["counters"]["logicalGenerationCount"] = 17
+                turn_id = f"turn-{turn_index:02}"
+                lines.extend(
+                    [
+                        _event({"type": "task_started", "turn_id": turn_id}),
+                        _event(
+                            {
+                                "type": "task_complete",
+                                "turn_id": turn_id,
+                                "timing": timing,
+                            }
+                        ),
+                    ]
+                )
+            rollout.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = kd4_turn_latency_audit.main(
+                    [str(rollout), "--repo-root", str(root), "--summary-json"]
+                )
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(report["perTurn"]), 20)
+        self.assertEqual(report["omittedPerTurnRecords"], 1)
+        self.assertEqual(report["populations"]["all"]["turns"], 21)
+        self.assertEqual(
+            report["populations"]["all"]["tokens"]["totalTokens"], 21 * 17 * 115
+        )
+        for turn in report["perTurn"]:
+            self.assertEqual(len(turn["tokenIntervals"]), 16)
+            self.assertEqual(turn["omittedTokenIntervals"], 1)
+            self.assertEqual(turn["tokens"]["totalTokens"], 17 * 115)
+        self.assertLess(len(stdout.getvalue().encode("utf-8")), 512 * 1024)
+
     def test_uuid_cli_resolves_snapshot_and_emits_bounded_execution_loop(self) -> None:
         session_id = "01a018c7-a357-7c11-a7ca-9248dd075f22"
         with tempfile.TemporaryDirectory() as temp:
@@ -726,11 +818,11 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         )
         self.assertEqual(report["toolRelay"]["phaseTotalsMs"]["endToEndDurationMs"], 8)
         self.assertEqual(report["toolRelay"]["topSlowCalls"], [])
-        self.assertEqual(report["perTurn"][0]["agentActiveDurationNs"], 900)
+        self.assertEqual(report["perTurn"][0]["agentActiveDurationNs"], 900_000_000)
         self.assertEqual(report["perTurn"][0]["firstUsefulActionMs"], 12.5)
-        self.assertEqual(report["perTurn"][0]["humanWaitNs"], 100)
-        self.assertEqual(report["perTurn"][0]["humanOnlyWaitNs"], 100)
-        self.assertEqual(report["perTurn"][0]["humanWaitUnionNs"], 150)
+        self.assertEqual(report["perTurn"][0]["humanWaitNs"], 100_000_000)
+        self.assertEqual(report["perTurn"][0]["humanOnlyWaitNs"], 100_000_000)
+        self.assertEqual(report["perTurn"][0]["humanWaitUnionNs"], 150_000_000)
         self.assertEqual(
             report["perTurn"][0]["humanWaitCounts"]["userInputWaitCount"], 1
         )
@@ -754,25 +846,25 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertEqual(report["schemaVersion"], 16)
         breakdown = report["latencyBreakdown"]
         orchestration_breakdown = breakdown["orchestration"]
-        self.assertEqual(orchestration_breakdown["exclusiveTotalNs"], 100)
+        self.assertEqual(orchestration_breakdown["exclusiveTotalNs"], 100_000_000)
         self.assertEqual(orchestration_breakdown["shareOfAgentActive"], 1 / 9)
         self.assertEqual(
             orchestration_breakdown["localActivityUnionsNs"]["planningExclusiveNs"],
-            17,
+            17_000_000,
         )
         self.assertEqual(
             orchestration_breakdown["preFirstModelOutput"]["clientCriticalPathNs"],
-            80,
+            80_000_000,
         )
         self.assertEqual(
             orchestration_breakdown["toolRelayOverheadNs"]["dispatchQueueNs"],
             1_000_000,
         )
         model_breakdown = breakdown["modelInference"]
-        self.assertEqual(model_breakdown["exclusiveTotalNs"], 600)
-        self.assertEqual(model_breakdown["activeUnionNs"], 600)
+        self.assertEqual(model_breakdown["exclusiveTotalNs"], 600_000_000)
+        self.assertEqual(model_breakdown["activeUnionNs"], 600_000_000)
         self.assertEqual(
-            model_breakdown["requestPhaseUnionsNs"]["streamProcessingNs"], 20
+            model_breakdown["requestPhaseUnionsNs"]["streamProcessingNs"], 20_000_000
         )
         self.assertEqual(model_breakdown["logicalGenerations"], 2)
         self.assertEqual(model_breakdown["physicalAttempts"], 2)
@@ -781,7 +873,7 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
             model_breakdown["generationPurposes"]["deterministic_tool_continuation"][
                 "modelStreamWaitNs"
             ],
-            300,
+            300_000_000,
         )
         self.assertEqual(
             report["coverage"]["terminalLifecycleStateCounts"], {"completed": 1}
@@ -797,7 +889,8 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertEqual(intervals[1]["tokens"]["inputTokens"], 110)
         summary = kd4_turn_latency_audit.bounded_summary(report)
         self.assertEqual(
-            summary["latencyBreakdown"]["orchestration"]["exclusiveTotalNs"], 100
+            summary["latencyBreakdown"]["orchestration"]["exclusiveTotalNs"],
+            100_000_000,
         )
         self.assertEqual(
             summary["latencyBreakdown"]["modelInference"]["generationPurposes"],
@@ -1400,12 +1493,12 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertEqual(report["populations"]["eval"]["turns"], 1)
         self.assertEqual(report["populations"]["repository_root"]["turns"], 1)
         all_population = report["populations"]["all"]
-        self.assertEqual(all_population["modelOnlyNs"], 1200)
-        self.assertEqual(all_population["toolOnlyNs"], 400)
+        self.assertEqual(all_population["modelOnlyNs"], 1_200_000_000)
+        self.assertEqual(all_population["toolOnlyNs"], 400_000_000)
         self.assertEqual(all_population["decisionLatency"]["decisionReadyAttempts"], 2)
         self.assertEqual(
             all_population["observationalNonprogressLatency"]["modelStreamWaitNs"],
-            600,
+            600_000_000,
         )
 
     def test_excludes_invalid_profiles_and_falls_back_for_schema_14(self) -> None:
@@ -1421,8 +1514,8 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
                 {
                     "generationIndex": 0,
                     "attemptKind": "retry",
-                    "modelStreamWaitNs": 50,
-                    "decisionLatencyNs": 40,
+                    "modelStreamWaitNs": 50_000_000,
+                    "decisionLatencyNs": 40_000_000,
                 }
             )
             (sessions / "rollout.jsonl").write_text(
@@ -1465,7 +1558,7 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         )
         self.assertEqual(
             population["observationalNonprogressLatency"]["decisionLatencyNs"],
-            290,
+            290_000_000,
         )
         self.assertEqual(
             population["observationalNonprogressLatency"]["physicalAttempts"],

@@ -606,12 +606,16 @@ impl FeaturesToml {
             }
             let enabled = features.enabled(spec.id);
             if spec.id == Feature::CodeMode {
+                entries.remove(spec.key);
                 materialize_resolved_feature_enabled(code_mode, enabled);
             } else if spec.id == Feature::MultiAgentV2 {
+                entries.remove(spec.key);
                 materialize_resolved_feature_enabled(multi_agent_v2, enabled);
             } else if spec.id == Feature::CurrentTimeReminder {
+                entries.remove(spec.key);
                 materialize_resolved_feature_enabled(current_time_reminder, enabled);
             } else if spec.id == Feature::NetworkProxy {
+                entries.remove(spec.key);
                 materialize_resolved_feature_enabled(network_proxy, enabled);
             } else {
                 entries.insert(spec.key.to_string(), enabled);
@@ -631,10 +635,24 @@ fn materialize_resolved_feature_enabled<T: FeatureConfig>(
 }
 
 impl From<BTreeMap<String, bool>> for FeaturesToml {
-    fn from(entries: BTreeMap<String, bool>) -> Self {
+    fn from(mut entries: BTreeMap<String, bool>) -> Self {
         Self {
+            code_mode: entries
+                .remove(Feature::CodeMode.key())
+                .map(FeatureToml::Enabled),
+            multi_agent_v2: entries
+                .remove(Feature::MultiAgentV2.key())
+                .map(FeatureToml::Enabled),
+            current_time_reminder: entries
+                .remove(Feature::CurrentTimeReminder.key())
+                .map(FeatureToml::Enabled),
+            network_proxy: entries
+                .remove(Feature::NetworkProxy.key())
+                .map(FeatureToml::Enabled),
+            removed_apps_mcp_path_override: entries
+                .remove("apps_mcp_path_override")
+                .map(FeatureToml::Enabled),
             entries,
-            ..Default::default()
         }
     }
 }

@@ -83,7 +83,7 @@ impl SearchRequestProcessor {
                     existing.store(true, Ordering::Relaxed);
                 }
                 let flag = Arc::new(AtomicBool::new(false));
-                pending_fuzzy_searches.insert(token.clone(), flag.clone());
+                pending_fuzzy_searches.insert(token, flag.clone());
                 flag
             }
             None => Arc::new(AtomicBool::new(false)),
@@ -98,7 +98,9 @@ impl SearchRequestProcessor {
 
         let results = match query.as_str() {
             "" => vec![],
-            _ => run_fuzzy_file_search(query, roots, cancel_flag.clone()).await,
+            _ => run_fuzzy_file_search(query, roots, cancel_flag.clone())
+                .await
+                .map_err(|err| internal_error(format!("fuzzy file search failed: {err}")))?,
         };
 
         Ok(FuzzyFileSearchResponse { files: results })

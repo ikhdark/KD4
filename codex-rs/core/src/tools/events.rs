@@ -459,10 +459,8 @@ impl ToolEmitter {
         Ok(())
     }
 
-    pub async fn begin(&self, ctx: ToolEventCtx<'_>) {
-        self.emit(ctx, ToolEventStage::Begin)
-            .await
-            .expect("begin events do not invalidate tool history");
+    pub async fn begin(&self, ctx: ToolEventCtx<'_>) -> CodexResult<()> {
+        self.emit(ctx, ToolEventStage::Begin).await
     }
 
     fn format_exec_output_for_model(
@@ -1968,7 +1966,8 @@ mod tests {
                 "uncertain-call",
                 Some(&tracker),
             ))
-            .await;
+            .await
+            .expect("begin event should publish");
         tokio::fs::write(repo.join("changed.txt"), b"changed")
             .await
             .expect("mutate repository");
@@ -2053,7 +2052,8 @@ mod tests {
                 "shell-mutation",
                 None,
             ))
-            .await;
+            .await
+            .expect("begin event should publish");
         tokio::fs::write(repo.join("shell.txt"), "after shell")
             .await
             .expect("shell mutation");
@@ -2088,7 +2088,8 @@ mod tests {
             "unified-mutation",
             None,
         ))
-        .await;
+        .await
+        .expect("begin event should publish");
         tokio::fs::write(repo.join("unified.txt"), "after unified")
             .await
             .expect("unified mutation");
@@ -2163,7 +2164,10 @@ mod tests {
                 codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
             );
             let ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), call_id, Some(&tracker));
-            emitter.begin(ctx).await;
+            emitter
+                .begin(ctx)
+                .await
+                .expect("begin event should publish");
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
             let delta = codex_apply_patch::apply_patch(
@@ -2239,7 +2243,10 @@ mod tests {
             "known-patch",
             Some(&tracker),
         );
-        emitter.begin(ctx).await;
+        emitter
+            .begin(ctx)
+            .await
+            .expect("begin event should publish");
         let delta = codex_apply_patch::apply_patch(
             "*** Begin Patch\n*** Add File: a.txt\n+one\n*** End Patch",
             &cwd,
@@ -2269,7 +2276,10 @@ mod tests {
             "unknown-patch",
             Some(&tracker),
         );
-        unknown.begin(ctx).await;
+        unknown
+            .begin(ctx)
+            .await
+            .expect("begin event should publish");
         unknown
             .finish(ctx, Ok(ExecToolCallOutput::default()), None)
             .await
@@ -2378,7 +2388,10 @@ mod tests {
                 None,
             )
         };
-        emitter.begin(ctx).await;
+        emitter
+            .begin(ctx)
+            .await
+            .expect("begin event should publish");
         let error = tokio::time::timeout(
             Duration::from_secs(5),
             emitter.finish(ctx, Ok(ExecToolCallOutput::default()), delta.as_ref()),

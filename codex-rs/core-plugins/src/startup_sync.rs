@@ -35,6 +35,10 @@ const CURATED_PLUGINS_BACKUP_ARCHIVE_FALLBACK_VERSION: &str = "export-backup";
 const CURATED_PLUGINS_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const CURATED_PLUGINS_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const CURATED_PLUGINS_BACKUP_ARCHIVE_TIMEOUT: Duration = Duration::from_secs(30);
+const CURATED_PLUGINS_MAX_ARCHIVE_BYTES: usize = 50 * 1024 * 1024;
+const CURATED_PLUGINS_MAX_EXTRACTED_BYTES: u64 = 250 * 1024 * 1024;
+const CURATED_PLUGINS_MAX_ARCHIVE_ENTRIES: usize = 20_000;
+const COMMAND_MAX_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
 // Keep this comfortably above a normal sync attempt so we do not race another Codex process.
 const CURATED_PLUGINS_STALE_TEMP_DIR_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 // These variables can redirect Git away from the repository selected by `-C`,
@@ -206,9 +210,13 @@ fn sync_openai_plugins_repo_via_git(
     let repo_path = curated_plugins_repo_path(codex_home);
     let sha_path = codex_home.join(CURATED_PLUGINS_SHA_FILE);
     let remote_sha = git_ls_remote_head_sha(git_binary)?;
-    let local_sha = read_local_git_or_sha_file(&repo_path, &sha_path, git_binary);
-
-    if local_sha.as_deref() == Some(remote_sha.as_str()) && repo_path.join(".git").is_dir() {
+    if repo_path.join(".git").is_dir()
+        && git_head_sha(&repo_path, git_binary).ok().as_deref() == Some(remote_sha.as_str())
+        && ensure_marketplace_manifest_exists(&repo_path).is_ok()
+    {
+        if read_sha_file(&sha_path).as_deref() != Some(remote_sha.as_str()) {
+            write_curated_plugins_sha(&sha_path, &remote_sha)?;
+        }
         return Ok(remote_sha);
     }
 
@@ -344,7 +352,9 @@ fn sync_openai_plugins_repo_via_http_with_clients(
     let remote_sha = runtime.block_on(fetch_curated_repo_remote_sha(http_clients, api_base_url))?;
     let local_sha = read_sha_file(&sha_path);
 
-    if local_sha.as_deref() == Some(remote_sha.as_str()) && repo_path.is_dir() {
+    if local_sha.as_deref() == Some(remote_sha.as_str())
+        && ensure_marketplace_manifest_exists(&repo_path).is_ok()
+    {
         return Ok(remote_sha);
     }
 
@@ -656,20 +666,6 @@ fn write_curated_plugins_sha(sha_path: &Path, remote_sha: &str) -> Result<(), St
     })
 }
 
-fn read_local_git_or_sha_file(
-    repo_path: &Path,
-    sha_path: &Path,
-    git_binary: &Path,
-) -> Option<String> {
-    if repo_path.join(".git").is_dir()
-        && let Ok(sha) = git_head_sha(repo_path, git_binary)
-    {
-        return Some(sha);
-    }
-
-    read_sha_file(sha_path)
-}
-
 fn git_ls_remote_head_sha(git_binary: &Path) -> Result<String, String> {
     let mut command = git_command(git_binary);
     command
@@ -826,25 +822,25 @@ pub(crate) fn run_git_command_with_timeout(
     context: &str,
     timeout: Duration,
 ) -> Result<Output, String> {
-    use std::io::Read;
-    use std::io::Seek;
-
     // Pipes cannot be collected only after try_wait: Git may fill a pipe before
-    // exiting, and descendants may retain its write end after timeout. Anonymous
+    // exiting, and descendants may retain its write end after timeout. Temporary
     // files let the synchronous caller poll without either kind of pipe wait.
-    let capture =
-        || tempfile::tempfile().map_err(|err| format!("failed to capture {context}: {err}"));
-    let mut stdout = capture()?;
-    let mut stderr = capture()?;
+    let capture = || {
+        tempfile::NamedTempFile::new().map_err(|err| format!("failed to capture {context}: {err}"))
+    };
+    let stdout = capture()?;
+    let stderr = capture()?;
     command
         .stdin(Stdio::null())
         .stdout(
             stdout
+                .as_file()
                 .try_clone()
                 .map_err(|err| format!("failed to capture {context}: {err}"))?,
         )
         .stderr(
             stderr
+                .as_file()
                 .try_clone()
                 .map_err(|err| format!("failed to capture {context}: {err}"))?,
         );
@@ -856,7 +852,7 @@ pub(crate) fn run_git_command_with_timeout(
         managed
             .require_descendant_containment()
             .map_err(|err| format!("failed to contain {context}: {err}"))?;
-        command.creation_flags(codex_utils_pty::WINDOWS_CREATE_SUSPENDED);
+        command.creation_flags(codex_utils_pty::WINDOWS_CREATE_SUSPENDED | 0x08000000);
         managed
     };
     #[cfg(unix)]
@@ -880,6 +876,19 @@ pub(crate) fn run_git_command_with_timeout(
         .map_err(|err| format!("failed to contain {context}: {err}"))?;
     let start = std::time::Instant::now();
     let status = loop {
+        for capture in [&stdout, &stderr] {
+            if capture
+                .as_file()
+                .metadata()
+                .map_err(|err| format!("failed to inspect {context} output: {err}"))?
+                .len()
+                > COMMAND_MAX_OUTPUT_BYTES
+            {
+                return Err(format!(
+                    "{context} output exceeds {COMMAND_MAX_OUTPUT_BYTES} bytes"
+                ));
+            }
+        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {}
@@ -887,10 +896,7 @@ pub(crate) fn run_git_command_with_timeout(
         }
         if start.elapsed() >= timeout {
             drop(child);
-            let mut bytes = Vec::new();
-            stderr
-                .rewind()
-                .and_then(|()| stderr.read_to_end(&mut bytes))
+            let bytes = read_captured_output(&stderr, false)
                 .map_err(|err| format!("failed to read {context} output: {err}"))?;
             let stderr = String::from_utf8_lossy(&bytes);
             let stderr = stderr.trim();
@@ -905,19 +911,13 @@ pub(crate) fn run_git_command_with_timeout(
         }
         std::thread::sleep(Duration::from_millis(100).min(timeout.saturating_sub(start.elapsed())));
     };
-    let mut output = Output {
+    let output = Output {
         status,
-        stdout: Vec::new(),
-        stderr: Vec::new(),
+        stdout: read_captured_output(&stdout, status.success())
+            .map_err(|err| format!("failed to read {context} output: {err}"))?,
+        stderr: read_captured_output(&stderr, status.success())
+            .map_err(|err| format!("failed to read {context} output: {err}"))?,
     };
-    stdout
-        .rewind()
-        .and_then(|()| stdout.read_to_end(&mut output.stdout))
-        .map_err(|err| format!("failed to read {context} output: {err}"))?;
-    stderr
-        .rewind()
-        .and_then(|()| stderr.read_to_end(&mut output.stderr))
-        .map_err(|err| format!("failed to read {context} output: {err}"))?;
     if output.status.success() {
         #[cfg(windows)]
         child
@@ -934,6 +934,32 @@ pub(crate) fn run_git_command_with_timeout(
             .map_err(|err| format!("failed to reap {context}: {err}"))?;
     }
     Ok(output)
+}
+
+fn read_captured_output(
+    file: &tempfile::NamedTempFile,
+    require_complete: bool,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let extent = file.as_file().metadata()?.len();
+    if require_complete && extent > COMMAND_MAX_OUTPUT_BYTES {
+        return Err(std::io::Error::other(
+            "command output exceeds capture limit",
+        ));
+    }
+    // Reopening provides an independent cursor on both Windows and Unix.
+    // Read only this extent even if a successful helper continues writing.
+    let extent = extent.min(COMMAND_MAX_OUTPUT_BYTES);
+    let mut bytes = Vec::with_capacity(extent as usize);
+    file.reopen()?.take(extent).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != extent {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "command capture shortened",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn ensure_git_success(output: &Output, context: &str) -> Result<(), String> {
@@ -1129,14 +1155,11 @@ async fn fetch_github_text(
         .send()
         .await
         .map_err(|err| format!("failed to {context} from {url}: {err}"))?;
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(format!(
-            "{context} from {url} failed with status {status}: {body}"
-        ));
-    }
-    Ok(body)
+    let body =
+        crate::remote::read_plugin_http_response(response, crate::remote::MAX_PLUGIN_JSON_BYTES)
+            .await
+            .map_err(|err| format!("failed to read {context} response from {url}: {err}"))?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 async fn fetch_github_bytes(
@@ -1148,18 +1171,11 @@ async fn fetch_github_bytes(
         .send()
         .await
         .map_err(|err| format!("failed to {context} from {url}: {err}"))?;
-    let status = response.status();
-    let body = response
-        .bytes()
-        .await
-        .map_err(|err| format!("failed to read {context} response from {url}: {err}"))?;
-    if !status.is_success() {
-        let body_text = String::from_utf8_lossy(&body);
-        return Err(format!(
-            "{context} from {url} failed with status {status}: {body_text}"
-        ));
-    }
-    Ok(body.to_vec())
+    let body =
+        crate::remote::read_plugin_http_response(response, CURATED_PLUGINS_MAX_ARCHIVE_BYTES)
+            .await
+            .map_err(|err| format!("failed to read {context} response from {url}: {err}"))?;
+    Ok(body)
 }
 
 async fn fetch_public_text(
@@ -1173,14 +1189,11 @@ async fn fetch_public_text(
         .send()
         .await
         .map_err(|err| format!("failed to {context} from {url}: {err}"))?;
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(format!(
-            "{context} from {url} failed with status {status}: {body}"
-        ));
-    }
-    Ok(body)
+    let body =
+        crate::remote::read_plugin_http_response(response, crate::remote::MAX_PLUGIN_JSON_BYTES)
+            .await
+            .map_err(|err| format!("failed to read {context} response from {url}: {err}"))?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 async fn fetch_public_bytes(
@@ -1194,18 +1207,11 @@ async fn fetch_public_bytes(
         .send()
         .await
         .map_err(|err| format!("failed to {context} from {url}: {err}"))?;
-    let status = response.status();
-    let body = response
-        .bytes()
-        .await
-        .map_err(|err| format!("failed to read {context} response from {url}: {err}"))?;
-    if !status.is_success() {
-        let body_text = String::from_utf8_lossy(&body);
-        return Err(format!(
-            "{context} from {url} failed with status {status}: {body_text}"
-        ));
-    }
-    Ok(body.to_vec())
+    let body =
+        crate::remote::read_plugin_http_response(response, CURATED_PLUGINS_MAX_ARCHIVE_BYTES)
+            .await
+            .map_err(|err| format!("failed to read {context} response from {url}: {err}"))?;
+    Ok(body)
 }
 
 fn github_request(http_clients: &RouteAwareClientPool, url: &str) -> RouteAwareRequestBuilder {
@@ -1235,6 +1241,12 @@ fn extract_zipball_to_dir(bytes: &[u8], destination: &Path) -> Result<(), String
     let mut archive = ZipArchive::new(cursor)
         .map_err(|err| format!("failed to open curated plugins zip archive: {err}"))?;
 
+    if archive.len() > CURATED_PLUGINS_MAX_ARCHIVE_ENTRIES {
+        return Err(format!(
+            "curated plugins archive exceeds {CURATED_PLUGINS_MAX_ARCHIVE_ENTRIES} entries"
+        ));
+    }
+    let mut extracted_bytes = 0;
     for index in 0..archive.len() {
         let mut entry = archive
             .by_index(index)
@@ -1286,12 +1298,21 @@ fn extract_zipball_to_dir(bytes: &[u8], destination: &Path) -> Result<(), String
                 output_path.display()
             )
         })?;
-        std::io::copy(&mut entry, &mut output).map_err(|err| {
-            format!(
-                "failed to write curated plugins file {}: {err}",
-                output_path.display()
-            )
-        })?;
+        use std::io::Read;
+        let remaining = CURATED_PLUGINS_MAX_EXTRACTED_BYTES - extracted_bytes;
+        let copied =
+            std::io::copy(&mut (&mut entry).take(remaining + 1), &mut output).map_err(|err| {
+                format!(
+                    "failed to write curated plugins file {}: {err}",
+                    output_path.display()
+                )
+            })?;
+        if copied > remaining {
+            return Err(format!(
+                "curated plugins archive exceeds {CURATED_PLUGINS_MAX_EXTRACTED_BYTES} extracted bytes"
+            ));
+        }
+        extracted_bytes += copied;
         apply_zip_permissions(&entry, &output_path)?;
     }
 
@@ -1302,6 +1323,12 @@ fn apply_zip_permissions(
     _entry: &zip::read::ZipFile<'_>,
     _output_path: &Path,
 ) -> Result<(), String> {
+    #[cfg(unix)]
+    if let Some(mode) = _entry.unix_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(_output_path, std::fs::Permissions::from_mode(mode & 0o777))
+            .map_err(|err| format!("failed to restore archive file permissions: {err}"))?;
+    }
     Ok(())
 }
 

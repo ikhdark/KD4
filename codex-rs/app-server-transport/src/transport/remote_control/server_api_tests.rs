@@ -30,47 +30,51 @@ fn assert_transient_timeout(err: &io::Error, expected_status: Option<StatusCode>
 }
 
 async fn timed_out_request(partial_response: Option<&'static [u8]>) -> io::Error {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("listener should bind");
-    let url = format!(
-        "http://{}/backend-api/wham/remote/control/server/refresh",
-        listener
-            .local_addr()
-            .expect("listener should have a local address")
-    );
-    let (request_done_tx, request_done_rx) = oneshot::channel();
-    let server_task = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.expect("request should connect");
-        if let Some(partial_response) = partial_response {
-            stream
-                .write_all(partial_response)
-                .await
-                .expect("partial response should write");
-        }
-        request_done_rx
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let listener = TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("test should report request completion");
-    });
+            .expect("listener should bind");
+        let url = format!(
+            "http://{}/backend-api/wham/remote/control/server/refresh",
+            listener
+                .local_addr()
+                .expect("listener should have a local address")
+        );
+        let (request_done_tx, request_done_rx) = oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("request should connect");
+            if let Some(partial_response) = partial_response {
+                stream
+                    .write_all(partial_response)
+                    .await
+                    .expect("partial response should write");
+            }
+            request_done_rx
+                .await
+                .expect("test should report request completion");
+        });
 
-    let client = create_client_without_request_logging().expect("test HTTP client");
-    let err = send_remote_control_server_request::<_, serde_json::Value>(
-        &client,
-        &url,
-        &auth(),
-        "installation-id",
-        &json!({"server_id": "server-id"}),
-        "refresh",
-        "server refresh",
-        TEST_REQUEST_TIMEOUT,
-    )
+        let client = create_client_without_request_logging().expect("test HTTP client");
+        let err = send_remote_control_server_request::<_, serde_json::Value>(
+            &client,
+            &url,
+            &auth(),
+            "installation-id",
+            &json!({"server_id": "server-id"}),
+            "refresh",
+            "server refresh",
+            TEST_REQUEST_TIMEOUT,
+        )
+        .await
+        .expect_err("incomplete response should time out");
+        request_done_tx
+            .send(())
+            .expect("server should wait for request completion");
+        server_task.await.expect("server task should finish");
+        err
+    })
     .await
-    .expect_err("incomplete response should time out");
-    request_done_tx
-        .send(())
-        .expect("server should wait for request completion");
-    server_task.await.expect("server task should finish");
-    err
+    .expect("test exchange should finish in time")
 }
 
 fn enrollment(now: OffsetDateTime) -> RemoteControlEnrollment {
@@ -282,5 +286,135 @@ fn http_date_retry_after_preserves_absolute_deadline() {
     assert_eq!(
         refresh_deferral(Some(retry_at), body_read_at),
         (Duration::from_secs(90), retry_at)
+    );
+}
+
+#[tokio::test]
+async fn server_response_body_is_bounded() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let url = format!(
+            "http://{}/refresh",
+            listener.local_addr().expect("listener address")
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("request should connect");
+            // The client must reject before the rest of the advertised body or EOF.
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2097152\r\n\r\n")
+                .await
+                .expect("headers should write");
+            stream
+                .write_all(&vec![b' '; 1024 * 1024 + 1])
+                .await
+                .expect("oversized body should write");
+            stream
+        });
+        let client = create_client_without_request_logging().expect("test HTTP client");
+        let auth = auth();
+        let body = json!({});
+        let request = send_remote_control_server_request::<_, serde_json::Value>(
+            &client,
+            &url,
+            &auth,
+            "installation-id",
+            &body,
+            "refresh",
+            "server refresh",
+            Duration::from_secs(2),
+        );
+        let (err, stream) = tokio::join!(request, server);
+        let _stream = stream.expect("server should finish writing");
+        let err =
+            err.expect_err("oversized response should fail before waiting for the remaining body");
+        assert!(err.to_string().contains("exceeds 1 MiB limit"));
+        assert_eq!(
+            remote_control_server_request_error(&err)
+                .expect("metadata should remain")
+                .status,
+            Some(StatusCode::OK)
+        );
+    })
+    .await
+    .expect("bounded read should finish");
+}
+
+#[tokio::test]
+async fn auth_failures_stop_dispatch_for_remote_control_requests() {
+    struct UnavailableAuth {
+        transient: bool,
+    }
+
+    impl codex_api::AuthProvider for UnavailableAuth {
+        fn add_auth_headers(&self, _headers: &mut axum::http::HeaderMap) {}
+
+        fn try_add_auth_headers(
+            &self,
+            _headers: &mut axum::http::HeaderMap,
+        ) -> Result<(), codex_api::AuthError> {
+            Err(if self.transient {
+                codex_api::AuthError::Transient("credentials unavailable".to_string())
+            } else {
+                codex_api::AuthError::Build("credentials invalid".to_string())
+            })
+        }
+    }
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test listener");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let url = format!(
+        "http://{}/refresh",
+        listener.local_addr().expect("local address")
+    );
+    let client = create_client_without_request_logging().expect("test HTTP client");
+    for transient in [false, true] {
+        let auth = RemoteControlConnectionAuth {
+            auth_provider: std::sync::Arc::new(UnavailableAuth { transient }),
+            account_id: "account-a".to_string(),
+        };
+        let error = send_remote_control_server_request::<_, serde_json::Value>(
+            &client,
+            &url,
+            &auth,
+            "installation-id",
+            &json!({"server_id": "server-id"}),
+            "refresh",
+            "server refresh",
+            TEST_REQUEST_TIMEOUT,
+        )
+        .await
+        .expect_err("auth failure must reject the request");
+        assert_eq!(
+            error.kind(),
+            if transient {
+                ErrorKind::WouldBlock
+            } else {
+                ErrorKind::InvalidInput
+            }
+        );
+        let source = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<codex_api::AuthError>())
+            .expect("preserve the structured auth failure");
+        match (transient, source) {
+            (false, codex_api::AuthError::Build(message)) => {
+                assert_eq!(message, "credentials invalid")
+            }
+            (true, codex_api::AuthError::Transient(message)) => {
+                assert_eq!(message, "credentials unavailable")
+            }
+            _ => panic!("preserve the auth failure variant"),
+        }
+    }
+    assert_eq!(
+        listener
+            .accept()
+            .expect_err("no request should connect")
+            .kind(),
+        ErrorKind::WouldBlock
     );
 }

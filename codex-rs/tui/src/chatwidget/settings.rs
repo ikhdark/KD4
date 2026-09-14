@@ -211,6 +211,7 @@ impl ChatWidget {
         // be identical across two accounts, so always invalidate account-scoped requests and data.
         self.clear_pending_token_activity_refreshes();
         self.clear_pending_rate_limit_reset_requests();
+        self.rate_limit_snapshots_by_limit_id.clear();
         self.codex_rate_limit_reached_type = None;
         self.codex_spend_control_reached = None;
         self.rate_limit_warnings = RateLimitWarningState::default();
@@ -220,7 +221,7 @@ impl ChatWidget {
         let had_refreshing_status_outputs = !self.refreshing_status_outputs.is_empty();
         let now = Local::now();
         for (_, handle) in self.refreshing_status_outputs.drain(..) {
-            handle.finish_rate_limit_refresh(&[], now);
+            handle.finish_rate_limit_refresh(&[], now, /*refresh_succeeded*/ false);
         }
         if had_refreshing_status_outputs {
             self.request_redraw();
@@ -490,33 +491,33 @@ impl ChatWidget {
         )
     }
 
-    pub(super) fn refresh_model_display(&mut self) {
-        // Keep composer paste affordances aligned with the currently effective model.
-        self.sync_image_paste_enabled();
-        self.sync_service_tier_commands();
-        self.refresh_terminal_title();
-    }
-
     /// Refresh every UI surface that depends on the effective model, reasoning
     /// effort, or collaboration mode.
     ///
     /// Call this at the end of any setter that mutates `current_collaboration_mode`,
     /// `active_collaboration_mask`, or per-mode reasoning-effort overrides.
-    /// Consolidating both refreshes here prevents the bug where callers update the
-    /// header/title (`refresh_model_display`) but forget the footer status line
-    /// (`refresh_status_line`).
+    /// Consolidating refreshes here keeps the header/title and footer status line
+    /// aligned with the effective model.
     pub(super) fn refresh_model_dependent_surfaces(&mut self) {
-        self.refresh_model_display();
-        self.refresh_status_line();
+        self.sync_image_paste_enabled();
+        self.sync_service_tier_commands();
+        self.refresh_status_surfaces();
     }
 
     fn apply_thread_settings(&mut self, mut settings: ThreadSettings) {
         let cwd_changed = self.config.cwd != settings.cwd;
         self.apply_thread_settings_cwd(settings.cwd.clone());
         self.config.model_provider_id = settings.model_provider.clone();
-        self.set_service_tier(settings.service_tier.clone());
-        self.set_approval_policy(settings.approval_policy);
-        self.set_approvals_reviewer(settings.approvals_reviewer.to_core());
+        self.config.service_tier = settings.service_tier.clone();
+        if let Err(err) = self
+            .config
+            .permissions
+            .approval_policy
+            .set(settings.approval_policy.to_core())
+        {
+            tracing::warn!(%err, "failed to set approval_policy on chat config");
+        }
+        self.config.approvals_reviewer = settings.approvals_reviewer.to_core();
         self.config.personality = settings.personality;
 
         let permission_profile = settings.permission_profile.take().unwrap_or_else(|| {
@@ -549,10 +550,9 @@ impl ChatWidget {
 
         settings.collaboration_mode.settings.model = settings.model;
         settings.collaboration_mode.settings.reasoning_effort = settings.effort;
-        self.set_effective_collaboration_mode(settings.collaboration_mode);
+        self.apply_effective_collaboration_mode(settings.collaboration_mode);
         self.refresh_effective_service_tier();
-        self.refresh_status_surfaces();
-        self.sync_service_tier_commands();
+        self.refresh_model_dependent_surfaces();
         self.sync_personality_command_enabled();
         if cwd_changed {
             self.refresh_skills_for_current_cwd(/*force_reload*/ true);
@@ -582,7 +582,7 @@ impl ChatWidget {
             .set_workspace_roots(self.config.workspace_roots.clone());
     }
 
-    pub(super) fn set_effective_collaboration_mode(&mut self, mode: CollaborationMode) {
+    pub(super) fn apply_effective_collaboration_mode(&mut self, mode: CollaborationMode) {
         let mode_kind = mode.mode;
         let settings = mode.settings;
         if mode_kind == ModeKind::Default {
@@ -600,7 +600,6 @@ impl ChatWidget {
         });
         self.update_collaboration_mode_indicator();
         self.refresh_plan_mode_nudge();
-        self.refresh_model_dependent_surfaces();
     }
 
     pub(super) fn model_display_name(&self) -> &str {
@@ -726,6 +725,7 @@ impl ChatWidget {
                 .insert(self.plan_mode_nudge_scope());
         }
         self.active_collaboration_mask = Some(mask);
+        self.refresh_effective_service_tier();
         self.update_collaboration_mode_indicator();
         self.refresh_plan_mode_nudge();
         self.refresh_model_dependent_surfaces();

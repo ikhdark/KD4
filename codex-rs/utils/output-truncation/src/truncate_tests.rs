@@ -498,6 +498,7 @@ fn formatted_output_respects_the_complete_projection_ceiling() {
 
     assert!(truncated.was_truncated);
     assert!(approx_token_count(&truncated.text) <= limits.applied_limit);
+    assert!(truncated.text.contains("xxxx"));
 }
 
 #[test]
@@ -505,6 +506,7 @@ fn exact_token_ceiling_includes_the_truncation_marker() {
     let truncated = truncate_text_to_token_ceiling(&"abcd ".repeat(10_000), 32);
 
     assert!(approx_token_count(&truncated) <= 32);
+    assert!(truncated.contains("abcd"));
 }
 
 #[test]
@@ -521,9 +523,57 @@ fn token_ceiling_retains_head_middle_and_tail_evidence() {
     assert!(truncated.contains("MIDDLE_EVIDENCE"));
     assert!(truncated.contains("TAIL_EVIDENCE"));
     assert!(approx_token_count(&truncated) <= 256);
+    let limits = resolve_output_limits(Some(256), OutputOutcome::Success, None, &content, 256);
+    let formatted = formatted_truncate_text_with_output_limit(&content, limits);
+    assert!(formatted.text.contains("HEAD_EVIDENCE"));
+    assert!(formatted.text.contains("MIDDLE_EVIDENCE"));
+    assert!(formatted.text.contains("TAIL_EVIDENCE"));
+    assert_eq!(
+        formatted
+            .text
+            .matches("[omitted before retained middle]")
+            .count(),
+        1
+    );
+    assert_eq!(
+        formatted
+            .text
+            .matches("[omitted after retained middle]")
+            .count(),
+        1
+    );
+    assert!(approx_token_count(&formatted.text) <= 256);
 }
 
 #[test]
 fn exact_token_ceiling_zero_returns_no_text() {
     assert_eq!(truncate_text_to_token_ceiling("content", 0), "");
+}
+
+#[test]
+fn just_over_budget_retains_most_of_the_source() {
+    let source = "x".repeat(4004);
+    let result = truncate_text_to_token_ceiling(&source, 1000);
+    assert!(approx_token_count(&result) <= 1000);
+    assert!(result.bytes().filter(|byte| *byte == b'x').count() > 3900);
+}
+
+#[test]
+fn small_and_unicode_outputs_remain_useful_and_bounded() {
+    for source in [
+        "hello ".repeat(100),
+        "漢字🦀 ".repeat(100),
+        ":;! ".repeat(100),
+    ] {
+        for limit in 1..64 {
+            let result = truncate_text_to_token_ceiling(&source, limit);
+            assert!(approx_token_count(&result) <= limit, "{limit}: {result}");
+            assert!(
+                result
+                    .chars()
+                    .any(|ch| source.contains(ch) && !ch.is_whitespace()),
+                "{limit}: {result}"
+            );
+        }
+    }
 }

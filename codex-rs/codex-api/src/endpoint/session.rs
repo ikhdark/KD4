@@ -72,12 +72,12 @@ impl<T: HttpTransport> EndpointSession<T> {
         method: &Method,
         path: &str,
         extra_headers: &HeaderMap,
-        body: Option<&RequestBody>,
+        body: Option<RequestBody>,
     ) -> Request {
         let mut req = self.provider.build_request(method.clone(), path);
         req.headers.extend(extra_headers.clone());
         if let Some(body) = body {
-            req.body = Some(body.clone());
+            req.body = Some(body);
         }
         req
     }
@@ -107,7 +107,7 @@ impl<T: HttpTransport> EndpointSession<T> {
         body: Option<Value>,
     ) -> Result<Response, ApiError> {
         let body = body.map(RequestBody::Json);
-        let request = self.make_request(&method, path, &extra_headers, body.as_ref());
+        let request = self.make_request(&method, path, &extra_headers, body);
         let request = prepare_request(request).await?;
         let make_request = || request.clone();
 
@@ -147,7 +147,7 @@ impl<T: HttpTransport> EndpointSession<T> {
         C: Fn(&mut Request),
     {
         let body = body.map(RequestBody::Json);
-        let mut request = self.make_request(&method, path, &extra_headers, body.as_ref());
+        let mut request = self.make_request(&method, path, &extra_headers, body);
         configure(&mut request);
         let request = prepare_request(request).await?;
         let make_request = || request.clone();
@@ -188,7 +188,7 @@ impl<T: HttpTransport> EndpointSession<T> {
         C: Fn(&mut Request),
     {
         let body = body.map(RequestBody::EncodedJson);
-        let mut request = self.make_request(&method, path, &extra_headers, body.as_ref());
+        let mut request = self.make_request(&method, path, &extra_headers, body);
         configure(&mut request);
         let request = prepare_request(request).await?;
         let make_request = || request.clone();

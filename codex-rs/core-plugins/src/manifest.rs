@@ -388,6 +388,11 @@ fn resolve_manifest_hooks(
                 .map(|path| codex_plugin::manifest::PluginManifestHooks::Paths(vec![path]))
         }
         RawPluginManifestHooks::Paths(paths) => {
+            if paths.is_empty() {
+                return Some(codex_plugin::manifest::PluginManifestHooks::Paths(
+                    Vec::new(),
+                ));
+            }
             let hooks = paths
                 .iter()
                 .filter_map(|path| resolve_manifest_path(plugin_root, "hooks", Some(path)))

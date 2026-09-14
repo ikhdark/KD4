@@ -1091,7 +1091,7 @@ fn file_change_declined_maps_to_failed_status() {
                             path: "file.txt".to_string(),
                             kind: PatchChangeKind::Update,
                         }],
-                        status: PatchApplyStatus::Failed,
+                        status: PatchApplyStatus::Declined,
                     }),
                 },
             })],
@@ -1321,11 +1321,11 @@ fn plan_update_emits_started_then_updated_then_completed() {
                         }),
                     },
                 }),
-                ThreadEvent::TurnCompleted(TurnCompletedEvent {
+                ThreadEvent::TurnCompleted(Box::new(TurnCompletedEvent {
                     surfaced_result: None,
                     usage: Usage::default(),
                     timing: None,
-                }),
+                })),
             ],
             status: CodexStatus::InitiateShutdown,
         }
@@ -1458,7 +1458,7 @@ fn token_usage_update_is_emitted_on_turn_completion() {
     assert_eq!(
         completed,
         CollectedThreadEvents {
-            events: vec![ThreadEvent::TurnCompleted(TurnCompletedEvent {
+            events: vec![ThreadEvent::TurnCompleted(Box::new(TurnCompletedEvent {
                 surfaced_result: None,
                 usage: Usage {
                     input_tokens: 10,
@@ -1467,7 +1467,7 @@ fn token_usage_update_is_emitted_on_turn_completion() {
                     reasoning_output_tokens: 7,
                 },
                 timing: None,
-            })],
+            }))],
             status: CodexStatus::InitiateShutdown,
         }
     );
@@ -1506,11 +1506,21 @@ fn turn_completion_recovers_final_message_from_turn_items() {
     assert_eq!(
         completed,
         CollectedThreadEvents {
-            events: vec![ThreadEvent::TurnCompleted(TurnCompletedEvent {
-                surfaced_result: None,
-                usage: Usage::default(),
-                timing: None,
-            })],
+            events: vec![
+                ThreadEvent::ItemCompleted(ItemCompletedEvent {
+                    item: ExecThreadItem {
+                        id: "item_0".to_string(),
+                        details: ThreadItemDetails::AgentMessage(AgentMessageItem {
+                            text: "final answer".to_string()
+                        }),
+                    },
+                }),
+                ThreadEvent::TurnCompleted(Box::new(TurnCompletedEvent {
+                    surfaced_result: None,
+                    usage: Usage::default(),
+                    timing: None,
+                }))
+            ],
             status: CodexStatus::InitiateShutdown,
         }
     );
@@ -1622,11 +1632,11 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
                         }),
                     },
                 }),
-                ThreadEvent::TurnCompleted(TurnCompletedEvent {
+                ThreadEvent::TurnCompleted(Box::new(TurnCompletedEvent {
                     surfaced_result: None,
                     usage: Usage::default(),
                     timing: None,
-                }),
+                })),
             ],
             status: CodexStatus::InitiateShutdown,
         }
@@ -1679,11 +1689,21 @@ fn turn_completion_overwrites_stale_final_message_from_turn_items() {
     assert_eq!(
         completed,
         CollectedThreadEvents {
-            events: vec![ThreadEvent::TurnCompleted(TurnCompletedEvent {
-                surfaced_result: None,
-                usage: Usage::default(),
-                timing: None,
-            })],
+            events: vec![
+                ThreadEvent::ItemCompleted(ItemCompletedEvent {
+                    item: ExecThreadItem {
+                        id: "item_1".to_string(),
+                        details: ThreadItemDetails::AgentMessage(AgentMessageItem {
+                            text: "final answer".to_string()
+                        }),
+                    },
+                }),
+                ThreadEvent::TurnCompleted(Box::new(TurnCompletedEvent {
+                    surfaced_result: None,
+                    usage: Usage::default(),
+                    timing: None,
+                }))
+            ],
             status: CodexStatus::InitiateShutdown,
         }
     );
@@ -1731,11 +1751,11 @@ fn turn_completion_preserves_streamed_final_message_when_turn_items_are_empty() 
     assert_eq!(
         completed,
         CollectedThreadEvents {
-            events: vec![ThreadEvent::TurnCompleted(TurnCompletedEvent {
+            events: vec![ThreadEvent::TurnCompleted(Box::new(TurnCompletedEvent {
                 surfaced_result: None,
                 usage: Usage::default(),
                 timing: None,
-            })],
+            }))],
             status: CodexStatus::InitiateShutdown,
         }
     );
@@ -1781,10 +1801,8 @@ fn surfaced_result_without_canonical_message_clears_plain_output_and_stays_typed
     assert!(completed.events.iter().any(|event| {
         matches!(
             event,
-            ThreadEvent::TurnCompleted(TurnCompletedEvent {
-                surfaced_result: Some(actual),
-                ..
-            }) if actual == &surfaced_result
+            ThreadEvent::TurnCompleted(completed)
+                if completed.surfaced_result.as_ref() == Some(&surfaced_result)
         )
     }));
 }
@@ -1870,11 +1888,11 @@ fn turn_completion_falls_back_to_final_plan_text() {
     assert_eq!(
         completed,
         CollectedThreadEvents {
-            events: vec![ThreadEvent::TurnCompleted(TurnCompletedEvent {
+            events: vec![ThreadEvent::TurnCompleted(Box::new(TurnCompletedEvent {
                 surfaced_result: None,
                 usage: Usage::default(),
                 timing: None,
-            })],
+            }))],
             status: CodexStatus::InitiateShutdown,
         }
     );

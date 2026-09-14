@@ -146,6 +146,8 @@ impl BugStore {
         Ok(row.map(row_to_claim))
     }
 
+    /// Claim the oldest eligible report other than the excluded submission.
+    /// Reports created after that submission are also eligible.
     pub async fn claim_next_older(&self, excluded_id: i64) -> anyhow::Result<Option<BugClaim>> {
         let now = chrono::Utc::now().timestamp();
         let token = uuid::Uuid::new_v4().to_string();

@@ -14,7 +14,7 @@
 //!   non-empty cell.
 //! - A **delimiter line** immediately follows the header and contains only
 //!   alignment markers (`---`, `:---`, `---:`, `:---:`), each with at least
-//!   three dashes.
+//!   one dash.
 //! - **Body rows** follow the delimiter.
 //!
 //! A **fenced code block** starts with 3+ backticks or tildes and ends with a
@@ -37,13 +37,25 @@
 /// finally be displayed.
 pub(crate) fn parse_table_segments(line: &str) -> Option<Vec<&str>> {
     let trimmed = line.trim();
-    if trimmed.is_empty() {
+    if !trimmed.contains('|') {
         return None;
     }
 
-    let has_outer_pipe = trimmed.starts_with('|') || trimmed.ends_with('|');
+    let trailing_pipe = trimmed.ends_with('|')
+        && trimmed.as_bytes()[..trimmed.len() - 1]
+            .iter()
+            .rev()
+            .take_while(|byte| **byte == b'\\')
+            .count()
+            % 2
+            == 0;
+    let has_outer_pipe = trimmed.starts_with('|') || trailing_pipe;
     let content = trimmed.strip_prefix('|').unwrap_or(trimmed);
-    let content = content.strip_suffix('|').unwrap_or(content);
+    let content = if trailing_pipe {
+        content.strip_suffix('|').unwrap_or(content)
+    } else {
+        content
+    };
     let raw_segments = split_unescaped_pipe(content);
     if !has_outer_pipe && raw_segments.len() <= 1 {
         return None;
@@ -99,7 +111,7 @@ fn is_table_delimiter_segment(segment: &str) -> bool {
     }
     let without_leading = trimmed.strip_prefix(':').unwrap_or(trimmed);
     let without_ends = without_leading.strip_suffix(':').unwrap_or(without_leading);
-    without_ends.len() >= 3 && without_ends.chars().all(|c| c == '-')
+    !without_ends.is_empty() && without_ends.bytes().all(|c| c == b'-')
 }
 
 /// Whether `line` is a valid table delimiter row (every segment passes
@@ -137,9 +149,8 @@ pub(crate) enum FenceKind {
 /// limits (>3 spaces → not a fence), blockquote prefix stripping, and
 /// backtick/tilde marker matching.
 ///
-/// The tracker reports the fence context that applies to the current line
-/// before that line mutates the state. Callers rely on that when deciding
-/// whether the current raw line can open or continue a table.
+/// The tracker reports the state after the most recent call to `advance`: an
+/// opening fence enters its context and a closing fence returns to `Outside`.
 pub(crate) struct FenceTracker {
     state: Option<(char, usize, FenceKind)>,
 }
@@ -244,6 +255,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn escaped_trailing_pipe_is_cell_text() {
+        assert_eq!(parse_table_segments(r"text\|"), None);
+        assert_eq!(parse_table_segments(r"| text\|"), Some(vec![r"text\|"]));
+        assert_eq!(parse_table_segments(r"a | b\|"), Some(vec!["a", r"b\|"]));
+        assert_eq!(parse_table_segments(r"a | b\\|"), Some(vec!["a", r"b\\"]));
+    }
+
+    #[test]
+    fn short_delimiters_match_the_markdown_renderer() {
+        for delimiter in ["- | -", ":- | --:", ":--: | -"] {
+            assert!(is_table_delimiter_line(delimiter));
+            let markdown = format!("a | b\n{delimiter}\nc | d\n");
+            let events: Vec<_> =
+                pulldown_cmark::Parser::new_ext(&markdown, pulldown_cmark::Options::ENABLE_TABLES)
+                    .collect();
+            assert!(events.iter().any(|event| matches!(
+                event,
+                pulldown_cmark::Event::Start(pulldown_cmark::Tag::Table(_))
+            )));
+        }
+    }
+
+    #[test]
     fn parse_table_segments_basic() {
         assert_eq!(
             parse_table_segments("| A | B | C |"),
@@ -309,9 +343,9 @@ mod tests {
     #[test]
     fn is_table_delimiter_segment_invalid() {
         assert!(!is_table_delimiter_segment(""));
-        assert!(!is_table_delimiter_segment("--"));
+        assert!(!is_table_delimiter_segment(":"));
         assert!(!is_table_delimiter_segment("abc"));
-        assert!(!is_table_delimiter_segment(":--"));
+        assert!(!is_table_delimiter_segment("::"));
     }
 
     #[test]
@@ -324,7 +358,7 @@ mod tests {
     #[test]
     fn is_table_delimiter_line_invalid() {
         assert!(!is_table_delimiter_line("| A | B |"));
-        assert!(!is_table_delimiter_line("| -- | -- |"));
+        assert!(!is_table_delimiter_line("| : | :: |"));
     }
 
     #[test]

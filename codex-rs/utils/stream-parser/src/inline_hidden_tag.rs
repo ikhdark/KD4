@@ -69,12 +69,12 @@ where
         }
     }
 
-    fn find_next_open(&self) -> Option<(usize, usize)> {
+    fn find_next_open(&self, pending: &str) -> Option<(usize, usize)> {
         self.specs
             .iter()
             .enumerate()
             .filter_map(|(idx, spec)| {
-                self.pending
+                pending
                     .find(spec.open)
                     .map(|pos| (pos, spec.open.len(), idx))
             })
@@ -87,31 +87,72 @@ where
             .map(|(pos, _len, idx)| (pos, idx))
     }
 
-    fn max_open_prefix_suffix_len(&self) -> usize {
-        self.specs
-            .iter()
-            .map(|spec| longest_suffix_prefix_len(&self.pending, spec.open))
-            .max()
-            .map_or(0, std::convert::identity)
-    }
+    fn consume(&mut self, eof: bool) -> StreamTextChunk<ExtractedInlineTag<T>> {
+        let mut out = StreamTextChunk::default();
+        let mut consumed = 0;
+        loop {
+            let pending = &self.pending[consumed..];
+            if let Some(mut active) = self.active.take() {
+                if let Some(close_idx) = pending.find(active.close) {
+                    active.content.push_str(&pending[..close_idx]);
+                    consumed += close_idx + active.close.len();
+                    out.extracted.push(ExtractedInlineTag {
+                        tag: active.tag,
+                        content: active.content,
+                    });
+                    continue;
+                }
+                let keep = if eof {
+                    0
+                } else {
+                    longest_suffix_prefix_len(pending, active.close)
+                };
+                let take = pending.len() - keep;
+                active.content.push_str(&pending[..take]);
+                self.active = Some(active);
+                consumed += take;
+                break;
+            }
 
-    fn push_visible_prefix(out: &mut StreamTextChunk<ExtractedInlineTag<T>>, pending: &str) {
-        if !pending.is_empty() {
-            out.visible_text.push_str(pending);
+            let next_open = self.find_next_open(pending);
+            let keep = if eof {
+                0
+            } else {
+                self.specs
+                    .iter()
+                    .map(|spec| longest_suffix_prefix_len(pending, spec.open))
+                    .max()
+                    .unwrap_or(0)
+            };
+            // An incomplete opener at an earlier or equal offset can still win.
+            // At EOF only complete openers participate in the choice.
+            if let Some((open_idx, spec_idx)) = next_open
+                && (keep == 0 || pending.len() - keep > open_idx)
+            {
+                out.visible_text.push_str(&pending[..open_idx]);
+                let spec = &self.specs[spec_idx];
+                consumed += open_idx + spec.open.len();
+                self.active = Some(ActiveTag {
+                    tag: spec.tag.clone(),
+                    close: spec.close,
+                    content: String::new(),
+                });
+                continue;
+            }
+            let take = pending.len() - keep;
+            out.visible_text.push_str(&pending[..take]);
+            consumed += take;
+            break;
         }
-    }
-
-    fn drain_visible_to_suffix_match(
-        &mut self,
-        out: &mut StreamTextChunk<ExtractedInlineTag<T>>,
-        keep_suffix_len: usize,
-    ) {
-        let take = self.pending.len().saturating_sub(keep_suffix_len);
-        if take == 0 {
-            return;
+        // Move the unconsumed suffix only once, even for a complete dense document.
+        self.pending.drain(..consumed);
+        if eof && let Some(active) = self.active.take() {
+            out.extracted.push(ExtractedInlineTag {
+                tag: active.tag,
+                content: active.content,
+            });
         }
-        Self::push_visible_prefix(out, &self.pending[..take]);
-        self.pending.drain(..take);
+        out
     }
 }
 
@@ -123,77 +164,11 @@ where
 
     fn push_str(&mut self, chunk: &str) -> StreamTextChunk<Self::Extracted> {
         self.pending.push_str(chunk);
-        let mut out = StreamTextChunk::default();
-
-        loop {
-            if let Some(close) = self.active.as_ref().map(|active| active.close) {
-                if let Some(close_idx) = self.pending.find(close) {
-                    let Some(mut active) = self.active.take() else {
-                        continue;
-                    };
-                    active.content.push_str(&self.pending[..close_idx]);
-                    out.extracted.push(ExtractedInlineTag {
-                        tag: active.tag,
-                        content: active.content,
-                    });
-                    let close_len = close.len();
-                    self.pending.drain(..close_idx + close_len);
-                    continue;
-                }
-
-                let keep = longest_suffix_prefix_len(&self.pending, close);
-                let take = self.pending.len().saturating_sub(keep);
-                if take > 0 {
-                    if let Some(active) = self.active.as_mut() {
-                        active.content.push_str(&self.pending[..take]);
-                    }
-                    self.pending.drain(..take);
-                }
-                break;
-            }
-
-            if let Some((open_idx, spec_idx)) = self.find_next_open() {
-                Self::push_visible_prefix(&mut out, &self.pending[..open_idx]);
-                let spec = &self.specs[spec_idx];
-                let open_len = spec.open.len();
-                self.pending.drain(..open_idx + open_len);
-                self.active = Some(ActiveTag {
-                    tag: spec.tag.clone(),
-                    close: spec.close,
-                    content: String::new(),
-                });
-                continue;
-            }
-
-            let keep = self.max_open_prefix_suffix_len();
-            self.drain_visible_to_suffix_match(&mut out, keep);
-            break;
-        }
-
-        out
+        self.consume(false)
     }
 
     fn finish(&mut self) -> StreamTextChunk<Self::Extracted> {
-        let mut out = StreamTextChunk::default();
-
-        if let Some(mut active) = self.active.take() {
-            if !self.pending.is_empty() {
-                active.content.push_str(&self.pending);
-                self.pending.clear();
-            }
-            out.extracted.push(ExtractedInlineTag {
-                tag: active.tag,
-                content: active.content,
-            });
-            return out;
-        }
-
-        if !self.pending.is_empty() {
-            out.visible_text.push_str(&self.pending);
-            self.pending.clear();
-        }
-
-        out
+        self.consume(true)
     }
 }
 
@@ -280,25 +255,63 @@ mod tests {
 
     #[test]
     fn generic_inline_parser_prefers_longest_opener_at_same_offset() {
-        let mut parser = InlineHiddenTagParser::new(vec![
-            InlineTagSpec {
-                tag: Tag::A,
-                open: "<a>",
-                close: "</a>",
-            },
-            InlineTagSpec {
-                tag: Tag::B,
-                open: "<ab>",
-                close: "</ab>",
-            },
-        ]);
+        for (input, visible, tag, content) in [
+            ("x<a>!y</a>!z", "xz", Tag::B, "y"),
+            ("x<a>y</a>z", "xz", Tag::A, "y"),
+            ("x<a>", "x", Tag::A, ""),
+        ] {
+            for split in 0..=input.len() {
+                let mut parser = InlineHiddenTagParser::new(vec![
+                    InlineTagSpec {
+                        tag: Tag::A,
+                        open: "<a>",
+                        close: "</a>",
+                    },
+                    InlineTagSpec {
+                        tag: Tag::B,
+                        open: "<a>!",
+                        close: "</a>!",
+                    },
+                ]);
+                let out = collect_chunks(&mut parser, &[&input[..split], &input[split..]]);
+                assert_eq!(out.visible_text, visible);
+                assert_eq!(
+                    out.extracted,
+                    vec![super::ExtractedInlineTag {
+                        tag,
+                        content: content.to_string(),
+                    }]
+                );
+            }
+        }
+    }
 
-        let out = collect_chunks(&mut parser, &["x<ab>y</ab>z"]);
-
-        assert_eq!(out.visible_text, "xz");
-        assert_eq!(out.extracted.len(), 1);
-        assert_eq!(out.extracted[0].tag, Tag::B);
-        assert_eq!(out.extracted[0].content, "y");
+    #[test]
+    fn earlier_incomplete_opener_takes_precedence() {
+        let input = "x<a>!y</long>z";
+        for split in 0..=input.len() {
+            let mut parser = InlineHiddenTagParser::new(vec![
+                InlineTagSpec {
+                    tag: Tag::A,
+                    open: "a>",
+                    close: "</a>",
+                },
+                InlineTagSpec {
+                    tag: Tag::B,
+                    open: "<a>!",
+                    close: "</long>",
+                },
+            ]);
+            let out = collect_chunks(&mut parser, &[&input[..split], &input[split..]]);
+            assert_eq!(out.visible_text, "xz");
+            assert_eq!(
+                out.extracted,
+                vec![super::ExtractedInlineTag {
+                    tag: Tag::B,
+                    content: "y".to_string(),
+                }]
+            );
+        }
     }
 
     #[test]

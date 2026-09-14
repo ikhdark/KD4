@@ -321,12 +321,12 @@ fn deadline_timeout_io_error() -> std::io::Error {
     )
 }
 
-fn extract_ide_context(response: Value) -> Result<IdeContext, IdeContextError> {
+fn extract_ide_context(mut response: Value) -> Result<IdeContext, IdeContextError> {
     ensure_success_response(&response)?;
     let ide_context = response
-        .get("result")
-        .and_then(|result| result.get("ideContext"))
-        .cloned()
+        .get_mut("result")
+        .and_then(|result| result.get_mut("ideContext"))
+        .map(Value::take)
         .ok_or_else(|| {
             IdeContextError::InvalidResponse(
                 "ide-context response did not include result.ideContext".to_string(),

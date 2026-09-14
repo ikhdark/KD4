@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -20,6 +21,59 @@ from scripts.build_tooling_test_support import (
 
 
 class BuildToolingEnvironmentTest(unittest.TestCase):
+    def test_dynamic_loader_registers_postponed_dataclass_and_restores_on_failure(self):
+        from scripts import build_tooling_test_support as support
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "fixture.py"
+            source.write_text(
+                "from __future__ import annotations\nfrom dataclasses import dataclass\n@dataclass\nclass Item:\n    name: str\n"
+            )
+            with mock.patch.dict(sys.modules):
+                module = support.load_script_module(str(source), "loader_fixture")
+                self.assertEqual(module.Item("example").name, "example")
+                self.assertIs(sys.modules["loader_fixture"], module)
+                source.write_text("raise RuntimeError('import failed')\n")
+                with self.assertRaisesRegex(RuntimeError, "import failed"):
+                    support.load_script_module(str(source), "loader_fixture")
+                self.assertIs(sys.modules["loader_fixture"], module)
+
+    def test_sdk_check_reports_lint_and_format_differences(self):
+        formatter = load_format_module()
+        for check, first_code, expected_calls in (
+            (True, 1, 2),
+            (True, 2, 1),
+            (False, 1, 1),
+        ):
+            with self.subTest(check=check, code=first_code):
+                with mock.patch.object(
+                    formatter.subprocess,
+                    "run",
+                    side_effect=[
+                        subprocess.CompletedProcess([], first_code, "lint changes\n"),
+                        subprocess.CompletedProcess([], 0, "format checked\n"),
+                    ],
+                ) as run:
+                    result = formatter.run_formatter_group(
+                        formatter.python_sdk_formatter_group(check=check)
+                    )
+                self.assertEqual(result.returncode, first_code)
+                self.assertEqual(run.call_count, expected_calls)
+                self.assertEqual("format checked" in result.output, expected_calls == 2)
+
+    def test_recipe_startup_does_not_restart_shared_sccache(self):
+        shell = load_just_shell_module()
+        with (
+            mock.patch.object(sys, "argv", ["just-shell.py", "cargo check"]),
+            mock.patch.object(shell, "python_tool_env", return_value={}),
+            mock.patch.object(shell, "rust_tool_env", return_value={}),
+            mock.patch.object(shell, "run_powershell", return_value=7),
+            mock.patch.object(shell, "ensure_sccache_server_env") as restart,
+            mock.patch.dict(os.environ),
+        ):
+            self.assertEqual(shell.main(), 7)
+        restart.assert_not_called()
+
     def test_just_shell_limits_rust_setup_to_rust_commands(self) -> None:
         just_shell = load_just_shell_module()
 
@@ -198,6 +252,32 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
                 run=fake_run,
                 cache_dir=Path(tmp),
             )
+            self.assertFalse(restarted)
+            first_calls = list(calls)
+            calls.clear()
+            restarted = just_shell.ensure_sccache_server_env(
+                {
+                    "RUSTC_WRAPPER": "/tools/sccache",
+                    "SCCACHE_CACHE_SIZE": "80G",
+                },
+                which=lambda program: (
+                    f"/tools/{program}" if program == "sccache" else None
+                ),
+                run=fake_run,
+                cache_dir=Path(tmp),
+            )
+            self.assertEqual(calls, [])
+            self.assertFalse(restarted)
+            with mock.patch.object(
+                just_shell.time, "time", return_value=time.time() + 31
+            ):
+                restarted = just_shell.ensure_sccache_server_env(
+                    {"RUSTC_WRAPPER": "/tools/sccache", "SCCACHE_CACHE_SIZE": "80G"},
+                    which=lambda _: "/tools/sccache",
+                    run=fake_run,
+                    cache_dir=Path(tmp),
+                )
+            self.assertEqual(calls, first_calls)
 
         self.assertFalse(restarted)
         self.assertEqual(calls[-1], ["/tools/sccache", "--start-server"])
@@ -558,7 +638,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         )
 
         self.assertEqual(result, 1)
-        self.assertIn("PowerShell 7.4", stderr.getvalue())
+        self.assertIn("PowerShell 7.5", stderr.getvalue())
 
     def test_local_just_shell_reports_powershell_launch_failure(self) -> None:
         just_shell = load_just_shell_module()

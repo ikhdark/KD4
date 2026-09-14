@@ -22,8 +22,12 @@ use toml::Value as TomlValue;
 #[test]
 fn feature_metadata_is_exhaustive_and_single_sourced() {
     assert_eq!(crate::ALL_FEATURES.len(), crate::FEATURES.len());
+    let mut ids = std::collections::BTreeSet::new();
+    let mut keys = std::collections::BTreeSet::new();
 
     for (feature, spec) in crate::ALL_FEATURES.iter().zip(crate::FEATURES) {
+        assert!(ids.insert(spec.id), "duplicate feature ID: {:?}", spec.id);
+        assert!(keys.insert(spec.key), "duplicate feature key: {}", spec.key);
         assert_eq!(*feature, spec.id);
         assert_eq!(feature.key(), spec.key);
         assert_eq!(feature.stage(), spec.stage);
@@ -378,7 +382,7 @@ fn image_generation_is_stable_and_legacy_alias_is_unknown() {
 }
 
 #[test]
-fn image_generation_toggle_controls_extension_backed_generation() {
+fn image_generation_toggle_resolves_feature_state() {
     let mut entries = BTreeMap::new();
     entries.insert("image_generation".to_string(), false);
     let mut features = Features::with_defaults();
@@ -441,6 +445,7 @@ fn enable_fanout_is_under_development() {
 #[test]
 fn enable_fanout_normalization_enables_multi_agent_one_way() {
     let mut enable_fanout_features = Features::with_defaults();
+    enable_fanout_features.disable(Feature::Collab);
     enable_fanout_features.enable(Feature::SpawnCsv);
     enable_fanout_features.normalize_dependencies();
     assert_eq!(enable_fanout_features.enabled(Feature::SpawnCsv), true);
@@ -456,7 +461,9 @@ fn enable_fanout_normalization_enables_multi_agent_one_way() {
 #[test]
 fn apps_require_feature_flag_and_chatgpt_auth() {
     let mut features = Features::with_defaults();
+    features.disable(Feature::Apps);
     assert!(!features.apps_enabled_for_auth(/*has_chatgpt_auth*/ false));
+    assert!(!features.apps_enabled_for_auth(/*has_chatgpt_auth*/ true));
 
     features.enable(Feature::Apps);
     assert!(!features.apps_enabled_for_auth(/*has_chatgpt_auth*/ false));
@@ -466,7 +473,9 @@ fn apps_require_feature_flag_and_chatgpt_auth() {
 #[test]
 fn from_sources_applies_base_profile_and_overrides() {
     let mut base_entries = BTreeMap::new();
-    base_entries.insert("plugins".to_string(), true);
+    base_entries.insert("plugins".to_string(), false);
+    base_entries.insert("code_mode_only".to_string(), false);
+    base_entries.insert("web_search_request".to_string(), true);
     let base_features = FeaturesToml {
         entries: base_entries,
         ..Default::default()
@@ -474,6 +483,7 @@ fn from_sources_applies_base_profile_and_overrides() {
 
     let mut profile_entries = BTreeMap::new();
     profile_entries.insert("code_mode_only".to_string(), true);
+    profile_entries.insert("web_search_request".to_string(), false);
     let profile_features = FeaturesToml {
         entries: profile_entries,
         ..Default::default()
@@ -487,14 +497,54 @@ fn from_sources_applies_base_profile_and_overrides() {
             features: Some(&profile_features),
         },
         FeatureOverrides {
-            web_search_request: Some(false),
+            web_search_request: Some(true),
         },
     );
 
-    assert_eq!(features.enabled(Feature::Plugins), true);
+    assert_eq!(features.enabled(Feature::Plugins), false);
     assert_eq!(features.enabled(Feature::CodeModeOnly), true);
     assert_eq!(features.enabled(Feature::CodeMode), true);
-    assert_eq!(features.enabled(Feature::WebSearchRequest), false);
+    assert_eq!(features.enabled(Feature::WebSearchRequest), true);
+}
+
+#[test]
+fn structured_features_have_one_serialized_storage_location() {
+    let structured = [
+        Feature::CodeMode,
+        Feature::MultiAgentV2,
+        Feature::CurrentTimeReminder,
+        Feature::NetworkProxy,
+    ];
+    let input: BTreeMap<String, bool> = structured
+        .into_iter()
+        .map(|feature| (feature.key().to_string(), false))
+        .chain([("custom_extension".to_string(), false)])
+        .collect();
+    let mut config = FeaturesToml::from(input);
+    let serialized = toml::to_string(&config).unwrap();
+    assert_eq!(toml::from_str::<FeaturesToml>(&serialized).unwrap(), config);
+    let mut resolved = Features::with_defaults();
+    for feature in structured {
+        assert!(!config.entries.contains_key(feature.key()));
+        resolved.enable(feature);
+        // Materialization also repairs older internal representations.
+        config.entries.insert(feature.key().to_string(), false);
+    }
+    config.materialize_resolved_enabled(&resolved);
+    let serialized = toml::to_string(&config).unwrap();
+    let replayed: FeaturesToml = toml::from_str(&serialized).unwrap();
+    for feature in structured {
+        assert!(!config.entries.contains_key(feature.key()));
+        assert_eq!(replayed.entries().get(feature.key()), Some(&true));
+        assert_eq!(
+            serialized
+                .lines()
+                .filter(|line| line.starts_with(&format!("{} =", feature.key())))
+                .count(),
+            1
+        );
+    }
+    assert_eq!(replayed.entries().get("custom_extension"), Some(&false));
 }
 
 #[test]

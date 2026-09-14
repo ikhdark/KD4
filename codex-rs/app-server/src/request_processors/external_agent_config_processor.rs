@@ -48,6 +48,8 @@ use codex_state::ExternalAgentConfigImportSuccessRecord;
 use codex_thread_store::ThreadStore;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use tokio_util::task::TaskTracker;
+use tracing::Instrument;
 
 use super::ConfigRequestProcessor;
 use super::external_agent_session_import::ExternalAgentSessionImporter;
@@ -62,6 +64,7 @@ pub(crate) struct ExternalAgentConfigRequestProcessor {
     config_processor: ConfigRequestProcessor,
     state_db: Option<StateDbHandle>,
     analytics_events_client: AnalyticsEventsClient,
+    background_tasks: TaskTracker,
 }
 
 pub(crate) struct ExternalAgentConfigRequestProcessorArgs {
@@ -74,6 +77,7 @@ pub(crate) struct ExternalAgentConfigRequestProcessorArgs {
     pub(crate) analytics_events_client: AnalyticsEventsClient,
     pub(crate) arg0_paths: Arg0DispatchPaths,
     pub(crate) codex_home: PathBuf,
+    pub(crate) background_tasks: TaskTracker,
 }
 
 impl ExternalAgentConfigRequestProcessor {
@@ -88,6 +92,7 @@ impl ExternalAgentConfigRequestProcessor {
             analytics_events_client,
             arg0_paths,
             codex_home,
+            background_tasks,
         } = args;
         let session_importer = ExternalAgentSessionImporter::new(
             codex_home.clone(),
@@ -107,6 +112,7 @@ impl ExternalAgentConfigRequestProcessor {
             config_processor,
             state_db,
             analytics_events_client,
+            background_tasks,
         }
     }
 
@@ -214,6 +220,23 @@ impl ExternalAgentConfigRequestProcessor {
         request_id: ConnectionRequestId,
         params: ExternalAgentConfigImportParams,
     ) -> Result<(), JSONRPCErrorError> {
+        // Disconnect cancels the RPC future. Keep foreground mutations and their
+        // completion/handoff under one owner, including response backpressure.
+        let processor = self.clone();
+        self.background_tasks
+            .spawn(
+                async move { processor.import_owned(request_id, params).await }
+                    .instrument(tracing::Span::current()),
+            )
+            .await
+            .map_err(|error| internal_error(format!("import task failed: {error}")))?
+    }
+
+    async fn import_owned(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ExternalAgentConfigImportParams,
+    ) -> Result<(), JSONRPCErrorError> {
         let import_id = Uuid::new_v4().to_string();
         let analytics_source = params.source.clone().unwrap_or_default();
         let needs_runtime_refresh = migration_items_need_runtime_refresh(&params.migration_items);
@@ -228,7 +251,7 @@ impl ExternalAgentConfigRequestProcessor {
             self.validate_pending_session_imports(&params);
         let import_outcome = self.import_external_agent_config(params).await;
         if needs_runtime_refresh {
-            self.config_processor.handle_config_mutation().await;
+            self.config_processor.handle_config_mutation();
         }
         self.outgoing
             .send_response(
@@ -282,7 +305,7 @@ impl ExternalAgentConfigRequestProcessor {
             )
         });
         let pending_plugin_imports = import_outcome.pending_plugin_imports;
-        tokio::spawn(async move {
+        self.background_tasks.spawn(async move {
             let session_progress_outgoing = Arc::clone(&outgoing);
             let session_import_id = import_id.clone();
             let session_imports = async move {
@@ -562,14 +585,16 @@ async fn send_import_progress(
     import_id: &str,
     item_result: &CoreImportItemResult,
 ) {
-    outgoing
-        .send_server_notification(ServerNotification::ExternalAgentConfigImportProgress(
+    let _ = tokio::time::timeout(
+        crate::outgoing_message::RESOURCE_DELIVERY_TIMEOUT,
+        outgoing.send_server_notification(ServerNotification::ExternalAgentConfigImportProgress(
             ExternalAgentConfigImportProgressNotification {
                 import_id: import_id.to_string(),
                 item_type_results: vec![protocol_import_type_result(item_result)],
             },
-        ))
-        .await;
+        )),
+    )
+    .await;
 }
 
 async fn send_completed_import_notification(
@@ -592,11 +617,13 @@ async fn send_completed_import_notification(
             "failed to record external agent config import completion"
         );
     }
-    outgoing
-        .send_server_notification(ServerNotification::ExternalAgentConfigImportCompleted(
+    let _ = tokio::time::timeout(
+        crate::outgoing_message::RESOURCE_DELIVERY_TIMEOUT,
+        outgoing.send_server_notification(ServerNotification::ExternalAgentConfigImportCompleted(
             notification,
-        ))
-        .await;
+        )),
+    )
+    .await;
 }
 
 fn log_completed_import_failures(notification: &ExternalAgentConfigImportCompletedNotification) {

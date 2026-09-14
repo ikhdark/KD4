@@ -32,7 +32,8 @@ expression: messages
   Results by type:
     Settings: 1 imported, 0 failed
     Plugins: 1 imported, 1 failed
-  Run /import again to check for additional items.
+    deployer@example [plugin_import]: install failed
+  Resolve the failures above, then run /import to retry.
 No Claude Code setup was found to import.
 Import from Claude Code is unavailable in remote sessions. Start Codex locally and run /import.
 Import from Claude Code is unavailable while Codex is connected to the local app-server daemon. Stop the daemon, restart Codex, and run /import.

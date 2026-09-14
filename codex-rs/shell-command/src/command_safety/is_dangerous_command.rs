@@ -167,12 +167,24 @@ fn rm_has_force_option(args: &[String]) -> bool {
 
 fn sudo_subcommand(command: &[String]) -> Option<&[String]> {
     let mut index = 1;
+    let mut options = true;
     while index < command.len() {
         let arg = command[index].as_str();
-        if arg == "--" {
-            return command.get(index + 1..).filter(|rest| !rest.is_empty());
+        if options && arg == "--" {
+            options = false;
+            index += 1;
+            continue;
         }
-        if arg == "-" || !arg.starts_with('-') {
+        if arg.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty()
+                && name.bytes().enumerate().all(|(i, ch)| {
+                    ch == b'_' || ch.is_ascii_alphabetic() || (i > 0 && ch.is_ascii_digit())
+                })
+        }) {
+            index += 1;
+            continue;
+        }
+        if !options || arg == "-" || !arg.starts_with('-') {
             return command.get(index..).filter(|rest| !rest.is_empty());
         }
 
@@ -219,6 +231,24 @@ mod tests {
 
     fn vec_str(items: &[&str]) -> Vec<String> {
         items.iter().map(std::string::ToString::to_string).collect()
+    }
+
+    #[test]
+    fn review_regression_sudo_environment_assignments_preserve_hazards() {
+        for argv in [
+            vec!["sudo", "NAME=value", "rm", "-rf", "target"],
+            vec!["sudo", "-u", "root", "A=1", "B=", "rm", "-f", "target"],
+            vec!["sudo", "--", "NAME=value", "rm", "-rf", "target"],
+        ] {
+            assert!(command_might_be_dangerous(&vec_str(&argv)), "{argv:?}");
+        }
+        assert!(!command_might_be_dangerous(&vec_str(&[
+            "sudo",
+            "NAME=value",
+            "echo",
+            "rm",
+            "-rf"
+        ])));
     }
 
     #[test]

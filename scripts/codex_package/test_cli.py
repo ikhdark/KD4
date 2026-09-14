@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import json
+import hashlib
 import sys
 import tempfile
 import unittest
@@ -14,6 +15,13 @@ from codex_package.cargo import SourceBuildOutputs
 
 
 class CliPerformanceFlagsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        fingerprint = mock.patch.object(
+            cli, "source_tree_fingerprint", return_value={"status": "test"}
+        )
+        fingerprint.start()
+        self.addCleanup(fingerprint.stop)
+
     def test_archive_compression_defaults_to_fast(self) -> None:
         with mock.patch("sys.argv", ["codex_package"]):
             args = cli.parse_args()
@@ -87,7 +95,9 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                 mock.patch.object(
                     cli, "build_source_binaries"
                 ) as build_source_binaries,
-                mock.patch.object(cli, "prepare_package_dir") as prepare_package_dir,
+                mock.patch.object(
+                    cli, "prepare_package_dir", side_effect=create_staged_package_dir
+                ) as prepare_package_dir,
                 mock.patch.object(cli, "build_package_dir") as build_package_dir,
                 mock.patch.object(cli, "validate_package_dir") as validate_package_dir,
                 mock.patch.object(
@@ -354,14 +364,193 @@ class CliPreflightTest(unittest.TestCase):
             cli.write_release_manifests(release_dir, package_dir, [archive_path])
 
             checksums = (release_dir / "codex-package_SHA256SUMS").read_text()
-            self.assertIn(archive_path.name, checksums)
+            self.assertEqual(
+                checksums,
+                f"{hashlib.sha256(b'archive').hexdigest()}  {archive_path.name}\n",
+            )
             provenance = json.loads(
                 (
                     release_dir / "codex-package_x86_64-pc-windows-msvc_PROVENANCE.json"
                 ).read_text()
             )
             self.assertEqual(provenance["version"], "1.2.3")
-            self.assertEqual(provenance["artifacts"][0]["name"], archive_path.name)
+            self.assertEqual(
+                provenance["artifacts"],
+                [
+                    {
+                        "name": archive_path.name,
+                        "size": 7,
+                        "sha256": hashlib.sha256(b"archive").hexdigest(),
+                    }
+                ],
+            )
+
+    def test_strict_release_semver(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            package = Path(temp_dir) / "package"
+            for version in [
+                "01.2.3",
+                "1.02.3",
+                "1.2.03",
+                "1.2.3-alpha..1",
+                "1.2.3-.",
+                "1.2.3-01",
+                "1.2.3+foo..bar",
+            ]:
+                with (
+                    self.subTest(version=version),
+                    self.assertRaisesRegex(RuntimeError, "semantic version"),
+                ):
+                    cli.validate_cli_request(
+                        request_args(release_version=version),
+                        cli.TARGET_SPECS["x86_64-pc-windows-msvc"],
+                        package,
+                    )
+            for version in ["0.0.0", "1.2.3-alpha.1", "1.2.3-0", "1.2.3-01a+001.build"]:
+                with self.subTest(version=version):
+                    args = request_args(
+                        target="x86_64-pc-windows-msvc",
+                        variant="codex",
+                        package_dir=package,
+                        release_version=version,
+                    )
+                    with (
+                        mock.patch.object(cli, "parse_args", return_value=args),
+                        mock.patch.object(
+                            cli,
+                            "resolve_package_inputs",
+                            side_effect=RuntimeError("valid request reached inputs"),
+                        ) as inputs,
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "valid request reached inputs"
+                        ):
+                            cli.main()
+                        inputs.assert_called_once()
+
+    def test_cheap_input_failures_do_not_start_cargo(self) -> None:
+        spec = cli.TARGET_SPECS["x86_64-pc-windows-msvc"]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for failure in ["version", "ripgrep", "zstd"]:
+                with self.subTest(failure=failure):
+                    root = Path(temp_dir)
+                    args = request_args(
+                        target=spec.target,
+                        variant="codex",
+                        package_dir=root / "package",
+                        rg_bin=None,
+                        release_version=None if failure == "version" else "1.2.3",
+                    )
+                    if failure == "ripgrep":
+                        args.rg_bin = root / "missing-rg.exe"
+                    if failure == "zstd":
+                        args.archive_output = [root / "out.tar.zst"]
+                    with (
+                        mock.patch.object(cli, "parse_args", return_value=args),
+                        mock.patch.object(
+                            cli,
+                            "read_workspace_version",
+                            side_effect=RuntimeError("invalid version"),
+                        ),
+                        mock.patch.object(
+                            cli,
+                            "resolve_zstd_command",
+                            side_effect=RuntimeError("missing zstd"),
+                        ),
+                        mock.patch.object(cli, "resolve_source_outputs") as build,
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "version|ripgrep|zstd"
+                        ):
+                            cli.main()
+                        build.assert_not_called()
+
+    def test_failed_validation_preserves_previous_package_without_copying_it(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            package = root / "package"
+            package.mkdir()
+            (package / "old").write_bytes(b"previous")
+            args = request_args(
+                target="x86_64-pc-windows-msvc",
+                variant="codex",
+                package_dir=package,
+                reuse_package_dir=True,
+            )
+
+            def build(staging, *args, **kwargs):
+                self.assertEqual(list(staging.iterdir()), [])
+                (staging / "new").write_bytes(b"new")
+
+            with (
+                mock.patch.object(cli, "parse_args", return_value=args),
+                mock.patch.object(
+                    cli, "resolve_package_inputs", return_value=("1.2.3", mock.Mock())
+                ),
+                mock.patch.object(cli, "validate_package_input_roles"),
+                mock.patch.object(
+                    cli, "source_tree_fingerprint", return_value={"status": "test"}
+                ),
+                mock.patch.object(cli, "build_package_dir", side_effect=build),
+                mock.patch.object(
+                    cli,
+                    "validate_package_dir",
+                    side_effect=RuntimeError("validation failed"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "validation failed"),
+            ):
+                cli.main()
+            self.assertEqual((package / "old").read_bytes(), b"previous")
+            self.assertEqual(list(root.iterdir()), [package])
+
+    def test_non_force_package_preserves_destination_created_during_staging(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            package = Path(temp_dir) / "package"
+            with self.assertRaisesRegex(RuntimeError, "not empty"):
+                with cli.staged_package_destination(
+                    package, reuse_existing=False
+                ) as staging:
+                    staging.mkdir()
+                    (staging / "new").write_bytes(b"new")
+                    package.mkdir()
+                    (package / "other").write_bytes(b"other writer")
+            self.assertEqual((package / "other").read_bytes(), b"other writer")
+            self.assertFalse((package / "new").exists())
+
+    def test_second_archive_activation_failure_restores_previous_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            outputs = [root / "first.zip", root / "second.zip"]
+            for path in outputs:
+                path.write_bytes(path.name.encode())
+            activate = cli.activate_archive
+
+            def fail_second(staging, dest, *, force):
+                if dest == outputs[1]:
+                    raise OSError("second activation failed")
+                activate(staging, dest, force=force)
+
+            with (
+                mock.patch.object(
+                    cli, "write_archive", side_effect=create_staged_archive
+                ),
+                mock.patch.object(cli, "activate_archive", side_effect=fail_second),
+                self.assertRaisesRegex(OSError, "second activation failed"),
+            ):
+                cli.write_archives_atomically(
+                    root / "package",
+                    outputs,
+                    force=True,
+                    entries=[],
+                    compression="fast",
+                )
+            for path in outputs:
+                self.assertEqual(path.read_bytes(), path.name.encode())
+            self.assertEqual(set(root.iterdir()), set(outputs))
 
     def test_skip_build_rejects_ignored_source_override(self) -> None:
         args = request_args(

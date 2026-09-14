@@ -119,12 +119,17 @@ pub(crate) fn matches_marked_text(start_marker: &str, end_marker: &str, text: &s
     }
 
     let trimmed = text.trim_start();
-    let starts_with_marker = trimmed
+    if !trimmed
         .get(..start_marker.len())
-        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(start_marker));
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(start_marker))
+    {
+        return false;
+    }
     let trimmed = trimmed.trim_end();
-    let ends_with_marker = trimmed
+    if trimmed.len() < start_marker.len().saturating_add(end_marker.len()) {
+        return false;
+    }
+    trimmed
         .get(trimmed.len().saturating_sub(end_marker.len())..)
-        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(end_marker));
-    starts_with_marker && ends_with_marker
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(end_marker))
 }

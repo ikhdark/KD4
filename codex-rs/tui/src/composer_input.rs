@@ -12,6 +12,7 @@ use std::time::Duration;
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::ChatComposer;
+use crate::bottom_pane::ChatComposerConfig;
 use crate::bottom_pane::InputResult;
 use crate::render::renderable::Renderable;
 
@@ -19,7 +20,7 @@ use crate::render::renderable::Renderable;
 pub enum ComposerAction {
     /// The user submitted the current text (typically via Enter). Contains the submitted text.
     Submitted(String),
-    /// No submission occurred; UI may need to redraw if `needs_redraw()` returned true.
+    /// No submission occurred; Callers should schedule a redraw after input.
     None,
 }
 
@@ -37,12 +38,13 @@ impl ComposerInput {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let sender = AppEventSender::new(tx.clone());
         // `enhanced_keys_supported=true` enables Shift+Enter newline hint/behavior.
-        let inner = ChatComposer::new(
+        let inner = ChatComposer::new_with_config(
             /*has_input_focus*/ true,
             sender,
             /*enhanced_keys_supported*/ true,
             "Compose new task".to_string(),
             /*disable_paste_burst*/ false,
+            ChatComposerConfig::plain_text(),
         );
         Self { inner, _tx: tx, rx }
     }
@@ -131,5 +133,36 @@ impl ComposerInput {
 impl Default for ComposerInput {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyCode;
+    use crossterm::event::KeyModifiers;
+
+    #[test]
+    fn slash_commands_submit_as_text() {
+        let mut input = ComposerInput::new();
+        input.handle_paste("/help".to_string());
+        assert!(
+            matches!(input.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ComposerAction::Submitted(text) if text == "/help")
+        );
+    }
+
+    #[test]
+    fn image_paths_submit_as_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.png");
+        image::RgbaImage::new(1, 1).save(&path).unwrap();
+        let text = path.to_string_lossy().into_owned();
+        let mut input = ComposerInput::new();
+        input.handle_paste(text.clone());
+        assert!(
+            matches!(input.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ComposerAction::Submitted(submitted) if submitted == text)
+        );
     }
 }

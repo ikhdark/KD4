@@ -198,107 +198,58 @@ fn unwrap_markdown_fences<'a>(markdown_source: &'a str) -> Cow<'a, str> {
         false
     }
 
-    fn content_from_ranges(source: &str, ranges: &[Range<usize>]) -> String {
-        let total_len: usize = ranges.iter().map(ExactSizeIterator::len).sum();
-        let mut content = String::with_capacity(total_len);
-        for range in ranges {
-            content.push_str(&source[range.start..range.end]);
-        }
-        content
-    }
-
-    struct MarkdownCandidateData {
-        fence: Fence,
-        opening_range: Range<usize>,
-        content_ranges: Vec<Range<usize>>,
-    }
-
-    // Box the large variant to keep ActiveFence small (~pointer-sized).
     enum ActiveFence {
         Passthrough(Fence),
-        MarkdownCandidate(Box<MarkdownCandidateData>),
+        MarkdownCandidate { fence: Fence, opening: Range<usize> },
     }
 
-    let mut out = String::with_capacity(markdown_source.len());
+    let mut out: Option<String> = None;
+    let mut retained_start = 0;
     let mut active_fence: Option<ActiveFence> = None;
     let mut source_offset = 0usize;
-
-    let mut push_source_range = |range: Range<usize>| {
-        if !range.is_empty() {
-            out.push_str(&markdown_source[range]);
-        }
-    };
-
     for line in markdown_source.split_inclusive('\n') {
         let line_start = source_offset;
         source_offset += line.len();
-        let line_range = line_start..source_offset;
-
         if let Some(active) = active_fence.take() {
             match active {
                 ActiveFence::Passthrough(fence) => {
-                    push_source_range(line_range);
                     if !is_close_fence(line, fence) {
                         active_fence = Some(ActiveFence::Passthrough(fence));
                     }
                 }
-                ActiveFence::MarkdownCandidate(mut data) => {
-                    if is_close_fence(line, data.fence) {
-                        if markdown_fence_contains_table(
-                            &content_from_ranges(markdown_source, &data.content_ranges),
-                            data.fence.is_blockquoted,
-                        ) {
-                            for range in data.content_ranges {
-                                push_source_range(range);
-                            }
-                        } else {
-                            push_source_range(data.opening_range);
-                            for range in data.content_ranges {
-                                push_source_range(range);
-                            }
-                            push_source_range(line_range);
+                ActiveFence::MarkdownCandidate { fence, opening } => {
+                    if is_close_fence(line, fence) {
+                        let body = &markdown_source[opening.end..line_start];
+                        if markdown_fence_contains_table(body, fence.is_blockquoted) {
+                            let output = out.get_or_insert_with(|| {
+                                String::with_capacity(markdown_source.len())
+                            });
+                            output.push_str(&markdown_source[retained_start..opening.start]);
+                            output.push_str(body);
+                            retained_start = source_offset;
                         }
                     } else {
-                        data.content_ranges.push(line_range);
-                        active_fence = Some(ActiveFence::MarkdownCandidate(data));
+                        active_fence = Some(ActiveFence::MarkdownCandidate { fence, opening });
                     }
                 }
             }
-            continue;
-        }
-
-        if let Some((fence, is_markdown)) = parse_open_fence(line) {
-            if is_markdown {
-                active_fence = Some(ActiveFence::MarkdownCandidate(Box::new(
-                    MarkdownCandidateData {
-                        fence,
-                        opening_range: line_range,
-                        content_ranges: Vec::new(),
-                    },
-                )));
-            } else {
-                push_source_range(line_range);
-                active_fence = Some(ActiveFence::Passthrough(fence));
-            }
-            continue;
-        }
-
-        push_source_range(line_range);
-    }
-
-    if let Some(active) = active_fence {
-        match active {
-            ActiveFence::Passthrough(_) => {}
-            ActiveFence::MarkdownCandidate(data) => {
-                push_source_range(data.opening_range);
-                for range in data.content_ranges {
-                    push_source_range(range);
+        } else if let Some((fence, is_markdown)) = parse_open_fence(line) {
+            active_fence = Some(if is_markdown {
+                ActiveFence::MarkdownCandidate {
+                    fence,
+                    opening: line_start..source_offset,
                 }
-            }
+            } else {
+                ActiveFence::Passthrough(fence)
+            });
         }
     }
-
-    Cow::Owned(out)
+    if let Some(mut out) = out {
+        out.push_str(&markdown_source[retained_start..]);
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(markdown_source)
+    }
 }
 
 #[cfg(test)]
@@ -482,6 +433,7 @@ mod tests {
         let src = "```markdown\n> | A | B |\n> |---|---|\n> | 1 | 2 |\n```\n";
         let normalized = unwrap_markdown_fences(src);
         assert_eq!(normalized, src);
+        assert!(matches!(normalized, Cow::Borrowed(_)));
     }
 
     #[test]

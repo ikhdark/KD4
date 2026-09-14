@@ -14,7 +14,10 @@ pub(crate) fn validate_metric_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(MetricsError::EmptyMetricName);
     }
-    if !name.chars().all(is_metric_char) {
+    if name.len() > 255
+        || !name.as_bytes()[0].is_ascii_alphabetic()
+        || !name.chars().all(is_metric_char)
+    {
         return Err(MetricsError::InvalidMetricName {
             name: name.to_string(),
         });

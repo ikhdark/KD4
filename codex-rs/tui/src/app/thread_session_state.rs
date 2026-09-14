@@ -113,6 +113,14 @@ impl App {
             }
         };
         session.thread_id = thread_id;
+        let forked_from_id = thread
+            .forked_from_id
+            .as_deref()
+            .and_then(|id| ThreadId::from_string(id).ok());
+        if session.forked_from_id != forked_from_id {
+            session.fork_parent_title = None;
+        }
+        session.forked_from_id = forked_from_id;
         session.thread_name = thread.name.clone();
         session.model_provider_id = thread.model_provider.clone();
         session.set_cwd_retargeting_implicit_runtime_workspace_root(thread.cwd.clone());
@@ -405,6 +413,8 @@ mod tests {
             ThreadId::from_string("00000000-0000-0000-0000-000000000405").expect("valid thread");
         let primary_session = ThreadSessionState {
             permission_profile: PermissionProfile::workspace_write(),
+            forked_from_id: Some(ThreadId::new()),
+            fork_parent_title: Some("Primary's parent".to_string()),
             ..test_thread_session(primary_thread_id, test_path_buf("/tmp/primary"))
         };
         let read_thread = Thread {
@@ -446,6 +456,8 @@ mod tests {
             .permissions
             .permission_profile()
             .clone();
+        assert_eq!(session.forked_from_id, None);
+        assert_eq!(session.fork_parent_title, None);
         assert_eq!(session.permission_profile, expected_permission_profile);
         assert_ne!(
             session.permission_profile,

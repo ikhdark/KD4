@@ -1,3 +1,4 @@
+use super::token_usage_replay::TokenUsageReplaySnapshot;
 use super::*;
 use crate::thread_status::ThreadStatusSubscription;
 use tokio::sync::Notify;
@@ -118,6 +119,10 @@ impl PendingThreadUnloads {
         }
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Retain the listener generation guard through connection admission and response enqueue"
+    )]
     async fn admit_resume_connection<'a>(
         &self,
         thread_state_manager: &ThreadStateManager,
@@ -631,7 +636,7 @@ pub(super) async fn ensure_listener_task_running(
         .map_err(|err| internal_error(format!("failed to register skills watcher: {err}")))?;
     let thread_settings_baseline =
         thread_settings_from_config_snapshot(&conversation.config_snapshot().await);
-    let (mut listener_command_rx, listener_generation) = {
+    let (mut listener_command_rx, listener_generation, listener_overflow) = {
         let mut thread_state = thread_state.lock().await;
         if thread_state.listener_matches(&conversation) {
             return Ok(());
@@ -648,10 +653,10 @@ pub(super) async fn ensure_listener_task_running(
             );
             return Ok(());
         };
-        listener_task_context
+        let listener_overflow = listener_task_context
             .thread_state_manager
             .register_listener_command_tx(conversation_id, listener_command_tx);
-        (listener_command_rx, listener_generation)
+        (listener_command_rx, listener_generation, listener_overflow)
     };
     let event_context = listener_task_context.clone();
     let ListenerTaskContext {
@@ -673,6 +678,15 @@ pub(super) async fn ensure_listener_task_running(
                 biased;
                 _ = listener_cancellation.cancelled() => {
                     // Listener was superseded or the thread is being torn down.
+                    break;
+                }
+                _ = listener_overflow.cancelled() => {
+                    // A goal update was not admitted. Continuing the stream could
+                    // leave clients on an older goal indefinitely. Resume sends
+                    // the authoritative goal snapshot before live updates.
+                    for connection_id in thread_state_manager.subscribed_connection_ids(conversation_id).await {
+                        outgoing_for_task.fail_connection_delivery(connection_id).await;
+                    }
                     break;
                 }
                 listener_command = listener_command_rx.recv() => {
@@ -1197,30 +1211,24 @@ pub(super) async fn handle_pending_thread_resume_request(
         if state.listener_generation != pending.listener_generation
             || state.listener_command_tx().is_none()
         {
-            drop(state);
-            outgoing
-                .send_error(
-                    pending.request_id,
-                    resume_listener_changed_error(conversation_id),
-                )
-                .await;
-            return;
-        }
-        if let Some(history_items) = pending.history_items.as_deref() {
+            Err(resume_listener_changed_error(conversation_id))
+        } else if let Some(history_items) = pending.history_items.as_deref() {
             state.seed_resume_history_for_listener(history_items, pending.listener_generation);
+            Ok(state.active_turn_snapshot())
         } else if !state.resume_history_is_seeded_for_current_listener() {
-            drop(state);
-            outgoing
-                .send_error(
-                    pending.request_id,
-                    internal_error(format!(
-                        "thread {conversation_id} resume history is not initialized for the active listener"
-                    )),
-                )
-                .await;
+            Err(internal_error(format!(
+                "thread {conversation_id} resume history is not initialized for the active listener"
+            )))
+        } else {
+            Ok(state.active_turn_snapshot())
+        }
+    };
+    let active_turn = match active_turn {
+        Ok(active_turn) => active_turn,
+        Err(error) => {
+            outgoing.send_error(pending.request_id, error).await;
             return;
         }
-        state.active_turn_snapshot()
     };
     let history_items = pending.history_items.as_deref().unwrap_or(&[]);
     tracing::debug!(
@@ -1240,12 +1248,12 @@ pub(super) async fn handle_pending_thread_resume_request(
     let request_id = pending.request_id;
     let connection_id = request_id.connection_id;
     let mut thread = pending.thread_summary;
-    let token_usage_turn_id = if pending.include_turns {
-        Some(populate_thread_turns_from_history_with_token_usage(
+    let token_usage_snapshot = if pending.include_turns {
+        populate_thread_turns_from_history_with_token_usage(
             &mut thread,
             history_items,
             active_turn.as_ref(),
-        ))
+        )
     } else {
         None
     };
@@ -1363,15 +1371,14 @@ pub(super) async fn handle_pending_thread_resume_request(
     }
     // Match cold resume: metadata-only resume should attach the listener without
     // paying the cost of turn reconstruction for historical usage replay.
-    if let Some(token_usage_turn_id) = token_usage_turn_id {
+    if let Some(token_usage_snapshot) = token_usage_snapshot {
         // Rejoining a loaded thread has the same UI contract as a cold resume, but
-        // uses the live conversation state instead of reconstructing a new session.
+        // keeps the usage and its owner from the same loaded history snapshot.
         send_thread_token_usage_update_to_connection(
             outgoing,
             connection_id,
             conversation_id,
-            conversation.as_ref(),
-            token_usage_turn_id,
+            token_usage_snapshot,
         )
         .await;
     }
@@ -1459,15 +1466,15 @@ pub(super) fn populate_thread_turns_from_history_with_token_usage(
     thread: &mut Thread,
     items: &[RolloutItem],
     active_turn: Option<&Turn>,
-) -> String {
+) -> Option<TokenUsageReplaySnapshot> {
     let (mut turns, token_usage_replay) =
         super::token_usage_replay::build_turns_with_token_usage_replay(items);
     if let Some(active_turn) = active_turn {
         merge_turn_history_with_active_turn(&mut turns, active_turn.clone());
     }
-    let token_usage_turn_id = token_usage_replay.into_turn_id(&turns);
+    let token_usage_snapshot = token_usage_replay.into_snapshot(&turns);
     thread.turns = turns;
-    token_usage_turn_id
+    token_usage_snapshot
 }
 
 pub(super) async fn resolve_pending_server_request(
@@ -1751,25 +1758,26 @@ mod tests {
                 matches!(&notifications[3], ServerNotification::TurnCompleted(turn)
                 if turn.turn.id == "turn-1" && turn.turn.status == TurnStatus::Interrupted && turn.turn.error.is_none())
             );
-            let state = state.lock().await;
-            let page = state
-                .indexed_items_page(
-                    None,
-                    None,
-                    10,
-                    codex_app_server_protocol::SortDirection::Asc,
-                )
-                .expect("valid page")
-                .expect("initialized history index");
-            assert_eq!(
-                page.items.len(),
-                1,
-                "legacy echoes must not create duplicate items"
-            );
-            assert!(
-                matches!(&page.items[0].item, ThreadItem::CollabAgentToolCall { id, status, .. } if id == "wait-1" && *status == expected_status)
-            );
-            drop(state);
+            {
+                let state = state.lock().await;
+                let page = state
+                    .indexed_items_page(
+                        None,
+                        None,
+                        10,
+                        codex_app_server_protocol::SortDirection::Asc,
+                    )
+                    .expect("valid page")
+                    .expect("initialized history index");
+                assert_eq!(
+                    page.items.len(),
+                    1,
+                    "legacy echoes must not create duplicate items"
+                );
+                assert!(
+                    matches!(&page.items[0].item, ThreadItem::CollabAgentToolCall { id, status, .. } if id == "wait-1" && *status == expected_status)
+                );
+            }
             fixture
                 .release_shutdown
                 .take()

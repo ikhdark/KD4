@@ -271,10 +271,10 @@ impl CodeModeExecuteHandler {
             let traced_response = response.clone();
             dispatch_lease
                 .record_trace(move || {
-                    code_cell_trace.record_initial_response(&traced_response);
-                    if live_cell && !keep_dispatch_open {
-                        code_cell_trace.record_ended(&traced_response);
-                    }
+                    code_cell_trace.record_initial_response(
+                        &traced_response,
+                        live_cell && !keep_dispatch_open,
+                    );
                 })
                 .await;
         }

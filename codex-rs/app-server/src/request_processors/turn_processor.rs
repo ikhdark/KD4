@@ -123,7 +123,6 @@ fn normalized_task_fingerprint(
 ) -> Option<String> {
     let mut request = serde_json::to_value(params).unwrap_or(Value::Null);
     if let Value::Object(request) = &mut request {
-        request.remove("threadId");
         request.remove("clientUserMessageId");
         request.remove("runIndependently");
     }
@@ -293,6 +292,7 @@ pub(crate) struct TurnRequestProcessor {
     config_manager: ConfigManager,
     thread_state_manager: ThreadStateManager,
     bug_worker_shutdown: CancellationToken,
+    background_tasks: TaskTracker,
 }
 
 fn map_additional_context(
@@ -361,15 +361,19 @@ fn estimated_additional_context_rendered_bytes(
         };
         total.saturating_add(escaped)
     });
-    let value_bytes = entry.value.chars().fold(0usize, |total, ch| {
+    let mut value_bytes = 0usize;
+    for ch in entry.value.chars() {
         let escaped = match ch {
             '&' => "&amp;".len(),
             '<' => "&lt;".len(),
             '>' => "&gt;".len(),
             _ => ch.len_utf8(),
         };
-        total.saturating_add(escaped)
-    });
+        value_bytes += escaped;
+        if value_bytes >= MAX_ADDITIONAL_CONTEXT_VALUE_RENDERED_BYTES {
+            break;
+        }
+    }
 
     source_bytes
         .saturating_add(value_bytes.min(MAX_ADDITIONAL_CONTEXT_VALUE_RENDERED_BYTES))
@@ -405,6 +409,7 @@ impl TurnRequestProcessor {
         config_manager: ConfigManager,
         thread_state_manager: ThreadStateManager,
         bug_worker_shutdown: CancellationToken,
+        background_tasks: TaskTracker,
     ) -> Self {
         Self {
             auth_manager,
@@ -416,6 +421,7 @@ impl TurnRequestProcessor {
             config_manager,
             thread_state_manager,
             bug_worker_shutdown,
+            background_tasks,
         }
     }
 
@@ -493,13 +499,33 @@ impl TurnRequestProcessor {
             originator: snapshot.originator.clone(),
             shutdown: self.bug_worker_shutdown.clone(),
         };
-        let cwd_path = self.config.cwd.to_path_buf();
-        let cwd = cwd_path.to_string_lossy().into_owned();
-        let repository_root = codex_git_utils::get_git_repo_root(cwd_path.as_path())
-            .map(|path| path.to_string_lossy().into_owned());
-        let git_commit = codex_git_utils::get_head_commit_hash(cwd_path.as_path())
-            .await
-            .map(|sha| sha.0);
+        let selected_environment = snapshot.environment_selections().first();
+        // Only attach local Git evidence when the reported environment is local.
+        let local_cwd = match selected_environment {
+            Some(selection) => self
+                .thread_manager
+                .environment_manager()
+                .get_environment(&selection.environment_id)
+                .filter(|environment| !environment.is_remote())
+                .and_then(|_| selection.cwd.to_abs_path().ok()),
+            None => Some(snapshot.cwd().clone()),
+        };
+        let cwd = local_cwd
+            .as_ref()
+            .map(|cwd| cwd.to_string_lossy().into_owned())
+            .or_else(|| selected_environment.map(|selection| selection.cwd.to_string()))
+            .unwrap_or_else(|| snapshot.cwd().to_string_lossy().into_owned());
+        let (repository_root, git_commit) = if let Some(cwd) = local_cwd {
+            (
+                codex_git_utils::get_git_repo_root(cwd.as_path())
+                    .map(|path| path.to_string_lossy().into_owned()),
+                codex_git_utils::get_head_commit_hash(cwd.as_path())
+                    .await
+                    .map(|sha| sha.0),
+            )
+        } else {
+            (None, None)
+        };
         let store = BugStore::open(self.config.sqlite_home.as_path())
             .await
             .map_err(|_| internal_error("failed to persist bug report"))?;
@@ -638,11 +664,16 @@ impl TurnRequestProcessor {
     async fn turn_task_fingerprint(
         params: &TurnStartParams,
         thread: &CodexThread,
+        additional_context: &IndexMap<String, CoreAdditionalContextEntry>,
     ) -> Option<String> {
         let snapshot = thread.config_snapshot().await;
         let workspace_identity =
             task_workspace_identity(params, snapshot.cwd(), &snapshot.workspace_roots);
         let settings_identity = serde_json::json!({
+            "additionalContext": additional_context.iter().map(|(source, entry)| {
+                (source, &entry.value, format!("{:?}", entry.kind))
+            }).collect::<Vec<_>>(),
+            "developerInstructions": snapshot.developer_instructions,
             "model": snapshot.model,
             "modelProviderId": snapshot.model_provider_id,
             "serviceTier": snapshot.service_tier,
@@ -699,7 +730,7 @@ impl TurnRequestProcessor {
         let task_fingerprint = if params.run_independently.unwrap_or(false) {
             None
         } else {
-            Self::turn_task_fingerprint(&params, thread.as_ref()).await
+            Self::turn_task_fingerprint(&params, thread.as_ref(), &additional_context).await
         };
         let environment_selections =
             resolve_turn_environment_selections(self.thread_manager.as_ref(), params.environments)?;
@@ -748,67 +779,89 @@ impl TurnRequestProcessor {
         };
         let turn_id = thread.reserve_turn_id();
 
-        // Admission must precede connection capability mutations. Duplicate or overloaded turns
-        // are rejected without changing shared thread or MCP state, and a failed capability update
-        // releases the claim so the request can be retried.
-        claim_turn_start_before_connection_updates(
-            &self.thread_state_manager,
-            task_fingerprint.as_deref(),
-            thread_id,
-            &turn_id,
-            || async {
-                Self::set_app_server_client_info(
-                    thread.as_ref(),
-                    app_server_client_name,
-                    app_server_client_version,
-                )
-                .await?;
-                thread
-                    .set_openai_form_elicitation_support(supports_openai_form_elicitation)
+        // The RPC handler is cancelled on disconnect. Own admission through core
+        // submission together so a dropped caller cannot strand a claimed turn.
+        // Reuse the thread lifecycle tracker so shutdown drains this work too.
+        let processor = self.clone();
+        let submission_thread = Arc::clone(&thread);
+        let submission_turn_id = turn_id.clone();
+        let submission_request_id = request_id.clone();
+        self.background_tasks
+            .spawn(
+                async move {
+                    let thread = submission_thread;
+                    let turn_id = submission_turn_id;
+                    let request_id = submission_request_id;
+                    // Admission must precede connection capability mutations. Duplicate or overloaded turns
+                    // are rejected without changing shared thread or MCP state, and a failed capability update
+                    // releases the claim so the request can be retried.
+                    claim_turn_start_before_connection_updates(
+                        &processor.thread_state_manager,
+                        task_fingerprint.as_deref(),
+                        thread_id,
+                        &turn_id,
+                        || async {
+                            Self::set_app_server_client_info(
+                                thread.as_ref(),
+                                app_server_client_name,
+                                app_server_client_version,
+                            )
+                            .await?;
+                            thread
+                                .set_openai_form_elicitation_support(
+                                    supports_openai_form_elicitation,
+                                )
+                                .await
+                                .map_err(|err| {
+                                    internal_error(format!(
+                                        "failed to update OpenAI form elicitation support: {err}"
+                                    ))
+                                })?;
+                            Ok(())
+                        },
+                    )
                     .await
-                    .map_err(|err| {
-                        internal_error(format!(
-                            "failed to update OpenAI form elicitation support: {err}"
-                        ))
+                    .inspect_err(|_| {
+                        processor.track_error_response(&request_id, /*error_type*/ None);
                     })?;
-                Ok(())
-            },
-        )
-        .await
-        .inspect_err(|_| {
-            self.track_error_response(&request_id, /*error_type*/ None);
-        })?;
-        let turn_origin_tracker = {
-            let thread_state = self.thread_state_manager.thread_state(thread_id).await;
-            thread_state.lock().await.turn_origin_tracker()
-        };
-        let origin_reservation =
-            turn_origin_tracker.reserve(turn_id.clone(), request_id.connection_id);
-        let request_trace_context = self.request_trace_context(&request_id).await;
-        if let Err(err) = thread
-            .submit_user_input_with_reserved_turn_id(
-                turn_id.clone(),
-                turn_op,
-                request_trace_context,
-                client_user_message_id,
+                    let turn_origin_tracker = {
+                        let thread_state =
+                            processor.thread_state_manager.thread_state(thread_id).await;
+                        thread_state.lock().await.turn_origin_tracker()
+                    };
+                    let origin_reservation =
+                        turn_origin_tracker.reserve(turn_id.clone(), request_id.connection_id);
+                    let request_trace_context = processor.request_trace_context(&request_id).await;
+                    if let Err(err) = thread
+                        .submit_user_input_with_reserved_turn_id(
+                            turn_id.clone(),
+                            turn_op,
+                            request_trace_context,
+                            client_user_message_id,
+                        )
+                        .await
+                    {
+                        let error = release_turn_start_after_submission_error(
+                            &processor.thread_state_manager,
+                            thread_id,
+                            &turn_id,
+                            err,
+                        )
+                        .await;
+                        processor.track_error_response(&request_id, /*error_type*/ None);
+                        return Err(error);
+                    }
+                    origin_reservation.commit();
+                    Ok::<(), JSONRPCErrorError>(())
+                }
+                .instrument(tracing::Span::current()),
             )
             .await
-        {
-            let error = release_turn_start_after_submission_error(
-                &self.thread_state_manager,
-                thread_id,
-                &turn_id,
-                err,
-            )
-            .await;
-            self.track_error_response(&request_id, /*error_type*/ None);
-            return Err(error);
-        }
-        origin_reservation.commit();
+            .map_err(|error| internal_error(format!("turn submission task failed: {error}")))??;
 
         if turn_has_input {
             let config_snapshot = thread.config_snapshot().await;
-            codex_memories_write::start_memories_startup_task(
+            let _ = codex_memories_write::start_memories_startup_task(
                 Arc::clone(&self.thread_manager),
                 Arc::clone(&self.auth_manager),
                 thread_id,
@@ -1301,8 +1354,8 @@ impl TurnRequestProcessor {
 }
 
 const BUG_CLASSIFIER_SCHEMA_VERSION: &str = "bug-classification-v1";
-const BUG_CLASSIFIER_PROMPT_VERSION: &str = "bug-classifier-prompt-v1";
-const BUG_CLASSIFIER_INSTRUCTIONS: &str = "Classify the supplied bug report. Return only the requested JSON object. The summary may be abstractive. Every other populated field must quote exact source text through its evidence range. Do not infer facts that are not stated in the report.";
+const BUG_CLASSIFIER_PROMPT_VERSION: &str = "bug-classifier-prompt-v2";
+const BUG_CLASSIFIER_INSTRUCTIONS: &str = "Classify the supplied bug report. Return only the requested JSON object. The summary may be abstractive. Every other populated field must quote exact source text through its evidence range. Evidence ranges use zero-based UTF-8 byte offsets with an exclusive end. Copy cited text exactly. Normalize only severity to critical, high, medium, or low; use null when no supported severity is stated. Do not infer facts that are not stated in the report.";
 
 #[derive(Clone)]
 struct BugClassifierContext {
@@ -1484,12 +1537,20 @@ async fn classify_bug_report(
         ) => result.map_err(|_| BugClassificationFailure::Provider)?,
     };
 
+    consume_bug_classification_stream(&mut stream, &context.shutdown, raw_text).await
+}
+
+async fn consume_bug_classification_stream(
+    stream: &mut (impl futures::Stream<Item = Result<ResponseEvent, CodexErr>> + Unpin),
+    shutdown: &CancellationToken,
+    raw_text: &str,
+) -> Result<ValidatedBugClassification, BugClassificationFailure> {
     let mut completed = false;
     let mut output_count = 0usize;
     let mut output = None;
     loop {
         let event = tokio::select! {
-            _ = context.shutdown.cancelled() => return Err(BugClassificationFailure::Cancelled),
+            _ = shutdown.cancelled() => return Err(BugClassificationFailure::Cancelled),
             event = stream.next() => event,
         };
         let Some(event) = event else {
@@ -1497,6 +1558,9 @@ async fn classify_bug_report(
         };
         match event.map_err(|_| BugClassificationFailure::Provider)? {
             ResponseEvent::OutputItemDone(item) => {
+                if matches!(item, ResponseItem::Reasoning { .. }) {
+                    continue;
+                }
                 output_count += 1;
                 if let ResponseItem::Message { role, content, .. } = item
                     && role == "assistant"

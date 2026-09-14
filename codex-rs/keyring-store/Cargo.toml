@@ -12,5 +12,5 @@ keyring = { workspace = true, features = ["crypto-rust", "windows-native"] }
 tracing = { workspace = true }
 
 [lib]
-test = false
+test = true
 doctest = false

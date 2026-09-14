@@ -18,13 +18,12 @@ use rmcp::model::ClientNotification;
 use rmcp::model::ClientRequest;
 use rmcp::model::JsonRpcMessage;
 use serde_json::Value;
-use tokio::io::AsyncWrite;
-use tokio::io::AsyncWriteExt;
-use tokio::io::{self};
+use std::io::Write;
+use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
-use tracing::error;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
@@ -38,6 +37,7 @@ mod outgoing_message;
 mod patch_approval;
 
 use crate::message_processor::MessageProcessor;
+use crate::outgoing_message::OutgoingError;
 use crate::outgoing_message::OutgoingJsonRpcMessage;
 use crate::outgoing_message::OutgoingMessage;
 use crate::outgoing_message::OutgoingMessageSender;
@@ -58,14 +58,17 @@ const OTEL_SERVICE_NAME: &str = "codex_mcp_server";
 
 type IncomingMessage = JsonRpcMessage<ClientRequest, Value, ClientNotification>;
 
-fn spawn_stdin_line_reader() -> mpsc::Receiver<IoResult<String>> {
+fn spawn_stdin_line_reader(
+    input_closed: CancellationToken,
+) -> IoResult<mpsc::Receiver<IoResult<String>>> {
     // Tokio's stdin reader uses an uncancellable blocking read that runtime shutdown waits for.
     // Keep that read on a detached OS thread so closing the async receiver lets this server and its
     // runtime finish even when the client deliberately leaves stdin open.
     let (line_tx, line_rx) = mpsc::channel(CHANNEL_CAPACITY);
-    if let Err(err) = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("codex-mcp-server-stdin".to_string())
         .spawn(move || {
+            let _closed_guard = input_closed.drop_guard();
             let stdin = std::io::stdin();
             let mut stdin = stdin.lock();
             loop {
@@ -86,45 +89,59 @@ fn spawn_stdin_line_reader() -> mpsc::Receiver<IoResult<String>> {
                     }
                 }
             }
-        })
-    {
-        error!("Failed to start stdin reader thread: {err}");
-    }
-    line_rx
+        })?;
+    Ok(line_rx)
 }
 
-async fn write_outgoing_messages<W>(
+fn write_outgoing_messages<W: Write>(
     mut outgoing_rx: mpsc::Receiver<OutgoingMessage>,
     mut stdout: W,
-    output_failed: CancellationToken,
-) where
-    W: AsyncWrite + Unpin,
-{
-    while let Some(outgoing_message) = outgoing_rx.recv().await {
+) -> IoResult<()> {
+    while let Some(outgoing_message) = outgoing_rx.blocking_recv() {
         let msg: OutgoingJsonRpcMessage = outgoing_message.into();
-        match serde_json::to_string(&msg) {
-            Ok(json) => {
-                if let Err(err) = stdout.write_all(json.as_bytes()).await {
-                    error!("Failed to write to stdout: {err}");
-                    output_failed.cancel();
-                    break;
-                }
-                if let Err(err) = stdout.write_all(b"\n").await {
-                    error!("Failed to write newline to stdout: {err}");
-                    output_failed.cancel();
-                    break;
-                }
-                if let Err(err) = stdout.flush().await {
-                    error!("Failed to flush stdout: {err}");
-                    output_failed.cancel();
-                    break;
-                }
-            }
-            Err(err) => error!("Failed to serialize JSON-RPC message: {err}"),
-        }
+        let mut json = serde_json::to_vec(&msg)?;
+        json.push(b'\n');
+        stdout.write_all(&json)?;
+        stdout.flush()?;
     }
+    Ok(())
+}
 
-    info!("stdout writer exited (channel closed)");
+fn spawn_stdout_writer(
+    outgoing_rx: mpsc::Receiver<OutgoingMessage>,
+    output_failed: CancellationToken,
+) -> IoResult<oneshot::Receiver<IoResult<()>>> {
+    let (done_tx, done_rx) = oneshot::channel();
+    // Like stdin, a blocked stdout write must not keep Tokio's blocking pool
+    // alive after the bounded final drain. The process owns this detached thread.
+    std::thread::Builder::new()
+        .name("codex-mcp-server-stdout".to_string())
+        .spawn(move || {
+            let _failure_guard = output_failed.drop_guard();
+            let result = write_outgoing_messages(outgoing_rx, std::io::stdout().lock());
+            let _ = done_tx.send(result);
+        })?;
+    Ok(done_rx)
+}
+
+fn decode_incoming_message(line: &str) -> Result<IncomingMessage, OutgoingError> {
+    serde_json::from_str(line).map_err(|error| {
+        // Successful frames are parsed once. Only failed frames need inspection
+        // to distinguish invalid JSON from an invalid request and recover its ID.
+        let (id, code) = match serde_json::from_str::<Value>(line) {
+            Ok(value) => (
+                value
+                    .get("id")
+                    .and_then(|id| serde_json::from_value(id.clone()).ok()),
+                rmcp::model::ErrorCode::INVALID_REQUEST,
+            ),
+            Err(_) => (None, rmcp::model::ErrorCode::PARSE_ERROR),
+        };
+        OutgoingError {
+            id,
+            error: rmcp::model::ErrorData::new(code, error.to_string(), None),
+        }
+    })
 }
 
 pub async fn run_main(
@@ -192,11 +209,15 @@ pub async fn run_main(
     let (outgoing_tx, outgoing_rx) = mpsc::channel::<OutgoingMessage>(CHANNEL_CAPACITY);
     let installation_id = resolve_installation_id(&config.codex_home).await?;
     let output_failed = CancellationToken::new();
+    let input_closed = CancellationToken::new();
+
+    let stdout_writer_done = spawn_stdout_writer(outgoing_rx, output_failed.clone())?;
+    let mut stdin_lines = spawn_stdin_line_reader(input_closed.clone())?;
 
     // Task: read from stdin, push to `incoming_tx`.
     let stdin_reader_handle = tokio::spawn({
         let output_failed = output_failed.clone();
-        let mut stdin_lines = spawn_stdin_line_reader();
+        let outgoing_tx = outgoing_tx.clone();
         async move {
             loop {
                 let line = tokio::select! {
@@ -210,11 +231,10 @@ pub async fn run_main(
                 let line = match line {
                     Ok(line) => line,
                     Err(err) => {
-                        error!("Failed reading stdin: {err}");
-                        break;
+                        return Err(err);
                     }
                 };
-                match serde_json::from_str::<IncomingMessage>(&line) {
+                match decode_incoming_message(&line) {
                     Ok(msg) => {
                         let sent = tokio::select! {
                             biased;
@@ -225,11 +245,20 @@ pub async fn run_main(
                             break;
                         }
                     }
-                    Err(e) => error!("Failed to deserialize JSON-RPC message: {e}"),
+                    Err(error) => {
+                        tokio::select! {
+                            biased;
+                            _ = output_failed.cancelled() => break,
+                            result = outgoing_tx.send(OutgoingMessage::Error(error)) => {
+                                if result.is_err() { break; }
+                            }
+                        }
+                    }
                 }
             }
 
             debug!("stdin reader finished (EOF)");
+            Ok::<(), std::io::Error>(())
         }
     });
 
@@ -247,6 +276,7 @@ pub async fn run_main(
         )
         .await;
         async move {
+            let _shutdown_guard = output_failed.clone().drop_guard();
             loop {
                 let msg = tokio::select! {
                     biased;
@@ -256,11 +286,17 @@ pub async fn run_main(
                 let Some(msg) = msg else {
                     break;
                 };
-                match msg {
-                    JsonRpcMessage::Request(r) => processor.process_request(r).await,
-                    JsonRpcMessage::Response(r) => processor.process_response(r).await,
-                    JsonRpcMessage::Notification(n) => processor.process_notification(n).await,
-                    JsonRpcMessage::Error(e) => processor.process_error(e).await,
+                tokio::select! {
+                    biased;
+                    _ = output_failed.cancelled() => break,
+                    _ = async {
+                        match msg {
+                            JsonRpcMessage::Request(r) => processor.process_request(r).await,
+                            JsonRpcMessage::Response(r) => processor.process_response(r).await,
+                            JsonRpcMessage::Notification(n) => processor.process_notification(n).await,
+                            JsonRpcMessage::Error(e) => processor.process_error(e).await,
+                        }
+                    } => {}
                 }
             }
 
@@ -269,19 +305,35 @@ pub async fn run_main(
         }
     });
 
-    // Task: write outgoing messages to stdout.
-    let stdout_writer_handle = tokio::spawn(write_outgoing_messages(
-        outgoing_rx,
-        io::stdout(),
-        output_failed,
-    ));
-
-    // Wait for all tasks to finish.  The typical exit path is the stdin reader
-    // hitting EOF which, once it drops `incoming_tx`, propagates shutdown to
-    // the processor and then to the stdout task.
-    let _ = tokio::join!(stdin_reader_handle, processor_handle, stdout_writer_handle);
-
-    Ok(())
+    let reader_abort = stdin_reader_handle.abort_handle();
+    let processor_abort = processor_handle.abort_handle();
+    let finish = async {
+        let (reader_result, processor_result) = tokio::join!(stdin_reader_handle, processor_handle);
+        let writer_result = stdout_writer_done
+            .await
+            .map_err(|_| std::io::Error::other("stdout writer terminated without a result"))?;
+        writer_result?;
+        reader_result.map_err(std::io::Error::other)??;
+        processor_result.map_err(std::io::Error::other)?;
+        Ok(())
+    };
+    tokio::pin!(finish);
+    tokio::select! {
+        result = &mut finish => result,
+        _ = input_closed.cancelled() => {
+            // Start the deadline at the blocking reader's EOF, even if dispatch
+            // is still waiting for space in the outgoing channel.
+            match tokio::time::timeout(Duration::from_secs(20), &mut finish).await {
+                Ok(result) => result,
+                Err(_) => {
+                    output_failed.cancel();
+                    reader_abort.abort();
+                    processor_abort.abort();
+                    Err(std::io::Error::new(ErrorKind::TimedOut, "MCP transport did not drain during shutdown"))
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

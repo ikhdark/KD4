@@ -170,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn background_terminal_timeout_description_matches_runtime_default() {
+    fn background_terminal_timeout_description_documents_default() {
         let schema = serde_json::to_value(config_schema()).expect("schema should serialize");
         let description = schema["properties"]["background_terminal_max_timeout"]["description"]
             .as_str()

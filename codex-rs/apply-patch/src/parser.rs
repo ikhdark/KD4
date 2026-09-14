@@ -44,14 +44,6 @@ pub(crate) const EOF_MARKER: &str = "*** End of File";
 pub(crate) const CHANGE_CONTEXT_MARKER: &str = "@@ ";
 pub(crate) const EMPTY_CHANGE_CONTEXT_MARKER: &str = "@@";
 
-/// Currently, the only OpenAI model that knowingly requires lenient parsing is
-/// gpt-4.1. While we could try to require everyone to pass in a strictness
-/// param when invoking apply_patch, it is a pain to thread it through all of
-/// the call sites, so we resign ourselves allowing lenient parsing for all
-/// models. See [`ParseMode::Lenient`] for details on the exceptions we make for
-/// gpt-4.1.
-const PARSE_IN_STRICT_MODE: bool = false;
-
 #[derive(Debug, PartialEq, Error, Clone)]
 pub enum ParseError {
     #[error("invalid patch: {0}")]
@@ -127,17 +119,15 @@ pub struct UpdateFileChunk {
     pub is_end_of_file: bool,
 }
 
+/// Parse patches leniently for compatibility with models that wrap patch text
+/// in a shell heredoc. See [`ParseMode::Lenient`] for the accepted wrappers.
 pub fn parse_patch(patch: &str) -> Result<ApplyPatchArgs, ParseError> {
-    let mode = if PARSE_IN_STRICT_MODE {
-        ParseMode::Strict
-    } else {
-        ParseMode::Lenient
-    };
-    parse_patch_text(patch, mode)
+    parse_patch_text(patch, ParseMode::Lenient)
 }
 
 enum ParseMode {
     /// Parse the patch text argument as is.
+    #[cfg(test)]
     Strict,
 
     /// GPT-4.1 is known to formulate the `command` array for the `local_shell`
@@ -176,15 +166,17 @@ enum ParseMode {
 }
 
 fn parse_patch_text(patch: &str, mode: ParseMode) -> Result<ApplyPatchArgs, ParseError> {
-    let lines: Vec<&str> = patch.trim().lines().collect();
+    // Keep CRLF bytes intact: the streaming parser strips exactly one CR.
+    let lines: Vec<&str> = patch.trim().split('\n').collect();
     let patch_lines = match mode {
+        #[cfg(test)]
         ParseMode::Strict => check_patch_boundaries_strict(&lines)?,
         ParseMode::Lenient => check_patch_boundaries_lenient(&lines)?,
     };
 
     let patch = patch_lines.join("\n");
     let mut parser = StreamingPatchParser::default();
-    parser.push_delta(&patch)?;
+    parser.push_delta_in_place(&patch)?;
     let hunks = parser.finish()?;
     let environment_id = parser.environment_id().map(str::to_owned);
     Ok(ApplyPatchArgs {
@@ -193,6 +185,42 @@ fn parse_patch_text(patch: &str, mode: ParseMode) -> Result<ApplyPatchArgs, Pars
         workdir: None,
         environment_id,
     })
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+
+    #[test]
+    fn batch_streaming_and_replay_preserve_extra_carriage_returns() {
+        let body = "*** Begin Patch\r\n*** Add File: a.txt\r\n+x\r\r\n*** End Patch";
+        for patch in [body.to_string(), format!("<<'EOF'\r\n{body}\r\nEOF")] {
+            let args = parse_patch(&patch).unwrap();
+            let expected = vec![Hunk::AddFile {
+                path: PathBuf::from("a.txt"),
+                contents: "x\r\n".to_string(),
+            }];
+            assert_eq!(args.hunks, expected);
+            assert_eq!(parse_patch(&args.patch).unwrap().hunks, expected);
+            let mut parser = StreamingPatchParser::default();
+            for ch in body.chars() {
+                parser.push_delta_in_place(&ch.to_string()).unwrap();
+            }
+            assert_eq!(parser.finish().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn heredoc_closing_delimiter_must_be_exact() {
+        for delimiter in ["NOTEOF", "echo EOF", "suffixEOF"] {
+            assert!(
+                parse_patch(&format!(
+                    "<<'EOF'\n*** Begin Patch\n*** Add File: a.txt\n+x\n*** End Patch\n{delimiter}"
+                ))
+                .is_err()
+            );
+        }
+    }
 }
 
 /// Checks the start and end lines of the patch text for `apply_patch`,
@@ -208,7 +236,7 @@ fn check_patch_boundaries_strict<'a>(lines: &'a [&'a str]) -> Result<&'a [&'a st
 }
 
 /// If we are in lenient mode, we check if the first line starts with `<<EOF`
-/// (possibly quoted) and the last line ends with `EOF`. There must be at least
+/// (possibly quoted) and the last line is `EOF`. There must be at least
 /// 4 lines total because the heredoc markers take up 2 lines and the patch text
 /// must have at least 2 lines.
 ///
@@ -224,8 +252,9 @@ fn check_patch_boundaries_lenient<'a>(
 
     match original_lines {
         [first, .., last] => {
-            if (first == &"<<EOF" || first == &"<<'EOF'" || first == &"<<\"EOF\"")
-                && last.ends_with("EOF")
+            let first = first.strip_suffix('\r').unwrap_or(first);
+            if matches!(first, "<<EOF" | "<<'EOF'" | "<<\"EOF\"")
+                && last.trim() == "EOF"
                 && original_lines.len() >= 4
             {
                 let inner_lines = &original_lines[1..original_lines.len() - 1];

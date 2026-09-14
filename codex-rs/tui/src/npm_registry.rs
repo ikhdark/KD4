@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 
-#[cfg(not(debug_assertions))]
+#[cfg(any(not(debug_assertions), test))]
 pub(crate) const PACKAGE_URL: &str = "https://registry.npmjs.org/@openai%2fcodex";
 
 #[derive(Deserialize, Debug, Clone)]
@@ -126,5 +126,30 @@ mod tests {
             err.to_string().contains("missing dist metadata"),
             "error should name missing dist metadata: {err}"
         );
+    }
+    #[test]
+    fn ready_version_rejects_missing_or_empty_distribution_fields() {
+        for field in ["tarball", "integrity"] {
+            for value in [None, Some(String::new())] {
+                let mut package = package_info("1.2.3", "1.2.3");
+                let dist = package
+                    .versions
+                    .get_mut("1.2.3")
+                    .unwrap()
+                    .dist
+                    .as_mut()
+                    .unwrap();
+                match field {
+                    "tarball" => dist.tarball = value,
+                    _ => dist.integrity = value,
+                }
+                assert_eq!(
+                    ensure_version_ready(&package, "1.2.3")
+                        .unwrap_err()
+                        .to_string(),
+                    format!("npm package version 1.2.3 is missing dist.{field}")
+                );
+            }
+        }
     }
 }

@@ -87,10 +87,7 @@ impl TraceReducer {
     /// exact conversation item that authored its JavaScript.
     pub(super) fn start_or_queue_code_cell(&mut self, pending: PendingCodeCellStart) -> Result<()> {
         let code_cell_id = pending.started.code_cell_id.clone();
-        if self
-            .source_item_id_for_pending_code_cell(&pending)?
-            .is_none()
-        {
+        let Some(source_item_id) = self.source_item_id_for_pending_code_cell(&pending) else {
             if self.rollout.code_cells.contains_key(&code_cell_id)
                 || self.pending_code_cell_starts.contains_key(&code_cell_id)
             {
@@ -98,9 +95,9 @@ impl TraceReducer {
             }
             self.pending_code_cell_starts.insert(code_cell_id, pending);
             return Ok(());
-        }
+        };
 
-        self.start_code_cell(pending)
+        self.start_code_cell(pending, source_item_id)
     }
 
     /// Materializes any queued code-cell starts unlocked by newly reduced conversation items.
@@ -110,25 +107,26 @@ impl TraceReducer {
     pub(super) fn flush_pending_code_cell_starts(&mut self) -> Result<()> {
         let mut ready_ids = Vec::new();
         for (code_cell_id, pending) in &self.pending_code_cell_starts {
-            if self
-                .source_item_id_for_pending_code_cell(pending)?
-                .is_some()
-            {
-                ready_ids.push(code_cell_id.clone());
+            if let Some(source_item_id) = self.source_item_id_for_pending_code_cell(pending) {
+                ready_ids.push((code_cell_id.clone(), source_item_id));
             }
         }
 
-        for code_cell_id in ready_ids {
+        for (code_cell_id, source_item_id) in ready_ids {
             let Some(pending) = self.pending_code_cell_starts.remove(&code_cell_id) else {
                 continue;
             };
-            self.start_code_cell(pending)?;
+            self.start_code_cell(pending, source_item_id)?;
         }
         Ok(())
     }
 
     /// Inserts the reduced `CodeCell` once source ownership can be proven.
-    fn start_code_cell(&mut self, pending: PendingCodeCellStart) -> Result<()> {
+    fn start_code_cell(
+        &mut self,
+        pending: PendingCodeCellStart,
+        source_item_id: String,
+    ) -> Result<()> {
         let PendingCodeCellStart {
             seq,
             wall_time_unix_ms,
@@ -148,11 +146,6 @@ impl TraceReducer {
         };
         self.validate_code_cell_turn(&thread_id, &codex_turn_id)?;
 
-        let source_item_id = self.source_item_id_for_code_cell_start(
-            &thread_id,
-            &started.code_cell_id,
-            &started.model_visible_call_id,
-        )?;
         let output_item_ids = self.model_visible_code_cell_item_ids(
             &thread_id,
             &started.model_visible_call_id,
@@ -196,7 +189,10 @@ impl TraceReducer {
                 yielded_seq: None,
                 source_js: started.source_js,
                 nested_tool_call_ids,
-                wait_tool_call_ids: Vec::new(),
+                wait_tool_call_ids: self
+                    .pending_code_cell_waits
+                    .remove(&started.code_cell_id)
+                    .unwrap_or_default(),
             },
         );
 
@@ -214,15 +210,16 @@ impl TraceReducer {
     fn source_item_id_for_pending_code_cell(
         &self,
         pending: &PendingCodeCellStart,
-    ) -> Result<Option<String>> {
-        Ok(self
-            .model_visible_code_cell_item_ids(
-                &pending.thread_id,
-                &pending.started.model_visible_call_id,
-                ConversationItemKind::CustomToolCall,
-            )
-            .into_iter()
-            .next())
+    ) -> Option<String> {
+        self.rollout
+            .conversation_items
+            .values()
+            .find(|item| {
+                item.thread_id == pending.thread_id
+                    && item.call_id.as_deref() == Some(&pending.started.model_visible_call_id)
+                    && item.kind == ConversationItemKind::CustomToolCall
+            })
+            .map(|item| item.item_id.clone())
     }
 
     /// Records the runtime's first response for a code cell, or waits for its source item.
@@ -287,7 +284,9 @@ impl TraceReducer {
             cell.yielded_at_unix_ms = Some(wall_time_unix_ms);
             cell.yielded_seq = Some(seq);
         }
-        cell.runtime_status = status;
+        if cell.execution.status == ExecutionStatus::Running {
+            cell.runtime_status = status;
+        }
         Ok(())
     }
 
@@ -332,6 +331,9 @@ impl TraceReducer {
             bail!("code cell end referenced unknown cell {code_cell_id}");
         };
 
+        if cell.execution.status != ExecutionStatus::Running {
+            return Ok(());
+        }
         if cell.initial_response_at_unix_ms.is_none() {
             cell.initial_response_at_unix_ms = Some(wall_time_unix_ms);
             cell.initial_response_seq = Some(seq);
@@ -373,10 +375,21 @@ impl TraceReducer {
                     && cell.execution.status == ExecutionStatus::Running
             })
             .map(|cell| cell.code_cell_id.clone())
+            .chain(
+                self.pending_code_cell_starts
+                    .iter()
+                    .filter(|(_, pending)| pending.codex_turn_id.as_deref() == Some(codex_turn_id))
+                    .map(|(id, _)| id.clone()),
+            )
             .collect();
 
         for code_cell_id in code_cell_ids {
-            self.end_code_cell(seq, wall_time_unix_ms, code_cell_id, runtime_status.clone())?;
+            self.end_or_queue_code_cell(
+                seq,
+                wall_time_unix_ms,
+                code_cell_id,
+                runtime_status.clone(),
+            )?;
         }
         Ok(())
     }
@@ -491,10 +504,16 @@ impl TraceReducer {
         else {
             return Ok(());
         };
-        let Some(cell) = self.rollout.code_cells.get_mut(&code_cell_id) else {
-            return Ok(());
-        };
-        push_unique(&mut cell.wait_tool_call_ids, tool_call_id);
+        if let Some(cell) = self.rollout.code_cells.get_mut(&code_cell_id) {
+            push_unique(&mut cell.wait_tool_call_ids, tool_call_id);
+        } else if self.pending_code_cell_starts.contains_key(&code_cell_id) {
+            push_unique(
+                self.pending_code_cell_waits
+                    .entry(code_cell_id)
+                    .or_default(),
+                tool_call_id,
+            );
+        }
         Ok(())
     }
 
@@ -670,27 +689,6 @@ impl TraceReducer {
             })
             .map(|item| item.item_id.clone())
             .collect()
-    }
-
-    fn source_item_id_for_code_cell_start(
-        &self,
-        thread_id: &str,
-        code_cell_id: &str,
-        model_visible_call_id: &str,
-    ) -> Result<String> {
-        self.model_visible_code_cell_item_ids(
-            thread_id,
-            model_visible_call_id,
-            ConversationItemKind::CustomToolCall,
-        )
-        .into_iter()
-        .next()
-        .with_context(|| {
-            format!(
-                "code cell {code_cell_id} referenced model-visible call {model_visible_call_id}, \
-                 but no custom tool call item was observed"
-            )
-        })
     }
 
     fn add_code_cell_output_item(&mut self, code_cell_id: &str, item_id: &str) -> Result<()> {

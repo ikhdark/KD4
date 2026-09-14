@@ -74,17 +74,14 @@ impl ExtensionEventSink for AppServerExtensionEventSink {
                     .thread_state_manager
                     .current_listener_command_tx(thread_id)
                 {
-                    let command = ThreadListenerCommand::EmitThreadGoalUpdated {
-                        turn_id: turn_id.clone(),
-                        goal: goal.clone(),
-                    };
+                    let command = ThreadListenerCommand::EmitThreadGoalUpdated { turn_id, goal };
                     match listener_command_tx.try_send(command) {
                         Ok(()) => return,
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                             tracing::warn!(
                                 %thread_id,
                                 capacity = crate::thread_state::THREAD_LISTENER_COMMAND_CAPACITY,
-                                "extension goal update exceeded listener command capacity; sending an explicit unordered fallback notification"
+                                "extension goal update exceeded listener command capacity; disconnecting subscribers for snapshot recovery"
                             );
                         }
                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
@@ -93,6 +90,9 @@ impl ExtensionEventSink for AppServerExtensionEventSink {
                             );
                         }
                     }
+                    self.thread_state_manager
+                        .fail_listener_command_delivery(thread_id, &listener_command_tx);
+                    return;
                 }
                 self.outgoing
                     .try_send_server_notification(ServerNotification::ThreadGoalUpdated(
@@ -183,7 +183,7 @@ mod tests {
         };
         for contributor in registry.turn_input_contributors() {
             contributor
-                .contribute(input.clone(), &session_store, &thread_store, &turn_store)
+                .contribute(&input, &session_store, &thread_store, &turn_store)
                 .await;
         }
         let notification = timeout(Duration::from_secs(1), outgoing_rx.recv())
@@ -268,7 +268,8 @@ mod tests {
         let thread_state_manager = ThreadStateManager::new();
         let thread_id = ThreadId::default();
         let (listener_command_tx, mut listener_command_rx) = thread_listener_command_channel();
-        thread_state_manager.register_listener_command_tx(thread_id, listener_command_tx);
+        let overflow =
+            thread_state_manager.register_listener_command_tx(thread_id, listener_command_tx);
         let sink = app_server_extension_event_sink(outgoing, thread_state_manager);
 
         const COMMAND_COUNT: usize = THREAD_LISTENER_COMMAND_CAPACITY + 1;
@@ -280,20 +281,17 @@ mod tests {
         }
 
         assert_eq!(listener_command_rx.len(), THREAD_LISTENER_COMMAND_CAPACITY);
-        let overflow = outgoing_rx
-            .try_recv()
-            .expect("overload must surface as an explicit fallback notification");
-        let crate::outgoing_message::OutgoingEnvelope::Broadcast { message } = overflow else {
-            panic!("expected a broadcast overflow notification");
-        };
-        let crate::outgoing_message::OutgoingMessage::AppServerNotification(
-            ServerNotification::ThreadGoalUpdated(overflow),
-        ) = message
-        else {
-            panic!("expected an overflow goal notification");
-        };
-        let overflow_turn_id = format!("turn-{THREAD_LISTENER_COMMAND_CAPACITY}");
-        assert_eq!(overflow.turn_id.as_deref(), Some(overflow_turn_id.as_str()));
+        assert!(
+            overflow.is_cancelled(),
+            "overflow must force snapshot recovery"
+        );
+        assert!(
+            matches!(
+                outgoing_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ),
+            "newer goals must never overtake queued goals"
+        );
         for index in 0..THREAD_LISTENER_COMMAND_CAPACITY {
             let command = listener_command_rx
                 .recv()
@@ -305,7 +303,10 @@ mod tests {
             let expected_turn_id = format!("turn-{index}");
             assert_eq!(turn_id.as_deref(), Some(expected_turn_id.as_str()));
         }
-        assert!(listener_command_rx.try_recv().is_err());
+        assert!(matches!(
+            listener_command_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     fn thread_goal_updated_event(thread_id: ThreadId, turn_id: &str) -> Event {

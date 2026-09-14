@@ -14,33 +14,38 @@ const GPT_5_BEDROCK_CONTEXT_WINDOW: i64 = 272_000;
 const GPT_5_5_OPENAI_MODEL_ID: &str = "gpt-5.5";
 const GPT_5_4_OPENAI_MODEL_ID: &str = "gpt-5.4";
 
+#[expect(clippy::expect_used, reason = "The embedded model catalog is validated by catalog tests and cannot change at runtime")]
 pub(crate) fn static_model_catalog() -> ModelsResponse {
+    let bundled = bundled_models_response().expect("bundled models.json should parse");
     with_default_only_service_tier(ModelsResponse {
         models: vec![
-            astra_bedrock_model(),
+            astra_bedrock_model(bundled_openai_model(&bundled, "gpt-6-astra")),
             gpt_5_bedrock_model(
-                GPT_5_5_OPENAI_MODEL_ID,
+                bundled_openai_model(&bundled, GPT_5_5_OPENAI_MODEL_ID),
                 AMAZON_BEDROCK_GPT_5_5_MODEL_ID,
                 "GPT-5.5",
                 /*priority*/ 0,
             ),
             gpt_5_bedrock_model(
-                GPT_5_4_OPENAI_MODEL_ID,
+                bundled_openai_model(&bundled, GPT_5_4_OPENAI_MODEL_ID),
                 AMAZON_BEDROCK_GPT_5_4_MODEL_ID,
                 "GPT-5.4",
                 /*priority*/ 1,
             ),
             gpt_5_6_bedrock_model(
+                bundled_openai_model(&bundled, GPT_5_5_OPENAI_MODEL_ID),
                 AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID,
                 "GPT-5.6 Sol",
                 /*priority*/ 2,
             ),
             gpt_5_6_bedrock_model(
+                bundled_openai_model(&bundled, GPT_5_5_OPENAI_MODEL_ID),
                 AMAZON_BEDROCK_GPT_5_6_TERRA_MODEL_ID,
                 "GPT-5.6 Terra",
                 /*priority*/ 3,
             ),
             gpt_5_6_bedrock_model(
+                bundled_openai_model(&bundled, GPT_5_5_OPENAI_MODEL_ID),
                 AMAZON_BEDROCK_GPT_5_6_LUNA_MODEL_ID,
                 "GPT-5.6 Luna",
                 /*priority*/ 4,
@@ -59,8 +64,9 @@ pub(crate) fn with_default_only_service_tier(mut catalog: ModelsResponse) -> Mod
     catalog
 }
 
-fn astra_bedrock_model() -> ModelInfo {
-    let mut model = bundled_openai_model("gpt-6-astra");
+fn astra_bedrock_model(mut model: ModelInfo) -> ModelInfo {
+    model.availability_nux = None;
+    model.upgrade = None;
     model.slug = AMAZON_BEDROCK_GPT_6_ASTRA_MODEL_ID.to_string();
     model.display_name = "GPT-6 Astra".to_string();
     model.priority = -1;
@@ -73,16 +79,26 @@ fn astra_bedrock_model() -> ModelInfo {
     model
         .supported_reasoning_levels
         .retain(|level| level.effort != ReasoningEffort::Ultra);
+    if let Some(default) = &model.default_reasoning_level
+        && !model
+            .supported_reasoning_levels
+            .iter()
+            .any(|level| &level.effort == default)
+    {
+        model.default_reasoning_level = model
+            .supported_reasoning_levels
+            .first()
+            .map(|level| level.effort.clone());
+    }
     model
 }
 
 fn gpt_5_bedrock_model(
-    openai_slug: &str,
+    mut model: ModelInfo,
     bedrock_slug: &str,
     display_name: &str,
     priority: i32,
 ) -> ModelInfo {
-    let mut model = bundled_openai_model(openai_slug);
     model.slug = bedrock_slug.to_string();
     model.display_name = display_name.to_string();
     model.priority = priority;
@@ -93,29 +109,35 @@ fn gpt_5_bedrock_model(
     model
 }
 
-fn gpt_5_6_bedrock_model(bedrock_slug: &str, display_name: &str, priority: i32) -> ModelInfo {
-    let mut model = gpt_5_bedrock_model(
-        GPT_5_5_OPENAI_MODEL_ID,
-        bedrock_slug,
-        display_name,
-        priority,
-    );
-    model
+fn gpt_5_6_bedrock_model(
+    template: ModelInfo,
+    bedrock_slug: &str,
+    display_name: &str,
+    priority: i32,
+) -> ModelInfo {
+    let mut model = gpt_5_bedrock_model(template, bedrock_slug, display_name, priority);
+    if !model
         .supported_reasoning_levels
-        .push(ReasoningEffortPreset {
-            effort: ReasoningEffort::Max,
-            description: "Maximum reasoning depth for the hardest problems".to_string(),
-        });
+        .iter()
+        .any(|level| level.effort == ReasoningEffort::Max)
+    {
+        model
+            .supported_reasoning_levels
+            .push(ReasoningEffortPreset {
+                effort: ReasoningEffort::Max,
+                description: "Maximum reasoning depth for the hardest problems".to_string(),
+            });
+    }
     model
 }
 
-fn bundled_openai_model(slug: &str) -> ModelInfo {
-    bundled_models_response()
-        .unwrap_or_else(|err| panic!("bundled models.json should parse: {err}"))
+fn bundled_openai_model(catalog: &ModelsResponse, slug: &str) -> ModelInfo {
+    catalog
         .models
-        .into_iter()
+        .iter()
         .find(|model| model.slug == slug)
         .unwrap_or_else(|| panic!("bundled models.json should include {slug}"))
+        .clone()
 }
 
 #[cfg(test)]
@@ -124,6 +146,41 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn adapted_templates_handle_existing_max_and_filtered_default() {
+        let bundled = bundled_models_response().unwrap();
+        let template = gpt_5_6_bedrock_model(
+            bundled_openai_model(&bundled, GPT_5_5_OPENAI_MODEL_ID),
+            "test",
+            "test",
+            0,
+        );
+        let adapted = gpt_5_6_bedrock_model(template, "test", "test", 0);
+        assert_eq!(
+            adapted
+                .supported_reasoning_levels
+                .iter()
+                .filter(|level| level.effort == ReasoningEffort::Max)
+                .count(),
+            1
+        );
+        let mut template = bundled_openai_model(&bundled, "gpt-6-astra");
+        template.default_reasoning_level = Some(ReasoningEffort::Ultra);
+        let adapted = astra_bedrock_model(template);
+        assert!(
+            !adapted
+                .supported_reasoning_levels
+                .iter()
+                .any(|level| level.effort == ReasoningEffort::Ultra)
+        );
+        assert!(
+            adapted
+                .supported_reasoning_levels
+                .iter()
+                .any(|level| Some(&level.effort) == adapted.default_reasoning_level.as_ref())
+        );
+    }
 
     #[test]
     fn catalog_uses_mantle_model_ids_as_slugs() {
@@ -192,17 +249,27 @@ mod tests {
             expected.slug = slug.to_string();
             expected.display_name = display_name.to_string();
             expected.priority = priority;
+            let mut actual = catalog
+                .models
+                .iter()
+                .find(|model| model.slug == slug)
+                .unwrap()
+                .clone();
+            assert_eq!(
+                actual
+                    .supported_reasoning_levels
+                    .iter()
+                    .filter(|level| level.effort == ReasoningEffort::Max)
+                    .count(),
+                1
+            );
+            actual
+                .supported_reasoning_levels
+                .retain(|level| level.effort != ReasoningEffort::Max);
             expected
                 .supported_reasoning_levels
-                .push(ReasoningEffortPreset {
-                    effort: ReasoningEffort::Max,
-                    description: "Maximum reasoning depth for the hardest problems".to_string(),
-                });
-
-            assert_eq!(
-                catalog.models.iter().find(|model| model.slug == slug),
-                Some(&expected)
-            );
+                .retain(|level| level.effort != ReasoningEffort::Max);
+            assert_eq!(actual, expected);
         }
     }
 

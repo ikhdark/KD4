@@ -184,8 +184,7 @@ fn hierarchical_paired_bootstrap_for_shape(
     all_a.sort_by(f64::total_cmp);
     all_b.sort_by(f64::total_cmp);
     let baseline_p95_ns = percentile_sorted(&all_a, 0.95);
-    let point_median_ratio =
-        percentile_sorted(&all_b, 0.5) / percentile_sorted(&all_a, 0.5);
+    let point_median_ratio = percentile_sorted(&all_b, 0.5) / percentile_sorted(&all_a, 0.5);
     let point_p95_ratio = percentile_sorted(&all_b, 0.95) / baseline_p95_ns;
     let p95_ratio_ucb_gate_applied =
         baseline_p95_ns >= AB_P95_RATIO_UCB_GATE_MIN_BASELINE_NS as f64;
@@ -209,12 +208,10 @@ fn hierarchical_paired_bootstrap_for_shape(
         }
         resampled_a.sort_by(f64::total_cmp);
         resampled_b.sort_by(f64::total_cmp);
-        median_ratios.push(
-            percentile_sorted(&resampled_b, 0.5) / percentile_sorted(&resampled_a, 0.5),
-        );
-        p95_ratios.push(
-            percentile_sorted(&resampled_b, 0.95) / percentile_sorted(&resampled_a, 0.95),
-        );
+        median_ratios
+            .push(percentile_sorted(&resampled_b, 0.5) / percentile_sorted(&resampled_a, 0.5));
+        p95_ratios
+            .push(percentile_sorted(&resampled_b, 0.95) / percentile_sorted(&resampled_a, 0.95));
     }
     median_ratios.sort_by(f64::total_cmp);
     p95_ratios.sort_by(f64::total_cmp);
@@ -1889,11 +1886,8 @@ fn clean_main_identity(repo: &Path) -> Result<(PathBuf, String, String)> {
 fn verified_repository_root(repo: &Path) -> Result<PathBuf> {
     let requested = fs::canonicalize(repo)
         .with_context(|| format!("canonicalize requested repository {}", repo.display()))?;
-    let discovered = fs::canonicalize(git_text(
-        &requested,
-        &["rev-parse", "--show-toplevel"],
-    )?)
-    .context("canonicalize Git-reported repository root")?;
+    let discovered = fs::canonicalize(git_text(&requested, &["rev-parse", "--show-toplevel"])?)
+        .context("canonicalize Git-reported repository root")?;
     anyhow::ensure!(
         discovered == requested,
         "Git top-level {} does not match requested repository {}",
@@ -2091,9 +2085,7 @@ fn update_os_str_hash(hasher: &mut Sha256, value: &std::ffi::OsStr) {
     hasher.update([0]);
 }
 
-fn build_environment_hash(
-    variables: &BTreeMap<std::ffi::OsString, std::ffi::OsString>,
-) -> String {
+fn build_environment_hash(variables: &BTreeMap<std::ffi::OsString, std::ffi::OsString>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"kd4.turn_latency.build_environment\0");
     for (name, value) in variables {
@@ -2249,13 +2241,8 @@ fn rust_provenance_in_build_environment(
     environment: &AbBuildEnvironment,
     rustc: &Path,
 ) -> Result<(String, String)> {
-    let version = executable_text_in_build_environment(
-        rustc,
-        environment,
-        codex_rs,
-        &["-vV"],
-        "rustc -vV",
-    )?;
+    let version =
+        executable_text_in_build_environment(rustc, environment, codex_rs, &["-vV"], "rustc -vV")?;
     let target = version
         .lines()
         .find_map(|line| line.strip_prefix("host: "))
@@ -2269,7 +2256,11 @@ fn recorded_ab_build_inputs(
     baseline_target: &Path,
     candidate_codex_rs: &Path,
     candidate_target: &Path,
-) -> Result<(AbBuildEnvironment, AbBuildEnvironment, AbRecordedBuildInputs)> {
+) -> Result<(
+    AbBuildEnvironment,
+    AbBuildEnvironment,
+    AbRecordedBuildInputs,
+)> {
     let cargo = fs::canonicalize(which::which("cargo").context("locate cargo on PATH")?)
         .context("canonicalize cargo executable")?;
     let rustc = fs::canonicalize(which::which("rustc").context("locate rustc on PATH")?)
@@ -2385,10 +2376,7 @@ fn select_turn_latency_executable_from_cargo_json(output: &[u8]) -> Result<PathB
     Ok(executables.remove(0))
 }
 
-fn build_turn_latency_worker(
-    codex_rs: &Path,
-    environment: &AbBuildEnvironment,
-) -> Result<PathBuf> {
+fn build_turn_latency_worker(codex_rs: &Path, environment: &AbBuildEnvironment) -> Result<PathBuf> {
     #[cfg(test)]
     AB_BUILD_COMMAND_INVOCATIONS.fetch_add(1, Ordering::SeqCst);
     let output = build_command(environment)
@@ -2863,7 +2851,7 @@ fn terminate_ab_worker_process(worker: &mut AbWorkerProcess) -> Result<()> {
         if worker.child.try_wait()?.is_none() {
             let _ = worker.child.wait()?;
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -5427,7 +5415,7 @@ fn run_ab_compare(args: &AbCompareArgs) -> Result<()> {
         candidate_cli_binary_sha256: manifest.candidate.cli_sha256.clone(),
         rustc_version: manifest.rustc_version.clone(),
         rust_target: manifest.rust_target,
-        build_configuration_sha256: manifest.build_configuration_sha256.clone(),
+        build_configuration_sha256: manifest.build_configuration_sha256,
         profile: AB_BUILD_PROFILE.to_string(),
         execution_profile: args.profile,
         features: Vec::new(),
@@ -5993,8 +5981,7 @@ fn validate_ab_report_prepared_manifest_provenance(
             && provenance.candidate_cli_binary_sha256 == manifest.candidate.cli_sha256
             && provenance.rustc_version == manifest.rustc_version
             && provenance.rust_target == manifest.rust_target
-            && provenance.build_configuration_sha256
-                == manifest.build_configuration_sha256,
+            && provenance.build_configuration_sha256 == manifest.build_configuration_sha256,
         "accepted report provenance does not match its verified prepared manifest"
     );
     Ok(())

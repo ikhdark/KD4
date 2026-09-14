@@ -108,13 +108,7 @@ pub(crate) async fn run_cwd_selection_prompt(
         }
     }
 
-    if screen.should_exit {
-        Ok(CwdPromptOutcome::Exit)
-    } else {
-        Ok(CwdPromptOutcome::Selection(
-            screen.selection().unwrap_or(CwdSelection::Session),
-        ))
-    }
+    Ok(screen.outcome())
 }
 
 struct CwdPromptScreen {
@@ -187,6 +181,15 @@ impl CwdPromptScreen {
 
     fn selection(&self) -> Option<CwdSelection> {
         self.selection
+    }
+
+    fn outcome(&self) -> CwdPromptOutcome {
+        if self.should_exit {
+            CwdPromptOutcome::Exit
+        } else {
+            self.selection()
+                .map_or(CwdPromptOutcome::Exit, CwdPromptOutcome::Selection)
+        }
     }
 }
 
@@ -297,6 +300,25 @@ mod tests {
         let mut screen = new_prompt();
         screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(screen.selection(), Some(CwdSelection::Session));
+        assert_eq!(
+            screen.outcome(),
+            CwdPromptOutcome::Selection(CwdSelection::Session)
+        );
+    }
+
+    #[test]
+    fn cwd_prompt_without_selection_exits() {
+        assert_eq!(new_prompt().outcome(), CwdPromptOutcome::Exit);
+    }
+
+    #[test]
+    fn cwd_prompt_escape_explicitly_selects_session() {
+        let mut screen = new_prompt();
+        screen.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            screen.outcome(),
+            CwdPromptOutcome::Selection(CwdSelection::Session)
+        );
     }
 
     #[test]

@@ -81,14 +81,33 @@ async fn run_command_with_reservation(
     cwd: &Path,
     reservation: impl Future<Output = io::Result<codex_utils_pty::ManagedRootProcess>>,
 ) -> CommandRunResult {
+    let mut command = build_command(shell, handler);
+    command.current_dir(cwd);
+    run_owned_command(command, input_json, handler.timeout_sec, true, reservation).await
+}
+
+pub(crate) async fn run_finalizer_command(command: Command, timeout_sec: u64) -> CommandRunResult {
+    run_owned_command(
+        command,
+        "",
+        timeout_sec,
+        false,
+        codex_utils_pty::ManagedRootProcess::reserve_with_reclaim(),
+    )
+    .await
+}
+
+async fn run_owned_command(
+    mut command: Command,
+    input_json: &str,
+    timeout_sec: u64,
+    stdout_is_protocol: bool,
+    reservation: impl Future<Output = io::Result<codex_utils_pty::ManagedRootProcess>>,
+) -> CommandRunResult {
     let started_at = chrono::Utc::now().timestamp();
     let started = Instant::now();
-    let timeout_duration = Duration::from_secs(handler.timeout_sec);
-    let timeout_deadline = tokio::time::Instant::now() + timeout_duration;
-
-    let mut command = build_command(shell, handler);
+    let timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_sec);
     command
-        .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -117,11 +136,11 @@ async fn run_command_with_reservation(
                 },
             );
         }
-        Err(_) => return finish_timeout(started_at, started, handler.timeout_sec),
+        Err(_) => return finish_timeout(started_at, started, timeout_sec),
     };
 
     if tokio::time::Instant::now() >= timeout_deadline {
-        return finish_timeout(started_at, started, handler.timeout_sec);
+        return finish_timeout(started_at, started, timeout_sec);
     }
 
     #[cfg(windows)]
@@ -131,7 +150,7 @@ async fn run_command_with_reservation(
         match run_windows_process_operation(spawn_timeout, move || command.spawn()).await {
             Ok(child) => child,
             Err(err) if err.kind() == io::ErrorKind::TimedOut => {
-                return finish_timeout(started_at, started, handler.timeout_sec);
+                return finish_timeout(started_at, started, timeout_sec);
             }
             Err(err) => {
                 return finish_command_run(
@@ -204,12 +223,20 @@ async fn run_command_with_reservation(
 
     if tokio::time::Instant::now() >= timeout_deadline {
         terminate_command_tree(&mut child, &managed).await;
-        return finish_timeout(started_at, started, handler.timeout_sec);
+        #[cfg(unix)]
+        {
+            cancellation_guard.0 = None;
+        }
+        return finish_timeout(started_at, started, timeout_sec);
     }
 
     let stdin = child.stdin.take();
     let Some(stdout) = child.stdout.take() else {
         terminate_command_tree(&mut child, &managed).await;
+        #[cfg(unix)]
+        {
+            cancellation_guard.0 = None;
+        }
         return finish_command_run(
             started_at,
             started,
@@ -224,6 +251,10 @@ async fn run_command_with_reservation(
     };
     let Some(stderr) = child.stderr.take() else {
         terminate_command_tree(&mut child, &managed).await;
+        #[cfg(unix)]
+        {
+            cancellation_guard.0 = None;
+        }
         return finish_command_run(
             started_at,
             started,
@@ -248,15 +279,27 @@ async fn run_command_with_reservation(
         }
     };
     let wait_for_output = async {
-        let ((), stdout, stderr) = tokio::try_join!(
+        let wait_for_tree = async {
+            #[cfg(unix)]
+            {
+                let pid = child
+                    .id()
+                    .ok_or_else(|| io::Error::other("hook process has no id"))?;
+                codex_utils_pty::process_group::wait_for_exit_without_reaping(pid).await?;
+                codex_utils_pty::process_group::kill_process_group(pid)?;
+                cancellation_guard.0 = None;
+            }
+            let status = child.wait().await?;
+            #[cfg(windows)]
+            managed.terminate()?;
+            Ok::<_, io::Error>(status)
+        };
+        let (status, (), stdout, stderr) = tokio::try_join!(
+            async { wait_for_tree.await.map_err(CommandRunError::Wait) },
             async { write_stdin.await.map_err(CommandRunError::Stdin) },
             async { capture_output(stdout).await.map_err(CommandRunError::Wait) },
             async { capture_output(stderr).await.map_err(CommandRunError::Wait) },
         )?;
-        // Keep the root unreaped while pipe I/O can still suspend. On Unix this
-        // reserves its process-group ID until cancellation cleanup is disarmed,
-        // even if the root exits before a descendant closes the inherited pipes.
-        let status = child.wait().await.map_err(CommandRunError::Wait)?;
         Ok::<_, CommandRunError>((status, stdout, stderr))
     };
     let result = match timeout_at(timeout_deadline, wait_for_output).await {
@@ -265,7 +308,8 @@ async fn run_command_with_reservation(
             // A successful hook's stdout can be structured JSON, so never parse a
             // partial document as if it were complete. Exit-code-2 denials use
             // stderr and can safely retain the bounded head/tail preview.
-            let stdout_exceeded_limit = exit_code == Some(0) && stdout.was_truncated();
+            let stdout_exceeded_limit =
+                stdout_is_protocol && exit_code == Some(0) && stdout.was_truncated();
             let error = stdout_exceeded_limit.then(|| {
                 format!(
                     "hook stdout exceeded the {HOOK_STREAM_CAPTURE_MAX_BYTES}-byte capture limit"
@@ -309,7 +353,7 @@ async fn run_command_with_reservation(
         }
         Err(_) => {
             terminate_command_tree(&mut child, &managed).await;
-            finish_timeout(started_at, started, handler.timeout_sec)
+            finish_timeout(started_at, started, timeout_sec)
         }
     };
     #[cfg(unix)]
@@ -494,19 +538,52 @@ fn build_command(shell: &CommandShell, handler: &ConfiguredHandler) -> Command {
     } else {
         Command::new(&shell.program)
     };
+    let script = plugin_command_for_shell(shell, handler);
     if shell.program.is_empty() {
-        append_shell_command(&mut command, &handler.command, true);
+        append_shell_command(&mut command, &script, true);
     } else {
         command.args(&shell.args);
 
         append_shell_command(
             &mut command,
-            &handler.command,
+            &script,
             shell.args.iter().any(|arg| arg.eq_ignore_ascii_case("/c")),
         );
     }
     command.envs(&handler.env);
     command
+}
+
+// Keep plugin paths in the environment. Substituting their values into shell
+// source causes legal path characters to be interpreted as executable syntax.
+fn plugin_command_for_shell(shell: &CommandShell, handler: &ConfiguredHandler) -> String {
+    let program = Path::new(&shell.program)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let cmd = (shell.program.is_empty() && cfg!(windows)) || program == "cmd";
+    let powershell = program == "powershell" || program == "pwsh";
+    let mut script = handler.command.clone();
+    for key in [
+        "PLUGIN_ROOT",
+        "CLAUDE_PLUGIN_ROOT",
+        "PLUGIN_DATA",
+        "CLAUDE_PLUGIN_DATA",
+    ] {
+        if !handler.env.contains_key(key) {
+            continue;
+        }
+        let replacement = if cmd {
+            format!("%{key}%")
+        } else if powershell {
+            format!("${{env:{key}}}")
+        } else {
+            continue;
+        };
+        script = script.replace(&format!("${{{key}}}"), &replacement);
+    }
+    script
 }
 
 #[cfg(windows)]
@@ -715,6 +792,40 @@ mod tests {
             "a descendant survived the hook timeout and wrote {}",
             marker.display()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn normal_completion_terminates_redirected_descendants() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let cwd = AbsolutePathBuf::try_from(temp_dir.path().to_path_buf()).expect("cwd");
+        let handler = test_handler(
+            "(sleep 1; printf late > escaped.txt) </dev/null >/dev/null 2>&1 & exit 0".to_string(),
+            5,
+            &cwd,
+        );
+        let result = run_command(&explicit_test_shell(), &handler, 0, "{}", cwd.as_path()).await;
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.error, None);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!temp_dir.path().join("escaped.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn finalizer_deadline_terminates_the_process_tree() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let cwd = AbsolutePathBuf::try_from(temp_dir.path().to_path_buf()).expect("cwd");
+        #[cfg(windows)]
+        let script = "Start-Sleep -Seconds 3; Set-Content escaped.txt late";
+        #[cfg(not(windows))]
+        let script = "(sleep 3; printf late > escaped.txt) & sleep 60";
+        let handler = test_handler(script.to_string(), 1, &cwd);
+        let mut command = build_command(&explicit_test_shell(), &handler);
+        command.current_dir(cwd.as_path());
+        let result = super::run_finalizer_command(command, 1).await;
+        assert_eq!(result.error, Some("hook timed out after 1s".to_string()));
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(!temp_dir.path().join("escaped.txt").exists());
     }
 
     #[tokio::test]

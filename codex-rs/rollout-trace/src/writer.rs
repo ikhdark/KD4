@@ -8,7 +8,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
-use std::sync::PoisonError;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -44,6 +43,7 @@ struct TraceWriterInner {
     event_log: BufWriter<File>,
     next_seq: u64,
     next_payload_ordinal: u64,
+    append_failed: bool,
 }
 
 impl TraceWriter {
@@ -56,20 +56,26 @@ impl TraceWriter {
     ) -> Result<Self> {
         let bundle_dir = bundle_dir.as_ref().to_path_buf();
         let payloads_dir = bundle_dir.join(PAYLOADS_DIR_NAME);
-        std::fs::create_dir_all(&payloads_dir)
+        std::fs::create_dir_all(&bundle_dir)?;
+        anyhow::ensure!(
+            !bundle_dir.join(MANIFEST_FILE_NAME).try_exists()? && !payloads_dir.try_exists()?,
+            "trace bundle already contains a manifest or payload directory"
+        );
+        // Claim the log before writing anything else. Concurrent creators cannot
+        // reset identities or replace evidence belonging to the winner.
+        let event_log_path = bundle_dir.join(RAW_EVENT_LOG_FILE_NAME);
+        let event_log = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&event_log_path)
+            .with_context(|| format!("create trace event log {}", event_log_path.display()))?;
+        std::fs::create_dir(&payloads_dir)
             .with_context(|| format!("create trace payload dir {}", payloads_dir.display()))?;
 
         let started_at_unix_ms = unix_time_ms();
         let manifest =
             TraceBundleManifest::new(trace_id, rollout_id, root_thread_id, started_at_unix_ms);
         write_json_file(&bundle_dir.join(MANIFEST_FILE_NAME), &manifest)?;
-
-        let event_log_path = bundle_dir.join(RAW_EVENT_LOG_FILE_NAME);
-        let event_log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&event_log_path)
-            .with_context(|| format!("open trace event log {}", event_log_path.display()))?;
 
         Ok(Self {
             inner: Mutex::new(TraceWriterInner {
@@ -78,6 +84,7 @@ impl TraceWriter {
                 event_log: BufWriter::new(event_log),
                 next_seq: 1,
                 next_payload_ordinal: 1,
+                append_failed: false,
             }),
         })
     }
@@ -94,6 +101,7 @@ impl TraceWriter {
         let raw_payload_id = format!("raw_payload:{ordinal}");
         let relative_path = format!("{PAYLOADS_DIR_NAME}/{ordinal}.json");
         let absolute_path = inner.payloads_dir.join(format!("{ordinal}.json"));
+        drop(inner);
         // Payload files are created before the event that references them. A
         // replay interrupted after an event is appended should never point at a
         // payload file that the writer planned but had not written yet.
@@ -139,6 +147,10 @@ impl TraceWriter {
         payload: RawTraceEventPayload,
     ) -> Result<RawTraceEvent> {
         let mut inner = self.lock_inner();
+        anyhow::ensure!(
+            !inner.append_failed,
+            "trace event log is no longer writable"
+        );
         let event = RawTraceEvent {
             schema_version: RAW_TRACE_EVENT_SCHEMA_VERSION,
             seq: inner.next_seq,
@@ -148,10 +160,14 @@ impl TraceWriter {
             codex_turn_id: context.codex_turn_id,
             payload,
         };
-        inner.next_seq += 1;
+        // A serialization panic or partial write must prevent another record
+        // from being appended to an uncertain JSONL boundary.
+        inner.append_failed = true;
         serde_json::to_writer(&mut inner.event_log, &event)?;
         inner.event_log.write_all(b"\n")?;
         inner.event_log.flush()?;
+        inner.append_failed = false;
+        inner.next_seq += 1;
         Ok(event)
     }
 
@@ -167,17 +183,26 @@ impl TraceWriter {
     }
 
     fn lock_inner(&self) -> MutexGuard<'_, TraceWriterInner> {
-        // Preserve the event log after a panic in tracing code. Dropping the
-        // writer would lose subsequent diagnostic events in exactly the session
-        // we are trying to debug.
-        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+        self.inner.lock().unwrap_or_else(|poisoned| {
+            let mut inner = poisoned.into_inner();
+            inner.append_failed = true;
+            inner
+        })
     }
 }
 
 fn write_json_file(path: &Path, value: &impl Serialize) -> Result<()> {
-    let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
-    serde_json::to_writer_pretty(file, value)
-        .with_context(|| format!("write JSON {}", path.display()))
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("create {}", path.display()))?;
+    let mut output = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut output, value)
+        .with_context(|| format!("write JSON {}", path.display()))?;
+    output
+        .flush()
+        .with_context(|| format!("flush JSON {}", path.display()))
 }
 
 pub(crate) fn unix_time_ms() -> i64 {
@@ -199,6 +224,77 @@ mod tests {
     use crate::raw_event::RawTraceEventPayload;
     use crate::replay_bundle;
     use crate::writer::TraceWriter;
+
+    #[test]
+    fn create_rejects_existing_bundle_evidence_without_overwriting() -> anyhow::Result<()> {
+        for name in ["manifest.json", "trace.jsonl", "payloads"] {
+            let temp = TempDir::new()?;
+            let evidence = temp.path().join(name);
+            if name == "payloads" {
+                std::fs::create_dir(&evidence)?;
+                std::fs::write(evidence.join("1.json"), b"original")?;
+            } else {
+                std::fs::write(&evidence, b"original")?;
+            }
+            assert!(
+                TraceWriter::create(temp.path(), "new".into(), "new".into(), "root".into())
+                    .is_err()
+            );
+            assert_eq!(
+                std::fs::read(if name == "payloads" {
+                    evidence.join("1.json")
+                } else {
+                    evidence
+                })?,
+                b"original"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn append_failure_disables_subsequent_writes() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let writer =
+            TraceWriter::create(temp.path(), "trace".into(), "rollout".into(), "root".into())?;
+        let event = RawTraceEventPayload::RolloutStarted {
+            trace_id: "trace".into(),
+            root_thread_id: "root".into(),
+        };
+        writer.append(event.clone())?;
+        let log = temp.path().join("trace.jsonl");
+        let before = std::fs::read(&log)?;
+        // A read-only handle forces a real flush error after serialization.
+        writer.lock_inner().event_log = std::io::BufWriter::new(std::fs::File::open(&log)?);
+        assert!(writer.append(event.clone()).is_err());
+        writer.lock_inner().event_log =
+            std::io::BufWriter::new(std::fs::OpenOptions::new().append(true).open(&log)?);
+        assert!(writer.append(event).is_err());
+        assert_eq!(std::fs::read(&log)?, before);
+        assert_eq!(writer.lock_inner().next_seq, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn payload_serialization_releases_event_log_lock() -> anyhow::Result<()> {
+        struct ChecksLock<'a>(&'a TraceWriter);
+        impl serde::Serialize for ChecksLock<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let _guard = self.0.inner.try_lock().map_err(serde::ser::Error::custom)?;
+                serializer.serialize_str("payload")
+            }
+        }
+        let temp = TempDir::new()?;
+        let writer =
+            TraceWriter::create(temp.path(), "trace".into(), "rollout".into(), "root".into())?;
+        let payload =
+            writer.write_json_payload(RawPayloadKind::ProtocolEvent, &ChecksLock(&writer))?;
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join(payload.path))?,
+            "\"payload\""
+        );
+        Ok(())
+    }
 
     #[test]
     fn writer_records_payload_refs_and_replays_rollout_status() -> anyhow::Result<()> {
@@ -260,7 +356,7 @@ mod tests {
             inference_call_id: "inference-1".to_string(),
             response_id: Some("resp-1".to_string()),
             upstream_request_id: Some("req-1".to_string()),
-            response_payload: inference_response.clone(),
+            response_payload: Some(inference_response.clone()),
         })?;
         writer.append(RawTraceEventPayload::CodexTurnEnded {
             codex_turn_id: "turn-1".to_string(),

@@ -67,6 +67,9 @@ impl<T: HttpTransport> ResponsesClient<T> {
             .await
     }
 
+    /// Calls `dispatch_ready` after JSON serialization and header construction,
+    /// before request preparation, authentication, or transport I/O. This does
+    /// not confirm dispatch.
     #[instrument(
         name = "responses.stream_request",
         level = "info",

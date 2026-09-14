@@ -509,6 +509,7 @@ async fn parent_cancellation_settles_running_item_and_exports_snapshot() {
     let manager = crate::ThreadManager::with_models_provider_for_tests(
         codex_login::CodexAuth::from_api_key("dummy"),
         turn.config.model_provider.clone(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     Arc::get_mut(&mut session)
         .expect("unique session")
@@ -565,6 +566,7 @@ async fn worker_stop_cancels_job_settles_other_worker_and_requests_shutdown() {
     let manager = crate::ThreadManager::with_models_provider_for_tests(
         codex_login::CodexAuth::from_api_key("dummy"),
         turn.config.model_provider.clone(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let other_worker_thread_id = manager
         .start_thread((*turn.config).clone())
@@ -696,6 +698,10 @@ enum BlockedJobCleanupRoute {
     ParentCancellation,
 }
 
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Hold the contested owner to assert cancellation, admission, or cleanup behavior under contention"
+)]
 async fn assert_runner_preserves_worker_until_cleanup(route: BlockedJobCleanupRoute) {
     use sqlx::Connection;
 
@@ -710,6 +716,7 @@ async fn assert_runner_preserves_worker_until_cleanup(route: BlockedJobCleanupRo
     let manager = crate::ThreadManager::with_models_provider_for_tests(
         codex_login::CodexAuth::from_api_key("dummy"),
         turn.config.model_provider.clone(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let worker = manager
         .start_thread((*turn.config).clone())

@@ -87,6 +87,10 @@ fn splits_large_server_messages_into_wire_chunks() {
         seq_id: 9,
     };
 
+    let ServerEvent::ServerMessage { message } = &envelope.event else {
+        unreachable!()
+    };
+    let expected = serde_json::to_vec(message).expect("message should serialize");
     let segments = split_server_envelope_for_transport(envelope).expect("split should succeed");
 
     assert!(segments.len() > 1);
@@ -102,6 +106,29 @@ fn splits_large_server_messages_into_wire_chunks() {
             .len()
             <= REMOTE_CONTROL_SEGMENT_MAX_BYTES
     }));
+    let mut reconstructed = Vec::new();
+    for (index, segment) in segments.iter().enumerate() {
+        assert_eq!(segment.client_id, ClientId("client-1".to_string()));
+        assert_eq!(segment.stream_id, StreamId("stream-1".to_string()));
+        let ServerEvent::ServerMessageChunk {
+            segment_id,
+            segment_count,
+            message_size_bytes,
+            message_chunk_base64,
+        } = &segment.event
+        else {
+            panic!("expected chunk")
+        };
+        assert_eq!(*segment_id, index);
+        assert_eq!(*segment_count, segments.len());
+        assert_eq!(*message_size_bytes, expected.len());
+        reconstructed.extend(
+            base64::engine::general_purpose::STANDARD
+                .decode(message_chunk_base64)
+                .expect("valid base64"),
+        );
+    }
+    assert_eq!(reconstructed, expected);
 }
 
 #[test]
@@ -383,4 +410,29 @@ fn chunk_envelope(
         seq_id: Some(seq_id),
         cursor: None,
     }
+}
+
+#[test]
+fn unsendable_server_message_is_an_error() {
+    let envelope = ServerEnvelope {
+        event: ServerEvent::ServerMessage {
+            message: Box::new(OutgoingMessage::AppServerNotification(
+                ServerNotification::ConfigWarning(ConfigWarningNotification {
+                    summary: "warning".to_string(),
+                    details: None,
+                    path: None,
+                    range: None,
+                }),
+            )),
+        },
+        client_id: ClientId("x".repeat(REMOTE_CONTROL_SEGMENT_MAX_BYTES)),
+        stream_id: StreamId("stream".to_string()),
+        seq_id: 1,
+    };
+    assert_eq!(
+        split_server_envelope_for_transport(envelope)
+            .expect_err("metadata cannot fit")
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
 }

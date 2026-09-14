@@ -182,7 +182,7 @@ use tokio::sync::mpsc;
 
 const TEST_PRODUCT_CLIENT_ID: &str = "codex_work_desktop";
 
-fn test_tracking_context(thread_id: &str, turn_id: &str) -> TrackEventsContext {
+pub(crate) fn test_tracking_context(thread_id: &str, turn_id: &str) -> TrackEventsContext {
     TrackEventsContext {
         model_slug: "gpt-5".to_string(),
         thread_id: thread_id.to_string(),
@@ -379,7 +379,7 @@ fn sample_turn_started_notification(thread_id: &str, turn_id: &str) -> ServerNot
     })
 }
 
-fn sample_turn_token_usage_fact(thread_id: &str, turn_id: &str) -> TurnTokenUsageFact {
+pub(crate) fn sample_turn_token_usage_fact(thread_id: &str, turn_id: &str) -> TurnTokenUsageFact {
     TurnTokenUsageFact {
         thread_id: thread_id.to_string(),
         turn_id: turn_id.to_string(),
@@ -393,7 +393,7 @@ fn sample_turn_token_usage_fact(thread_id: &str, turn_id: &str) -> TurnTokenUsag
     }
 }
 
-fn sample_turn_completed_notification(
+pub(crate) fn sample_turn_completed_notification(
     thread_id: &str,
     turn_id: &str,
     status: AppServerTurnStatus,
@@ -603,7 +603,7 @@ async fn ingest_initialize(reducer: &mut AnalyticsReducer, out: &mut Vec<TrackEv
         .await;
 }
 
-async fn ingest_turn_prerequisites(
+pub(crate) async fn ingest_turn_prerequisites(
     reducer: &mut AnalyticsReducer,
     out: &mut Vec<TrackEventRequest>,
     include_initialize: bool,
@@ -957,7 +957,7 @@ async fn ingest_complete_child_turn(
     }
 }
 
-fn sample_command_execution_item(
+pub(crate) fn sample_command_execution_item(
     status: CommandExecutionStatus,
     exit_code: Option<i32>,
     duration_ms: Option<i64>,
@@ -1396,14 +1396,20 @@ async fn reducer_emits_accepted_line_fingerprints_once_from_latest_turn_diff_on_
     .await;
     events.clear();
 
-    for line in ["let old_value = 1;", "let latest_value = 2;"] {
+    for (hunk, line) in [
+        ("@@ -0,0 +1 @@", "let old_value = 1;"),
+        (
+            "@@ -1 +1,2 @@",
+            "let latest_value = 2;\n+let added = 3;\n-let removed = 0;",
+        ),
+    ] {
         let diff = format!(
             "\
 diff --git a/src/lib.rs b/src/lib.rs
 index 1111111..2222222
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -0,0 +1 @@
+{hunk}
 +{line}
 "
         );
@@ -1443,8 +1449,28 @@ index 1111111..2222222
         .collect::<Vec<_>>();
     assert_eq!(accepted_line_events.len(), 1);
     let event = accepted_line_events[0];
-    assert_eq!(event.event_params.accepted_added_lines, 1);
+    assert_eq!(event.event_params.accepted_added_lines, 2);
+    assert_eq!(event.event_params.accepted_deleted_lines, 1);
+    assert_eq!(event.event_params.completed_at, 456);
     assert!(event.event_params.line_fingerprints.is_empty());
+
+    events.clear();
+    reducer
+        .ingest(
+            AnalyticsFact::Notification(Box::new(sample_turn_completed_notification(
+                "thread-2",
+                "turn-2",
+                AppServerTurnStatus::Completed,
+                None,
+            ))),
+            &mut events,
+        )
+        .await;
+    ingest_turn_prerequisites(&mut reducer, &mut events, false, true, true, true).await;
+    assert!(events.iter().all(|event| !matches!(
+        event,
+        TrackEventRequest::TurnEvent(_) | TrackEventRequest::AcceptedLineFingerprints(_)
+    )));
 }
 
 #[test]
@@ -2614,7 +2640,7 @@ async fn interrupted_tool_item_is_flushed_with_original_context() {
                 ItemStartedNotification {
                     thread_id: "thread-1".to_string(),
                     turn_id: "turn-1".to_string(),
-                    started_at_ms: 400,
+                    started_at_ms: 455_400,
                     item: sample_command_execution_item(
                         CommandExecutionStatus::InProgress,
                         None,
@@ -2647,9 +2673,9 @@ async fn interrupted_tool_item_is_flushed_with_original_context() {
         "not_needed"
     );
     assert_eq!(payload["event_params"]["failure_kind"], json!(null));
-    assert_eq!(payload["event_params"]["started_at_ms"], 400);
-    assert_eq!(payload["event_params"]["completed_at_ms"], 456);
-    assert_eq!(payload["event_params"]["duration_ms"], 56);
+    assert_eq!(payload["event_params"]["started_at_ms"], 455_400);
+    assert_eq!(payload["event_params"]["completed_at_ms"], 456_000);
+    assert_eq!(payload["event_params"]["duration_ms"], 600);
 }
 
 #[tokio::test]
@@ -2679,7 +2705,7 @@ async fn failed_turn_flushes_in_progress_tool_item() {
                 ItemStartedNotification {
                     thread_id: "thread-1".to_string(),
                     turn_id: "turn-1".to_string(),
-                    started_at_ms: 400,
+                    started_at_ms: 455_400,
                     item: sample_command_execution_item(
                         CommandExecutionStatus::InProgress,
                         None,
@@ -2707,9 +2733,9 @@ async fn failed_turn_flushes_in_progress_tool_item() {
     assert_eq!(payload["event_type"], "codex_command_execution_event");
     assert_eq!(payload["event_params"]["item_id"], "item-1");
     assert_eq!(payload["event_params"]["terminal_status"], "failed");
-    assert_eq!(payload["event_params"]["started_at_ms"], 400);
-    assert_eq!(payload["event_params"]["completed_at_ms"], 456);
-    assert_eq!(payload["event_params"]["duration_ms"], 56);
+    assert_eq!(payload["event_params"]["started_at_ms"], 455_400);
+    assert_eq!(payload["event_params"]["completed_at_ms"], 456_000);
+    assert_eq!(payload["event_params"]["duration_ms"], 600);
 }
 
 #[tokio::test]
@@ -4104,7 +4130,7 @@ async fn reducer_ingests_plugin_install_requested_fact() {
                 "thread_id": "thread-1",
                 "turn_id": "turn-1",
                 "model_slug": "gpt-5",
-                "product_client_id": originator().value,
+                "product_client_id": TEST_PRODUCT_CLIENT_ID,
             }
         }])
     );
@@ -5048,6 +5074,9 @@ async fn item_completed_without_turn_state_does_not_create_turn_state() {
         )
         .await;
 
+    ingest_turn_prerequisites(&mut reducer, &mut out, true, true, true, false).await;
+    out.clear();
+
     reducer
         .ingest(
             AnalyticsFact::Notification(Box::new(sample_turn_completed_notification(
@@ -5060,7 +5089,10 @@ async fn item_completed_without_turn_state_does_not_create_turn_state() {
         )
         .await;
 
-    assert!(out.is_empty());
+    assert_eq!(out.len(), 1);
+    let payload = serde_json::to_value(&out[0]).expect("turn event");
+    assert_eq!(payload["event_type"], "codex_turn_event");
+    assert_eq!(payload["event_params"]["total_tool_call_count"], 0);
 }
 
 #[tokio::test]
@@ -5346,7 +5378,7 @@ async fn turn_completed_without_started_notification_emits_null_started_at() {
     assert_eq!(payload["event_params"]["total_tokens"], json!(null));
 }
 
-fn sample_plugin_metadata() -> PluginTelemetryMetadata {
+pub(crate) fn sample_plugin_metadata() -> PluginTelemetryMetadata {
     PluginTelemetryMetadata {
         plugin_id: Some(PluginId::parse("sample@test").expect("valid plugin id")),
         remote_plugin_id: None,

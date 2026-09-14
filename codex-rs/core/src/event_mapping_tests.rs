@@ -32,7 +32,9 @@ fn contextual_user_content_requires_nonempty_exclusively_contextual_fragments() 
             .to_string(),
     };
     assert!(!is_contextual_user_message_content(&[]));
-    assert!(is_contextual_user_message_content(&[environment.clone()]));
+    assert!(is_contextual_user_message_content(std::slice::from_ref(
+        &environment
+    )));
     assert!(is_contextual_user_message_content(&[
         environment.clone(),
         warning
@@ -46,7 +48,9 @@ fn contextual_user_content_requires_nonempty_exclusively_contextual_fragments() 
             detail: None,
         },
     ] {
-        assert!(!is_contextual_user_message_content(&[ordinary.clone()]));
+        assert!(!is_contextual_user_message_content(std::slice::from_ref(
+            &ordinary
+        )));
         assert!(!is_contextual_user_message_content(&[
             environment.clone(),
             ordinary.clone()

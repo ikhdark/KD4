@@ -8,7 +8,6 @@ use tempfile::TempDir;
 pub struct TestBinaryDispatchGuard {
     _codex_home: TempDir,
     arg0: Arg0PathEntryGuard,
-    _previous_codex_home: Option<std::ffi::OsString>,
 }
 
 impl TestBinaryDispatchGuard {
@@ -72,7 +71,6 @@ where
             Some(TestBinaryDispatchGuard {
                 _codex_home: codex_home,
                 arg0,
-                _previous_codex_home: previous_codex_home,
             })
         }
     }

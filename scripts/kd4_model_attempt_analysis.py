@@ -67,6 +67,7 @@ def load_jsonl(paths: Sequence[Path]) -> tuple[list[dict[str, Any]], dict[str, i
     records: list[dict[str, Any]] = []
     exclusions: dict[str, int] = {}
     seen_attempts: dict[tuple[str, str, int], dict[str, Any]] = {}
+    conflicted_requests: set[str] = set()
     components: list[dict[str, Any]] = []
     seen_components: set[tuple[Any, ...]] = set()
     for path in paths:
@@ -127,9 +128,22 @@ def load_jsonl(paths: Sequence[Path]) -> tuple[list[dict[str, Any]], dict[str, i
                         if previous is not None:
                             reason = "conflicting_physical_attempt_duplicate"
                             exclusions[reason] = exclusions.get(reason, 0) + 1
+                            conflicted_requests.add(identity[0])
                         else:
                             seen_attempts[identity] = fields
                     records.append(fields)
+    quarantined = [
+        record
+        for record in records
+        if record.get("sampling_request_id") in conflicted_requests
+    ]
+    if quarantined:
+        exclusions["conflicted_logical_request_attempts"] = len(quarantined)
+        records = [
+            record
+            for record in records
+            if record.get("sampling_request_id") not in conflicted_requests
+        ]
     attempts_by_identity = {
         (
             record.get("sampling_request_id"),
@@ -168,6 +182,7 @@ def _stable_context_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]
     requests_over_120k = 0
     for record in records:
         active_total = 0.0
+        context_measured = False
         attempt_constructed_bytes = 0.0
         attempt_reused_bytes = 0.0
         attempt_cache_hits = 0.0
@@ -177,7 +192,9 @@ def _stable_context_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]
         for component in components:
             if not isinstance(component, dict) or component.get("active") is not True:
                 continue
-            tokens = _number(component.get("approx_tokens")) or 0.0
+            measured_tokens = _number(component.get("approx_tokens"))
+            context_measured = context_measured or measured_tokens is not None
+            tokens = measured_tokens or 0.0
             size = _number(component.get("serialized_bytes")) or 0.0
             active_total += tokens
             if component.get("local_reused") is True:
@@ -212,7 +229,9 @@ def _stable_context_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]
         reported_active_total = _number(record.get("logical_context_tokens"))
         if reported_active_total is not None:
             active_total = reported_active_total
-        active_totals.append(active_total)
+            context_measured = True
+        if context_measured:
+            active_totals.append(active_total)
         reported_constructed = _number(record.get("local_constructed_bytes"))
         local_constructed_bytes += (
             attempt_constructed_bytes
@@ -249,6 +268,8 @@ def _stable_context_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]
     )
     return {
         "componentVersions": top,
+        "measuredContextAttempts": len(active_totals),
+        "missingContextAttempts": len(records) - len(active_totals),
         "averageActiveContextTokens": round(sum(active_totals) / len(active_totals), 3)
         if active_totals
         else None,

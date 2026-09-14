@@ -46,6 +46,11 @@ pub fn run_main() -> i32 {
         return 2;
     }
 
+    run_apply_patch(&patch_arg)
+}
+
+/// Execute a patch for standalone and hidden CLI invocations, including recovery output.
+pub fn run_apply_patch(patch: &str) -> i32 {
     let mut stdout = std::io::stdout();
     let mut stderr = std::io::stderr();
     let cwd = match codex_utils_absolute_path::AbsolutePathBuf::current_dir() {
@@ -68,7 +73,7 @@ pub fn run_main() -> i32 {
     // TODO(anp): Discover the standalone executable cwd as PathUri directly.
     let cwd = codex_utils_path_uri::PathUri::from_abs_path(&cwd);
     match runtime.block_on(crate::apply_patch(
-        &patch_arg,
+        patch,
         &cwd,
         &mut stdout,
         &mut stderr,
@@ -77,9 +82,58 @@ pub fn run_main() -> i32 {
     )) {
         Ok(_) => {
             // Flush to ensure output ordering when used in pipelines.
-            let _ = stdout.flush();
-            0
+            match stdout.flush() {
+                Ok(()) => 0,
+                Err(err) => {
+                    eprintln!("Error: Patch applied, but failed to flush its output: {err}");
+                    1
+                }
+            }
         }
-        Err(_) => 1,
+        Err(failure) => {
+            let _ = print_failure_delta(failure.delta(), &mut stderr);
+            1
+        }
     }
+}
+
+fn print_failure_delta(
+    delta: &crate::AppliedPatchDelta,
+    stderr: &mut impl Write,
+) -> std::io::Result<()> {
+    if !delta.is_empty() {
+        writeln!(
+            stderr,
+            "Changes committed before the failure (do not retry the whole patch):"
+        )?;
+        for change in delta.changes() {
+            match &change.change {
+                crate::AppliedPatchFileChange::Add { .. } => {
+                    writeln!(stderr, "A {}", change.path.display())?;
+                }
+                crate::AppliedPatchFileChange::Delete { .. } => {
+                    writeln!(stderr, "D {}", change.path.display())?;
+                }
+                crate::AppliedPatchFileChange::Update { move_path, .. } => {
+                    if let Some(destination) = move_path {
+                        writeln!(
+                            stderr,
+                            "M {} -> {}",
+                            change.path.display(),
+                            destination.display()
+                        )?;
+                    } else {
+                        writeln!(stderr, "M {}", change.path.display())?;
+                    }
+                }
+            }
+        }
+    }
+    if !delta.is_exact() {
+        writeln!(
+            stderr,
+            "The change list is incomplete; additional partial filesystem effects may exist."
+        )?;
+    }
+    Ok(())
 }

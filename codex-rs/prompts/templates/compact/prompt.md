@@ -36,8 +36,9 @@ re-established.
 
 ## Evidence
 
-The most relevant fresh file, command, test, and validation evidence. Identify
-stale or unverified evidence rather than presenting it as authoritative.
+Preserve the available evidence identifier or command, scope, observed outcome,
+and any known later invalidation. Mark unknown freshness explicitly; do not
+invent identifiers or gather new evidence.
 
 ## Next action
 

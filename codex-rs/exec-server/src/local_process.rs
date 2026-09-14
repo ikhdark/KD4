@@ -19,6 +19,7 @@ use codex_utils_pty::ExecCommandSession;
 use codex_utils_pty::ProcessSignal as PtyProcessSignal;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
+#[cfg(test)]
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 
@@ -54,7 +55,6 @@ use crate::protocol::WriteParams;
 use crate::protocol::WriteResponse;
 use crate::protocol::WriteStatus;
 use crate::rpc::RpcNotificationSender;
-use crate::rpc::RpcServerOutboundMessage;
 use crate::rpc::internal_error;
 use crate::rpc::invalid_params;
 use crate::rpc::invalid_request;
@@ -62,6 +62,7 @@ use crate::telemetry::ExecServerTelemetry;
 use crate::telemetry::ProcessMetricGuard;
 
 const RETAINED_OUTPUT_BYTES_PER_PROCESS: usize = 1024 * 1024;
+#[cfg(test)]
 const NOTIFICATION_CHANNEL_CAPACITY: usize = 256;
 const PROCESS_EVENT_CHANNEL_CAPACITY: usize = 256;
 const RETAINED_STDIN_WRITE_IDS_PER_PROCESS: usize = 4096;
@@ -172,6 +173,8 @@ struct Inner {
     notifications: std::sync::RwLock<Option<RpcNotificationSender>>,
     processes: Mutex<HashMap<ProcessId, ProcessEntry>>,
     telemetry: ExecServerTelemetry,
+    #[cfg(test)]
+    read_wait_started: tokio::sync::Notify,
 }
 
 #[derive(Clone)]
@@ -189,24 +192,13 @@ struct LocalExecProcess {
 
 impl Default for LocalProcess {
     fn default() -> Self {
-        Self::with_discarded_notifications(/*runtime_paths*/ None)
+        Self::with_runtime_paths(None, ExecServerTelemetry::default(), None)
     }
 }
 
 impl LocalProcess {
     pub(crate) fn with_local_runtime_paths(runtime_paths: ExecServerRuntimePaths) -> Self {
-        Self::with_discarded_notifications(Some(runtime_paths))
-    }
-
-    fn with_discarded_notifications(runtime_paths: Option<ExecServerRuntimePaths>) -> Self {
-        let (outgoing_tx, mut outgoing_rx) =
-            mpsc::channel::<RpcServerOutboundMessage>(NOTIFICATION_CHANNEL_CAPACITY);
-        tokio::spawn(async move { while outgoing_rx.recv().await.is_some() {} });
-        Self::with_runtime_paths(
-            RpcNotificationSender::new(outgoing_tx),
-            ExecServerTelemetry::default(),
-            runtime_paths,
-        )
+        Self::with_runtime_paths(None, ExecServerTelemetry::default(), Some(runtime_paths))
     }
 
     pub(crate) fn new(
@@ -214,19 +206,21 @@ impl LocalProcess {
         telemetry: ExecServerTelemetry,
         runtime_paths: ExecServerRuntimePaths,
     ) -> Self {
-        Self::with_runtime_paths(notifications, telemetry, Some(runtime_paths))
+        Self::with_runtime_paths(Some(notifications), telemetry, Some(runtime_paths))
     }
 
     fn with_runtime_paths(
-        notifications: RpcNotificationSender,
+        notifications: Option<RpcNotificationSender>,
         telemetry: ExecServerTelemetry,
         runtime_paths: Option<ExecServerRuntimePaths>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                notifications: std::sync::RwLock::new(Some(notifications)),
+                notifications: std::sync::RwLock::new(notifications),
                 processes: Mutex::new(HashMap::new()),
                 telemetry,
+                #[cfg(test)]
+                read_wait_started: tokio::sync::Notify::new(),
             }),
             runtime_paths,
         }
@@ -448,7 +442,10 @@ impl LocalProcess {
                 let mut chunks = Vec::new();
                 let mut total_bytes = 0;
                 let mut next_seq = process.next_seq;
-                for retained in process.output.iter().filter(|chunk| chunk.seq > after_seq) {
+                let start = process
+                    .output
+                    .partition_point(|chunk| chunk.seq <= after_seq);
+                for retained in process.output.range(start..) {
                     let chunk_len = retained.chunk.len();
                     if !chunks.is_empty() && total_bytes + chunk_len > max_bytes {
                         break;
@@ -477,9 +474,15 @@ impl LocalProcess {
                         failure: None,
                         sandbox_denied: process.sandbox_denied,
                     },
-                    Arc::clone(&process.output_notify),
+                    // Register before releasing the state lock: notify_waiters does
+                    // not retain a permit for a future created after the update.
+                    Arc::clone(&process.output_notify).notified_owned(),
                 )
             };
+
+            // Exercise updates between snapshotting and polling the waiter in tests.
+            #[cfg(test)]
+            tokio::task::yield_now().await;
 
             let has_new_terminal_event =
                 response.exited && after_seq < response.next_seq.saturating_sub(1);
@@ -500,8 +503,15 @@ impl LocalProcess {
             if remaining.is_zero() {
                 return Ok(response);
             }
-            let _ = tokio::time::timeout(remaining, output_notify.notified()).await;
+            #[cfg(test)]
+            self.inner.read_wait_started.notify_one();
+            let _ = tokio::time::timeout(remaining, output_notify).await;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_read_wait(&self) {
+        self.inner.read_wait_started.notified().await;
     }
 
     pub(crate) async fn exec_write(
@@ -601,10 +611,12 @@ impl LocalProcess {
                     if process.exit_code.is_some() {
                         return Ok(TerminateResponse { running: false });
                     }
-                    process.session.request_terminate().map_err(|err| {
-                        internal_error(format!("failed to terminate process: {err}"))
-                    })?;
-                    process.termination_requested = true;
+                    if !process.termination_requested {
+                        process.session.request_terminate().map_err(|err| {
+                            internal_error(format!("failed to terminate process: {err}"))
+                        })?;
+                        process.termination_requested = true;
+                    }
                     true
                 }
                 Some(ProcessEntry::Starting(_)) => {
@@ -883,7 +895,7 @@ async fn watch_exit(
     output_notify: Arc<Notify>,
 ) {
     let exit_code = exit_rx.await.unwrap_or(-1);
-    let (sandboxed, tty) = {
+    let (output_pending, tty) = {
         let mut processes = inner.processes.lock().await;
         match processes.get_mut(&process_id) {
             Some(ProcessEntry::Running(process)) => {
@@ -897,9 +909,13 @@ async fn watch_exit(
                         "error"
                     });
                 }
-                (sandboxed, process.tty)
+                (
+                    (sandboxed && process.open_streams != 0)
+                        .then(|| Arc::clone(&output_notify).notified_owned()),
+                    process.tty,
+                )
             }
-            Some(ProcessEntry::Starting(_)) | None => (false, false),
+            Some(ProcessEntry::Starting(_)) | None => (None, false),
         }
     };
     if tty {
@@ -908,8 +924,8 @@ async fn watch_exit(
             process.session.release_pty_after_exit();
         }
     }
-    if sandboxed {
-        let _ = tokio::time::timeout(Duration::from_millis(20), output_notify.notified()).await;
+    if let Some(output_pending) = output_pending {
+        let _ = tokio::time::timeout(Duration::from_millis(20), output_pending).await;
     }
     let notification = {
         let mut processes = inner.processes.lock().await;
@@ -1089,7 +1105,7 @@ mod tests {
         tokio::spawn(async move { while outgoing_rx.recv().await.is_some() {} });
         (
             LocalProcess::with_runtime_paths(
-                RpcNotificationSender::new(outgoing_tx),
+                Some(RpcNotificationSender::new(outgoing_tx)),
                 telemetry,
                 /*runtime_paths*/ None,
             ),
@@ -1255,16 +1271,19 @@ mod tests {
             occupied_rx.await.expect("blocking worker started");
             let backend = LocalProcess::default();
             let mut params = test_exec_params(HashMap::new());
-            params.cwd = PathUri::parse("file:///usr/local/checkout").expect("foreign cwd");
-            let source = params.cwd.to_abs_path().expect_err("non-native cwd");
-            let expected = invalid_params(format!(
-                "cwd URI `{}` is not valid on this exec-server host: {source}",
-                params.cwd
-            ));
+            let temp = tempfile::tempdir().expect("launch marker directory");
+            let marker = temp.path().join("launched.txt");
+            params.cwd = PathUri::from_host_native_path(temp.path()).expect("marker directory URI");
+            params.argv = vec![
+                "cmd.exe".to_string(),
+                "/d".to_string(),
+                "/c".to_string(),
+                "echo launched>launched.txt".to_string(),
+            ];
             let process_id = params.process_id.clone();
+            let expected = invalid_request(format!("process {process_id} start was cancelled"));
             let mut start = Box::pin(backend.exec(params));
 
-            // Invalid cwd validation used to run synchronously in this poll.
             // With the blocking pool occupied, preparation must yield instead.
             assert!(futures::poll!(start.as_mut()).is_pending());
             assert!(matches!(
@@ -1309,6 +1328,25 @@ mod tests {
                     .contains_key(&process_id)
             );
             blocker.await.expect("blocking pool released");
+            tokio::task::spawn_blocking(|| ())
+                .await
+                .expect("drain preparation");
+            assert!(
+                !marker.exists(),
+                "cancelled preparation must not launch the command"
+            );
+            let control = std::process::Command::new("cmd.exe")
+                .current_dir(temp.path())
+                .args(["/d", "/c", "echo launched>launched.txt"])
+                .status()
+                .expect("valid control launch");
+            assert!(control.success());
+            assert_eq!(
+                std::fs::read_to_string(marker)
+                    .expect("control marker")
+                    .trim(),
+                "launched"
+            );
         });
     }
 
@@ -1517,6 +1555,62 @@ mod tests {
         })
         .await
         .expect("closed process should be evicted");
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn read_observes_output_notified_after_snapshot_before_wait() {
+        let backend = LocalProcess::default();
+        assert!(notification_sender(&backend.inner).is_none());
+        let process = spawn_test_process(&backend, "read-race").await;
+        let mut read = Box::pin(backend.exec_read(ReadParams {
+            process_id: process.process_id.clone(),
+            after_seq: None,
+            max_bytes: None,
+            wait_ms: Some(30_000),
+        }));
+        // Stop at the yield after snapshotting, before polling the Notify future.
+        assert!(futures::poll!(read.as_mut()).is_pending());
+        process
+            .stdout_tx
+            .send(b"ready".to_vec())
+            .await
+            .expect("send output");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                {
+                    let processes = backend.inner.processes.lock().await;
+                    if matches!(processes.get(&process.process_id), Some(ProcessEntry::Running(running)) if !running.output.is_empty()) {
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("output retained before resuming read");
+        let response = timeout(Duration::from_secs(1), read)
+            .await
+            .expect("prompt wakeup")
+            .expect("read");
+        assert_eq!(response.chunks.len(), 1);
+        assert_eq!(response.chunks[0].chunk.0, b"ready");
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn exec_rejects_managed_network_without_sandbox() {
+        let backend = LocalProcess::default();
+        let mut params = test_exec_params(HashMap::new());
+        params.argv = vec!["cmd.exe".into(), "/d".into(), "/c".into(), "exit 0".into()];
+        params.enforce_managed_network = true;
+        let error = backend
+            .exec(params)
+            .await
+            .expect_err("unenforceable network policy");
+        assert_eq!(
+            error.message,
+            "managed network enforcement requires a sandbox context"
+        );
+        assert!(backend.inner.processes.lock().await.is_empty());
         backend.shutdown().await;
     }
 

@@ -223,13 +223,18 @@ where
                 accounting.clear_current_turn_goal();
                 return;
             }
-            let Ok(goal) = self
+            let goal = match self
                 .state_dbs
                 .thread_goals()
                 .get_thread_goal(runtime.thread_id())
                 .await
-            else {
-                return;
+            {
+                Ok(goal) => goal,
+                Err(err) => {
+                    tracing::warn!("failed to read goal at turn start: {err}");
+                    accounting.clear_current_turn_goal();
+                    return;
+                }
             };
             if let Some(goal) = goal
                 && matches!(
@@ -248,16 +253,16 @@ where
             let Some(runtime) = goal_runtime_handle(input.thread_store) else {
                 return;
             };
-            if !runtime.is_enabled() {
-                return;
-            }
 
+            let Ok(_goal_state_permit) = runtime.goal_state_permit().await else {
+                return;
+            };
             let turn_id = input.turn_store.level_id();
             if let Err(err) = runtime
                 .account_active_goal_progress(
                     turn_id,
                     &format!("{turn_id}:turn-stop"),
-                    codex_state::GoalAccountingMode::ActiveOnly,
+                    codex_state::GoalAccountingMode::ActiveOrStopped,
                     BudgetLimitedGoalDisposition::ClearActive,
                 )
                 .await
@@ -277,16 +282,16 @@ where
             let Some(runtime) = goal_runtime_handle(input.thread_store) else {
                 return;
             };
-            if !runtime.is_enabled() {
-                return;
-            }
 
+            let Ok(_goal_state_permit) = runtime.goal_state_permit().await else {
+                return;
+            };
             let turn_id = input.turn_store.level_id();
             if let Err(err) = runtime
                 .account_active_goal_progress(
                     turn_id,
                     &format!("{turn_id}:turn-abort"),
-                    codex_state::GoalAccountingMode::ActiveOnly,
+                    codex_state::GoalAccountingMode::ActiveOrStopped,
                     BudgetLimitedGoalDisposition::ClearActive,
                 )
                 .await
@@ -347,12 +352,9 @@ where
                 return;
             }
 
-            let Some(_recorded) = runtime
+            runtime
                 .accounting_state()
-                .record_token_usage(turn_store.level_id(), &token_usage.total_token_usage)
-            else {
-                return;
-            };
+                .record_token_usage(turn_store.level_id(), &token_usage.total_token_usage);
         })
     }
 }
@@ -373,6 +375,9 @@ where
             if !should_count_for_goal_progress {
                 return;
             }
+            let Ok(_goal_state_permit) = runtime.goal_state_permit().await else {
+                return;
+            };
             let turn_id = input.turn_id;
             let progress = match runtime
                 .account_active_goal_progress(
@@ -402,8 +407,13 @@ where
             {
                 return;
             }
+            let mut report = BudgetLimitReportReservation {
+                accounting: runtime.accounting_state(),
+                goal_id: progress.goal_id,
+                delivered: false,
+            };
             let item = budget_limit_steering_item(&goal);
-            runtime.inject_active_turn_steering(item).await;
+            report.delivered = runtime.inject_active_turn_steering(item).await;
         })
     }
 }
@@ -445,6 +455,7 @@ where
         let accounting_state = runtime.accounting_state();
         let create: Arc<dyn codex_extension_api::ToolExecutor<codex_extension_api::ToolCall>> =
             Arc::new(GoalToolExecutor::create(
+                Arc::clone(&runtime),
                 runtime.thread_id(),
                 Arc::clone(&self.state_dbs),
                 Arc::clone(&accounting_state),
@@ -458,6 +469,7 @@ where
 
         vec![
             Arc::new(GoalToolExecutor::get(
+                Arc::clone(&runtime),
                 runtime.thread_id(),
                 Arc::clone(&self.state_dbs),
                 Arc::clone(&accounting_state),
@@ -467,6 +479,7 @@ where
             )),
             create,
             Arc::new(GoalToolExecutor::update(
+                Arc::clone(&runtime),
                 runtime.thread_id(),
                 Arc::clone(&self.state_dbs),
                 accounting_state,
@@ -506,6 +519,20 @@ pub fn install_with_backend<C>(
     registry.tool_contributor(extension);
 }
 
+struct BudgetLimitReportReservation {
+    accounting: Arc<GoalAccountingState>,
+    goal_id: String,
+    delivered: bool,
+}
+
+impl Drop for BudgetLimitReportReservation {
+    fn drop(&mut self) {
+        if !self.delivered {
+            self.accounting.rearm_budget_limit_report(&self.goal_id);
+        }
+    }
+}
+
 fn goal_runtime_handle(thread_store: &ExtensionData) -> Option<Arc<GoalRuntimeHandle>> {
     thread_store.get::<GoalRuntimeHandle>()
 }
@@ -522,5 +549,29 @@ fn tool_attempt_counts_for_goal_progress(outcome: ToolCallOutcome) -> bool {
             handler_executed: false,
         }
         | ToolCallOutcome::Aborted => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BudgetLimitReportReservation;
+    use crate::accounting::GoalAccountingState;
+    use std::sync::Arc;
+
+    #[test]
+    fn undelivered_budget_notice_can_be_retried() {
+        let accounting = Arc::new(GoalAccountingState::default());
+        for delivered in [false, true] {
+            assert!(accounting.mark_budget_limit_reported_if_new("goal-1"));
+            {
+                let _reservation = BudgetLimitReportReservation {
+                    accounting: Arc::clone(&accounting),
+                    goal_id: "goal-1".to_string(),
+                    delivered,
+                };
+                assert!(!accounting.mark_budget_limit_reported_if_new("goal-1"));
+            }
+        }
+        assert!(!accounting.mark_budget_limit_reported_if_new("goal-1"));
     }
 }

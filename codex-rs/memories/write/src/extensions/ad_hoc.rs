@@ -1,6 +1,6 @@
 use crate::memory_extensions_root;
+use std::io::Write as _;
 use std::path::Path;
-use tokio::io::AsyncWriteExt;
 
 pub(super) const INSTRUCTIONS: &str =
     include_str!("../../templates/extensions/ad_hoc/instructions.md");
@@ -9,20 +9,19 @@ pub(super) async fn seed_instructions(memory_root: &Path) -> std::io::Result<()>
     let extension_root = memory_extensions_root(memory_root).join("ad_hoc");
     let instructions_path = extension_root.join("instructions.md");
 
-    tokio::fs::create_dir_all(&extension_root).await?;
-    match tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&instructions_path)
-        .await
-    {
-        Ok(mut file) => {
-            file.write_all(INSTRUCTIONS.as_bytes()).await?;
-            file.flush().await
+    tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&extension_root)?;
+        let mut file = tempfile::NamedTempFile::new_in(&extension_root)?;
+        file.write_all(INSTRUCTIONS.as_bytes())?;
+        file.flush()?;
+        match file.persist_noclobber(&instructions_path) {
+            Ok(_) => Ok(()),
+            Err(err) if err.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(err) => Err(err.error),
         }
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(err) => Err(err),
-    }
+    })
+    .await
+    .map_err(|err| std::io::Error::other(format!("instruction seeding task failed: {err}")))?
 }
 
 #[cfg(test)]

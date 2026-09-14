@@ -69,7 +69,7 @@ elevated_windows_sandbox = true
     assert!(migrated["features"].get("chronicle").is_none());
     assert!(
         migrated["profiles"]["work"]["features"]
-            .get("chronicle")
+            .get("telepathy")
             .is_none()
     );
     assert!(
@@ -148,7 +148,10 @@ project = true
     );
 }
 
-struct TestFileSystem;
+#[derive(Default)]
+struct TestFileSystem {
+    metadata_error: Option<(AbsolutePathBuf, io::ErrorKind)>,
+}
 
 impl ExecutorFileSystem for TestFileSystem {
     fn canonicalize<'a>(
@@ -211,7 +214,13 @@ impl ExecutorFileSystem for TestFileSystem {
         _sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileMetadata> {
         Box::pin(async move {
-            let metadata = tokio::fs::symlink_metadata(path.to_abs_path()?.as_path()).await?;
+            let path = path.to_abs_path()?;
+            if let Some((failed_path, kind)) = &self.metadata_error
+                && &path == failed_path
+            {
+                return Err(io::Error::new(*kind, "injected metadata failure"));
+            }
+            let metadata = tokio::fs::symlink_metadata(path.as_path()).await?;
             let file_type = metadata.file_type();
             let to_millis = |time: std::io::Result<std::time::SystemTime>| {
                 time.ok()
@@ -284,7 +293,7 @@ model = "gpt-work"
     overrides.user_config_profile = Some("work".parse().expect("profile-v2 name"));
 
     let err = load_config_layers_state(
-        &TestFileSystem,
+        &TestFileSystem::default(),
         tmp.path(),
         /*cwd*/ None,
         &[],
@@ -342,7 +351,7 @@ model = "gpt-main"
     overrides.user_config_profile = Some("work".parse().expect("profile-v2 name"));
 
     let err = load_config_layers_state(
-        &TestFileSystem,
+        &TestFileSystem::default(),
         tmp.path(),
         /*cwd*/ None,
         &[],
@@ -381,6 +390,7 @@ async fn profile_v2_allows_unrelated_legacy_profiles_in_base_user_config() {
         tmp.path().join(CONFIG_TOML_FILE),
         r#"
 model = "gpt-main"
+model_reasoning_effort = "high"
 
 [profiles.dev]
 model = "gpt-dev"
@@ -397,8 +407,8 @@ model = "gpt-dev"
     ));
     overrides.user_config_profile = Some("work".parse().expect("profile-v2 name"));
 
-    load_config_layers_state(
-        &TestFileSystem,
+    let stack = load_config_layers_state(
+        &TestFileSystem::default(),
         tmp.path(),
         /*cwd*/ None,
         &[],
@@ -407,6 +417,16 @@ model = "gpt-dev"
     )
     .await
     .expect("profile-v2 should allow unrelated legacy profiles in base user config");
+    let effective = stack.effective_config();
+    assert_eq!(effective["model"].as_str(), Some("gpt-work-v2"));
+    assert_eq!(effective["model_reasoning_effort"].as_str(), Some("high"));
+    let user_layers = stack
+        .layers_high_to_low()
+        .into_iter()
+        .filter(|layer| matches!(layer.name, ConfigLayerSource::User { .. }))
+        .map(|layer| layer.config["model"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(user_layers, vec!["gpt-work-v2", "gpt-main"]);
 }
 
 #[tokio::test]
@@ -419,7 +439,7 @@ async fn config_layer_stack_preserves_project_discovery_context() {
     std::fs::create_dir(workspace.path().join(".git")).expect("git marker");
     let cwd = AbsolutePathBuf::from_absolute_path(&nested).expect("absolute cwd");
     let project_root = AbsolutePathBuf::from_absolute_path(workspace.path()).expect("project root");
-    let fs = TestFileSystem;
+    let fs = TestFileSystem::default();
     let cwd_key = toml::Value::String(cwd.as_path().to_string_lossy().into_owned()).to_string();
     let user_config = format!("[projects.{cwd_key}]\ntrust_level = \"trusted\"\n");
     std::fs::write(codex_home.path().join(CONFIG_TOML_FILE), &user_config).expect("user config");
@@ -462,4 +482,263 @@ async fn config_layer_stack_preserves_project_discovery_context() {
         toml::Value::Table(Default::default()),
     );
     assert_eq!(updated.project_discovery(), Some(discovery));
+}
+
+#[tokio::test]
+async fn user_marker_edits_invalidate_discovery_but_model_edits_preserve_it() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let cwd = AbsolutePathBuf::from_absolute_path(workspace.path()).unwrap();
+    let config_path = AbsolutePathBuf::resolve_path_against_base(CONFIG_TOML_FILE, home.path());
+    std::fs::write(&config_path, "project_root_markers = ['.git']\n").unwrap();
+    // Legacy managed layers arrive after project discovery and cannot select
+    // its boundary, including when a later user edit considers reusing it.
+    let managed_config_path = home.path().join("managed_config.toml");
+    std::fs::write(
+        &managed_config_path,
+        "project_root_markers = ['.managed-root']\n",
+    )
+    .unwrap();
+    let fs = TestFileSystem::default();
+    let stack = load_config_layers_state(
+        &fs,
+        home.path(),
+        Some(cwd),
+        &[],
+        LoaderOverrides::with_managed_config_path_for_tests(managed_config_path),
+        &crate::NoopThreadConfigLoader,
+    )
+    .await
+    .unwrap();
+    let discovery = stack.project_discovery().expect("loaded discovery");
+    assert_eq!(discovery.project_root_markers(), &[".git"]);
+    for (contents, reusable) in [
+        ("model = 'different'", true),
+        ("project_root_markers = ['.git']", true),
+        ("project_root_markers = []", false),
+        ("project_root_markers = ['.new-root']", false),
+        ("project_root_markers = false", false),
+    ] {
+        let updated = stack.with_user_config(&config_path, toml::from_str(contents).unwrap());
+        assert_eq!(
+            updated.project_discovery(),
+            reusable.then_some(discovery),
+            "{contents}"
+        );
+        assert_eq!(
+            stack.with_user_layer_from(&updated).project_discovery(),
+            reusable.then_some(discovery),
+            "{contents}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn discovery_reports_operational_metadata_errors() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let cwd = AbsolutePathBuf::from_absolute_path(workspace.path()).unwrap();
+    for (relative_path, markers) in [
+        (".root", vec![".root"]),
+        (".git", vec![]),
+        (".codex", vec![]),
+        ("", vec![]),
+    ] {
+        let failed_path = if relative_path.is_empty() {
+            cwd.clone()
+        } else {
+            cwd.join(relative_path)
+        };
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::Other] {
+            let fs = TestFileSystem {
+                metadata_error: Some((failed_path.clone(), kind)),
+            };
+            let error = load_config_layers_state(
+                &fs,
+                home.path(),
+                Some(cwd.clone()),
+                &[(
+                    "project_root_markers".to_string(),
+                    TomlValue::try_from(&markers).unwrap(),
+                )],
+                LoaderOverrides::without_managed_config_for_tests(),
+                &crate::NoopThreadConfigLoader,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert!(
+                error
+                    .to_string()
+                    .contains(&failed_path.display().to_string()),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn config_file_boundaries_migrate_before_strict_validation() {
+    for source in ["user", "system", "managed", "project"] {
+        let home = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let cwd = AbsolutePathBuf::from_absolute_path(workspace.path()).unwrap();
+        let mut overrides = LoaderOverrides::without_managed_config_for_tests();
+        let config_path = match source {
+            "system" => {
+                let path = home.path().join("system.toml");
+                overrides.system_config_path = Some(path.clone());
+                path
+            }
+            "managed" => {
+                let path = home.path().join("managed_config.toml");
+                overrides.managed_config_path = Some(path.clone());
+                path
+            }
+            "project" => {
+                std::fs::create_dir(cwd.join(".codex")).unwrap();
+                let key = TomlValue::String(cwd.to_string_lossy().into_owned());
+                std::fs::write(
+                    home.path().join(CONFIG_TOML_FILE),
+                    format!("[projects.{key}]\ntrust_level = 'trusted'\n"),
+                )
+                .unwrap();
+                cwd.join(".codex").join(CONFIG_TOML_FILE).to_path_buf()
+            }
+            _ => home.path().join(CONFIG_TOML_FILE),
+        };
+        std::fs::write(
+            &config_path,
+            "[features]\nexperimental_use_unified_exec_tool = false\ntelepathy = true\n",
+        )
+        .unwrap();
+        let mut options = ConfigLoadOptions::from(overrides.clone());
+        options.strict_config = true;
+        let stack = load_config_layers_state(
+            &TestFileSystem::default(),
+            home.path(),
+            Some(cwd.clone()),
+            &[("project_root_markers".to_string(), TomlValue::Array(vec![]))],
+            options,
+            &crate::NoopThreadConfigLoader,
+        )
+        .await
+        .unwrap();
+        let effective = stack.effective_config();
+        assert_eq!(
+            effective["features"]["unified_exec"].as_bool(),
+            Some(false),
+            "{source}"
+        );
+        assert!(
+            effective["features"]
+                .get("experimental_use_unified_exec_tool")
+                .is_none(),
+            "{source}"
+        );
+        assert!(effective["features"].get("telepathy").is_none(), "{source}");
+        std::fs::write(&config_path, "config_version = 999\n").unwrap();
+        let error = load_config_layers_state(
+            &TestFileSystem::default(),
+            home.path(),
+            Some(cwd),
+            &[("project_root_markers".to_string(), TomlValue::Array(vec![]))],
+            overrides,
+            &crate::NoopThreadConfigLoader,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("unsupported config_version 999"),
+            "{source}: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn overridden_invalid_field_does_not_change_relative_path_base() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    std::fs::write(
+        home.path().join(CONFIG_TOML_FILE),
+        "model = 42\nlog_dir = 'logs'\n",
+    )
+    .unwrap();
+    let stack = load_config_layers_state(
+        &TestFileSystem::default(),
+        home.path(),
+        Some(AbsolutePathBuf::from_absolute_path(workspace.path()).unwrap()),
+        &[(
+            "model".to_string(),
+            TomlValue::String("valid-model".to_string()),
+        )],
+        LoaderOverrides::without_managed_config_for_tests(),
+        &crate::NoopThreadConfigLoader,
+    )
+    .await
+    .unwrap();
+    let config: ConfigToml = stack.effective_config().try_into().unwrap();
+    assert_eq!(config.model.as_deref(), Some("valid-model"));
+    assert_eq!(config.log_dir.unwrap().as_path(), home.path().join("logs"));
+}
+
+#[tokio::test]
+async fn disabled_project_config_ignores_unsupported_version() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    std::fs::create_dir(workspace.path().join(".codex")).unwrap();
+    std::fs::write(
+        workspace.path().join(".codex/config.toml"),
+        "config_version = 999\nmodel = 'untrusted'\n",
+    )
+    .unwrap();
+    let stack = load_config_layers_state(
+        &TestFileSystem::default(),
+        home.path(),
+        Some(AbsolutePathBuf::from_absolute_path(workspace.path()).unwrap()),
+        &[("project_root_markers".to_string(), TomlValue::Array(vec![]))],
+        LoaderOverrides::without_managed_config_for_tests(),
+        &crate::NoopThreadConfigLoader,
+    )
+    .await
+    .unwrap();
+    assert!(stack.effective_config().get("model").is_none());
+    let layers = stack.get_layers(crate::ConfigLayerStackOrdering::LowestPrecedenceFirst, true);
+    let project = layers
+        .iter()
+        .find(|layer| matches!(layer.name, ConfigLayerSource::Project { .. }))
+        .unwrap();
+    assert!(project.is_disabled());
+    assert!(project.config.as_table().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn root_checkout_hook_config_obeys_version_boundary() {
+    let root = tempdir().unwrap();
+    let folder = AbsolutePathBuf::from_absolute_path(root.path()).unwrap();
+    let file = folder.join(CONFIG_TOML_FILE);
+    std::fs::write(&file, "config_version = 999\n").unwrap();
+    let config = TomlValue::Table(toml::map::Map::new());
+    let error = merge_root_checkout_project_hooks(
+        &TestFileSystem::default(),
+        config.clone(),
+        Some(&folder),
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("unsupported config_version 999"));
+    assert_eq!(
+        merge_root_checkout_project_hooks(
+            &TestFileSystem::default(),
+            config.clone(),
+            Some(&folder),
+            false
+        )
+        .await
+        .unwrap(),
+        config
+    );
 }

@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import io
+import os
 import sys
 import tarfile
 import tempfile
@@ -85,34 +86,23 @@ class ResolveZstdCommandTest(unittest.TestCase):
             )
             process.kill.assert_not_called()
 
-    def test_tar_zst_none_uses_zstd_level_zero(self) -> None:
+    def test_tar_zst_none_is_rejected_before_compressor_launch(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            package_dir = root / "package"
-            package_dir.mkdir()
-            output = root / "package.tar.zst"
-            process = mock.Mock()
-            process.stdin = io.BytesIO()
-            process.wait.return_value = 0
-
-            with (
-                mock.patch.object(
-                    archive, "resolve_zstd_command", return_value=["zstd"]
-                ),
-                mock.patch.object(
-                    archive.subprocess, "Popen", return_value=process
-                ) as popen,
-                mock.patch.object(archive, "write_tar_stream"),
-            ):
-                archive.write_tar_zst_archive(
-                    package_dir,
-                    output,
-                    entries=[],
-                    compression="none",
-                )
-
-            cmd = popen.call_args.args[0]
-            self.assertEqual(cmd, ["zstd", "-T0", "-0", "-f", "-", "-o", str(output)])
+            with mock.patch.object(archive.subprocess, "Popen") as popen:
+                with self.assertRaisesRegex(RuntimeError, "compression 'none'"):
+                    archive.write_archive(
+                        root / "package",
+                        root / "out.tar.zst",
+                        force=True,
+                        compression="none",
+                    )
+                with self.assertRaisesRegex(RuntimeError, "compression 'none'"):
+                    archive.write_tar_zst_archive(
+                        root, root / "out.tar.zst", compression="none"
+                    )
+                popen.assert_not_called()
+            self.assertFalse((root / "out.tar.zst").exists())
 
 
 class WriteArchiveSafetyTest(unittest.TestCase):
@@ -232,17 +222,41 @@ class ArchiveMemberNameTest(unittest.TestCase):
             first_zip = root / "first.zip"
             second_zip = root / "second.zip"
 
-            archive.write_tar_archive(
-                package_dir, first_tgz, mode="w:gz", entries=entries
-            )
-            archive.write_tar_archive(
-                package_dir, second_tgz, mode="w:gz", entries=entries
-            )
-            archive.write_zip_archive(package_dir, first_zip, entries=entries)
-            archive.write_zip_archive(package_dir, second_zip, entries=entries)
+            for timestamp, tgz, zipped in [
+                (946684800, first_tgz, first_zip),
+                (1893456000, second_tgz, second_zip),
+            ]:
+                os.utime(payload, (timestamp, timestamp))
+                with mock.patch("time.time", return_value=timestamp):
+                    archive.write_tar_archive(
+                        package_dir, tgz, mode="w:gz", entries=entries
+                    )
+                    archive.write_zip_archive(package_dir, zipped, entries=entries)
 
             self.assertEqual(first_tgz.read_bytes(), second_tgz.read_bytes())
             self.assertEqual(first_zip.read_bytes(), second_zip.read_bytes())
+
+    def test_fast_zip_streams_with_level_one(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            package = root / "package"
+            package.mkdir()
+            member = package / "codex-package.json"
+            payload = b"repeatable data" * 10000
+            member.write_bytes(payload)
+            output = root / "out.zip"
+            with (
+                mock.patch.object(
+                    zipfile, "_get_compressor", wraps=zipfile._get_compressor
+                ) as compressor,
+                mock.patch.object(
+                    Path, "read_bytes", side_effect=AssertionError("must stream")
+                ),
+            ):
+                archive.write_archive(package, output, force=False, compression="fast")
+            compressor.assert_called_once_with(zipfile.ZIP_DEFLATED, 1)
+            with zipfile.ZipFile(output) as zipped:
+                self.assertEqual(zipped.read(member.name), payload)
 
     def test_package_entries_exclude_unmanaged_reuse_contents(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -111,6 +111,7 @@ const NOTIFICATIONS_TO_OPT_OUT: &[&str] = &[
 const APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const APP_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const APP_SERVER_GRACEFUL_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_ANALYTICS_ENABLED: bool = true;
 const OTEL_SERVICE_NAME: &str = "codex-app-server-test-client";
 const TRACE_DISABLED_MESSAGE: &str =
@@ -118,7 +119,12 @@ const TRACE_DISABLED_MESSAGE: &str =
 
 /// Minimal launcher that initializes the Codex app-server and logs the handshake.
 #[derive(Parser)]
-#[command(author = "Codex", version, about = "Bootstrap Codex app-server", long_about = None)]
+#[command(
+    author = "Codex",
+    version,
+    about = "Bootstrap Codex app-server",
+    long_about = "Bootstrap Codex app-server. Set CODEX_APP_SERVER_TEST_CLIENT_WIRE_DUMP to enable full wire diagnostics (user input answers are redacted)."
+)]
 struct Cli {
     /// Path to the `codex` CLI binary. When set, requests use stdio by
     /// spawning `codex app-server` as a child process.
@@ -146,6 +152,7 @@ struct Cli {
     config_overrides: Vec<String>,
 
     /// JSON array of dynamic tool specs or a single tool object.
+    /// Registration only: this client cannot execute dynamic tool calls.
     /// Prefix a filename with '@' to read from a file.
     ///
     /// Example:
@@ -657,7 +664,7 @@ fn serve(codex_bin: &Path, config_overrides: &[String], listen: &str, kill: bool
 
     let pid = child.id();
 
-    println!("started codex app-server");
+    println!("spawned codex app-server (readiness not checked)");
     println!("listen: {listen}");
     println!("pid: {pid} (app-server process)");
     println!("log: {}", log_path.display());
@@ -688,7 +695,10 @@ fn kill_listeners_on_same_port(listen: &str) -> Result<()> {
 
     for pid in listener_pids_on_port(port)? {
         println!("force killing remaining listener pid {pid} on port {port}");
-        let _ = terminate_process(pid, true);
+        let status = terminate_process(pid, true)?;
+        if !status.success() {
+            bail!("failed to force terminate listener pid {pid}: {status}");
+        }
     }
 
     Ok(())
@@ -783,7 +793,7 @@ async fn resume_message_v2(
             thread_id,
             ..Default::default()
         })?;
-        println!("< thread/resume response: {resume_response:?}");
+        println!("< thread/resume: {}", resume_response.thread.id);
 
         let turn_response = client.turn_start(TurnStartParams {
             thread_id: resume_response.thread.id.clone(),
@@ -794,7 +804,7 @@ async fn resume_message_v2(
             }],
             ..Default::default()
         })?;
-        println!("< turn/start response: {turn_response:?}");
+        println!("< turn/start: {}", turn_response.turn.id);
 
         client.stream_turn(&resume_response.thread.id, &turn_response.turn.id)?;
 
@@ -816,7 +826,7 @@ async fn thread_resume_follow(
             thread_id,
             ..Default::default()
         })?;
-        println!("< thread/resume response: {resume_response:?}");
+        println!("< thread/resume: {}", resume_response.thread.id);
         println!("< streaming notifications until process is terminated");
 
         client.stream_notifications_forever()
@@ -926,7 +936,7 @@ async fn send_message_v2_with_policies(
                 dynamic_tools: policies.dynamic_tools.clone(),
                 ..Default::default()
             })?;
-            println!("< thread/start response: {thread_response:?}");
+            println!("< thread/start: {}", thread_response.thread.id);
             let mut turn_params = TurnStartParams {
                 thread_id: thread_response.thread.id.clone(),
                 client_user_message_id: None,
@@ -941,7 +951,7 @@ async fn send_message_v2_with_policies(
             turn_params.sandbox_policy = policies.sandbox_policy;
 
             let turn_response = client.turn_start(turn_params)?;
-            println!("< turn/start response: {turn_response:?}");
+            println!("< turn/start: {}", turn_response.turn.id);
 
             client.stream_turn(&thread_response.thread.id, &turn_response.turn.id)?;
 
@@ -966,7 +976,7 @@ async fn send_follow_up_v2(
             dynamic_tools: dynamic_tools.clone(),
             ..Default::default()
         })?;
-        println!("< thread/start response: {thread_response:?}");
+        println!("< thread/start: {}", thread_response.thread.id);
 
         let first_turn_params = TurnStartParams {
             thread_id: thread_response.thread.id.clone(),
@@ -1219,6 +1229,9 @@ fn live_elicitation_timeout_pause(
         bail!("helper script not found: {}", script_path.display());
     }
 
+    let script_path = script_path
+        .canonicalize()
+        .context("resolve helper script path")?;
     let workspace = workspace
         .canonicalize()
         .with_context(|| format!("failed to resolve workspace `{}`", workspace.display()))?;
@@ -1234,7 +1247,7 @@ fn live_elicitation_timeout_pause(
         model: Some(model),
         ..Default::default()
     })?;
-    println!("< thread/start response: {thread_response:?}");
+    println!("< thread/start: {}", thread_response.thread.id);
 
     let thread_id = thread_response.thread.id;
     let command = format!(
@@ -1250,7 +1263,7 @@ fn live_elicitation_timeout_pause(
         "Use the `exec_command` tool exactly once. Set its `cmd` field to the exact shell command below. Do not rewrite it, do not split it, do not call any other tool, do not set `yield_time_ms`, and wait for the command to finish before replying.\n\n{command}\n\nAfter the command finishes, reply with exactly `DONE`."
     );
 
-    let started_at = Instant::now();
+    client.helper_command = Some(command);
     let turn_response = client.turn_start(TurnStartParams {
         thread_id: thread_id.clone(),
         client_user_message_id: None,
@@ -1264,10 +1277,10 @@ fn live_elicitation_timeout_pause(
         cwd: Some(workspace),
         ..Default::default()
     })?;
-    println!("< turn/start response: {turn_response:?}");
+    println!("< turn/start: {}", turn_response.turn.id);
 
     let stream_result = client.stream_turn(&thread_id, &turn_response.turn.id);
-    let elapsed = started_at.elapsed();
+    let elapsed = client.helper_duration.unwrap_or_default();
 
     let validation_result = (|| -> Result<()> {
         stream_result?;
@@ -1312,7 +1325,7 @@ fn live_elicitation_timeout_pause(
         }
         if elapsed < minimum_elapsed {
             bail!(
-                "turn completed too quickly to prove timeout pause worked: elapsed={elapsed:?}, expected at least {minimum_elapsed:?}"
+                "helper execution completed too quickly to prove timeout pause worked: elapsed={elapsed:?}, expected at least {minimum_elapsed:?}"
             );
         }
 
@@ -1365,8 +1378,8 @@ fn parse_dynamic_tools_arg(dynamic_tools: &Option<String>) -> Result<Option<Vec<
 }
 
 enum WebSocketOperation {
-    Read(mpsc::Sender<Result<Message>>),
-    Send(Message, mpsc::Sender<Result<()>>),
+    Read(Option<Instant>, mpsc::Sender<Result<Message>>),
+    Send(Message, Option<Instant>, mpsc::Sender<Result<()>>),
 }
 
 /// Own the async socket and runtime together so connection cancellation closes
@@ -1469,20 +1482,25 @@ impl BlockingWebSocket {
             }
             while let Ok(operation) = operations_rx.recv() {
                 match operation {
-                    WebSocketOperation::Read(response) => {
-                        let result = runtime
-                            .block_on(socket.next())
-                            .context("websocket stream ended")
-                            .and_then(|result| result.map_err(anyhow::Error::from));
-                        if response.send(result).is_err() {
+                    WebSocketOperation::Read(deadline, response) => {
+                        let result = runtime.block_on(socket_operation_until(deadline, async {
+                            socket
+                                .next()
+                                .await
+                                .context("websocket stream ended")?
+                                .map_err(anyhow::Error::from)
+                        }));
+                        let failed = result.is_err();
+                        if response.send(result).is_err() || failed {
                             break;
                         }
                     }
-                    WebSocketOperation::Send(message, response) => {
-                        let result = runtime
-                            .block_on(socket.send(message))
-                            .map_err(anyhow::Error::from);
-                        if response.send(result).is_err() {
+                    WebSocketOperation::Send(message, deadline, response) => {
+                        let result = runtime.block_on(socket_operation_until(deadline, async {
+                            socket.send(message).await.map_err(anyhow::Error::from)
+                        }));
+                        let failed = result.is_err();
+                        if response.send(result).is_err() || failed {
                             break;
                         }
                     }
@@ -1499,24 +1517,36 @@ impl BlockingWebSocket {
         Ok(client)
     }
 
-    fn read(&self) -> Result<Message> {
+    fn read(&self, deadline: Option<Instant>) -> Result<Message> {
         let (response, receiver) = mpsc::channel();
         self.operations
             .as_ref()
             .context("websocket worker closed")?
-            .send(WebSocketOperation::Read(response))
+            .send(WebSocketOperation::Read(deadline, response))
             .context("websocket worker stopped")?;
         receiver.recv().context("websocket read worker stopped")?
     }
 
-    fn send(&self, message: Message) -> Result<()> {
+    fn send(&self, message: Message, deadline: Option<Instant>) -> Result<()> {
         let (response, receiver) = mpsc::channel();
         self.operations
             .as_ref()
             .context("websocket worker closed")?
-            .send(WebSocketOperation::Send(message, response))
+            .send(WebSocketOperation::Send(message, deadline, response))
             .context("websocket worker stopped")?;
         receiver.recv().context("websocket write worker stopped")?
+    }
+}
+
+async fn socket_operation_until<T>(
+    deadline: Option<Instant>,
+    operation: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline.into(), operation)
+            .await
+            .context("websocket operation deadline expired")?,
+        None => operation.await,
     }
 }
 
@@ -1546,6 +1576,7 @@ enum ClientTransport {
 struct CodexClient {
     transport: ClientTransport,
     operation_deadline: Option<Instant>,
+    wire_dump: bool,
     pending_notifications: VecDeque<JSONRPCNotification>,
     command_approval_behavior: CommandApprovalBehavior,
     command_approval_count: usize,
@@ -1553,6 +1584,9 @@ struct CodexClient {
     command_execution_statuses: Vec<CommandExecutionStatus>,
     command_execution_outputs: Vec<String>,
     command_output_stream: String,
+    helper_command: Option<String>,
+    helper_item_id: Option<String>,
+    helper_duration: Option<Duration>,
     command_item_started: bool,
     helper_done_seen: bool,
     turn_completed_before_helper_done: bool,
@@ -1628,6 +1662,7 @@ impl CodexClient {
                 stdout: BufReader::new(stdout),
             },
             operation_deadline: None,
+            wire_dump: std::env::var_os("CODEX_APP_SERVER_TEST_CLIENT_WIRE_DUMP").is_some(),
             pending_notifications: VecDeque::new(),
             command_approval_behavior: CommandApprovalBehavior::AlwaysAccept,
             command_approval_count: 0,
@@ -1635,6 +1670,9 @@ impl CodexClient {
             command_execution_statuses: Vec::new(),
             command_execution_outputs: Vec::new(),
             command_output_stream: String::new(),
+            helper_command: None,
+            helper_item_id: None,
+            helper_duration: None,
             command_item_started: false,
             helper_done_seen: false,
             turn_completed_before_helper_done: false,
@@ -1657,6 +1695,7 @@ impl CodexClient {
                 socket: Box::new(socket),
             },
             operation_deadline: None,
+            wire_dump: std::env::var_os("CODEX_APP_SERVER_TEST_CLIENT_WIRE_DUMP").is_some(),
             pending_notifications: VecDeque::new(),
             command_approval_behavior: CommandApprovalBehavior::AlwaysAccept,
             command_approval_count: 0,
@@ -1664,6 +1703,9 @@ impl CodexClient {
             command_execution_statuses: Vec::new(),
             command_execution_outputs: Vec::new(),
             command_output_stream: String::new(),
+            helper_command: None,
+            helper_item_id: None,
+            helper_duration: None,
             command_item_started: false,
             helper_done_seen: false,
             turn_completed_before_helper_done: false,
@@ -1675,7 +1717,7 @@ impl CodexClient {
 
     /// Bounds a smoke polling operation, including its synchronous child RPC/turn IO.
     /// Expiry terminates this owned stdio server; callers must not treat its remote state as known.
-    fn with_stdio_deadline<T>(
+    fn with_operation_deadline<T>(
         &mut self,
         deadline: Instant,
         operation: impl FnOnce(&mut Self) -> Result<T>,
@@ -1686,8 +1728,18 @@ impl CodexClient {
         deadline
             .checked_duration_since(Instant::now())
             .context("smoke operation deadline expired before starting IO")?;
+        // Reuse an enclosing watchdog when it already enforces this budget.
+        if self
+            .operation_deadline
+            .is_some_and(|prior| prior <= deadline)
+        {
+            return operation(self);
+        }
         let ClientTransport::Stdio { child, .. } = &self.transport else {
-            bail!("smoke operation deadline requires its owned stdio server");
+            let previous = self.operation_deadline.replace(deadline);
+            let result = operation(self);
+            self.operation_deadline = previous;
+            return result;
         };
         let child = std::sync::Arc::clone(child);
         let previous = self.operation_deadline.replace(deadline);
@@ -1735,6 +1787,9 @@ impl CodexClient {
     }
 
     fn note_helper_output(&mut self, output: &str) {
+        if self.helper_command.is_none() || self.helper_done_seen {
+            return;
+        }
         self.command_output_stream.push_str(output);
         if self
             .command_output_stream
@@ -1742,6 +1797,15 @@ impl CodexClient {
         {
             self.helper_done_seen = true;
         }
+        // Retain only enough bytes to recognize a marker split across deltas.
+        let mut start = self
+            .command_output_stream
+            .len()
+            .saturating_sub("[elicitation-hold] done".len() - 1);
+        while !self.command_output_stream.is_char_boundary(start) {
+            start += 1;
+        }
+        self.command_output_stream.drain(..start);
     }
 
     fn initialize(&mut self) -> Result<InitializeResponse> {
@@ -1775,19 +1839,28 @@ impl CodexClient {
             },
         };
 
-        let response: InitializeResponse = self.send_request(request, request_id, "initialize")?;
-
-        // Complete the initialize handshake.
-        let initialized = JSONRPCMessage::Notification(JSONRPCNotification {
-            method: "initialized".to_string(),
-            params: None,
-        });
-        self.write_jsonrpc_message(initialized)?;
-
-        Ok(response)
+        self.with_operation_deadline(Instant::now() + RPC_TIMEOUT, |client| {
+            let response: InitializeResponse =
+                client.send_request(request, request_id, "initialize")?;
+            // Complete the initialize handshake within the same IO budget.
+            client.write_jsonrpc_message(JSONRPCMessage::Notification(JSONRPCNotification {
+                method: "initialized".to_string(),
+                params: None,
+            }))?;
+            Ok(response)
+        })
     }
 
     fn thread_start(&mut self, params: ThreadStartParams) -> Result<ThreadStartResponse> {
+        if params
+            .dynamic_tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+        {
+            eprintln!(
+                "dynamic tools are registered only; this client does not execute dynamic tool calls"
+            );
+        }
         let request_id = self.request_id();
         let request = ClientRequest::ThreadStart {
             request_id: request_id.clone(),
@@ -1926,6 +1999,17 @@ impl CodexClient {
     }
 
     fn stream_turn(&mut self, thread_id: &str, turn_id: &str) -> Result<()> {
+        self.last_turn_status = None;
+        self.last_turn_error_message = None;
+        self.command_execution_statuses.clear();
+        self.command_execution_outputs.clear();
+        self.command_output_stream.clear();
+        self.helper_item_id = None;
+        self.helper_duration = None;
+        self.command_item_started = false;
+        self.helper_done_seen = false;
+        self.turn_completed_before_helper_done = false;
+        self.unexpected_items_before_helper_done.clear();
         loop {
             let notification = self.next_notification()?;
 
@@ -1936,61 +2020,97 @@ impl CodexClient {
             match server_notification {
                 ServerNotification::ThreadStarted(payload) => {
                     if payload.thread.id == thread_id {
-                        println!("< thread/started notification: {:?}", payload.thread);
+                        println!("< thread/started: {}", payload.thread.id);
                     }
                 }
                 ServerNotification::TurnStarted(payload) => {
-                    if payload.turn.id == turn_id {
+                    if payload.thread_id == thread_id && payload.turn.id == turn_id {
                         println!("< turn/started notification: {:?}", payload.turn.status);
                     }
                 }
                 ServerNotification::AgentMessageDelta(delta) => {
+                    if delta.thread_id != thread_id || delta.turn_id != turn_id {
+                        continue;
+                    }
                     print!("{}", delta.delta);
                     std::io::stdout().flush().ok();
                 }
                 ServerNotification::CommandExecutionOutputDelta(delta) => {
-                    self.note_helper_output(&delta.delta);
+                    if delta.thread_id != thread_id || delta.turn_id != turn_id {
+                        continue;
+                    }
+                    if self.helper_item_id.as_deref() == Some(delta.item_id.as_str()) {
+                        self.note_helper_output(&delta.delta);
+                    }
                     print!("{}", delta.delta);
                     std::io::stdout().flush().ok();
                 }
                 ServerNotification::TerminalInteraction(delta) => {
+                    if delta.thread_id != thread_id || delta.turn_id != turn_id {
+                        continue;
+                    }
                     println!("[stdin sent: {}]", delta.stdin);
                     std::io::stdout().flush().ok();
                 }
                 ServerNotification::ItemStarted(payload) => {
-                    if matches!(payload.item, ThreadItem::CommandExecution { .. }) {
-                        if self.command_item_started && !self.helper_done_seen {
+                    if payload.thread_id != thread_id || payload.turn_id != turn_id {
+                        continue;
+                    }
+                    if let Some(expected_command) = self.helper_command.as_ref() {
+                        if let ThreadItem::CommandExecution { id, command, .. } = &payload.item {
+                            if self.command_item_started
+                                || !is_helper_command(command, expected_command)
+                            {
+                                self.unexpected_items_before_helper_done
+                                    .push(payload.item.clone());
+                            } else {
+                                self.command_item_started = true;
+                                self.helper_item_id = Some(id.clone());
+                            }
+                        } else if item_started_before_helper_done_is_unexpected(
+                            &payload.item,
+                            self.command_item_started,
+                            self.helper_done_seen,
+                        ) {
                             self.unexpected_items_before_helper_done
                                 .push(payload.item.clone());
                         }
-                        self.command_item_started = true;
-                    } else if item_started_before_helper_done_is_unexpected(
-                        &payload.item,
-                        self.command_item_started,
-                        self.helper_done_seen,
-                    ) {
-                        self.unexpected_items_before_helper_done
-                            .push(payload.item.clone());
                     }
-                    println!("\n< item started: {:?}", payload.item);
+                    println!("\n< item started: {}", payload.item.id());
                 }
                 ServerNotification::ItemCompleted(payload) => {
+                    if payload.thread_id != thread_id || payload.turn_id != turn_id {
+                        continue;
+                    }
                     if let ThreadItem::CommandExecution {
+                        id,
                         status,
                         aggregated_output,
+                        duration_ms,
                         ..
-                    } = payload.item.clone()
+                    } = &payload.item
                     {
-                        self.command_execution_statuses.push(status);
-                        if let Some(aggregated_output) = aggregated_output {
-                            self.note_helper_output(&aggregated_output);
-                            self.command_execution_outputs.push(aggregated_output);
+                        if self.helper_item_id.as_deref() == Some(id.as_str()) {
+                            self.command_execution_statuses.push(status.clone());
+                            self.helper_duration = duration_ms
+                                .and_then(|ms| u64::try_from(ms).ok())
+                                .map(Duration::from_millis);
+                            if let Some(output) = aggregated_output {
+                                // Aggregated output is a separate complete representation, not another delta.
+                                self.helper_done_seen |= output.contains("[elicitation-hold] done");
+                                self.command_execution_outputs.push(output.clone());
+                            }
                         }
+                        if let Some(output) = aggregated_output {
+                            println!("{output}");
+                        }
+                    } else if let ThreadItem::AgentMessage { text, .. } = &payload.item {
+                        println!("{text}");
                     }
-                    println!("< item completed: {:?}", payload.item);
+                    println!("< item completed: {}", payload.item.id());
                 }
                 ServerNotification::TurnCompleted(payload) => {
-                    if payload.turn.id == turn_id {
+                    if payload.thread_id == thread_id && payload.turn.id == turn_id {
                         self.last_turn_status = Some(payload.turn.status.clone());
                         if self.command_item_started && !self.helper_done_seen {
                             self.turn_completed_before_helper_done = true;
@@ -2006,14 +2126,28 @@ impl CodexClient {
                         {
                             println!("[turn error] {}", error.message);
                         }
+                        if payload.turn.status != TurnStatus::Completed {
+                            bail!(
+                                "turn {turn_id} ended with {:?}: {}",
+                                payload.turn.status,
+                                self.last_turn_error_message
+                                    .as_deref()
+                                    .unwrap_or("no error details")
+                            );
+                        }
                         break;
                     }
                 }
                 ServerNotification::McpToolCallProgress(payload) => {
+                    if payload.thread_id != thread_id || payload.turn_id != turn_id {
+                        continue;
+                    }
                     println!("< MCP tool progress: {}", payload.message);
                 }
                 _ => {
-                    println!("[UNKNOWN SERVER NOTIFICATION] {server_notification:?}");
+                    if self.wire_dump {
+                        println!("[UNKNOWN SERVER NOTIFICATION] {server_notification:?}");
+                    }
                 }
             }
         }
@@ -2022,6 +2156,7 @@ impl CodexClient {
     }
 
     fn stream_notifications_forever(&mut self) -> Result<()> {
+        self.wire_dump = true;
         loop {
             let _ = self.next_notification()?;
         }
@@ -2045,8 +2180,10 @@ impl CodexClient {
             rpc.request_id = ?request_id,
         );
         request_span.in_scope(|| {
-            self.write_request(&request)?;
-            self.wait_for_response(request_id, method)
+            self.with_operation_deadline(Instant::now() + RPC_TIMEOUT, |client| {
+                client.write_request(&request)?;
+                client.wait_for_response(request_id, method)
+            })
         })
     }
 
@@ -2056,8 +2193,9 @@ impl CodexClient {
             .context("client request was not a valid JSON-RPC request")?;
         request.trace = current_span_w3c_trace_context();
         let request_json = serde_json::to_string(&request)?;
-        let request_pretty = serde_json::to_string_pretty(&request)?;
-        print_multiline_with_prefix("> ", &request_pretty);
+        if self.wire_dump {
+            print_multiline_with_prefix("> ", &serde_json::to_string_pretty(&request)?);
+        }
         self.write_payload(&request_json)
     }
 
@@ -2122,8 +2260,9 @@ impl CodexClient {
 
             let parsed: Value =
                 serde_json::from_str(trimmed).context("response was not valid JSON-RPC")?;
-            let pretty = serde_json::to_string_pretty(&parsed)?;
-            print_multiline_with_prefix("< ", &pretty);
+            if self.wire_dump {
+                print_multiline_with_prefix("< ", &serde_json::to_string_pretty(&parsed)?);
+            }
             let message: JSONRPCMessage = serde_json::from_value(parsed)
                 .context("response was not a valid JSON-RPC message")?;
             return Ok(message);
@@ -2146,6 +2285,9 @@ impl CodexClient {
                 self.approve_file_change_request(request_id, params)?;
             }
             ServerRequest::ToolRequestUserInput { request_id, params } => {
+                if self.operation_deadline.is_some() {
+                    bail!("request_user_input cannot block terminal input during a finite RPC");
+                }
                 let response = request_user_input::prompt_for_answers(&params)?;
                 self.send_server_request_response(request_id, &response)?;
             }
@@ -2278,8 +2420,9 @@ impl CodexClient {
 
     fn write_jsonrpc_message(&mut self, message: JSONRPCMessage) -> Result<()> {
         let payload = serde_json::to_string(&message)?;
-        let pretty = serde_json::to_string_pretty(&message)?;
-        print_multiline_with_prefix("> ", &pretty);
+        if let Some(pretty) = wire_diagnostic(&message, self.wire_dump)? {
+            print_multiline_with_prefix("> ", &pretty);
+        }
         self.write_payload(&payload)
     }
 
@@ -2298,7 +2441,13 @@ impl CodexClient {
             }
             ClientTransport::WebSocket { socket, url } => {
                 socket
-                    .send(Message::Text(payload.to_string().into()))
+                    .send(
+                        Message::Text(payload.to_string().into()),
+                        Some(
+                            self.operation_deadline
+                                .unwrap_or_else(|| Instant::now() + RPC_TIMEOUT),
+                        ),
+                    )
                     .with_context(|| format!("failed to write websocket message to `{url}`"))?;
                 Ok(())
             }
@@ -2320,7 +2469,7 @@ impl CodexClient {
             }
             ClientTransport::WebSocket { socket, url } => loop {
                 let frame = socket
-                    .read()
+                    .read(self.operation_deadline)
                     .with_context(|| format!("failed to read websocket message from `{url}`"))?;
                 match frame {
                     Message::Text(text) => return Ok(text.to_string()),
@@ -2333,6 +2482,43 @@ impl CodexClient {
             },
         }
     }
+}
+
+fn is_helper_command(command: &str, expected: &str) -> bool {
+    if command == expected {
+        return true;
+    }
+    // The protocol renders the shell argv, rather than just exec_command's cmd.
+    // Use its formatter for both Windows and POSIX quoting of the final script argument.
+    [
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        "powershell",
+    ]
+    .into_iter()
+    .any(|shell| {
+        let rendered = codex_app_server_protocol::command_display_string(&[
+            shell.to_string(),
+            "-Command".to_string(),
+            expected.to_string(),
+        ]);
+        command.ends_with(&rendered[shell.len()..])
+    })
+}
+
+// Answer contents never belong in diagnostics, even with explicit wire logging.
+fn wire_diagnostic(message: &JSONRPCMessage, enabled: bool) -> Result<Option<String>> {
+    if !enabled {
+        return Ok(None);
+    }
+    if let JSONRPCMessage::Response(response) = message
+        && response.result.get("answers").is_some()
+    {
+        return Ok(Some(format!(
+            "response {:?}: [user input answers redacted]",
+            response.id
+        )));
+    }
+    Ok(Some(serde_json::to_string_pretty(message)?))
 }
 
 fn print_multiline_with_prefix(prefix: &str, payload: &str) {
@@ -2458,6 +2644,158 @@ impl Drop for CodexClient {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn websocket_rpc_deadline_closes_stalled_peer() {
+        use super::*;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            let request: serde_json::Value =
+                serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(request["method"], "initialize");
+            let error = socket.read().unwrap_err();
+            assert!(
+                !matches!(error, tungstenite::Error::Io(ref err) if matches!(err.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)),
+                "the client must close the stalled connection: {error}"
+            );
+        });
+        let mut client = CodexClient::connect_websocket(&format!("ws://{address}")).unwrap();
+        let started = Instant::now();
+        let error = client
+            .with_operation_deadline(started + Duration::from_millis(150), |client| {
+                client.initialize()
+            })
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("deadline"), "{error:#}");
+        drop(client);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn turn_results_and_helper_observations_follow_wire_identity() {
+        use super::*;
+        use serde_json::json;
+        let temp = tempfile::tempdir().unwrap();
+        let mut client = smoke_deadline_client(&temp.path().join("requests.jsonl"), "");
+        let completion = |thread_id: &str, status: &str| -> JSONRPCNotification {
+            serde_json::from_value(json!({"method":"turn/completed", "params":{
+                "threadId":thread_id, "turn":{"id":"turn", "items":[], "status":status,
+                    "error": if status == "failed" { json!({"message":"fixture failure"}) } else { json!(null) }}
+            }})).unwrap()
+        };
+        for (status, expected) in [
+            ("failed", TurnStatus::Failed),
+            ("interrupted", TurnStatus::Interrupted),
+            ("completed", TurnStatus::Completed),
+        ] {
+            client
+                .pending_notifications
+                .push_back(completion("other-thread", "failed"));
+            client
+                .pending_notifications
+                .push_back(completion("thread", status));
+            let result = client
+                .with_operation_deadline(Instant::now() + Duration::from_secs(1), |client| {
+                    client.stream_turn("thread", "turn")
+                });
+            assert_eq!(result.is_ok(), status == "completed");
+            assert_eq!(client.last_turn_status, Some(expected));
+            assert_eq!(
+                client.last_turn_error_message.as_deref(),
+                (status == "failed").then_some("fixture failure")
+            );
+        }
+        client.note_helper_output(&"x".repeat(100_000));
+        assert!(
+            client.command_output_stream.is_empty(),
+            "ordinary turns retain no helper output"
+        );
+        client.helper_command = Some("run helper".into());
+        client.note_helper_output(&format!("{}[elicitation-hold] ", "é".repeat(100_000)));
+        assert!(!client.helper_done_seen);
+        assert!(client.command_output_stream.len() < "[elicitation-hold] done".len());
+        client.note_helper_output("done");
+        assert!(client.helper_done_seen, "split markers must be recognized");
+
+        let item = |id: &str, duration: i64| json!({"type":"commandExecution", "id":id, "command":"run helper", "cwd":temp.path(), "status":"completed", "commandActions":[], "aggregatedOutput":"[elicitation-hold] done", "durationMs":duration});
+        for (method, thread_id, id, duration) in [
+            ("item/started", "thread", "helper", 0),
+            ("item/completed", "other-thread", "helper", 99999),
+            ("item/completed", "thread", "unrelated", 99999),
+            ("item/completed", "thread", "helper", 12500),
+        ] {
+            client.pending_notifications.push_back(serde_json::from_value(json!({"method":method, "params":{
+                "threadId":thread_id, "turnId":"turn", "item":item(id, duration), "startedAtMs":0, "completedAtMs":0
+            }})).unwrap());
+        }
+        client
+            .pending_notifications
+            .push_back(completion("thread", "completed"));
+        client
+            .with_operation_deadline(Instant::now() + Duration::from_secs(1), |client| {
+                client.stream_turn("thread", "turn")
+            })
+            .unwrap();
+        assert_eq!(client.helper_item_id.as_deref(), Some("helper"));
+        assert_eq!(client.helper_duration, Some(Duration::from_millis(12500)));
+        assert_eq!(
+            client.command_execution_statuses,
+            vec![CommandExecutionStatus::Completed]
+        );
+        assert_eq!(
+            client.command_execution_outputs,
+            vec!["[elicitation-hold] done"]
+        );
+        assert!(client.helper_done_seen);
+    }
+
+    #[test]
+    fn helper_matching_and_wire_diagnostics_preserve_exact_payloads() {
+        use super::*;
+        let expected = "$env:X='a'; powershell -File 'C:\\helper.ps1'";
+        assert!(is_helper_command(expected, expected));
+        for shell in [r"C:\Program Files\PowerShell\7\pwsh.exe", "powershell"] {
+            let rendered = codex_app_server_protocol::command_display_string(&[
+                shell.into(),
+                "-NoProfile".into(),
+                "-Command".into(),
+                expected.into(),
+            ]);
+            assert!(is_helper_command(&rendered, expected), "{rendered}");
+            assert!(!is_helper_command(&rendered, "different command"));
+        }
+        let message = JSONRPCMessage::Response(JSONRPCResponse {
+            id: RequestId::Integer(42),
+            result: serde_json::json!({"answers":{"q":{"answers":["private answer"]}}, "interrupted":false}),
+        });
+        assert_eq!(wire_diagnostic(&message, false).unwrap(), None);
+        let diagnostic = wire_diagnostic(&message, true).unwrap().unwrap();
+        assert!(!diagnostic.contains("private answer"));
+        assert!(diagnostic.contains("redacted"));
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("requests.jsonl");
+        let mut client = smoke_deadline_client(
+            &log,
+            "$response = @{id=$request.id; result=@{data=@(); nextCursor=$null}}; [Console]::WriteLine(($response | ConvertTo-Json -Depth 10 -Compress))",
+        );
+        client.wire_dump = true;
+        client.write_jsonrpc_message(message).unwrap();
+        client.model_list(ModelListParams::default()).unwrap();
+        let requests = std::fs::read_to_string(log).unwrap();
+        let actual: serde_json::Value =
+            serde_json::from_str(requests.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            actual["result"]["answers"]["q"]["answers"],
+            serde_json::json!(["private answer"])
+        );
+    }
+
+    #[test]
     fn background_app_server_reports_bound_port_and_accepts_initialization() {
         use super::*;
 
@@ -2549,6 +2887,7 @@ mod tests {
                     stdout,
                 },
                 operation_deadline: None,
+                wire_dump: std::env::var_os("CODEX_APP_SERVER_TEST_CLIENT_WIRE_DUMP").is_some(),
                 pending_notifications: VecDeque::new(),
                 command_approval_behavior: CommandApprovalBehavior::AlwaysAccept,
                 command_approval_count: 0,
@@ -2556,6 +2895,9 @@ mod tests {
                 command_execution_statuses: Vec::new(),
                 command_execution_outputs: Vec::new(),
                 command_output_stream: String::new(),
+                helper_command: None,
+                helper_item_id: None,
+                helper_duration: None,
                 command_item_started: false,
                 helper_done_seen: false,
                 turn_completed_before_helper_done: false,
@@ -2659,7 +3001,7 @@ mod tests {
         let peer = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept normal client connection");
             stream
-                .set_read_timeout(Some(Duration::from_secs(12)))
+                .set_read_timeout(Some(Duration::from_secs(2)))
                 .expect("bound regression peer");
             let mut reader = BufReader::new(stream);
             let mut request_line = String::new();
@@ -2679,13 +3021,20 @@ mod tests {
             }
             // Never answer the handshake. The connection deadline must close
             // the owned socket; the original blocking connect waits until this
-            // independent 12-second peer timeout and fails both assertions.
+            // independent two-second peer timeout and fails both assertions.
             let mut byte = [0];
             reader.read(&mut byte)
         });
         let started = Instant::now();
-        let error = match CodexClient::connect(&Endpoint::ConnectWs(format!("ws://{address}")), &[])
-        {
+        let error = match BlockingWebSocket::connect_with_runtime(
+            &format!("ws://{address}"),
+            Duration::from_millis(150),
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+            },
+        ) {
             Ok(_) => panic!("a stalled handshake cannot establish a client"),
             Err(error) => error,
         };
@@ -2695,8 +3044,8 @@ mod tests {
             format!("{error:#}").contains("websocket connection deadline expired"),
             "{error:#}"
         );
-        assert!(elapsed >= Duration::from_secs(10), "{elapsed:?}");
-        assert!(elapsed < Duration::from_secs(12), "{elapsed:?}");
+        assert!(elapsed >= Duration::from_millis(150), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
         assert_eq!(
             peer_result.expect("deadline closes the connection before peer timeout"),
             0
@@ -2823,6 +3172,7 @@ mod tests {
                 stdout,
             },
             operation_deadline: None,
+            wire_dump: std::env::var_os("CODEX_APP_SERVER_TEST_CLIENT_WIRE_DUMP").is_some(),
             pending_notifications: VecDeque::new(),
             command_approval_behavior: CommandApprovalBehavior::AlwaysAccept,
             command_approval_count: 0,
@@ -2830,6 +3180,9 @@ mod tests {
             command_execution_statuses: Vec::new(),
             command_execution_outputs: Vec::new(),
             command_output_stream: String::new(),
+            helper_command: None,
+            helper_item_id: None,
+            helper_duration: None,
             command_item_started: false,
             helper_done_seen: false,
             turn_completed_before_helper_done: false,
@@ -2849,7 +3202,7 @@ mod tests {
             "$response = @{jsonrpc='2.0'; id=$request.id; result=@{data=@(); nextCursor=$null}}; [Console]::WriteLine(($response | ConvertTo-Json -Depth 10 -Compress))",
         );
         client
-            .with_stdio_deadline(Instant::now() + Duration::from_secs(1), |client| {
+            .with_operation_deadline(Instant::now() + Duration::from_secs(1), |client| {
                 let response = client.model_list(ModelListParams::default())?;
                 assert!(response.data.is_empty());
                 assert_eq!(response.next_cursor, None);

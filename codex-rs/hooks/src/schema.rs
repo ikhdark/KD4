@@ -38,6 +38,15 @@ const STOP_OUTPUT_FIXTURE: &str = "stop.command.output.schema.json";
 const INTERRUPT_INPUT_FIXTURE: &str = "interrupt.command.input.schema.json";
 const INTERRUPT_OUTPUT_FIXTURE: &str = "interrupt.command.output.schema.json";
 
+// Option<Value> normally conflates an absent field with explicit JSON null.
+// Reserved permission fields must retain both as distinct protocol states.
+fn deserialize_present_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(transparent)]
 pub(crate) struct NullableString(Option<String>);
@@ -200,12 +209,12 @@ pub(crate) struct PermissionRequestDecisionWire {
     /// Reserved for a future input-rewrite capability.
     ///
     /// PermissionRequest hooks currently fail closed if this field is present.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_present_value")]
     pub updated_input: Option<Value>,
     /// Reserved for a future permission-rewrite capability.
     ///
     /// PermissionRequest hooks currently fail closed if this field is present.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_present_value")]
     pub updated_permissions: Option<Value>,
     #[serde(default)]
     pub message: Option<String>,

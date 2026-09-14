@@ -539,7 +539,7 @@ fn map_sandbox_error(error: JSONRPCErrorError) -> io::Error {
         FS_PERMISSION_DENIED_ERROR_CODE => {
             io::Error::new(io::ErrorKind::PermissionDenied, error.message)
         }
-        -32600 => io::Error::new(io::ErrorKind::InvalidInput, error.message),
+        -32600 | -32602 => io::Error::new(io::ErrorKind::InvalidInput, error.message),
         _ => io::Error::other(error.message),
     }
 }

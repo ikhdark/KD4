@@ -43,6 +43,9 @@ impl FileSearchManager {
     /// This should be called when the session's CWD changes on resume.
     /// Drops the current session so it will be recreated with the new directory on next query.
     pub fn update_search_dir(&mut self, new_dir: PathBuf) {
+        if self.search_dir == new_dir {
+            return;
+        }
         self.search_dir = new_dir;
         #[expect(clippy::unwrap_used)]
         let mut st = self.state.lock().unwrap();
@@ -54,7 +57,7 @@ impl FileSearchManager {
     pub fn on_user_query(&self, query: String) {
         #[expect(clippy::unwrap_used)]
         let mut st = self.state.lock().unwrap();
-        if query == st.latest_query {
+        if query == st.latest_query && (query.is_empty() || st.session.is_some()) {
             return;
         }
         st.latest_query.clear();
@@ -115,7 +118,7 @@ impl TuiSessionReporter {
         let st = state.lock().unwrap();
         if st.session_token != self.session_token
             || st.latest_query.is_empty()
-            || snapshot.query.is_empty()
+            || snapshot.query != st.latest_query
         {
             return;
         }
@@ -141,15 +144,55 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[test]
+    fn reporter_drops_stale_query_results_and_delivers_current_query() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let manager = FileSearchManager::new(PathBuf::from("/repo"), AppEventSender::new(tx));
+        manager.state.lock().unwrap().latest_query = "current".to_string();
+        let reporter = TuiSessionReporter {
+            state: Arc::downgrade(&manager.state),
+            app_tx: manager.app_tx.clone(),
+            session_token: 0,
+        };
+        reporter.send_snapshot(&file_search::FileSearchSnapshot {
+            query: "old".to_string(),
+            ..Default::default()
+        });
+        assert!(
+            rx.try_recv().is_err(),
+            "old-query results must not enter the event queue"
+        );
+        reporter.send_snapshot(&file_search::FileSearchSnapshot {
+            query: "current".to_string(),
+            ..Default::default()
+        });
+        assert!(
+            matches!(rx.try_recv().expect("current results"), AppEvent::FileSearchResult { query, matches }
+            if query == "current" && matches.is_empty())
+        );
+    }
+
     #[tokio::test]
     async fn file_search_manager_publishes_matches_and_releases_workers_on_drop() {
         let directory = tempfile::tempdir().expect("search directory");
         std::fs::write(directory.path().join("needle.rs"), "fn needle() {}")
             .expect("write matching file");
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let manager =
+        let mut manager =
             FileSearchManager::new(directory.path().to_path_buf(), AppEventSender::new(tx));
+        // A failed session startup leaves the query recorded but no live session.
+        manager.state.lock().unwrap().latest_query = "needle".to_string();
         manager.on_user_query("needle".to_string());
+        let token = manager.state.lock().unwrap().session_token;
+        manager.update_search_dir(directory.path().to_path_buf());
+        {
+            let state = manager.state.lock().unwrap();
+            assert!(
+                state.session.is_some(),
+                "an unchanged directory must retain the live search"
+            );
+            assert_eq!(state.session_token, token);
+        }
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match rx.recv().await.expect("search must publish before closing") {
@@ -157,7 +200,7 @@ mod tests {
                         if query == "needle"
                             && matches
                                 .iter()
-                                .any(|entry| entry.path == PathBuf::from("needle.rs")) =>
+                                .any(|entry| entry.path == std::path::Path::new("needle.rs")) =>
                     {
                         break;
                     }

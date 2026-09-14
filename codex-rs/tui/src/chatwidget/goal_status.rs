@@ -28,17 +28,20 @@ impl GoalStatusState {
         now: Instant,
         active_turn_started_at: Option<Instant>,
     ) -> Option<GoalStatusIndicator> {
-        let mut goal = self.goal.clone();
+        let goal = &self.goal;
         if goal.status == AppThreadGoalStatus::Active
             && let Some(active_turn_started_at) = active_turn_started_at
         {
             let baseline = self.observed_at.max(active_turn_started_at);
             let active_seconds = now.saturating_duration_since(baseline).as_secs();
-            goal.time_used_seconds = goal
+            let time_used_seconds = goal
                 .time_used_seconds
                 .saturating_add(i64::try_from(active_seconds).unwrap_or(i64::MAX));
+            return Some(GoalStatusIndicator::Active {
+                usage: active_goal_usage(goal.token_budget, goal.tokens_used, time_used_seconds),
+            });
         }
-        goal_status_indicator_from_app_goal(&goal)
+        goal_status_indicator_from_app_goal(goal)
     }
 }
 

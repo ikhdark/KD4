@@ -105,9 +105,13 @@ impl ThreadGoalRequestProcessor {
             return Err(invalid_request("goals feature is disabled"));
         }
 
+        if params.replace && params.objective.is_none() {
+            return Err(invalid_request("replacing a goal requires an objective"));
+        }
+
         let thread_id = parse_thread_id_for_request(params.thread_id.as_str())?;
-        let state_db = self.state_db_for_materialized_thread(thread_id).await?;
-        self.reconcile_thread_goal_rollout(thread_id, &state_db)
+        let (state_db, rollout_path) = self.state_db_for_materialized_thread(thread_id).await?;
+        self.reconcile_thread_goal_rollout(thread_id, &state_db, &rollout_path)
             .await?;
 
         let listener_command_tx = {
@@ -130,9 +134,11 @@ impl ThreadGoalRequestProcessor {
                         &state_db,
                         GoalSetRequest {
                             thread_id,
-                            objective: objective
-                                .map(GoalObjectiveUpdate::Set)
-                                .unwrap_or(GoalObjectiveUpdate::Keep),
+                            objective: match objective {
+                                Some(objective) if params.replace => GoalObjectiveUpdate::Replace(objective),
+                                Some(objective) => GoalObjectiveUpdate::Set(objective),
+                                None => GoalObjectiveUpdate::Keep,
+                            },
                             status,
                             token_budget: match params.token_budget {
                                 Some(token_budget) => GoalTokenBudgetUpdate::Set(token_budget),
@@ -193,7 +199,7 @@ impl ThreadGoalRequestProcessor {
         }
 
         let thread_id = parse_thread_id_for_request(params.thread_id.as_str())?;
-        let state_db = self.state_db_for_materialized_thread(thread_id).await?;
+        let (state_db, _) = self.state_db_for_materialized_thread(thread_id).await?;
         let goal = self
             .goal_service
             .get_thread_goal(&state_db, thread_id)
@@ -213,8 +219,8 @@ impl ThreadGoalRequestProcessor {
         }
 
         let thread_id = parse_thread_id_for_request(params.thread_id.as_str())?;
-        let state_db = self.state_db_for_materialized_thread(thread_id).await?;
-        self.reconcile_thread_goal_rollout(thread_id, &state_db)
+        let (state_db, rollout_path) = self.state_db_for_materialized_thread(thread_id).await?;
+        self.reconcile_thread_goal_rollout(thread_id, &state_db, &rollout_path)
             .await?;
 
         let listener_command_tx = {
@@ -257,16 +263,17 @@ impl ThreadGoalRequestProcessor {
     async fn state_db_for_materialized_thread(
         &self,
         thread_id: ThreadId,
-    ) -> Result<StateDbHandle, JSONRPCErrorError> {
-        if let Ok(thread) = self.thread_manager.get_thread(thread_id).await {
-            if thread.rollout_path().is_none() {
-                return Err(invalid_request(format!(
+    ) -> Result<(StateDbHandle, PathBuf), JSONRPCErrorError> {
+        let rollout_path = if let Ok(thread) = self.thread_manager.get_thread(thread_id).await {
+            let rollout_path = thread.rollout_path().ok_or_else(|| {
+                invalid_request(format!(
                     "ephemeral thread does not support goals: {thread_id}"
-                )));
-            }
+                ))
+            })?;
             if let Some(state_db) = thread.state_db() {
-                return Ok(state_db);
+                return Ok((state_db, rollout_path));
             }
+            rollout_path
         } else {
             codex_rollout::find_thread_path_by_id_str(
                 &self.config.codex_home,
@@ -277,11 +284,12 @@ impl ThreadGoalRequestProcessor {
             .map_err(|err| {
                 internal_error(format!("failed to locate thread id {thread_id}: {err}"))
             })?
-            .ok_or_else(|| invalid_request(format!("thread not found: {thread_id}")))?;
-        }
+            .ok_or_else(|| invalid_request(format!("thread not found: {thread_id}")))?
+        };
 
         self.state_db
             .clone()
+            .map(|state_db| (state_db, rollout_path))
             .ok_or_else(|| internal_error("sqlite state db unavailable for thread goals"))
     }
 
@@ -289,25 +297,8 @@ impl ThreadGoalRequestProcessor {
         &self,
         thread_id: ThreadId,
         state_db: &StateDbHandle,
+        rollout_path: &std::path::Path,
     ) -> Result<(), JSONRPCErrorError> {
-        let running_thread = self.thread_manager.get_thread(thread_id).await.ok();
-        let rollout_path = match running_thread.as_ref() {
-            Some(thread) => thread.rollout_path().ok_or_else(|| {
-                invalid_request(format!(
-                    "ephemeral thread does not support goals: {thread_id}"
-                ))
-            })?,
-            None => codex_rollout::find_thread_path_by_id_str(
-                &self.config.codex_home,
-                &thread_id.to_string(),
-                self.state_db.as_deref(),
-            )
-            .await
-            .map_err(|err| {
-                internal_error(format!("failed to locate thread id {thread_id}: {err}"))
-            })?
-            .ok_or_else(|| invalid_request(format!("thread not found: {thread_id}")))?,
-        };
         // Goal mutations do not own thread metadata. A valid row for this
         // rollout already provides the identity needed by the goal store.
         if state_db
@@ -320,7 +311,7 @@ impl ThreadGoalRequestProcessor {
         }
         reconcile_rollout(
             Some(state_db),
-            rollout_path.as_path(),
+            rollout_path,
             self.config.model_provider_id.as_str(),
             /*builder*/ None,
             &[],
@@ -333,7 +324,7 @@ impl ThreadGoalRequestProcessor {
 
     async fn emit_thread_goal_snapshot(&self, thread_id: ThreadId) {
         let state_db = match self.state_db_for_materialized_thread(thread_id).await {
-            Ok(state_db) => state_db,
+            Ok((state_db, _)) => state_db,
             Err(err) => {
                 warn!(
                     "failed to open state db before emitting thread goal resume snapshot for {thread_id}: {}",

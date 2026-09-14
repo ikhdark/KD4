@@ -33,6 +33,67 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::WarningEvent;
 use pretty_assertions::assert_eq;
 
+#[path = "../examples/enabled_extensions/shared_state_extension.rs"]
+mod shared_state_extension;
+
+#[tokio::test]
+async fn example_context_estimates_preserve_text_without_recording_contributions() {
+    let mut builder = ExtensionRegistryBuilder::<()>::new();
+    shared_state_extension::install(&mut builder);
+    let registry = builder.build();
+    let session_store = ExtensionData::new("session");
+    let thread_store = ExtensionData::new("thread");
+    let expected = vec![
+        PromptFragment::developer_policy("Prefer short answers unless the user asks for detail."),
+        PromptFragment::developer_capability(
+            "This extension can contribute more than one prompt fragment.",
+        ),
+    ];
+
+    // Preview both before the first contribution and after the stores contain counters.
+    for expected_count in 0..2 {
+        let mut estimated = Vec::new();
+        for contributor in registry.context_contributors() {
+            estimated.extend(
+                contributor
+                    .estimate_thread_context(&session_store, &thread_store)
+                    .await,
+            );
+        }
+        assert_eq!(estimated, expected);
+        for store in [&session_store, &thread_store] {
+            assert_eq!(
+                shared_state_extension::recorded_style_contributions(store),
+                expected_count
+            );
+            assert_eq!(
+                shared_state_extension::recorded_usage_contributions(store),
+                expected_count
+            );
+        }
+
+        let mut contributed = Vec::new();
+        for contributor in registry.context_contributors() {
+            contributed.extend(
+                contributor
+                    .contribute_thread_context(&session_store, &thread_store)
+                    .await,
+            );
+        }
+        assert_eq!(contributed, expected);
+        for store in [&session_store, &thread_store] {
+            assert_eq!(
+                shared_state_extension::recorded_style_contributions(store),
+                expected_count + 1
+            );
+            assert_eq!(
+                shared_state_extension::recorded_usage_contributions(store),
+                expected_count + 1
+            );
+        }
+    }
+}
+
 struct AllContributors;
 
 impl ContextContributor for AllContributors {
@@ -56,7 +117,7 @@ impl TokenUsageContributor for AllContributors {}
 impl TurnInputContributor for AllContributors {
     fn contribute<'a>(
         &'a self,
-        input: TurnInputContext,
+        input: &'a TurnInputContext,
         _session_store: &'a ExtensionData,
         _thread_store: &'a ExtensionData,
         _turn_store: &'a ExtensionData,

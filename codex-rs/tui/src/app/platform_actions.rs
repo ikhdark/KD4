@@ -22,6 +22,7 @@ pub(super) struct PendingWindowsSandboxSetup {
 
 impl App {
     pub(super) fn spawn_world_writable_scan(&self) {
+        let origin = crate::app_event::WorldWritableScanOrigin::from_config(&self.config);
         let scan = self
             .chat_widget
             .world_writable_warning_details_for_config(self.config.clone());
@@ -29,6 +30,7 @@ impl App {
         tokio::spawn(async move {
             if let Some((sample_paths, extra_count, failed_scan)) = scan.await {
                 tx.send(AppEvent::OpenWorldWritableWarningConfirmation {
+                    origin: Some(origin),
                     preset: None,
                     profile_selection: None,
                     sample_paths,

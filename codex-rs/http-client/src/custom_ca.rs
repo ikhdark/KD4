@@ -35,6 +35,7 @@
 //! - those subprocess tests also scrub inherited CA environment variables before launch so their
 //!   result depends only on the test fixtures and env vars set by the test itself
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -64,7 +65,9 @@ pub const SSL_CERT_FILE_ENV: &str = "SSL_CERT_FILE";
 const CA_CERT_HINT: &str = "If you set CODEX_CA_CERTIFICATE or SSL_CERT_FILE, ensure it points to a PEM file containing one or more CERTIFICATE blocks, or unset it to use system roots.";
 type PemSection = (SectionKind, Vec<u8>);
 
-static NATIVE_ROOT_STORE: LazyLock<RootCertStore> = LazyLock::new(|| {
+static NATIVE_ROOT_STORE: LazyLock<RootCertStore> = LazyLock::new(load_native_root_store);
+
+fn load_native_root_store() -> RootCertStore {
     let mut root_store = RootCertStore::empty();
     let rustls_native_certs::CertificateResult { certs, errors, .. } =
         rustls_native_certs::load_native_certs();
@@ -76,7 +79,7 @@ static NATIVE_ROOT_STORE: LazyLock<RootCertStore> = LazyLock::new(|| {
     }
     let _ = root_store.add_parsable_certificates(certs);
     root_store
-});
+}
 static RUSTLS_CLIENT_CONFIGS: LazyLock<Mutex<HashMap<CaBundleCacheKey, Arc<ClientConfig>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static REQWEST_CA_CERTIFICATES: LazyLock<
@@ -88,6 +91,7 @@ struct CaBundleCacheKey {
     source_env: Option<&'static str>,
     path: Option<PathBuf>,
     pem_sha256: Option<[u8; 32]>,
+    native_roots_sha256: Option<[u8; 32]>,
 }
 
 impl CaBundleCacheKey {
@@ -96,6 +100,7 @@ impl CaBundleCacheKey {
             source_env: bundle.map(|bundle| bundle.source_env),
             path: bundle.map(|bundle| bundle.path.clone()),
             pem_sha256: pem_data.map(|pem_data| Sha256::digest(pem_data).into()),
+            native_roots_sha256: None,
         }
     }
 }
@@ -105,21 +110,14 @@ pub(crate) enum CustomCaPolicy {
     HonorProcessEnvironment,
     ExplicitRootSet,
 }
-static DEFAULT_RUSTLS_CLIENT_CONFIG: LazyLock<Arc<ClientConfig>> = LazyLock::new(|| {
-    ensure_rustls_crypto_provider();
-    Arc::new(
-        ClientConfig::builder()
-            .with_root_certificates(native_root_store().clone())
-            .with_no_client_auth(),
-    )
-});
-
-fn native_root_store() -> &'static RootCertStore {
-    &NATIVE_ROOT_STORE
-}
-
-fn default_rustls_client_config() -> Arc<ClientConfig> {
-    Arc::clone(&DEFAULT_RUSTLS_CLIENT_CONFIG)
+fn native_root_store() -> Cow<'static, RootCertStore> {
+    // The native loader replaces OS roots with these mutable sources. Never put their
+    // contents into the permanent platform snapshot; include the resulting roots in cache identity.
+    if env::var_os(SSL_CERT_FILE_ENV).is_some() || env::var_os("SSL_CERT_DIR").is_some() {
+        Cow::Owned(load_native_root_store())
+    } else {
+        Cow::Borrowed(&NATIVE_ROOT_STORE)
+    }
 }
 
 /// Describes why a transport using shared custom CA support could not be constructed.
@@ -332,7 +330,25 @@ fn cached_rustls_client_config(
     bundle: Option<&ConfiguredCaBundle>,
 ) -> Result<Arc<ClientConfig>, BuildCustomCaTransportError> {
     let pem_data = bundle.map(ConfiguredCaBundle::read_pem_data).transpose()?;
-    let key = CaBundleCacheKey::new(bundle, pem_data.as_deref());
+    let roots = native_root_store();
+    let mut key = CaBundleCacheKey::new(bundle, pem_data.as_deref());
+    if matches!(&roots, Cow::Owned(_)) {
+        let mut hasher = Sha256::new();
+        for root in &roots.roots {
+            hasher.update([u8::from(root.name_constraints.is_some())]);
+            for field in [
+                root.subject.as_ref(),
+                root.subject_public_key_info.as_ref(),
+                root.name_constraints
+                    .as_ref()
+                    .map_or(&[][..], |value| value.as_ref()),
+            ] {
+                hasher.update(field.len().to_le_bytes());
+                hasher.update(field);
+            }
+        }
+        key.native_roots_sha256 = Some(hasher.finalize().into());
+    }
     let mut configs = RUSTLS_CLIENT_CONFIGS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -340,7 +356,7 @@ fn cached_rustls_client_config(
         return Ok(config.clone());
     }
 
-    let config = build_rustls_client_config_from_pem_data(bundle, pem_data.as_deref())?;
+    let config = build_rustls_client_config_from_pem_data(bundle, pem_data.as_deref(), &roots)?;
     configs.retain(|cached_key, _| cached_key.source_env != key.source_env);
     configs.insert(key, config.clone());
     Ok(config)
@@ -391,15 +407,21 @@ fn build_rustls_client_config(
     bundle: Option<&ConfiguredCaBundle>,
 ) -> Result<Arc<ClientConfig>, BuildCustomCaTransportError> {
     let pem_data = bundle.map(ConfiguredCaBundle::read_pem_data).transpose()?;
-    build_rustls_client_config_from_pem_data(bundle, pem_data.as_deref())
+    build_rustls_client_config_from_pem_data(bundle, pem_data.as_deref(), &native_root_store())
 }
 
 fn build_rustls_client_config_from_pem_data(
     bundle: Option<&ConfiguredCaBundle>,
     pem_data: Option<&[u8]>,
+    roots: &RootCertStore,
 ) -> Result<Arc<ClientConfig>, BuildCustomCaTransportError> {
+    ensure_rustls_crypto_provider();
     let Some(bundle) = bundle else {
-        return Ok(default_rustls_client_config());
+        return Ok(Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots.clone())
+                .with_no_client_auth(),
+        ));
     };
     let Some(pem_data) = pem_data else {
         return Err(BuildCustomCaTransportError::InvalidCaFile {
@@ -414,7 +436,7 @@ fn build_rustls_client_config_from_pem_data(
     // Start from the platform roots so websocket callers keep the same baseline trust behavior
     // they would get from tungstenite's default rustls connector, then layer in the Codex custom
     // CA bundle on top when configured.
-    let mut root_store = native_root_store().clone();
+    let mut root_store = roots.clone();
 
     let certificates = bundle.load_certificates_from_pem_data(pem_data)?;
     for (idx, cert) in certificates.into_iter().enumerate() {
@@ -725,7 +747,7 @@ impl ConfiguredCaBundle {
             // that error is reported here before we can classify the block as ignorable. A bundle
             // containing valid certificates plus a malformed `X509 CRL` therefore still fails to
             // load today, even though well-formed CRLs are ignored.
-            let (section_kind, der) = match section_result {
+            let (section_kind, der, trusted) = match section_result {
                 Ok(section) => section,
                 Err(error) => return Err(self.pem_parse_error(&error)),
             };
@@ -734,7 +756,7 @@ impl ConfiguredCaBundle {
                     // Standard CERTIFICATE blocks already decode to the exact DER bytes reqwest
                     // wants. Only OpenSSL TRUSTED CERTIFICATE blocks need trimming to drop any
                     // trailing X509_AUX trust metadata before registration.
-                    let cert_der = normalized_pem.certificate_der(&der).ok_or_else(|| {
+                    let cert_der = (if trusted { first_der_item(&der) } else { Some(der.as_slice()) }).ok_or_else(|| {
                         self.invalid_ca_file(
                             "failed to extract certificate data from TRUSTED CERTIFICATE: invalid DER length",
                         )
@@ -801,86 +823,53 @@ impl ConfiguredCaBundle {
     }
 }
 
-/// The PEM text shape after OpenSSL compatibility normalization.
-///
-/// `Standard` means the input already used ordinary PEM certificate labels. `TrustedCertificate`
-/// means the input used OpenSSL's `TRUSTED CERTIFICATE` labels, so callers must also be prepared
-/// to trim trailing `X509_AUX` bytes from decoded certificate sections.
-enum NormalizedPem {
-    /// PEM contents that already used ordinary `CERTIFICATE` labels.
-    Standard(String),
-    /// PEM contents rewritten from OpenSSL `TRUSTED CERTIFICATE` labels to `CERTIFICATE`.
-    TrustedCertificate(String),
+/// PEM blocks retain their original label so auxiliary data is trimmed only for trusted certs.
+struct NormalizedPem {
+    blocks: Vec<(bool, String)>,
 }
 
 impl NormalizedPem {
-    /// Normalizes PEM text from a CA bundle into the label shape this module expects.
-    ///
-    /// Codex only needs certificate DER bytes to seed `reqwest`'s root store, but operators may
-    /// point it at CA files that came from OpenSSL tooling rather than from a minimal certificate
-    /// bundle. OpenSSL's `TRUSTED CERTIFICATE` form is one such variant: it is still certificate
-    /// material, but it uses a different PEM label and may carry auxiliary trust metadata that
-    /// this crate does not consume. This constructor rewrites only the PEM labels so the mixed-
-    /// section parser can keep treating the file as certificate input. The rustls ecosystem does
-    /// not currently accept `TRUSTED CERTIFICATE` as a standard certificate label upstream, so
-    /// this remains a local compatibility shim rather than behavior delegated to
-    /// `rustls-pki-types`.
-    ///
-    /// See also:
-    /// - rustls/pemfile issue #52, closed as not planned, documenting that
-    ///   `BEGIN TRUSTED CERTIFICATE` blocks are ignored upstream:
-    ///   <https://github.com/rustls/pemfile/issues/52>
-    /// - OpenSSL `x509 -trustout`, which emits `TRUSTED CERTIFICATE` PEM blocks:
-    ///   <https://docs.openssl.org/master/man1/openssl-x509/>
-    /// - OpenSSL PEM readers, which document that plain `PEM_read_bio_X509()` discards auxiliary
-    ///   trust settings:
-    ///   <https://docs.openssl.org/master/man3/PEM_read_bio_PrivateKey/>
-    /// - `openssl s_server`, a real OpenSSL-based server/test tool that operates in this
-    ///   ecosystem:
-    ///   <https://docs.openssl.org/master/man1/openssl-s_server/>
     fn from_pem_data(source_env: &'static str, path: &Path, pem_data: &[u8]) -> Self {
         let pem = String::from_utf8_lossy(pem_data);
-        if pem.contains("TRUSTED CERTIFICATE") {
-            info!(
-                source_env,
-                ca_path = %path.display(),
-                "normalizing OpenSSL TRUSTED CERTIFICATE labels in custom CA bundle"
-            );
-            Self::TrustedCertificate(
-                pem.replace("BEGIN TRUSTED CERTIFICATE", "BEGIN CERTIFICATE")
-                    .replace("END TRUSTED CERTIFICATE", "END CERTIFICATE"),
-            )
-        } else {
-            Self::Standard(pem.into_owned())
+        let mut blocks = Vec::new();
+        let mut contents = String::new();
+        let mut trusted = false;
+        for line in pem.lines() {
+            if line.starts_with("-----BEGIN ") {
+                if !contents.is_empty() {
+                    blocks.push((trusted, std::mem::take(&mut contents)));
+                }
+                trusted = line.trim_end() == "-----BEGIN TRUSTED CERTIFICATE-----";
+            }
+            let line = if trusted {
+                match line.trim_end() {
+                    "-----BEGIN TRUSTED CERTIFICATE-----" => "-----BEGIN CERTIFICATE-----",
+                    "-----END TRUSTED CERTIFICATE-----" => "-----END CERTIFICATE-----",
+                    _ => line,
+                }
+            } else {
+                line
+            };
+            contents.push_str(line);
+            contents.push('\n');
         }
+        if !contents.is_empty() {
+            blocks.push((trusted, contents));
+        }
+        if blocks.iter().any(|(trusted, _)| *trusted) {
+            info!(source_env, ca_path = %path.display(),
+                "normalizing OpenSSL TRUSTED CERTIFICATE labels in custom CA bundle");
+        }
+        Self { blocks }
     }
 
-    /// Returns the normalized PEM contents regardless of the label shape that produced them.
-    fn contents(&self) -> &str {
-        match self {
-            Self::Standard(contents) | Self::TrustedCertificate(contents) => contents,
-        }
-    }
-
-    /// Iterates over every recognized PEM section in this normalized PEM text.
-    ///
-    /// `rustls-pki-types` exposes mixed-section parsing through a `PemObject` implementation on the
-    /// `(SectionKind, Vec<u8>)` tuple. Keeping that type-directed API here lets callers iterate in
-    /// terms of normalized sections rather than trait plumbing.
-    fn sections(&self) -> impl Iterator<Item = Result<PemSection, pem::Error>> + '_ {
-        PemSection::pem_slice_iter(self.contents().as_bytes())
-    }
-
-    /// Returns the certificate DER bytes for one parsed PEM certificate section.
-    ///
-    /// Standard PEM certificates already decode to the exact DER bytes `reqwest` wants. OpenSSL
-    /// `TRUSTED CERTIFICATE` sections may append `X509_AUX` bytes after the certificate, so those
-    /// sections need to be trimmed down to their first DER object before registration.
-    fn certificate_der<'a>(&self, der: &'a [u8]) -> Option<&'a [u8]> {
-        match self {
-            Self::Standard(_) => Some(der),
-            Self::TrustedCertificate(_) => first_der_item(der),
-        }
+    fn sections(
+        &self,
+    ) -> impl Iterator<Item = Result<(SectionKind, Vec<u8>, bool), pem::Error>> + '_ {
+        self.blocks.iter().flat_map(|(trusted, contents)| {
+            PemSection::pem_slice_iter(contents.as_bytes())
+                .map(move |section| section.map(|(kind, der)| (kind, der, *trusted)))
+        })
     }
 }
 
@@ -898,7 +887,6 @@ mod tests {
 
     use super::BuildCustomCaTransportError;
     use super::CODEX_CA_CERT_ENV;
-    use super::CaBundleCacheKey;
     use super::ConfiguredCaBundle;
     use super::CustomCaPolicy;
     use super::EnvSource;
@@ -998,44 +986,47 @@ mod tests {
                 )
                 .expect("server config"),
         );
-        let handshake = |config| -> Result<(), rustls::Error> {
-            let mut client = rustls::ClientConnection::new(
-                config,
-                "localhost".try_into().expect("server name"),
-            )?;
-            let mut server = rustls::ServerConnection::new(Arc::clone(&server_config))?;
-            for _ in 0..10 {
-                let mut records = Vec::new();
-                client
-                    .write_tls(&mut records)
-                    .expect("write client records");
-                server
-                    .read_tls(&mut records.as_slice())
-                    .expect("read client records");
-                server.process_new_packets()?;
-                records.clear();
-                server
-                    .write_tls(&mut records)
-                    .expect("write server records");
-                client
-                    .read_tls(&mut records.as_slice())
-                    .expect("read server records");
-                client.process_new_packets()?;
-                if !client.is_handshaking() && !server.is_handshaking() {
-                    return Ok(());
-                }
-            }
-            panic!("TLS handshake failed to finish within ten record exchanges");
-        };
 
-        handshake(config).expect("loaded custom CA must authenticate the server");
+        handshake(config, Arc::clone(&server_config))
+            .expect("loaded custom CA must authenticate the server");
         let default_config = build_rustls_client_config(None).expect("default config");
         assert!(matches!(
-            handshake(default_config),
+            handshake(default_config, server_config),
             Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::UnknownIssuer
             ))
         ));
+    }
+
+    fn handshake(
+        config: Arc<rustls::ClientConfig>,
+        server_config: Arc<rustls::ServerConfig>,
+    ) -> Result<(), rustls::Error> {
+        let mut client =
+            rustls::ClientConnection::new(config, "localhost".try_into().expect("server name"))?;
+        let mut server = rustls::ServerConnection::new(Arc::clone(&server_config))?;
+        for _ in 0..10 {
+            let mut records = Vec::new();
+            client
+                .write_tls(&mut records)
+                .expect("write client records");
+            server
+                .read_tls(&mut records.as_slice())
+                .expect("read client records");
+            server.process_new_packets()?;
+            records.clear();
+            server
+                .write_tls(&mut records)
+                .expect("write server records");
+            client
+                .read_tls(&mut records.as_slice())
+                .expect("read server records");
+            client.process_new_packets()?;
+            if !client.is_handshaking() && !server.is_handshaking() {
+                return Ok(());
+            }
+        }
+        panic!("TLS handshake failed to finish within ten record exchanges");
     }
 
     #[test]
@@ -1043,7 +1034,12 @@ mod tests {
         let first = native_root_store();
         let second = native_root_store();
 
-        assert!(std::ptr::eq(first, second));
+        if std::env::var_os("SSL_CERT_FILE").is_none() && std::env::var_os("SSL_CERT_DIR").is_none()
+        {
+            assert!(std::ptr::eq(first.as_ref(), second.as_ref()));
+        } else {
+            assert_eq!(first.roots, second.roots);
+        }
     }
 
     #[test]
@@ -1070,7 +1066,13 @@ mod tests {
         };
 
         let first = cached_rustls_client_config(Some(&bundle)).expect("first rustls config");
-        let first_key = CaBundleCacheKey::new(Some(&bundle), Some(first_pem.as_bytes()));
+        let first_key = RUSTLS_CLIENT_CONFIGS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, config)| Arc::ptr_eq(config, &first))
+            .map(|(key, _)| key.clone())
+            .expect("first config is cached");
         fs::write(&cert_path, second_pem).expect("rotate CA contents");
         OpenOptions::new()
             .write(true)
@@ -1216,5 +1218,82 @@ mod tests {
         );
 
         assert!(client.is_ok());
+    }
+    #[test]
+    fn trusted_pem_normalization_is_scoped_to_each_block() {
+        let bundle = ConfiguredCaBundle {
+            source_env: "TEST",
+            path: "mixed.pem".into(),
+        };
+        let certs = bundle.parse_certificates(b"# TRUSTED CERTIFICATE comment\n-----BEGIN CERTIFICATE-----\nMAAFAA==\n-----END CERTIFICATE-----\n-----BEGIN TRUSTED CERTIFICATE-----\nMAAFAA==\n-----END TRUSTED CERTIFICATE-----\n").expect("parse mixed PEM");
+        assert_eq!(
+            certs.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+            vec![&[0x30, 0, 5, 0][..], &[0x30, 0][..]]
+        );
+    }
+
+    #[test]
+    fn environment_root_rotation_revokes_old_trust() {
+        const CHILD: &str = "CODEX_HTTP_ROOT_ROTATION_CHILD";
+        let Ok(path) = std::env::var(CHILD) else {
+            let dir = TempDir::new().expect("tempdir");
+            for codex_override in [false, true] {
+                let path = dir.path().join("rotating.pem");
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "custom_ca::tests::environment_root_rotation_revokes_old_trust",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, &path)
+                    .env("SSL_CERT_FILE", &path)
+                    .env_remove("SSL_CERT_DIR")
+                    .env_remove("CODEX_CA_CERTIFICATE");
+                if codex_override {
+                    command.env("CODEX_CA_CERTIFICATE", dir.path().join("fixed.pem"));
+                }
+                let output = command.output().expect("run isolated rotation test");
+                assert!(
+                    output.status.success(),
+                    "rotation failed: {} {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("ROTATION_ASSERTED"));
+            }
+            return;
+        };
+        fn certificate() -> (String, Arc<rustls::ServerConfig>) {
+            let rcgen::CertifiedKey { cert, signing_key } =
+                rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let server = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.der().clone()],
+                    rustls_pki_types::PrivateKeyDer::Pkcs8(signing_key.serialize_der().into()),
+                )
+                .unwrap();
+            (cert.pem(), Arc::new(server))
+        }
+        super::ensure_rustls_crypto_provider();
+        let (pem_a, server_a) = certificate();
+        let (pem_b, server_b) = certificate();
+        fs::write(&path, pem_a).unwrap();
+        if let Some(fixed) = std::env::var_os("CODEX_CA_CERTIFICATE") {
+            fs::write(fixed, TEST_CERT).unwrap();
+        }
+        let first = super::build_rustls_client_config_with_custom_ca().expect("first config");
+        handshake(first, Arc::clone(&server_a)).expect("A trusted initially");
+        fs::write(&path, pem_b).unwrap();
+        let rotated = super::build_rustls_client_config_with_custom_ca().expect("rotated config");
+        handshake(Arc::clone(&rotated), server_b).expect("B trusted after rotation");
+        assert!(matches!(
+            handshake(rotated, server_a),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer
+            ))
+        ));
+        println!("ROTATION_ASSERTED");
     }
 }

@@ -182,12 +182,11 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
     /// Poll the shared crossterm stream for the next mapped `TuiEvent`.
     ///
     /// This skips events we don't use (mouse events, etc.) and keeps polling until it yields
-    /// a mapped event, hits `Pending`, or sees EOF/error. When the broker is paused, it drops
+    /// a mapped event, exhausts a bounded batch, hits `Pending`, or sees EOF/error. When the broker is paused, it drops
     /// the underlying stream and returns `Pending` to fully release stdin.
     pub fn poll_crossterm_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TuiEvent>> {
-        // Some crossterm events map to None (e.g. FocusLost, mouse); loop so we keep polling
-        // until we return a mapped event, hit Pending, or see EOF/error.
-        loop {
+        // Bound ignored input so a continuously ready source cannot starve draws or shutdown.
+        for _ in 0..64 {
             let poll_result = {
                 let mut state = self
                     .broker
@@ -228,18 +227,23 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
                 return Poll::Ready(Some(mapped));
             }
         }
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 
     /// Poll the draw broadcast stream for the next draw event. Draw events are used to trigger a redraw of the TUI.
     pub fn poll_draw_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TuiEvent>> {
-        match Pin::new(&mut self.draw_stream).poll_next(cx) {
-            Poll::Ready(Some(Ok(()))) => Poll::Ready(Some(TuiEvent::Draw)),
-            Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(_)))) => {
-                Poll::Ready(Some(TuiEvent::Draw))
+        // Lag advances the receiver to a retained notification; it is not itself a draw.
+        for _ in 0..2 {
+            match Pin::new(&mut self.draw_stream).poll_next(cx) {
+                Poll::Ready(Some(Ok(()))) => return Poll::Ready(Some(TuiEvent::Draw)),
+                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(_)))) => continue,
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
         }
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 
     /// Map a crossterm event to a [`TuiEvent`], skipping events we don't use (mouse events, etc.).
@@ -443,6 +447,24 @@ mod tests {
 
         let first = stream.next().await;
         assert!(matches!(first, Some(TuiEvent::Draw)));
+        assert!(futures::poll!(std::pin::pin!(stream.next())).is_pending());
+        draw_tx.send(()).unwrap();
+        assert!(matches!(stream.next().await, Some(TuiEvent::Draw)));
+    }
+
+    #[tokio::test]
+    async fn ignored_input_batch_yields_to_draws_without_losing_keys() {
+        let (broker, handle, draw_tx, draw_rx, terminal_focused) = setup();
+        let mut stream = make_stream(broker, draw_rx, terminal_focused);
+        // Cross our 64-event limit without exhausting Tokio's cooperative receive budget.
+        for _ in 0..65 {
+            handle.send(Ok(Event::FocusLost));
+        }
+        let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        handle.send(Ok(Event::Key(key)));
+        draw_tx.send(()).unwrap();
+        assert!(matches!(stream.next().await, Some(TuiEvent::Draw)));
+        assert!(matches!(stream.next().await, Some(TuiEvent::Key(actual)) if actual == key));
     }
 
     #[tokio::test(flavor = "current_thread")]

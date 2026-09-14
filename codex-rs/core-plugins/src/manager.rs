@@ -36,7 +36,6 @@ use crate::marketplace::home_dir;
 use crate::marketplace::list_marketplaces_with_home;
 use crate::marketplace::plugin_interface_with_marketplace_category;
 use crate::marketplace_policy::MarketplacePolicy;
-use crate::marketplace_policy::allowed_configured_marketplace_names;
 use crate::marketplace_policy::configured_plugins_from_stack;
 use crate::marketplace_upgrade::ConfiguredMarketplaceUpgradeError;
 use crate::marketplace_upgrade::ConfiguredMarketplaceUpgradeOutcome;
@@ -87,6 +86,7 @@ use codex_tools::filter_request_plugin_install_discoverable_tools_for_client;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -222,7 +222,7 @@ pub struct PluginListBackgroundTaskOptions {
 #[derive(Clone, PartialEq, Eq)]
 struct NonCuratedCacheRefreshRequest {
     roots: Vec<AbsolutePathBuf>,
-    configured_plugin_keys: Vec<String>,
+    config_layer_stack: ConfigLayerStackIdentity,
     mode: NonCuratedCacheRefreshMode,
 }
 
@@ -799,6 +799,16 @@ impl PluginsManager {
 
     fn cached_plugin_outcome(&self, key: &PluginLoadCacheKey) -> Option<PluginLoadOutcome> {
         let auth_mode = self.auth_mode();
+        {
+            let cache = self
+                .loaded_plugins_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let cached = cache.entry.as_ref().filter(|cached| cached.key == *key)?;
+            if cached.resolved_auth_mode == auth_mode {
+                return Some(cached.resolved_outcome.clone());
+            }
+        }
         let mut cache = self
             .loaded_plugins_cache
             .write()
@@ -902,6 +912,18 @@ impl PluginsManager {
         &self,
         plugin_id: &PluginId,
     ) -> PluginTelemetryMetadata {
+        let mut metadata = self.telemetry_metadata_for_plugin_id_async(plugin_id).await;
+        metadata.capability_summary = match self.installed_plugin_root(plugin_id).await {
+            Some(plugin_root) => plugin_capability_summary_from_root(plugin_id, &plugin_root).await,
+            None => None,
+        };
+        metadata
+    }
+
+    async fn telemetry_metadata_for_plugin_id_async(
+        &self,
+        plugin_id: &PluginId,
+    ) -> PluginTelemetryMetadata {
         let cached_remote_plugin_id = {
             let cache = self
                 .remote_installed_plugins_cache
@@ -932,16 +954,11 @@ impl PluginsManager {
                 }
             }
         };
-        let mut metadata = PluginTelemetryMetadata {
+        PluginTelemetryMetadata {
             plugin_id: Some(plugin_id.clone()),
             remote_plugin_id,
             capability_summary: None,
-        };
-        metadata.capability_summary = match self.installed_plugin_root(plugin_id).await {
-            Some(plugin_root) => plugin_capability_summary_from_root(plugin_id, &plugin_root).await,
-            None => None,
-        };
-        metadata
+        }
     }
 
     pub async fn telemetry_metadata_for_installed_plugin_with_remote_id(
@@ -979,7 +996,8 @@ impl PluginsManager {
     ) -> PluginTelemetryMetadata {
         PluginTelemetryMetadata {
             remote_plugin_id: Some(remote_plugin_id.to_string()),
-            ..self.telemetry_metadata_for_plugin_id(plugin_id)
+            plugin_id: Some(plugin_id.clone()),
+            capability_summary: None,
         }
     }
 
@@ -1721,11 +1739,22 @@ impl PluginsManager {
     }
 
     async fn uninstall_plugin_id(&self, plugin_id: PluginId) -> Result<(), PluginUninstallError> {
-        let plugin_telemetry = if self.installed_plugin_root(&plugin_id).await.is_some() {
-            Some(
-                self.telemetry_metadata_for_installed_plugin(&plugin_id)
-                    .await,
-            )
+        let analytics_events_client = self
+            .analytics_events_client
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let plugin_telemetry = if analytics_events_client.is_some() {
+            if let Some(root) = self.installed_plugin_root(&plugin_id).await {
+                let mut metadata = self
+                    .telemetry_metadata_for_plugin_id_async(&plugin_id)
+                    .await;
+                metadata.capability_summary =
+                    plugin_capability_summary_from_root(&plugin_id, &root).await;
+                Some(metadata)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -1747,10 +1776,6 @@ impl PluginsManager {
         .await
         .map_err(PluginUninstallError::join)??;
 
-        let analytics_events_client = match self.analytics_events_client.read() {
-            Ok(client) => client.clone(),
-            Err(err) => err.into_inner().clone(),
-        };
         if let Some(plugin_telemetry) = plugin_telemetry
             && let Some(analytics_events_client) = analytics_events_client
         {
@@ -1766,14 +1791,71 @@ impl PluginsManager {
         additional_roots: &[AbsolutePathBuf],
         include_openai_curated: bool,
     ) -> Result<ConfiguredMarketplaceListOutcome, MarketplaceError> {
+        Self::list_marketplaces_with_context(
+            &self.store,
+            self.codex_home.as_path(),
+            self.auth_mode(),
+            self.restriction_product,
+            config,
+            additional_roots,
+            include_openai_curated,
+        )
+    }
+
+    pub(crate) async fn list_marketplaces_for_config_async(
+        &self,
+        config: &PluginsConfigInput,
+        include_openai_curated: bool,
+    ) -> Result<ConfiguredMarketplaceListOutcome, MarketplaceError> {
+        let store = self.store.clone();
+        let codex_home = self.codex_home.clone();
+        let auth_mode = self.auth_mode();
+        let restriction_product = self.restriction_product;
+        let config = config.clone();
+        let dispatcher = tracing::dispatcher::get_default(Clone::clone);
+        tokio::task::spawn_blocking(move || {
+            tracing::dispatcher::with_default(&dispatcher, || {
+                Self::list_marketplaces_with_context(
+                    &store,
+                    codex_home.as_path(),
+                    auth_mode,
+                    restriction_product,
+                    &config,
+                    &[],
+                    include_openai_curated,
+                )
+            })
+        })
+        .await
+        .map_err(|err| {
+            MarketplaceError::InvalidPlugin(format!("failed to list plugin marketplaces: {err}"))
+        })?
+    }
+
+    fn list_marketplaces_with_context(
+        store: &PluginStore,
+        codex_home: &Path,
+        auth_mode: Option<AuthMode>,
+        restriction_product: Option<Product>,
+        config: &PluginsConfigInput,
+        additional_roots: &[AbsolutePathBuf],
+        include_openai_curated: bool,
+    ) -> Result<ConfiguredMarketplaceListOutcome, MarketplaceError> {
         if !config.plugins_enabled {
             return Ok(ConfiguredMarketplaceListOutcome::default());
         }
 
-        let (installed_plugins, enabled_plugins) = self.configured_plugin_states(config);
-        let marketplace_roots =
-            self.marketplace_roots(config, additional_roots, include_openai_curated);
-        let marketplace_outcome = self.list_marketplaces_with_policy(config, &marketplace_roots)?;
+        let (installed_plugins, enabled_plugins) =
+            Self::configured_plugin_states(store, codex_home, config);
+        let marketplace_roots = Self::marketplace_roots_with_context(
+            codex_home,
+            auth_mode,
+            config,
+            additional_roots,
+            include_openai_curated,
+        );
+        let marketplace_outcome =
+            Self::list_marketplaces_with_policy_at_home(codex_home, config, &marketplace_roots)?;
         let mut seen_plugin_keys = HashSet::new();
         let marketplaces = marketplace_outcome
             .marketplaces
@@ -1788,7 +1870,13 @@ impl PluginsManager {
                         if !seen_plugin_keys.insert(plugin_key.clone()) {
                             return None;
                         }
-                        if !self.restriction_product_matches(plugin.policy.products.as_deref()) {
+                        if !match plugin.policy.products.as_deref() {
+                            None => true,
+                            Some([]) => false,
+                            Some(products) => restriction_product.is_some_and(|product| {
+                                product.matches_product_restriction(products)
+                            }),
+                        } {
                             return None;
                         }
                         let plugin_id =
@@ -1797,7 +1885,7 @@ impl PluginsManager {
                         let installed_version = installed.then_some(()).and_then(|_| {
                             plugin_id
                                 .as_ref()
-                                .and_then(|plugin_id| self.store.active_plugin_version(plugin_id))
+                                .and_then(|plugin_id| store.active_plugin_version(plugin_id))
                         });
                         let enabled = enabled_plugins.contains(&plugin_key);
                         let mut interface = plugin.interface;
@@ -1806,7 +1894,7 @@ impl PluginsManager {
                         if installed
                             && plugin.source.is_install_materialized()
                             && let Some(plugin_id) = plugin_id.as_ref()
-                            && let Some(plugin_root) = self.store.active_plugin_root(plugin_id)
+                            && let Some(plugin_root) = store.active_plugin_root(plugin_id)
                             && let Some(manifest) = load_plugin_manifest(plugin_root.as_path())
                         {
                             local_version = manifest.version.clone();
@@ -2241,25 +2329,12 @@ impl PluginsManager {
                     on_effective_plugins_changed,
                 );
                 if config_for_remote_sync.remote_plugin_enabled {
-                    match crate::remote::fetch_and_cache_global_remote_plugin_catalog(
-                        manager.codex_home.as_path(),
-                        &remote_plugin_service_config(&config_for_remote_sync),
-                        auth.as_ref(),
-                    )
-                    .await
-                    {
-                        Ok(()) => {}
-                        Err(
-                            RemotePluginCatalogError::AuthRequired
-                            | RemotePluginCatalogError::UnsupportedAuthMode,
-                        ) => {}
-                        Err(err) => {
-                            warn!(
-                                error = %err,
-                                "failed to warm remote plugin catalog cache"
-                            );
-                        }
-                    }
+                    manager.schedule_global_remote_catalog_cache_refresh(
+                        GlobalRemoteCatalogCacheRefreshRequest {
+                            service_config: remote_plugin_service_config(&config_for_remote_sync),
+                            auth,
+                        },
+                    );
                 }
             });
         }
@@ -2411,53 +2486,15 @@ impl PluginsManager {
         roots: &[AbsolutePathBuf],
         mode: NonCuratedCacheRefreshMode,
     ) {
-        let marketplace_roots =
-            self.marketplace_roots(config, roots, /*include_openai_curated*/ false);
-        let outcome = match self.list_marketplaces_with_policy(config, &marketplace_roots) {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                warn!("failed to prepare non-curated plugin cache refresh: {err}");
-                return;
-            }
-        };
-        let policy = MarketplacePolicy::from_requirements(config.config_layer_stack.requirements());
-        let mut roots = outcome
-            .marketplaces
-            .into_iter()
-            .filter(|marketplace| !is_openai_curated_marketplace_name(&marketplace.name))
-            .filter_map(|marketplace| {
-                match policy.validate_install(
-                    &config.config_layer_stack,
-                    self.codex_home.as_path(),
-                    &marketplace.path,
-                    &marketplace.name,
-                ) {
-                    Ok(()) => Some(marketplace.path),
-                    Err(err) => {
-                        warn!(
-                            marketplace = marketplace.name,
-                            path = %marketplace.path.display(),
-                            error = %err,
-                            "skipping marketplace source during plugin cache refresh"
-                        );
-                        None
-                    }
-                }
-            })
-            .collect::<Vec<_>>();
-        roots.sort_unstable();
-        roots.dedup();
-        let mut configured_plugin_keys =
-            configured_plugins_from_stack(&config.config_layer_stack, self.codex_home.as_path())
-                .into_keys()
-                .collect::<Vec<_>>();
-        configured_plugin_keys.sort_unstable();
-        if roots.is_empty() || configured_plugin_keys.is_empty() {
+        if !config.plugins_enabled {
             return;
         }
+        let mut roots = roots.to_vec();
+        roots.sort_unstable();
+        roots.dedup();
         let mut request = NonCuratedCacheRefreshRequest {
             roots,
-            configured_plugin_keys,
+            config_layer_stack: ConfigLayerStackIdentity(Arc::clone(&config.config_layer_stack)),
             mode,
         };
 
@@ -2470,6 +2507,7 @@ impl PluginsManager {
                 && state.requested.as_ref().is_some_and(|requested| {
                     requested.mode == NonCuratedCacheRefreshMode::ForceReinstall
                         && requested.roots == request.roots
+                        && requested.config_layer_stack == request.config_layer_stack
                 })
             {
                 request.mode = NonCuratedCacheRefreshMode::ForceReinstall;
@@ -2679,22 +2717,59 @@ impl PluginsManager {
                 return;
             };
 
-            let refresh_result = match request.mode {
-                NonCuratedCacheRefreshMode::IfVersionChanged => {
-                    refresh_non_curated_plugin_cache_detailed(
-                        self.codex_home.as_path(),
-                        &request.roots,
-                        &request.configured_plugin_keys,
-                    )
-                }
-                NonCuratedCacheRefreshMode::ForceReinstall => {
-                    refresh_non_curated_plugin_cache_force_reinstall_detailed(
-                        self.codex_home.as_path(),
-                        &request.roots,
-                        &request.configured_plugin_keys,
-                    )
-                }
-            };
+            let refresh_result = (|| {
+                let config = PluginsConfigInput::new(
+                    Arc::clone(&request.config_layer_stack.0),
+                    true,
+                    false,
+                    String::new(),
+                );
+                let roots = self.marketplace_roots(&config, &request.roots, false);
+                let outcome = self
+                    .list_marketplaces_with_policy(&config, &roots)
+                    .map_err(|err| err.to_string())?;
+                let roots = outcome
+                    .marketplaces
+                    .into_iter()
+                    .filter(|marketplace| !is_openai_curated_marketplace_name(&marketplace.name))
+                    .map(|marketplace| marketplace.path)
+                    .collect::<Vec<_>>();
+                let keys = configured_plugins_from_stack(
+                    &request.config_layer_stack.0,
+                    self.codex_home.as_path(),
+                )
+                .into_keys()
+                .collect::<Vec<_>>();
+                let mut refreshed = match request.mode {
+                    NonCuratedCacheRefreshMode::IfVersionChanged => {
+                        refresh_non_curated_plugin_cache_detailed(
+                            self.codex_home.as_path(),
+                            &roots,
+                            &keys,
+                        )
+                    }
+                    NonCuratedCacheRefreshMode::ForceReinstall => {
+                        refresh_non_curated_plugin_cache_force_reinstall_detailed(
+                            self.codex_home.as_path(),
+                            &roots,
+                            &keys,
+                        )
+                    }
+                }?;
+                refreshed
+                    .errors
+                    .extend(outcome.errors.into_iter().map(|error| {
+                        crate::loader::NonCuratedCacheRefreshError {
+                            marketplace_name: error.path.display().to_string(),
+                            message: format!(
+                                "failed to discover marketplace {}: {}",
+                                error.path.display(),
+                                error.message
+                            ),
+                        }
+                    }));
+                Ok::<_, String>(refreshed)
+            })();
             let refreshed = match refresh_result {
                 Ok(refresh_outcome) => {
                     if refresh_outcome.cache_refreshed {
@@ -2732,17 +2807,18 @@ impl PluginsManager {
     }
 
     fn configured_plugin_states(
-        &self,
+        store: &PluginStore,
+        codex_home: &Path,
         config: &PluginsConfigInput,
     ) -> (HashSet<String>, HashSet<String>) {
         let configured_plugins =
-            configured_plugins_from_stack(&config.config_layer_stack, self.codex_home.as_path());
+            configured_plugins_from_stack(&config.config_layer_stack, codex_home);
         let installed_plugins = configured_plugins
             .keys()
             .filter(|plugin_key| {
                 PluginId::parse(plugin_key)
                     .ok()
-                    .is_some_and(|plugin_id| self.store.is_installed(&plugin_id))
+                    .is_some_and(|plugin_id| store.is_installed(&plugin_id))
             })
             .cloned()
             .collect::<HashSet<_>>();
@@ -2759,25 +2835,37 @@ impl PluginsManager {
         additional_roots: &[AbsolutePathBuf],
         include_openai_curated: bool,
     ) -> Vec<AbsolutePathBuf> {
+        Self::marketplace_roots_with_context(
+            self.codex_home.as_path(),
+            self.auth_mode(),
+            config,
+            additional_roots,
+            include_openai_curated,
+        )
+    }
+
+    fn marketplace_roots_with_context(
+        codex_home: &Path,
+        auth_mode: Option<AuthMode>,
+        config: &PluginsConfigInput,
+        additional_roots: &[AbsolutePathBuf],
+        include_openai_curated: bool,
+    ) -> Vec<AbsolutePathBuf> {
         // Treat the curated catalog as an extra marketplace root so plugin listing can surface it
         // without requiring every caller to know where it is stored.
         let mut roots = additional_roots.to_vec();
         roots.extend(installed_marketplace_roots_from_layer_stack(
             &config.config_layer_stack,
-            self.codex_home.as_path(),
+            codex_home,
         ));
         let curated_marketplace_path = if include_openai_curated {
-            if matches!(
-                self.auth_mode(),
-                Some(AuthMode::ApiKey | AuthMode::BedrockApiKey)
-            ) {
-                let api_marketplace_path =
-                    curated_plugins_api_marketplace_path(self.codex_home.as_path());
+            if matches!(auth_mode, Some(AuthMode::ApiKey | AuthMode::BedrockApiKey)) {
+                let api_marketplace_path = curated_plugins_api_marketplace_path(codex_home);
                 api_marketplace_path
                     .is_file()
                     .then_some(api_marketplace_path)
             } else {
-                let curated_repo_root = curated_plugins_repo_path(self.codex_home.as_path());
+                let curated_repo_root = curated_plugins_repo_path(codex_home);
                 curated_repo_root.is_dir().then_some(curated_repo_root)
             }
         } else {
@@ -2799,18 +2887,29 @@ impl PluginsManager {
         config: &PluginsConfigInput,
         roots: &[AbsolutePathBuf],
     ) -> Result<MarketplaceListOutcome, MarketplaceError> {
+        Self::list_marketplaces_with_policy_at_home(self.codex_home.as_path(), config, roots)
+    }
+
+    fn list_marketplaces_with_policy_at_home(
+        codex_home: &Path,
+        config: &PluginsConfigInput,
+        roots: &[AbsolutePathBuf],
+    ) -> Result<MarketplaceListOutcome, MarketplaceError> {
         let mut outcome = list_marketplaces_with_home(roots, home_dir().as_deref())?;
         let policy = MarketplacePolicy::from_requirements(config.config_layer_stack.requirements());
         if !policy.is_restricted() {
             return Ok(outcome);
         }
-        let allowed_marketplace_names = allowed_configured_marketplace_names(
-            &config.config_layer_stack,
-            self.codex_home.as_path(),
-        );
+        let user_config = config.config_layer_stack.effective_user_config();
         outcome.marketplaces.retain(|marketplace| {
-            is_openai_curated_marketplace_name(&marketplace.name)
-                || allowed_marketplace_names.contains(&marketplace.name)
+            policy
+                .validate_install_with_user_config(
+                    user_config.as_ref(),
+                    codex_home,
+                    &marketplace.path,
+                    &marketplace.name,
+                )
+                .is_ok()
         });
         Ok(outcome)
     }

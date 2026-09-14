@@ -39,7 +39,8 @@ use tokio::time::timeout;
 use crate::auth::agent_identity_telemetry;
 use crate::auth::resolve_provider_auth;
 
-const MODELS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
+// Command-backed auth retains its separately configured deadline. This bounds transport setup and HTTP only.
+const MODELS_NETWORK_TIMEOUT: Duration = Duration::from_secs(5);
 const MODELS_ENDPOINT: &str = "/models";
 
 /// Provider-owned OpenAI-compatible `/models` endpoint.
@@ -109,6 +110,15 @@ impl OpenAiModelsEndpoint {
     ) -> CoreResult<ModelsFetchResult> {
         let _timer =
             codex_otel::start_global_timer("codex.remote_models.fetch_update.duration_ms", &[]);
+        let mut headers = HeaderMap::new();
+        if let Some(etag) = etag {
+            headers.insert(
+                IF_NONE_MATCH,
+                etag.parse().map_err(|err| {
+                    CodexErr::InvalidRequest(format!("invalid models ETag validator: {err}"))
+                })?,
+            );
+        }
         let auth = self.auth().await;
         let auth_mode = auth.as_ref().map(CodexAuth::auth_mode);
         let api_provider = self.provider_info.to_api_provider(auth_mode)?;
@@ -128,28 +138,26 @@ impl OpenAiModelsEndpoint {
             agent_identity_telemetry,
             auth_env: self.auth_env(),
         });
-        timeout(MODELS_REFRESH_TIMEOUT, async {
+        timeout(MODELS_NETWORK_TIMEOUT, async {
             let transport = self
                 .transport_for(http_client_factory, request_url.clone())
                 .await?;
             let client = ModelsClient::new(transport, api_provider, api_auth)
                 .with_telemetry(Some(request_telemetry));
-            let mut headers = HeaderMap::new();
-            if let Some(etag) = etag {
-                let etag = etag.parse().map_err(|err| {
-                    CodexErr::InvalidRequest(format!("invalid models ETag validator: {err}"))
-                })?;
-                headers.insert(IF_NONE_MATCH, etag);
-            }
             client
                 .list_models_conditional(request_url, headers)
                 .await
                 .map_err(map_api_error)
-                .map(|result| match result {
+                .and_then(|result| match result {
                     ModelsListResult::Modified { models, etag } => {
-                        ModelsFetchResult::Modified { models, etag }
+                        Ok(ModelsFetchResult::Modified { models, etag })
                     }
-                    ModelsListResult::NotModified => ModelsFetchResult::NotModified,
+                    ModelsListResult::NotModified if etag.is_some() => {
+                        Ok(ModelsFetchResult::NotModified)
+                    }
+                    ModelsListResult::NotModified => Err(CodexErr::InvalidRequest(
+                        "models endpoint returned 304 without an ETag validator".to_string(),
+                    )),
                 })
         })
         .await
@@ -611,5 +619,53 @@ mod tests {
             .expect("conditional models request should succeed");
 
         assert!(matches!(result, ModelsFetchResult::NotModified));
+    }
+    #[tokio::test]
+    async fn conditional_models_rejects_unvalidated_not_modified() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let endpoint = OpenAiModelsEndpoint::new(
+            ModelProviderInfo::create_openai_provider(Some(server.uri())),
+            None,
+        );
+        let result = endpoint
+            .list_models_conditional(
+                "0.0.0",
+                HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+                None,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(CodexErr::InvalidRequest(message)) if message.contains("304 without an ETag"))
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_etag_does_not_build_transport() {
+        let build_count = Arc::new(AtomicUsize::new(0));
+        let endpoint = OpenAiModelsEndpoint {
+            provider_info: ModelProviderInfo::create_openai_provider(None),
+            auth_manager: None,
+            transport_builder: Arc::new(RecordingTransportBuilder {
+                observed_request: Arc::new(Mutex::new(None)),
+                build_count: build_count.clone(),
+            }),
+            transport_cache: Mutex::new(None),
+        };
+        let result = endpoint
+            .list_models_conditional(
+                "0.0.0",
+                HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+                Some("invalid\nheader"),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(CodexErr::InvalidRequest(message)) if message.contains("invalid models ETag"))
+        );
+        assert_eq!(build_count.load(Ordering::SeqCst), 0);
     }
 }

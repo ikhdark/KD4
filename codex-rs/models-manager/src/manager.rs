@@ -385,6 +385,9 @@ impl AvailableModelPresets {
 #[derive(Debug)]
 pub struct OpenAiModelsManager {
     state: RwLock<ModelState>,
+    // Serialize cache loads and remote refreshes through publication and persistence.
+    // Acquire before `state` or `etag_refresh`; readers do not need this gate.
+    refresh_gate: tokio::sync::Mutex<()>,
     cache_manager: ModelsCacheManager,
     endpoint_client: SharedModelsEndpointClient,
     auth_manager: Option<Arc<AuthManager>>,
@@ -513,6 +516,7 @@ impl OpenAiModelsManager {
         let remote_models = load_bundled_models_or_panic();
         Self {
             state: RwLock::new(ModelState::new(remote_models, None, active_cache_identity)),
+            refresh_gate: tokio::sync::Mutex::new(()),
             cache_manager,
             endpoint_client,
             auth_manager,
@@ -732,6 +736,7 @@ impl OpenAiModelsManager {
         }
     }
 
+    #[expect(clippy::await_holding_invalid_type, reason = "Serializes model catalog and cache refresh transactions across network and disk awaits")]
     async fn run_etag_refresh_worker(self: Arc<Self>, mut exit_guard: EtagRefreshWorkerExitGuard) {
         loop {
             let notice = {
@@ -754,6 +759,7 @@ impl OpenAiModelsManager {
                 return;
             };
 
+            let _refresh = self.refresh_gate.lock().await;
             let refresh_identity = self.ensure_current_cache_identity().await;
             let write_basis = match self
                 .cache_manager
@@ -870,6 +876,10 @@ impl OpenAiModelsManager {
         refresh_strategy: RefreshStrategy,
         http_client_factory: &HttpClientFactory,
     ) -> CoreResult<()> {
+        if refresh_strategy == RefreshStrategy::Offline {
+            self.try_load_cache().await?;
+            return Ok(());
+        }
         if !self.should_refresh_models().await {
             match refresh_strategy {
                 RefreshStrategy::Offline | RefreshStrategy::OnlineIfUncached => {
@@ -892,9 +902,16 @@ impl OpenAiModelsManager {
             }
             RefreshStrategy::OnlineIfUncached => {
                 // Try cache first, fall back to online if unavailable
-                if self.try_load_cache().await? {
-                    info!("models cache: using cached models for OnlineIfUncached");
-                    return Ok(());
+                match self.try_load_cache().await {
+                    Ok(true) => {
+                        info!("models cache: using cached models for OnlineIfUncached");
+                        return Ok(());
+                    }
+                    Ok(false) => {}
+                    Err(CodexErr::Io(err)) if err.kind() == std::io::ErrorKind::InvalidData => {
+                        error!("models cache: corrupt cache, fetching remote models: {err}");
+                    }
+                    Err(err) => return Err(err),
                 }
                 info!("models cache: cache miss, fetching remote models");
                 self.fetch_and_update_models(http_client_factory).await
@@ -906,10 +923,12 @@ impl OpenAiModelsManager {
         }
     }
 
+    #[expect(clippy::await_holding_invalid_type, reason = "Serializes model catalog and cache refresh transactions across network and disk awaits")]
     async fn fetch_and_update_models(
         &self,
         http_client_factory: &HttpClientFactory,
     ) -> CoreResult<()> {
+        let _refresh = self.refresh_gate.lock().await;
         let fetch_identity = self.ensure_current_cache_identity().await;
         let client_version = crate::client_version_to_whole();
         let current_etag = self.get_etag().await;
@@ -1006,8 +1025,15 @@ impl OpenAiModelsManager {
 
     /// Reset identity-scoped in-memory state when the authoritative auth scope changes.
     async fn ensure_current_cache_identity(&self) -> String {
-        let current_identity = self.cache_manager.current_identity();
+        {
+            let state = self.state.read().await;
+            let current_identity = self.cache_manager.current_identity();
+            if state.active_cache_identity == current_identity {
+                return current_identity;
+            }
+        }
         let mut state = self.state.write().await;
+        let current_identity = self.cache_manager.current_identity();
         if state.reset_for_cache_identity(current_identity.clone()) {
             info!(
                 mismatch_category = "provider_cache_identity",
@@ -1028,7 +1054,7 @@ impl OpenAiModelsManager {
         }
 
         let mut state = self.state.try_write()?;
-        if state.reset_for_cache_identity(current_identity) {
+        if state.reset_for_cache_identity(self.cache_manager.current_identity()) {
             info!(
                 mismatch_category = "provider_cache_identity",
                 "models cache: reset identity-scoped in-memory catalog"
@@ -1093,7 +1119,9 @@ impl OpenAiModelsManager {
     }
 
     /// Attempt to satisfy the refresh from the cache when its complete identity and TTL match.
+    #[expect(clippy::await_holding_invalid_type, reason = "Serializes model catalog and cache refresh transactions across network and disk awaits")]
     async fn try_load_cache(&self) -> CoreResult<bool> {
+        let _refresh = self.refresh_gate.lock().await;
         let load_identity = self.ensure_current_cache_identity().await;
         let _timer =
             codex_otel::start_global_timer("codex.remote_models.load_cache.duration_ms", &[]);
@@ -1114,10 +1142,10 @@ impl OpenAiModelsManager {
             self.ensure_current_cache_identity().await;
             return Ok(false);
         }
-        let models = cache.models.clone();
+        let models_count = cache.models.len();
         if !self
             .apply_remote_models_and_etag_for_identity(
-                models.clone(),
+                cache.models,
                 cache.etag.clone(),
                 &load_identity,
             )
@@ -1131,7 +1159,7 @@ impl OpenAiModelsManager {
             return Ok(false);
         }
         info!(
-            models_count = models.len(),
+            models_count,
             etag = ?cache.etag,
             "models cache: cache entry applied"
         );

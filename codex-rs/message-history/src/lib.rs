@@ -8,11 +8,10 @@
 //! {"session_id":"<uuid>","ts":<unix_seconds>,"text":"<message>"}
 //! ````
 //!
-//! To minimize the chance of interleaved writes when multiple processes are
-//! appending concurrently, callers should *prepare the full line* (record +
-//! trailing `\n`) and write it with a **single `write(2)` system call** while
-//! the file descriptor is opened with the `O_APPEND` flag. POSIX guarantees
-//! that writes up to `PIPE_BUF` bytes are atomic in that case.
+//! Complete records are serialized before taking an exclusive file lock. Writers
+//! recover incomplete trailing records and append while holding that lock.
+//! Retention publishes a complete replacement; locked handles are checked against
+//! the current path before use. Appends do not promise a disk sync per message.
 
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -31,8 +30,6 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use std::time::Duration;
-use tokio::fs;
-use tokio::io::AsyncReadExt;
 
 use codex_config::types::History;
 use codex_config::types::HistoryPersistence;
@@ -119,7 +116,7 @@ pub async fn append_entry(
         .map_err(|e| std::io::Error::other(format!("system clock before Unix epoch: {e}")))?
         .as_secs();
 
-    // Construct the JSON line first so we can write it in a single syscall.
+    // Serialize before taking the exclusive lock.
     let entry = HistoryEntry {
         session_id: conversation_id.to_string(),
         ts,
@@ -129,125 +126,110 @@ pub async fn append_entry(
         .map_err(|e| std::io::Error::other(format!("failed to serialise history entry: {e}")))?;
     line.push('\n');
 
-    // Open the history file for read/write access (append-only on Unix).
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
-
-    let mut history_file = options.open(&path)?;
-
-    // Ensure permissions.
-    ensure_owner_only_permissions(&history_file).await?;
-
     let history_max_bytes = config.max_bytes;
-
-    // Perform a blocking write under an advisory write lock using std::fs.
     tokio::task::spawn_blocking(move || -> Result<()> {
-        // Retry a few times to avoid indefinite blocking when contended.
-        for _ in 0..MAX_RETRIES {
-            match history_file.try_lock() {
-                Ok(()) => {
-                    // While holding the exclusive lock, write the full line.
-                    // We do not open the file with `append(true)` on Windows, so ensure the
-                    // cursor is positioned at the end before writing.
-                    history_file.seek(SeekFrom::End(0))?;
-                    history_file.write_all(line.as_bytes())?;
-                    history_file.flush()?;
-                    enforce_history_limit(&mut history_file, history_max_bytes)?;
-                    return Ok(());
-                }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    std::thread::sleep(RETRY_SLEEP);
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-
-        Err(std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            "could not acquire exclusive lock on history file after multiple attempts",
-        ))
+        let mut file = open_locked_history(&path, true)?;
+        recover_incomplete_suffix(&mut file)?;
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(line.as_bytes())?;
+        file.flush()?;
+        enforce_history_limit(&mut file, &path, history_max_bytes, line.len() as u64)
     })
     .await??;
-
     Ok(())
 }
 
-/// Trim the history file to honor `max_bytes`, dropping the oldest lines while holding
-/// the write lock so the newest entry is always retained. When the file exceeds the
-/// hard cap, it rewrites the remaining tail to a soft cap to avoid trimming again
-/// immediately on the next write.
-fn enforce_history_limit(file: &mut File, max_bytes: Option<usize>) -> Result<()> {
-    let Some(max_bytes) = max_bytes else {
-        return Ok(());
-    };
-
-    if max_bytes == 0 {
-        return Ok(());
-    }
-
-    let max_bytes = match u64::try_from(max_bytes) {
-        Ok(value) => value,
-        Err(_) => return Ok(()),
-    };
-
-    let mut current_len = file.metadata()?.len();
-
-    if current_len <= max_bytes {
-        return Ok(());
-    }
-
-    let mut reader_file = file.try_clone()?;
-    reader_file.seek(SeekFrom::Start(0))?;
-
-    let mut buf_reader = BufReader::new(reader_file);
-    let mut line_lengths = Vec::new();
-    let mut line_buf = String::new();
-
-    loop {
-        line_buf.clear();
-
-        let bytes = buf_reader.read_line(&mut line_buf)?;
-
-        if bytes == 0 {
-            break;
+// A writer may have opened the previous file before another writer replaced it.
+// Check identity only after locking, then reopen stale handles. Readers use the
+// same protocol so their identity and contents describe one coherent snapshot.
+fn open_locked_history(path: &Path, exclusive: bool) -> Result<File> {
+    for _ in 0..MAX_RETRIES {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(exclusive)
+            .create(exclusive)
+            .truncate(false)
+            .open(path)?;
+        let lock = if exclusive {
+            file.try_lock()
+        } else {
+            file.try_lock_shared()
+        };
+        match lock {
+            Ok(()) => {
+                if log_identity(&file)? == log_identity(&File::open(path)?)? {
+                    return Ok(file);
+                }
+            }
+            Err(std::fs::TryLockError::WouldBlock) => std::thread::sleep(RETRY_SLEEP),
+            Err(error) => return Err(error.into()),
         }
-
-        line_lengths.push(bytes as u64);
     }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        "could not lock the current history file after multiple attempts",
+    ))
+}
 
-    if line_lengths.is_empty() {
+fn recover_incomplete_suffix(file: &mut File) -> Result<()> {
+    let mut end = file.metadata()?.len();
+    if end == 0 {
         return Ok(());
     }
-
-    let last_index = line_lengths.len() - 1;
-    let trim_target = trim_target_bytes(max_bytes, line_lengths[last_index]);
-
-    let mut drop_bytes = 0u64;
-    let mut idx = 0usize;
-
-    while current_len > trim_target && idx < last_index {
-        current_len = current_len.saturating_sub(line_lengths[idx]);
-        drop_bytes += line_lengths[idx];
-        idx += 1;
-    }
-
-    if drop_bytes == 0 {
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0];
+    file.read_exact(&mut last)?;
+    if last[0] == b'\n' {
         return Ok(());
     }
+    let mut buffer = [0; HISTORY_READ_BUFFER_SIZE];
+    while end > 0 {
+        let start = end.saturating_sub(buffer.len() as u64);
+        let len = (end - start) as usize;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buffer[..len])?;
+        if let Some(index) = memchr::memrchr(b'\n', &buffer[..len]) {
+            return file.set_len(start + index as u64 + 1);
+        }
+        end = start;
+    }
+    file.set_len(0)
+}
 
-    let mut reader = buf_reader.into_inner();
-    reader.seek(SeekFrom::Start(drop_bytes))?;
-
-    let capacity = usize::try_from(current_len).unwrap_or(0);
-    let mut tail = Vec::with_capacity(capacity);
-
-    reader.read_to_end(&mut tail)?;
-
-    file.set_len(0)?;
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(&tail)?;
-    file.flush()?;
-
+/// Retain complete records within the soft cap, always keeping the newest entry.
+/// Copy only the retained suffix and publish it without truncating the original.
+fn enforce_history_limit(
+    file: &mut File,
+    path: &Path,
+    max_bytes: Option<usize>,
+    newest_entry_len: u64,
+) -> Result<()> {
+    let Some(max_bytes) = max_bytes.filter(|limit| *limit > 0) else {
+        return Ok(());
+    };
+    let current_len = file.metadata()?.len();
+    if current_len <= max_bytes as u64 {
+        return Ok(());
+    }
+    let target = trim_target_bytes(max_bytes as u64, newest_entry_len);
+    let start = current_len.saturating_sub(target);
+    if start == 0 {
+        return Ok(());
+    }
+    // Start one byte earlier so a suffix already aligned to a line is retained.
+    file.seek(SeekFrom::Start(start - 1))?;
+    let mut reader = BufReader::new(file);
+    reader.skip_until(b'\n')?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("history has no parent"))?;
+    let mut replacement = tempfile::NamedTempFile::new_in(parent)?;
+    std::io::copy(&mut reader, &mut replacement)?;
+    replacement.as_file().sync_all()?;
+    // Keep both generations locked across publication. Waiting users of the old
+    // generation must reopen; users of the new one wait for publication to finish.
+    replacement.as_file().lock()?;
+    replacement.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -261,10 +243,10 @@ fn trim_target_bytes(max_bytes: u64, newest_entry_len: u64) -> u64 {
 
 /// Asynchronously fetch the history file's *identifier* and current entry count.
 ///
-/// The identifier is the file's inode on Unix or creation time on Windows.
+/// The identifier is the Windows file index, stable across ordinary appends.
 /// The entry count is derived by counting newline bytes in the file. Returns
 /// `(0, 0)` when the file does not exist or its metadata cannot be read. If
-/// metadata succeeds but the file cannot be opened or scanned, returns
+/// opening and locking succeeds but scanning fails, returns
 /// `(log_id, 0)` so callers can still detect that a history file exists.
 pub async fn history_metadata(config: &HistoryConfig) -> (u64, usize) {
     let path = history_filepath(config);
@@ -273,10 +255,10 @@ pub async fn history_metadata(config: &HistoryConfig) -> (u64, usize) {
 
 /// Look up a single history entry by file identity and zero-based offset.
 ///
-/// Returns `Some(entry)` when the current history file's identifier (inode on
-/// Unix, creation time on Windows) matches `log_id` **and** a valid JSON
+/// Returns `Some(entry)` when the current history file's identifier (file index on
+/// the Windows filesystem) matches `log_id` **and** a valid JSON
 /// record exists at `offset`. Returns `None` on any mismatch, I/O error, or
-/// parse failure, all of which are logged at `warn` level.
+/// parse failure. I/O and parse failures are logged at `warn` level.
 ///
 /// This function is synchronous because it acquires a shared advisory file lock
 /// via `File::try_lock_shared`. Callers on an async runtime should wrap it in
@@ -286,112 +268,71 @@ pub fn lookup(log_id: u64, offset: usize, config: &HistoryConfig) -> Option<Hist
     lookup_history_entry(&path, log_id, offset)
 }
 
-// On Windows, simply succeed.
-async fn ensure_owner_only_permissions(_file: &File) -> Result<()> {
-    Ok(())
-}
-
 async fn history_metadata_for_file(path: &Path) -> (u64, usize) {
-    let log_id = match fs::metadata(path).await {
-        Ok(metadata) => log_identity(&metadata).unwrap_or(0),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, 0),
-        Err(_) => return (0, 0),
-    };
-
-    // Open the file.
-    let mut file = match fs::File::open(path).await {
-        Ok(f) => f,
-        Err(_) => return (log_id, 0),
-    };
-
-    // Count newline bytes.
-    let mut buf = [0u8; HISTORY_READ_BUFFER_SIZE];
-    let mut count = 0usize;
-    loop {
-        match file.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                count += memchr_iter(b'\n', &buf[..n]).count();
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<(u64, usize)> {
+        let mut file = open_locked_history(&path, false)?;
+        let log_id = log_identity(&file)?;
+        let mut buffer = [0; HISTORY_READ_BUFFER_SIZE];
+        let mut count = 0;
+        loop {
+            match file.read(&mut buffer) {
+                Ok(0) => return Ok((log_id, count)),
+                Ok(len) => count += memchr_iter(b'\n', &buffer[..len]).count(),
+                Err(_) => return Ok((log_id, 0)),
             }
-            Err(_) => return (log_id, 0),
         }
-    }
-
-    (log_id, count)
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or((0, 0))
 }
 
 fn lookup_history_entry(path: &Path, log_id: u64, offset: usize) -> Option<HistoryEntry> {
-    use std::io::BufRead;
-    use std::io::BufReader;
-
-    let file: File = match OpenOptions::new().read(true).open(path) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to open history file");
-            return None;
+    let result = (|| -> Result<Option<HistoryEntry>> {
+        let file = open_locked_history(path, false)?;
+        if log_id != 0 && log_identity(&file)? != log_id {
+            return Ok(None);
         }
-    };
-
-    let metadata = match file.metadata() {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to stat history file");
-            return None;
+        let mut reader = BufReader::new(file);
+        for _ in 0..offset {
+            if reader.skip_until(b'\n')? == 0 {
+                return Ok(None);
+            }
         }
-    };
-
-    let current_log_id = log_identity(&metadata)?;
-
-    if log_id != 0 && current_log_id != log_id {
-        return None;
-    }
-
-    // Open & lock file for reading using a shared lock.
-    // Retry a few times to avoid indefinite blocking.
-    for _ in 0..MAX_RETRIES {
-        let lock_result = file.try_lock_shared();
-
-        match lock_result {
-            Ok(()) => {
-                let reader = BufReader::new(&file);
-                for (idx, line_res) in reader.lines().enumerate() {
-                    let line = match line_res {
-                        Ok(l) => l,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to read line from history file");
-                            return None;
-                        }
-                    };
-
-                    if idx == offset {
-                        match serde_json::from_str::<HistoryEntry>(&line) {
-                            Ok(entry) => return Some(entry),
-                            Err(e) => {
-                                tracing::warn!(error = %e, "failed to parse history entry");
-                                return None;
-                            }
-                        }
-                    }
-                }
-                // Not found at requested offset.
-                return None;
-            }
-            Err(std::fs::TryLockError::WouldBlock) => {
-                std::thread::sleep(RETRY_SLEEP);
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to acquire shared lock on history file");
-                return None;
-            }
+        let mut line = Vec::new();
+        reader.read_until(b'\n', &mut line)?;
+        if line.last() != Some(&b'\n') {
+            return Ok(None);
+        }
+        serde_json::from_slice(&line)
+            .map(Some)
+            .map_err(std::io::Error::other)
+    })();
+    match result {
+        Ok(entry) => entry,
+        Err(error) => {
+            tracing::warn!(%error, "failed to look up history entry");
+            None
         }
     }
-
-    None
 }
 
-fn log_identity(metadata: &std::fs::Metadata) -> Option<u64> {
-    use std::os::windows::fs::MetadataExt;
-    Some(metadata.creation_time())
+// A file index survives appends but changes on replacement, unlike Windows
+// creation timestamps, which can be preserved by filesystem name tunneling.
+fn log_identity(file: &File) -> Result<u64> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION;
+    use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle;
+    // SAFETY: this structure contains only integer and FILETIME fields, for which
+    // zero is valid, and is initialized here as writable API output storage.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle remains owned by `file`; `info` is valid writable storage.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow))
 }
 
 #[cfg(test)]

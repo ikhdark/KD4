@@ -58,9 +58,11 @@ async fn hydrate_sends_bearer_token_and_preserves_metadata() {
 #[tokio::test]
 async fn hydrate_preserves_missing_email() {
     let server = MockServer::start().await;
+    let mut metadata = response(None);
+    metadata.as_object_mut().unwrap().remove("email");
     Mock::given(method("GET"))
         .and(path(WHOAMI_PATH))
-        .respond_with(ResponseTemplate::new(200).set_body_json(response(/*email*/ None)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
         .expect(1)
         .mount(&server)
         .await;

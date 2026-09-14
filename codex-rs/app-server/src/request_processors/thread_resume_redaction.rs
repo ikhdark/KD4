@@ -140,7 +140,11 @@ mod tests {
                 }),
                 mcp_app_resource_uri: Some("ui://widget/lookup.html".to_string()),
                 plugin_id: Some("sample@test".to_string()),
-                result: Some(Box::new(redacted_mcp_tool_call_result())),
+                result: Some(Box::new(McpToolCallResult {
+                    content: vec![serde_json::json!({"type": "text", "text": "[redacted]"})],
+                    structured_content: None,
+                    meta: None,
+                })),
                 error: None,
                 duration_ms: Some(8),
             }

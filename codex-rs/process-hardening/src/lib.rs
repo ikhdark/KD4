@@ -8,6 +8,7 @@ use windows_sys::Win32::System::SystemServices::PROCESS_MITIGATION_EXTENSION_POI
 use windows_sys::Win32::System::SystemServices::PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY_0;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::Threading::GetProcessMitigationPolicy;
+use windows_sys::Win32::System::Threading::PROCESS_DEP_DISABLE_ATL_THUNK_EMULATION;
 use windows_sys::Win32::System::Threading::PROCESS_DEP_ENABLE;
 use windows_sys::Win32::System::Threading::ProcessDEPPolicy;
 use windows_sys::Win32::System::Threading::ProcessExtensionPointDisablePolicy;
@@ -53,14 +54,12 @@ fn enable_dep(flags: u32) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: the successful query initialized the union's `Flags` field.
-    if unsafe { current.Anonymous.Flags } & flags == flags && current.Permanent {
+    let current_flags = unsafe { current.Anonymous.Flags };
+    if current_flags & flags == flags && current.Permanent {
         return Ok(());
     }
 
-    let policy = PROCESS_MITIGATION_DEP_POLICY {
-        Anonymous: PROCESS_MITIGATION_DEP_POLICY_0 { Flags: flags },
-        Permanent: true,
-    };
+    let policy = hardened_dep_policy(current_flags, flags);
     // SAFETY: `policy` has the structure and lifetime required for this policy kind,
     // and SetProcessMitigationPolicy does not retain the buffer.
     if unsafe {
@@ -74,6 +73,17 @@ fn enable_dep(flags: u32) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+fn hardened_dep_policy(current_flags: u32, flags: u32) -> PROCESS_MITIGATION_DEP_POLICY {
+    // Preserve existing documented settings without copying reserved bits.
+    let known_flags = PROCESS_DEP_ENABLE | PROCESS_DEP_DISABLE_ATL_THUNK_EMULATION;
+    PROCESS_MITIGATION_DEP_POLICY {
+        Anonymous: PROCESS_MITIGATION_DEP_POLICY_0 {
+            Flags: (current_flags & known_flags) | flags,
+        },
+        Permanent: true,
+    }
 }
 
 fn disable_extension_points(flags: u32) -> io::Result<()> {
@@ -139,10 +149,7 @@ mod tests {
 
         assert_eq!(
             calls.into_inner(),
-            vec![
-                ("dep", DEP_POLICY_FLAGS),
-                ("extension-points", EXTENSION_POINT_DISABLE_POLICY_FLAGS),
-            ]
+            vec![("dep", 1), ("extension-points", 1)]
         );
     }
 
@@ -164,8 +171,54 @@ mod tests {
     }
 
     #[test]
+    fn dep_policy_preserves_documented_settings_and_drops_reserved_bits() {
+        for (current, expected) in [(0, 1), (1, 1), (2, 3), (3, 3), (u32::MAX, 3)] {
+            let policy = hardened_dep_policy(current, DEP_POLICY_FLAGS);
+            // SAFETY: hardened_dep_policy initializes the union's Flags field.
+            assert_eq!(unsafe { policy.Anonymous.Flags }, expected);
+            assert!(policy.Permanent);
+        }
+    }
+
+    #[test]
     fn hardening_applies_to_the_current_process_idempotently() {
         pre_main_hardening_windows().expect("apply Windows hardening");
         pre_main_hardening_windows().expect("already-applied hardening remains successful");
+
+        let mut dep = PROCESS_MITIGATION_DEP_POLICY::default();
+        let mut extension_points = PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY::default();
+        // SAFETY: both queries receive writable buffers of the required policy
+        // structure and size; neither API call retains the buffer.
+        unsafe {
+            assert_ne!(
+                GetProcessMitigationPolicy(
+                    GetCurrentProcess(),
+                    ProcessDEPPolicy,
+                    &raw mut dep as *mut c_void,
+                    size_of_val(&dep),
+                ),
+                0,
+                "query DEP policy: {}",
+                io::Error::last_os_error()
+            );
+            assert_ne!(
+                GetProcessMitigationPolicy(
+                    GetCurrentProcess(),
+                    ProcessExtensionPointDisablePolicy,
+                    &raw mut extension_points as *mut c_void,
+                    size_of_val(&extension_points),
+                ),
+                0,
+                "query extension-point policy: {}",
+                io::Error::last_os_error()
+            );
+            assert_eq!(dep.Anonymous.Flags & 1, 1, "DEP must be enabled");
+            assert!(dep.Permanent, "DEP must be permanent");
+            assert_eq!(
+                extension_points.Anonymous.Flags & 1,
+                1,
+                "extension points must be disabled"
+            );
+        }
     }
 }

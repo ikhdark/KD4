@@ -19,7 +19,7 @@ use crate::MaybeApplyPatchVerified;
 use crate::parser::Hunk;
 use crate::parser::ParseError;
 use crate::parser::parse_patch;
-use crate::unified_diff_from_chunks;
+use crate::unified_diff_from_chunks_internal;
 use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
 use std::str::Utf8Error;
@@ -44,12 +44,10 @@ enum MaybeApplyPatch {
 
 #[derive(Debug, PartialEq)]
 pub enum ExtractHeredocError {
-    UnsupportedShell,
     CommandDidNotStartWithApplyPatch,
     FailedToLoadBashGrammar(LanguageError),
     HeredocNotUtf8(Utf8Error),
     FailedToParsePatchIntoAst,
-    FailedToFindHeredocBody,
 }
 
 fn classify_shell_name(shell: &str, convention: PathConvention) -> Option<String> {
@@ -131,10 +129,9 @@ fn maybe_parse_apply_patch(argv: &[String], cwd: &PathUri) -> MaybeApplyPatch {
                     }
                     Err(e) => MaybeApplyPatch::PatchParseError(e),
                 },
-                Err(
-                    ExtractHeredocError::CommandDidNotStartWithApplyPatch
-                    | ExtractHeredocError::UnsupportedShell,
-                ) => MaybeApplyPatch::NotApplyPatch,
+                Err(ExtractHeredocError::CommandDidNotStartWithApplyPatch) => {
+                    MaybeApplyPatch::NotApplyPatch
+                }
                 Err(e) => MaybeApplyPatch::ShellParseError(e),
             },
             None => MaybeApplyPatch::NotApplyPatch,
@@ -177,14 +174,24 @@ async fn maybe_parse_apply_patch_verified_inner(
     // Detect a raw patch body passed directly as the command or as the body of a shell
     // script. In these cases, report an explicit error rather than applying the patch.
     if let [body] = argv
+        && body.contains(crate::parser::BEGIN_PATCH_MARKER)
         && parse_patch(body).is_ok()
     {
         return MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ImplicitInvocation);
     }
-    if let Some((_, script)) = parse_shell_script(argv, cwd)
-        && parse_patch(script).is_ok()
-    {
-        return MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ImplicitInvocation);
+    if let Some((_, script)) = parse_shell_script(argv, cwd) {
+        if script.contains(crate::parser::BEGIN_PATCH_MARKER) {
+            if parse_patch(script).is_ok() {
+                return MaybeApplyPatchVerified::CorrectnessError(
+                    ApplyPatchError::ImplicitInvocation,
+                );
+            }
+        } else if !APPLY_PATCH_COMMANDS
+            .iter()
+            .any(|name| script.contains(name))
+        {
+            return MaybeApplyPatchVerified::NotApplyPatch;
+        }
     }
 
     match maybe_parse_apply_patch(argv, cwd) {
@@ -237,6 +244,13 @@ async fn try_verify_apply_patch_args(
         .map(|dir| cwd.join(dir))
         .transpose()?
         .unwrap_or_else(|| cwd.clone());
+    if workdir.is_some() && !fs.get_metadata(&effective_cwd, sandbox).await?.is_directory {
+        return Err(ParseError::InvalidPatchError(format!(
+            "cd target is not a directory: {}",
+            effective_cwd.inferred_native_path_string()
+        ))
+        .into());
+    }
 
     let mut mutation_endpoints = HashSet::new();
     for hunk in &hunks {
@@ -262,7 +276,7 @@ async fn try_verify_apply_patch_args(
     }
 
     let mut changes = HashMap::new();
-    for hunk in hunks {
+    for (hunk_index, hunk) in hunks.into_iter().enumerate() {
         let path = hunk.resolve_path(&effective_cwd)?;
         match hunk {
             Hunk::AddFile { contents, .. } => {
@@ -284,7 +298,15 @@ async fn try_verify_apply_patch_args(
                     unified_diff,
                     content: contents,
                     ..
-                } = unified_diff_from_chunks(&path, &chunks, fs, sandbox).await?;
+                } = unified_diff_from_chunks_internal(
+                    &path,
+                    &chunks,
+                    1,
+                    Some(hunk_index + 1),
+                    fs,
+                    sandbox,
+                )
+                .await?;
                 changes.insert(
                     path,
                     ApplyPatchFileChange::Update {
@@ -308,7 +330,7 @@ async fn try_verify_apply_patch_args(
 /// Resolve existing endpoints through links and resolve the closest existing
 /// ancestor of prospective endpoints. This prevents differently-spelled paths
 /// from bypassing the one-mutation-per-endpoint invariant.
-async fn mutation_endpoint_identity(
+pub(crate) async fn mutation_endpoint_identity(
     fs: &dyn ExecutorFileSystem,
     path: &PathUri,
     sandbox: Option<&codex_exec_server::FileSystemSandboxContext>,
@@ -379,8 +401,7 @@ async fn mutation_endpoint_identity(
 /// - Parsed with Tree‑sitter Bash and a strict query that uses anchors so the
 ///   heredoc‑redirected statement is the only top‑level statement.
 /// - The connector between `cd` and `apply_patch` must be `&&` (not `|` or `||`).
-/// - Exactly one positional `word` argument is allowed for `cd` (no flags, no quoted
-///   strings, no second argument).
+/// - Exactly one literal path argument is allowed for `cd`, optionally quoted.
 /// - The apply command is validated in‑query via `#any-of?` to allow `apply_patch`
 ///   or `applypatch`.
 /// - Preceding or trailing commands (e.g., `echo ...;` or `... && echo done`) do not match.
@@ -439,12 +460,12 @@ fn extract_apply_patch_from_bash(
                                 name: (command_name (word) @cd_name) .
                                 argument: [
                                   (word) @cd_path
-                                  (string (string_content) @cd_path)
+                                  (string . (string_content) @cd_path .)
                                   (raw_string) @cd_raw_string
                                 ] .)
                             "&&"
                             . (command
-                                name: (command_name (word) @apply_name))
+                                name: (command_name (word) @apply_name) .)
                             .)
                     (#eq? @cd_name "cd")
                     (#any-of? @apply_name "apply_patch" "applypatch")
@@ -470,6 +491,9 @@ fn extract_apply_patch_from_bash(
 
     let bytes = src.as_bytes();
     let root = tree.root_node();
+    if root.has_error() {
+        return Err(ExtractHeredocError::FailedToParsePatchIntoAst);
+    }
 
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&APPLY_PATCH_QUERY, root, bytes);
@@ -633,6 +657,106 @@ mod tests {
             ),
             MaybeApplyPatch::NotApplyPatch
         );
+    }
+
+    #[test]
+    fn test_cd_rejects_extra_arguments_and_expansions() {
+        for prefix in [
+            "cd repo && apply_patch extra ",
+            "cd \"repo/$HOME\" && apply_patch ",
+            "cd \"repo/$(pwd)\" && apply_patch ",
+        ] {
+            let script = format!(
+                "{prefix}<<'PATCH'\n*** Begin Patch\n*** Add File: a.txt\n+x\n*** End Patch\nPATCH"
+            );
+            assert!(
+                matches!(
+                    maybe_parse_apply_patch(
+                        &strs_to_strings(&["bash", "-lc", &script]),
+                        &PathUri::parse("file:///workspace").unwrap()
+                    ),
+                    MaybeApplyPatch::NotApplyPatch
+                ),
+                "{script}"
+            );
+        }
+        assert!(extract_apply_patch_from_bash("apply_patch <<'PATCH'\n*** Begin Patch\n").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_explicit_cd_requires_an_existing_directory() {
+        let tmp = tempdir().unwrap();
+        let cwd = PathUri::from_host_native_path(tmp.path()).unwrap();
+        fs::write(tmp.path().join("file"), "not a directory").unwrap();
+        fs::create_dir(tmp.path().join("repo")).unwrap();
+        for directory in ["missing", "file", "repo"] {
+            let script = format!(
+                "cd {directory} && apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: a.txt\n+x\n*** End Patch\nPATCH"
+            );
+            let result = maybe_parse_apply_patch_verified(
+                &strs_to_strings(&["bash", "-lc", &script]),
+                &cwd,
+                LOCAL_FS.as_ref(),
+                None,
+            )
+            .await;
+            if directory == "repo" {
+                let MaybeApplyPatchVerified::Body(action) = result else {
+                    panic!("{result:?}")
+                };
+                assert_eq!(action.cwd, cwd.join("repo").unwrap());
+                assert_eq!(
+                    action.changes().get(&cwd.join("repo/a.txt").unwrap()),
+                    Some(&ApplyPatchFileChange::Add {
+                        content: "x\n".to_string()
+                    })
+                );
+            } else {
+                assert!(
+                    matches!(result, MaybeApplyPatchVerified::CorrectnessError(_)),
+                    "{result:?}"
+                );
+            }
+        }
+        assert!(!tmp.path().join("missing").exists());
+        assert!(!tmp.path().join("repo/a.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_verification_reports_structured_mismatch_without_writes() {
+        let tmp = tempdir().unwrap();
+        let cwd = PathUri::from_host_native_path(tmp.path()).unwrap();
+        let original = "anchor\ncurrent\ntail\n";
+        fs::write(tmp.path().join("a.txt"), original).unwrap();
+        let patch = "*** Begin Patch\n*** Add File: untouched.txt\n+x\n*** Update File: a.txt\n@@\n anchor\n-obsolete\n+new\n tail\n*** End Patch";
+        let result = maybe_parse_apply_patch_verified(
+            &strs_to_strings(&["apply_patch", patch]),
+            &cwd,
+            LOCAL_FS.as_ref(),
+            None,
+        )
+        .await;
+        let MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::PatchContextMismatch(
+            mismatch,
+        )) = result
+        else {
+            panic!("{result:?}")
+        };
+        assert_eq!(mismatch.hunk_ordinal, 2);
+        assert_eq!(mismatch.chunk_ordinal, 1);
+        assert_eq!(
+            mismatch.canonical_path,
+            cwd.join("a.txt").unwrap().to_string()
+        );
+        assert_eq!(
+            mismatch.current_excerpt,
+            "     1 | anchor\n     2 | current\n     3 | tail"
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+            original
+        );
+        assert!(!tmp.path().join("untouched.txt").exists());
     }
 
     #[tokio::test]

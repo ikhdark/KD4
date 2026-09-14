@@ -12,7 +12,11 @@ use super::search_mode::SearchMode;
 
 pub(super) fn render_footer(area: Rect, buf: &mut Buffer, search_mode: SearchMode) {
     let right_line = search_mode_indicator_line(search_mode);
-    let right_width = right_line.width() as u16;
+    let right_width = if right_line.width() <= usize::from(area.width) {
+        right_line.width() as u16
+    } else {
+        0
+    };
     let gap = u16::from(right_width > 0);
     let left_width = area.width.saturating_sub(right_width).saturating_sub(gap);
     let left_line =
@@ -78,4 +82,21 @@ fn search_mode_indicator_line(active_search_mode: SearchMode) -> Line<'static> {
     }
 
     Line::from(spans)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn narrow_footer_keeps_insertion_hint() {
+        let area = Rect::new(0, 0, 20, 1);
+        let mut buf = Buffer::empty(area);
+        render_footer(area, &mut buf, SearchMode::Tools);
+        assert_eq!(
+            (0..12).map(|x| buf[(x, 0)].symbol()).collect::<String>(),
+            "enter insert"
+        );
+    }
 }

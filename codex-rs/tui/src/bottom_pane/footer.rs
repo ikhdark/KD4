@@ -303,7 +303,7 @@ fn left_side_line(
     };
 
     if let Some(collaboration_mode_indicator) = collaboration_mode_indicator {
-        if !matches!(state.hint, SummaryHintKind::None) {
+        if line.width() > 0 {
             line.push_span(" · ".dim());
         }
         line.push_span(collaboration_mode_indicator.styled_span(state.show_cycle_hint));
@@ -611,7 +611,7 @@ pub(crate) fn max_left_width_for_right(area: Rect, right_width: u16) -> Option<u
 
 pub(crate) fn can_show_left_with_context(area: Rect, left_width: u16, context_width: u16) -> bool {
     let Some(context_x) = right_aligned_x(area, context_width) else {
-        return true;
+        return left_fits(area, left_width);
     };
     if left_width == 0 {
         return true;
@@ -1229,6 +1229,14 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::Backend;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn missing_context_still_requires_left_text_to_fit() {
+        let area = Rect::new(5, 3, 12, 1);
+        assert!(can_show_left_with_context(area, 5, 0));
+        assert!(!can_show_left_with_context(area, 20, 0));
+        assert!(!can_show_left_with_context(Rect::new(0, 0, 0, 0), 1, 0));
+    }
 
     #[test]
     fn oversized_context_span_keeps_visible_prefix() {

@@ -1506,6 +1506,11 @@ fn list_marketplaces_dedupes_multiple_roots_in_same_repo() {
     )
     .unwrap();
 
+    let nested_only = list_marketplaces_with_home(
+        &[AbsolutePathBuf::try_from(nested_root.clone()).unwrap()],
+        None,
+    )
+    .unwrap();
     let marketplaces = list_marketplaces_with_home(
         &[
             AbsolutePathBuf::try_from(repo_root.clone()).unwrap(),
@@ -1516,6 +1521,8 @@ fn list_marketplaces_dedupes_multiple_roots_in_same_repo() {
     .unwrap()
     .marketplaces;
 
+    assert_eq!(nested_only.marketplaces, marketplaces);
+    assert!(nested_only.errors.is_empty());
     assert_eq!(
         marketplaces,
         vec![Marketplace {
@@ -2277,4 +2284,38 @@ fn find_installable_marketplace_plugin_rejects_explicit_empty_products() {
         err.to_string(),
         "plugin `disabled-plugin` is not available for install in marketplace `codex-curated`"
     );
+}
+
+#[test]
+fn repeated_direct_marketplace_does_not_discover_enclosing_repository() {
+    let tmp = tempdir().unwrap();
+    let parent = tmp.path().join("repo");
+    let nested = parent.join("nested");
+    fs::create_dir_all(parent.join(".git")).unwrap();
+    for (root, name) in [(&parent, "parent"), (&nested, "nested")] {
+        fs::create_dir_all(root.join(".agents/plugins")).unwrap();
+        fs::write(
+            root.join(".agents/plugins/marketplace.json"),
+            format!(r#"{{"name":"{name}","plugins":[]}}"#),
+        )
+        .unwrap();
+    }
+    let manifest =
+        AbsolutePathBuf::try_from(nested.join(".agents/plugins/marketplace.json")).unwrap();
+    let root = AbsolutePathBuf::try_from(nested).unwrap();
+    for roots in [
+        vec![root.clone(), root],
+        vec![manifest.clone(), manifest.clone()],
+    ] {
+        let outcome = list_marketplaces_with_home(&roots, None).unwrap();
+        assert!(outcome.errors.is_empty());
+        assert_eq!(
+            outcome
+                .marketplaces
+                .iter()
+                .map(|marketplace| (&marketplace.name, &marketplace.path))
+                .collect::<Vec<_>>(),
+            vec![(&"nested".to_string(), &manifest)]
+        );
+    }
 }

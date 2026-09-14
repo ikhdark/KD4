@@ -791,7 +791,10 @@ impl ConfigToml {
                         )
                     })
                     .await
-                    .expect("permission profile projection worker panicked")
+                    .unwrap_or_else(|error| {
+                        tracing::error!(%error, "permission profile projection worker failed; falling back to read-only");
+                        PermissionProfile::read_only()
+                    })
                 }
                 None => PermissionProfile::workspace_write(),
             },

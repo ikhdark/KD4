@@ -117,7 +117,17 @@ fn spawned_thread_start_appends_to_root_bundle() -> anyhow::Result<()> {
 
 #[test]
 fn disabled_thread_context_accepts_trace_calls_without_writing() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    struct Unused;
+    impl serde::Serialize for Unused {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            panic!("disabled tracing serialized a request")
+        }
+    }
+    impl std::fmt::Display for Unused {
+        fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            panic!("disabled tracing formatted an error")
+        }
+    }
     let thread_trace = ThreadTraceContext::disabled();
 
     thread_trace.record_ended(RolloutStatus::Completed);
@@ -137,10 +147,10 @@ fn disabled_thread_context_accepts_trace_calls_without_writing() -> anyhow::Resu
     let inference_trace =
         thread_trace.inference_trace_context("turn-1", "gpt-test", "test-provider");
     let inference_attempt = inference_trace.start_attempt();
-    inference_attempt.record_started(&serde_json::json!({ "kind": "inference" }));
+    inference_attempt.record_started(&Unused);
     let token_usage: Option<codex_protocol::protocol::TokenUsage> = None;
     inference_attempt.record_completed("response-1", Some("req-1"), &token_usage, &[]);
-    inference_attempt.record_failed("inference failed", /*upstream_request_id*/ None, &[]);
+    inference_attempt.record_failed(Unused, /*upstream_request_id*/ None, &[]);
 
     let compaction_trace = thread_trace.compaction_trace_context(
         "turn-1",
@@ -148,10 +158,9 @@ fn disabled_thread_context_accepts_trace_calls_without_writing() -> anyhow::Resu
         "gpt-test",
         "test-provider",
     );
-    let compaction_attempt =
-        compaction_trace.start_attempt(&serde_json::json!({ "kind": "compaction" }));
+    let compaction_attempt = compaction_trace.start_attempt(&Unused);
     compaction_attempt.record_completed(&[]);
-    compaction_attempt.record_failed("compaction failed");
+    compaction_attempt.record_failed(Unused);
     compaction_trace.record_installed(&CompactionCheckpointTracePayload {
         input_history: &[],
         replacement_history: &[],
@@ -164,8 +173,6 @@ fn disabled_thread_context_accepts_trace_calls_without_writing() -> anyhow::Resu
     });
     assert!(!built_dispatch_invocation.get());
     assert!(!dispatch_trace.is_enabled());
-
-    assert_eq!(fs::read_dir(temp.path())?.count(), 0);
 
     Ok(())
 }
@@ -211,21 +218,34 @@ fn protocol_wrapper_records_selected_events_as_raw_payloads() -> anyhow::Result<
     let thread_trace =
         ThreadTraceContext::start_root_in_root_for_test(temp.path(), minimal_metadata(thread_id))?;
 
+    let child_id = ThreadId::new();
+    let child = thread_trace.start_child_thread_trace_or_disabled(minimal_metadata(child_id));
     thread_trace.record_protocol_event(&EventMsg::ShutdownComplete);
+    child.record_protocol_event(&EventMsg::ShutdownComplete);
 
-    let event_log = fs::read_to_string(single_bundle_dir(temp.path())?.join("trace.jsonl"))?;
-    let protocol_event_seen = event_log.lines().any(|line| {
-        let event: crate::RawTraceEvent = serde_json::from_str(line).expect("raw trace event");
-        matches!(
-            event.payload,
-            RawTraceEventPayload::ProtocolEventObserved {
-                event_type,
-                ..
-            } if event_type == "shutdown_complete"
-        )
-    });
-
-    assert!(protocol_event_seen);
+    let bundle = single_bundle_dir(temp.path())?;
+    let event_log = fs::read_to_string(bundle.join("trace.jsonl"))?;
+    let mut owners = Vec::new();
+    for line in event_log.lines() {
+        let event: crate::RawTraceEvent = serde_json::from_str(line)?;
+        if let RawTraceEventPayload::ProtocolEventObserved {
+            event_type,
+            event_payload,
+        } = event.payload
+        {
+            assert_eq!(event_type, "shutdown_complete");
+            assert_eq!(event.codex_turn_id, None);
+            assert_eq!(event_payload.kind, RawPayloadKind::ProtocolEvent);
+            let contents: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(bundle.join(event_payload.path))?)?;
+            assert_eq!(contents, serde_json::json!({"type": "shutdown_complete"}));
+            owners.push(event.thread_id);
+        }
+    }
+    assert_eq!(
+        owners,
+        vec![Some(thread_id.to_string()), Some(child_id.to_string())]
+    );
     Ok(())
 }
 
@@ -319,4 +339,192 @@ fn single_bundle_dir(root: &Path) -> anyhow::Result<PathBuf> {
     entries.sort();
     assert_eq!(entries.len(), 1);
     Ok(entries.remove(0))
+}
+
+#[test]
+fn provider_completion_survives_response_capture_failure() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let thread = ThreadTraceContext::start_root_in_root_for_test(
+        temp.path(),
+        minimal_metadata(ThreadId::new()),
+    )?;
+    thread.record_codex_turn_started("turn-1");
+    let inference = thread
+        .inference_trace_context("turn-1", "model", "provider")
+        .start_attempt();
+    inference.record_started(&serde_json::json!({"input": []}));
+    let compaction = thread
+        .compaction_trace_context("turn-1", "compact-1", "model", "provider")
+        .start_attempt(&serde_json::json!({"input": []}));
+    let bundle = single_bundle_dir(temp.path())?;
+    // Keep request evidence readable while making the next payload writes fail.
+    fs::create_dir(bundle.join("payloads/4.json"))?;
+    fs::create_dir(bundle.join("payloads/5.json"))?;
+    inference.record_completed("response-1", Some("request-1"), &None, &[]);
+    inference.record_failed("late duplicate", None, &[]);
+    compaction.record_completed(&[]);
+    let replayed = replay_bundle(&bundle)?;
+    let call = replayed
+        .inference_calls
+        .values()
+        .next()
+        .expect("inference start");
+    assert_eq!(call.execution.status, ExecutionStatus::Completed);
+    assert_eq!(call.response_id.as_deref(), Some("response-1"));
+    assert_eq!(call.upstream_request_id.as_deref(), Some("request-1"));
+    assert_eq!(call.raw_response_payload_id, None);
+    let compact = replayed
+        .compaction_requests
+        .values()
+        .next()
+        .expect("compaction start");
+    assert_eq!(compact.execution.status, ExecutionStatus::Completed);
+    assert_eq!(compact.raw_response_payload_id, None);
+    let events = fs::read_to_string(bundle.join("trace.jsonl"))?;
+    assert_eq!(
+        events
+            .lines()
+            .filter(|line| line.contains("inference_completed"))
+            .count(),
+        1
+    );
+    assert!(!events.contains("inference_failed"));
+    Ok(())
+}
+
+#[test]
+fn failed_request_capture_does_not_emit_unmatched_terminal_events() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let thread = ThreadTraceContext::start_root_in_root_for_test(
+        temp.path(),
+        minimal_metadata(ThreadId::new()),
+    )?;
+    thread.record_codex_turn_started("turn-1");
+    let bundle = single_bundle_dir(temp.path())?;
+    fs::create_dir(bundle.join("payloads/2.json"))?;
+    fs::create_dir(bundle.join("payloads/3.json"))?;
+    let inference = thread
+        .inference_trace_context("turn-1", "model", "provider")
+        .start_attempt();
+    inference.record_started(&serde_json::json!({"input": []}));
+    inference.record_completed("response-1", None, &None, &[]);
+    inference.record_failed("failure", None, &[]);
+    let compaction = thread
+        .compaction_trace_context("turn-1", "compact-1", "model", "provider")
+        .start_attempt(&serde_json::json!({"input": []}));
+    compaction.record_completed(&[]);
+    compaction.record_failed("failure");
+    let replayed = replay_bundle(&bundle)?;
+    assert!(replayed.inference_calls.is_empty());
+    assert!(replayed.compaction_requests.is_empty());
+    assert_eq!(
+        fs::read_to_string(bundle.join("trace.jsonl"))?
+            .lines()
+            .count(),
+        3
+    );
+    Ok(())
+}
+
+#[test]
+fn checkpoint_and_responses_preserve_reasoning_evidence() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let thread = ThreadTraceContext::start_root_in_root_for_test(
+        temp.path(),
+        minimal_metadata(ThreadId::new()),
+    )?;
+    thread.record_codex_turn_started("turn-1");
+    let history: Vec<codex_protocol::models::ResponseItem> =
+        serde_json::from_value(serde_json::json!([{
+            "type": "reasoning", "id": "rs_1", "summary": [],
+            "content": [{"type": "text", "text": "captured reasoning"}]
+        }]))?;
+    let inference = thread
+        .inference_trace_context("turn-1", "model", "provider")
+        .start_attempt();
+    inference.record_started(&serde_json::json!({"input": []}));
+    inference.record_completed("response-1", None, &None, &history);
+    let compaction = thread.compaction_trace_context("turn-1", "compact-1", "model", "provider");
+    compaction
+        .start_attempt(&serde_json::json!({"input": []}))
+        .record_completed(&history);
+    compaction.record_installed(&CompactionCheckpointTracePayload {
+        input_history: &history,
+        replacement_history: &history,
+    });
+    let bundle = single_bundle_dir(temp.path())?;
+    let replayed = replay_bundle(&bundle)?;
+    let mut checked = 0;
+    for payload in replayed.raw_payloads.values() {
+        let fields: &[&str] = match payload.kind {
+            RawPayloadKind::InferenceResponse | RawPayloadKind::CompactionResponse => {
+                &["output_items"]
+            }
+            RawPayloadKind::CompactionCheckpoint => &["input_history", "replacement_history"],
+            _ => continue,
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(bundle.join(&payload.path))?)?;
+        for field in fields {
+            assert_eq!(
+                json[*field][0]["content"],
+                serde_json::json!([{"type": "text", "text": "captured reasoning"}])
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 4);
+    Ok(())
+}
+
+#[test]
+fn immediate_code_cell_completion_reuses_captured_payload() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let thread = ThreadTraceContext::start_root_in_root_for_test(
+        temp.path(),
+        minimal_metadata(ThreadId::new()),
+    )?;
+    thread.record_codex_turn_started("turn-1");
+    let inference = thread
+        .inference_trace_context("turn-1", "model", "provider")
+        .start_attempt();
+    inference.record_started(&serde_json::json!({"input": []}));
+    let output = serde_json::from_value(
+        serde_json::json!({"type":"custom_tool_call", "name":"exec", "call_id":"call-1", "input":"text(1)"}),
+    )?;
+    inference.record_completed("response-1", None, &None, &[output]);
+    let cell = thread.start_code_cell_trace("turn-1", "cell-1", "call-1", "text(1)");
+    cell.record_initial_response(
+        &codex_code_mode::RuntimeResponse::Result {
+            cell_id: codex_code_mode::CellId::new("cell-1".into()),
+            content_items: vec![],
+            error_text: None,
+        },
+        true,
+    );
+    let bundle = single_bundle_dir(temp.path())?;
+    let mut payloads = Vec::new();
+    for line in fs::read_to_string(bundle.join("trace.jsonl"))?.lines() {
+        let event: crate::RawTraceEvent = serde_json::from_str(line)?;
+        match event.payload {
+            RawTraceEventPayload::CodeCellInitialResponse {
+                response_payload, ..
+            }
+            | RawTraceEventPayload::CodeCellEnded {
+                response_payload, ..
+            } => payloads.push(response_payload.expect("response evidence")),
+            _ => {}
+        }
+    }
+    assert_eq!(payloads.len(), 2);
+    assert_eq!(payloads[0], payloads[1]);
+    let replayed = replay_bundle(&bundle)?;
+    let cell = replayed.code_cells.values().next().expect("code cell");
+    assert_eq!(cell.runtime_status, crate::CodeCellRuntimeStatus::Completed);
+    assert!(
+        cell.initial_response_seq.expect("initial response")
+            < cell.execution.ended_seq.expect("runtime ended")
+    );
+    assert_eq!(replayed.raw_payloads.len(), 4);
+    Ok(())
 }

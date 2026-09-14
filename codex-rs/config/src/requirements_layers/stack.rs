@@ -168,21 +168,17 @@ impl RequirementsLayerStack {
         // Regular TOML fields are folded low-to-high like config. These custom
         // fields append or union values, so process them high-to-low to keep
         // priority order visible in the output.
-        for layer in layers.iter().rev() {
-            let domain_fields = &layer.domain_fields;
-            super::rules::merge(&mut rules, domain_fields.rules.clone(), &layer.source);
-            hooks.merge(
-                &mut hooks_output,
-                domain_fields.hooks.clone(),
-                &layer.source,
-            )?;
-            deny_read.merge(domain_fields.permissions.clone(), &layer.source);
+        for layer in layers.into_iter().rev() {
+            let domain_fields = layer.domain_fields;
+            super::rules::merge(&mut rules, domain_fields.rules, &layer.source);
+            hooks.merge(&mut hooks_output, domain_fields.hooks, &layer.source)?;
+            deny_read.merge(domain_fields.permissions, &layer.source);
         }
         output.rules = rules;
         output.hooks = hooks_output;
         deny_read.apply_to(&mut output.permissions);
 
-        let output_is_empty = output.clone().into_toml().is_empty();
+        let output_is_empty = output.is_empty();
         Ok((!output_is_empty).then_some(output))
     }
 }

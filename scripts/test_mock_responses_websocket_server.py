@@ -14,6 +14,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import mock_responses_websocket_server as server
 
 
+def run_bounded(coroutine):
+    async def wait():
+        return await asyncio.wait_for(coroutine, timeout=5)
+
+    return asyncio.run(wait())
+
+
 class FakeWebSocket:
     def __init__(
         self, messages: list[str | bytes | BaseException], *, path: str = server.PATH
@@ -70,7 +77,7 @@ class MockResponsesWebSocketServerTest(unittest.TestCase):
         with mock.patch.object(
             server, "_dump_json", side_effect=AssertionError("event serialization")
         ):
-            asyncio.run(
+            run_bounded(
                 server._handle_connection(
                     websocket,
                     quiet=True,
@@ -95,7 +102,7 @@ class MockResponsesWebSocketServerTest(unittest.TestCase):
         out = io.StringIO()
 
         with contextlib.redirect_stdout(out):
-            asyncio.run(
+            run_bounded(
                 server._handle_connection(
                     websocket,
                     quiet=True,
@@ -110,7 +117,7 @@ class MockResponsesWebSocketServerTest(unittest.TestCase):
         out = io.StringIO()
 
         with contextlib.redirect_stdout(out):
-            asyncio.run(
+            run_bounded(
                 server._handle_connection(
                     websocket,
                     quiet=False,
@@ -137,14 +144,14 @@ class MockResponsesWebSocketServerTest(unittest.TestCase):
         del websocket.request
 
         with self.assertRaises(AttributeError):
-            asyncio.run(
+            run_bounded(
                 server._handle_connection(websocket, quiet=True, log_json="off")
             )
 
     def test_invalid_json_closes_with_invalid_payload_code(self) -> None:
         websocket = FakeWebSocket([b"\xff"])
 
-        asyncio.run(
+        run_bounded(
             server._handle_connection(
                 websocket,
                 quiet=True,
@@ -158,12 +165,14 @@ class MockResponsesWebSocketServerTest(unittest.TestCase):
     def test_serve_disables_compression_caps_messages_and_can_exit(self) -> None:
         captured: dict[str, object] = {}
         fake_server = FakeServer()
+        ready = asyncio.Event()
 
         async def fake_serve(handler: object, host: str, port: int, **kwargs: object):
             captured["handler"] = handler
             captured["host"] = host
             captured["port"] = port
             captured["kwargs"] = kwargs
+            ready.set()
             return fake_server
 
         with (
@@ -180,12 +189,12 @@ class MockResponsesWebSocketServerTest(unittest.TestCase):
                         max_message_bytes=123,
                     )
                 )
-                await asyncio.sleep(0)
+                await ready.wait()
                 handler = captured["handler"]
                 await handler(FakeWebSocket(["{}", "{}"]))
                 return await task
 
-            rc = asyncio.run(run_once())
+            rc = run_bounded(run_once())
 
         self.assertEqual(rc, 0)
         self.assertTrue(fake_server.closed)
@@ -199,9 +208,11 @@ class MockResponsesWebSocketServerTest(unittest.TestCase):
     def test_serve_ignores_aborted_connections_for_session_limit(self) -> None:
         captured: dict[str, object] = {}
         fake_server = FakeServer()
+        ready = asyncio.Event()
 
         async def fake_serve(handler: object, host: str, port: int, **kwargs: object):
             captured["handler"] = handler
+            ready.set()
             return fake_server
 
         with (
@@ -211,7 +222,7 @@ class MockResponsesWebSocketServerTest(unittest.TestCase):
 
             async def run_connections() -> int:
                 task = asyncio.create_task(server._serve(0, quiet=True, max_sessions=1))
-                await asyncio.sleep(0)
+                await ready.wait()
                 handler = captured["handler"]
                 await handler(FakeWebSocket([server.ConnectionClosed(None, None)]))
                 await handler(FakeWebSocket(["{}", "{}"], path="/health"))
@@ -219,7 +230,7 @@ class MockResponsesWebSocketServerTest(unittest.TestCase):
                 await handler(FakeWebSocket(["{}", "{}"]))
                 return await task
 
-            rc = asyncio.run(run_connections())
+            rc = run_bounded(run_connections())
 
         self.assertEqual(rc, 0)
         self.assertTrue(fake_server.closed)
@@ -235,14 +246,14 @@ class MockResponsesWebSocketServerTest(unittest.TestCase):
             ),
             contextlib.redirect_stderr(stderr),
         ):
-            rc = asyncio.run(server._serve(0, quiet=True, max_sessions=1))
+            rc = run_bounded(server._serve(0, quiet=True, max_sessions=1))
 
         self.assertEqual(rc, 2)
         self.assertIn("dependency missing", stderr.getvalue())
 
     def test_serve_rejects_non_positive_max_sessions(self) -> None:
         with self.assertRaisesRegex(ValueError, "max_sessions must be >= 1"):
-            asyncio.run(server._serve(0, quiet=True, max_sessions=0))
+            run_bounded(server._serve(0, quiet=True, max_sessions=0))
 
     def test_parser_rejects_non_positive_max_sessions(self) -> None:
         with self.assertRaises(SystemExit):
@@ -253,7 +264,7 @@ class MockResponsesWebSocketServerTest(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(SystemExit):
                 server._build_arg_parser().parse_args(["--port", value])
         with self.assertRaisesRegex(ValueError, "port must be between"):
-            asyncio.run(server._serve(65536, quiet=True, max_sessions=1))
+            run_bounded(server._serve(65536, quiet=True, max_sessions=1))
 
     def test_parser_accepts_performance_flags(self) -> None:
         args = server._build_arg_parser().parse_args(

@@ -134,12 +134,12 @@ pub(crate) fn unscoped_ip_literal(host: &str) -> Option<&str> {
 }
 
 fn normalize_ip_literal(host: &str) -> Option<String> {
-    if host.parse::<IpAddr>().is_ok() {
-        return Some(host.to_string());
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Some(ip.to_string());
     }
     for delimiter in ["%25", "%"] {
         if let Some((ip, scope)) = host.split_once(delimiter)
-            && ip.parse::<IpAddr>().is_ok()
+            && let Ok(ip) = ip.parse::<IpAddr>()
         {
             return Some(format!("{ip}%{scope}"));
         }
@@ -358,6 +358,24 @@ mod tests {
     use super::*;
 
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn ipv6_spelling_is_canonical_for_allow_and_deny_matching() {
+        let variants = ["[2001:0DB8:0000:0000:0000:0000:0000:0001]", "2001:db8::1"];
+        for pattern in variants {
+            let set = compile_allowlist_globset(&[pattern.to_string()]).unwrap();
+            let deny_set = compile_denylist_globset(&[pattern.to_string()]).unwrap();
+            for host in variants {
+                assert_eq!(normalize_host(host), "2001:db8::1");
+                assert!(set.is_match(normalize_host(host)));
+                assert!(deny_set.is_match(normalize_host(host)));
+            }
+        }
+        assert_eq!(
+            normalize_host("FE80:0000:0000:0000:0000:0000:0000:0001%eth0"),
+            "fe80::1%eth0"
+        );
+    }
 
     #[test]
     fn method_allowed_full_allows_everything() {

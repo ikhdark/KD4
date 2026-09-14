@@ -2745,77 +2745,87 @@ async fn apps_popup_shows_disabled_status_for_installed_but_disabled_apps() {
 
 #[tokio::test]
 async fn apps_refresh_preserves_toggled_enabled_state() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    set_chatgpt_auth(&mut chat);
-    chat.config
-        .features
-        .enable(Feature::Apps)
-        .expect("test config should allow feature update");
-    chat.bottom_pane.set_connectors_enabled(/*enabled*/ true);
+    for initial_is_final in [false, true] {
+        let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+        set_chatgpt_auth(&mut chat);
+        chat.config
+            .features
+            .enable(Feature::Apps)
+            .expect("test config should allow feature update");
+        chat.bottom_pane.set_connectors_enabled(/*enabled*/ true);
 
-    chat.on_connectors_loaded(
-        Ok(ConnectorsSnapshot {
-            connectors: vec![AppInfo {
-                id: "connector_1".to_string(),
-                name: "Notion".to_string(),
-                description: Some("Workspace docs".to_string()),
-                logo_url: None,
-                logo_url_dark: None,
-                icon_assets: None,
-                icon_dark_assets: None,
-                distribution_channel: None,
-                branding: None,
-                app_metadata: None,
-                labels: None,
-                install_url: Some("https://example.test/notion".to_string()),
-                is_accessible: true,
-                is_enabled: true,
-                plugin_display_names: Vec::new(),
-            }],
-        }),
-        /*is_final*/ true,
-    );
-    chat.update_connector_enabled("connector_1", /*enabled*/ false);
+        chat.on_connectors_loaded(
+            Ok(ConnectorsSnapshot {
+                connectors: vec![AppInfo {
+                    id: "connector_1".to_string(),
+                    name: "Notion".to_string(),
+                    description: Some("Workspace docs".to_string()),
+                    logo_url: None,
+                    logo_url_dark: None,
+                    icon_assets: None,
+                    icon_dark_assets: None,
+                    distribution_channel: None,
+                    branding: None,
+                    app_metadata: None,
+                    labels: None,
+                    install_url: Some("https://example.test/notion".to_string()),
+                    is_accessible: true,
+                    is_enabled: true,
+                    plugin_display_names: Vec::new(),
+                }],
+            }),
+            /*is_final*/ initial_is_final,
+        );
+        let snapshot = ConnectorsSnapshot {
+            connectors: chat
+                .connectors_for_mentions()
+                .expect("initial snapshot")
+                .to_vec(),
+        };
+        chat.on_connectors_loaded(Ok(snapshot), false);
+        chat.update_connector_enabled("connector_1", /*enabled*/ false);
+        assert!(!chat.connectors_for_mentions().expect("mention snapshot")[0].is_enabled);
 
-    chat.on_connectors_loaded(
-        Ok(ConnectorsSnapshot {
-            connectors: vec![AppInfo {
-                id: "connector_1".to_string(),
-                name: "Notion".to_string(),
-                description: Some("Workspace docs".to_string()),
-                logo_url: None,
-                logo_url_dark: None,
-                icon_assets: None,
-                icon_dark_assets: None,
-                distribution_channel: None,
-                branding: None,
-                app_metadata: None,
-                labels: None,
-                install_url: Some("https://example.test/notion".to_string()),
-                is_accessible: true,
-                is_enabled: true,
-                plugin_display_names: Vec::new(),
-            }],
-        }),
-        /*is_final*/ true,
-    );
+        chat.on_connectors_loaded(
+            Ok(ConnectorsSnapshot {
+                connectors: vec![AppInfo {
+                    id: "connector_1".to_string(),
+                    name: "Notion".to_string(),
+                    description: Some("Workspace docs".to_string()),
+                    logo_url: None,
+                    logo_url_dark: None,
+                    icon_assets: None,
+                    icon_dark_assets: None,
+                    distribution_channel: None,
+                    branding: None,
+                    app_metadata: None,
+                    labels: None,
+                    install_url: Some("https://example.test/notion".to_string()),
+                    is_accessible: true,
+                    is_enabled: true,
+                    plugin_display_names: Vec::new(),
+                }],
+            }),
+            /*is_final*/ true,
+        );
 
-    assert_matches!(
-        &chat.connectors.cache,
-        ConnectorsCacheState::Ready(snapshot)
-            if snapshot
-                .connectors
-                .iter()
-                .find(|connector| connector.id == "connector_1")
-                .is_some_and(|connector| !connector.is_enabled)
-    );
+        assert_matches!(
+            &chat.connectors.cache,
+            ConnectorsCacheState::Ready(snapshot)
+                if snapshot
+                    .connectors
+                    .iter()
+                    .find(|connector| connector.id == "connector_1")
+                    .is_some_and(|connector| !connector.is_enabled)
+        );
 
-    chat.add_connectors_output();
-    let popup = render_bottom_popup(&chat, /*width*/ 80);
-    assert!(
-        popup.contains("Installed · Disabled. Press Enter to open the app page"),
-        "expected disabled status to persist after reload, got:\n{popup}"
-    );
+        chat.add_connectors_output();
+        let popup = render_bottom_popup(&chat, /*width*/ 80);
+        assert!(
+            popup.contains("Installed · Disabled. Press Enter to open the app page"),
+            "expected disabled status to persist after reload, got:\n{popup}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -3597,4 +3607,31 @@ async fn reasoning_popup_escape_returns_to_model_popup() {
     let after_escape = render_bottom_popup(&chat, /*width*/ 80);
     assert!(after_escape.contains("Select Model"));
     assert!(!after_escape.contains("Select Reasoning Level"));
+}
+
+#[tokio::test]
+async fn apps_failed_loading_popup_closes_and_retry_shows_loading() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    set_chatgpt_auth(&mut chat);
+    chat.config
+        .features
+        .enable(Feature::Apps)
+        .expect("enable apps");
+    chat.bottom_pane.set_connectors_enabled(true);
+    chat.add_connectors_output();
+    assert!(render_bottom_popup(&chat, 80).contains("Loading installed and available apps..."));
+    chat.on_connectors_loaded(Err("test apps unavailable".to_string()), true);
+    assert!(!render_bottom_popup(&chat, 80).contains("Loading installed and available apps..."));
+    let history = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<String>();
+    assert!(history.contains("test apps unavailable"), "{history}");
+    chat.add_connectors_output();
+    assert!(render_bottom_popup(&chat, 80).contains("Loading installed and available apps..."));
+    let mut fetched = false;
+    while let Ok(event) = rx.try_recv() {
+        fetched |= matches!(event, AppEvent::FetchConnectorsList { .. });
+    }
+    assert!(fetched, "retry must dispatch another fetch");
 }

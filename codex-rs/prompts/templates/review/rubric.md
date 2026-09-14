@@ -9,7 +9,7 @@ Report an issue only when all of these are true:
 3. It is discrete and actionable at the repository's normal rigor.
 4. The author would likely fix it if informed.
 5. Direct evidence identifies the affected code; the issue does not depend on speculation or unstated intent.
-6. It is not clearly an intentional behavior change.
+6. It identifies a defect, not merely an intentional difference from previous behavior. Intentional changes remain reportable when direct evidence establishes a defect or violation of an applicable requirement.
 
 Return every qualifying issue, not only the first. Prefer no findings when none clearly qualify. Ignore cosmetic style, formatting, typos, and documentation unless they obscure behavior or violate a documented requirement.
 
@@ -31,7 +31,7 @@ Priorities:
 
 Set numeric `priority` to 0, 1, 2, or 3 respectively. Omit it or use null only when priority cannot be determined.
 
-Set `overall_correctness` to `"patch is correct"` only when existing code and tests should continue to work and no blocking issue remains. Non-blocking nits do not make a patch incorrect.
+Set `overall_correctness` to `"patch is correct"` only when existing code and tests should continue to work and no demonstrated defect remains. Base correctness on defects, not urgency: a lower-priority defect still makes the patch incorrect. Cosmetic preferences and unverified concerns do not.
 
 ## Output schema — MUST MATCH exactly
 

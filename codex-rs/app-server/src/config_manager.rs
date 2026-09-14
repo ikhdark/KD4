@@ -315,6 +315,8 @@ impl ConfigManager {
             .chain(
                 request_overrides
                     .into_iter()
+                    .collect::<BTreeMap<_, _>>()
+                    .into_iter()
                     .map(|(key, value)| (key, json_to_toml(value))),
             )
             .collect::<Vec<_>>();
@@ -349,7 +351,9 @@ impl ConfigManager {
             .await?;
         self.apply_runtime_feature_enablement(&mut config);
         self.apply_arg0_paths(&mut config);
-        if let Ok(mut cache) = self.load_cache.write() {
+        if let Ok(mut cache) = self.load_cache.write()
+            && self.load_generation.load(Ordering::Acquire) == generation
+        {
             *cache = Some(ConfigLoadCacheEntry {
                 key: cache_key,
                 generation,
@@ -517,6 +521,42 @@ fn apply_runtime_feature_enablement_to_features(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn equivalent_rpc_maps_share_a_cache_entry() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let manager =
+            ConfigManager::without_managed_config_for_tests(codex_home.path().to_path_buf());
+        let overrides = ConfigOverrides {
+            cwd: Some(codex_home.path().to_path_buf()),
+            ..Default::default()
+        };
+        for _ in 0..16 {
+            let values = [
+                ("model".to_string(), serde_json::json!("rpc-model")),
+                (
+                    "shell_environment_policy.inherit".to_string(),
+                    serde_json::json!("none"),
+                ),
+                (
+                    "shell_environment_policy.set.TEST".to_string(),
+                    serde_json::json!("value"),
+                ),
+            ]
+            .into_iter()
+            .collect();
+            let config = manager
+                .load_with_overrides(Some(values), overrides.clone())
+                .await?;
+            assert_eq!(config.model.as_deref(), Some("rpc-model"));
+            assert_eq!(
+                config.permissions.shell_environment_policy.inherit,
+                codex_protocol::config_types::ShellEnvironmentPolicyInherit::None
+            );
+        }
+        assert_eq!(manager.config_build_count(), 1);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn identical_config_loads_within_ttl_reuse_built_config() -> std::io::Result<()> {

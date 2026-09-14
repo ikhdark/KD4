@@ -86,8 +86,11 @@ impl StatusHistoryHandle {
         &self,
         rate_limits: &[RateLimitSnapshotDisplay],
         now: DateTime<Local>,
+        refresh_succeeded: bool,
     ) {
-        let rate_limits = if rate_limits.len() <= 1 {
+        let rate_limits = if rate_limits.is_empty() && refresh_succeeded {
+            StatusRateLimitData::Unavailable
+        } else if rate_limits.len() <= 1 {
             compose_rate_limit_data(rate_limits.first(), now)
         } else {
             compose_rate_limit_data_many(rate_limits, now)
@@ -108,7 +111,7 @@ struct StatusHistoryCell {
     model_details: Vec<String>,
     directory: PathBuf,
     permissions: String,
-    agents_summary: Arc<RwLock<String>>,
+    agents_summary: String,
     collaboration_mode: Option<String>,
     model_provider: Option<String>,
     remote_connection: Option<RemoteConnectionStatus>,
@@ -268,23 +271,7 @@ impl StatusHistoryCell {
         let approval_policy = AskForApproval::from(config.permissions.approval_policy.value());
         let permission_profile = config.permissions.effective_permission_profile();
         let workspace_roots = config.effective_workspace_roots();
-        let mut config_entries = vec![
-            ("workdir", config.cwd.display().to_string()),
-            ("model", model_name.to_string()),
-            ("provider", config.model_provider_id.clone()),
-            (
-                "approval",
-                config.permissions.approval_policy.value().to_string(),
-            ),
-            (
-                "sandbox",
-                summarize_permission_profile(
-                    &permission_profile,
-                    &config.cwd,
-                    workspace_roots.as_slice(),
-                ),
-            ),
-        ];
+        let mut config_entries = Vec::new();
         if config.model_provider.wire_api == WireApi::Responses {
             let effort_value = reasoning_effort_override
                 .unwrap_or_else(|| config.model_reasoning_effort.clone())
@@ -300,11 +287,7 @@ impl StatusHistoryCell {
             ));
         }
         let (model_name, model_details) = compose_model_display(model_name, &config_entries);
-        let approval = config_entries
-            .iter()
-            .find(|(k, _)| *k == "approval")
-            .map(|(_, v)| v.clone())
-            .unwrap_or_else(|| "<unknown>".to_string());
+        let approval = config.permissions.approval_policy.value().to_string();
         let active_permission_profile = config.permissions.active_permission_profile();
         let sandbox =
             status_permission_summary(&permission_profile, &config.cwd, workspace_roots.as_slice());
@@ -349,7 +332,6 @@ impl StatusHistoryCell {
             rate_limits,
             refreshing_rate_limits,
         }));
-        let agents_summary = Arc::new(RwLock::new(agents_summary));
 
         (
             Self {
@@ -743,12 +725,6 @@ impl HistoryCell for StatusHistoryCell {
             .rate_limit_state
             .read()
             .expect("status history rate-limit state poisoned");
-        #[expect(clippy::expect_used)]
-        let agents_summary = self
-            .agents_summary
-            .read()
-            .expect("status history agents summary state poisoned")
-            .clone();
 
         if self.model_provider.is_some() {
             push_label(&mut labels, &mut seen, "Model provider");
@@ -778,22 +754,21 @@ impl HistoryCell for StatusHistoryCell {
         let formatter = FieldFormatter::from_labels(labels.iter().map(String::as_str));
         let value_width = formatter.value_width(available_inner_width);
 
-        let note_first_line = Line::from(vec![
-            Span::from("Visit ").cyan(),
-            CHATGPT_USAGE_URL.cyan().underlined(),
-            Span::from(" for up-to-date").cyan(),
-        ]);
-        let note_second_line = Line::from(vec![
-            Span::from("information on rate limits and credits").cyan(),
-        ]);
-        let note_lines = adaptive_wrap_lines(
-            [note_first_line, note_second_line],
-            RtOptions::new(available_inner_width),
-        );
         lines.push(Line::from(Vec::<Span<'static>>::new()));
-        // The ChatGPT usage page only applies to providers backed by OpenAI auth;
-        // providers like Bedrock manage limits and billing elsewhere.
+        // The ChatGPT usage page applies to providers backed by OpenAI auth.
         if self.show_chatgpt_usage_link {
+            let note_first_line = Line::from(vec![
+                Span::from("Visit ").cyan(),
+                CHATGPT_USAGE_URL.cyan().underlined(),
+                Span::from(" for up-to-date").cyan(),
+            ]);
+            let note_second_line = Line::from(vec![
+                Span::from("information on rate limits and credits").cyan(),
+            ]);
+            let note_lines = adaptive_wrap_lines(
+                [note_first_line, note_second_line],
+                RtOptions::new(available_inner_width),
+            );
             lines.extend(note_lines);
             lines.push(Line::from(Vec::<Span<'static>>::new()));
         }
@@ -830,7 +805,7 @@ impl HistoryCell for StatusHistoryCell {
         }
         lines.push(formatter.line("Directory", vec![Span::from(directory_value)]));
         lines.push(formatter.line("Permissions", vec![Span::from(self.permissions.clone())]));
-        lines.push(formatter.line("Agents.md", vec![Span::from(agents_summary)]));
+        lines.push(formatter.line("Agents.md", vec![Span::from(self.agents_summary.clone())]));
 
         if let Some(account_value) = account_value {
             lines.push(formatter.line("Account", vec![Span::from(account_value)]));

@@ -45,7 +45,6 @@ pub fn summarize_session(path: &Path) -> io::Result<Option<SessionSummary>> {
     let mut fallback_title = None;
     let mut saw_user_message = false;
     let mut latest_timestamp = None;
-    let mut saw_message = false;
 
     for line in reader.lines() {
         let line = line?;
@@ -68,17 +67,22 @@ pub fn summarize_session(path: &Path) -> io::Result<Option<SessionSummary>> {
         if let Some(title) = ai_title_from_record(&record) {
             ai_title = Some(title.to_string());
         }
-        let Some(message) = conversation_message_from_owned_record(&mut record) else {
+        let Some(role) = conversation_message_role(&record) else {
             continue;
         };
-        saw_message = true;
-        if message.role == MessageRole::User {
+        if role == MessageRole::User {
             saw_user_message = true;
-            if fallback_title.is_none() {
+            if fallback_title.is_none()
+                && let Some(message) = conversation_message_from_owned_record(&mut record)
+            {
                 fallback_title = fallback_title_from_user_message(&message.text);
             }
         }
-        if let Some(timestamp) = message.timestamp {
+        if let Some(timestamp) = record
+            .get("timestamp")
+            .and_then(JsonValue::as_str)
+            .and_then(parse_timestamp)
+        {
             latest_timestamp =
                 Some(latest_timestamp.map_or(timestamp, |current: i64| current.max(timestamp)));
         }
@@ -87,7 +91,7 @@ pub fn summarize_session(path: &Path) -> io::Result<Option<SessionSummary>> {
     let Some(cwd) = cwd else {
         return Ok(None);
     };
-    if !saw_message {
+    if !saw_user_message {
         return Ok(None);
     }
     let Some(latest_timestamp) = latest_timestamp else {
@@ -194,18 +198,48 @@ fn title_from_record<'a>(record: &'a JsonValue, record_type: &str, field: &str) 
         .filter(|title| !title.is_empty())
 }
 
-fn conversation_message_from_owned_record(record: &mut JsonValue) -> Option<ConversationMessage> {
+// Shared eligibility and effective-role rules for discovery and import.
+fn conversation_message_role(record: &JsonValue) -> Option<MessageRole> {
     let record_type = record.get("type")?.as_str()?;
-    if record_type != "assistant" && record_type != "user" {
-        return None;
-    }
-    if record.get("isMeta").and_then(JsonValue::as_bool) == Some(true)
+    if !matches!(record_type, "assistant" | "user")
+        || record.get("isMeta").and_then(JsonValue::as_bool) == Some(true)
         || record.get("isSidechain").and_then(JsonValue::as_bool) == Some(true)
     {
         return None;
     }
+    let content = record.get("message")?.get("content")?;
+    let mut has_content = false;
+    let mut only_tool_result = true;
+    if let Some(text) = content.as_str() {
+        has_content = !text.trim().is_empty();
+        only_tool_result = false;
+    } else {
+        for block in content.as_array().into_iter().flatten() {
+            match block.get("type").and_then(JsonValue::as_str) {
+                Some("text") => {
+                    if let Some(text) = block.get("text").and_then(JsonValue::as_str) {
+                        has_content |= !text.trim().is_empty();
+                        only_tool_result &= text.is_empty();
+                    }
+                }
+                Some("thinking") | None => {}
+                Some("tool_result") => has_content = true,
+                Some(_) => {
+                    has_content = true;
+                    only_tool_result = false;
+                }
+            }
+        }
+    }
+    has_content.then_some(if record_type == "assistant" || only_tool_result {
+        MessageRole::Assistant
+    } else {
+        MessageRole::User
+    })
+}
 
-    let is_assistant = record_type == "assistant";
+fn conversation_message_from_owned_record(record: &mut JsonValue) -> Option<ConversationMessage> {
+    let role = conversation_message_role(record)?;
     let timestamp = record
         .get("timestamp")
         .and_then(JsonValue::as_str)
@@ -216,35 +250,22 @@ fn conversation_message_from_owned_record(record: &mut JsonValue) -> Option<Conv
             if text.trim().is_empty() {
                 return None;
             }
-            ExtractedMessage {
-                text,
-                only_tool_result: false,
-            }
+            text
         }
         content => extract_message_text(&content)?,
     };
     Some(ConversationMessage {
-        role: if is_assistant || extracted.only_tool_result {
-            MessageRole::Assistant
-        } else {
-            MessageRole::User
-        },
-        text: extracted.text,
+        role,
+        text: extracted,
         timestamp,
     })
 }
 
-struct ExtractedMessage {
-    text: String,
-    only_tool_result: bool,
-}
-
-fn extract_message_text(content: &JsonValue) -> Option<ExtractedMessage> {
-    let blocks = content_blocks(content);
+fn extract_message_text(content: &JsonValue) -> Option<String> {
+    let blocks = content.as_array()?;
     let mut parts = Vec::new();
-    let mut only_tool_result = !blocks.is_empty();
 
-    for block in &blocks {
+    for block in blocks {
         let block_type = block.get("type").and_then(JsonValue::as_str);
         match block_type {
             Some("text") => {
@@ -252,12 +273,10 @@ fn extract_message_text(content: &JsonValue) -> Option<ExtractedMessage> {
                     && !text.is_empty()
                 {
                     parts.push(text.to_string());
-                    only_tool_result = false;
                 }
             }
             Some("tool_use") => {
                 parts.push(tool_call_note(block));
-                only_tool_result = false;
             }
             Some("tool_result") => {
                 parts.push(tool_result_note(block));
@@ -265,7 +284,6 @@ fn extract_message_text(content: &JsonValue) -> Option<ExtractedMessage> {
             Some("thinking") => {}
             Some(other) => {
                 parts.push(format!("[external unsupported block: {other}]"));
-                only_tool_result = false;
             }
             None => {}
         }
@@ -276,33 +294,7 @@ fn extract_message_text(content: &JsonValue) -> Option<ExtractedMessage> {
         .filter(|part| !part.trim().is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
-    if text.is_empty() {
-        None
-    } else {
-        Some(ExtractedMessage {
-            text,
-            only_tool_result,
-        })
-    }
-}
-
-fn content_blocks(content: &JsonValue) -> Vec<JsonValue> {
-    if let Some(text) = content.as_str() {
-        return vec![serde_json::json!({
-            "type": "text",
-            "text": text,
-        })];
-    }
-    content
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter(|item| item.is_object())
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default()
+    if text.is_empty() { None } else { Some(text) }
 }
 
 fn tool_call_note(block: &JsonValue) -> String {
@@ -311,7 +303,9 @@ fn tool_call_note(block: &JsonValue) -> String {
         .and_then(JsonValue::as_str)
         .unwrap_or("unknown");
     let mut lines = Vec::new();
-    if let Some(input) = block.get("input").and_then(JsonValue::as_object) {
+    if let Some(input) = block.get("input")
+        && input.is_object()
+    {
         if let Some(description) = input.get("description").and_then(JsonValue::as_str) {
             lines.push(format!(
                 "description: {}",
@@ -331,7 +325,10 @@ fn tool_call_note(block: &JsonValue) -> String {
         if lines.is_empty() {
             lines.push(format!(
                 "input: {}",
-                truncate(&JsonValue::Object(input.clone()).to_string(), NOTE_MAX_LEN)
+                truncate(
+                    &input.to_string(),
+                    NOTE_MAX_LEN
+                )
             ));
         }
     } else if let Some(input) = block.get("input") {
@@ -369,22 +366,26 @@ fn tool_result_note(block: &JsonValue) -> String {
     if text.is_empty() {
         format!("{label}\n[/{EXTERNAL_AGENT_TOOL_RESULT_TAG}]")
     } else {
-        format!(
-            "{label}\n{}\n[/{EXTERNAL_AGENT_TOOL_RESULT_TAG}]",
-            truncate(&text, TOOL_RESULT_MAX_LEN)
-        )
+        format!("{label}\n{text}\n[/{EXTERNAL_AGENT_TOOL_RESULT_TAG}]")
     }
 }
 
 fn tool_result_text(content: Option<&JsonValue>) -> String {
     match content {
-        Some(JsonValue::String(text)) => text.clone(),
-        Some(JsonValue::Array(items)) => items
-            .iter()
-            .filter_map(|item| item.get("text").and_then(JsonValue::as_str))
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"),
+        Some(JsonValue::String(text)) => truncate(text, TOOL_RESULT_MAX_LEN),
+        Some(JsonValue::Array(items)) => {
+            let mut texts = items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(JsonValue::as_str))
+                .filter(|text| !text.is_empty());
+            let first = texts.next().unwrap_or_default();
+            let excerpt = first
+                .chars()
+                .chain(texts.flat_map(|text| std::iter::once('\n').chain(text.chars())))
+                .take(TOOL_RESULT_MAX_LEN + 1)
+                .collect::<String>();
+            truncate(&excerpt, TOOL_RESULT_MAX_LEN)
+        }
         _ => String::new(),
     }
 }
@@ -401,7 +402,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn reads_session_import_in_one_pass() {
+    fn reads_session_content_and_matching_fingerprint() {
         let root = TempDir::new().expect("tempdir");
         let path = root.path().join("session.jsonl");
         let contents = [
@@ -505,6 +506,50 @@ mod tests {
             "[external_agent_tool_result: error]\n\
              command failed\n\
              [/external_agent_tool_result]"
+        );
+    }
+    #[test]
+    fn discovery_and_import_share_eligibility_and_bounded_tool_result_text() {
+        let root = tempfile::TempDir::new().unwrap();
+        let path = root.path().join("session.jsonl");
+        let result = serde_json::json!({"type":"user", "cwd":root.path(), "timestamp":"2026-06-03T12:00:00Z",
+            "message":{"content":[{"type":"tool_result", "is_error":true,
+                "content":[{"text":"prefix"},{"text":""},{"text":"ç•Œ".repeat(10_000)}]}]}});
+        std::fs::write(&path, result.to_string()).unwrap();
+        assert!(summarize_session(&path).unwrap().is_none());
+        assert!(
+            crate::prepare_validated_session_import(
+                root.path(),
+                ExternalAgentSessionMigration {
+                    path: path.clone(),
+                    cwd: root.path().to_path_buf(),
+                    title: None,
+                }
+            )
+            .unwrap()
+            .is_none()
+        );
+        let user = serde_json::json!({"type":"user", "cwd":root.path(), "timestamp":"2026-06-03T12:00:00Z", "message":{"content":"real request"}});
+        std::fs::write(&path, format!("{user}\n{result}")).unwrap();
+        assert_eq!(
+            summarize_session(&path)
+                .unwrap()
+                .unwrap()
+                .migration
+                .title
+                .as_deref(),
+            Some("real request")
+        );
+        let parsed = read_session_import(&path).unwrap();
+        assert_eq!(parsed.messages.len(), 2);
+        assert_eq!(parsed.messages[0].role, MessageRole::User);
+        assert_eq!(parsed.messages[1].role, MessageRole::Assistant);
+        assert_eq!(
+            parsed.messages[1].text,
+            format!(
+                "[external_agent_tool_result: error]\nprefix\n{}...\n[/external_agent_tool_result]",
+                "ç•Œ".repeat(3_990)
+            )
         );
     }
 }

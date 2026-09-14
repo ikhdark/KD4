@@ -52,6 +52,7 @@ const EVENT_STREAM_MIME_TYPE: &str = "text/event-stream";
 const JSON_MIME_TYPE: &str = "application/json";
 const HEADER_SESSION_ID: &str = "Mcp-Session-Id";
 const NON_JSON_RESPONSE_BODY_PREVIEW_BYTES: usize = 8_192;
+const MAX_JSON_RPC_ERROR_BODY_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct StreamableHttpClientAdapter {
@@ -197,37 +198,57 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         let content_type = response_header(&response.headers, CONTENT_TYPE);
         let session_id = response_header(&response.headers, HEADER_SESSION_ID);
         if !status_is_success(response.status) {
-            let body = collect_body(&mut body_stream).await?;
-            if !retryable_post_response_status(mcp_method.as_deref(), response.status)
-                && content_type
-                    .as_deref()
-                    .is_some_and(|content_type| content_type.starts_with(JSON_MIME_TYPE))
+            let parse_error =
+                !retryable_post_response_status(mcp_method.as_deref(), response.status)
+                    && content_type
+                        .as_deref()
+                        .is_some_and(|content_type| has_media_type(content_type, JSON_MIME_TYPE));
+            let limit = if parse_error {
+                MAX_JSON_RPC_ERROR_BODY_BYTES
+            } else {
+                NON_JSON_RESPONSE_BODY_PREVIEW_BYTES
+            };
+            let (body, truncated) = collect_body_prefix(&mut body_stream, limit).await?;
+            if parse_error
+                && !truncated
                 && let Some(message) = parse_json_rpc_error(&body)
             {
                 return Ok(StreamableHttpPostResponse::Json(message, session_id));
             }
-            return Err(unexpected_http_status_error(
-                response.status,
-                body_preview(String::from_utf8_lossy(&body).to_string()),
+            let mut preview = body_preview(String::from_utf8_lossy(
+                &body[..body.len().min(NON_JSON_RESPONSE_BODY_PREVIEW_BYTES)],
             ));
+            if truncated {
+                preview.push_str(&format!(
+                    "... (HTTP error body exceeds {limit}-byte collection limit)"
+                ));
+            }
+            return Err(unexpected_http_status_error(response.status, preview));
         }
         match content_type.as_deref() {
-            Some(content_type) if content_type.starts_with(EVENT_STREAM_MIME_TYPE) => {
+            Some(content_type) if has_media_type(content_type, EVENT_STREAM_MIME_TYPE) => {
                 let event_stream = sse_stream_from_body(body_stream);
                 Ok(StreamableHttpPostResponse::Sse(event_stream, session_id))
             }
-            Some(content_type) if content_type.starts_with(JSON_MIME_TYPE) => {
+            Some(content_type) if has_media_type(content_type, JSON_MIME_TYPE) => {
                 let body = collect_body(&mut body_stream).await?;
                 let message: ServerJsonRpcMessage =
                     serde_json::from_slice(&body).map_err(StreamableHttpError::Deserialize)?;
                 Ok(StreamableHttpPostResponse::Json(message, session_id))
             }
             _ => {
-                let body = collect_body(&mut body_stream).await?;
+                let (body, truncated) =
+                    collect_body_prefix(&mut body_stream, NON_JSON_RESPONSE_BODY_PREVIEW_BYTES)
+                        .await?;
                 let content_type = content_type.unwrap_or_else(|| "missing-content-type".into());
+                let suffix = if truncated {
+                    "... (body preview truncated)"
+                } else {
+                    ""
+                };
                 Err(StreamableHttpError::UnexpectedContentType(Some(format!(
-                    "{content_type}; body: {}",
-                    body_preview(String::from_utf8_lossy(&body).to_string())
+                    "{content_type}; body: {}{suffix}",
+                    body_preview(String::from_utf8_lossy(&body))
                 ))))
             }
         }
@@ -303,7 +324,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         insert_header(
             &mut headers,
             ACCEPT,
-            [EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE].join(", "),
+            EVENT_STREAM_MIME_TYPE.to_string(),
             StreamableHttpClientAdapterError::Header,
         )?;
         insert_header(
@@ -361,7 +382,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         }
 
         match response_header(&response.headers, CONTENT_TYPE).as_deref() {
-            Some(content_type) if is_streamable_http_content_type(content_type) => {}
+            Some(content_type) if has_media_type(content_type, EVENT_STREAM_MIME_TYPE) => {}
             Some(content_type) => {
                 return Err(StreamableHttpError::UnexpectedContentType(Some(
                     content_type.to_string(),
@@ -473,13 +494,11 @@ where
     Ok(())
 }
 
-fn is_streamable_http_content_type(content_type: &str) -> bool {
+fn has_media_type(content_type: &str, expected: &str) -> bool {
     content_type
-        .as_bytes()
-        .starts_with(EVENT_STREAM_MIME_TYPE.as_bytes())
-        || content_type
-            .as_bytes()
-            .starts_with(JSON_MIME_TYPE.as_bytes())
+        .split(';')
+        .next()
+        .is_some_and(|essence| essence.trim().eq_ignore_ascii_case(expected))
 }
 
 fn protocol_headers(
@@ -567,6 +586,26 @@ fn parse_json_rpc_error(body: &[u8]) -> Option<ServerJsonRpcMessage> {
     }
 }
 
+async fn collect_body_prefix(
+    body_stream: &mut HttpResponseBodyStream,
+    limit: usize,
+) -> std::result::Result<(Vec<u8>, bool), StreamableHttpError<StreamableHttpClientAdapterError>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = body_stream
+        .recv()
+        .await
+        .map_err(StreamableHttpClientAdapterError::from)
+        .map_err(StreamableHttpError::Client)?
+    {
+        let remaining = limit - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if chunk.len() > remaining {
+            return Ok((body, true));
+        }
+    }
+    Ok((body, false))
+}
+
 async fn collect_body(
     body_stream: &mut HttpResponseBodyStream,
 ) -> std::result::Result<Vec<u8>, StreamableHttpError<StreamableHttpClientAdapterError>> {
@@ -593,4 +632,103 @@ fn sse_stream_from_body(
         }
     }))
     .boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::routing::any;
+
+    #[tokio::test]
+    async fn transport_bounds_errors_and_preserves_large_successes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/{case}", any(|axum::extract::Path(case): axum::extract::Path<String>| async move {
+            let (status, content_type, body) = match case.as_str() {
+                "error" => (StatusCode::SERVICE_UNAVAILABLE, "text/plain", Body::from_stream(
+                    stream::once(async { Ok::<_, io::Error>(vec![b'x'; NON_JSON_RESPONSE_BODY_PREVIEW_BYTES + 1]) })
+                        .chain(stream::pending()))),
+                "rpc-error" => (StatusCode::BAD_REQUEST, JSON_MIME_TYPE, Body::from_stream(
+                    stream::once(async { Ok::<_, io::Error>(vec![b'x'; MAX_JSON_RPC_ERROR_BODY_BYTES + 1]) })
+                        .chain(stream::pending()))),
+                "invalid-type" => (StatusCode::OK, "application/json-invalid", Body::from("{}")),
+                "json-get" => (StatusCode::OK, JSON_MIME_TYPE, Body::from("{}")),
+                "rpc" => (StatusCode::BAD_REQUEST, "Application/JSON; charset=utf-8", Body::from(
+                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid arguments"}}"#)),
+                _ => (StatusCode::OK, "Application/JSON; charset=utf-8", Body::from(serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "result": {"payload": "x".repeat(MAX_JSON_RPC_ERROR_BODY_BYTES + 1)}
+                }).to_string())),
+            };
+            (status, [(CONTENT_TYPE, content_type)], body)
+        }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let adapter = StreamableHttpClientAdapter::new(
+            Arc::new(codex_exec_server::ReqwestHttpClient),
+            HeaderMap::new(),
+            None,
+        );
+        for case in ["error", "rpc-error", "invalid-type", "rpc", "success"] {
+            let message = serde_json::from_value(
+                serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"tools/list"}),
+            )
+            .unwrap();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                adapter.post_message(
+                    format!("http://{address}/{case}").into(),
+                    message,
+                    None,
+                    None,
+                    HashMap::new(),
+                ),
+            )
+            .await
+            .expect("response processing must finish without EOF for oversized errors");
+            match (case, result) {
+                (
+                    "error" | "rpc-error",
+                    Err(StreamableHttpError::Client(
+                        StreamableHttpClientAdapterError::UnexpectedHttpStatus {
+                            body_preview, ..
+                        },
+                    )),
+                ) => {
+                    assert!(body_preview.len() < NON_JSON_RESPONSE_BODY_PREVIEW_BYTES + 200);
+                    assert!(body_preview.contains("collection limit"));
+                }
+                ("invalid-type", Err(StreamableHttpError::UnexpectedContentType(_))) => {}
+                ("rpc", Ok(StreamableHttpPostResponse::Json(JsonRpcMessage::Error(error), _))) => {
+                    assert_eq!(error.error.message, "invalid arguments");
+                }
+                ("success", Ok(StreamableHttpPostResponse::Json(message, _))) => {
+                    assert_eq!(
+                        serde_json::to_value(message).unwrap()["result"]["payload"]
+                            .as_str()
+                            .unwrap()
+                            .len(),
+                        MAX_JSON_RPC_ERROR_BODY_BYTES + 1
+                    );
+                }
+                _ => panic!("unexpected response for {case}"),
+            }
+        }
+        let result = adapter
+            .get_stream(
+                format!("http://{address}/json-get").into(),
+                "session".into(),
+                None,
+                None,
+                HashMap::new(),
+            )
+            .await;
+        server.abort();
+        assert!(matches!(
+            result,
+            Err(StreamableHttpError::UnexpectedContentType(_))
+        ));
+    }
 }

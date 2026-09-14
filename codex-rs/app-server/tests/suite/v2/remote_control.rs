@@ -9,6 +9,7 @@ use app_test_support::TestAppServer;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
 use app_test_support::write_mock_responses_config_toml_with_chatgpt_base_url;
+use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RemoteControlClient;
@@ -584,6 +585,154 @@ async fn remote_control_status_read_returns_connecting_status_after_enable() -> 
 }
 
 #[tokio::test]
+async fn remote_control_pairing_rejects_invalid_requests_without_backend_requests() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let listener = configured_remote_control_listener(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+
+    for (params, message) in [
+        (
+            RemoteControlPairingStatusParams {
+                pairing_code: None,
+                manual_pairing_code: None,
+            },
+            "remoteControl/pairing/status requires pairingCode or manualPairingCode",
+        ),
+        (
+            RemoteControlPairingStatusParams {
+                pairing_code: Some("pairing-code".to_string()),
+                manual_pairing_code: Some("ABCD-EFGH".to_string()),
+            },
+            "remoteControl/pairing/status accepts either pairingCode or manualPairingCode, not both",
+        ),
+    ] {
+        let request_id = mcp
+            .send_remote_control_pairing_status_request(params)
+            .await?;
+        let error = timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+        )
+        .await??;
+        assert_eq!(error.error.code, -32600);
+        assert_eq!(error.error.message, message);
+        assert_eq!(error.error.data, None);
+    }
+
+    // This reaches the present handle and exercises the pairing error mapper.
+    let request_id = mcp
+        .send_remote_control_pairing_start_request(RemoteControlPairingStartParams::default())
+        .await?;
+    let error = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert_eq!(error.error.code, -32600);
+    assert_eq!(
+        error.error.message,
+        "remote control pairing requires remote control to be enabled"
+    );
+    assert_eq!(
+        listener
+            .into_std()?
+            .accept()
+            .expect_err("rejected requests must not connect to the backend")
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_control_pairing_start_propagates_backend_failure() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let _backend =
+        PairingRemoteControlBackend::start_with_pairing_failure(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let request_id = mcp.send_remote_control_ephemeral_enable_request().await?;
+    wait_for_response(&mut mcp, request_id).await?;
+    let request_id = mcp
+        .send_remote_control_pairing_start_request(RemoteControlPairingStartParams {
+            manual_code: true,
+        })
+        .await?;
+    let error = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert_eq!(error.error.code, -32603);
+    assert!(
+        error
+            .error
+            .message
+            .contains("remote control pairing failed")
+    );
+    assert!(error.error.message.contains("HTTP 500"));
+    assert!(error.error.message.contains("pairing backend failure"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_control_client_management_propagates_backend_errors() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let listener = configured_remote_control_listener(codex_home.path()).await?;
+    let server_task = tokio::spawn(async move {
+        for status in ["404 Not Found", "500 Internal Server Error"] {
+            let request = read_http_request(&listener).await?;
+            assert_eq!(
+                request.request_line,
+                "GET /backend-api/wham/remote/control/environments/environment-id/clients HTTP/1.1"
+            );
+            respond_with_status(
+                request.reader.into_inner(),
+                status,
+                "client backend failure",
+            )
+            .await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    for (status, code) in [(404, -32600), (500, -32603)] {
+        let request_id = mcp
+            .send_remote_control_clients_list_request(RemoteControlClientsListParams {
+                environment_id: "environment-id".to_string(),
+                cursor: None,
+                limit: None,
+                order: None,
+            })
+            .await?;
+        let error = timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+        )
+        .await??;
+        assert_eq!(error.error.code, code);
+        assert!(error.error.message.contains(&format!("HTTP {status}")));
+        assert!(error.error.message.contains("client backend failure"));
+    }
+    timeout(DEFAULT_TIMEOUT, server_task).await???;
+    Ok(())
+}
+
+#[tokio::test]
 async fn remote_control_pairing_start_returns_pairing_artifacts() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mut backend = PairingRemoteControlBackend::start(codex_home.path()).await?;
@@ -681,6 +830,7 @@ async fn remote_control_pairing_start_returns_pairing_artifacts() -> Result<()> 
         received,
         RemoteControlPairingStatusResponse { claimed: true }
     );
+    timeout(DEFAULT_TIMEOUT, backend.wait_for_status_requests()).await??;
     Ok(())
 }
 
@@ -688,12 +838,22 @@ async fn remote_control_pairing_start_returns_pairing_artifacts() -> Result<()> 
 async fn pairing_start_works_after_ephemeral_enable() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mut backend = PairingRemoteControlBackend::start(codex_home.path()).await?;
+    let state_db =
+        StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string()).await?;
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .build()
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    timeout(
+        DEFAULT_TIMEOUT,
+        mcp.initialize_with_client_info(ClientInfo {
+            name: "pairing-test-client".to_string(),
+            title: None,
+            version: "0.1.0".to_string(),
+        }),
+    )
+    .await??;
     let request_id = mcp.send_remote_control_ephemeral_enable_request().await?;
     wait_for_response(&mut mcp, request_id).await?;
 
@@ -722,6 +882,25 @@ async fn pairing_start_works_after_ephemeral_enable() -> Result<()> {
             environment_id: "environment-id".to_string(),
             expires_at: 33_336_362_096,
         }
+    );
+    let enrollment = state_db
+        .get_remote_control_enrollment(
+            &backend.websocket_url,
+            "account_id",
+            Some("pairing-test-client"),
+        )
+        .await?
+        .context("pairing must persist enrollment for the requesting client")?;
+    assert_eq!(enrollment.environment_id, "environment-id");
+    assert!(
+        state_db
+            .get_remote_control_enrollment(
+                &backend.websocket_url,
+                "account_id",
+                Some(DEFAULT_CLIENT_NAME),
+            )
+            .await?
+            .is_none()
     );
     Ok(())
 }
@@ -935,13 +1114,31 @@ impl BlockingRemoteControlBackend {
 
 struct PairingRemoteControlBackend {
     enroll_request_rx: Option<oneshot::Receiver<Result<String>>>,
+    status_requests_rx: Option<oneshot::Receiver<()>>,
+    websocket_url: String,
     server_task: JoinHandle<()>,
 }
 
 impl PairingRemoteControlBackend {
     async fn start(codex_home: &std::path::Path) -> Result<Self> {
+        Self::start_with_pairing_response(codex_home, /*fail_pairing*/ false).await
+    }
+
+    async fn start_with_pairing_failure(codex_home: &std::path::Path) -> Result<Self> {
+        Self::start_with_pairing_response(codex_home, /*fail_pairing*/ true).await
+    }
+
+    async fn start_with_pairing_response(
+        codex_home: &std::path::Path,
+        fail_pairing: bool,
+    ) -> Result<Self> {
         let listener = configured_remote_control_listener(codex_home).await?;
+        let websocket_url = format!(
+            "ws://{}/backend-api/wham/remote/control/server",
+            listener.local_addr()?
+        );
         let (enroll_request_tx, enroll_request_rx) = oneshot::channel();
+        let (status_requests_tx, status_requests_rx) = oneshot::channel();
         let server_task = tokio::spawn(async move {
             let mut enroll_request_tx = Some(enroll_request_tx);
             let result = async {
@@ -966,6 +1163,23 @@ impl PairingRemoteControlBackend {
                 } else {
                     request_after_enroll
                 };
+                assert_eq!(
+                    pair_http_request.request_line,
+                    "POST /backend-api/wham/remote/control/server/pair HTTP/1.1"
+                );
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&pair_http_request.body)?,
+                    serde_json::json!({ "manual_code": true })
+                );
+                if fail_pairing {
+                    respond_with_status(
+                        pair_http_request.reader.into_inner(),
+                        "500 Internal Server Error",
+                        "pairing backend failure",
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 respond_with_json(
                     pair_http_request.reader.into_inner(),
                     serde_json::json!({
@@ -996,6 +1210,7 @@ impl PairingRemoteControlBackend {
                     )
                     .await?;
                 }
+                let _ = status_requests_tx.send(());
                 std::future::pending::<()>().await;
                 Ok::<(), anyhow::Error>(())
             }
@@ -1011,6 +1226,8 @@ impl PairingRemoteControlBackend {
 
         Ok(Self {
             enroll_request_rx: Some(enroll_request_rx),
+            status_requests_rx: Some(status_requests_rx),
+            websocket_url,
             server_task,
         })
     }
@@ -1020,6 +1237,14 @@ impl PairingRemoteControlBackend {
             .take()
             .context("enroll request should only be awaited once")?
             .await?
+    }
+
+    async fn wait_for_status_requests(&mut self) -> Result<()> {
+        self.status_requests_rx
+            .take()
+            .context("status requests should only be awaited once")?
+            .await?;
+        Ok(())
     }
 }
 

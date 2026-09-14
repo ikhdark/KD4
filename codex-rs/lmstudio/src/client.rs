@@ -1,9 +1,11 @@
 use codex_core::config::Config;
 use codex_http_client::HttpClient;
 use codex_http_client::HttpClientBuilder;
+use codex_http_client::HttpResponse;
 use codex_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
 use std::io;
 use std::path::Path;
+use std::path::PathBuf;
 
 #[derive(Clone)]
 pub struct LMStudioClient {
@@ -15,6 +17,21 @@ const LMSTUDIO_CONNECTION_ERROR: &str = "LM Studio is not responding. Install fr
 
 impl LMStudioClient {
     pub async fn try_from_provider(config: &Config) -> std::io::Result<Self> {
+        let client = Self::from_provider(config)?;
+        client.check_server().await?;
+        Ok(client)
+    }
+
+    pub(crate) async fn try_from_provider_with_models(
+        config: &Config,
+    ) -> io::Result<(Self, io::Result<Vec<String>>)> {
+        let client = Self::from_provider(config)?;
+        let response = client.check_server().await?;
+        let models = Self::models_from_response(response).await;
+        Ok((client, models))
+    }
+
+    fn from_provider(config: &Config) -> io::Result<Self> {
         let provider = config
             .model_providers
             .get(LMSTUDIO_OSS_PROVIDER_ID)
@@ -40,18 +57,16 @@ impl LMStudioClient {
             client,
             base_url: base_url.to_string(),
         };
-        client.check_server().await?;
-
         Ok(client)
     }
 
-    async fn check_server(&self) -> io::Result<()> {
+    async fn check_server(&self) -> io::Result<HttpResponse> {
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
         let response = self.client.get(&url).send().await;
 
         if let Ok(resp) = response {
             if resp.status().is_success() {
-                Ok(())
+                Ok(resp)
             } else {
                 Err(io::Error::other(format!(
                     "Server returned error: {} {LMSTUDIO_CONNECTION_ERROR}",
@@ -104,19 +119,7 @@ impl LMStudioClient {
             .map_err(|e| io::Error::other(format!("Request failed: {e}")))?;
 
         if response.status().is_success() {
-            let json: serde_json::Value = response.json().await.map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("JSON parse error: {e}"))
-            })?;
-            let models = json["data"]
-                .as_array()
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "No 'data' array in response")
-                })?
-                .iter()
-                .filter_map(|model| model["id"].as_str())
-                .map(std::string::ToString::to_string)
-                .collect();
-            Ok(models)
+            Self::models_from_response(response).await
         } else {
             Err(io::Error::other(format!(
                 "Failed to fetch models: {}",
@@ -125,15 +128,31 @@ impl LMStudioClient {
         }
     }
 
+    async fn models_from_response(response: HttpResponse) -> io::Result<Vec<String>> {
+        let json: serde_json::Value = response.json().await.map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("JSON parse error: {e}"))
+        })?;
+        let models = json["data"]
+            .as_array()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "No 'data' array in response")
+            })?
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .map(std::string::ToString::to_string)
+            .collect();
+        Ok(models)
+    }
+
     // Find lms, checking fallback paths if not in PATH
-    fn find_lms() -> std::io::Result<String> {
+    fn find_lms() -> std::io::Result<PathBuf> {
         Self::find_lms_with_home_dir(/*home_dir*/ None)
     }
 
-    fn find_lms_with_home_dir(home_dir: Option<&str>) -> std::io::Result<String> {
+    fn find_lms_with_home_dir(home_dir: Option<&str>) -> std::io::Result<PathBuf> {
         // First try 'lms' in PATH
-        if which::which("lms").is_ok() {
-            return Ok("lms".to_string());
+        if let Ok(path) = which::which("lms") {
+            return Ok(path);
         }
 
         // Platform-specific fallback paths
@@ -145,7 +164,7 @@ impl LMStudioClient {
         let fallback_path = format!("{home}/.lmstudio/bin/lms.exe");
 
         if Path::new(&fallback_path).exists() {
-            Ok(fallback_path)
+            Ok(PathBuf::from(fallback_path))
         } else {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -163,11 +182,15 @@ impl LMStudioClient {
         let status = tokio::process::Command::new(&lms)
             .args(["get", "--yes", model])
             .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true)
             .status()
             .await
             .map_err(|e| {
-                std::io::Error::other(format!("Failed to execute '{lms} get --yes {model}': {e}"))
+                std::io::Error::other(format!(
+                    "Failed to execute '{} get --yes {model}': {e}",
+                    lms.display()
+                ))
             })?;
 
         if !status.success() {
@@ -309,10 +332,11 @@ mod tests {
             .await;
 
         let client = LMStudioClient::from_host_root(server.uri()).expect("shared HTTP client");
-        client
+        let response = client
             .check_server()
             .await
             .expect("server check should pass");
+        assert_eq!(response.status().as_u16(), 200);
     }
 
     #[tokio::test]
@@ -360,6 +384,11 @@ mod tests {
                 "content-type",
                 "application/json",
             ))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "model": "openai/gpt-oss-20b",
+                "input": "",
+                "max_output_tokens": 1
+            })))
             .respond_with(wiremock::ResponseTemplate::new(200))
             .expect(1)
             .mount(&server)
@@ -406,7 +435,7 @@ mod tests {
                 wiremock::ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!({ "data": [] })),
             )
-            .expect(2)
+            .expect(1)
             .mount(&server)
             .await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))

@@ -5,7 +5,11 @@ use anyhow::Result;
 use anyhow::bail;
 use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::ResponseItem;
+use serde::Deserialize;
 use serde_json::Value;
+use sha2::Digest;
+use sha2::Sha256;
+use std::io::Write;
 
 use crate::model::AgentMessageMetadata;
 use crate::model::ConversationBody;
@@ -27,6 +31,8 @@ pub(super) struct NormalizedConversationItem {
     pub(super) channel: Option<ConversationChannel>,
     pub(super) kind: ConversationItemKind,
     pub(super) agent_message: Option<AgentMessageMetadata>,
+    pub(super) tool_name: Option<String>,
+    pub(super) tool_namespace: Option<String>,
     pub(super) body: ConversationBody,
     pub(super) call_id: Option<String>,
 }
@@ -73,6 +79,11 @@ fn normalize_model_item(
             channel: Some(ConversationChannel::Commentary),
             kind: ConversationItemKind::FunctionCall,
             agent_message: None,
+            tool_name: item.get("name").and_then(Value::as_str).map(str::to_owned),
+            tool_namespace: item
+                .get("namespace")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             body: raw_text_or_json_body(item.get("arguments"), raw_payload),
             call_id: item
                 .get("call_id")
@@ -84,6 +95,8 @@ fn normalize_model_item(
             channel: Some(ConversationChannel::Commentary),
             kind: ConversationItemKind::FunctionCallOutput,
             agent_message: None,
+            tool_name: None,
+            tool_namespace: None,
             body: tool_output_body(item.get("output"), raw_payload),
             call_id: item
                 .get("call_id")
@@ -95,6 +108,11 @@ fn normalize_model_item(
             channel: Some(ConversationChannel::Commentary),
             kind: ConversationItemKind::CustomToolCall,
             agent_message: None,
+            tool_name: item.get("name").and_then(Value::as_str).map(str::to_owned),
+            tool_namespace: item
+                .get("namespace")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             body: custom_tool_call_body(item, raw_payload),
             call_id: item
                 .get("call_id")
@@ -106,6 +124,8 @@ fn normalize_model_item(
             channel: Some(ConversationChannel::Commentary),
             kind: ConversationItemKind::CustomToolCallOutput,
             agent_message: None,
+            tool_name: None,
+            tool_namespace: None,
             body: tool_output_body(item.get("output"), raw_payload),
             call_id: item
                 .get("call_id")
@@ -118,6 +138,8 @@ fn normalize_model_item(
                 channel: Some(ConversationChannel::Commentary),
                 kind: ConversationItemKind::FunctionCall,
                 agent_message: None,
+                tool_name: None,
+                tool_namespace: None,
                 body: json_body(item, raw_payload),
                 call_id: item
                     .get("call_id")
@@ -130,6 +152,8 @@ fn normalize_model_item(
             channel: Some(ConversationChannel::Commentary),
             kind: ConversationItemKind::FunctionCallOutput,
             agent_message: None,
+            tool_name: None,
+            tool_namespace: None,
             body: json_body(item, raw_payload),
             call_id: item
                 .get("call_id")
@@ -142,6 +166,8 @@ fn normalize_model_item(
                 channel: Some(ConversationChannel::Summary),
                 kind: ConversationItemKind::Message,
                 agent_message: None,
+                tool_name: None,
+                tool_namespace: None,
                 body: compaction_body(item, raw_payload)?,
                 call_id: None,
             })
@@ -177,6 +203,8 @@ fn normalize_message_item(
             .and_then(channel_from_phase),
         kind: ConversationItemKind::Message,
         agent_message: None,
+        tool_name: None,
+        tool_namespace: None,
         body: ConversationBody {
             parts: content_parts(item.get("content"), raw_payload),
         },
@@ -189,10 +217,9 @@ fn normalize_agent_message_item(
     raw_payload: &RawPayloadRef,
 ) -> Result<NormalizedConversationItem> {
     let raw_payload_id = &raw_payload.raw_payload_id;
-    let response_item =
-        serde_json::from_value::<ResponseItem>(item.clone()).with_context(|| {
-            format!("failed to parse agent_message item in payload {raw_payload_id}")
-        })?;
+    let response_item = ResponseItem::deserialize(item).with_context(|| {
+        format!("failed to parse agent_message item in payload {raw_payload_id}")
+    })?;
     let ResponseItem::AgentMessage {
         author,
         recipient,
@@ -223,6 +250,8 @@ fn normalize_agent_message_item(
         channel: Some(ConversationChannel::Analysis),
         kind: ConversationItemKind::Message,
         agent_message: Some(AgentMessageMetadata { author, recipient }),
+        tool_name: None,
+        tool_namespace: None,
         body: ConversationBody { parts },
         call_id: None,
     })
@@ -279,6 +308,8 @@ fn normalize_reasoning_item(
         channel: Some(ConversationChannel::Analysis),
         kind: ConversationItemKind::Reasoning,
         agent_message: None,
+        tool_name: None,
+        tool_namespace: None,
         body: ConversationBody { parts },
         call_id: None,
     })
@@ -390,6 +421,8 @@ fn content_parts(content: Option<&Value>, raw_payload: &RawPayloadRef) -> Vec<Co
                     parts.push(ConversationPart::Text {
                         text: text.to_string(),
                     });
+                } else {
+                    parts.push(payload_ref_part("malformed_text", raw_payload));
                 }
             }
             Some("input_image") => parts.push(payload_ref_part("input_image", raw_payload)),
@@ -476,9 +509,13 @@ fn compaction_body(item: &Value, raw_payload: &RawPayloadRef) -> Result<Conversa
 }
 
 fn json_body(value: &Value, raw_payload: &RawPayloadRef) -> ConversationBody {
+    let mut canonical = value.clone();
+    canonical.sort_all_objects();
+    let (summary, content_sha256) = summarize_json(&canonical);
     ConversationBody {
         parts: vec![ConversationPart::Json {
-            summary: summarize_json(value),
+            summary,
+            content_sha256,
             raw_payload_id: raw_payload.raw_payload_id.clone(),
         }],
     }
@@ -491,19 +528,44 @@ fn payload_ref_part(label: &str, raw_payload: &RawPayloadRef) -> ConversationPar
     }
 }
 
-fn summarize_json(value: &Value) -> String {
+#[expect(clippy::expect_used, reason = "JSON Value and SummaryWriter serialization are infallible; the prefix is explicitly validated as UTF-8 before conversion")]
+fn summarize_json(value: &Value) -> (String, String) {
+    // Reconciliation needs the full content identity: keep serialization
+    // streaming so even large values allocate only a bounded display prefix.
     const MAX_JSON_SUMMARY_LEN: usize = 240;
-    let mut summary =
-        serde_json::to_string(value).unwrap_or_else(|_| "<unserializable json>".to_string());
-    if summary.len() > MAX_JSON_SUMMARY_LEN {
-        let mut end = MAX_JSON_SUMMARY_LEN;
-        while !summary.is_char_boundary(end) {
-            end -= 1;
+    struct SummaryWriter {
+        prefix: Vec<u8>,
+        digest: Sha256,
+    }
+    impl Write for SummaryWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.digest.update(bytes);
+            let remaining = (MAX_JSON_SUMMARY_LEN + 1).saturating_sub(self.prefix.len());
+            self.prefix
+                .extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+            Ok(bytes.len())
         }
-        summary.truncate(end);
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = SummaryWriter {
+        prefix: Vec::with_capacity(MAX_JSON_SUMMARY_LEN + 1),
+        digest: Sha256::new(),
+    };
+    serde_json::to_writer(&mut writer, value)
+        .expect("JSON values serialize to an infallible writer");
+    let truncated = writer.prefix.len() > MAX_JSON_SUMMARY_LEN;
+    writer.prefix.truncate(MAX_JSON_SUMMARY_LEN);
+    // A serialized UTF-8 scalar can straddle the display budget.
+    while std::str::from_utf8(&writer.prefix).is_err() {
+        writer.prefix.pop();
+    }
+    let mut summary = String::from_utf8(writer.prefix).expect("validated UTF-8 prefix");
+    if truncated {
         summary.push_str("...");
     }
-    summary
+    (summary, format!("{:x}", writer.digest.finalize()))
 }
 
 fn u64_field(value: &Value, field: &str) -> Option<u64> {

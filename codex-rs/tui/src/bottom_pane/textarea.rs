@@ -49,6 +49,37 @@ fn is_word_separator(ch: char) -> bool {
     WORD_SEPARATORS.contains(ch)
 }
 
+// Inspect only the word segment nearest the cursor, without allocating every piece.
+#[expect(
+    clippy::expect_used,
+    reason = "Both word-motion callers pass a nonempty run and Unicode word segments are nonempty"
+)]
+fn edge_word_piece(text: &str, backwards: bool) -> Range<usize> {
+    let mut segments = text.split_word_bound_indices();
+    let (start, segment) = if backwards {
+        segments.next_back()
+    } else {
+        segments.next()
+    }
+    .expect("word movement starts at a non-whitespace character");
+    if backwards {
+        let mut chars = segment.char_indices().rev();
+        let (_, last) = chars.next().expect("nonempty word segment");
+        let boundary = chars
+            .find(|(_, ch)| is_word_separator(*ch) != is_word_separator(last))
+            .map_or(0, |(idx, ch)| idx + ch.len_utf8());
+        start + boundary..start + segment.len()
+    } else {
+        let mut chars = segment.char_indices();
+        let (_, first) = chars.next().expect("nonempty word segment");
+        let boundary = chars
+            .find(|(_, ch)| is_word_separator(*ch) != is_word_separator(first))
+            .map_or(segment.len(), |(idx, _)| idx);
+        start..start + boundary
+    }
+}
+
+// Vim text objects need every piece in a run to locate the piece under the cursor.
 fn split_word_pieces(run: &str) -> Vec<(usize, &str)> {
     let mut pieces = Vec::new();
     for (segment_start, segment) in run.split_word_bound_indices() {
@@ -58,7 +89,6 @@ fn split_word_pieces(run: &str) -> Vec<(usize, &str)> {
             continue;
         };
         let mut in_separator = is_word_separator(first_char);
-
         for (idx, ch) in chars {
             let is_separator = is_word_separator(ch);
             if is_separator == in_separator {
@@ -68,10 +98,8 @@ fn split_word_pieces(run: &str) -> Vec<(usize, &str)> {
             piece_start = idx;
             in_separator = is_separator;
         }
-
         pieces.push((segment_start + piece_start, &segment[piece_start..]));
     }
-
     pieces
 }
 
@@ -211,6 +239,14 @@ impl TextArea {
                 });
             }
             self.elements.sort_by_key(|e| e.range.start);
+            let mut previous_end = 0;
+            self.elements.retain(|element| {
+                if element.range.start < previous_end {
+                    return false;
+                }
+                previous_end = element.range.end;
+                true
+            });
         }
         // Stage 3: clamp the cursor and reset derived state tied to the prior content.
         // The kill buffer is editing history rather than visible-buffer state, so full-buffer
@@ -502,127 +538,94 @@ impl TextArea {
         if self.vim_enabled {
             self.handle_vim_input(event);
         } else {
-            let keymap = self.editor_keymap.clone();
-            self.input_with_keymap(event, &keymap);
+            Self::editor_action(event, &self.editor_keymap)(self, event);
         }
     }
 
+    #[cfg(test)]
     pub fn input_with_keymap(&mut self, event: KeyEvent, keymap: &EditorKeymap) {
+        Self::editor_action(event, keymap)(self, event);
+    }
+
+    fn editor_action(event: KeyEvent, keymap: &EditorKeymap) -> fn(&mut Self, KeyEvent) {
         if keymap.insert_newline.is_pressed(event) {
-            self.insert_str("\n");
-            return;
+            return |area, _| area.insert_str("\n");
         }
-
         if keymap.delete_backward_word.is_pressed(event) {
-            self.delete_backward_word();
-            return;
+            return |area, _| area.delete_backward_word();
         }
-
-        // Windows AltGr generates ALT|CONTROL. Preserve typed characters for AltGr users
-        // unless a specific shortcut already matched above.
-        if let KeyEvent {
-            code: KeyCode::Char(c),
-            modifiers,
-            ..
-        } = event
-            && is_altgr(modifiers)
-        {
-            self.insert_str(&c.to_string());
-            return;
+        // Windows AltGr produces ALT|CONTROL; preserve text unless a shortcut above matched.
+        if matches!(event.code, KeyCode::Char(_)) && is_altgr(event.modifiers) {
+            return |area, event| {
+                if let KeyCode::Char(c) = event.code {
+                    area.insert_str(&c.to_string());
+                }
+            };
         }
-
         if keymap.delete_backward.is_pressed(event) {
-            self.delete_backward(/*n*/ 1);
-            return;
+            return |area, _| area.delete_backward(1);
         }
         if keymap.delete_forward_word.is_pressed(event) {
-            self.delete_forward_word();
-            return;
+            return |area, _| area.delete_forward_word();
         }
         if keymap.delete_forward.is_pressed(event) {
-            self.delete_forward(/*n*/ 1);
-            return;
+            return |area, _| area.delete_forward(1);
         }
         if keymap.kill_line_start.is_pressed(event) {
-            self.kill_to_beginning_of_line();
-            return;
+            return |area, _| area.kill_to_beginning_of_line();
         }
         if keymap.kill_whole_line.is_pressed(event) {
-            self.kill_current_line();
-            return;
+            return |area, _| area.kill_current_line();
         }
         if keymap.kill_line_end.is_pressed(event) {
-            self.kill_to_end_of_line();
-            return;
+            return |area, _| area.kill_to_end_of_line();
         }
         if keymap.yank.is_pressed(event) {
-            self.yank();
-            return;
+            return |area, _| area.yank();
         }
         if keymap.move_word_left.is_pressed(event) {
-            self.set_cursor(self.beginning_of_previous_word());
-            return;
+            return |area, _| area.set_cursor(area.beginning_of_previous_word());
         }
         if keymap.move_word_right.is_pressed(event) {
-            self.set_cursor(self.end_of_next_word());
-            return;
+            return |area, _| area.set_cursor(area.end_of_next_word());
         }
         if keymap.move_left.is_pressed(event) {
-            self.move_cursor_left();
-            return;
+            return |area, _| area.move_cursor_left();
         }
         if keymap.move_right.is_pressed(event) {
-            self.move_cursor_right();
-            return;
+            return |area, _| area.move_cursor_right();
         }
         if keymap.move_up.is_pressed(event) {
-            self.move_cursor_up();
-            return;
+            return |area, _| area.move_cursor_up();
         }
         if keymap.move_down.is_pressed(event) {
-            self.move_cursor_down();
-            return;
+            return |area, _| area.move_cursor_down();
         }
         if keymap.move_line_start.is_pressed(event) {
-            let move_up_at_bol = matches!(
-                event,
-                KeyEvent {
-                    code: KeyCode::Char('a'),
-                    modifiers: KeyModifiers::CONTROL,
-                    ..
-                }
-            );
-            self.move_cursor_to_beginning_of_line(move_up_at_bol);
-            return;
+            return |area, event| {
+                area.move_cursor_to_beginning_of_line(
+                    event.code == KeyCode::Char('a') && event.modifiers == KeyModifiers::CONTROL,
+                )
+            };
         }
         if keymap.move_line_end.is_pressed(event) {
-            let move_down_at_eol = matches!(
-                event,
-                KeyEvent {
-                    code: KeyCode::Char('e'),
-                    modifiers: KeyModifiers::CONTROL,
-                    ..
-                }
-            );
-            self.move_cursor_to_end_of_line(move_down_at_eol);
-            return;
+            return |area, event| {
+                area.move_cursor_to_end_of_line(
+                    event.code == KeyCode::Char('e') && event.modifiers == KeyModifiers::CONTROL,
+                )
+            };
         }
-
-        if let KeyEvent {
-            code: KeyCode::Char(c),
-            modifiers: KeyModifiers::NONE | KeyModifiers::SHIFT,
-            ..
-        } = event
-        {
-            // Insert plain characters (and Shift-modified). Do not insert when ALT is held,
-            // because many terminals map Option/Meta combos to ALT+<char>.
-            if c.is_ascii_control() {
-                return;
+        |area, event| {
+            if let KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers: KeyModifiers::NONE | KeyModifiers::SHIFT,
+                ..
+            } = event
+                && !c.is_ascii_control()
+            {
+                area.insert_str(&c.to_string());
             }
-            self.insert_str(&c.to_string());
         }
-
-        tracing::debug!("Unhandled key event in TextArea: {:?}", event);
     }
 
     fn handle_vim_input(&mut self, event: KeyEvent) {
@@ -641,8 +644,7 @@ impl TextArea {
             self.enter_vim_normal_mode();
             return;
         }
-        let keymap = self.editor_keymap.clone();
-        self.input_with_keymap(event, &keymap);
+        Self::editor_action(event, &self.editor_keymap)(self, event);
     }
 
     fn handle_vim_normal(&mut self, event: KeyEvent) {
@@ -880,6 +882,12 @@ impl TextArea {
             return;
         };
         match op {
+            VimOperator::Delete if matches!(motion, VimMotion::Up | VimMotion::Down) => {
+                self.kill_line_range(range);
+            }
+            VimOperator::Yank if matches!(motion, VimMotion::Up | VimMotion::Down) => {
+                self.yank_line_range(range);
+            }
             VimOperator::Delete => self.kill_range(range),
             VimOperator::Yank => self.yank_range(range),
             VimOperator::Change => {}
@@ -1698,27 +1706,15 @@ impl TextArea {
         else {
             return 0;
         };
-        let run_start = prefix[..first_non_ws_idx]
-            .char_indices()
-            .rev()
-            .find(|&(_, ch)| ch.is_whitespace())
-            .map_or(0, |(idx, ch)| idx + ch.len_utf8());
-        let run_end = first_non_ws_idx + ch.len_utf8();
-        let pieces = split_word_pieces(&prefix[run_start..run_end]);
-        let mut pieces = pieces.into_iter().rev().peekable();
-        let Some((piece_start, piece)) = pieces.next() else {
-            return run_start;
-        };
-        let mut start = run_start + piece_start;
-
-        if piece.chars().all(is_word_separator) {
-            while let Some((idx, piece)) = pieces.peek() {
-                if !piece.chars().all(is_word_separator) {
-                    break;
-                }
-                start = run_start + *idx;
-                pieces.next();
-            }
+        let prefix = &prefix[..first_non_ws_idx + ch.len_utf8()];
+        let piece = edge_word_piece(prefix, true);
+        let mut start = piece.start;
+        if prefix[piece].chars().all(is_word_separator) {
+            start = prefix[..start]
+                .char_indices()
+                .rev()
+                .find(|(_, ch)| !is_word_separator(*ch))
+                .map_or(0, |(idx, ch)| idx + ch.len_utf8());
         }
 
         self.adjust_pos_out_of_elements(start, /*prefer_start*/ true)
@@ -1734,22 +1730,14 @@ impl TextArea {
             return self.text.len();
         };
         let run = &suffix[first_non_ws..];
-        let run = &run[..run.find(char::is_whitespace).unwrap_or(run.len())];
-        let mut pieces = split_word_pieces(run).into_iter().peekable();
-        let Some((start, piece)) = pieces.next() else {
-            return cursor_pos + first_non_ws;
-        };
-        let word_start = cursor_pos + first_non_ws + start;
-        let mut end = word_start + piece.len();
-        if piece.chars().all(is_word_separator) {
-            while let Some((idx, piece)) = pieces.peek() {
-                if !piece.chars().all(is_word_separator) {
-                    break;
-                }
-                end = cursor_pos + first_non_ws + *idx + piece.len();
-                pieces.next();
-            }
+        let piece = edge_word_piece(run, false);
+        let mut end = piece.end;
+        if run[piece].chars().all(is_word_separator) {
+            end += run[end..]
+                .find(|ch| !is_word_separator(ch))
+                .unwrap_or(run.len() - end);
         }
+        let end = cursor_pos + first_non_ws + end;
 
         self.adjust_pos_out_of_elements(end, /*prefer_start*/ false)
     }
@@ -2024,10 +2012,13 @@ impl TextArea {
             let r = &lines[idx];
             let y = area.y + row as u16;
             let line_range = r.start..r.end - 1;
-            let masked = self.text[line_range.clone()]
-                .chars()
-                .map(|_| mask_char)
-                .collect::<String>();
+            // Keep masking on the same display-cell geometry as wrapping and cursor placement.
+            let mask = if unicode_width::UnicodeWidthChar::width(mask_char) == Some(1) {
+                mask_char
+            } else {
+                '*'
+            };
+            let masked = mask.to_string().repeat(self.text[line_range].width());
             buf.set_stringn(
                 area.x,
                 y,
@@ -3754,18 +3745,70 @@ mod tests {
     }
 
     #[test]
+    fn vim_vertical_delete_and_yank_paste_whole_lines() {
+        for (operator, motion, cursor, expected) in [
+            ('y', 'j', 1, "abc\nabc\n123\n123\nxyz"),
+            ('y', 'k', 5, "abc\n123\nabc\n123\nxyz"),
+            ('d', 'j', 1, "xyz\nabc\n123"),
+            ('d', 'k', 5, "xyz\nabc\n123"),
+        ] {
+            let mut t = ta_with("abc\n123\nxyz");
+            t.set_cursor(cursor);
+            t.set_vim_enabled(true);
+            for key in [operator, motion, 'p'] {
+                t.input(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+            }
+            assert_eq!(t.text(), expected, "{operator}{motion}p");
+            assert_eq!(t.kill_buffer_kind, KillBufferKind::Linewise);
+        }
+    }
+
+    #[test]
+    fn restored_elements_reject_overlap_and_keep_adjacent_elements_atomic() {
+        let mut t = TextArea::new();
+        t.set_text_with_elements(
+            "abcdefghij",
+            &[
+                UserTextElement::new((2..6).into(), Some("cdef".into())),
+                UserTextElement::new((4..8).into(), Some("efgh".into())),
+                UserTextElement::new((6..10).into(), Some("ghij".into())),
+            ],
+        );
+        assert_eq!(
+            t.elements
+                .iter()
+                .map(|e| e.range.clone())
+                .collect::<Vec<_>>(),
+            vec![2..6, 6..10]
+        );
+        t.set_cursor(2);
+        t.input(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert_eq!(t.text(), "abghij");
+        assert_eq!(
+            t.text_elements(),
+            vec![UserTextElement::new((2..6).into(), Some("ghij".into()))]
+        );
+    }
+
+    #[test]
+    fn masked_render_matches_unicode_display_width_and_cursor() {
+        let mut t = ta_with("界e\u{301}x");
+        t.set_cursor("界e\u{301}".len());
+        let area = Rect::new(0, 0, 8, 1);
+        for mask in ['*', '界', '\u{301}'] {
+            let mut state = TextAreaState::default();
+            let mut buf = Buffer::empty(area);
+            t.render_ref_masked(area, &mut buf, &mut state, mask);
+            let row: String = (0..8).map(|x| buf[(x, 0)].symbol()).collect();
+            assert_eq!(row, "****    ");
+            assert_eq!(t.cursor_pos_with_state(area, state), Some((3, 0)));
+        }
+    }
+
+    #[test]
     fn fuzz_textarea_randomized() {
-        // Deterministic seed for reproducibility
-        // Seed the RNG based on the current day in Pacific Time (PST/PDT). This
-        // keeps the fuzz test deterministic within a day while still varying
-        // day-to-day to improve coverage.
-        let pst_today_seed: u64 = (chrono::Utc::now() - chrono::Duration::hours(8))
-            .date_naive()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc()
-            .timestamp() as u64;
-        let mut rng = rand::rngs::StdRng::seed_from_u64(pst_today_seed);
+        const SEED: u64 = 0x5eed_c0de;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
 
         for _case in 0..500 {
             let mut ta = TextArea::new();
@@ -3934,20 +3977,27 @@ mod tests {
                 // Sanity invariants
                 assert!(ta.cursor() <= ta.text().len());
 
-                // Element invariants
-                for payload in &elem_texts {
-                    if let Some(start) = ta.text().find(payload) {
-                        let end = start + payload.len();
-                        // 1) Text inside elements matches the initially set payload
-                        assert_eq!(&ta.text()[start..end], payload);
-                        // 2) Cursor is never strictly inside an element
-                        let c = ta.cursor();
-                        assert!(
-                            c <= start || c >= end,
-                            "cursor inside element: {start}..{end} at {c}"
-                        );
-                    }
+                assert!(ta.text().is_char_boundary(ta.cursor()));
+                let mut previous_end = 0;
+                for element in &ta.elements {
+                    let range = &element.range;
+                    assert!(range.start >= previous_end && range.start < range.end);
+                    let payload = ta.text().get(range.clone()).expect("valid element range");
+                    assert!(
+                        elem_texts.iter().any(|expected| expected == payload),
+                        "damaged element with seed {SEED}: {payload:?}"
+                    );
+                    assert!(ta.cursor() <= range.start || ta.cursor() >= range.end);
+                    previous_end = range.end;
                 }
+                let mut outside_elements = ta.text().to_string();
+                for element in ta.elements.iter().rev() {
+                    outside_elements.replace_range(element.range.clone(), "");
+                }
+                assert!(
+                    !outside_elements.contains(['[', ']']),
+                    "orphaned element text with seed {SEED}: {outside_elements:?}"
+                );
 
                 // Render and compute cursor positions; ensure they are in-bounds and do not panic
                 let area = Rect::new(0, 0, width, height);
@@ -3958,12 +4008,14 @@ mod tests {
                 ratatui::widgets::WidgetRef::render_ref(&(&ta), full_area, &mut buf);
 
                 // cursor_pos: x must be within width when present
-                let _ = ta.cursor_pos(area);
+                let (x, y) = ta.cursor_pos(area).expect("nonempty viewport");
+                assert!(x < width && y < height);
 
                 // cursor_pos_with_state: always within viewport rows
-                let (_x, _y) = ta
+                let (x, y) = ta
                     .cursor_pos_with_state(area, state)
-                    .unwrap_or((area.x, area.y));
+                    .expect("nonempty viewport");
+                assert!(x < width && y < height);
 
                 // Stateful render should not panic, and updates scroll
                 let mut sbuf = Buffer::empty(area);

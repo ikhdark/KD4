@@ -54,7 +54,25 @@ pub fn prefix_lines(
                 subsequent_prefix.clone()
             });
             spans.extend(l.spans);
-            Line::from(spans).style(l.style)
+            Line { spans, ..l }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::style::Stylize;
+
+    #[test]
+    fn prefixes_preserve_line_metadata() {
+        let line = Line::from("body").cyan().right_aligned();
+        let prefixed = prefix_lines(vec![line.clone(), line.clone()], "> ".into(), "  ".into());
+        assert_eq!(prefixed[0].to_string(), "> body");
+        assert_eq!(prefixed[1].to_string(), "  body");
+        for result in prefixed {
+            assert_eq!(result.style, line.style);
+            assert_eq!(result.alignment, line.alignment);
+        }
+    }
 }

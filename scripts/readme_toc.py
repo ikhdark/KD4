@@ -32,7 +32,11 @@ REFERENCE_LINK_RE = re.compile(r"!?\[([^\]]*)\](?:\[[^\]]*\])")
 AUTOLINK_RE = re.compile(r"<((?:https?://|mailto:)[^>]+)>", re.IGNORECASE)
 HTML_TAG_RE = re.compile(r"</?[A-Za-z][^>]*>")
 BACKSLASH_ESCAPE_RE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])")
-INLINE_MARKER_RE = re.compile(r"(?<!\\)[*_~]")
+INLINE_MARKER_RES = (
+    re.compile(r"(?<![\w\\])(_{1,2})(?=\S)(.+?)(?<=\S)\1(?!\w)"),
+    re.compile(r"(?<!\\)(\*{1,3})(?=\S)(.+?)(?<=\S)\1"),
+    re.compile(r"(?<!\\)(~~)(?=\S)(.+?)(?<=\S)\1"),
+)
 
 
 @dataclass(frozen=True)
@@ -126,23 +130,35 @@ def advance_code_fence(
 
 def disambiguate_slug(slug: str, used_slugs: dict[str, int]) -> str:
     count = used_slugs.get(slug, 0)
+    candidate = slug if count == 0 else f"{slug}-{count}"
+    while candidate in used_slugs:
+        count += 1
+        candidate = f"{slug}-{count}"
     used_slugs[slug] = count + 1
-    if count == 0:
-        return slug
-    return f"{slug}-{count}"
+    used_slugs.setdefault(candidate, 1)
+    return candidate
 
 
 def heading_plain_text(markdown: str) -> str:
     """Return the rendered text used by a GFM ATX heading."""
     text = CLOSING_ATX_RE.sub("", markdown.strip())
-    text = INLINE_CODE_RE.sub(lambda match: match.group(2).strip(), text)
+    literals: list[str] = []
+
+    def protect_code(match: re.Match[str]) -> str:
+        literals.append(match.group(2).strip())
+        return f"\x00{len(literals) - 1}\x00"
+
+    text = INLINE_CODE_RE.sub(protect_code, text)
     text = INLINE_LINK_RE.sub(lambda match: match.group(1), text)
     text = REFERENCE_LINK_RE.sub(lambda match: match.group(1), text)
     text = AUTOLINK_RE.sub(lambda match: match.group(1), text)
     text = HTML_TAG_RE.sub("", text)
-    text = INLINE_MARKER_RE.sub("", text)
+    for marker_re in INLINE_MARKER_RES:
+        text = marker_re.sub(r"\2", text)
     text = BACKSLASH_ESCAPE_RE.sub(lambda match: match.group(1), text)
-    return html.unescape(text).strip()
+    text = html.unescape(text)
+    text = re.sub(r"\x00(\d+)\x00", lambda match: literals[int(match.group(1))], text)
+    return text.strip()
 
 
 def slugify_heading(text: str) -> str:

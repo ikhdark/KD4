@@ -7,21 +7,30 @@ use super::parse_tool_input_schema_without_compaction;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 
+fn untyped_enum(values: Vec<serde_json::Value>, description: Option<String>) -> JsonSchema {
+    JsonSchema {
+        enum_values: Some(values),
+        description,
+        ..Default::default()
+    }
+}
+
 // Tests in this section exercise normalization transforms that mutate badly
 // formed JSON for consumption by the Responses API.
 
 #[test]
-fn parse_tool_input_schema_coerces_boolean_schemas() {
-    // Example schema shape:
-    // true
-    //
-    // Expected normalization behavior:
-    // - JSON Schema boolean forms are coerced to `{ "type": "string" }`
-    //   because the baseline enum model cannot represent boolean-schema
-    //   semantics directly.
-    let schema = parse_tool_input_schema(&serde_json::json!(true)).expect("parse schema");
-
-    assert_eq!(schema, JsonSchema::string(/*description*/ None));
+fn parse_tool_input_schema_preserves_true_and_rejects_false() {
+    assert_eq!(
+        parse_tool_input_schema(&serde_json::json!(true)).unwrap(),
+        JsonSchema::default()
+    );
+    for input in [
+        serde_json::json!(false),
+        serde_json::json!({"type":"object", "properties":{"blocked":false}}),
+    ] {
+        assert!(parse_tool_input_schema(&input).is_err());
+        assert!(parse_tool_input_schema_without_compaction(&input).is_err());
+    }
 }
 
 #[test]
@@ -49,8 +58,7 @@ fn parse_tool_input_schema_infers_object_shape_and_defaults_properties() {
     //
     // Expected normalization behavior:
     // - `properties` implies an object schema when `type` is omitted.
-    // - The child property has no recognized schema hints, so it is coerced to
-    //   an empty permissive schema.
+    // - The untyped property retains its description.
     let schema = parse_tool_input_schema(&serde_json::json!({
         "properties": {
             "query": {"description": "search query"}
@@ -61,7 +69,13 @@ fn parse_tool_input_schema_infers_object_shape_and_defaults_properties() {
     assert_eq!(
         schema,
         JsonSchema::object(
-            BTreeMap::from([("query".to_string(), JsonSchema::default())]),
+            BTreeMap::from([(
+                "query".to_string(),
+                JsonSchema {
+                    description: Some("search query".to_string()),
+                    ..Default::default()
+                }
+            )]),
             /*required*/ None,
             /*additional_properties*/ None
         )
@@ -69,7 +83,7 @@ fn parse_tool_input_schema_infers_object_shape_and_defaults_properties() {
 }
 
 #[test]
-fn parse_tool_input_schema_coerces_unrecognized_object_schema_to_empty_schema() {
+fn parse_tool_input_schema_preserves_description_on_untyped_schema() {
     // Example schema shape:
     // {
     //   "description": "Ticket identifier",
@@ -77,15 +91,20 @@ fn parse_tool_input_schema_coerces_unrecognized_object_schema_to_empty_schema() 
     // }
     //
     // Expected normalization behavior:
-    // - Object schemas with no recognized schema hints are treated as
-    //   malformed and coerced to the empty permissive schema.
+    // - Untyped schemas preserve their supported annotations.
     let schema = parse_tool_input_schema(&serde_json::json!({
         "description": "Ticket identifier",
         "title": "Ticket ID"
     }))
     .expect("parse schema");
 
-    assert_eq!(schema, JsonSchema::default());
+    assert_eq!(
+        schema,
+        JsonSchema {
+            description: Some("Ticket identifier".to_string()),
+            ..Default::default()
+        }
+    );
 }
 
 #[test]
@@ -101,7 +120,7 @@ fn parse_tool_input_schema_preserves_integer_and_defaults_array_items() {
     //
     // Expected normalization behavior:
     // - `"integer"` is preserved distinctly from `"number"`.
-    // - Arrays missing `items` receive a permissive string `items` schema.
+    // - Arrays missing `items` receive a permissive `items` schema.
     let schema = parse_tool_input_schema(&serde_json::json!({
         "type": "object",
         "properties": {
@@ -121,10 +140,7 @@ fn parse_tool_input_schema_preserves_integer_and_defaults_array_items() {
                 ),
                 (
                     "tags".to_string(),
-                    JsonSchema::array(
-                        JsonSchema::string(/*description*/ None),
-                        /*description*/ None,
-                    )
+                    JsonSchema::array(JsonSchema::default(), /*description*/ None,)
                 ),
             ]),
             /*required*/ None,
@@ -283,40 +299,50 @@ fn parse_tool_input_schema_preserves_all_numeric_constraints() {
 }
 
 #[test]
-fn parse_tool_input_schema_infers_string_from_enum_const_and_format_keywords() {
-    // Example schema shapes:
-    // { "enum": ["fast", "safe"] }
-    // { "const": "file" }
-    // { "format": "date-time" }
-    //
-    // Expected normalization behavior:
-    // - `enum` and `const` normalize into explicit string-enum schemas.
-    // - `format` still falls back to a plain string schema.
-    let enum_schema = parse_tool_input_schema(&serde_json::json!({
-        "enum": ["fast", "safe"]
-    }))
-    .expect("parse enum schema");
-    let const_schema = parse_tool_input_schema(&serde_json::json!({
-        "const": "file"
-    }))
-    .expect("parse const schema");
-    let format_schema = parse_tool_input_schema(&serde_json::json!({
-        "format": "date-time"
-    }))
-    .expect("parse format schema");
-
-    assert_eq!(
-        enum_schema,
-        JsonSchema::string_enum(
-            vec![serde_json::json!("fast"), serde_json::json!("safe")],
-            /*description*/ None,
-        )
-    );
-    assert_eq!(
-        const_schema,
-        JsonSchema::string_enum(vec![serde_json::json!("file")], /*description*/ None)
-    );
-    assert_eq!(format_schema, JsonSchema::string(/*description*/ None));
+fn parse_tool_input_schema_preserves_untyped_enum_and_const() {
+    for (input, expected) in [
+        (
+            serde_json::json!({"enum":[1,"auto"]}),
+            serde_json::json!({"enum":[1,"auto"]}),
+        ),
+        (
+            serde_json::json!({"enum":[1,"auto"],"minimum":0}),
+            serde_json::json!({"enum":[1,"auto"],"minimum":0}),
+        ),
+        (
+            serde_json::json!({"type":"enum","enum":[1,2],"const":2}),
+            serde_json::json!({"enum":[1,2],"allOf":[{"enum":[2]}]}),
+        ),
+        (
+            serde_json::json!({"enum":[1,2],"const":3,"allOf":null}),
+            serde_json::json!({"enum":[1,2],"allOf":[{"enum":[3]}]}),
+        ),
+        (
+            serde_json::json!({"const":7}),
+            serde_json::json!({"enum":[7]}),
+        ),
+        (
+            serde_json::json!({"const":null}),
+            serde_json::json!({"enum":[null]}),
+        ),
+        (
+            serde_json::json!({"enum":["fast","safe"]}),
+            serde_json::json!({"enum":["fast","safe"]}),
+        ),
+        (
+            serde_json::json!({"format":"date-time"}),
+            serde_json::json!({"type":"string"}),
+        ),
+        (
+            serde_json::json!({"type":"integer","enum":[1,2],"const":3,"allOf":[{"minimum":1}]}),
+            serde_json::json!({"type":"integer","enum":[1,2],"allOf":[{"type":"number","minimum":1},{"enum":[3]}]}),
+        ),
+    ] {
+        assert_eq!(
+            serde_json::to_value(parse_tool_input_schema(&input).unwrap()).unwrap(),
+            expected
+        );
+    }
 }
 
 #[test]
@@ -494,7 +520,7 @@ fn parse_tool_input_schema_rewrites_const_to_single_value_enum() {
 
     assert_eq!(
         schema,
-        JsonSchema::string_enum(vec![serde_json::json!("tagged")], /*description*/ None)
+        untyped_enum(vec![serde_json::json!("tagged")], /*description*/ None)
     );
 }
 
@@ -562,7 +588,7 @@ fn parse_tool_input_schema_fills_default_items_for_nullable_array_union() {
                 JsonSchemaPrimitiveType::Array,
                 JsonSchemaPrimitiveType::Null,
             ])),
-            items: Some(Box::new(JsonSchema::string(/*description*/ None))),
+            items: Some(Box::new(JsonSchema::default())),
             ..Default::default()
         }
     );
@@ -803,10 +829,7 @@ fn parse_tool_input_schema_preserves_nested_one_of_property() {
                 "query".to_string(),
                 JsonSchema::one_of(
                     vec![
-                        JsonSchema::string_enum(
-                            vec![serde_json::json!("exact")],
-                            /*description*/ None,
-                        ),
+                        untyped_enum(vec![serde_json::json!("exact")], /*description*/ None,),
                         JsonSchema::number(/*description*/ None),
                     ],
                     /*description*/ None,
@@ -857,7 +880,10 @@ fn parse_tool_input_schema_preserves_nested_all_of_property() {
                 JsonSchema::all_of(
                     vec![
                         JsonSchema::string(/*description*/ None),
-                        JsonSchema::default(),
+                        JsonSchema {
+                            description: Some("unrecognized by itself".to_string()),
+                            ..Default::default()
+                        },
                     ],
                     /*description*/ None,
                 ),
@@ -1005,56 +1031,14 @@ fn parse_large_tool_input_schema_compacts_descriptions_only_on_default_path() {
 
 #[test]
 fn parse_large_tool_input_schema_ignores_dropped_metadata_for_budget() {
-    let schema = parse_tool_input_schema(&serde_json::json!({
-        "type": "object",
-        "properties": {
-            "event": {
-                "type": "object",
-                "title": "Calendar event",
-                "properties": {
-                    "recurrence": {
-                        "type": "object",
-                        "examples": [
-                            {
-                                "payload": "x".repeat(5_500)
-                            }
-                        ],
-                        "properties": {
-                            "pattern": {
-                                "type": "string",
-                                "title": "Recurrence pattern"
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }))
-    .expect("parse schema");
-
+    let input = serde_json::json!({
+        "type": "object", "description": "Keep this guidance",
+        "properties": {"query": {"type":"string", "title":"Query"}},
+        "examples": [{"payload": "x".repeat(5_500)}]
+    });
     assert_eq!(
-        serde_json::to_value(schema).expect("serialize schema"),
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "event": {
-                    "type": "object",
-                    "description": "Calendar event",
-                    "properties": {
-                        "recurrence": {
-                            "type": "object",
-                            "description": "Recurrence settings",
-                            "properties": {
-                                "pattern": {
-                                    "type": "string",
-                                    "description": "Recurrence pattern"
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        })
+        serde_json::to_value(parse_tool_input_schema(&input).unwrap()).unwrap(),
+        serde_json::json!({"type":"object", "description":"Keep this guidance", "properties":{"query":{"type":"string"}}})
     );
 }
 
@@ -1101,12 +1085,15 @@ fn parse_large_tool_input_schema_preserves_reachable_definitions_over_budget() {
             "properties": {
                 "event": {
                     "type": "object",
+                    "description": "Calendar event",
                     "properties": {
                         "recurrence": {
                             "type": "object",
+                            "description": "Recurrence settings",
                             "properties": {
                                 "pattern": {
-                                    "type": "string"
+                                    "type": "string",
+                                    "description": "Recurrence pattern"
                                 }
                             }
                         }
@@ -1416,7 +1403,6 @@ fn parse_large_tool_input_schema_preserves_object_enum_literal_descriptions() {
             "type": "object",
             "properties": {
                 "choice": {
-                    "type": "string",
                     "enum": [
                         {
                             "description": "first literal",
@@ -1447,7 +1433,7 @@ fn parse_tool_input_schema_preserves_string_enum_constraints() {
     //
     // Expected normalization behavior:
     // - Legacy `type: "enum"` and `type: "const"` inputs are normalized into
-    //   the current string-enum representation.
+    //   the untyped enum representation.
     let schema = super::parse_tool_input_schema(&serde_json::json!({
         "type": "object",
         "properties": {
@@ -1473,14 +1459,11 @@ fn parse_tool_input_schema_preserves_string_enum_constraints() {
             BTreeMap::from([
                 (
                     "kind".to_string(),
-                    JsonSchema::string_enum(
-                        vec![serde_json::json!("tagged")],
-                        /*description*/ None,
-                    ),
+                    untyped_enum(vec![serde_json::json!("tagged")], /*description*/ None,),
                 ),
                 (
                     "response_length".to_string(),
-                    JsonSchema::string_enum(
+                    untyped_enum(
                         vec![
                             serde_json::json!("short"),
                             serde_json::json!("medium"),
@@ -1491,7 +1474,7 @@ fn parse_tool_input_schema_preserves_string_enum_constraints() {
                 ),
                 (
                     "scope".to_string(),
-                    JsonSchema::string_enum(
+                    untyped_enum(
                         vec![serde_json::json!("one"), serde_json::json!("two")],
                         /*description*/ None,
                     ),
@@ -1715,7 +1698,7 @@ fn parse_tool_input_schema_handles_cyclic_local_refs() {
     // Expected normalization behavior:
     // - Recursive refs are preserved.
     // - Pruning traversal terminates after visiting each local target once.
-    // - Responses API handles this recursive local-ref shape correctly.
+    // - Preserves the reference; downstream API acceptance is outside this test.
     let schema = parse_tool_input_schema(&serde_json::json!({
         "type": "object",
         "properties": {
@@ -1859,7 +1842,7 @@ fn parse_tool_input_schema_preserves_unresolved_and_external_refs() {
     // Expected normalization behavior:
     // - Unresolved local refs and external refs are preserved.
     // - Unreachable local definitions are still pruned.
-    // - Responses API handles these refs correctly during downstream validation.
+    // - Preserves the references; downstream API acceptance is outside this test.
     let schema = parse_tool_input_schema(&serde_json::json!({
         "type": "object",
         "properties": {
@@ -2063,5 +2046,72 @@ fn parse_tool_input_schema_drops_malformed_definition_tables() {
             )])),
             ..Default::default()
         }
+    );
+}
+
+#[test]
+fn parse_tool_input_schema_retains_definitions_for_unhandled_local_refs() {
+    let input = serde_json::json!({
+        "type":"object",
+        "properties": {
+            "payload":{"$ref":"#/properties/holder/$defs/Inner"},
+            "holder":{"type":"object", "properties":{}, "$defs":{"Inner":{"$ref":"#/$defs/Shared"}}}
+        },
+        "$defs":{"Shared":{"type":"string"}}
+    });
+    assert_eq!(
+        serde_json::to_value(parse_tool_input_schema(&input).unwrap()).unwrap(),
+        input
+    );
+}
+
+#[test]
+fn parse_tool_input_schema_does_not_follow_literal_refs_in_definitions() {
+    let input = serde_json::json!({
+        "type":"object", "properties":{"choice":{"$ref":"#/$defs/Choice"}},
+        "$defs":{
+            "Choice":{"enum":[{"$ref":"#/$defs/Unused"}], "examples":[{"$ref":"#/unknown"}]},
+            "Unused":{"type":"string"}
+        }
+    });
+    assert_eq!(
+        serde_json::to_value(parse_tool_input_schema(&input).unwrap()).unwrap(),
+        serde_json::json!({"type":"object", "properties":{"choice":{"$ref":"#/$defs/Choice"}},
+            "$defs":{"Choice":{"enum":[{"$ref":"#/$defs/Unused"}]}}})
+    );
+}
+
+#[test]
+fn parse_tool_input_schema_preserves_string_assertions_through_compaction() {
+    let input = serde_json::json!({
+        "type":"object", "description":"x".repeat(5_500),
+        "properties":{"code":{"type":"string", "pattern":"^[0-9]{6}$", "minLength":6, "maxLength":6}}
+    });
+    assert_eq!(
+        serde_json::to_value(parse_tool_input_schema(&input).unwrap()).unwrap(),
+        serde_json::json!({"type":"object", "properties":{"code":{"type":"string", "pattern":"^[0-9]{6}$", "minLength":6, "maxLength":6}}})
+    );
+}
+
+#[test]
+fn parse_tool_input_schema_rejects_unsupported_assertions_but_ignores_metadata() {
+    for assertion in [
+        serde_json::json!({"not":{"type":"string"}}),
+        serde_json::json!({"prefixItems":[{"type":"number"}]}),
+        serde_json::json!({"uniqueItems":true}),
+    ] {
+        let input = serde_json::json!({"type":"object", "properties":{"value":assertion}});
+        assert!(
+            parse_tool_input_schema(&input)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported tool input schema assertion")
+        );
+        assert!(parse_tool_input_schema_without_compaction(&input).is_err());
+    }
+    assert_eq!(
+        parse_tool_input_schema(&serde_json::json!({"title":"Title", "examples":[{"not":{}}]}))
+            .unwrap(),
+        JsonSchema::default()
     );
 }

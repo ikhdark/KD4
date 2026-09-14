@@ -8,7 +8,7 @@ fn review_prompt_template_renders_base_branch_variant() {
             &BASE_BRANCH_PROMPT_TEMPLATE,
             [("base_branch", "main"), ("merge_base_sha", "abc123")]
         ),
-        "Review the code changes against the base branch 'main'. The merge base commit for this comparison is abc123. Run `git diff abc123` to inspect the changes relative to main. Provide prioritized, actionable findings."
+        "Review the code changes against the base branch 'main'. The merge base commit for this comparison is abc123. Run `git diff abc123` to inspect tracked changes relative to main, including staged and unstaged edits. Provide prioritized, actionable findings."
     );
 }
 
@@ -51,6 +51,8 @@ fn review_rubric_stays_compact_without_losing_output_contracts() {
     );
     for required in [
         "Return every qualifying issue",
+        "Intentional changes remain reportable when direct evidence establishes a defect or violation of an applicable requirement.",
+        "Base correctness on defects, not urgency: a lower-priority defect still makes the patch incorrect.",
         "[P0]",
         "\"priority\"",
         "\"code_location\"",

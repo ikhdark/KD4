@@ -41,7 +41,6 @@ use codex_protocol::protocol::McpAuthStatus;
 use rmcp::model::ElicitationCapability;
 use rmcp::model::ReadResourceRequestParams;
 use rmcp::model::ReadResourceResult;
-use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::ResolvedMcpCatalog;
@@ -148,6 +147,24 @@ pub struct McpConfig {
     /// Plugin declarations used to attribute connector tools to plugin display names.
     /// MCP registrations retain their own package attribution in the catalog.
     pub connector_snapshot: ConnectorSnapshot,
+}
+
+impl McpConfig {
+    /// Cache identity follows the materialized host-owned registration.
+    pub fn codex_apps_tools_cache_key(
+        &self,
+        auth: Option<&CodexAuth>,
+    ) -> crate::CodexAppsToolsCacheKey {
+        let key = codex_apps_tools_cache_key(
+            auth,
+            &self.chatgpt_base_url,
+            self.apps_mcp_product_sku.as_deref(),
+        );
+        match self.mcp_server_catalog.server(CODEX_APPS_MCP_SERVER_NAME) {
+            Some(server) => key.for_server(server.config()),
+            None => key,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -362,6 +379,7 @@ pub struct McpServerStatusSnapshot {
     pub tools_by_server: HashMap<String, HashMap<String, Tool>>,
     pub resources: HashMap<String, Vec<Resource>>,
     pub resource_templates: HashMap<String, Vec<ResourceTemplate>>,
+    pub resource_errors: Vec<crate::McpServerCollectionError>,
     pub auth_statuses: HashMap<String, McpAuthStatus>,
     pub server_names: Vec<String>,
 }
@@ -431,6 +449,7 @@ async fn collect_mcp_server_status_snapshot_impl(
             tools_by_server: HashMap::new(),
             resources: HashMap::new(),
             resource_templates: HashMap::new(),
+            resource_errors: Vec::new(),
             auth_statuses: HashMap::new(),
             server_names: Vec::new(),
         };
@@ -525,7 +544,7 @@ fn codex_apps_mcp_bearer_token_env_var() -> Option<String> {
     }
 }
 
-fn codex_apps_mcp_url_for_base_url(base_url: &str) -> String {
+pub(crate) fn codex_apps_mcp_url_for_base_url(base_url: &str) -> String {
     let base_url = canonicalize_chatgpt_base_url(base_url);
     let (base_url, default_path) = if base_url.contains("/backend-api") {
         (base_url, "wham/apps")
@@ -643,31 +662,15 @@ fn convert_mcp_resources(
         .map(|(name, resources)| {
             let resources = resources
                 .into_iter()
-                .filter_map(|resource| match serde_json::to_value(resource) {
-                    Ok(value) => match Resource::from_mcp_value(value.clone()) {
+                .filter_map(
+                    |resource| match crate::resource_client::resource_from_rmcp(resource) {
                         Ok(resource) => Some(resource),
                         Err(err) => {
-                            let (uri, resource_name) = match value {
-                                Value::Object(obj) => (
-                                    obj.get("uri")
-                                        .and_then(|v| v.as_str().map(ToString::to_string)),
-                                    obj.get("name")
-                                        .and_then(|v| v.as_str().map(ToString::to_string)),
-                                ),
-                                _ => (None, None),
-                            };
-
-                            tracing::warn!(
-                                "Failed to convert MCP resource (uri={uri:?}, name={resource_name:?}): {err}"
-                            );
+                            tracing::warn!("Failed to convert MCP resource: {err}");
                             None
                         }
                     },
-                    Err(err) => {
-                        tracing::warn!("Failed to serialize MCP resource: {err}");
-                        None
-                    }
-                })
+                )
                 .collect::<Vec<_>>();
             (name, resources)
         })
@@ -682,30 +685,16 @@ fn convert_mcp_resource_templates(
         .map(|(name, templates)| {
             let templates = templates
                 .into_iter()
-                .filter_map(|template| match serde_json::to_value(template) {
-                    Ok(value) => match ResourceTemplate::from_mcp_value(value.clone()) {
+                .filter_map(|template| {
+                    let uri_template = template.uri_template.clone();
+                    let template_name = template.name.clone();
+                    let converted = serde_json::to_value(template).and_then(ResourceTemplate::from_mcp_value);
+                    match converted {
                         Ok(template) => Some(template),
                         Err(err) => {
-                            let (uri_template, template_name) = match value {
-                                Value::Object(obj) => (
-                                    obj.get("uriTemplate")
-                                        .or_else(|| obj.get("uri_template"))
-                                        .and_then(|v| v.as_str().map(ToString::to_string)),
-                                    obj.get("name")
-                                        .and_then(|v| v.as_str().map(ToString::to_string)),
-                                ),
-                                _ => (None, None),
-                            };
-
-                            tracing::warn!(
-                                "Failed to convert MCP resource template (uri_template={uri_template:?}, name={template_name:?}): {err}"
-                            );
+                            tracing::warn!("Failed to convert MCP resource template (uri_template={uri_template:?}, name={template_name:?}): {err}");
                             None
                         }
-                    },
-                    Err(err) => {
-                        tracing::warn!("Failed to serialize MCP resource template: {err}");
-                        None
                     }
                 })
                 .collect::<Vec<_>>();
@@ -724,12 +713,9 @@ async fn collect_mcp_server_status_snapshot_from_manager(
         mcp_connection_manager.list_all_tools(),
         async {
             if detail.include_resources() {
-                mcp_connection_manager
-                    .list_all_resources(|_| true)
-                    .await
-                    .results
+                mcp_connection_manager.list_all_resources(|_| true).await
             } else {
-                HashMap::new()
+                crate::McpServerCollection::default()
             }
         },
         async {
@@ -737,9 +723,8 @@ async fn collect_mcp_server_status_snapshot_from_manager(
                 mcp_connection_manager
                     .list_all_resource_templates(|_| true)
                     .await
-                    .results
             } else {
-                HashMap::new()
+                crate::McpServerCollection::default()
             }
         },
     );
@@ -761,8 +746,13 @@ async fn collect_mcp_server_status_snapshot_from_manager(
     McpServerStatusSnapshot {
         server_infos,
         tools_by_server,
-        resources: convert_mcp_resources(resources),
-        resource_templates: convert_mcp_resource_templates(resource_templates),
+        resources: convert_mcp_resources(resources.results),
+        resource_templates: convert_mcp_resource_templates(resource_templates.results),
+        resource_errors: resources
+            .errors
+            .into_iter()
+            .chain(resource_templates.errors)
+            .collect(),
         auth_statuses: auth_statuses_from_entries(&auth_status_entries),
         server_names,
     }

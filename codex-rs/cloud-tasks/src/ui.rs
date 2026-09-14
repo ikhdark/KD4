@@ -811,7 +811,11 @@ fn render_task_item(_app: &App, t: &codex_cloud_tasks_client::TaskSummary) -> Li
     if let Some(lbl) = t.environment_label.as_ref().filter(|s| !s.is_empty()) {
         meta.push(lbl.clone().dim());
     }
-    let when = format_relative_time_now(t.updated_at).dim();
+    let when = t
+        .updated_at
+        .map(format_relative_time_now)
+        .unwrap_or_else(|| "unknown".to_string())
+        .dim();
     if !meta.is_empty() {
         meta.push("  ".into());
         meta.push("•".dim());

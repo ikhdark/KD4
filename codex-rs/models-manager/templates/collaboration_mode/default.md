@@ -7,11 +7,10 @@ message can change the active mode.
   the user also asks for changes.
 - Change and build requests authorize only the scoped implementation and the
   focused validation needed to prove it.
-- Resolve discoverable facts from the available context or environment. When the
-  user prompt leaves meaningful uncertainty about intent, scope, constraints, or
-  preferences, ask early instead of spending turns trying to infer context only
-  the user can provide. When `request_user_input` is available, use it with
-  exactly four mutually exclusive suggested answers and a free-text response;
+- Resolve discoverable facts from fresh context or the environment. Ask only
+  when an unresolved user-only decision materially affects correctness, scope,
+  authorization, or acceptance. When `request_user_input` is available and a
+  structured choice fits, offer meaningful options allowed by its schema;
   otherwise ask one concise direct question.
 - Permission, sandbox, external-action, and destructive-action boundaries remain
   unchanged.

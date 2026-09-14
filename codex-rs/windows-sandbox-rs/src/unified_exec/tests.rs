@@ -1159,9 +1159,10 @@ fn public_windows_backends_defer_native_preparation_without_launching_on_error()
             drop(release);
             blocker.await?;
             let result = timeout(Duration::from_secs(15), spawn).await?;
-            let error = result
-                .err()
-                .expect("native preflight must reject the file used as sandbox directory");
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("native preflight must reject the file used as sandbox directory"),
+            };
             if matches!(level, WindowsSandboxLevel::RestrictedToken)
                 && !crate::legacy_restricted_token_enforces_delete_child()
             {

@@ -753,17 +753,11 @@ pub fn essential_projection_fields(value: &JsonValue) -> JsonValue {
             object
                 .iter()
                 .filter_map(|(key, value)| {
+                    if is_essential_key(key) {
+                        return Some((key.clone(), value.clone()));
+                    }
                     let nested = essential_projection_fields(value);
-                    (is_essential_key(key) || !is_empty_projection(&nested)).then(|| {
-                        (
-                            key.clone(),
-                            if is_essential_key(key) {
-                                value.clone()
-                            } else {
-                                nested
-                            },
-                        )
-                    })
+                    (!is_empty_projection(&nested)).then(|| (key.clone(), nested))
                 })
                 .collect(),
         ),
@@ -806,19 +800,58 @@ fn is_essential_key(key: &str) -> bool {
     key == "id"
         || key.ends_with("_id")
         || key.ends_with("Id")
-        || normalized.contains("cursor")
-        || normalized.contains("status")
-        || normalized.contains("state")
-        || normalized.contains("gate")
-        || normalized.contains("next_action")
-        || normalized.contains("nextrequiredaction")
+        || matches!(
+            normalized.as_str(),
+            "cursor"
+                | "next_cursor"
+                | "nextcursor"
+                | "next_cursors"
+                | "nextcursors"
+                | "previous_cursor"
+                | "previouscursor"
+                | "status"
+                | "agent_status"
+                | "process_status"
+                | "coverage_status"
+                | "index_status"
+                | "previous_status"
+                | "state"
+                | "attempt_state"
+                | "lease_state"
+                | "state_revision"
+                | "gate"
+                | "gates"
+                | "pending_gates"
+                | "unresolved_gates"
+                | "next_action"
+                | "next_required_action"
+                | "nextrequiredaction"
+        )
         || normalized == "aborted"
         || normalized == "abort_reason"
         || normalized == "abortreason"
-        || (normalized.contains("omitted") && normalized.contains("count"))
-        || (normalized.contains("truncated") && normalized.contains("count"))
-        || (normalized.contains("remaining") && normalized.contains("count"))
-        || (normalized.contains("retention") && normalized.contains("reason"))
+        || matches!(
+            normalized.as_str(),
+            "omitted_count"
+                | "omittedcount"
+                | "omitted_result_count"
+                | "omittedresultcount"
+                | "omitted_error_count"
+                | "omittederrorcount"
+                | "omitted_item_counts"
+                | "truncated_count"
+                | "truncatedcount"
+                | "remaining_count"
+                | "remainingcount"
+                | "remaining_match_count"
+                | "remainingmatchcount"
+                | "remaining_result_count"
+                | "remainingresultcount"
+                | "retention_limit_reason"
+                | "retentionlimitreason"
+                | "raw_output_artifact_retention_limit_reason"
+                | "raw_output_artifact_retention_limit_hit"
+        )
         || normalized == "retention_limit_hit"
         || normalized == "retentionlimithit"
         || normalized == "action"
@@ -1312,11 +1345,39 @@ mod canonical_tests {
             serde_json::json!(["first", "second"])
         );
         assert_eq!(metadata.essential_inline["command_was_executed"], true);
-        assert!(metadata.essential_inline["failure_signature"].is_null());
+        assert_eq!(
+            metadata.essential_inline.get("failure_signature"),
+            Some(&JsonValue::Null)
+        );
         assert_eq!(metadata.essential_inline["not_exercised"], false);
         assert!(metadata.essential_inline.get("valid").is_none());
         assert!(metadata.essential_inline.get("payload").is_none());
         assert!(metadata.essential_inline["nested"].get("items").is_none());
+    }
+
+    #[test]
+    fn essential_projection_does_not_promote_payload_key_substrings() {
+        let value = serde_json::json!({
+            "aggregated_output": "large output".repeat(10_000),
+            "statement": "large statement".repeat(10_000),
+            "status_history": ["old status".repeat(10_000)],
+            "nested": { "status": "running", "payload": "large".repeat(10_000) },
+            "gate": { "state": { "status": "blocked", "reason": "approval" } },
+            "nextCursor": "page-2",
+            "call_id": "call-1",
+        });
+        let output = JsonToolOutput::new(value.clone());
+        let metadata = output.projection_metadata().expect("JSON projection");
+        assert_eq!(
+            metadata.essential_inline,
+            serde_json::json!({
+                "nested": { "status": "running" },
+                "gate": { "state": { "status": "blocked", "reason": "approval" } },
+                "nextCursor": "page-2",
+                "call_id": "call-1",
+            })
+        );
+        assert_eq!(metadata.spillable_text, vec![value.to_string()]);
     }
 
     #[test]

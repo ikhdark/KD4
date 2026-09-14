@@ -55,9 +55,19 @@ async fn memories_startup_creates_memory_root() -> anyhow::Result<()> {
     let memory_root = home.path().join("memories");
     let test = build_test_codex(&server, home).await?;
 
+    let response = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("root"),
+            ev_assistant_message("root-message", "complete"),
+            ev_completed("root"),
+        ]),
+    )
+    .await;
     assert!(!memory_root.exists());
     trigger_memories_startup(&test).await;
-    wait_for_dir(&memory_root).await?;
+    assert!(memory_root.is_dir());
+    assert_eq!(response.requests().len(), 1);
 
     shutdown_test_codex(&test).await?;
     Ok(())
@@ -132,7 +142,8 @@ async fn memories_startup_phase2_tracks_workspace_diff_across_runs() -> anyhow::
 
     trigger_memories_startup(&test).await;
 
-    let request = wait_for_single_request(&phase2).await;
+    assert_eq!(phase2.requests().len(), 1);
+    let request = wait_for_first_request(&phase2).await;
     let request_body = request.body_json();
     let tools = request_body["tools"]
         .as_array()
@@ -180,6 +191,39 @@ async fn memories_startup_phase2_tracks_workspace_diff_across_runs() -> anyhow::
             .iter()
             .all(|summary| !summary.contains("rollout summary A"))
     );
+
+    db.memories()
+        .enqueue_global_consolidation(now.timestamp() + 1)
+        .await?;
+    // Age only the successful-run cooldown so the second startup reaches the diff check.
+    let pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new().filename(
+            test.config
+                .sqlite_home
+                .join(codex_state::MEMORIES_DB_FILENAME),
+        ),
+    )
+    .await?;
+    assert_eq!(
+        sqlx::query("UPDATE jobs SET finished_at = 0 WHERE kind = 'memory_consolidate_global' AND status = 'pending'")
+            .execute(&pool)
+            .await?
+            .rows_affected(),
+        1
+    );
+    trigger_memories_startup(&test).await;
+    let acknowledged: i64 =
+        sqlx::query_scalar("SELECT last_success_watermark FROM jobs WHERE kind = 'memory_consolidate_global' AND status = 'done'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(acknowledged, now.timestamp() + 1);
+    pool.close().await;
+    assert_eq!(
+        phase2.requests().len(),
+        1,
+        "unchanged second run must not call the model"
+    );
+    wait_for_phase2_workspace_reset(&memory_root).await?;
 
     shutdown_test_codex(&test).await?;
     Ok(())
@@ -236,7 +280,8 @@ async fn memories_startup_phase2_prunes_old_extension_resources() -> anyhow::Res
 
     trigger_memories_startup(&test).await;
 
-    let request = wait_for_single_request(&phase2).await;
+    assert_eq!(phase2.requests().len(), 1);
+    let request = wait_for_first_request(&phase2).await;
     let prompt = phase2_prompt_text(&request);
     assert!(
         prompt.contains("phase2_workspace_diff.md"),
@@ -299,7 +344,8 @@ async fn memories_startup_phase2_prunes_old_extension_resources_without_stage1_i
 
     trigger_memories_startup(&test).await;
 
-    let request = wait_for_single_request(&phase2).await;
+    assert_eq!(phase2.requests().len(), 1);
+    let request = wait_for_first_request(&phase2).await;
     let prompt = phase2_prompt_text(&request);
     assert!(
         prompt.contains("phase2_workspace_diff.md"),
@@ -374,7 +420,8 @@ async fn memories_startup_phase1_uses_live_thread_service_tier_and_detached_meta
             &request_context,
         )
         .await?;
-    let request = wait_for_single_request(&stage_one).await;
+    assert_eq!(stage_one.requests().len(), 1);
+    let request = wait_for_first_request(&stage_one).await;
     let metadata_header = request
         .header("x-codex-turn-metadata")
         .expect("detached memory request should include workspace metadata");
@@ -468,8 +515,13 @@ async fn memories_startup_phase2_rejects_required_worker_capabilities_before_sid
         )
         .await?;
         let threads_before = test.thread_manager.list_thread_created_ids().await;
+        assert!(!root.join(".git").exists());
 
         phase2::run(context, Arc::new(config)).await;
+        assert!(
+            !root.join(".git").exists(),
+            "invalid config must not prepare Git"
+        );
 
         assert_eq!(
             tokio::fs::read_to_string(root.join("raw_memories.md")).await?,
@@ -663,7 +715,8 @@ async fn run_memory_phase_one_model_request_test(
 
     let (context, config) = memory_startup_context_with_provider(&test, provider).await;
     phase1::run(context, config).await;
-    let request = wait_for_single_request(&response).await;
+    assert_eq!(response.requests().len(), 1);
+    let request = wait_for_first_request(&response).await;
     shutdown_test_codex(&test).await?;
     Ok(request)
 }
@@ -719,7 +772,8 @@ async fn run_memory_phase_two_model_request_test(
     tokio::fs::create_dir_all(&root).await?;
     seed_extension_instructions(&root).await?;
     phase2::run(context, Arc::new(config)).await;
-    let request = wait_for_single_request(&response).await;
+    assert_eq!(response.requests().len(), 1);
+    let request = wait_for_first_request(&response).await;
     wait_for_phase2_workspace_reset(&home.path().join("memories")).await?;
     assert!(
         tokio::fs::read_to_string(root.join("raw_memories.md"))
@@ -779,6 +833,14 @@ async fn trigger_memories_startup(test: &TestCodex) {
         Arc::clone(&test.codex),
         Arc::new(config),
         &config_snapshot.session_source,
+    )
+    .expect("eligible startup")
+    .await
+    .expect("startup completes");
+    assert_eq!(
+        test.thread_manager.list_thread_ids().await,
+        vec![test.session_configured.thread_id],
+        "startup completion must remove its consolidation worker"
     );
 }
 
@@ -934,7 +996,7 @@ async fn seed_stage1_candidate(
     Ok(thread_id)
 }
 
-async fn wait_for_single_request(mock: &ResponseMock) -> ResponsesRequest {
+async fn wait_for_first_request(mock: &ResponseMock) -> ResponsesRequest {
     wait_for_request(mock, /*expected_count*/ 1).await.remove(0)
 }
 
@@ -947,21 +1009,6 @@ async fn wait_for_file_removed(path: &Path) -> anyhow::Result<()> {
         assert!(
             Instant::now() < deadline,
             "timed out waiting for {} to be removed",
-            path.display()
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-async fn wait_for_dir(path: &Path) -> anyhow::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if tokio::fs::try_exists(path).await? && path.is_dir() {
-            return Ok(());
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {} to be created",
             path.display()
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1012,20 +1059,14 @@ fn phase2_prompt_text(request: &ResponsesRequest) -> String {
 }
 
 async fn wait_for_phase2_workspace_reset(memory_root: &Path) -> anyhow::Result<()> {
-    wait_for_file_removed(&memory_root.join("phase2_workspace_diff.md")).await?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Ok(diff) = diff_since_latest_init(memory_root).await
-            && !diff.has_changes()
-        {
-            return Ok(());
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for clean memory workspace baseline"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    // Callers have joined startup or awaited phase2::run, including shutdown and DB acknowledgment.
+    assert!(!memory_root.join("phase2_workspace_diff.md").exists());
+    let diff = diff_since_latest_init(memory_root).await?;
+    assert!(
+        !diff.has_changes(),
+        "workspace should be acknowledged: {diff:?}"
+    );
+    Ok(())
 }
 
 async fn seed_stage1_output_for_existing_thread(
@@ -1079,5 +1120,73 @@ async fn read_rollout_summary_bodies(memory_root: &Path) -> anyhow::Result<Vec<S
 async fn shutdown_test_codex(test: &TestCodex) -> anyhow::Result<()> {
     test.codex.submit(Op::Shutdown {}).await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::ShutdownComplete)).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovered_baseline_consolidates_already_synchronized_inputs() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let home = Arc::new(TempDir::new()?);
+    let test = build_test_codex(&server, home.clone()).await?;
+    let db = test.codex.state_db().unwrap();
+    seed_stage1_output(
+        db.as_ref(),
+        home.path(),
+        chrono::Utc::now(),
+        "pending raw",
+        "pending summary",
+        "recovery",
+    )
+    .await?;
+    let root = home.path().join("memories");
+    let selected = db
+        .memories()
+        .get_phase2_input_selection(1, test.config.memories.max_unused_days)
+        .await?;
+    crate::sync_rollout_summaries_from_memories(&root, &selected, 1).await?;
+    crate::rebuild_raw_memories_file_from_memories(&root, &selected, 1).await?;
+    seed_extension_instructions(&root).await?;
+    tokio::fs::create_dir_all(root.join(".git")).await?;
+    tokio::fs::write(root.join("MEMORY.md"), "old consolidated memory").await?;
+    let response = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("recovery"),
+            ev_assistant_message("recovery-msg", "complete"),
+            ev_completed("recovery"),
+        ]),
+    )
+    .await;
+    trigger_memories_startup(&test).await;
+    assert_eq!(
+        response.requests().len(),
+        1,
+        "baseline recovery must consolidate pre-existing inputs"
+    );
+    wait_for_phase2_workspace_reset(&root).await?;
+    shutdown_test_codex(&test).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn disabled_generation_does_not_start_pipeline() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let home = Arc::new(TempDir::new()?);
+    let test = build_test_codex(&server, home.clone()).await?;
+    let mut config = test.config.clone();
+    config.features.enable(Feature::MemoryTool)?;
+    config.memories.generate_memories = false;
+    let source = test.codex.config_snapshot().await.session_source;
+    let task = start_memories_startup_task(
+        Arc::clone(&test.thread_manager),
+        test.thread_manager.auth_manager(),
+        test.session_configured.thread_id,
+        Arc::clone(&test.codex),
+        Arc::new(config),
+        &source,
+    );
+    assert!(task.is_none());
+    assert!(!home.path().join("memories").exists());
+    shutdown_test_codex(&test).await?;
     Ok(())
 }

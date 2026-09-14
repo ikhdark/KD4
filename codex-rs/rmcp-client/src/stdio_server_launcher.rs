@@ -53,10 +53,49 @@ use tracing::info;
 use tracing::warn;
 
 use crate::executor_process_transport::ExecutorProcessTransport;
+use crate::executor_process_transport::MCP_STDIO_MAX_LINE_BYTES;
 use crate::program_resolver;
 use crate::utils::create_env_for_mcp_server;
 use crate::utils::create_env_overlay_for_remote_mcp_server;
 use crate::utils::remote_mcp_env_var_names;
+
+// Consume oversized diagnostics through their delimiter without retaining them.
+// Byte framing keeps malformed UTF-8 from stopping the pipe consumer.
+async fn read_stderr_line(
+    reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
+) -> io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    let mut oversized = false;
+    loop {
+        let bytes = reader.fill_buf().await?;
+        if bytes.is_empty() {
+            return Ok((!line.is_empty() && !oversized).then_some(line));
+        }
+        let newline = memchr::memchr(b'\n', bytes);
+        let len = newline.unwrap_or(bytes.len());
+        if !oversized {
+            if len > MCP_STDIO_MAX_LINE_BYTES - line.len() {
+                line.clear();
+                oversized = true;
+                warn!(
+                    "MCP server stderr line exceeded the {MCP_STDIO_MAX_LINE_BYTES}-byte limit; discarding diagnostic"
+                );
+            } else {
+                line.extend_from_slice(&bytes[..len]);
+            }
+        }
+        reader.consume(len + usize::from(newline.is_some()));
+        if newline.is_some() {
+            if !oversized {
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                return Ok(Some(line));
+            }
+            oversized = false;
+        }
+    }
+}
 
 // General purpose public code.
 
@@ -271,12 +310,13 @@ impl LocalStdioServerLauncher {
 
         if let Some(stderr) = stderr {
             tokio::spawn(async move {
-                let mut reader = BufReader::new(stderr).lines();
+                let mut reader = BufReader::new(stderr);
                 loop {
-                    match reader.next_line().await {
-                        Ok(Some(line)) => {
-                            info!("MCP server stderr ({program_name}): {line}");
-                        }
+                    match read_stderr_line(&mut reader).await {
+                        Ok(Some(line)) => info!(
+                            "MCP server stderr ({program_name}): {}",
+                            String::from_utf8_lossy(&line)
+                        ),
                         Ok(None) => break,
                         Err(error) => {
                             warn!("Failed to read MCP server stderr ({program_name}): {error}");
@@ -597,6 +637,30 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::Notify;
     use tokio::sync::watch;
+
+    #[tokio::test]
+    async fn local_stderr_drains_oversized_and_non_utf8_lines() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let writing = tokio::spawn(async move {
+            writer
+                .write_all(&vec![b'x'; MCP_STDIO_MAX_LINE_BYTES + 1])
+                .await
+                .unwrap();
+            writer.write_all(b"\ninvalid \xff\nnext\r\n").await.unwrap();
+        });
+        let mut reader = BufReader::new(reader);
+        assert_eq!(
+            read_stderr_line(&mut reader).await.unwrap(),
+            Some(b"invalid \xff".to_vec())
+        );
+        assert_eq!(
+            read_stderr_line(&mut reader).await.unwrap(),
+            Some(b"next".to_vec())
+        );
+        assert_eq!(read_stderr_line(&mut reader).await.unwrap(), None);
+        writing.await.unwrap();
+    }
 
     struct BlockingExecProcess {
         process_id: ProcessId,

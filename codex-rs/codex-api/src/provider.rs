@@ -54,6 +54,22 @@ impl Provider {
     pub fn url_for_path(&self, path: &str) -> String {
         let base = self.base_url.trim_end_matches('/');
         let path = path.trim_start_matches('/');
+        if let Ok(mut url) = Url::parse(&self.base_url) {
+            let base_path = url.path().trim_end_matches('/');
+            let joined_path = if path.is_empty() {
+                base_path.to_string()
+            } else {
+                format!("{base_path}/{path}")
+            };
+            url.set_path(&joined_path);
+            if let Some(params) = &self.query_params
+                && !params.is_empty()
+            {
+                url.query_pairs_mut().extend_pairs(params);
+            }
+            return url.into();
+        }
+        // Preserve invalid configurations for the fallible transport boundary.
         let mut url = if path.is_empty() {
             base.to_string()
         } else {
@@ -113,16 +129,27 @@ pub fn is_azure_responses_provider(name: &str, base_url: Option<&str>) -> bool {
 }
 
 fn matches_azure_responses_base_url(base_url: &str) -> bool {
-    let base_url = base_url.to_ascii_lowercase();
-    const AZURE_MARKERS: [&str; 6] = [
-        "openai.azure.",
-        "cognitiveservices.azure.",
-        "aoai.azure.",
-        "azure-api.",
-        "azurefd.",
-        "windows.net/openai",
-    ];
-    AZURE_MARKERS.iter().any(|marker| base_url.contains(marker))
+    let Ok(url) = Url::parse(base_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.');
+    let matches_domain = |domain: &str| {
+        host == domain
+            || host
+                .strip_suffix(domain)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    };
+    ["com", "us", "cn"].iter().any(|suffix| {
+        ["openai", "cognitiveservices", "aoai"]
+            .iter()
+            .any(|service| matches_domain(&format!("{service}.azure.{suffix}")))
+    }) || matches_domain("azure-api.net")
+        || matches_domain("azurefd.net")
+        || (matches_domain("windows.net")
+            && (url.path() == "/openai" || url.path().starts_with("/openai/")))
 }
 
 #[cfg(test)]
@@ -138,6 +165,7 @@ mod tests {
             "https://foo.aoai.azure.com/openai",
             "https://foo.openai.azure-api.net/openai",
             "https://foo.z01.azurefd.net/",
+            "https://foo.windows.net/openai/deployments/bar",
         ];
 
         for base_url in positive_cases {
@@ -156,6 +184,11 @@ mod tests {
             "https://api.openai.com/v1",
             "https://example.com/openai",
             "https://myproxy.azurewebsites.net/openai",
+            "https://proxy.example/v1?note=openai.azure.com",
+            "https://proxy.example/openai.azure.com",
+            "https://foo.openai.azure.com.example/v1",
+            "https://notazurefd.net/openai",
+            "https://foo.windows.net/openai-other",
         ];
 
         for base_url in negative_cases {
@@ -164,5 +197,35 @@ mod tests {
                 "expected {base_url} not to be detected as Azure"
             );
         }
+    }
+
+    #[test]
+    fn request_and_websocket_urls_preserve_base_query_and_fragment() {
+        let provider = Provider {
+            name: "test".into(),
+            base_url: "https://proxy.example/v1/?tenant=a#section".into(),
+            query_params: Some(HashMap::from([("api-version".into(), "2026 09".into())])),
+            headers: HeaderMap::new(),
+            retry: RetryConfig {
+                max_retries: 0,
+                base_delay: Duration::ZERO,
+                retry_429: false,
+                retry_5xx: false,
+                retry_transport: false,
+            },
+            stream_idle_timeout: Duration::from_secs(1),
+        };
+        let request = provider.build_request(Method::POST, "/responses");
+        assert_eq!(
+            request.url,
+            "https://proxy.example/v1/responses?tenant=a&api-version=2026+09#section"
+        );
+        assert_eq!(
+            provider
+                .websocket_url_for_path("responses")
+                .expect("valid URL")
+                .as_str(),
+            "wss://proxy.example/v1/responses?tenant=a&api-version=2026+09#section"
+        );
     }
 }

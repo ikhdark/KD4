@@ -36,6 +36,11 @@ pub(super) async fn search_threads(
     store: &LocalThreadStore,
     params: SearchThreadsParams,
 ) -> ThreadStoreResult<ThreadSearchPage> {
+    if params.page_size == 0 {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: "page size must be greater than zero".to_string(),
+        });
+    }
     let search_term = params.search_term.as_str();
     if search_term.is_empty() {
         return Err(ThreadStoreError::InvalidRequest {
@@ -142,9 +147,14 @@ pub(super) async fn search_threads(
     let more_matches_available = matching_items.len() > params.page_size;
     matching_items.truncate(params.page_size);
     let next_cursor = if more_matches_available {
-        matching_items
-            .last()
-            .and_then(|item| cursor_from_thread_search_item(item, params.sort_key))
+        Some(
+            matching_items
+                .last()
+                .and_then(|item| cursor_from_thread_search_item(item, params.sort_key))
+                .ok_or_else(|| ThreadStoreError::Internal {
+                    message: "failed to construct required thread search cursor".to_string(),
+                })?,
+        )
     } else {
         None
     }

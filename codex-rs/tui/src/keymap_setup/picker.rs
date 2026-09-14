@@ -42,12 +42,13 @@ struct KeymapActionRow {
     label: String,
     description: &'static str,
     binding_summary: String,
+    unbound: bool,
     custom_binding: bool,
 }
 
 impl KeymapActionRow {
     fn is_unbound(&self) -> bool {
-        self.binding_summary == "unbound"
+        self.unbound
     }
 }
 
@@ -346,6 +347,7 @@ fn build_keymap_rows(
                 label: action_label(descriptor.action),
                 description: descriptor.description,
                 binding_summary: format_binding_summary(bindings),
+                unbound: bindings.is_empty(),
                 custom_binding: has_custom_binding(
                     keymap_config,
                     descriptor.context,
@@ -476,4 +478,44 @@ fn keymap_debug_hint_line() -> Line<'static> {
         "esc".set_style(style),
         " close".dim(),
     ])
+}
+
+#[cfg(test)]
+mod binding_state_tests {
+    use super::*;
+
+    #[test]
+    fn unbound_filter_uses_bindings_even_when_the_summary_cannot_format_them() {
+        let mut runtime = RuntimeKeymap::defaults();
+        runtime.app.toggle_vim_mode = vec![crate::key_hint::KeyBinding::new(
+            crossterm::event::KeyCode::Null,
+            crossterm::event::KeyModifiers::NONE,
+        )];
+        let rows = build_keymap_rows(
+            &runtime,
+            &TuiKeymap::default(),
+            KeymapActionFilter {
+                fast_mode_enabled: false,
+            },
+        );
+        let toggle = rows
+            .iter()
+            .find(|row| row.context == "global" && row.action == "toggle_vim_mode")
+            .unwrap();
+        assert!(!toggle.is_unbound());
+        let defaults = build_keymap_rows(
+            &RuntimeKeymap::defaults(),
+            &TuiKeymap::default(),
+            KeymapActionFilter {
+                fast_mode_enabled: false,
+            },
+        );
+        assert!(
+            defaults
+                .iter()
+                .find(|row| row.context == "global" && row.action == "toggle_vim_mode")
+                .unwrap()
+                .is_unbound()
+        );
+    }
 }

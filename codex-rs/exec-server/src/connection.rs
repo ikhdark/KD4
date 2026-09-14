@@ -351,7 +351,11 @@ impl JsonRpcConnection {
             let mut reader = BufReader::new(reader);
             let mut line = String::new();
             loop {
-                line.clear();
+                if line.capacity() > 1024 * 1024 {
+                    line = String::new();
+                } else {
+                    line.clear();
+                }
                 let read_result = (&mut reader).take(read_limit).read_line(&mut line).await;
                 match read_result {
                     Ok(0) => {
@@ -477,7 +481,7 @@ impl JsonRpcConnection {
     }
 
     fn from_websocket_stream<T, M, E>(
-        mut websocket: T,
+        websocket: T,
         connection_label: String,
         ping_interval: Option<Duration>,
     ) -> Self
@@ -491,106 +495,78 @@ impl JsonRpcConnection {
         let (disconnected_tx, disconnected_rx) = watch::channel(false);
 
         let websocket_task = tokio::spawn(async move {
-            let mut ping_interval = ping_interval.map(|ping_interval| {
-                let mut interval = tokio::time::interval_at(
-                    tokio::time::Instant::now() + ping_interval,
-                    ping_interval,
-                );
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                interval
-            });
-
-            loop {
-                tokio::select! {
-                    maybe_message = outgoing_rx.recv() => {
-                        let Some(message) = maybe_message else {
-                            break;
-                        };
-                        if let Err(reason) = send_websocket_jsonrpc_message(
-                            &mut websocket,
-                            &connection_label,
-                            &message,
-                        )
-                        .await
-                        {
-                            send_disconnected(&incoming_tx, &disconnected_tx, Some(reason)).await;
-                            break;
-                        }
-                    }
-                    _ = async {
-                        match ping_interval.as_mut() {
-                            Some(interval) => interval.tick().await,
-                            None => std::future::pending().await,
-                        }
-                    } => {
-                        if let Err(err) = websocket.send(M::ping()).await {
-                            send_disconnected(
-                                &incoming_tx,
-                                &disconnected_tx,
-                                Some(format!(
-                                    "failed to write websocket ping to {connection_label}: {err}"
-                                )),
-                            )
-                            .await;
-                            break;
-                        }
-                    }
-                    incoming_message = websocket.next() => {
-                        match incoming_message {
-                            Some(Ok(message)) => match message.parse_jsonrpc_frame() {
-                                Ok(JsonRpcWebSocketFrame::Message(message)) => {
-                                    if incoming_tx
-                                        .send(JsonRpcConnectionEvent::Message(message))
-                                        .await
-                                        .is_err()
-                                    {
-                                        break;
-                                    }
+            let (mut writer, mut reader) = websocket.split();
+            let read = async {
+                while let Some(message) = reader.next().await {
+                    match message {
+                        Ok(message) => match message.parse_jsonrpc_frame() {
+                            Ok(JsonRpcWebSocketFrame::Message(message)) => {
+                                if incoming_tx
+                                    .send(JsonRpcConnectionEvent::Message(message))
+                                    .await
+                                    .is_err()
+                                {
+                                    return None;
                                 }
-                                Ok(JsonRpcWebSocketFrame::Close) => {
-                                    send_disconnected(
-                                        &incoming_tx,
-                                        &disconnected_tx,
-                                        /*reason*/ None,
-                                    )
-                                    .await;
-                                    break;
-                                }
-                                Ok(JsonRpcWebSocketFrame::Ignore) => {}
-                                Err(err) => {
-                                    send_malformed_message(
-                                        &incoming_tx,
-                                        Some(format!(
-                                            "failed to parse websocket JSON-RPC message from {connection_label}: {err}"
-                                        )),
-                                    )
-                                    .await;
-                                }
-                            },
-                            Some(Err(err)) => {
-                                send_disconnected(
-                                    &incoming_tx,
-                                    &disconnected_tx,
-                                    Some(format!(
-                                        "failed to read websocket JSON-RPC message from {connection_label}: {err}"
-                                    )),
-                                )
-                                .await;
-                                break;
                             }
-                            None => {
-                                send_disconnected(
-                                    &incoming_tx,
-                                    &disconnected_tx,
-                                    /*reason*/ None,
-                                )
-                                .await;
-                                break;
+                            Ok(JsonRpcWebSocketFrame::Close) => return None,
+                            Ok(JsonRpcWebSocketFrame::Ignore) => {}
+                            Err(err) => {
+                                send_malformed_message(&incoming_tx, Some(format!(
+                                    "failed to parse websocket JSON-RPC message from {connection_label}: {err}"
+                                ))).await;
+                            }
+                        },
+                        Err(err) => {
+                            return Some(format!(
+                                "failed to read websocket JSON-RPC message from {connection_label}: {err}"
+                            ));
+                        }
+                    }
+                }
+                None
+            };
+            let write = async {
+                let mut ping_interval = ping_interval.map(|ping_interval| {
+                    let mut interval = tokio::time::interval_at(
+                        tokio::time::Instant::now() + ping_interval,
+                        ping_interval,
+                    );
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    interval
+                });
+                loop {
+                    tokio::select! {
+                        message = outgoing_rx.recv() => {
+                            let message = message?;
+                            if let Err(reason) = send_websocket_jsonrpc_message(
+                                &mut writer, &connection_label, &message,
+                            ).await {
+                                return Some(reason);
+                            }
+                        }
+                        _ = async {
+                            match ping_interval.as_mut() {
+                                Some(interval) => interval.tick().await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            if let Err(err) = writer.send(M::ping()).await {
+                                return Some(format!(
+                                    "failed to write websocket ping to {connection_label}: {err}"
+                                ));
                             }
                         }
                     }
                 }
-            }
+            };
+            // Keep both futures alive until disconnect: inbound progress must not
+            // cancel a pending send, and a full inbound queue must not stop writes.
+            let reason = tokio::select! {
+                reason = read => reason,
+                reason = write => reason,
+            };
+            send_disconnected(&incoming_tx, &disconnected_tx, reason).await;
         });
 
         Self {
@@ -789,6 +765,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stdio_connection_rejects_ambiguous_envelopes_and_keeps_reading() -> anyhow::Result<()>
+    {
+        let (reader, mut peer) = tokio::io::duplex(1024);
+        let mut connection = JsonRpcConnection::from_stdio_with_max_message_len(
+            reader,
+            tokio::io::sink(),
+            "test stdio peer".to_string(),
+            1024,
+        );
+        for wire in [
+            r#"{"id":null,"method":"process/read"}"#,
+            r#"{"id":1,"result":{},"error":{"code":-32000,"message":"failed"}}"#,
+        ] {
+            peer.write_all(wire.as_bytes()).await?;
+            peer.write_all(b"\n").await?;
+            let event = timeout(Duration::from_secs(1), connection.incoming_rx.recv()).await?;
+            assert!(
+                matches!(event, Some(JsonRpcConnectionEvent::MalformedMessage { .. })),
+                "{event:?}"
+            );
+        }
+
+        let expected = test_jsonrpc_message();
+        peer.write_all(serde_json::to_string(&expected)?.as_bytes())
+            .await?;
+        peer.write_all(b"\n").await?;
+        let event = timeout(Duration::from_secs(1), connection.incoming_rx.recv()).await?;
+        match event {
+            Some(JsonRpcConnectionEvent::Message(actual)) => assert_eq!(actual, expected),
+            event => {
+                anyhow::bail!("expected valid message after malformed envelopes, got {event:?}")
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn stdio_connection_accepts_message_at_size_limit() -> anyhow::Result<()> {
         let message = test_jsonrpc_message();
         let encoded = serde_json::to_string(&message)?;
@@ -879,11 +892,14 @@ mod tests {
         server_websocket
             .send(Message::Pong(b"check".to_vec().into()))
             .await?;
-        assert!(
-            timeout(Duration::from_millis(50), connection.incoming_rx.recv())
-                .await
-                .is_err()
-        );
+        let message = test_jsonrpc_message();
+        server_websocket
+            .send(Message::Text(serde_json::to_string(&message)?.into()))
+            .await?;
+        assert!(matches!(
+            timeout(Duration::from_secs(1), connection.incoming_rx.recv()).await?,
+            Some(JsonRpcConnectionEvent::Message(actual)) if actual == message
+        ));
 
         drop(connection);
         Ok(())
@@ -941,18 +957,57 @@ mod tests {
 
         connection.outgoing_tx.send(message.clone()).await?;
         control.wait_for_blocked_write().await?;
-        control.send_inbound(Message::Pong(b"check".to_vec().into()))?;
-        assert!(
-            timeout(Duration::from_millis(50), connection.incoming_rx.recv())
-                .await
-                .is_err()
-        );
+        control.send_inbound(Message::Text(serde_json::to_string(&message)?.into()))?;
+        assert!(matches!(
+            timeout(Duration::from_secs(1), connection.incoming_rx.recv()).await?,
+            Some(JsonRpcConnectionEvent::Message(inbound)) if inbound == message
+        ));
 
         control.set_write_ready();
         assert!(matches!(
             timeout(Duration::from_secs(1), outbound_rx.next()).await?,
             Some(Message::Text(text)) if serde_json::from_str::<JSONRPCMessage>(&text)? == message
         ));
+        drop(connection);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn websocket_connection_writes_while_incoming_queue_is_full() -> anyhow::Result<()> {
+        let (websocket, control, mut outbound_rx) = ControlledWebSocket::new(true);
+        let connection = JsonRpcConnection::from_websocket_stream(websocket, "test".into(), None);
+        let message = test_jsonrpc_message();
+        for _ in 0..=CHANNEL_CAPACITY {
+            control.send_inbound(Message::Text(serde_json::to_string(&message)?.into()))?;
+        }
+        timeout(Duration::from_secs(1), async {
+            while connection.incoming_rx.len() != CHANNEL_CAPACITY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        connection.outgoing_tx.send(message.clone()).await?;
+        assert!(matches!(
+            timeout(Duration::from_secs(1), outbound_rx.next()).await?,
+            Some(Message::Text(text)) if serde_json::from_str::<JSONRPCMessage>(&text)? == message
+        ));
+        drop(connection);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn websocket_connection_observes_close_while_write_is_blocked() -> anyhow::Result<()> {
+        let (websocket, control, _outbound_rx) = ControlledWebSocket::new(false);
+        let mut connection =
+            JsonRpcConnection::from_websocket_stream(websocket, "test".into(), None);
+        connection.outgoing_tx.send(test_jsonrpc_message()).await?;
+        control.wait_for_blocked_write().await?;
+        control.send_inbound(Message::Close(None))?;
+        assert!(matches!(
+            timeout(Duration::from_secs(1), connection.incoming_rx.recv()).await?,
+            Some(JsonRpcConnectionEvent::Disconnected { reason: None })
+        ));
+        assert!(*connection.disconnected_rx.borrow());
         drop(connection);
         Ok(())
     }

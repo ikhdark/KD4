@@ -277,7 +277,9 @@ pub(crate) struct DiffScopeBackgroundRgbs {
 /// by most VS Code themes) and falls back to `diff.inserted` / `diff.deleted`
 /// (used by some older `.tmTheme` files).
 pub(crate) fn diff_scope_background_rgbs() -> DiffScopeBackgroundRgbs {
-    let theme = current_syntax_theme();
+    let theme = theme_lock()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     diff_scope_background_rgbs_for_theme(&theme)
 }
 
@@ -296,13 +298,15 @@ fn diff_scope_background_rgbs_for_theme(theme: &Theme) -> DiffScopeBackgroundRgb
 fn scope_background_rgb(highlighter: &Highlighter<'_>, scope_name: &str) -> Option<(u8, u8, u8)> {
     let scope = Scope::new(scope_name).ok()?;
     let bg = highlighter.style_mod_for_stack(&[scope]).background?;
-    Some((bg.r, bg.g, bg.b))
+    (bg.a > 1).then_some((bg.r, bg.g, bg.b))
 }
 
 /// Query the active syntax theme for the first foreground style provided by the
 /// supplied TextMate scopes.
 pub(crate) fn foreground_style_for_scopes(scope_names: &[&str]) -> Option<Style> {
-    let theme = current_syntax_theme();
+    let theme = theme_lock()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     foreground_style_for_scopes_with_theme(&theme, scope_names)
 }
 
@@ -311,7 +315,7 @@ fn foreground_style_for_scopes_with_theme(theme: &Theme, scope_names: &[&str]) -
     scope_names.iter().find_map(|scope_name| {
         let scope = Scope::new(scope_name).ok()?;
         let fg = highlighter.style_mod_for_stack(&[scope]).foreground?;
-        convert_syntect_color(fg).map(|fg| Style::default().fg(fg))
+        Some(Style::default().fg(convert_syntect_color(fg).unwrap_or(RtColor::Reset)))
     })
 }
 
@@ -1526,41 +1530,7 @@ mod tests {
         );
 
         // Build the set of variants reachable through our kebab-case mapping.
-        let kebab_names = [
-            "ansi",
-            "base16",
-            "base16-eighties-dark",
-            "base16-mocha-dark",
-            "base16-ocean-dark",
-            "base16-ocean-light",
-            "base16-256",
-            "catppuccin-frappe",
-            "catppuccin-latte",
-            "catppuccin-macchiato",
-            "catppuccin-mocha",
-            "coldark-cold",
-            "coldark-dark",
-            "dark-neon",
-            "dracula",
-            "github",
-            "gruvbox-dark",
-            "gruvbox-light",
-            "inspired-github",
-            "1337",
-            "monokai-extended",
-            "monokai-extended-bright",
-            "monokai-extended-light",
-            "monokai-extended-origin",
-            "nord",
-            "one-half-dark",
-            "one-half-light",
-            "solarized-dark",
-            "solarized-light",
-            "sublime-snazzy",
-            "two-dark",
-            "zenburn",
-        ];
-        let mapped: Vec<EmbeddedThemeName> = kebab_names
+        let mapped: Vec<EmbeddedThemeName> = BUILTIN_THEME_NAMES
             .iter()
             .map(|k| parse_theme_name(k).unwrap_or_else(|| panic!("unmapped kebab name: {k}")))
             .collect();
@@ -1572,5 +1542,31 @@ mod tests {
                 "EmbeddedThemeName::{variant:?} has no kebab-case mapping in parse_theme_name"
             );
         }
+    }
+    #[test]
+    fn diff_backgrounds_do_not_treat_terminal_sentinels_as_rgb() {
+        for alpha in [0, 1] {
+            let mut item = theme_item("markup.inserted", Some((3, 4, 5)));
+            item.style.background.as_mut().unwrap().a = alpha;
+            let theme = Theme {
+                scopes: vec![item],
+                ..Theme::default()
+            };
+            assert_eq!(diff_scope_background_rgbs_for_theme(&theme).inserted, None);
+        }
+    }
+
+    #[test]
+    fn explicit_default_foreground_stops_scope_fallback() {
+        let mut item = theme_item_with_foreground("keyword", (0, 0, 0));
+        item.style.foreground.as_mut().unwrap().a = 1;
+        let theme = Theme {
+            scopes: vec![item, theme_item_with_foreground("string", (40, 50, 60))],
+            ..Theme::default()
+        };
+        assert_eq!(
+            foreground_style_for_scopes_with_theme(&theme, &["keyword", "string"]),
+            Some(Style::default().fg(RtColor::Reset))
+        );
     }
 }

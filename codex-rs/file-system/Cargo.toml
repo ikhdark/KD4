@@ -25,3 +25,6 @@ windows-sys = { workspace = true, features = [
 [lib]
 test = false
 doctest = false
+
+[dev-dependencies]
+futures = { workspace = true, features = ["executor"] }

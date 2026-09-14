@@ -1,6 +1,6 @@
 use crate::bash::extract_bash_command;
 use crate::bash::try_parse_shell;
-use crate::bash::try_parse_word_only_commands_sequence;
+use crate::bash::try_parse_word_only_commands_with_operators;
 use crate::powershell::extract_trusted_noprofile_powershell_command;
 use codex_protocol::parse_command::ParsedCommand;
 use shlex::split as shlex_split;
@@ -85,6 +85,32 @@ mod tests {
     fn assert_parsed(args: &[String], expected: Vec<ParsedCommand>) {
         let out = parse_command(args);
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn review_regression_summaries_preserve_writers_and_uncertain_cwd() {
+        for source in [
+            "cat input.txt | uniq - output.txt",
+            "cat input.txt; uniq input.txt output.txt",
+            "cat input.txt | cut -f 1 other.txt",
+            "cat input.txt | column other.txt",
+            "cd subdir | cat file.txt",
+            "cd subdir || cat file.txt",
+            "cd subdir; cat file.txt",
+            "cd subdir && cat first.txt; cat second.txt",
+            "python -c 'print(\"os.walk\")'",
+        ] {
+            let parsed = parse_command(&vec_str(&["bash", "-lc", source]));
+            assert!(
+                matches!(parsed.as_slice(), [ParsedCommand::Unknown { .. }]),
+                "{source}: {parsed:?}"
+            );
+        }
+        let parsed = parse_command(&vec_str(&["bash", "-lc", "cd subdir && cat file.txt"]));
+        assert!(
+            matches!(parsed.as_slice(), [ParsedCommand::Read { path, .. }] if path == &PathBuf::from("subdir/file.txt")),
+            "{parsed:?}"
+        );
     }
 
     #[test]
@@ -709,25 +735,23 @@ mod tests {
     }
 
     #[test]
-    fn supports_python_walks_files() {
+    fn python_source_remains_unknown() {
         let inner = r#"python -c "import os; print(os.listdir('.'))""#;
         assert_parsed(
             &vec_str(&["bash", "-lc", inner]),
-            vec![ParsedCommand::ListFiles {
-                cmd: shlex_join(&shlex_split_safe(inner)),
-                path: None,
+            vec![ParsedCommand::Unknown {
+                cmd: inner.to_string(),
             }],
         );
     }
 
     #[test]
-    fn supports_python3_walks_files() {
+    fn python3_source_remains_unknown() {
         let inner = r#"python3 -c "import glob; print(glob.glob('*.rs'))""#;
         assert_parsed(
             &vec_str(&["bash", "-lc", inner]),
-            vec![ParsedCommand::ListFiles {
-                cmd: shlex_join(&shlex_split_safe(inner)),
-                path: None,
+            vec![ParsedCommand::Unknown {
+                cmd: inner.to_string(),
             }],
         );
     }
@@ -749,12 +773,8 @@ mod tests {
         for cmd in ["wc", "tr", "cut", "sort", "uniq", "xargs", "tee", "column"] {
             assert!(is_small_formatting_command(&shlex_split_safe(cmd)));
         }
-        for cmd in ["wc", "tr", "cut", "uniq", "column"] {
-            assert!(is_small_formatting_command(&shlex_split_safe(&format!(
-                "{cmd} -x"
-            ))));
-        }
-        for cmd in ["sort", "xargs", "tee"] {
+        assert!(is_small_formatting_command(&shlex_split_safe("tr -x")));
+        for cmd in ["wc", "uniq", "sort", "xargs", "tee", "cut", "column"] {
             assert!(!is_small_formatting_command(&shlex_split_safe(&format!(
                 "{cmd} -x"
             ))));
@@ -891,15 +911,13 @@ mod tests {
     }
 
     #[test]
-    fn filters_out_printf() {
+    fn unsupported_printf_quoting_remains_unknown() {
         let inner =
             r#"printf "\n===== ansi-escape/Cargo.toml =====\n"; cat -- ansi-escape/Cargo.toml"#;
         assert_parsed(
             &vec_str(&["bash", "-lc", inner]),
-            vec![ParsedCommand::Read {
-                cmd: "cat -- ansi-escape/Cargo.toml".to_string(),
-                name: "Cargo.toml".to_string(),
-                path: PathBuf::from("ansi-escape/Cargo.toml"),
+            vec![ParsedCommand::Unknown {
+                cmd: inner.to_string(),
             }],
         );
     }
@@ -1331,11 +1349,28 @@ pub fn parse_command_impl(command: &[String]) -> Vec<ParsedCommand> {
 
     let normalized = normalize_tokens(command);
 
+    if normalized.iter().any(|token| token == "cd")
+        && normalized
+            .iter()
+            .any(|token| matches!(token.as_str(), "|" | "||" | ";"))
+    {
+        return vec![ParsedCommand::Unknown {
+            cmd: shlex_join(command),
+        }];
+    }
+
+    let operators = normalized
+        .iter()
+        .filter(|token| matches!(token.as_str(), "|" | "&&" | "||" | ";"))
+        .cloned()
+        .collect::<Vec<_>>();
     let parts = if contains_connectors(&normalized) {
         split_on_connectors(&normalized)
     } else {
         vec![normalized]
     };
+
+    let parts = drop_small_formatting_commands(parts, &operators);
 
     // Preserve left-to-right execution order for all commands, including bash -c/-lc
     // so summaries reflect the order they will run.
@@ -1374,69 +1409,30 @@ pub fn parse_command_impl(command: &[String]) -> Vec<ParsedCommand> {
         commands.push(parsed);
     }
 
-    while let Some(next) = simplify_once(&commands) {
-        commands = next;
-    }
+    simplify_commands(&mut commands);
 
     commands
 }
 
-fn simplify_once(commands: &[ParsedCommand]) -> Option<Vec<ParsedCommand>> {
-    if commands.len() <= 1 {
-        return None;
-    }
-
-    // echo ... && ...rest => ...rest
-    if let ParsedCommand::Unknown { cmd } = &commands[0]
-        && shlex_split(cmd).is_some_and(|t| t.first().map(String::as_str) == Some("echo"))
-    {
-        return Some(commands[1..].to_vec());
-    }
-
-    // cd foo && [any command] => [any command] (keep non-cd when a cd is followed by something)
-    if let Some(idx) = commands.iter().position(|pc| match pc {
-        ParsedCommand::Unknown { cmd } => {
-            shlex_split(cmd).is_some_and(|t| t.first().map(String::as_str) == Some("cd"))
+fn simplify_commands(commands: &mut Vec<ParsedCommand>) {
+    let mut remaining = commands.len();
+    let mut kept = false;
+    commands.retain(|command| {
+        let discard = remaining > 1
+            && match command {
+                ParsedCommand::Unknown { cmd } => shlex_split(cmd).is_some_and(|tokens| {
+                    matches!(tokens.first().map(String::as_str), Some("true"))
+                        || (!kept && tokens.first().is_some_and(|token| token == "echo"))
+                }),
+                _ => false,
+            };
+        if discard {
+            remaining -= 1;
+        } else {
+            kept = true;
         }
-        _ => false,
-    }) && commands.len() > idx + 1
-    {
-        let mut out = Vec::with_capacity(commands.len() - 1);
-        out.extend_from_slice(&commands[..idx]);
-        out.extend_from_slice(&commands[idx + 1..]);
-        return Some(out);
-    }
-
-    // cmd || true => cmd
-    if let Some(idx) = commands
-        .iter()
-        .position(|pc| matches!(pc, ParsedCommand::Unknown { cmd } if cmd == "true"))
-    {
-        let mut out = Vec::with_capacity(commands.len() - 1);
-        out.extend_from_slice(&commands[..idx]);
-        out.extend_from_slice(&commands[idx + 1..]);
-        return Some(out);
-    }
-
-    // nl -[any_flags] && ...rest => ...rest
-    if let Some(idx) = commands.iter().position(|pc| match pc {
-        ParsedCommand::Unknown { cmd } => {
-            if let Some(tokens) = shlex_split(cmd) {
-                tokens.first().is_some_and(|s| s.as_str() == "nl")
-                    && tokens.iter().skip(1).all(|t| t.starts_with('-'))
-            } else {
-                false
-            }
-        }
-        _ => false,
-    }) {
-        let mut out = Vec::with_capacity(commands.len() - 1);
-        out.extend_from_slice(&commands[..idx]);
-        out.extend_from_slice(&commands[idx + 1..]);
-        return Some(out);
-    }
-
-    None
+        !discard
+    });
 }
 
 /// Validates that this is a `sed -n 123,123p` command.
@@ -1741,33 +1737,6 @@ fn awk_data_file_operand(args: &[String]) -> Option<String> {
     None
 }
 
-fn python_walks_files(args: &[String]) -> bool {
-    let args_no_connector = trim_at_connector(args);
-    let mut iter = args_no_connector.iter();
-    while let Some(arg) = iter.next() {
-        if arg == "-c"
-            && let Some(script) = iter.next()
-        {
-            return script.contains("os.walk")
-                || script.contains("os.listdir")
-                || script.contains("os.scandir")
-                || script.contains("glob.glob")
-                || script.contains("glob.iglob")
-                || script.contains("pathlib.Path")
-                || script.contains(".rglob(");
-        }
-    }
-    false
-}
-
-fn is_python_command(cmd: &str) -> bool {
-    cmd == "python"
-        || cmd == "python2"
-        || cmd == "python3"
-        || cmd.starts_with("python2.")
-        || cmd.starts_with("python3.")
-}
-
 fn cd_target(args: &[String]) -> Option<String> {
     if args.is_empty() {
         return None;
@@ -1870,16 +1839,37 @@ fn parse_shell_lc_commands(original: &[String]) -> Option<Vec<ParsedCommand>> {
 /// Parses command metadata from a Bash-compatible shell script.
 pub fn parse_shell_script(script: &str) -> Vec<ParsedCommand> {
     if let Some(tree) = try_parse_shell(script)
-        && let Some(all_commands) = try_parse_word_only_commands_sequence(&tree, script)
+        && let Some((all_commands, operators)) =
+            try_parse_word_only_commands_with_operators(&tree, script)
         && !all_commands.is_empty()
     {
-        let script_tokens = shlex_split(script).unwrap_or_else(|| vec![script.to_string()]);
+        let single_command_text = shlex_join(&all_commands[0]);
+        let has_pipe = operators.iter().any(|op| op == "|");
+        let has_sed_n = all_commands.iter().any(|words| {
+            words.first().is_some_and(|word| word == "sed")
+                && words.get(1).is_some_and(|word| word == "-n")
+        });
+        // Only a successful cd followed by && establishes the next command's cwd.
+        if all_commands.iter().enumerate().any(|(index, words)| {
+            words.first().is_some_and(|word| word == "cd")
+                && (operators.get(index).is_none_or(|op| op != "&&")
+                    || index
+                        .checked_sub(1)
+                        .and_then(|i| operators.get(i))
+                        .is_some_and(|op| op == "|")
+                    || operators.iter().any(|op| matches!(op.as_str(), "||" | ";"))
+                    || cd_target(&words[1..]).is_none())
+        }) {
+            return vec![ParsedCommand::Unknown {
+                cmd: script.to_string(),
+            }];
+        }
         // Strip small formatting helpers (e.g., head/tail/awk/wc/etc) so we
         // bias toward the primary command when pipelines are present.
         // First, drop obvious small formatting helpers (e.g., wc/awk/etc).
         let had_multiple_commands = all_commands.len() > 1;
         // Commands arrive in source order; drop formatting helpers while preserving it.
-        let filtered_commands = drop_small_formatting_commands(all_commands);
+        let filtered_commands = drop_small_formatting_commands(all_commands, &operators);
         if filtered_commands.is_empty() {
             return vec![ParsedCommand::Unknown {
                 cmd: script.to_string(),
@@ -1919,32 +1909,18 @@ pub fn parse_shell_script(script: &str) -> Vec<ParsedCommand> {
             commands.push(parsed);
         }
 
-        if commands.len() > 1 {
-            commands.retain(|pc| !matches!(pc, ParsedCommand::Unknown { cmd } if cmd == "true"));
-            // Apply the same simplifications used for non-bash parsing, e.g., drop leading `cd`.
-            while let Some(next) = simplify_once(&commands) {
-                commands = next;
-            }
-        }
+        simplify_commands(&mut commands);
         if commands.len() == 1 {
             // If we reduced to a single command, attribute the full original script
             // for clearer UX in file-reading and listing scenarios, or when there were
             // no connectors in the original script. For pipeline commands (e.g.
             // `rg --files | sed -n`), keep only the primary command.
-            let had_connectors = had_multiple_commands
-                || script_tokens
-                    .iter()
-                    .any(|t| t == "|" || t == "&&" || t == "||" || t == ";");
+            let had_connectors = had_multiple_commands;
             commands = commands
                 .into_iter()
                 .map(|pc| match pc {
                     ParsedCommand::Read { name, cmd, path } => {
                         if had_connectors {
-                            let has_pipe = script_tokens.iter().any(|t| t == "|");
-                            let has_sed_n = script_tokens.windows(2).any(|w| {
-                                w.first().map(String::as_str) == Some("sed")
-                                    && w.get(1).map(String::as_str) == Some("-n")
-                            });
                             if has_pipe && has_sed_n {
                                 ParsedCommand::Read {
                                     cmd: script.to_string(),
@@ -1956,7 +1932,7 @@ pub fn parse_shell_script(script: &str) -> Vec<ParsedCommand> {
                             }
                         } else {
                             ParsedCommand::Read {
-                                cmd: shlex_join(&script_tokens),
+                                cmd: single_command_text.clone(),
                                 name,
                                 path,
                             }
@@ -1967,7 +1943,7 @@ pub fn parse_shell_script(script: &str) -> Vec<ParsedCommand> {
                             ParsedCommand::ListFiles { cmd, path }
                         } else {
                             ParsedCommand::ListFiles {
-                                cmd: shlex_join(&script_tokens),
+                                cmd: single_command_text.clone(),
                                 path,
                             }
                         }
@@ -1979,7 +1955,7 @@ pub fn parse_shell_script(script: &str) -> Vec<ParsedCommand> {
                             ParsedCommand::Search { cmd, query, path }
                         } else {
                             ParsedCommand::Search {
-                                cmd: shlex_join(&script_tokens),
+                                cmd: single_command_text.clone(),
                                 query,
                                 path,
                             }
@@ -2006,7 +1982,22 @@ fn is_small_formatting_command(tokens: &[String]) -> bool {
     }
     let cmd = tokens[0].as_str();
     match cmd {
-        "wc" | "tr" | "cut" | "uniq" | "column" | "yes" | "printf" => true,
+        "tr" | "yes" | "printf" => true,
+        // File operands on these utilities would describe another input, not
+        // merely reformat the preceding stage's stream.
+        "cut" | "column" => tokens.len() == 1,
+        "nl" => tokens
+            .iter()
+            .skip(1)
+            .all(|arg| matches!(arg.as_str(), "-ba" | "-bt" | "-bn")),
+        "wc" => tokens
+            .iter()
+            .skip(1)
+            .all(|arg| matches!(arg.as_str(), "-l" | "-w" | "-c" | "-m" | "-L")),
+        "uniq" => tokens
+            .iter()
+            .skip(1)
+            .all(|arg| matches!(arg.as_str(), "-c" | "-d" | "-u" | "-i" | "-z")),
         "sort" => is_small_sort_formatter(tokens),
         "tee" => is_small_tee_formatter(tokens),
         "xargs" => tokens.len() == 1,
@@ -2144,9 +2135,22 @@ fn is_small_sed_formatter(tokens: &[String]) -> bool {
     }
 }
 
-fn drop_small_formatting_commands(mut commands: Vec<Vec<String>>) -> Vec<Vec<String>> {
-    commands.retain(|tokens| !is_small_formatting_command(tokens));
+fn drop_small_formatting_commands(
+    commands: Vec<Vec<String>>,
+    operators: &[String],
+) -> Vec<Vec<String>> {
     commands
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, tokens)| {
+            let in_pipeline = operators.get(index).is_some_and(|op| op == "|")
+                || index
+                    .checked_sub(1)
+                    .and_then(|i| operators.get(i))
+                    .is_some_and(|op| op == "|");
+            (!in_pipeline || !is_small_formatting_command(&tokens)).then_some(tokens)
+        })
+        .collect()
 }
 
 fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
@@ -2550,18 +2554,6 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
                     cmd: shlex_join(main_cmd),
                     name,
                     path: PathBuf::from(path),
-                }
-            } else {
-                ParsedCommand::Unknown {
-                    cmd: shlex_join(main_cmd),
-                }
-            }
-        }
-        Some((head, tail)) if is_python_command(head) => {
-            if python_walks_files(tail) {
-                ParsedCommand::ListFiles {
-                    cmd: shlex_join(main_cmd),
-                    path: None,
                 }
             } else {
                 ParsedCommand::Unknown {

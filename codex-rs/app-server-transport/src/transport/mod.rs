@@ -245,10 +245,10 @@ async fn enqueue_incoming_message(
                 Err(mpsc::error::TrySendError::Closed(_)) => false,
                 Err(mpsc::error::TrySendError::Full(_overload_error)) => {
                     warn!(
-                        "dropping overload response for connection {:?}: outbound queue is full",
+                        "closing connection {:?}: outbound queue cannot accept overload response",
                         connection_id
                     );
-                    true
+                    false
                 }
             }
         }
@@ -280,6 +280,41 @@ mod tests {
     use serde_json::json;
     use tokio::time::Duration;
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn malformed_rpc_envelopes_do_not_reach_dispatch() {
+        let (events, mut received) = mpsc::channel(4);
+        let (writer, mut outgoing) = mpsc::channel(4);
+        let connection_id = ConnectionId(42);
+        for payload in [
+            r#"{"id":{},"method":"initialized"}"#,
+            r#"{"id":1,"result":null,"error":{"code":-1,"message":"failure"}}"#,
+        ] {
+            assert!(forward_incoming_message(&events, &writer, connection_id, payload).await);
+            assert!(matches!(
+                received.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            assert!(matches!(
+                outgoing.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+        assert!(
+            forward_incoming_message(
+                &events,
+                &writer,
+                connection_id,
+                r#"{"method":"initialized"}"#
+            )
+            .await
+        );
+        assert!(
+            matches!(received.try_recv(), Ok(TransportEvent::IncomingMessage {
+            message: JSONRPCMessage::Notification(JSONRPCNotification { method, .. }), ..
+        }) if method == "initialized")
+        );
+    }
 
     #[test]
     fn listen_off_parses_as_off_transport() {
@@ -389,17 +424,10 @@ mod tests {
             id: RequestId::Integer(7),
             result: json!({"ok": true}),
         });
-        let transport_event_tx_for_enqueue = transport_event_tx.clone();
-        let writer_tx_for_enqueue = writer_tx.clone();
-        let enqueue_handle = tokio::spawn(async move {
-            enqueue_incoming_message(
-                &transport_event_tx_for_enqueue,
-                &writer_tx_for_enqueue,
-                connection_id,
-                response,
-            )
-            .await
-        });
+        let enqueue =
+            enqueue_incoming_message(&transport_event_tx, &writer_tx, connection_id, response);
+        tokio::pin!(enqueue);
+        assert!(futures::poll!(&mut enqueue).is_pending());
 
         let queued_event = transport_event_rx
             .recv()
@@ -416,7 +444,9 @@ mod tests {
             _ => panic!("expected queued incoming message"),
         }
 
-        let enqueue_result = enqueue_handle.await.expect("enqueue task should not panic");
+        let enqueue_result = timeout(Duration::from_secs(1), enqueue)
+            .await
+            .expect("enqueue should resume after capacity is released");
         assert!(enqueue_result);
 
         let forwarded_event = transport_event_rx
@@ -480,7 +510,10 @@ mod tests {
         )
         .await
         .expect("enqueue should not block while writer queue is full");
-        assert!(enqueue_result);
+        assert!(
+            !enqueue_result,
+            "connection must close when rejection cannot be delivered"
+        );
 
         let queued_outgoing = writer_rx
             .recv()

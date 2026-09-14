@@ -65,8 +65,9 @@ impl KeyBinding {
     }
 
     pub(crate) fn display_label(&self) -> String {
-        let modifiers = modifiers_to_string(self.modifiers);
-        let key = match self.key {
+        let (key, modifiers) = normalize_key_parts(self.key, self.modifiers);
+        let modifiers = modifiers_to_string(modifiers);
+        let key = match key {
             KeyCode::Enter => "enter".to_string(),
             KeyCode::Char(' ') => "space".to_string(),
             KeyCode::Up => "↑".to_string(),
@@ -75,7 +76,7 @@ impl KeyBinding {
             KeyCode::Right => "→".to_string(),
             KeyCode::PageUp => "pgup".to_string(),
             KeyCode::PageDown => "pgdn".to_string(),
-            _ => self.key.to_string().to_ascii_lowercase(),
+            _ => key.to_string().to_ascii_lowercase(),
         };
         format!("{modifiers}{key}")
     }
@@ -208,6 +209,19 @@ pub(crate) fn is_altgr(mods: KeyModifiers) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uppercase_hint_displays_the_shift_required_to_match_it() {
+        let uppercase = plain(KeyCode::Char('A'));
+        assert_eq!(
+            uppercase.display_label(),
+            shift(KeyCode::Char('a')).display_label()
+        );
+        assert_ne!(
+            uppercase.display_label(),
+            plain(KeyCode::Char('a')).display_label()
+        );
+    }
 
     #[test]
     fn is_press_accepts_press_and_repeat_but_rejects_release() {

@@ -1073,7 +1073,7 @@ fn exec_server_request_for_env_test() -> ExecRequest {
         windows_sandbox_workspace_roots: vec![cwd],
         windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
         windows_sandbox_private_desktop: false,
-        permission_profile: permission_profile.clone(),
+        permission_profile,
         file_system_sandbox_policy,
         network_sandbox_policy,
         windows_sandbox_filesystem_overrides: None,
@@ -1247,7 +1247,7 @@ fn remote_ca_environment_waits_for_worker_and_preserves_peer_hash_contract() {
                 process_id, &request, false, Box::new(crate::unified_exec::NoopSpawnLifecycle),
                 None, &environment, &pending_spawns,
             ).await;
-            let error = result.err().expect("external peer declines after capturing exact request");
+            let error = match result { Err(error) => error, Ok(_) => panic!("external peer declines after capturing exact request") };
             assert!(error.to_string().contains("peer captured launch"), "unexpected launch error: {error:?}");
             let params: codex_exec_server::ExecParams = serde_json::from_value(captured_rx.recv().await.unwrap()).unwrap();
             assert_eq!(params.process_id.as_str(), process_id.to_string());
@@ -1289,10 +1289,277 @@ fn initial_exec_yield_time_uses_platform_floor() {
 #[cfg(windows)]
 #[tokio::test]
 async fn remote_registration_failure_preserves_original_error_when_cleanup_also_fails() {
+    assert_remote_startup_failure_closes_command(false).await;
+}
+
+#[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Hold the real turn tracker to verify cancellation cannot interrupt cached command completion"
+)]
+async fn cancelled_known_delta_replay_closes_started_command_before_returning() {
+    use crate::tools::known_delta_store;
+
+    let (session, mut turn, events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let turn_mut = Arc::get_mut(&mut turn).expect("unique turn fixture");
+    turn_mut.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
+    turn_mut
+        .approval_policy
+        .set(codex_protocol::protocol::AskForApproval::Never)
+        .unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let init = tokio::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repo.path())
+        .output()
+        .await
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    // Project namespace discovery requires a root commit, even for a bare blob selector.
+    let commit = tokio::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=KnownDelta Test",
+            "-c",
+            "user.email=known-delta@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=NUL",
+            "commit",
+            "--allow-empty",
+            "--quiet",
+            "-m",
+            "KnownDelta fixture root",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .await
+        .unwrap();
+    assert!(commit.status.success(), "{commit:?}");
+    tokio::fs::write(repo.path().join("read.txt"), b"cached output\n")
+        .await
+        .unwrap();
+    let object = tokio::process::Command::new("git")
+        .args(["hash-object", "-w", "read.txt"])
+        .current_dir(repo.path())
+        .output()
+        .await
+        .unwrap();
+    assert!(object.status.success(), "{object:?}");
+    let args = vec![
+        "show".to_string(),
+        String::from_utf8(object.stdout).unwrap().trim().to_string(),
+    ];
+    let thread_id = session.thread_id.to_string();
+    let prepared = known_delta_store::test_observation::with_profitability_costs(
+        async {
+            for _ in 0..2 {
+                let prepared = known_delta_store::prepare_immutable_git_show(
+                    &turn.config.codex_home,
+                    &thread_id,
+                    repo.path(),
+                    "git",
+                    &args,
+                    known_delta_store::ProjectNamespaceHint::Discover,
+                    false,
+                )
+                .await
+                .expect("immutable blob supports cache preparation");
+                assert!(
+                    !prepared.is_hit(),
+                    "initial execution and shadow validation"
+                );
+                known_delta_store::record_execution(
+                    &turn.config.codex_home,
+                    &prepared,
+                    known_delta_store::KnownDeltaExecutionObservation::CompleteSuccess {
+                        output: b"cached output\n",
+                        executor_cost: Duration::from_secs(1),
+                    },
+                )
+                .await;
+            }
+            known_delta_store::prepare_immutable_git_show(
+                &turn.config.codex_home,
+                &thread_id,
+                repo.path(),
+                "git",
+                &args,
+                known_delta_store::ProjectNamespaceHint::Discover,
+                false,
+            )
+            .await
+            .expect("validated blob supports cache reuse")
+        },
+        Duration::from_millis(1),
+        Duration::from_millis(1),
+        Duration::from_millis(10),
+    )
+    .await;
+    let hit = prepared
+        .hit()
+        .expect("fixture must enter KnownDelta replay");
+    let expected_output = hit.rendered_output().to_string();
+    let artifact = hit.raw_output_artifact().clone();
+    let environment = Arc::new(codex_exec_server::Environment::create_for_tests(None).unwrap());
+    environment.wait_until_ready().await.unwrap();
+    let cwd = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(repo.path()).unwrap();
+    let manager = &session.services.unified_exec_manager;
+    let reservation = manager.reserve_process_id().await;
+    let tracker = Arc::new(tokio::sync::Mutex::new(
+        crate::turn_diff_tracker::TurnDiffTracker::new(),
+    ));
+    let context = UnifiedExecContext::with_tracker(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "known-delta-cancel".to_string(),
+        Arc::clone(&tracker),
+        crate::tools::context::ToolCallSource::Direct,
+    );
+    let command = std::iter::once("git".to_string())
+        .chain(args)
+        .collect::<Vec<_>>();
+    let request = ExecCommandRequest {
+        validation: None,
+        command: command.clone(),
+        command_for_safety: command.clone(),
+        attempt_key: crate::tools::command_execution::CommandAttemptKey::new(
+            "exec_command",
+            "local",
+            cwd.to_string_lossy(),
+            &command,
+        ),
+        raw_output_artifact: artifact,
+        shell_type: crate::shell::ShellType::Bash,
+        shell_wrapper_is_owned: false,
+        hook_command: command.join(" "),
+        process_id: reservation.process_id(),
+        yield_time_ms: 30_000,
+        max_output_tokens: None,
+        cwd: cwd.clone().into(),
+        normalization_cwd: None,
+        sandbox_cwd: cwd.clone().into(),
+        turn_environment: crate::session::turn_context::TurnEnvironment::new(
+            "local".to_string(),
+            environment,
+            cwd.into(),
+            None,
+        ),
+        network: None,
+        tty: false,
+        sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
+        additional_permissions: None,
+        additional_permissions_uri: None,
+        additional_permissions_preapproved: false,
+        justification: None,
+        prefix_rule: None,
+        validation_launch: None,
+        known_delta: Some(prepared),
+    };
+    // Completion records the command in this real tracker before publishing its event.
+    let tracker_guard = tracker.lock().await;
+    let cancellation = CancellationToken::new();
+    let execution = manager.exec_command(request, reservation, &context, &cancellation);
+    tokio::pin!(execution);
+    let started = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            tokio::select! {
+                result = &mut execution => panic!("replay returned before completion was released: {result:?}"),
+                event = events.recv() => {
+                    if let codex_protocol::protocol::EventMsg::ItemStarted(event) = event.expect("events stay open").msg
+                        && let codex_protocol::items::TurnItem::CommandExecution(item) = event.item
+                    {
+                        break item;
+                    }
+                }
+            }
+        }
+    }).await.expect("cached replay publishes its command start");
+    assert_eq!(started.id, "known-delta-cancel");
+    assert_eq!(started.process_id, None);
+    cancellation.cancel();
+    assert!(
+        futures::poll!(&mut execution).is_pending(),
+        "cancellation must wait for cached terminal event delivery"
+    );
+    drop(tracker_guard);
+    let result = tokio::time::timeout(Duration::from_secs(10), &mut execution)
+        .await
+        .expect("cached replay settles after completion is released");
+    // Cancellation can win after delivery or replay can return in the same poll.
+    match result {
+        Ok(output) => {
+            assert_eq!(output.raw_output, expected_output.as_bytes());
+            assert_eq!(output.exit_code, Some(0));
+            assert!(output.process_exited);
+        }
+        Err(UnifiedExecError::ProcessFailed { message }) => {
+            assert_eq!(message, "unified exec cancelled");
+        }
+        Err(error) => panic!("unexpected replay failure: {error:?}"),
+    }
+    let mut completed_items = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        match event.msg {
+            codex_protocol::protocol::EventMsg::ItemStarted(event) => {
+                assert!(
+                    !matches!(
+                        event.item,
+                        codex_protocol::items::TurnItem::CommandExecution(_)
+                    ),
+                    "cached replay starts only once"
+                );
+            }
+            codex_protocol::protocol::EventMsg::ItemCompleted(event) => {
+                if let codex_protocol::items::TurnItem::CommandExecution(item) = event.item {
+                    completed_items.push(item);
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        completed_items.len(),
+        1,
+        "cached replay completes exactly once"
+    );
+    let completed = &completed_items[0];
+    assert_eq!(completed.id, started.id);
+    assert_eq!(
+        completed.status,
+        codex_protocol::items::CommandExecutionStatus::Completed
+    );
+    assert_eq!(completed.exit_code, Some(0));
+    assert_eq!(completed.process_id, None);
+    assert_eq!(
+        completed.aggregated_output.as_deref(),
+        Some(expected_output.as_str())
+    );
+    let store = manager.process_store.lock().await;
+    assert!(
+        store.processes.is_empty(),
+        "cached replay starts no process"
+    );
+    assert!(
+        store.reserved_process_ids.is_empty(),
+        "replay releases its reservation"
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn cancelled_remote_registration_closes_started_command_before_returning() {
+    assert_remote_startup_failure_closes_command(true).await;
+}
+
+#[cfg(windows)]
+async fn assert_remote_startup_failure_closes_command(cancel_during_registration: bool) {
     use futures::SinkExt;
     use futures::StreamExt;
 
-    let (session, mut turn, _events) =
+    let (session, mut turn, events) =
         crate::session::tests::make_session_and_context_with_rx().await;
     let turn_mut = Arc::get_mut(&mut turn).expect("unique turn fixture");
     turn_mut.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
@@ -1336,7 +1603,11 @@ async fn remote_registration_failure_preserves_original_error_when_cleanup_also_
                     } else {
                         "pending cleanup refused"
                     };
-                    serde_json::json!({"id": request["id"], "error": {"code": -32000, "message": message}})
+                    if cancel_during_registration {
+                        serde_json::json!({"id": request["id"], "result": {}})
+                    } else {
+                        serde_json::json!({"id": request["id"], "error": {"code": -32000, "message": message}})
+                    }
                 }
                 method => panic!("unexpected peer request: {method}"),
             };
@@ -1428,31 +1699,115 @@ async fn remote_registration_failure_preserves_original_error_when_cleanup_also_
         validation_launch: None,
         known_delta: None,
     };
-    let result = tokio::time::timeout(
-        Duration::from_secs(10),
-        manager.exec_command(request, reservation, &context, &CancellationToken::new()),
-    )
-    .await
-    .expect("normal manager failure settles");
+    let cancellation = CancellationToken::new();
+    let store_guard = if cancel_during_registration {
+        Some(manager.process_store.lock().await)
+    } else {
+        None
+    };
+    let execution = manager.exec_command(request, reservation, &context, &cancellation);
+    tokio::pin!(execution);
+    let mut started_items = Vec::new();
+    if cancel_during_registration {
+        let started = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    result = &mut execution => panic!("startup returned before registration was released: {result:?}"),
+                    event = events.recv() => {
+                        if let codex_protocol::protocol::EventMsg::ItemStarted(event) = event.expect("events stay open").msg
+                            && let codex_protocol::items::TurnItem::CommandExecution(item) = event.item
+                        {
+                            break item;
+                        }
+                    }
+                }
+            }
+        }).await.expect("normal startup publishes a command before blocked registration");
+        assert_eq!(started.id, "registration-failure");
+        started_items.push(started);
+        cancellation.cancel();
+    }
+    drop(store_guard);
+    let result = tokio::time::timeout(Duration::from_secs(10), &mut execution)
+        .await
+        .expect("normal manager failure settles");
     let Err(UnifiedExecError::ProcessFailed { message }) = result else {
         panic!("expected registration failure: {result:?}");
     };
-    assert!(
-        message.contains(&format!(
-            "process id {process_id} already has live command bookkeeping"
-        )),
-        "{message}"
+    if cancel_during_registration {
+        assert!(message.contains("unified exec cancelled"), "{message}");
+    } else {
+        assert!(
+            message.contains(&format!(
+                "process id {process_id} already has live command bookkeeping"
+            )),
+            "{message}"
+        );
+        assert!(
+            message.contains("additionally failed to terminate the untracked process"),
+            "{message}"
+        );
+        assert!(message.contains("ledger cleanup refused"), "{message}");
+        assert!(
+            message.contains("unified exec startup cleanup failed"),
+            "{message}"
+        );
+        assert!(message.contains("pending cleanup refused"), "{message}");
+    }
+    let mut completed_items = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        match event.msg {
+            codex_protocol::protocol::EventMsg::ItemStarted(event) => {
+                if let codex_protocol::items::TurnItem::CommandExecution(item) = event.item {
+                    started_items.push(item);
+                }
+            }
+            codex_protocol::protocol::EventMsg::ItemCompleted(event) => {
+                if let codex_protocol::items::TurnItem::CommandExecution(item) = event.item {
+                    completed_items.push(item);
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        started_items.len(),
+        1,
+        "registration published one command start"
     );
-    assert!(
-        message.contains("additionally failed to terminate the untracked process"),
-        "{message}"
+    assert_eq!(
+        completed_items.len(),
+        1,
+        "failed registration must close its command item"
     );
-    assert!(message.contains("ledger cleanup refused"), "{message}");
-    assert!(
-        message.contains("unified exec startup cleanup failed"),
-        "{message}"
+    let completed = &completed_items[0];
+    assert_eq!(started_items[0].id, "registration-failure");
+    assert_eq!(completed.id, started_items[0].id);
+    assert_eq!(
+        completed.status,
+        codex_protocol::items::CommandExecutionStatus::Failed
     );
-    assert!(message.contains("pending cleanup refused"), "{message}");
+    assert_eq!(completed.exit_code, Some(-1));
+    assert_eq!(completed.process_id, Some(process_id.to_string()));
+    let completed_output = completed
+        .aggregated_output
+        .as_deref()
+        .expect("failure output");
+    if cancel_during_registration {
+        assert!(
+            completed_output.contains("unified exec cancelled"),
+            "{completed_output}"
+        );
+    } else {
+        assert!(
+            completed_output.contains("already has live command bookkeeping"),
+            "{completed_output}"
+        );
+        assert!(
+            completed_output.contains("ledger cleanup refused"),
+            "{completed_output}"
+        );
+    }
     let start = requests_rx
         .try_recv()
         .expect("normal backend sent process/start");
@@ -1465,7 +1820,7 @@ async fn remote_registration_failure_preserves_original_error_when_cleanup_also_
             "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\necho registered"
         ])
     );
-    for _ in 0..2 {
+    for _ in 0..if cancel_during_registration { 1 } else { 2 } {
         let terminate = requests_rx
             .try_recv()
             .expect("both actual cleanup boundaries reached peer");
@@ -2291,10 +2646,11 @@ fn check_pending_remote_exec_drop(entered_shutdown: bool) {
             runtime.block_on(async {
                 tokio::time::timeout(Duration::from_secs(10), async {
                     loop {
+                        let cleaned = {
                         let store = manager.process_store.lock().await;
-                        let cleaned = !store.processes.contains_key(&process_id)
-                            && !store.reserved_process_ids.contains(&process_id);
-                        drop(store);
+                         !store.processes.contains_key(&process_id)
+                            && !store.reserved_process_ids.contains(&process_id)
+                        };
                         if cleaned { break; }
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
@@ -2498,10 +2854,11 @@ fn remote_start_cancellation_terminates_native_child_before_start_response() {
             runtime.block_on(async {
                 tokio::time::timeout(Duration::from_secs(10), async {
                     loop {
+                        let cleaned = {
                         let store = manager.process_store.lock().await;
-                        let cleaned = !store.processes.contains_key(&process_id)
-                            && !store.reserved_process_ids.contains(&process_id);
-                        drop(store);
+                         !store.processes.contains_key(&process_id)
+                            && !store.reserved_process_ids.contains(&process_id)
+                        };
                         if cleaned { break; }
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
@@ -2517,194 +2874,203 @@ fn remote_start_cancellation_terminates_native_child_before_start_response() {
 #[cfg(windows)]
 #[test]
 fn normal_local_termination_keeps_native_request_owned_after_caller_deadline() {
-    use codex_tools::ToolExecutor;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
-    };
-    struct ChildGuard(OwnedHandle);
-    impl ChildGuard {
-        fn exited(&self) -> bool {
-            unsafe { WaitForSingleObject(self.0.as_raw_handle(), 0) == WAIT_OBJECT_0 }
-        }
-    }
-    impl Drop for ChildGuard {
-        fn drop(&mut self) {
-            if !self.exited() {
-                unsafe {
-                    TerminateProcess(self.0.as_raw_handle(), 1);
-                    WaitForSingleObject(self.0.as_raw_handle(), 5_000);
+    // Keep the native-process test's stack budget when mutation tooling selects
+    // it directly through cargo test without the core runner's environment.
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            use codex_tools::ToolExecutor;
+            use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+            use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+            use windows_sys::Win32::System::Threading::{
+                OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+            };
+            struct ChildGuard(OwnedHandle);
+            impl ChildGuard {
+                fn exited(&self) -> bool {
+                    unsafe { WaitForSingleObject(self.0.as_raw_handle(), 0) == WAIT_OBJECT_0 }
                 }
             }
-        }
-    }
-    // Windows pipe reads use Tokio's blocking pool. Keep normal process I/O
-    // on its live runtime so occupying the caller's pool isolates termination.
-    let process_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("normal process runtime");
-    let (session, child, process_id) = process_runtime.block_on(async {
-        let fixture = tempfile::tempdir().expect("native child marker");
-        let marker = fixture.path().join("pid.txt");
-        let (session, mut turn) = crate::session::tests::make_session_and_context().await;
-        turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
-        turn.approval_policy
-            .set(codex_protocol::protocol::AskForApproval::Never)
-            .expect("test approval");
-        let program = which::which("powershell.exe")
-            .expect("Windows PowerShell")
-            .to_string_lossy()
-            .into_owned();
-        let script = format!(
-            "[System.IO.File]::WriteAllText('{}', [string]$PID); Start-Sleep -Seconds 60",
-            marker.to_string_lossy().replace('\'', "''")
-        );
-        let args = vec![
-            "-NoLogo".to_string(),
-            "-NoProfile".to_string(),
-            "-NonInteractive".to_string(),
-            "-Command".to_string(),
-            script,
-        ];
-        let mut allowed = vec![program.clone()];
-        allowed.extend(args.clone());
-        tokio::fs::create_dir_all(&turn.config.codex_home)
-            .await
-            .unwrap();
-        session
-            .services
-            .exec_policy
-            .append_amendment_and_update(
-                &turn.config.codex_home,
-                &codex_protocol::protocol::ExecPolicyAmendment::new(allowed),
-            )
-            .await
-            .expect("allow the exact normal producer");
-        let session = Arc::new(session);
-        let turn = Arc::new(turn);
-        let payload = crate::tools::context::ToolPayload::Function {
-            arguments: serde_json::json!({
-                "kind":"argv", "program":program, "args":args, "tty":false, "yield_time_ms":1000
-            })
-            .to_string(),
-        };
-        let output = crate::tools::handlers::ExecCommandHandler::default()
-            .handle(crate::tools::context::ToolInvocation {
-                session: Arc::clone(&session),
-                step_context: crate::session::step_context::StepContext::for_test(Arc::clone(
-                    &turn,
-                )),
-                cancellation_token: CancellationToken::new(),
-                tracker: Arc::new(tokio::sync::Mutex::new(
-                    crate::turn_diff_tracker::TurnDiffTracker::new(),
-                )),
-                call_id: "owned-native-termination".to_string(),
-                tool_name: codex_tools::ToolName::plain("exec_command"),
-                source: crate::tools::context::ToolCallSource::Direct,
-                payload: payload.clone(),
-            })
-            .await
-            .expect("normal local process launch");
-        let process_id = u32::try_from(
-            output.code_mode_result(&payload)["session_id"]
-                .as_u64()
-                .expect("retained live process"),
-        )
-        .unwrap();
-        let pid = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if let Ok(text) = tokio::fs::read_to_string(&marker).await
-                    && let Ok(pid) = text.parse::<u32>()
-                {
-                    break pid;
+            impl Drop for ChildGuard {
+                fn drop(&mut self) {
+                    if !self.exited() {
+                        unsafe {
+                            TerminateProcess(self.0.as_raw_handle(), 1);
+                            WaitForSingleObject(self.0.as_raw_handle(), 5_000);
+                        }
+                    }
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        })
-        .await
-        .expect("actual native child identity");
-        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
-        assert!(
-            !raw.is_null(),
-            "native handle: {}",
-            std::io::Error::last_os_error()
-        );
-        let child = ChildGuard(unsafe { OwnedHandle::from_raw_handle(raw) });
-        assert_eq!(
-            unsafe { WaitForSingleObject(child.0.as_raw_handle(), 0) },
-            WAIT_TIMEOUT
-        );
-        (session, child, process_id)
-    });
-    let termination_runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .max_blocking_threads(1)
-        .build()
-        .expect("single-worker termination caller runtime");
-    termination_runtime.block_on(async {
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let blocker = tokio::task::spawn_blocking(move || {
-            let _ = started_tx.send(());
-            release_rx.recv_timeout(Duration::from_secs(5)).is_ok()
-        });
-        started_rx.await.unwrap();
-        let terminated = tokio::time::timeout(
-            Duration::from_millis(50),
-            session.terminate_background_terminal(process_id),
-        )
-        .await;
-        assert!(
-            terminated.is_err(),
-            "queued native request must permit caller deadline"
-        );
-        assert!(
-            !blocker.is_finished(),
-            "runtime deadline progresses while worker remains occupied"
-        );
-        assert!(
-            !child.exited(),
-            "termination must not run inline ahead of the queued worker"
-        );
-        assert!(
-            session
-                .services
-                .unified_exec_manager
-                .process_store
-                .lock()
+            // Windows pipe reads use Tokio's blocking pool. Keep normal process I/O
+            // on its live runtime so occupying the caller's pool isolates termination.
+            let process_runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("normal process runtime");
+            let (session, child, process_id) = process_runtime.block_on(async {
+                let fixture = tempfile::tempdir().expect("native child marker");
+                let marker = fixture.path().join("pid.txt");
+                let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+                turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
+                turn.approval_policy
+                    .set(codex_protocol::protocol::AskForApproval::Never)
+                    .expect("test approval");
+                let program = which::which("powershell.exe")
+                    .expect("Windows PowerShell")
+                    .to_string_lossy()
+                    .into_owned();
+                let script = format!(
+                    "[System.IO.File]::WriteAllText('{}', [string]$PID); Start-Sleep -Seconds 60",
+                    marker.to_string_lossy().replace('\'', "''")
+                );
+                let args = vec![
+                    "-NoLogo".to_string(),
+                    "-NoProfile".to_string(),
+                    "-NonInteractive".to_string(),
+                    "-Command".to_string(),
+                    script,
+                ];
+                let mut allowed = vec![program.clone()];
+                allowed.extend(args.clone());
+                tokio::fs::create_dir_all(&turn.config.codex_home)
+                    .await
+                    .unwrap();
+                session
+                    .services
+                    .exec_policy
+                    .append_amendment_and_update(
+                        &turn.config.codex_home,
+                        &codex_protocol::protocol::ExecPolicyAmendment::new(allowed),
+                    )
+                    .await
+                    .expect("allow the exact normal producer");
+                let session = Arc::new(session);
+                let turn = Arc::new(turn);
+                let payload = crate::tools::context::ToolPayload::Function {
+                    arguments: serde_json::json!({
+                        "kind":"argv", "program":program, "args":args, "tty":false, "yield_time_ms":1000
+                    })
+                    .to_string(),
+                };
+                let output = crate::tools::handlers::ExecCommandHandler::default()
+                    .handle(crate::tools::context::ToolInvocation {
+                        session: Arc::clone(&session),
+                        step_context: crate::session::step_context::StepContext::for_test(Arc::clone(
+                            &turn,
+                        )),
+                        cancellation_token: CancellationToken::new(),
+                        tracker: Arc::new(tokio::sync::Mutex::new(
+                            crate::turn_diff_tracker::TurnDiffTracker::new(),
+                        )),
+                        call_id: "owned-native-termination".to_string(),
+                        tool_name: codex_tools::ToolName::plain("exec_command"),
+                        source: crate::tools::context::ToolCallSource::Direct,
+                        payload: payload.clone(),
+                    })
+                    .await
+                    .expect("normal local process launch");
+                let process_id = u32::try_from(
+                    output.code_mode_result(&payload)["session_id"]
+                        .as_u64()
+                        .expect("retained live process"),
+                )
+                .unwrap();
+                let pid = tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if let Ok(text) = tokio::fs::read_to_string(&marker).await
+                            && let Ok(pid) = text.parse::<u32>()
+                        {
+                            break pid;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
                 .await
-                .processes
-                .contains_key(&process_id),
-            "unconfirmed caller must retain registered process ownership"
-        );
-        release_tx.send(()).unwrap();
-        assert!(blocker.await.unwrap());
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !child.exited() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the accepted worker kills the real child after caller cancellation");
-        let _ = session.terminate_background_terminal(process_id).await;
-        assert!(
-            !session
-                .services
-                .unified_exec_manager
-                .process_store
-                .lock()
+                .expect("actual native child identity");
+                let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
+                assert!(
+                    !raw.is_null(),
+                    "native handle: {}",
+                    std::io::Error::last_os_error()
+                );
+                let child = ChildGuard(unsafe { OwnedHandle::from_raw_handle(raw) });
+                assert_eq!(
+                    unsafe { WaitForSingleObject(child.0.as_raw_handle(), 0) },
+                    WAIT_TIMEOUT
+                );
+                (session, child, process_id)
+            });
+            let termination_runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .max_blocking_threads(1)
+                .build()
+                .expect("single-worker termination caller runtime");
+            termination_runtime.block_on(async {
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    let _ = started_tx.send(());
+                    release_rx.recv_timeout(Duration::from_secs(5)).is_ok()
+                });
+                started_rx.await.unwrap();
+                let terminated = tokio::time::timeout(
+                    Duration::from_millis(50),
+                    session.terminate_background_terminal(process_id),
+                )
+                .await;
+                assert!(
+                    terminated.is_err(),
+                    "queued native request must permit caller deadline"
+                );
+                assert!(
+                    !blocker.is_finished(),
+                    "runtime deadline progresses while worker remains occupied"
+                );
+                assert!(
+                    !child.exited(),
+                    "termination must not run inline ahead of the queued worker"
+                );
+                assert!(
+                    session
+                        .services
+                        .unified_exec_manager
+                        .process_store
+                        .lock()
+                        .await
+                        .processes
+                        .contains_key(&process_id),
+                    "unconfirmed caller must retain registered process ownership"
+                );
+                release_tx.send(()).unwrap();
+                assert!(blocker.await.unwrap());
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while !child.exited() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
                 .await
-                .processes
-                .contains_key(&process_id)
-        );
-        assert!(session.list_background_terminals().await.is_empty());
-    });
-    drop(session);
-    drop(termination_runtime);
-    drop(process_runtime);
+                .expect("the accepted worker kills the real child after caller cancellation");
+                let _ = session.terminate_background_terminal(process_id).await;
+                assert!(
+                    !session
+                        .services
+                        .unified_exec_manager
+                        .process_store
+                        .lock()
+                        .await
+                        .processes
+                        .contains_key(&process_id)
+                );
+                assert!(session.list_background_terminals().await.is_empty());
+            });
+            drop(session);
+            drop(termination_runtime);
+            drop(process_runtime);
+        })
+        .expect("native termination test thread")
+        .join()
+        .expect("native termination remains owned after caller deadline");
 }
 
 #[cfg(windows)]
@@ -3103,10 +3469,11 @@ fn remote_commit_retirement_yields_and_cancellation_cleans_registered_child() {
                 assert!(matches!(retired_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
                     "the actual pending vector remains owned by held retirement");
                 assert_eq!(unsafe { WaitForSingleObject(child.0.as_raw_handle(), 0) }, WAIT_TIMEOUT);
+                {
                 let store = tokio::time::timeout(Duration::from_millis(50), manager.process_store.lock())
                     .await.expect("retirement does not retain the store mutex");
                 assert!(store.processes.contains_key(&process_id), "commit retains normal process custody");
-                drop(store);
+                }
                 assert!(session.services.command_execution.running_process(process_id).await.is_some());
                 if cancel_token {
                     cancellation.cancel();
@@ -3116,11 +3483,12 @@ fn remote_commit_retirement_yields_and_cancellation_cleans_registered_child() {
                     drop(pending);
                 } else {
                     drop(pending);
+                    {
                     let store = manager.process_store.lock().await;
                     let entry = store.processes.get(&process_id).expect("hard drop retains committed session ownership");
                     assert!(!entry.initial_exec_command_active.load(Ordering::Acquire),
                         "initial command guard must cover the new commit retirement await");
-                    drop(store);
+                    }
                     assert!(session.services.command_execution.running_process(process_id).await.is_some());
                     assert_eq!(unsafe { WaitForSingleObject(child.0.as_raw_handle(), 0) }, WAIT_TIMEOUT);
                     assert!(session.terminate_background_terminal(process_id).await,
@@ -3141,10 +3509,11 @@ fn remote_commit_retirement_yields_and_cancellation_cleans_registered_child() {
                 assert!(retired_process.upgrade().is_none(), "worker retires the actual final process owner");
                 assert_eq!(unsafe { WaitForSingleObject(child.0.as_raw_handle(), 0) }, WAIT_OBJECT_0,
                     "normal cancellation confirms real remote child exit");
+                {
                 let store = manager.process_store.lock().await;
                 assert!(!store.processes.contains_key(&process_id));
                 assert!(!store.reserved_process_ids.contains(&process_id));
-                drop(store);
+                }
                 assert!(session.services.command_execution.running_process(process_id).await.is_none());
             });
             drop(caller_runtime);

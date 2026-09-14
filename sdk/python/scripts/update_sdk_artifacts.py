@@ -490,6 +490,11 @@ def _annotate_schema(value: Any, base: str | None = None) -> None:
     if not isinstance(value, dict):
         return
 
+    # Python integers need no Rust width annotation. Keep the schema's numeric
+    # constraints while removing formats unsupported by datamodel-code-generator.
+    if value.get("format") in {"uint", "uint16", "uint32", "uint64"}:
+        value.pop("format")
+
     owner = value.get("title")
     props = value.get("properties")
     if isinstance(owner, str) and isinstance(props, dict):

@@ -11,13 +11,13 @@
 //!    first drawn.
 //! 4. Completed runs only persist when they have output or a non-success status.
 use super::HistoryCell;
+use super::line_to_static;
 use super::plain_lines;
 use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
 use crate::motion::MotionMode;
 use crate::motion::ReducedMotionIndicator;
 use crate::motion::activity_indicator;
 use crate::motion::shimmer_text;
-use crate::render::line_utils::push_owned_lines;
 use crate::render::renderable::Renderable;
 use crate::ui_consts::TRANSCRIPT_HINT;
 use crate::wrapping::RtOptions;
@@ -500,7 +500,7 @@ fn hook_context_preview_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     let mut wrapped = Vec::new();
     let mut source_lines = text.split('\n');
     let first_line = source_lines.next().unwrap_or_default();
-    push_wrapped_hook_context_line(
+    let mut total_rows = push_wrapped_hook_context_line(
         &mut wrapped,
         first_line,
         width,
@@ -511,9 +511,12 @@ fn hook_context_preview_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     );
     for line in source_lines {
         if line.is_empty() {
-            wrapped.push("".into());
+            total_rows += 1;
+            if wrapped.len() < HOOK_CONTEXT_MAX_DISPLAY_ROWS {
+                wrapped.push("".into());
+            }
         } else {
-            push_wrapped_hook_context_line(
+            total_rows += push_wrapped_hook_context_line(
                 &mut wrapped,
                 line,
                 width,
@@ -522,12 +525,12 @@ fn hook_context_preview_lines(text: &str, width: u16) -> Vec<Line<'static>> {
         }
     }
 
-    if wrapped.len() <= HOOK_CONTEXT_MAX_DISPLAY_ROWS {
+    if total_rows <= HOOK_CONTEXT_MAX_DISPLAY_ROWS {
         return wrapped;
     }
 
     let retained_rows = HOOK_CONTEXT_MAX_DISPLAY_ROWS - 1;
-    let omitted_rows = wrapped.len() - retained_rows;
+    let omitted_rows = total_rows - retained_rows;
     wrapped.truncate(retained_rows);
     let hint = vec![
         HOOK_OUTPUT_BODY_INDENT.into(),
@@ -543,15 +546,21 @@ fn push_wrapped_hook_context_line(
     text: &str,
     width: usize,
     initial_indent: Line<'static>,
-) {
-    let line = Line::from(text.to_string());
+) -> usize {
+    let line = Line::from(text);
     let wrapped = word_wrap_line(
         &line,
         RtOptions::new(width)
             .initial_indent(initial_indent)
             .subsequent_indent(Line::from(HOOK_OUTPUT_BODY_INDENT)),
     );
-    push_owned_lines(&wrapped, output);
+    output.extend(
+        wrapped
+            .iter()
+            .take(HOOK_CONTEXT_MAX_DISPLAY_ROWS.saturating_sub(output.len()))
+            .map(line_to_static),
+    );
+    wrapped.len()
 }
 
 impl HookRunState {

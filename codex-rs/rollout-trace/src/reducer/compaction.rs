@@ -137,6 +137,20 @@ impl TraceReducer {
                 turn.thread_id
             );
         }
+        let mut request_ids = Vec::new();
+        for request in self
+            .rollout
+            .compaction_requests
+            .values()
+            .filter(|request| request.compaction_id == compaction_id)
+        {
+            if request.thread_id != thread_id || request.codex_turn_id != codex_turn_id {
+                bail!(
+                    "compaction install {compaction_id} has a request with a different thread or turn owner"
+                );
+            }
+            request_ids.push(request.compaction_request_id.clone());
+        }
         let checkpoint = self.reduce_compaction_checkpoint(
             wall_time_unix_ms,
             &thread_id,
@@ -144,13 +158,6 @@ impl TraceReducer {
             &compaction_id,
             &checkpoint_payload,
         )?;
-        let request_ids = self
-            .rollout
-            .compaction_requests
-            .values()
-            .filter(|request| request.compaction_id == compaction_id)
-            .map(|request| request.compaction_request_id.clone())
-            .collect();
 
         self.pending_compaction_replacement_item_ids
             .insert(thread_id.clone(), checkpoint.replacement_item_ids.clone());

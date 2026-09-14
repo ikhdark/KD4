@@ -4,6 +4,7 @@
 //! live-only side effects.
 
 use super::*;
+use codex_app_server_protocol::PatchApplyStatus;
 
 impl ChatWidget {
     /// Replay a subset of initial events into the UI to seed the transcript when
@@ -147,6 +148,23 @@ impl ChatWidget {
                 status: codex_app_server_protocol::PatchApplyStatus::InProgress,
                 ..
             } => {}
+            ThreadItem::FileChange {
+                id,
+                changes,
+                status,
+            } if from_replay
+                && matches!(
+                    status,
+                    PatchApplyStatus::Completed | PatchApplyStatus::Failed
+                ) =>
+            {
+                self.flush_answer_stream_with_separator();
+                self.on_patch_apply_begin(id, file_update_changes_to_display(changes));
+                if matches!(status, codex_app_server_protocol::PatchApplyStatus::Failed) {
+                    self.add_to_history(history_cell::new_patch_apply_failure(String::new()));
+                }
+                self.transcript.had_work_activity = true;
+            }
             item @ ThreadItem::FileChange { .. } => self.on_file_change_completed(item),
             item @ ThreadItem::McpToolCall {
                 status: codex_app_server_protocol::McpToolCallStatus::InProgress,

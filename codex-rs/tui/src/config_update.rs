@@ -16,7 +16,6 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SkillsConfigWriteParams;
 use codex_app_server_protocol::SkillsConfigWriteResponse;
 use codex_config::loader::project_trust_key;
-use codex_features::FEATURES;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::TrustLevel;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -49,11 +48,11 @@ pub(crate) fn format_config_error(err: &impl Display) -> String {
 }
 
 fn trusted_project_edit(project_path: &Path) -> ConfigEdit {
-    let project_key = project_trust_key(project_path)
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"");
+    let project_key = serde_json::json!(project_trust_key(project_path))
+        .to_string()
+        .replace('\u{7f}', "\\u007f");
     replace_config_value(
-        format!("projects.\"{project_key}\".trust_level"),
+        format!("projects.{project_key}.trust_level"),
         serde_json::json!(TrustLevel::Trusted.to_string()),
     )
 }
@@ -114,16 +113,10 @@ pub(crate) fn build_windows_sandbox_mode_edits(elevated_enabled: bool) -> Vec<Co
 }
 
 pub(crate) fn build_feature_enabled_edit(feature_key: &str, enabled: bool) -> ConfigEdit {
-    let key_path = format!("features.{feature_key}");
-    let is_default_false_feature = FEATURES
-        .iter()
-        .find(|spec| spec.key == feature_key)
-        .is_some_and(|spec| !spec.default_enabled);
-    if enabled || !is_default_false_feature {
-        replace_config_value(key_path, serde_json::json!(enabled))
-    } else {
-        clear_config_value(key_path)
-    }
+    replace_config_value(
+        format!("features.{feature_key}"),
+        serde_json::json!(enabled),
+    )
 }
 
 pub(crate) fn build_memory_settings_edits(

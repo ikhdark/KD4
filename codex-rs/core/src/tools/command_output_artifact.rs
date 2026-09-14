@@ -849,11 +849,7 @@ fn scan_retention_root_blocking(
     let mut candidates_visited = 0_u64;
     let mut oversized = false;
     let mut thread_directories = std::fs::read_dir(root)?;
-    loop {
-        let thread_entry = match thread_directories.next().transpose()? {
-            Some(entry) => entry,
-            None => break,
-        };
+    while let Some(thread_entry) = thread_directories.next().transpose()? {
         if !thread_entry.file_type()?.is_dir() {
             continue;
         }
@@ -861,11 +857,7 @@ fn scan_retention_root_blocking(
         let mut entries = std::fs::read_dir(thread_entry.path())?;
         let mut log_paths = Vec::new();
         let mut bytes_by_stem = BTreeMap::<String, u64>::new();
-        loop {
-            let entry = match entries.next().transpose()? {
-                Some(entry) => entry,
-                None => break,
-            };
+        while let Some(entry) = entries.next().transpose()? {
             let path = entry.path();
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
@@ -1404,6 +1396,10 @@ impl Drop for RawOutputArtifactWriter {
 struct LockedOutputFile(Option<File>);
 
 impl LockedOutputFile {
+    #[expect(
+        clippy::expect_used,
+        reason = "The owned handle is initialized once and taken only while consuming this wrapper"
+    )]
     fn into_file(mut self) -> File {
         self.0.take().expect("locked output file ownership")
     }
@@ -1437,6 +1433,10 @@ async fn lock_output_file(file: tokio::fs::File) -> std::io::Result<tokio::fs::F
     Ok(tokio::fs::File::from_std(file.into_file()))
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "The wrapper is initialized with this handle and consumed only after unlocking"
+)]
 async fn unlock_output_file(file: tokio::fs::File) -> std::io::Result<()> {
     let file = LockedOutputFile(Some(file.into_std().await));
     run_blocking_artifact_io(move || {
@@ -1823,7 +1823,9 @@ fn reconcile_logical_artifact_transaction(path: &Path) -> std::io::Result<()> {
         let replacement = {
             let mut pending = TRANSACTION_MARKER_REPLACEMENT_FOR_TEST
                 .lock()
-                .expect("transaction marker replacement lock");
+                .map_err(|_| {
+                    std::io::Error::other("transaction marker replacement lock poisoned")
+                })?;
             if pending
                 .as_ref()
                 .is_some_and(|(marker, _)| marker == &transaction_path)
@@ -2731,7 +2733,7 @@ fn stage_attach_canonical_output_artifact(
         directory,
         id,
         canonical,
-        existing: existing,
+        existing,
         segments: staged_segments,
         cleanup,
     })

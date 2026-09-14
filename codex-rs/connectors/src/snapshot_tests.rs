@@ -57,3 +57,29 @@ fn source(id: &str, display_name: &str, connector_ids: &[&str]) -> PluginConnect
             .map(|id| AppConnectorId((*id).to_string())),
     )
 }
+
+#[test]
+fn source_normalizes_and_deduplicates_ids_before_indexing() {
+    let source = source(
+        "plugin",
+        "Plugin",
+        &[" drive ", "", " \t ", "drive", "Calendar", "calendar"],
+    );
+    assert_eq!(
+        source.connector_ids(),
+        &[
+            AppConnectorId("drive".to_string()),
+            AppConnectorId("Calendar".to_string()),
+            AppConnectorId("calendar".to_string()),
+        ]
+    );
+    let snapshot = ConnectorSnapshot::from_plugin_sources([source]);
+    assert_eq!(
+        snapshot.plugin_ids_for_connector_id("drive"),
+        &["plugin".to_string()]
+    );
+    assert_eq!(
+        snapshot.plugin_ids_for_connector_id(" drive "),
+        &[] as &[String]
+    );
+}

@@ -86,17 +86,40 @@ impl ConfigEditsBuilder {
         let _lock = acquire_atomic_write_lock(&config_path)?;
         let write_paths = resolve_symlink_write_paths(&config_path)?;
         let mut doc = read_or_create_config_document(write_paths.read_path.as_deref())?;
+        let mut mutated = false;
         if let Some(servers) = self.mcp_servers.as_ref() {
             replace_mcp_servers(&mut doc, servers);
+            mutated = true;
         }
         if let Some(servers) = self.mcp_servers_to_merge.as_ref() {
-            let mut current = mcp_servers_from_document(&doc)?;
+            // Validate even an empty merge, but preserve existing document entries.
+            let current = mcp_servers_from_document(&doc)?;
             for (name, config) in servers {
-                current
-                    .entry(name.clone())
-                    .or_insert_with(|| config.clone());
+                if current.contains_key(name) {
+                    continue;
+                }
+                let section = &mut doc["mcp_servers"];
+                if section.is_none() {
+                    let mut table = TomlTable::new();
+                    table.set_implicit(true);
+                    *section = TomlItem::Table(table);
+                }
+                let entry = if section.is_inline_table() {
+                    TomlItem::Value(serialize_mcp_server_inline(config).into())
+                } else {
+                    serialize_mcp_server(config)
+                };
+                section
+                    .as_table_like_mut()
+                    .ok_or_else(|| {
+                        std::io::Error::new(ErrorKind::InvalidData, "mcp_servers must be a table")
+                    })?
+                    .insert(name, entry);
+                mutated = true;
             }
-            replace_mcp_servers(&mut doc, &current);
+        }
+        if !mutated {
+            return Ok(());
         }
         write_atomically(&write_paths.write_path, &doc.to_string())
     }

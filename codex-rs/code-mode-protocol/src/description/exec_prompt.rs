@@ -10,7 +10,7 @@ pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript; input 
 - Do not rediscover known paths. Read/list known locations directly; otherwise search narrowly within that path. Reuse current applicable `AGENTS.md`; retrieve missing scopes or invalidated content.
 - Start useful work in the initial exec. Batch independent known reads/probes with `Promise.allSettled`; inspect every result. Find unknown paths first; sequence dependent calls. Keep status and file outputs distinct; independent calls may share one exec.
 - Prefer a purpose-built tool over shell; consolidate related read-only probes in one call. Never spawn a subprocess merely to re-filter a result already returned.
-- Nested calls: hard 60s default deadline. Resume only a returned session/cell ID; never duplicate a timed-out operation. Honor tool contracts.
+- Nested calls: hard 60s default deadline. After a timeout, resume a returned live session/cell ID. Do not rerun while the original is live or its effects are uncertain. Retry only if it never started, stopped and is safe to repeat, or the tool permits retry.
 - A cell runs to completion within its initial 10s budget and yields only on `yield_control()`, new user input, or when that budget expires. Keep long commands in the same awaited evaluation; call `yield_control()` only for a new model decision.
 - Run required validation after the final relevant edit. Parallelize only tool-permitted commands with independent build locks, output paths, and services. Propagate sequential failures with `&&` or exit-code checks; never mask them with `|| true`. Complete requested work and checks, or report failures/blockers. Follow plans while they match the current request.
 - Do not repeat unchanged deterministic failures. Change route/state or report the blocker; resume live operations through documented wait interfaces.
@@ -125,13 +125,20 @@ mod tests {
                     "Reuse current schemas, CLI usage, and results.",
                     "consult CLI `--help` only for uncertain arguments/subcommands.",
                     "Reuse current applicable `AGENTS.md`; retrieve missing scopes or invalidated content.",
+                    "After a timeout, resume a returned live session/cell ID.",
+                    "Do not rerun while the original is live or its effects are uncertain.",
+                    "Retry only if it never started, stopped and is safe to repeat, or the tool permits retry.",
                 ] {
                     assert!(
                         description.contains(required),
                         "missing guidance: {required}"
                     );
                 }
-                for retired in ["never whole files", "never repeat the same call/poll"] {
+                for retired in [
+                    "never whole files",
+                    "never repeat the same call/poll",
+                    "never duplicate a timed-out operation",
+                ] {
                     assert!(
                         !description.contains(retired),
                         "contradictory guidance: {retired}"

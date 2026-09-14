@@ -5,7 +5,6 @@ use super::TableCell;
 use super::TableColumnKind;
 use super::TableColumnMetrics;
 use crate::render::line_utils::line_to_static;
-use crate::render::line_utils::push_owned_lines;
 use crate::terminal_hyperlinks::HyperlinkLine;
 use crate::terminal_hyperlinks::remap_wrapped_line;
 use crate::wrapping::RtOptions;
@@ -37,6 +36,11 @@ pub(super) fn should_render_records(
         return false;
     }
 
+    let threshold = if rows.len() == 1 {
+        1
+    } else {
+        2.max(rows.len().div_ceil(3))
+    };
     let affected_rows = rows
         .iter()
         .filter(|row| {
@@ -45,6 +49,12 @@ pub(super) fn should_render_records(
                     .zip(column_widths)
                     .zip(metrics)
                     .any(|((cell, width), metrics)| {
+                        if metrics.kind == TableColumnKind::Narrative
+                            || (metrics.kind == TableColumnKind::TokenHeavy
+                                && *width >= MIN_SCANNABLE_TOKEN_HEAVY_WIDTH)
+                        {
+                            return false;
+                        }
                         let has_fragmented_token = cell
                             .plain_text()
                             .split_whitespace()
@@ -60,12 +70,8 @@ pub(super) fn should_render_records(
 
             contains_fragmented_value || expansive_cells_are_starved(row, column_widths, metrics)
         })
+        .take(threshold)
         .count();
-    let threshold = if rows.len() == 1 {
-        1
-    } else {
-        2.max(rows.len().div_ceil(3))
-    };
 
     affected_rows >= threshold
 }
@@ -75,24 +81,36 @@ fn expansive_cells_are_starved(
     column_widths: &[usize],
     metrics: &[TableColumnMetrics],
 ) -> bool {
-    let expansive_cells: Vec<(TableColumnKind, usize, usize)> = row
+    let mut cramped_cells = 0;
+    for ((cell, width), metrics) in row
         .iter()
         .zip(column_widths)
         .zip(metrics)
         .filter(|&((_cell, _width), metrics)| metrics.kind != TableColumnKind::Compact)
-        .map(|((cell, width), metrics)| (metrics.kind, *width, wrap_cell(cell, *width).len()))
-        .collect();
-
-    expansive_cells
-        .iter()
-        .filter(|(_, _, height)| *height >= CRAMPED_EXPANSIVE_CELL_LINES)
-        .count()
-        >= 2
-        || expansive_cells.iter().any(|(kind, width, height)| {
-            *kind == TableColumnKind::Narrative
+    {
+        // Use exactly the renderer's wrapping without owning lines or remapping links.
+        let height = cell
+            .lines
+            .iter()
+            .map(|line| {
+                word_wrap_line(&line.line, RtOptions::new((*width).max(1)))
+                    .len()
+                    .max(1)
+            })
+            .sum::<usize>()
+            .max(1);
+        if height >= CRAMPED_EXPANSIVE_CELL_LINES {
+            cramped_cells += 1;
+        }
+        if cramped_cells >= 2
+            || (metrics.kind == TableColumnKind::Narrative
                 && *width < MIN_SCANNABLE_NARRATIVE_WIDTH
-                && *height >= CATASTROPHIC_NARRATIVE_CELL_LINES
-        })
+                && height >= CATASTROPHIC_NARRATIVE_CELL_LINES)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 pub(super) fn render_records(
@@ -120,8 +138,10 @@ pub(super) fn render_records(
         FIELD_LEADING_PADDING + label_width + FIELD_GAP + minimum_value_width <= width
     });
     let mut out = Vec::new();
+    let mut widest_record = 0;
 
     for (row_index, row) in rows.iter().enumerate() {
+        let record_start = out.len();
         for (header, value) in headers.iter().zip(row) {
             if aligned_fields {
                 render_aligned_field(
@@ -137,7 +157,10 @@ pub(super) fn render_records(
             }
         }
         if row_index + 1 < rows.len() {
-            let width = available_width.unwrap_or_else(|| widest_line_width(&out));
+            let width = available_width.unwrap_or_else(|| {
+                widest_record = widest_record.max(widest_line_width(&out[record_start..]));
+                widest_record
+            });
             out.push(HyperlinkLine::new(Line::from(Span::styled(
                 TABLE_BODY_SEPARATOR_CHAR.to_string().repeat(width),
                 separator_style,
@@ -162,18 +185,21 @@ fn render_aligned_field(
         .unwrap_or_else(|| cell_width(value).max(MIN_VALUE_WIDTH));
     let wrapped_value = wrap_cell(value, value_width);
     for (line_index, value_line) in wrapped_value.into_iter().enumerate() {
-        let mut spans = Vec::new();
+        let mut prefix = HyperlinkLine::default();
         if line_index == 0 {
-            let label = header.plain_text();
-            spans.push(Span::raw(" ".repeat(FIELD_LEADING_PADDING)));
-            spans.push(Span::styled(label.clone(), label_style));
-            spans.push(Span::raw(
-                " ".repeat(label_width.saturating_sub(label.width()) + FIELD_GAP),
-            ));
+            prefix.push_span(Span::raw(" ".repeat(FIELD_LEADING_PADDING)), None);
+            append_line(&mut prefix, header_label(header, label_style));
+            prefix.push_span(
+                Span::raw(
+                    " ".repeat(label_width.saturating_sub(header.plain_text().width()) + FIELD_GAP),
+                ),
+                None,
+            );
         } else {
-            spans.push(Span::raw(" ".repeat(value_indent)));
+            prefix.push_span(Span::raw(" ".repeat(value_indent)), None);
         }
-        push_prefixed_value_line(out, spans, value_line);
+        append_line(&mut prefix, value_line);
+        out.push(prefix);
     }
 }
 
@@ -187,48 +213,53 @@ fn render_stacked_field(
     let label_width = available_width
         .map(|width| width.saturating_sub(FIELD_LEADING_PADDING).max(1))
         .unwrap_or_else(|| header.plain_text().width().max(1));
-    let label = Line::from(Span::styled(header.plain_text(), label_style));
-    let mut wrapped_labels = Vec::new();
-    push_owned_lines(
-        &word_wrap_line(&label, RtOptions::new(label_width)),
-        &mut wrapped_labels,
+    let label = header_label(header, label_style);
+    let wrapped_labels = remap_wrapped_line(
+        &label,
+        word_wrap_line(&label.line, RtOptions::new(label_width))
+            .into_iter()
+            .map(|line| line_to_static(&line))
+            .collect(),
     );
     for label_line in wrapped_labels {
-        let mut spans = vec![Span::raw(" ".repeat(FIELD_LEADING_PADDING))];
-        spans.extend(label_line.spans);
-        out.push(HyperlinkLine::new(Line::from(spans)));
+        let mut prefix = HyperlinkLine::from(" ".repeat(FIELD_LEADING_PADDING));
+        append_line(&mut prefix, label_line);
+        out.push(prefix);
     }
 
     let value_width = available_width
         .map(|width| width.saturating_sub(STACKED_VALUE_INDENT).max(1))
         .unwrap_or_else(|| cell_width(value).max(1));
     for value_line in wrap_cell(value, value_width) {
-        push_prefixed_value_line(
-            out,
-            vec![Span::raw(" ".repeat(STACKED_VALUE_INDENT))],
-            value_line,
-        );
+        let mut prefix = HyperlinkLine::from(" ".repeat(STACKED_VALUE_INDENT));
+        append_line(&mut prefix, value_line);
+        out.push(prefix);
     }
 }
 
-fn push_prefixed_value_line(
-    out: &mut Vec<HyperlinkLine>,
-    mut prefix: Vec<Span<'static>>,
-    mut value_line: HyperlinkLine,
-) {
-    let shift = prefix
-        .iter()
-        .map(|span| span.content.width())
-        .sum::<usize>();
-    prefix.append(&mut value_line.line.spans);
-    let mut output_line = HyperlinkLine::new(Line::from(prefix));
-    output_line
+fn header_label(header: &TableCell, style: Style) -> HyperlinkLine {
+    let mut label = HyperlinkLine::default();
+    for (index, line) in header.lines.iter().enumerate() {
+        if index > 0 {
+            label.push_span(Span::raw(" "), None);
+        }
+        append_line(&mut label, line.clone());
+    }
+    for span in &mut label.line.spans {
+        span.style = style;
+    }
+    label
+}
+
+fn append_line(prefix: &mut HyperlinkLine, mut value_line: HyperlinkLine) {
+    let shift = prefix.width();
+    prefix.line.spans.append(&mut value_line.line.spans);
+    prefix
         .hyperlinks
         .extend(value_line.hyperlinks.into_iter().map(|mut link| {
             link.columns = link.columns.start + shift..link.columns.end + shift;
             link
         }));
-    out.push(output_line);
 }
 
 fn wrap_cell(cell: &TableCell, width: usize) -> Vec<HyperlinkLine> {

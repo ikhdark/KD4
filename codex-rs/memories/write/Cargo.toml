@@ -45,5 +45,6 @@ codex-model-provider-info = { workspace = true }
 codex-models-manager = { workspace = true }
 core_test_support = { workspace = true }
 pretty_assertions = { workspace = true }
+sqlx = { workspace = true }
 tokio = { workspace = true, features = ["fs", "macros"] }
 wiremock = { workspace = true }

@@ -463,10 +463,13 @@ pub struct HttpRequestParams {
     pub redirect_policy: HttpRedirectPolicy,
     /// Caller-chosen stream id for `http/request/bodyDelta` notifications.
     ///
-    /// The id must remain unique on a connection until the terminal body delta
-    /// arrives, even if the caller stops reading the stream earlier. Buffered
-    /// requests still send an id so callers can keep one consistent request
-    /// envelope shape.
+    /// For streamed requests, the id must remain unique on a connection until
+    /// the terminal body delta arrives, even if the caller stops reading early.
+    /// Failure before streaming starts releases the id with the RPC error;
+    /// connection teardown ends all reservations without requiring a final delta.
+    /// Buffered requests also carry this field for a consistent envelope, but do
+    /// not reserve a stream id or emit body deltas: their RPC response or error
+    /// completes the request.
     pub request_id: String,
     /// Return after response headers and stream the response body as deltas.
     #[serde(default)]

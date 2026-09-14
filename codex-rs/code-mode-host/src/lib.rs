@@ -40,6 +40,9 @@ mod peer;
 
 const MAX_IN_FLIGHT_REQUESTS: usize = 256;
 const MAX_ACTIVE_CELLS: usize = 128;
+// Bound retained session storage independently of transient request/cell
+// permits: 64 sessions can retain up to 512 MiB of serialized stored values.
+const MAX_OPEN_SESSIONS: usize = 64;
 const MAX_RECENT_REQUEST_IDS: usize = 4096;
 const MAX_RECENT_SESSION_IDS: usize = 4096;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -82,7 +85,12 @@ where
                     let Some(frame) = frame else {
                         return Ok(());
                     };
-                    if let Err(err) = writer.write_frame(&frame).await {
+                    // Cancellation is terminal: never resume a partially written frame.
+                    let result = tokio::select! {
+                        _ = writer_disconnected.cancelled() => return Ok(()),
+                        result = writer.write_frame(&frame) => result,
+                    };
+                    if let Err(err) = result {
                         return Err(
                             anyhow::Error::new(err)
                                 .context("failed to write code-mode host message")
@@ -92,8 +100,9 @@ where
             }
         }
     });
+    let writer_abort = writer_task.abort_handle();
     let writer_peer = Arc::clone(&peer);
-    let writer_supervisor = tokio::spawn(async move {
+    let mut writer_supervisor = tokio::spawn(async move {
         match writer_task.await {
             Ok(Ok(())) if !writer_peer.is_disconnected() => {
                 writer_peer.fail("code-mode writer task exited unexpectedly".to_string());
@@ -145,10 +154,16 @@ where
         peer.fail("timed out shutting down code-mode host state".to_string());
     }
     drop(state);
-    tokio::time::timeout(SHUTDOWN_TIMEOUT, writer_supervisor)
-        .await
-        .context("timed out supervising code-mode writer task")?
-        .context("code-mode writer supervisor task failed")?;
+    match tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut writer_supervisor).await {
+        Ok(result) => result.context("code-mode writer supervisor task failed")?,
+        Err(err) => {
+            writer_abort.abort();
+            writer_supervisor
+                .await
+                .context("code-mode writer supervisor task failed")?;
+            return Err(err).context("timed out supervising code-mode writer task");
+        }
+    }
     let failure = peer.failure();
     drop(peer);
     input_result?;
@@ -424,6 +439,9 @@ impl HostState {
         if self.closing.load(Ordering::Acquire) {
             return Err("code-mode host is shutting down".to_string());
         }
+        if sessions.len() >= MAX_OPEN_SESSIONS {
+            return Err("code-mode host has too many open sessions".to_string());
+        }
         if !self
             .seen_session_ids
             .lock()
@@ -535,6 +553,8 @@ struct ActiveRequest {
 #[derive(Default)]
 struct RequestRegistry {
     active: HashMap<RequestId, ActiveRequest>,
+    // Recent duplicate detection only; clients allocate fresh IDs for the
+    // connection lifetime even after entries leave this bounded history.
     recent: HashSet<RequestId>,
     recent_order: VecDeque<RequestId>,
 }
@@ -589,6 +609,7 @@ impl RequestRegistry {
 
 #[derive(Default)]
 struct SeenSessionIds {
+    // As with request IDs, this is bounded duplicate detection, not an ID allocator.
     ids: HashSet<SessionId>,
     order: VecDeque<SessionId>,
 }

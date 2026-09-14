@@ -19,6 +19,7 @@ struct GitCheckInputs {
     selected_git: Option<PathBuf>,
     git_candidates: Vec<PathBuf>,
     git_version: Option<String>,
+    git_version_error: Option<String>,
     git_exec_path: Option<String>,
     git_build_options: Option<String>,
     repo_root: Option<PathBuf>,
@@ -32,7 +33,7 @@ pub(super) async fn git_check(cwd: &Path) -> DoctorCheck {
     let git_candidates = git_candidates();
     let repo_root = get_git_repo_root(cwd);
 
-    let (git_version, git_exec_path, git_build_options, branch, core_fsmonitor) =
+    let (git_version, git_version_error, git_exec_path, git_build_options, branch, core_fsmonitor) =
         if let Some(git_path) = selected_git.as_deref() {
             let (version, exec_path, build_options, branch, fsmonitor) = tokio::join!(
                 git_output(git_path, cwd, &["--version"]),
@@ -41,15 +42,23 @@ pub(super) async fn git_check(cwd: &Path) -> DoctorCheck {
                 git_output(git_path, cwd, &["rev-parse", "--abbrev-ref", "HEAD"]),
                 git_output(git_path, cwd, &["config", "--get", "core.fsmonitor"]),
             );
-            (version, exec_path, build_options, branch, fsmonitor)
+            (
+                version.as_ref().ok().cloned(),
+                version.err(),
+                exec_path.ok(),
+                build_options.ok(),
+                branch.ok(),
+                fsmonitor.ok(),
+            )
         } else {
-            (None, None, None, None, None)
+            (None, None, None, None, None, None)
         };
 
     git_check_from_inputs(GitCheckInputs {
         selected_git,
         git_candidates,
         git_version,
+        git_version_error,
         git_exec_path,
         git_build_options,
         git_entry: repo_root.as_deref().map(git_entry_summary),
@@ -70,6 +79,11 @@ fn git_check_from_inputs(inputs: GitCheckInputs) -> DoctorCheck {
         details.push(format!("PATH git #{}: {}", index + 1, path.display()));
     }
     push_optional_detail(&mut details, "git version", inputs.git_version.as_deref());
+    push_optional_detail(
+        &mut details,
+        "git version error",
+        inputs.git_version_error.as_deref(),
+    );
     push_optional_detail(
         &mut details,
         "git exec path",
@@ -118,8 +132,9 @@ fn git_check_from_inputs(inputs: GitCheckInputs) -> DoctorCheck {
                 CheckStatus::Warning,
                 "Git executable was found on PATH but did not return a version",
             )
+            .measured(inputs.git_version_error.clone().unwrap_or_else(|| "version unavailable".to_string()))
             .expected("git --version succeeds")
-            .remedy("Fix the selected Git executable or PATH so Codex can inspect Git metadata.")
+            .remedy("Inspect the Git version probe error and verify the selected executable and working directory.")
             .field("git version")
             .field("selected git"),
         );
@@ -189,7 +204,7 @@ fn git_candidates() -> Vec<PathBuf> {
         .collect()
 }
 
-async fn git_output(git_path: &Path, cwd: &Path, args: &[&str]) -> Option<String> {
+async fn git_output(git_path: &Path, cwd: &Path, args: &[&str]) -> Result<String, String> {
     let mut command = Command::new(git_path);
     command
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -198,14 +213,18 @@ async fn git_output(git_path: &Path, cwd: &Path, args: &[&str]) -> Option<String
         .kill_on_drop(true);
     let output = timeout(GIT_COMMAND_TIMEOUT, command.output())
         .await
-        .ok()?
-        .ok()?;
+        .map_err(|_| "timed out after 2 seconds".to_string())?
+        .map_err(|err| err.to_string())?;
     command_output_text(output)
 }
 
-fn command_output_text(output: Output) -> Option<String> {
+fn command_output_text(output: Output) -> Result<String, String> {
     if !output.status.success() {
-        return None;
+        return Err(format!(
+            "exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let normalized = stdout
@@ -215,9 +234,9 @@ fn command_output_text(output: Output) -> Option<String> {
         .collect::<Vec<_>>()
         .join("; ");
     if normalized.is_empty() {
-        None
+        Err("command produced no version output".to_string())
     } else {
-        Some(normalized)
+        Ok(normalized)
     }
 }
 
@@ -415,12 +434,22 @@ mod tests {
     fn warns_when_selected_git_cannot_report_version() {
         let check = git_check_from_inputs(GitCheckInputs {
             selected_git: Some(PathBuf::from(r"C:\Program Files\Git\cmd\git.exe")),
+            git_version_error: Some("timed out after 2 seconds".to_string()),
             repo_root: Some(PathBuf::from(r"C:\repo")),
             ..GitCheckInputs::default()
         });
 
         assert_eq!(check.status, CheckStatus::Warning);
         assert_eq!(check.summary, "Git executable found but could not be run");
+        assert!(
+            check
+                .details
+                .contains(&"git version error: timed out after 2 seconds".to_string())
+        );
+        assert_eq!(
+            check.issues[0].measured.as_deref(),
+            Some("timed out after 2 seconds")
+        );
     }
 
     #[test]

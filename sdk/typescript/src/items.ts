@@ -29,7 +29,7 @@ export type FileUpdateChange = {
 };
 
 /** The status of a file change. */
-export type PatchApplyStatus = "in_progress" | "completed" | "failed";
+export type PatchApplyStatus = "in_progress" | "completed" | "failed" | "declined";
 
 /** A set of file changes by the agent, from application start through completion. */
 export type FileChangeItem = {
@@ -37,7 +37,7 @@ export type FileChangeItem = {
   type: "file_change";
   /** Individual file changes that comprise the patch. */
   changes: FileUpdateChange[];
-  /** Whether the patch ultimately succeeded or failed. */
+  /** Whether the patch is running, succeeded, failed, or was declined. */
   status: PatchApplyStatus;
 };
 

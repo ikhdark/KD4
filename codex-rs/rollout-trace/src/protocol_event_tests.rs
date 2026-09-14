@@ -90,7 +90,7 @@ fn reasoning_policy_events_are_omitted_from_turn_traces() {
 
     assert!(
         codex_turn_trace_event(
-            thread_id.clone(),
+            &thread_id,
             "turn-1",
             &EventMsg::ReasoningPolicyUpdated(snapshot.clone()),
         )
@@ -98,7 +98,7 @@ fn reasoning_policy_events_are_omitted_from_turn_traces() {
     );
     assert!(
         codex_turn_trace_event(
-            thread_id,
+            &thread_id,
             "turn-1",
             &EventMsg::ReasoningPolicySummary(ReasoningPolicyHistory {
                 turn_id: "turn-1".to_string(),
@@ -197,5 +197,47 @@ fn exec_command_trace_payloads_use_inferred_native_cwd() -> anyhow::Result<()> {
             "status": "completed"
         })
     );
+    Ok(())
+}
+
+#[test]
+fn turn_lifecycle_mapping_preserves_ids_and_abort_status() -> anyhow::Result<()> {
+    for (json, expected_turn, expected_status) in [
+        (
+            json!({"type":"turn_started","turn_id":"actual", "model_context_window":null}),
+            "actual",
+            None,
+        ),
+        (
+            json!({"type":"turn_complete","turn_id":"actual", "last_agent_message":null}),
+            "actual",
+            Some(ExecutionStatus::Completed),
+        ),
+        (
+            json!({"type":"turn_aborted","turn_id":"actual","reason":"internal_error"}),
+            "actual",
+            Some(ExecutionStatus::Failed),
+        ),
+        (
+            json!({"type":"turn_aborted","turn_id":null,"reason":"interrupted"}),
+            "fallback",
+            Some(ExecutionStatus::Cancelled),
+        ),
+    ] {
+        let event: EventMsg = serde_json::from_value(json)?;
+        let mapped = codex_turn_trace_event("thread-1", "fallback", &event).expect("turn boundary");
+        assert_eq!(mapped.context_turn_id, expected_turn);
+        let expected = match expected_status {
+            None => crate::RawTraceEventPayload::CodexTurnStarted {
+                codex_turn_id: expected_turn.into(),
+                thread_id: "thread-1".into(),
+            },
+            Some(status) => crate::RawTraceEventPayload::CodexTurnEnded {
+                codex_turn_id: expected_turn.into(),
+                status,
+            },
+        };
+        assert_eq!(mapped.payload, expected);
+    }
     Ok(())
 }

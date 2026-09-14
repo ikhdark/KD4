@@ -113,3 +113,36 @@ fn missing_terminal_colors_use_theme_accent_fallback() {
     assert_eq!(palette.for_level(/*level*/ 4), active_style);
     assert!(!palette.uses_color);
 }
+
+#[test]
+fn fallback_quantizes_rgb_and_preserves_glyphs_and_modifiers() {
+    for color_level in [
+        StdoutColorLevel::Ansi16,
+        StdoutColorLevel::Unknown,
+        StdoutColorLevel::Ansi256,
+    ] {
+        let palette = TokenActivityPalette::from_parts(
+            None,
+            None,
+            color_level,
+            Style::default().fg(rgb_color((100, 200, 50))).bold(),
+        );
+        assert!(!matches!(palette.for_level(1).fg, Some(Color::Rgb(..))));
+        assert!(palette.for_level(1).add_modifier.contains(Modifier::BOLD));
+        assert_eq!(palette.glyph(TokenActivityView::Daily, 0), "□");
+        assert_eq!(palette.glyph(TokenActivityView::Daily, 1), "■");
+        for view in [TokenActivityView::Weekly, TokenActivityView::Cumulative] {
+            assert_eq!(palette.glyph(view, 0), " ");
+            assert_eq!(palette.glyph(view, 4), "█");
+        }
+    }
+    let palette = TokenActivityPalette::from_parts(
+        Some((240, 240, 240)),
+        Some((0, 0, 0)),
+        StdoutColorLevel::TrueColor,
+        Style::default().fg(rgb_color((100, 200, 50))),
+    );
+    for level in 0..=4 {
+        assert_eq!(palette.glyph(TokenActivityView::Daily, level), "■");
+    }
+}

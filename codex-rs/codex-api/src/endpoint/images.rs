@@ -81,7 +81,6 @@ mod tests {
     use crate::images::ImageUrl;
     use crate::provider::RetryConfig;
     use codex_client::Request;
-    use codex_client::RequestBody;
     use codex_client::Response;
     use codex_client::StreamResponse;
     use codex_client::TransportError;
@@ -278,14 +277,17 @@ mod tests {
             "https://example.com/api/codex/images/generations"
         );
         assert_eq!(
-            request.body.as_ref().and_then(RequestBody::json),
-            Some(&json!({
+            serde_json::from_slice::<serde_json::Value>(
+                &request.prepare_body_for_send().unwrap().body_bytes()
+            )
+            .unwrap(),
+            json!({
                 "prompt": "a red fox in a field",
                 "background": "opaque",
                 "model": "gpt-image-1.5",
                 "quality": "medium",
                 "size": "1024x1536",
-            }))
+            })
         );
     }
 
@@ -317,12 +319,15 @@ mod tests {
         let request = captured_request(&transport);
         assert_eq!(request.url, "https://example.com/api/codex/images/edits");
         assert_eq!(
-            request.body.as_ref().and_then(RequestBody::json),
-            Some(&json!({
+            serde_json::from_slice::<serde_json::Value>(
+                &request.prepare_body_for_send().unwrap().body_bytes()
+            )
+            .unwrap(),
+            json!({
                 "images": [{"image_url": "data:image/png;base64,Zm9v"}],
                 "prompt": "add a red hat",
                 "model": "gpt-image-1.5",
-            }))
+            })
         );
     }
 

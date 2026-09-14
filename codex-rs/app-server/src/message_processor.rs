@@ -489,6 +489,7 @@ impl MessageProcessor {
             config_manager.clone(),
             thread_state_manager,
             bug_worker_shutdown.clone(),
+            thread_processor.background_tasks.clone(),
         );
         if matches!(plugin_startup_tasks, crate::PluginStartupTasks::Start) {
             // Keep plugin startup warmups aligned at app-server startup.
@@ -519,6 +520,7 @@ impl MessageProcessor {
                 analytics_events_client,
                 arg0_paths,
                 codex_home: config.codex_home.to_path_buf(),
+                background_tasks: thread_processor.background_tasks.clone(),
             });
         let environment_processor =
             EnvironmentRequestProcessor::new(thread_manager.environment_manager());

@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
-#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Default)]
+#[derive(Deserialize, Serialize, Clone, PartialEq, Default)]
 pub struct TokenData {
     /// Flat info parsed from the JWT in auth.json.
     #[serde(
@@ -25,7 +25,7 @@ pub struct TokenData {
 }
 
 /// Flat subset of useful claims in id_token from auth.json.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct IdTokenInfo {
     pub email: Option<String>,
     /// The ChatGPT subscription plan type
@@ -108,6 +108,8 @@ struct StandardJwtClaims {
 pub enum IdTokenInfoError {
     #[error("invalid ID token format")]
     InvalidFormat,
+    #[error("JWT expiration is outside the supported timestamp range")]
+    InvalidExpiration,
     #[error(transparent)]
     Base64(#[from] base64::DecodeError),
     #[error(transparent)]
@@ -117,10 +119,15 @@ pub enum IdTokenInfoError {
 fn decode_jwt_payload<T: DeserializeOwned>(jwt: &str) -> Result<T, IdTokenInfoError> {
     // JWT format: header.payload.signature
     let mut parts = jwt.split('.');
-    let (_header_b64, payload_b64, _sig_b64) = match (parts.next(), parts.next(), parts.next()) {
-        (Some(h), Some(p), Some(s)) if !h.is_empty() && !p.is_empty() && !s.is_empty() => (h, p, s),
-        _ => return Err(IdTokenInfoError::InvalidFormat),
-    };
+    let (_header_b64, payload_b64, _sig_b64) =
+        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(h), Some(p), Some(s), None)
+                if !h.is_empty() && !p.is_empty() && !s.is_empty() =>
+            {
+                (h, p, s)
+            }
+            _ => return Err(IdTokenInfoError::InvalidFormat),
+        };
 
     let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64)?;
     let claims = serde_json::from_slice(&payload_bytes)?;
@@ -129,9 +136,12 @@ fn decode_jwt_payload<T: DeserializeOwned>(jwt: &str) -> Result<T, IdTokenInfoEr
 
 pub fn parse_jwt_expiration(jwt: &str) -> Result<Option<DateTime<Utc>>, IdTokenInfoError> {
     let claims: StandardJwtClaims = decode_jwt_payload(jwt)?;
-    Ok(claims
+    claims
         .exp
-        .and_then(|exp| DateTime::<Utc>::from_timestamp(exp, 0)))
+        .map(|exp| {
+            DateTime::<Utc>::from_timestamp(exp, 0).ok_or(IdTokenInfoError::InvalidExpiration)
+        })
+        .transpose()
 }
 
 pub fn parse_chatgpt_jwt_claims(jwt: &str) -> Result<IdTokenInfo, IdTokenInfoError> {
@@ -178,3 +188,21 @@ where
 #[cfg(test)]
 #[path = "token_data_tests.rs"]
 mod tests;
+
+impl std::fmt::Debug for TokenData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenData")
+            .field("id_token", &self.id_token)
+            .field("account_id", &self.account_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for IdTokenInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdTokenInfo")
+            .field("chatgpt_plan_type", &self.chatgpt_plan_type)
+            .field("chatgpt_account_id", &self.chatgpt_account_id)
+            .finish_non_exhaustive()
+    }
+}

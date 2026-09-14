@@ -4,7 +4,8 @@ use http::StatusCode;
 
 pub(super) const BEDROCK_EXPIRED_SIGNATURE_MESSAGE: &str = concat!(
     "Amazon Bedrock rejected the request because its AWS signature has expired. ",
-    "Refresh your AWS credentials and retry. If `AWS_BEARER_TOKEN_BEDROCK` is set, ",
+    "Retry with a freshly signed request and check your system clock. ",
+    "If you use a Bedrock API key, refresh it. If `AWS_BEARER_TOKEN_BEDROCK` is set, ",
     "update or unset it, then restart Codex",
 );
 

@@ -62,7 +62,20 @@ impl ToolManifestDictionary {
     /// Encodes a full runtime snapshot as one definition per hash and compact
     /// references thereafter. New definitions use a delta when the current
     /// manifest has the supported collection shape.
-    pub fn encode(&mut self, hash: String, manifest: Value) -> ToolManifestItem {
+    pub fn encode(&mut self, hash: String, manifest: Value) -> Result<ToolManifestItem, String> {
+        if self
+            .manifests
+            .get(&hash)
+            .is_some_and(|existing| existing != &manifest)
+        {
+            return Err(format!(
+                "tool manifest hash {hash} resolves to conflicting definitions"
+            ));
+        }
+        Ok(self.encode_checked(hash, manifest))
+    }
+
+    fn encode_checked(&mut self, hash: String, manifest: Value) -> ToolManifestItem {
         if self.manifests.contains_key(&hash) {
             self.current_hash = Some(hash.clone());
             return ToolManifestItem::reference(hash);
@@ -82,6 +95,17 @@ impl ToolManifestDictionary {
                 ))
             })
             .unwrap_or_else(|| ToolManifestItem::full(hash.clone(), manifest.clone()));
+        let encoded = if encoded.base_hash.is_some() {
+            let full = ToolManifestItem::full(hash.clone(), manifest.clone());
+            match (serde_json::to_vec(&encoded), serde_json::to_vec(&full)) {
+                (Ok(delta_bytes), Ok(full_bytes)) if delta_bytes.len() < full_bytes.len() => {
+                    encoded
+                }
+                _ => full,
+            }
+        } else {
+            encoded
+        };
         self.manifests.insert(hash.clone(), manifest);
         self.current_hash = Some(hash);
         encoded
@@ -111,16 +135,19 @@ impl ToolManifestDictionary {
                 return Ok(ToolManifestItem::reference(item.hash.clone()));
             }
 
-            return Ok(self.encode(item.hash.clone(), manifest.clone()));
+            return self.encode(item.hash.clone(), manifest.clone());
         }
 
-        let mut decoded = self.clone();
-        decoded.apply(item)?;
-        let manifest = decoded
-            .manifest(&item.hash)
-            .cloned()
-            .ok_or_else(|| format!("tool manifest hash {} is unavailable", item.hash))?;
-        Ok(self.encode(item.hash.clone(), manifest))
+        let base_hash = item
+            .base_hash
+            .as_ref()
+            .ok_or_else(|| "tool manifest delta has no base hash".to_string())?;
+        let base = self
+            .manifests
+            .get(base_hash)
+            .ok_or_else(|| format!("tool manifest base hash {base_hash} is unavailable"))?;
+        let manifest = apply_delta(base, &item.added, &item.removed)?;
+        self.encode(item.hash.clone(), manifest)
     }
 }
 
@@ -175,13 +202,28 @@ fn compute_delta(
     let mut added = Vec::new();
     let mut removed = Vec::new();
 
+    let mut remaining_cells = 1_000_000usize;
     for key in keys {
         let base_value = base.get(key)?;
         let target_value = target.get(key)?;
+        if base_value == target_value {
+            continue;
+        }
         match (base_value.as_array(), target_value.as_array()) {
             (Some(base_values), Some(target_values)) => {
+                let cells = base_values
+                    .len()
+                    .checked_add(1)?
+                    .checked_mul(target_values.len().checked_add(1)?)?;
+                remaining_cells = remaining_cells.checked_sub(cells)?;
                 let base_entries = named_entries(base_values);
                 let target_entries = named_entries(target_values);
+                for entries in [&base_entries, &target_entries] {
+                    let mut names = HashSet::new();
+                    if entries.iter().any(|entry| !names.insert(&entry.name)) {
+                        return None;
+                    }
+                }
                 let matches = longest_common_subsequence(&base_entries, &target_entries);
                 let matched_base = matches
                     .iter()
@@ -343,13 +385,19 @@ mod tests {
 
     #[test]
     fn definitions_deltas_and_references_reconstruct_full_dictionary() {
-        let first = manifest(&["shell", "read"]);
-        let second = manifest(&["shell", "search"]);
+        let first = manifest(&["a", "b", "c", "d", "e", "shell", "read"]);
+        let second = manifest(&["a", "b", "c", "d", "e", "shell", "search"]);
         let mut writer = ToolManifestDictionary::default();
 
-        let first_item = writer.encode("first".to_string(), first.clone());
-        let second_item = writer.encode("second".to_string(), second.clone());
-        let second_reference = writer.encode("second".to_string(), second.clone());
+        let first_item = writer
+            .encode("first".to_string(), first.clone())
+            .expect("valid manifest");
+        let second_item = writer
+            .encode("second".to_string(), second.clone())
+            .expect("valid manifest");
+        let second_reference = writer
+            .encode("second".to_string(), second.clone())
+            .expect("valid manifest");
 
         assert_eq!(first_item.manifest, Some(first.clone()));
         assert_eq!(second_item.base_hash.as_deref(), Some("first"));
@@ -382,7 +430,9 @@ mod tests {
         let original = manifest(&["shell", "read"]);
         let conflicting = manifest(&["shell", "write"]);
         let mut writer = ToolManifestDictionary::default();
-        writer.encode("known".to_string(), original.clone());
+        writer
+            .encode("known".to_string(), original.clone())
+            .expect("valid manifest");
 
         let reference = writer
             .encode_item(&ToolManifestItem::full(
@@ -404,7 +454,9 @@ mod tests {
     fn known_reference_is_accepted_without_redecoding_the_dictionary() {
         let original = manifest(&["shell", "read"]);
         let mut writer = ToolManifestDictionary::default();
-        writer.encode("known".to_string(), original.clone());
+        writer
+            .encode("known".to_string(), original.clone())
+            .expect("valid manifest");
 
         let reference = writer
             .encode_item(&ToolManifestItem::reference("known".to_string()))
@@ -418,6 +470,48 @@ mod tests {
                 .encode_item(&ToolManifestItem::reference("missing".to_string()))
                 .expect_err("an unknown reference must fail closed")
                 .contains("unavailable")
+        );
+    }
+    #[test]
+    fn ambiguous_identities_and_expensive_diffs_use_full_definitions() {
+        let base = manifest(&["x", "x", "x#1"]);
+        let target = manifest(&["x", "x#1"]);
+        let mut writer = ToolManifestDictionary::default();
+        writer.encode("base".into(), base).unwrap();
+        let item = writer.encode("target".into(), target.clone()).unwrap();
+        assert_eq!(item.manifest, Some(target));
+
+        let base = json!({"tools": (0..1001).map(|i| json!({"name": format!("tool{i}")})).collect::<Vec<_>>()});
+        let mut target = base.clone();
+        target["tools"][0]["name"] = json!("changed");
+        assert_eq!(compute_delta(&base, &target), None);
+        assert_eq!(compute_delta(&base, &base), Some((vec![], vec![])));
+    }
+
+    #[test]
+    fn encoder_rejects_conflicts_without_changing_current_definition() {
+        let original = manifest(&["shell"]);
+        let mut writer = ToolManifestDictionary::default();
+        writer.encode("known".into(), original.clone()).unwrap();
+        writer
+            .encode("current".into(), manifest(&["read"]))
+            .unwrap();
+        assert!(writer.encode("known".into(), manifest(&["write"])).is_err());
+        assert_eq!(writer.manifest("known"), Some(&original));
+        assert_eq!(writer.current_hash(), Some("current"));
+    }
+
+    #[test]
+    fn encoder_prefers_full_definition_when_delta_is_larger() {
+        let mut writer = ToolManifestDictionary::default();
+        writer.encode("base".into(), manifest(&["shell"])).unwrap();
+        let target = manifest(&[]);
+        assert_eq!(
+            writer
+                .encode("target".into(), target.clone())
+                .unwrap()
+                .manifest,
+            Some(target)
         );
     }
 }

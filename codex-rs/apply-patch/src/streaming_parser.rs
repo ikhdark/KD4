@@ -147,14 +147,18 @@ impl StreamingPatchParser {
     }
 
     pub fn push_delta_in_place(&mut self, delta: &str) -> Result<(), ParseError> {
-        for ch in delta.chars() {
-            if ch == '\n' {
+        for segment in delta.split_inclusive('\n') {
+            if let Some(segment) = segment.strip_suffix('\n') {
+                self.line_buffer.push_str(segment);
                 let mut line = std::mem::take(&mut self.line_buffer);
                 line.truncate(line.strip_suffix('\r').map_or(line.len(), str::len));
                 self.line_number += 1;
-                self.process_line(&line)?;
+                let result = self.process_line(&line);
+                line.clear();
+                self.line_buffer = line;
+                result?;
             } else {
-                self.line_buffer.push(ch);
+                self.line_buffer.push_str(segment);
             }
         }
 
@@ -170,7 +174,12 @@ impl StreamingPatchParser {
         if !self.line_buffer.is_empty() {
             let line = std::mem::take(&mut self.line_buffer);
             self.line_number += 1;
-            if line.trim() == END_PATCH_MARKER {
+            if line.trim() == END_PATCH_MARKER
+                && !matches!(
+                    self.state.mode,
+                    StreamingParserMode::NotStarted | StreamingParserMode::EndedPatch
+                )
+            {
                 self.ensure_update_hunk_is_not_empty(line.trim())?;
                 self.state.mode = StreamingParserMode::EndedPatch;
             } else {
@@ -436,6 +445,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_finish_rejects_end_marker_outside_an_active_patch() {
+        for patch in [
+            "*** End Patch",
+            "*** Begin Patch\n*** End Patch\n*** End Patch",
+        ] {
+            let mut parser = StreamingPatchParser::default();
+            parser.push_delta_in_place(patch).unwrap();
+            assert!(
+                matches!(parser.finish(), Err(InvalidPatchError(_))),
+                "{patch}"
+            );
+        }
+    }
+
+    #[test]
     fn test_streaming_patch_parser_streams_complete_lines_before_end_patch() {
         let mut parser = StreamingPatchParser::default();
         assert_eq!(
@@ -584,9 +608,9 @@ mod tests {
         let mut parser = StreamingPatchParser::default();
         let mut max_hunk_count = 0;
         let mut saw_hunk_counts = Vec::new();
-        let mut hunks = Vec::new();
         for ch in patch.chars() {
-            let updated_hunks = parser.push_delta(&ch.to_string()).unwrap();
+            parser.push_delta_in_place(&ch.to_string()).unwrap();
+            let updated_hunks = parser.hunks();
             if !updated_hunks.is_empty() {
                 let hunk_count = updated_hunks.len();
                 assert!(
@@ -597,11 +621,26 @@ mod tests {
                     saw_hunk_counts.push(hunk_count);
                     max_hunk_count = hunk_count;
                 }
-                hunks = updated_hunks;
             }
         }
 
         assert_eq!(saw_hunk_counts, vec![1, 2, 3, 4, 5, 6, 7]);
+        let hunks = parser.finish().unwrap();
+        assert_eq!(hunks, crate::parse_patch(patch).unwrap().hunks);
+        assert_eq!(hunks[0], AddFile {
+            path: PathBuf::from("docs/release-notes.md"),
+            contents: "# Release notes\n\n## CLI\n- Surface apply_patch progress while arguments stream.\n- Keep final patch application gated on the completed tool call.\n- Include file summaries in the progress event payload.\n".to_string(),
+        });
+        assert_eq!(hunks[5], UpdateFile {
+            path: PathBuf::from("README.md"),
+            move_path: None,
+            chunks: vec![UpdateFileChunk {
+                change_context: Some("Development workflow".to_string()),
+                old_lines: vec!["Build the Rust workspace before opening a pull request.".to_string()],
+                new_lines: vec!["Build the Rust workspace before opening a pull request.".to_string(), "When touching streamed tool calls, include parser coverage for partial input.".to_string(), "Prefer tests that exercise the exact event payload shape.".to_string()],
+                is_end_of_file: false,
+            }],
+        });
         assert_eq!(hunks.len(), 7);
         assert_eq!(
             hunks

@@ -49,7 +49,7 @@ pub(crate) struct PowershellResolutionState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum PowershellInvocation<'a> {
+pub(crate) enum PowershellInvocation<'a> {
     InlineCommand { script: &'a str, no_profile: bool },
     Opaque,
     Bare,
@@ -61,7 +61,7 @@ pub(super) enum PowershellInvocation<'a> {
 ///
 /// Only `-Command` exposes source that can be inspected. File, encoded, bare, and unknown forms
 /// remain opaque so callers cannot accidentally reinterpret them as inline script text.
-pub(super) fn parse_powershell_invocation(args: &[String]) -> PowershellInvocation<'_> {
+pub(crate) fn parse_powershell_invocation(args: &[String]) -> PowershellInvocation<'_> {
     if args.is_empty() {
         return PowershellInvocation::Empty;
     }
@@ -463,9 +463,10 @@ impl PowershellParserProcess {
             ));
         }
 
+        let syntax_error = response.status == "parse_errors";
         let outcome = response.into_outcome();
         if resolution.is_none()
-            && !matches!(outcome, PowershellParseOutcome::Failed)
+            && (syntax_error || !matches!(outcome, PowershellParseOutcome::Failed))
             && script.len().saturating_add(response_line.len()) <= MAX_CACHED_SYNTAX_BYTES
         {
             self.last_syntax = Some((script.to_string(), outcome.clone()));
@@ -781,6 +782,67 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn review_regression_scalar_values_and_quote_variants_round_trip() {
+        let host = try_find_powershell_executable_blocking().expect("Windows PowerShell");
+        let mut parser = PowershellParserProcess::spawn(host.as_path().to_str().unwrap()).unwrap();
+        for (script, expected) in [
+            (
+                "$path = 'Cargo.toml'; Get-Content $path",
+                vec!["Get-Content", "Cargo.toml"],
+            ),
+            (
+                "$path = 'Cargo.toml'; Get-Content -Path:$path",
+                vec!["Get-Content", "-Path", "Cargo.toml"],
+            ),
+            (
+                "$n = 123; Select-Object -First $n",
+                vec!["Select-Object", "-First", "123"],
+            ),
+            ("$x = ''; Write-Output $x", vec!["Write-Output", ""]),
+            (
+                "$x = '--pre'; rg $x pattern",
+                vec!["rg", "--pre", "pattern"],
+            ),
+        ] {
+            let PowershellParseOutcome::Analysis(analysis) = parser.parse(script).unwrap() else {
+                panic!("{script}");
+            };
+            assert_eq!(
+                analysis.commands,
+                vec![expected.into_iter().map(str::to_string).collect::<Vec<_>>()]
+            );
+        }
+        for quote in ['\'', '\u{2018}', '\u{2019}', '\u{201a}', '\u{201b}'] {
+            let value = format!("it{quote}s here");
+            let script = format!(
+                "Write-Output {}",
+                crate::quote_powershell_single_quoted(&value)
+            );
+            let PowershellParseOutcome::Analysis(analysis) = parser.parse(&script).unwrap() else {
+                panic!("{script}");
+            };
+            assert_eq!(
+                analysis.commands,
+                vec![vec!["Write-Output".to_string(), value]]
+            );
+        }
+        for script in [
+            "$x = 'a'; $x += 'b'; Get-Content $x",
+            "$x = 'a'; $x += Get-Content foo; $x",
+            "$x = '-n'; Write-Output '--pre' -OutVariable x; rg $x pattern",
+            "$x = '-n'; Write-Output '--pre' -ov:x; rg $x pattern",
+            "$x = '-n'; Write-Output '--pre' -OutV x; rg $x pattern",
+        ] {
+            assert_eq!(
+                parser.parse(script).unwrap(),
+                PowershellParseOutcome::Unsupported,
+                "{script}"
+            );
+        }
+    }
+
+    #[test]
     fn cached_parser_contention_bounds_temporary_hosts() {
         let parser: CachedParser = Arc::new(Mutex::new(None));
         let temporary_slot = Mutex::new(());
@@ -875,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_process_reuses_rejections_but_retries_parse_failures() {
+    fn parser_process_reuses_deterministic_rejections() {
         let Some(powershell) = try_find_powershell_executable_blocking() else {
             return;
         };
@@ -894,9 +956,13 @@ mod tests {
                 PowershellParseOutcome::Failed
             );
         }
+        assert_eq!(parser.next_request_id, 2, "syntax errors must be cached");
+        for _ in 0..2 {
+            assert_eq!(parser.parse("").unwrap(), PowershellParseOutcome::Failed);
+        }
         assert_eq!(
-            parser.next_request_id, 3,
-            "parse failures must not be cached"
+            parser.next_request_id, 4,
+            "parse_failed responses must not be cached"
         );
     }
 

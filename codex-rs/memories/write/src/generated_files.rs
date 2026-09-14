@@ -118,6 +118,10 @@ mod tests {
             .await
             .expect("read final metadata")
             .permissions();
+        assert!(
+            permissions.readonly(),
+            "unchanged file must not be replaced"
+        );
 
         #[allow(clippy::permissions_set_readonly_false)]
         permissions.set_readonly(false);

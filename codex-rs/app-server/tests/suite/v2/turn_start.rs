@@ -483,6 +483,147 @@ async fn turn_start_sends_originator_header() -> Result<()> {
 }
 
 #[tokio::test]
+async fn turn_start_keeps_identical_input_in_distinct_conversations_independent() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let captured = responses::mount_sse_sequence(
+        &server,
+        vec![
+            create_request_user_input_sse_response("question-first")?,
+            create_request_user_input_sse_response("question-second")?,
+            create_request_user_input_sse_response("question-third")?,
+            create_final_assistant_message_sse_response("First done")?,
+            create_final_assistant_message_sse_response("Second done")?,
+            create_final_assistant_message_sse_response("Third done")?,
+        ],
+    )
+    .await;
+    let codex_home = TempDir::new()?;
+    write_mock_responses_config_toml_with_chatgpt_base_url(
+        codex_home.path(),
+        &server.uri(),
+        &server.uri(),
+    )?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut thread_ids = Vec::new();
+    for _ in 0..3 {
+        let id = mcp
+            .send_thread_start_request_with_auto_env(ThreadStartParams {
+                model: Some("mock-model".to_string()),
+                ..Default::default()
+            })
+            .await?;
+        let response = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(id)),
+        )
+        .await??;
+        thread_ids.push(to_response::<ThreadStartResponse>(response)?.thread.id);
+    }
+    let mut pending_questions = Vec::new();
+    // The third conversation deliberately repeats all input/context from the
+    // first. Context hashing alone must not substitute for thread identity.
+    for (thread_id, context) in thread_ids.iter().zip([
+        "first conversation context",
+        "second conversation context",
+        "first conversation context",
+    ]) {
+        let id = mcp
+            .send_turn_start_request(TurnStartParams {
+                thread_id: thread_id.clone(),
+                input: vec![V2UserInput::Text {
+                    text: "continue".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                additional_context: Some(IndexMap::from([(
+                    "context".to_string(),
+                    AdditionalContextEntry {
+                        value: context.to_string(),
+                        kind: AdditionalContextKind::Untrusted,
+                    },
+                )])),
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Plan,
+                    settings: Settings {
+                        model: "mock-model".to_string(),
+                        reasoning_effort: Some(ReasoningEffort::Medium),
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            })
+            .await?;
+        let response = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(id)),
+        )
+        .await??;
+        assert_eq!(
+            to_response::<TurnStartResponse>(response)?.turn.status,
+            TurnStatus::InProgress
+        );
+        // The unanswered request keeps this turn active while the other starts.
+        let question = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_request_message(),
+        )
+        .await??;
+        let ServerRequest::ToolRequestUserInput { request_id, .. } = question else {
+            anyhow::bail!("expected a pending user question, got {question:?}");
+        };
+        pending_questions.push(request_id);
+    }
+    let requests = captured.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "all conversations must reach core/model submission"
+    );
+    for (request, own, other) in [
+        (
+            &requests[0],
+            "first conversation context",
+            "second conversation context",
+        ),
+        (
+            &requests[1],
+            "second conversation context",
+            "first conversation context",
+        ),
+        (
+            &requests[2],
+            "first conversation context",
+            "second conversation context",
+        ),
+    ] {
+        let input = request.message_input_texts("user").join("\n");
+        assert!(input.contains(own));
+        assert!(!input.contains(other));
+    }
+    for (request_id, thread_id) in pending_questions.into_iter().zip(thread_ids) {
+        mcp.send_response(
+            request_id,
+            json!({"answers": {"confirm_path": {"answers": ["yes"]}}}),
+        )
+        .await?;
+        let notification = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+        let completed: TurnCompletedNotification =
+            serde_json::from_value(notification.params.context("completion params")?)?;
+        assert_eq!(completed.thread_id, thread_id);
+        assert_eq!(completed.turn.status, TurnStatus::Completed);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn turn_start_emits_user_message_item_with_text_elements() -> Result<()> {
     let responses = vec![create_final_assistant_message_sse_response("Done")?];
     let server = create_mock_responses_server_sequence_unchecked(responses).await;

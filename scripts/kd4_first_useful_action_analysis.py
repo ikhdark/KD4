@@ -106,94 +106,120 @@ class _Turn:
     useful_tool_name: str | None = None
 
 
-def analyze_snapshots(snapshots: Sequence[RolloutSnapshot]) -> dict[str, Any]:
-    """Analyze snapshots already captured by ``kd4_turn_latency_audit``."""
+def decoded_records(snapshot: RolloutSnapshot) -> Iterable[Any]:
+    with io.BytesIO(snapshot.data) as handle:
+        for line in handle:
+            try:
+                yield json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                yield None
 
-    exclusions = {"invalidJsonLines": 0, "invalidTimestamps": 0, "incompleteTurns": 0}
+
+def analyze_snapshots(snapshots: Sequence[RolloutSnapshot]) -> dict[str, Any]:
+    """Analyze exact captured bytes, excluding malformed or partial records."""
+    return analyze_records(
+        (snapshot.metadata(), decoded_records(snapshot)) for snapshot in snapshots
+    )
+
+
+def analyze_records(
+    record_sets: Iterable[tuple[dict[str, str | int], Iterable[Any]]],
+) -> dict[str, Any]:
+    """Analyze parsed evidence shared by the primary audit without reparsing bytes."""
+    exclusions = {
+        "invalidJsonLines": 0,
+        "invalidTimestamps": 0,
+        "incompleteTurns": 0,
+        "incompleteCanonicalMilestones": 0,
+    }
     legacy_rows: list[dict[str, float]] = []
     canonical_rows: list[dict[str, float]] = []
     snapshot_metadata: list[dict[str, str | int]] = []
     completed_turns = 0
 
-    for snapshot in snapshots:
-        snapshot_metadata.append(snapshot.metadata())
+    for metadata, records in record_sets:
+        snapshot_metadata.append(metadata)
         active: _Turn | None = None
-        with io.StringIO(snapshot.data.decode("utf-8")) as handle:
-            for raw_line in handle:
-                try:
-                    record = json.loads(raw_line)
-                except json.JSONDecodeError:
-                    exclusions["invalidJsonLines"] += 1
-                    continue
-                timestamp_ms = _timestamp_ms(record.get("timestamp"))
-                if timestamp_ms is None:
-                    exclusions["invalidTimestamps"] += 1
-                    continue
-                payload = record.get("payload")
-                if not isinstance(payload, dict):
-                    continue
-                record_type = record.get("type")
-                payload_type = payload.get("type")
+        for record in records:
+            if not isinstance(record, dict):
+                exclusions["invalidJsonLines"] += 1
+                continue
+            timestamp_ms = _timestamp_ms(record.get("timestamp"))
+            if timestamp_ms is None:
+                exclusions["invalidTimestamps"] += 1
+                continue
+            payload = record.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            record_type = record.get("type")
+            payload_type = payload.get("type")
 
-                if record_type == "event_msg" and payload_type == "task_started":
-                    if active is not None:
-                        exclusions["incompleteTurns"] += 1
-                    active = _Turn(started_ms=timestamp_ms)
-                    continue
-                if active is None:
-                    continue
-                if record_type == "event_msg" and payload_type == "user_message":
-                    if active.user_input_ms is None:
-                        active.user_input_ms = timestamp_ms
-                    continue
-                if record_type == "response_item":
-                    tool_name = _tool_name(payload)
-                    if (
-                        tool_name is not None
-                        and active.useful_tool_emitted_ms is None
-                        and is_useful_tool(tool_name)
-                    ):
-                        active.useful_tool_emitted_ms = timestamp_ms
-                        active.useful_tool_name = tool_name
-                    continue
-                if record_type != "event_msg" or payload_type != "task_complete":
-                    continue
-
-                completed_turns += 1
-                timing = payload.get("timing")
-                milestones = (
-                    timing.get("milestones") if isinstance(timing, dict) else None
-                )
-                schema_version = (
-                    timing.get("schemaVersion") if isinstance(timing, dict) else None
-                )
+            if record_type == "event_msg" and payload_type == "task_started":
+                if active is not None:
+                    exclusions["incompleteTurns"] += 1
+                active = _Turn(started_ms=timestamp_ms)
+                continue
+            if active is None:
+                continue
+            if record_type == "event_msg" and payload_type == "user_message":
+                if active.user_input_ms is None:
+                    active.user_input_ms = timestamp_ms
+                continue
+            if record_type == "response_item":
+                tool_name = _tool_name(payload)
                 if (
-                    isinstance(schema_version, int)
-                    and schema_version >= CANONICAL_TIMING_SCHEMA_VERSION
-                    and isinstance(milestones, dict)
-                    and isinstance(milestones.get("firstDomainActionMs"), (int, float))
+                    tool_name is not None
+                    and active.useful_tool_emitted_ms is None
+                    and is_useful_tool(tool_name)
                 ):
-                    canonical_rows.append(
-                        {
-                            key: float(value)
-                            for key, value in milestones.items()
-                            if isinstance(value, (int, float))
-                        }
-                    )
-                elif active.useful_tool_emitted_ms is not None:
-                    row = {
-                        "startToUsefulToolEmittedMs": active.useful_tool_emitted_ms
-                        - active.started_ms
+                    active.useful_tool_emitted_ms = timestamp_ms
+                    active.useful_tool_name = tool_name
+                continue
+            if record_type != "event_msg" or payload_type != "task_complete":
+                continue
+
+            completed_turns += 1
+            timing = payload.get("timing")
+            milestones = timing.get("milestones") if isinstance(timing, dict) else None
+            schema_version = (
+                timing.get("schemaVersion") if isinstance(timing, dict) else None
+            )
+            if (
+                isinstance(schema_version, int)
+                and schema_version >= CANONICAL_TIMING_SCHEMA_VERSION
+                and isinstance(milestones, dict)
+                and all(
+                    isinstance(milestones.get(key), (int, float))
+                    and not isinstance(milestones[key], bool)
+                    for key in ("firstDomainActionMs", "firstUsefulActionMs")
+                )
+            ):
+                canonical_rows.append(
+                    {
+                        key: float(value)
+                        for key, value in milestones.items()
+                        if isinstance(value, (int, float))
                     }
-                    if active.user_input_ms is not None:
-                        row["startToUserInputEventMs"] = (
-                            active.user_input_ms - active.started_ms
-                        )
-                        row["userInputEventToUsefulToolEmittedMs"] = (
-                            active.useful_tool_emitted_ms - active.user_input_ms
-                        )
-                    legacy_rows.append(row)
-                active = None
+                )
+            elif (
+                isinstance(schema_version, int)
+                and schema_version >= CANONICAL_TIMING_SCHEMA_VERSION
+            ):
+                exclusions["incompleteCanonicalMilestones"] += 1
+            elif active.useful_tool_emitted_ms is not None:
+                row = {
+                    "startToUsefulToolEmittedMs": active.useful_tool_emitted_ms
+                    - active.started_ms
+                }
+                if active.user_input_ms is not None:
+                    row["startToUserInputEventMs"] = (
+                        active.user_input_ms - active.started_ms
+                    )
+                    row["userInputEventToUsefulToolEmittedMs"] = (
+                        active.useful_tool_emitted_ms - active.user_input_ms
+                    )
+                legacy_rows.append(row)
+            active = None
         if active is not None:
             exclusions["incompleteTurns"] += 1
 
@@ -288,7 +314,7 @@ def analyze_snapshots(snapshots: Sequence[RolloutSnapshot]) -> dict[str, Any]:
                 "not handler entry and not a runtime benchmark"
             ),
         },
-        "sourceFileCount": len(snapshots),
+        "sourceFileCount": len(snapshot_metadata),
         "sourceSnapshots": snapshot_metadata,
         "completedTurnCount": completed_turns,
         "canonicalTurnCount": len(canonical_rows),

@@ -8,7 +8,7 @@ use std::io::Write;
 
 const OSC52_MAX_RAW_BYTES: usize = 100_000;
 
-pub(crate) fn copy_to_clipboard(text: &str) -> Result<Option<ClipboardLease>, String> {
+pub(crate) fn copy_to_clipboard(text: &str) -> Result<(), String> {
     copy_to_clipboard_with(
         text,
         CopyEnvironment {
@@ -17,16 +17,6 @@ pub(crate) fn copy_to_clipboard(text: &str) -> Result<Option<ClipboardLease>, St
         osc52_copy,
         arboard_copy,
     )
-}
-
-/// Marker returned by the native Windows clipboard backend.
-pub(crate) struct ClipboardLease;
-
-impl ClipboardLease {
-    #[cfg(test)]
-    pub(crate) fn test() -> Self {
-        Self
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -38,21 +28,20 @@ fn copy_to_clipboard_with(
     text: &str,
     environment: CopyEnvironment,
     osc52_copy_fn: impl Fn(&str) -> Result<(), String>,
-    arboard_copy_fn: impl Fn(&str) -> Result<Option<ClipboardLease>, String>,
-) -> Result<Option<ClipboardLease>, String> {
+    arboard_copy_fn: impl Fn(&str) -> Result<(), String>,
+) -> Result<(), String> {
     if environment.ssh_session {
         return osc52_copy_fn(text)
-            .map(|()| None)
             .map_err(|error| format!("OSC 52 clipboard copy failed over SSH: {error}"));
     }
 
     match arboard_copy_fn(text) {
-        Ok(lease) => Ok(lease),
+        Ok(()) => Ok(()),
         Err(native_error) => {
             tracing::warn!(
                 "native Windows clipboard copy failed: {native_error}, falling back to OSC 52"
             );
-            osc52_copy_fn(text).map(|()| None).map_err(|osc_error| {
+            osc52_copy_fn(text).map_err(|osc_error| {
                 format!("native clipboard: {native_error}; OSC 52 fallback: {osc_error}")
             })
         }
@@ -63,13 +52,13 @@ fn is_ssh_session() -> bool {
     std::env::var_os("SSH_TTY").is_some() || std::env::var_os("SSH_CONNECTION").is_some()
 }
 
-fn arboard_copy(text: &str) -> Result<Option<ClipboardLease>, String> {
+fn arboard_copy(text: &str) -> Result<(), String> {
     let mut clipboard =
         arboard::Clipboard::new().map_err(|error| format!("clipboard unavailable: {error}"))?;
     clipboard
         .set_text(text)
         .map_err(|error| format!("failed to set clipboard text: {error}"))?;
-    Ok(None)
+    Ok(())
 }
 
 fn osc52_copy(text: &str) -> Result<(), String> {
@@ -137,17 +126,18 @@ mod tests {
         let result = copy_to_clipboard_with(
             "hello",
             CopyEnvironment { ssh_session: true },
-            |_| {
+            |text| {
+                assert_eq!(text, "hello");
                 osc_calls.set(osc_calls.get() + 1);
                 Ok(())
             },
             |_| {
                 native_calls.set(native_calls.get() + 1);
-                Ok(None)
+                Ok(())
             },
         );
 
-        assert!(matches!(result, Ok(None)));
+        assert_eq!(result, Ok(()));
         assert_eq!(osc_calls.get(), 1);
         assert_eq!(native_calls.get(), 0);
     }
@@ -155,6 +145,7 @@ mod tests {
     #[test]
     fn local_uses_native_windows_clipboard_first() {
         let osc_calls = Cell::new(0_u8);
+        let native_calls = Cell::new(0_u8);
         let result = copy_to_clipboard_with(
             "hello",
             CopyEnvironment { ssh_session: false },
@@ -162,21 +153,86 @@ mod tests {
                 osc_calls.set(osc_calls.get() + 1);
                 Ok(())
             },
-            |_| Ok(Some(ClipboardLease::test())),
+            |text| {
+                assert_eq!(text, "hello");
+                native_calls.set(native_calls.get() + 1);
+                Ok(())
+            },
         );
 
-        assert!(matches!(result, Ok(Some(_))));
+        assert_eq!(result, Ok(()));
         assert_eq!(osc_calls.get(), 0);
+        assert_eq!(native_calls.get(), 1);
     }
 
     #[test]
     fn local_falls_back_to_osc52_when_native_clipboard_fails() {
+        let native_called = Cell::new(false);
+        let osc_calls = Cell::new(0_u8);
         let result = copy_to_clipboard_with(
             "hello",
             CopyEnvironment { ssh_session: false },
-            |_| Ok(()),
-            |_| Err("native unavailable".into()),
+            |text| {
+                assert_eq!(text, "hello");
+                assert!(native_called.get(), "native copy must precede fallback");
+                osc_calls.set(osc_calls.get() + 1);
+                Ok(())
+            },
+            |text| {
+                assert_eq!(text, "hello");
+                native_called.set(true);
+                Err("native unavailable".into())
+            },
         );
-        assert!(matches!(result, Ok(None)));
+        assert_eq!(result, Ok(()));
+        assert_eq!(osc_calls.get(), 1);
+    }
+
+    #[test]
+    fn ssh_reports_osc52_failure_without_using_native_clipboard() {
+        let native_calls = Cell::new(0_u8);
+        let result = copy_to_clipboard_with(
+            "hello",
+            CopyEnvironment { ssh_session: true },
+            |text| {
+                assert_eq!(text, "hello");
+                Err("terminal unavailable".into())
+            },
+            |_| {
+                native_calls.set(native_calls.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(
+            result,
+            Err("OSC 52 clipboard copy failed over SSH: terminal unavailable".into())
+        );
+        assert_eq!(native_calls.get(), 0);
+    }
+
+    #[test]
+    fn local_reports_both_native_and_osc52_failures() {
+        let native_called = Cell::new(false);
+        let result = copy_to_clipboard_with(
+            "hello",
+            CopyEnvironment { ssh_session: false },
+            |text| {
+                assert_eq!(text, "hello");
+                assert!(native_called.get(), "native copy must precede fallback");
+                Err("terminal unavailable".into())
+            },
+            |text| {
+                assert_eq!(text, "hello");
+                native_called.set(true);
+                Err("native unavailable".into())
+            },
+        );
+        assert_eq!(
+            result,
+            Err(
+                "native clipboard: native unavailable; OSC 52 fallback: terminal unavailable"
+                    .into()
+            )
+        );
     }
 }

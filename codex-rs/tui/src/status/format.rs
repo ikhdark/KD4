@@ -1,7 +1,7 @@
 use ratatui::prelude::*;
 use ratatui::style::Stylize;
 use std::collections::BTreeSet;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone)]
@@ -98,21 +98,22 @@ pub(crate) fn line_display_width(line: &Line<'static>) -> usize {
         .sum()
 }
 
-pub(crate) fn truncate_line_to_width(line: Line<'static>, max_width: usize) -> Line<'static> {
+pub(crate) fn truncate_line_to_width(mut line: Line<'static>, max_width: usize) -> Line<'static> {
     if max_width == 0 {
-        return Line::from(Vec::<Span<'static>>::new());
+        line.spans.clear();
+        return line;
     }
 
     let mut used = 0usize;
     let mut spans_out: Vec<Span<'static>> = Vec::new();
 
-    for span in line.spans {
-        let text = span.content.into_owned();
+    for span in std::mem::take(&mut line.spans) {
+        let text = span.content.as_ref();
         let style = span.style;
-        let span_width = UnicodeWidthStr::width(text.as_str());
+        let span_width = UnicodeWidthStr::width(text);
 
         if span_width == 0 {
-            spans_out.push(Span::styled(text, style));
+            spans_out.push(span);
             continue;
         }
 
@@ -122,17 +123,17 @@ pub(crate) fn truncate_line_to_width(line: Line<'static>, max_width: usize) -> L
 
         if used + span_width <= max_width {
             used += span_width;
-            spans_out.push(Span::styled(text, style));
+            spans_out.push(span);
             continue;
         }
 
         let mut truncated = String::new();
-        for ch in text.chars() {
-            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        for ch in text.graphemes(true) {
+            let ch_width = UnicodeWidthStr::width(ch);
             if used + ch_width > max_width {
                 break;
             }
-            truncated.push(ch);
+            truncated.push_str(ch);
             used += ch_width;
         }
 
@@ -143,5 +144,40 @@ pub(crate) fn truncate_line_to_width(line: Line<'static>, max_width: usize) -> L
         break;
     }
 
-    Line::from(spans_out)
+    line.spans = spans_out;
+    line
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncation_preserves_graphemes_styles_and_alignment() {
+        let line = Line::from(vec![Span::raw("👩‍💻x").bold()])
+            .cyan()
+            .right_aligned();
+        let truncated = truncate_line_to_width(line.clone(), 2);
+        assert_eq!(truncated.to_string(), "👩‍💻");
+        assert_eq!(truncated.style, line.style);
+        assert_eq!(truncated.alignment, line.alignment);
+        assert_eq!(truncated.spans[0].style, line.spans[0].style);
+        let empty = truncate_line_to_width(line.clone(), 0);
+        assert!(empty.spans.is_empty());
+        assert_eq!(empty.style, line.style);
+        assert_eq!(empty.alignment, line.alignment);
+    }
+
+    #[test]
+    fn retained_spans_keep_borrowed_content() {
+        let truncated = truncate_line_to_width(Line::from("label"), 5);
+        assert_eq!(
+            truncated.spans[0].content,
+            std::borrow::Cow::Borrowed("label")
+        );
+        assert!(matches!(
+            truncated.spans[0].content,
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
 }

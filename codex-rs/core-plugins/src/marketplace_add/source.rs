@@ -27,16 +27,13 @@ pub(crate) fn parse_marketplace_source(
         ));
     }
 
-    let (base_source, parsed_ref) = split_source_ref(source);
-    let ref_name = explicit_ref.or(parsed_ref);
-
-    if looks_like_local_path(&base_source) {
-        if ref_name.is_some() {
+    if looks_like_local_path(source) {
+        if explicit_ref.is_some() {
             return Err(MarketplaceAddError::InvalidRequest(
                 "--ref is only supported for git marketplace sources".to_string(),
             ));
         }
-        let path = resolve_local_source_path(&base_source)?;
+        let path = resolve_local_source_path(source)?;
         if path.is_file() {
             return Err(MarketplaceAddError::InvalidRequest(
                 "local marketplace source must be a directory, not a file".to_string(),
@@ -44,6 +41,9 @@ pub(crate) fn parse_marketplace_source(
         }
         return Ok(MarketplaceSource::Local { path });
     }
+
+    let (base_source, parsed_ref) = split_source_ref(source);
+    let ref_name = explicit_ref.or(parsed_ref);
 
     if is_ssh_git_url(&base_source) || is_git_url(&base_source) {
         return Ok(MarketplaceSource::Git {
@@ -120,6 +120,9 @@ pub(super) fn validate_marketplace_source_root(root: &Path) -> Result<String, Ma
 }
 
 fn split_source_ref(source: &str) -> (String, Option<String>) {
+    if looks_like_local_path(source) {
+        return (source.to_string(), None);
+    }
     if let Some((base, ref_name)) = source.rsplit_once('#') {
         return (base.to_string(), non_empty_ref(ref_name));
     }
@@ -242,6 +245,29 @@ impl MarketplaceSource {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_source_keeps_literal_ref_delimiters() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["plugins@work", "plugins#work"] {
+            let path = temp.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            let source = path.to_str().unwrap();
+            assert_eq!(
+                super::parse_marketplace_source(source, None).unwrap(),
+                super::MarketplaceSource::Local {
+                    path: std::fs::canonicalize(&path).unwrap()
+                }
+            );
+            assert_eq!(
+                super::canonicalize_configured_git_source(source, None).unwrap(),
+                super::MarketplaceSource::Git {
+                    url: source.to_string(),
+                    ref_name: None
+                }
+            );
+        }
+    }
+
     use super::*;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;

@@ -45,7 +45,7 @@ use tracing::info;
 use tracing::warn;
 
 static PROCESS_COUNTER: AtomicUsize = AtomicUsize::new(1);
-const MCP_STDIO_MAX_LINE_BYTES: usize = 1024 * 1024;
+pub(super) const MCP_STDIO_MAX_LINE_BYTES: usize = 1024 * 1024;
 
 #[derive(Default)]
 struct LineBuffer {
@@ -307,6 +307,9 @@ impl ExecutorProcessTransport {
             .map_err(io::Error::other)?;
         for chunk in response.chunks {
             self.push_process_output_if_new(chunk);
+            if self.closed {
+                break;
+            }
         }
         self.last_seq = self.last_seq.max(response.next_seq.saturating_sub(1));
         if let Some(message) = response.failure {

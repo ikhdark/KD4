@@ -759,7 +759,7 @@ async fn runtime_repair_preserves_search_values_and_executes_only_the_corrected_
             .current_dir(fixture.path())
             .output()
             .expect("execute ripgrep");
-        assert!(output.status.success(), "{:?}", output);
+        assert!(output.status.success(), "{output:?}");
         assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
     }
 }
@@ -780,7 +780,7 @@ async fn runtime_preflight_executes_quoted_posix_text_with_comment_quotes() {
         .args(&command[1..])
         .output()
         .expect("execute Bash");
-    assert!(output.status.success(), "{:?}", output);
+    assert!(output.status.success(), "{output:?}");
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "$env:PATH");
 }
 
@@ -800,7 +800,7 @@ async fn runtime_preflight_preserves_powershell_calculated_measurement() {
         .args(&command[1..])
         .output()
         .expect("execute PowerShell");
-    assert!(output.status.success(), "{:?}", output);
+    assert!(output.status.success(), "{output:?}");
     assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "12");
 }
 

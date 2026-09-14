@@ -11,11 +11,7 @@ const AUTH_HEADER_PREFIX: &[u8] = b"Bearer ";
 pub(crate) fn read_auth_header_from_stdin() -> Result<&'static str> {
     use std::io::Read;
 
-    // Use of `stdio::io::stdin()` has the problem mentioned in the docstring on
-    // the UNIX version of `read_from_unix_stdin()`, so this should ultimately
-    // be replaced the low-level Windows equivalent. Because we do not have an
-    // equivalent of mlock() on Windows right now, it is not pressing until we
-    // address that issue.
+    // Standard input may buffer a copy of the key internally.
     read_auth_header_with(|buffer| std::io::stdin().read(buffer))
 }
 
@@ -23,13 +19,8 @@ fn read_auth_header_with<F>(mut read_fn: F) -> Result<&'static str>
 where
     F: FnMut(&mut [u8]) -> std::io::Result<usize>,
 {
-    // TAKE CARE WHEN MODIFYING THIS CODE!!!
-    //
-    // This function goes to great lengths to avoid leaving the API key in
-    // memory longer than necessary and to avoid copying it around. We read
-    // directly into a stack buffer so the only heap allocation should be the
-    // one to create the String (with the exact size) for the header value,
-    // which we then immediately protect with mlock(2).
+    // Zeroize the temporary buffer after parsing. The header allocation lives
+    // for the process lifetime; this function does not lock memory against swap.
     let mut buf = [0u8; BUFFER_SIZE];
     buf[..AUTH_HEADER_PREFIX.len()].copy_from_slice(AUTH_HEADER_PREFIX);
 
@@ -43,6 +34,7 @@ where
         let slice = &mut buf[prefix_len + total_read..];
         let read = match read_fn(slice) {
             Ok(n) => n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(err) => {
                 buf.zeroize();
                 return Err(err.into());
@@ -105,13 +97,8 @@ where
     let header_value = String::from(header_str);
     buf.zeroize();
 
-    let leaked: &'static mut str = header_value.leak();
-    mlock_str(leaked);
-
-    Ok(leaked)
+    Ok(header_value.leak())
 }
-
-fn mlock_str(_value: &str) {}
 
 /// The key should match /^[A-Za-z0-9\-_]+$/. Ensure there is no funny business
 /// with NUL characters and whatnot.
@@ -133,6 +120,24 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::io;
+
+    #[test]
+    fn retries_interrupted_reads_without_losing_partial_key() {
+        let mut calls = 0;
+        let result = read_auth_header_with(|buf| {
+            calls += 1;
+            let data: &[u8] = match calls {
+                1 => b"sk-",
+                2 => return Err(io::ErrorKind::Interrupted.into()),
+                3 => b"abc123\n",
+                _ => panic!("unexpected read"),
+            };
+            buf[..data.len()].copy_from_slice(data);
+            Ok(data.len())
+        })
+        .unwrap();
+        assert_eq!(result, "Bearer sk-abc123");
+    }
 
     #[test]
     fn reads_key_with_no_newlines() {

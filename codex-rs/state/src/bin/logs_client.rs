@@ -6,10 +6,12 @@ use chrono::DateTime;
 use clap::Parser;
 use clap::ValueEnum;
 use codex_state::LogQuery;
+use codex_state::LogReader;
 use codex_state::LogRow;
-use codex_state::StateRuntime;
 use dirs::home_dir;
 use owo_colors::OwoColorize;
+
+const LIVE_BATCH_SIZE: usize = 500;
 
 #[derive(Debug, Parser)]
 #[command(name = "codex-state-logs")]
@@ -60,7 +62,7 @@ struct Args {
     backfill: usize,
 
     /// Poll interval in milliseconds.
-    #[arg(long, default_value_t = 500)]
+    #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u64).range(1..))]
     poll_ms: u64,
 
     /// Show compact output with only time, level, and rendered log body.
@@ -107,26 +109,20 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let db_path = resolve_db_path(&args)?;
     let filter = build_filter(&args)?;
-    let codex_home = db_path
-        .parent()
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let runtime = StateRuntime::init(codex_home, "logs-client".to_string()).await?;
-
-    let mut last_id =
-        print_backfill(runtime.as_ref(), &filter, args.backfill, args.compact).await?;
-    if last_id == 0 {
-        last_id = fetch_max_id(runtime.as_ref(), &filter).await?;
-    }
+    let runtime = LogReader::open(&db_path).await?;
+    let mut last_id = initial_cursor(&runtime, &filter, args.backfill, args.compact).await?;
 
     let poll_interval = Duration::from_millis(args.poll_ms);
     loop {
-        let rows = fetch_new_rows(runtime.as_ref(), &filter, last_id).await?;
+        let rows = fetch_new_rows(&runtime, &filter, last_id).await?;
+        let caught_up = rows.len() < LIVE_BATCH_SIZE;
         for row in rows {
             last_id = last_id.max(row.id);
             println!("{}", format_row(&row, args.compact));
         }
-        tokio::time::sleep(poll_interval).await;
+        if caught_up {
+            tokio::time::sleep(poll_interval).await;
+        }
     }
 }
 
@@ -204,16 +200,25 @@ fn parse_timestamp(value: &str) -> anyhow::Result<i64> {
     Ok(dt.timestamp())
 }
 
-async fn print_backfill(
-    runtime: &StateRuntime,
+async fn initial_cursor(
+    runtime: &LogReader,
     filter: &LogFilter,
     backfill: usize,
     compact: bool,
 ) -> anyhow::Result<i64> {
     if backfill == 0 {
-        return Ok(0);
+        fetch_max_id(runtime, filter).await
+    } else {
+        print_backfill(runtime, filter, backfill, compact).await
     }
+}
 
+async fn print_backfill(
+    runtime: &LogReader,
+    filter: &LogFilter,
+    backfill: usize,
+    compact: bool,
+) -> anyhow::Result<i64> {
     let mut rows = fetch_backfill(runtime, filter, backfill).await?;
     rows.reverse();
 
@@ -226,7 +231,7 @@ async fn print_backfill(
 }
 
 async fn fetch_backfill(
-    runtime: &StateRuntime,
+    runtime: &LogReader,
     filter: &LogFilter,
     backfill: usize,
 ) -> anyhow::Result<Vec<LogRow>> {
@@ -243,13 +248,13 @@ async fn fetch_backfill(
 }
 
 async fn fetch_new_rows(
-    runtime: &StateRuntime,
+    runtime: &LogReader,
     filter: &LogFilter,
     last_id: i64,
 ) -> anyhow::Result<Vec<LogRow>> {
     let query = to_log_query(
         filter,
-        /*limit*/ None,
+        Some(LIVE_BATCH_SIZE),
         Some(last_id),
         /*descending*/ false,
     );
@@ -259,7 +264,7 @@ async fn fetch_new_rows(
         .context("failed to fetch new logs")
 }
 
-async fn fetch_max_id(runtime: &StateRuntime, filter: &LogFilter) -> anyhow::Result<i64> {
+async fn fetch_max_id(runtime: &LogReader, filter: &LogFilter) -> anyhow::Result<i64> {
     let query = to_log_query(
         filter, /*limit*/ None, /*after_id*/ None, /*descending*/ false,
     );
@@ -412,5 +417,110 @@ mod tests {
             .expect("parse uppercase log level");
 
         assert_eq!(args.level, Some(LogLevelThreshold::Warn));
+    }
+
+    #[test]
+    fn poll_interval_must_be_positive() {
+        assert!(Args::try_parse_from(["codex-state-logs", "--poll-ms", "0"]).is_err());
+        let args = Args::try_parse_from(["codex-state-logs", "--poll-ms", "1"])
+            .expect("positive interval");
+        assert_eq!(args.poll_ms, 1);
+    }
+
+    async fn logs_fixture(path: &std::path::Path) -> sqlx::SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(path)
+                    .create_if_missing(true),
+            )
+            .await
+            .expect("fixture database");
+        sqlx::migrate!("./logs_migrations")
+            .run(&pool)
+            .await
+            .expect("logs schema");
+        pool
+    }
+
+    async fn insert_fixture_logs(pool: &sqlx::SqlitePool, count: usize) {
+        sqlx::query("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < ?) INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body) SELECT 1, 0, 'INFO', 'fixture', 'arrival' FROM n")
+            .bind(count as i64).execute(pool).await.expect("insert arrivals");
+    }
+
+    #[tokio::test]
+    async fn exact_database_and_empty_backfill_handoff() {
+        let home = tempfile::tempdir().expect("home");
+        let selected = home.path().join("selected.sqlite");
+        let pool = logs_fixture(&selected).await;
+        let decoy = logs_fixture(&codex_state::logs_db_path(home.path())).await;
+        insert_fixture_logs(&decoy, 2).await;
+        let args = Args::try_parse_from([
+            "codex-state-logs",
+            "--db",
+            selected.to_str().expect("path"),
+            "--backfill",
+            "2",
+        ])
+        .expect("args");
+        let reader = LogReader::open(&resolve_db_path(&args).expect("resolved path"))
+            .await
+            .expect("reader");
+        let filter = build_filter(&args).expect("filter");
+        let cursor = initial_cursor(&reader, &filter, args.backfill, false)
+            .await
+            .expect("cursor");
+        assert_eq!(cursor, 0, "must not read the default database");
+        insert_fixture_logs(&pool, 1).await;
+        let rows = fetch_new_rows(&reader, &filter, cursor)
+            .await
+            .expect("arrival");
+        assert_eq!(rows.iter().map(|row| row.id).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(rows[0].message.as_deref(), Some("arrival"));
+        assert!(!home.path().join(codex_state::STATE_DB_FILENAME).exists());
+        assert!(
+            LogReader::open(&home.path().join("missing.sqlite"))
+                .await
+                .is_err()
+        );
+        assert!(!home.path().join("missing.sqlite").exists());
+    }
+
+    #[tokio::test]
+    async fn disabled_backfill_skips_history_and_live_reads_are_bounded() {
+        let home = tempfile::tempdir().expect("home");
+        let path = home.path().join("logs.sqlite");
+        let pool = logs_fixture(&path).await;
+        insert_fixture_logs(&pool, 1).await;
+        let reader = LogReader::open(&path).await.expect("reader");
+        let filter = build_filter(&Args::try_parse_from(["codex-state-logs"]).expect("args"))
+            .expect("filter");
+        let cursor = initial_cursor(&reader, &filter, 0, false)
+            .await
+            .expect("cursor");
+        assert_eq!(cursor, 1);
+        insert_fixture_logs(&pool, LIVE_BATCH_SIZE + 3).await;
+        let first = fetch_new_rows(&reader, &filter, cursor)
+            .await
+            .expect("first batch");
+        assert_eq!(first.len(), LIVE_BATCH_SIZE);
+        assert_eq!(first.first().expect("row").id, 2);
+        let second = fetch_new_rows(&reader, &filter, first.last().expect("row").id)
+            .await
+            .expect("second batch");
+        assert_eq!(
+            second.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![
+                LIVE_BATCH_SIZE as i64 + 2,
+                LIVE_BATCH_SIZE as i64 + 3,
+                LIVE_BATCH_SIZE as i64 + 4
+            ]
+        );
+        let backfill = fetch_backfill(&reader, &filter, 2).await.expect("backfill");
+        assert_eq!(
+            backfill.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![LIVE_BATCH_SIZE as i64 + 4, LIVE_BATCH_SIZE as i64 + 3]
+        );
     }
 }

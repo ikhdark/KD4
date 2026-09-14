@@ -92,7 +92,7 @@ impl PtySystem for ConPtySystem {
         let master = ConPtyMasterPty {
             inner: Arc::new(Mutex::new(Inner {
                 con,
-                readable,
+                readable: Arc::new(Mutex::new(readable)),
                 writable: Some(writable),
                 size,
             })),
@@ -110,9 +110,11 @@ impl PtySystem for ConPtySystem {
 }
 
 struct Inner {
-    con: PsuedoCon,
-    readable: FileDescriptor,
+    // Release our pipe reference before closing the console. A live reader can
+    // still drain output; an aborted reader lets the pipe close during teardown.
+    readable: Arc<Mutex<FileDescriptor>>,
     writable: Option<FileDescriptor>,
+    con: PsuedoCon,
     size: PtySize,
 }
 
@@ -147,6 +149,47 @@ pub struct ConPtySlavePty {
     inner: Arc<Mutex<Inner>>,
 }
 
+// Serialize clones so the availability check and read cannot race another reader.
+// The reader owns only the output pipe, allowing ProcessHandle to close the console.
+struct ConPtyReader(Arc<Mutex<FileDescriptor>>);
+
+impl std::io::Read for ConPtyReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::os::windows::io::AsRawHandle;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let mut reader = self
+            .0
+            .lock()
+            .map_err(|_| std::io::Error::other("PTY reader lock poisoned"))?;
+        let mut available = 0;
+        // SAFETY: reader owns the pipe handle; available is writable DWORD storage.
+        let ok = unsafe {
+            winapi::um::namedpipeapi::PeekNamedPipe(
+                reader.as_raw_handle().cast(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(winapi::shared::winerror::ERROR_BROKEN_PIPE as i32) {
+                return Ok(0);
+            }
+            return Err(error);
+        }
+        if available == 0 {
+            return Err(std::io::ErrorKind::WouldBlock.into());
+        }
+        let count = buf.len().min(available as usize);
+        reader.read(&mut buf[..count])
+    }
+}
+
 impl MasterPty for ConPtyMasterPty {
     fn resize(&self, size: PtySize) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
@@ -159,7 +202,9 @@ impl MasterPty for ConPtyMasterPty {
     }
 
     fn try_clone_reader(&self) -> anyhow::Result<Box<dyn std::io::Read + Send>> {
-        Ok(Box::new(self.inner.lock().unwrap().readable.try_clone()?))
+        Ok(Box::new(ConPtyReader(Arc::clone(
+            &self.inner.lock().unwrap().readable,
+        ))))
     }
 
     fn take_writer(&self) -> anyhow::Result<Box<dyn std::io::Write + Send>> {
