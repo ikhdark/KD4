@@ -886,8 +886,36 @@ fn is_validation_only_command(command: &[String], unwrapped: &[String]) -> bool 
 }
 
 fn looks_like_mutating_command(command: &[String]) -> bool {
+    // Preserve shell syntax and quoted arguments before considering individual
+    // executables. A read-only git command must not hide a later write or redirect.
+    if let Some((_, script)) = codex_shell_command::bash::extract_bash_command(command) {
+        return codex_shell_command::bash::parse_shell_script_into_commands(script).is_none_or(
+            |commands| {
+                commands
+                    .iter()
+                    .any(|argv| looks_like_mutating_command(argv))
+            },
+        );
+    }
     let normalized = normalized_command_tokens(command);
     let unwrapped = unwrap_command_tokens(&normalized);
+    if codex_shell_command::is_safe_command::is_known_safe_command(command)
+        || is_read_only_powershell_command(command)
+        || is_direct_file_read_command(command, unwrapped)
+        || is_validation_only_command(command, unwrapped)
+    {
+        return false;
+    }
+    if command.first().is_some_and(|program| {
+        matches!(
+            command_basename(&program.to_ascii_lowercase()),
+            "bash" | "sh" | "zsh" | "pwsh" | "powershell" | "cmd"
+        )
+    }) {
+        // The shell-aware readers above did not establish that the full script
+        // is read-only. Do not classify it from a flattened argv prefix.
+        return true;
+    }
     let format_check =
         is_format_only_command(command) && unwrapped.iter().any(|token| token == "--check");
     let mutating_format =
@@ -923,18 +951,11 @@ fn looks_like_mutating_command(command: &[String]) -> bool {
             return false;
         }
     }
-    if format_check
-        || is_validation_only_command(command, unwrapped)
-        || codex_shell_command::is_safe_command::is_known_safe_command(command)
-    {
+    if format_check {
         return false;
     }
 
     let joined = command.join(" ").to_ascii_lowercase();
-    if joined.contains(">>") || joined.contains(" > ") || joined.contains("| out-file") {
-        return true;
-    }
-
     let tokens = shell_filter_tokens(&joined);
     let explicit_dry_run = tokens.iter().any(|token| token == "--dry-run");
     let short_dry_run = tokens.iter().any(|token| token == "-n");
@@ -1025,10 +1046,6 @@ fn looks_like_mutating_command(command: &[String]) -> bool {
         _ => false,
     }) {
         return true;
-    }
-
-    if is_direct_file_read_command(command, unwrapped) || is_read_only_powershell_command(command) {
-        return false;
     }
 
     // Mutation tracking fails closed for every command that ordinary safety
@@ -1388,6 +1405,7 @@ fn git_subcommand(tokens: &[String]) -> Option<&str> {
                 | "--noglob-pathspecs"
                 | "--icase-pathspecs"
         ) || token.starts_with("--git-dir=")
+            || (token.starts_with("-c") && token.len() > 2)
             || token.starts_with("--work-tree=")
             || token.starts_with("--namespace=")
             || token.starts_with("--exec-path=")
@@ -1404,16 +1422,19 @@ fn git_subcommand(tokens: &[String]) -> Option<&str> {
 fn is_read_only_git_subcommand(subcommand: &str) -> bool {
     matches!(
         subcommand,
-        "cat-file"
+        "blame"
+            | "cat-file"
             | "describe"
             | "diff"
             | "for-each-ref"
             | "grep"
             | "log"
             | "ls-files"
+            | "ls-remote"
             | "ls-tree"
             | "name-rev"
             | "rev-parse"
+            | "rev-list"
             | "shortlog"
             | "show"
             | "status"

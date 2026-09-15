@@ -206,7 +206,7 @@ fn text_item(items: &[Value], index: usize) -> &str {
 
 fn extract_running_cell_id(text: &str) -> String {
     text.strip_prefix("Script running with cell ID ")
-        .and_then(|rest| rest.split('\n').next())
+        .and_then(|rest| rest.split_whitespace().next())
         .expect("running header should contain a cell ID")
         .to_string()
 }
@@ -1062,7 +1062,7 @@ async fn code_mode_terminal_prompt_requires_fresh_suites_and_completed_work(
         );
     } else {
         assert_eq!(
-            fs::read_to_string(test.cwd_path().join("suite-runs.txt"))?,
+            fs::read_to_string(test.cwd_path().join("suite-runs.txt"))?.replace("\r\n", "\n"),
             "passed\npassed\n",
             "each required suite executes once"
         );
@@ -1265,6 +1265,7 @@ async fn code_mode_tool_history_pressure_preserves_recoverable_results() -> Resu
     test.submit_turn("Recover the retained result.").await?;
     let output = custom_tool_output_last_non_empty_text(&recovered.single_request(), "recover-pin")
         .expect("registered recovery tool must return the stored output");
+    let output: String = serde_json::from_str(&output)?;
     assert!(
         output.contains(&format!("recovery-{index:03}\n")),
         "{output}"
@@ -1326,7 +1327,7 @@ text(JSON.stringify(result));
 }
 
 #[tokio::test]
-async fn code_mode_deduplicates_advice_and_preserves_nested_result_evidence() -> Result<()> {
+async fn code_mode_preserves_nested_result_evidence_without_injecting_advice() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = responses::start_mock_server().await;
     let test = test_codex()
@@ -1341,7 +1342,7 @@ async fn code_mode_deduplicates_advice_and_preserves_nested_result_evidence() ->
     fs::write(test.cwd_path().join("small.txt"), small)?;
     fs::write(test.cwd_path().join("large.txt"), &large)?;
     let small_command = if cfg!(windows) {
-        serde_json::json!({"kind": "argv", "program": "powershell.exe", "args": ["-NoLogo", "-NoProfile", "-Command", "Get-Content -Raw -Encoding utf8 small.txt"], "yield_time_ms": 30000})
+        serde_json::json!({"kind": "script", "cmd": "Get-Content -Raw -Encoding utf8 small.txt", "yield_time_ms": 30000})
     } else {
         serde_json::json!({"kind": "argv", "program": "cat", "args": ["small.txt"], "yield_time_ms": 30000})
     };
@@ -1394,18 +1395,12 @@ store('large', result);"#),
     let first_body =
         custom_tool_output_last_non_empty_text(&requests[1].single_request(), "call-0")
             .expect("the first read must reach the provider");
-    let advisory_offset = first_body.find("Low-density packet:").unwrap_or_else(|| {
-        panic!("the first small read must retain the batching guidance: {first_items:?}")
-    });
-    let (first_evidence, advisory) = first_body.split_at(advisory_offset);
-    assert_eq!(first_evidence.trim_end(), small);
+    assert_eq!(first_body.trim_end(), small);
+    assert!(!first_body.contains("Low-density packet:"));
     let request = final_request.single_request();
     let final_first = custom_tool_output_items(&request, "call-0");
     let final_last = custom_tool_output_items(&request, "call-2");
-    assert_eq!(
-        final_first, first_items,
-        "the first read and guidance stay in history"
-    );
+    assert_eq!(final_first, first_items, "the first read stays in history");
     let replayed: Value = serde_json::from_str(
         &custom_tool_output_last_non_empty_text(&request, "call-2")
             .expect("the captured evidence must be printed"),
@@ -1458,11 +1453,11 @@ store('large', result);"#),
         .await?;
     let next_body =
         custom_tool_output_last_non_empty_text(&next_request.single_request(), "next-read")
-            .expect("the next turn must receive the read and guidance");
+            .expect("the next turn must receive the read");
     assert_eq!(
-        next_body.strip_suffix(advisory).map(str::trim_end),
-        Some(small),
-        "the same evidence and guidance must remain available in the next turn"
+        next_body.trim_end(),
+        small,
+        "the same evidence must remain available in the next turn"
     );
     assert_eq!(
         fs::read_to_string(test.cwd_path().join("small.txt"))?,
@@ -1809,13 +1804,15 @@ if (!tool) {
         })
         .expect("exec description should be present");
     assert!(exec_description.contains("Nested tool schemas are discovered lazily at runtime"));
-    assert!(exec_description.contains("call `resolve_tool(name)`"));
-    assert!(exec_description.contains("Never scan `ALL_TOOLS`"));
+    assert!(exec_description.contains("`resolve_tool(name)` when the name is known"));
+    assert!(exec_description.contains("Never scan/filter/stringify/print `ALL_TOOLS`"));
     assert!(!exec_description.contains("### `tool_search`"));
-    assert!(!exec_description.contains("status: \"completed\" | \"incomplete\" | \"aborted\";"));
-    assert!(!exec_description.contains("execution: \"client\";"));
-    assert!(!exec_description.contains("tools: unknown[];"));
-    assert!(!exec_description.contains("omitted_result_count: number | null;"));
+    assert!(exec_description.contains("status: \"completed\" | \"incomplete\" | \"aborted\";"));
+    assert!(exec_description.contains("execution: \"client\";"));
+    assert!(exec_description.contains("tools: unknown[];"));
+    assert!(
+        exec_description.contains("omitted_result_count: number /* integer; minimum: 0 */ | null;")
+    );
     assert!(!exec_description.contains("calendar_timezone_option_99"));
 
     let request = follow_up_mock.single_request();
@@ -2427,10 +2424,41 @@ text(result.result?.selected_text ?? result.output);
 
     let request = second_mock.single_request();
     let output = custom_tool_output_last_non_empty_text(&request, "call-1")
-        .expect("code-mode output should contain the outer truncation warning");
-    assert!(output.starts_with("Warning: truncated output"), "{output}");
-    assert_output_has_truncation_marker(&output);
+        .expect("code-mode output should contain the compact truncation marker");
+    assert!(output.contains('…'), "{output}");
+    assert!(
+        codex_utils_output_truncation::approx_token_count(&output) <= 5,
+        "{output}"
+    );
+    assert!(!output.contains("0123456789012345678901234567890123456789"));
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_yielded_output_keeps_an_omission_marker_within_a_tiny_budget() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let (_test, response) = run_code_mode_turn(
+        &server,
+        "start and yield a verbose cell",
+        r#"// @exec: {"max_output_tokens": 5}
+text("0123456789012345678901234567890123456789");
+yield_control();
+await new Promise(() => {});
+"#,
+    )
+    .await?;
+    let request = response.single_request();
+    let items = custom_tool_output_items(&request, "call-1");
+    assert!(text_item(&items, 0).contains("Script running"));
+    let output = custom_tool_output_last_non_empty_text(&request, "call-1").unwrap();
+    assert!(output.contains('…'), "{output}");
+    assert!(
+        codex_utils_output_truncation::approx_token_count(&output) <= 5,
+        "{output}"
+    );
+    assert!(!output.contains("0123456789012345678901234567890123456789"));
     Ok(())
 }
 
@@ -2456,7 +2484,7 @@ throw new Error("boom");
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script failed\nWall time \d+\.\d+ seconds\nOutput:\n\z"
+            r"Script failed with cell ID \d+\nWall time \d+\.\d+ seconds\nOutput:\n\z"
         ),
         text_item(&items, /*index*/ 0),
     );
@@ -2565,7 +2593,7 @@ text("phase 3");
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script running with cell ID \d+\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
+            r"Script running with cell ID \d+(?: after explicit yield)?\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
         ),
         text_item(&first_items, /*index*/ 0),
     );
@@ -2606,7 +2634,7 @@ text("phase 3");
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script running with cell ID \d+\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
+            r"Script running with cell ID \d+(?: after explicit yield)?\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
         ),
         text_item(&second_items, /*index*/ 0),
     );
@@ -2650,7 +2678,7 @@ text("phase 3");
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script completed\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
+            r"Script completed with cell ID \d+\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
         ),
         text_item(&third_items, /*index*/ 0),
     );
@@ -2675,6 +2703,7 @@ async fn code_mode_yield_and_termination_are_not_starved_by_runtime_output() -> 
 for (let index = 0; index < 16_384; index++) {
     text(`event ${index}`);
 }
+yield_control();
 while (true) {}
 "#;
 
@@ -2708,7 +2737,7 @@ while (true) {}
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script running with cell ID \d+\nWall time \d+\.\d+ seconds\nOutput:\n\z"
+            r"Script running with cell ID \d+(?: after explicit yield)?\nWall time \d+\.\d+ seconds\nOutput:\n\z"
         ),
         text_item(&first_items, /*index*/ 0),
     );
@@ -2747,7 +2776,7 @@ while (true) {}
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script (?:completed|terminated|running with cell ID \d+)\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
+            r"Script (?:completed|terminated|running) with cell ID \d+\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
         ),
         text_item(&second_items, /*index*/ 0),
     );
@@ -2873,7 +2902,7 @@ text("session b done");
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script completed\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
+            r"Script completed with cell ID \d+\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
         ),
         text_item(&third_items, /*index*/ 0),
     );
@@ -2913,7 +2942,7 @@ text("session b done");
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script completed\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
+            r"Script completed with cell ID \d+\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
         ),
         text_item(&fourth_items, /*index*/ 0),
     );
@@ -2960,24 +2989,21 @@ store("b", 2);
 
     test.submit_turn("initialize stored values").await?;
 
-    let first_code = r#"
+    let first_gate = test.codex_home_path().join("code-mode-first-store.ready");
+    let first_wait = wait_for_file_source(&first_gate)?;
+    let first_code = format!(
+        r#"
 store("a", 3);
 text("first store pending");
 yield_control();
-await tools.test_sync_tool({
-  sleep_after_ms: 2_000,
-  barrier: {
-    id: "code-mode-concurrent-store",
-    participants: 2,
-    timeout_ms: 10_000,
-  },
-});
-"#;
+{first_wait}
+"#
+    );
     responses::mount_sse_once(
         &server,
         sse(vec![
             ev_response_created("resp-3"),
-            ev_custom_tool_call("call-first", "exec", first_code),
+            ev_custom_tool_call("call-first", "exec", &first_code),
             ev_completed("resp-3"),
         ]),
     )
@@ -3005,13 +3031,6 @@ await tools.test_sync_tool({
                 "call-second",
                 "exec",
                 r#"
-await tools.test_sync_tool({
-  barrier: {
-    id: "code-mode-concurrent-store",
-    participants: 2,
-    timeout_ms: 10_000,
-  },
-});
 store("b", 4);
 "#,
             ),
@@ -3029,6 +3048,7 @@ store("b", 4);
     .await;
 
     test.submit_turn("write the second key").await?;
+    fs::write(&first_gate, "ready")?;
 
     responses::mount_sse_once(
         &server,
@@ -3092,6 +3112,219 @@ store("b", 4);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_termination_retains_completed_nested_results_after_printed_progress()
+-> Result<()> {
+    use core_test_support::streaming_sse::StreamingSseChunk;
+    use core_test_support::streaming_sse::start_streaming_sse_server;
+
+    skip_if_no_network!(Ok(()));
+    let (terminate, termination_ready) = tokio::sync::oneshot::channel();
+    let (server, _) = start_streaming_sse_server(vec![
+        vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![
+                ev_custom_tool_call(
+                    "retained-exec",
+                    "exec",
+                    r#"
+text("started");
+yield_control();
+for (let index = 0; index < 10; index++) {
+    await tools.fixture__result({index});
+}
+text("progress log");
+await tools.fixture__result({index: 10});
+text("must not run after cancellation");
+"#,
+                ),
+                ev_completed("retained-start"),
+            ]),
+        }],
+        vec![StreamingSseChunk {
+            // Keep the original turn active so its nested dynamic calls can
+            // receive responses, then terminate after the eleventh call starts.
+            gate: Some(termination_ready),
+            body: sse(vec![
+                responses::ev_function_call(
+                    "retained-terminate",
+                    "wait",
+                    r#"{"cell_id":"1","terminate":true}"#,
+                ),
+                ev_completed("terminate"),
+            ]),
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![
+                ev_assistant_message("terminated", "terminated"),
+                ev_completed("terminated"),
+            ]),
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![
+                responses::ev_function_call(
+                    "retained-after",
+                    "wait",
+                    r#"{"cell_id":"1","yield_time_ms":1}"#,
+                ),
+                ev_completed("after"),
+            ]),
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![
+                ev_assistant_message("done", "done"),
+                ev_completed("done"),
+            ]),
+        }],
+    ])
+    .await;
+    let mut test = test_codex()
+        .with_config(|config| {
+            let _ = config.features.enable(Feature::CodeMode);
+        })
+        .build_with_streaming_server(&server)
+        .await?;
+    let options = test.thread_manager.start_thread_options(test.config.clone())
+        .with_dynamic_tools(vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+        name: "fixture".to_string(),
+        description: "Nested termination test tools".to_string(),
+        tools: vec![DynamicToolNamespaceTool::Function(DynamicToolFunctionSpec {
+            name: "result".to_string(),
+            description: "Return an indexed result.".to_string(),
+            input_schema: serde_json::json!({"type":"object", "properties":{"index":{"type":"integer"}}, "required":["index"], "additionalProperties":false}),
+            defer_loading: false,
+        })],
+    })]);
+    let thread = test
+        .thread_manager
+        .start_thread_with_options(options)
+        .await?;
+    test.codex.replace_thread(thread.thread);
+    test.session_configured = thread.session_configured;
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "start a cell".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    let output_for = |request: &[u8], call_id: &str| -> Value {
+        let body: Value = serde_json::from_slice(request).unwrap();
+        body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| {
+                item["call_id"] == call_id
+                    && matches!(
+                        item["type"].as_str(),
+                        Some("custom_tool_call_output" | "function_call_output")
+                    )
+            })
+            .unwrap_or_else(|| panic!("missing output for {call_id}: {body}"))["output"]
+            .clone()
+    };
+    let mut request = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::DynamicToolCallRequest(request) => Some(request.clone()),
+        _ => None,
+    })
+    .await;
+    // Confirm the initial packet was already delivered before any nested result
+    // completes: the later cancellation packet must carry those results itself.
+    tokio::time::timeout(Duration::from_secs(10), server.wait_for_request_count(2)).await?;
+    let started = output_for(&server.requests().await[1], "retained-exec").to_string();
+    assert!(
+        started.contains("Script running with cell ID 1"),
+        "{started}"
+    );
+    assert!(!started.contains("RETAINED_RESULT_"));
+    for index in 0..10 {
+        assert_eq!(request.arguments, serde_json::json!({"index":index}));
+        test.codex
+            .submit(Op::DynamicToolResponse {
+                id: request.call_id,
+                response: DynamicToolResponse {
+                    content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                        text: format!("RETAINED_RESULT_{index}"),
+                    }],
+                    success: true,
+                },
+            })
+            .await?;
+        request = wait_for_event_match(&test.codex, |event| match event {
+            EventMsg::DynamicToolCallRequest(request) => Some(request.clone()),
+            _ => None,
+        })
+        .await;
+    }
+    assert_eq!(request.arguments, serde_json::json!({"index":10}));
+    terminate
+        .send(())
+        .expect("release cancellation after completed results and progress");
+    let completed = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnComplete(event) => Some(event.last_agent_message.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        completed.as_deref(),
+        Some("required tool `wait` was cancelled")
+    );
+    assert_eq!(server.requests().await.len(), 2);
+    // Cancelling the pending required nested call completes this turn in the
+    // host. The next user turn must still receive its retained tool evidence.
+    test.submit_turn("show the cancellation outcome").await?;
+    let sent = server.requests().await;
+    assert_eq!(sent.len(), 3);
+    let visible = output_for(&sent[2], "retained-terminate").to_string();
+    assert!(visible.contains("Script terminated"), "{visible}");
+    assert!(visible.contains("progress log"), "{visible}");
+    assert_eq!(visible.matches("RETAINED_RESULT_").count(), 8, "{visible}");
+    for index in 0..8 {
+        assert!(
+            visible.contains(&format!("RETAINED_RESULT_{index}")),
+            "{visible}"
+        );
+    }
+    // Ten successful calls and the cancelled eleventh call produce eleven
+    // outcomes. The fallback retains the first eight and reports the other three.
+    assert!(
+        visible.contains("3 additional nested tool results were omitted"),
+        "{visible}"
+    );
+    assert!(
+        visible
+            .contains("Required nested tool outcome: required nested tool `result` was cancelled"),
+        "{visible}"
+    );
+    assert!(!visible.contains("must not run after cancellation"));
+
+    test.submit_turn("observe the closed cell again").await?;
+    let sent = server.requests().await;
+    assert_eq!(sent.len(), 5);
+    let after = output_for(&sent[4], "retained-after").to_string();
+    // Closed cells replay their cached terminal event. Per-packet nested
+    // evidence has been consumed and must not reappear on a later observation.
+    assert!(
+        after.contains("Script terminated with cell ID 1"),
+        "{after}"
+    );
+    assert!(after.contains("progress log"), "{after}");
+    assert!(!after.contains("RETAINED_RESULT_"));
+    assert!(!after.contains("nested tool results were omitted"));
+    assert!(!after.contains("must not run after cancellation"));
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_wait_can_terminate_and_continue() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -3100,17 +3333,13 @@ async fn code_mode_wait_can_terminate_and_continue() -> Result<()> {
         let _ = config.features.enable(Feature::CodeMode);
     });
     let test = builder.build(&server).await?;
-    let termination_gate = test.codex_home_path().join("code-mode-terminate.ready");
-    let termination_wait = wait_for_file_source(&termination_gate)?;
 
-    let code = format!(
-        r#"
+    let code = r#"
 text("phase 1");
 yield_control();
-{termination_wait}
+await new Promise(() => {});
 text("phase 2");
-"#
-    );
+"#;
 
     responses::mount_sse_once(
         &server,
@@ -3171,7 +3400,7 @@ text("phase 2");
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script terminated\nWall time \d+\.\d+ seconds\nOutput:\n\z"
+            r"Script terminated with cell ID \d+\nWall time \d+\.\d+ seconds\nOutput:\n\z"
         ),
         text_item(&second_items, /*index*/ 0),
     );
@@ -3208,7 +3437,7 @@ text("after terminate");
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d+ seconds\nOutput:\n\z"
+            r"Script completed with cell ID \d+\nWall time \d+\.\d+ seconds\nOutput:\n\z"
         ),
         text_item(&third_items, /*index*/ 0),
     );
@@ -3302,24 +3531,24 @@ async fn code_mode_wait_terminate_returns_completed_session_if_it_finished_after
             let _ = config.features.enable(Feature::CodeMode);
         });
     let test = builder.build(&server).await?;
-    let session_a_code = r#"
+    let completion_gate = test
+        .codex_home_path()
+        .join("code-mode-completed-after-yield.ready");
+    let completion_wait = wait_for_file_source(&completion_gate)?;
+    let session_a_code = format!(
+        r#"
 text("session a start");
 yield_control();
-await tools.test_sync_tool({
-  barrier: {
-    id: "code-mode-completed-after-yield",
-    participants: 2,
-    timeout_ms: 30_000,
-  },
-});
+{completion_wait}
 text("session a done");
-"#;
+"#
+    );
 
     responses::mount_sse_once(
         &server,
         sse(vec![
             ev_response_created("resp-1"),
-            ev_custom_tool_call("call-1", "exec", session_a_code),
+            ev_custom_tool_call("call-1", "exec", &session_a_code),
             ev_completed("resp-1"),
         ]),
     )
@@ -3350,11 +3579,6 @@ text("session a done");
                 "test_sync_tool",
                 &serde_json::to_string(&serde_json::json!({
                     "sleep_after_ms": 250,
-                    "barrier": {
-                        "id": "code-mode-completed-after-yield",
-                        "participants": 2,
-                        "timeout_ms": 30_000,
-                    },
                 }))?,
             ),
             ev_completed("resp-3"),
@@ -3370,6 +3594,7 @@ text("session a done");
     )
     .await;
 
+    fs::write(&completion_gate, "ready")?;
     test.submit_turn("release session a").await?;
 
     let second_request = second_completion.single_request();
@@ -3411,7 +3636,7 @@ text("session a done");
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script completed\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
+            r"Script completed with cell ID \d+\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
         ),
         text_item(&fourth_items, /*index*/ 0),
     );
@@ -3468,7 +3693,7 @@ text("after yield");
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script running with cell ID \d+\nWall time \d+\.\d+ seconds\nOutput:\n\z"
+            r"Script running with cell ID \d+(?: after explicit yield)?\nWall time \d+\.\d+ seconds\nOutput:\n\z"
         ),
         text_item(&first_items, /*index*/ 0),
     );
@@ -3584,19 +3809,15 @@ text("token one token two token three token four token five token six token seve
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script completed\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
+            r"Script completed with cell ID \d+\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
         ),
         text_item(&second_items, /*index*/ 0),
     );
-    let expected_pattern = r#"(?sx)
-\A
-Warning:\ truncated\ output\ \(original\ token\ count:\ \d+\)\n
-Total\ output\ lines:\ 1\n
-\n
-.*…\d+\ tokens\ truncated….*
-\z
-"#;
-    assert_regex_match(expected_pattern, text_item(&second_items, /*index*/ 1));
+    let truncated = text_item(&second_items, /*index*/ 1);
+    assert!(truncated.starts_with("token"), "{truncated}");
+    assert!(truncated.contains('\u{2026}'), "{truncated}");
+    assert!(truncated.ends_with("seven"), "{truncated}");
+    assert!(codex_utils_output_truncation::approx_token_count(truncated) <= 6);
 
     Ok(())
 }
@@ -3718,7 +3939,7 @@ text("after");
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d+ seconds\nOutput:\n\z"
+            r"Script completed with cell ID \d+\nWall time \d+\.\d+ seconds\nOutput:\n\z"
         ),
         text_item(&items, /*index*/ 0),
     );
@@ -3758,7 +3979,7 @@ text(circular);
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script failed\nWall time \d+\.\d+ seconds\nOutput:\n\z"
+            r"Script failed with cell ID \d+\nWall time \d+\.\d+ seconds\nOutput:\n\z"
         ),
         text_item(&items, /*index*/ 0),
     );
@@ -3794,7 +4015,7 @@ image("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUl
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d+ seconds\nOutput:\n\z"
+            r"Script completed with cell ID \d+\nWall time \d+\.\d+ seconds\nOutput:\n\z"
         ),
         text_item(&items, /*index*/ 0),
     );
@@ -3916,7 +4137,7 @@ async fn code_mode_image_helper_rejects_remote_url() -> Result<()> {
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script failed\nWall time \d+\.\d+ seconds\nOutput:\n\z"
+            r"Script failed with cell ID \d+\nWall time \d+\.\d+ seconds\nOutput:\n\z"
         ),
         text_item(&items, /*index*/ 0),
     );
@@ -3992,7 +4213,7 @@ image(out);
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script (?:completed|running with cell ID \d+)\nWall time \d+\.\d+ seconds\nOutput:\n\z"
+            r"Script (?:completed|running) with cell ID \d+\nWall time \d+\.\d+ seconds\nOutput:\n\z"
         ),
         text_item(&items, /*index*/ 0),
     );
@@ -4048,7 +4269,7 @@ image(imageItem);
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script (?:completed|running with cell ID \d+)\nWall time \d+\.\d+ seconds\nOutput:\n\z"
+            r"Script (?:completed|running) with cell ID \d+\nWall time \d+\.\d+ seconds\nOutput:\n\z"
         ),
         text_item(&items, /*index*/ 0),
     );
@@ -4377,7 +4598,12 @@ text(JSON.stringify(Object.getOwnPropertyNames(globalThis).sort()));
     let expected = [
         "AggregateError",
         "ALL_TOOL_NAMES",
+        "console",
         "ALL_TOOLS",
+        "exec",
+        "exec_command",
+        "execTool",
+        "shell",
         "Array",
         "ArrayBuffer",
         "AsyncDisposableStack",

@@ -325,10 +325,7 @@ fn tool_call_note(block: &JsonValue) -> String {
         if lines.is_empty() {
             lines.push(format!(
                 "input: {}",
-                truncate(
-                    &input.to_string(),
-                    NOTE_MAX_LEN
-                )
+                truncate(&input.to_string(), NOTE_MAX_LEN)
             ));
         }
     } else if let Some(input) = block.get("input") {
@@ -514,7 +511,7 @@ mod tests {
         let path = root.path().join("session.jsonl");
         let result = serde_json::json!({"type":"user", "cwd":root.path(), "timestamp":"2026-06-03T12:00:00Z",
             "message":{"content":[{"type":"tool_result", "is_error":true,
-                "content":[{"text":"prefix"},{"text":""},{"text":"ç•Œ".repeat(10_000)}]}]}});
+                "content":[{"text":"prefix"},{"text":""},{"text":"界".repeat(10_000)}]}]}});
         std::fs::write(&path, result.to_string()).unwrap();
         assert!(summarize_session(&path).unwrap().is_none());
         assert!(
@@ -548,7 +545,7 @@ mod tests {
             parsed.messages[1].text,
             format!(
                 "[external_agent_tool_result: error]\nprefix\n{}...\n[/external_agent_tool_result]",
-                "ç•Œ".repeat(3_990)
+                "界".repeat(3_990)
             )
         );
     }

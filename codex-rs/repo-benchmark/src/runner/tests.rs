@@ -4,7 +4,7 @@
 use super::*;
 use crate::prepare::builds::BuildIdentity;
 use crate::prepare::environment::{BASE_CONFIG, Environment, ToolIdentity};
-use crate::prepare::provenance::{FileIdentity, read_json};
+use crate::prepare::provenance::{FileIdentity, hash_tree, read_json};
 use crate::prepare::{FrozenFixture, MANIFEST_VERSION, SourceIdentity};
 use crate::schedule::{Mode, Variant, schedule};
 use crate::workloads::{LiveTask, prepare_fixture};
@@ -180,6 +180,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         mode: Mode::Fast,
         schedule: schedule(Mode::Fast),
         workspace,
+        workspace_lock: directory.join("workspace.lock"),
         additional_roots: vec![],
         runs_directory: directory.join("runs"),
         import_directory: directory.join("accepted"),
@@ -193,6 +194,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         harness_sources: config_identity.clone(),
         environment,
         base_config: config_identity.clone(),
+        project_config_comparison: None,
         features: vec![],
         feature_inventory: config_identity,
         overrides: Variant::ALL
@@ -214,6 +216,138 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         preparation_ms: 0,
         budgets: json!({}),
     }
+}
+
+#[test]
+fn report_write_exposes_ablation_scope_verification_and_incomplete_pair_rates() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut prepared = prepared_peer(temp.path(), false);
+    prepared.features = vec![
+        json!({"id":"runtime", "config_keys":["features.kd4_runtime"], "benchmark_on":true, "benchmark_control":{"kind":"runtime"}, "runtime_verification":{"kind":"contract_test", "path":"core/tests.rs", "symbol":"runtime_contract"}}),
+        json!({"id":"preflight", "config_keys":["features.kd4_runtime"], "benchmark_on":true, "benchmark_control":{"kind":"runtime"}}),
+        json!({"id":"disabled", "config_keys":["features.disabled"], "benchmark_on":false, "benchmark_control":{"kind":"runtime"}}),
+        json!({"id":"fixed", "config_keys":[], "benchmark_control":{"kind":"lacking_off_state", "reason":"present in both fork builds"}}),
+        json!({"id":"workflow", "config_keys":[], "benchmark_control":{"kind":"lacking_off_state", "reason":"repository workflow"}}),
+    ];
+    for (variant, enabled) in [(Variant::ForkOff, false), (Variant::ForkOn, true)] {
+        prepared.overrides.insert(
+            variant,
+            crate::prepare::feature_overrides(&prepared.features, enabled).unwrap(),
+        );
+    }
+    prepared.features.push(json!({"id":"unknown", "config_keys":["features.missing"], "benchmark_control":{"kind":"runtime"}}));
+    let project = temp.path().join("project");
+    fs::create_dir_all(project.join(".codex")).unwrap();
+    fs::write(
+        project.join(".codex/config.toml"),
+        "approval_policy = 'never'\nallow_login_shell = false\n[features]\nkd4_runtime = true\n",
+    )
+    .unwrap();
+    prepared.project_config_comparison =
+        crate::prepare::environment::ProjectConfigComparison::capture(
+            &project,
+            BASE_CONFIG,
+            &prepared.overrides,
+        )
+        .unwrap();
+    let code_mode_host = prepared.harness.clone();
+    prepared
+        .builds
+        .get_mut(&Variant::ForkOn)
+        .unwrap()
+        .executables
+        .insert("codex-code-mode-host".into(), code_mode_host);
+    let mut attempt = attempt(&prepared, false, "unrun");
+    attempt.scheduled = prepared.schedule[0].clone();
+    prepared.schedule = vec![attempt.scheduled.clone()];
+    let manifest = prepared.directory.join("prepared.json");
+    write_json(&manifest, &prepared).unwrap();
+    fs::create_dir_all(&prepared.runs_directory).unwrap();
+    let result = RunResult {
+        schema_version: 1,
+        id: "coverage-report".into(),
+        prepared_manifest: manifest.clone(),
+        prepared_manifest_sha256: hash_file(&manifest).unwrap(),
+        directory: prepared.runs_directory.clone(),
+        mode: Mode::Fast,
+        original_run: None,
+        attempts: vec![attempt],
+        scripted_execution_ms: 0,
+        real_model_execution_ms: 0,
+        finished: true,
+    };
+    write_json(&result.directory.join("result.json"), &result).unwrap();
+    crate::reports::write(&prepared, &result).unwrap();
+    let report: Value = read_json(&result.directory.join("report.json")).unwrap();
+    assert_eq!(
+        report["ablationCounts"],
+        json!({"runtime_changed":2, "runtime_unchanged":1, "not_ablated":2, "configuration_unavailable":1})
+    );
+    assert_eq!(
+        report["coupledControls"],
+        json!({"features.kd4_runtime":["runtime", "preflight"]})
+    );
+    let features = report["featureCoverage"].as_array().unwrap();
+    assert_eq!(
+        report["prepared"]["projectConfigComparison"]["byVariant"]["fork_off"]["changed"],
+        json!(["features.kd4_runtime"])
+    );
+    assert_eq!(
+        report["prepared"]["projectConfigComparison"]["byVariant"]["fork_on"]["changed"],
+        json!([])
+    );
+    assert_eq!(
+        features[0]["declaredVerification"]["symbol"],
+        "runtime_contract"
+    );
+    assert_eq!(
+        features[0]["configuredSettingsByVariant"]["fork_off"]["features.kd4_runtime"],
+        false
+    );
+    assert_eq!(
+        features[0]["configuredSettingsByVariant"]["fork_on"]["features.kd4_runtime"],
+        true
+    );
+    assert!(
+        features
+            .iter()
+            .all(|feature| feature["exercised"].is_null())
+    );
+    assert_eq!(features[3]["ablationStatus"], "not_ablated");
+    assert_eq!(features[5]["ablationStatus"], "configuration_unavailable");
+    let markdown = fs::read_to_string(result.directory.join("report.md")).unwrap();
+    for expected in [
+        "2 change runtime settings",
+        "1 keep identical runtime settings",
+        "2 are not ablated",
+        "1 have unavailable configuration",
+        "Shared control `features.kd4_runtime`",
+        "core/tests.rs::runtime_contract",
+        "not controlled in either fork arm",
+        "100.0% incomplete",
+        "Excluded pairs",
+        "100.0%",
+        "linear interpolation at (n-1)*q",
+        "## Configuration scope",
+        "allow_login_shell",
+        "excludes home configuration",
+        "Code-mode host availability differs across variants",
+        "fork_on: code-mode host present",
+        "reference: code-mode host absent",
+    ] {
+        assert!(
+            markdown.contains(expected),
+            "missing {expected}: {markdown}"
+        );
+    }
+    let represented: Vec<_> = report["comparisons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["scheduledPairSlots"] == 1)
+        .collect();
+    assert_eq!(represented.len(), 2);
+    assert!(represented.iter().all(|row| row["excludedPairRate"] == 1.0));
 }
 
 fn attempt(prepared: &Prepared, live: bool, name: &str) -> Attempt {
@@ -245,6 +379,7 @@ fn attempt(prepared: &Prepared, live: bool, name: &str) -> Attempt {
         diagnostics: None,
         outside_execution_ms: BTreeMap::new(),
         final_workspace_sha256: None,
+        evidence_files: vec![],
         evidence_directory: directory,
         rerun_command: format!("just repo-benchmark rerun --attempt {name}"),
     }
@@ -259,7 +394,13 @@ fn add_live_fixture(prepared: &mut Prepared, with_verifier: bool) {
     )
     .unwrap();
     let descriptor = if with_verifier {
-        reset_workspace(&prepared.directory, &prepared.workspace, &snapshot).unwrap();
+        reset_workspace(
+            &prepared.directory,
+            &prepared.workspace,
+            &snapshot,
+            &hash_tree(&snapshot).unwrap(),
+        )
+        .unwrap();
         let protected = prepared.directory.join("protected/rust_bugfix");
         fs::create_dir_all(&protected).unwrap();
         let descriptor =
@@ -341,6 +482,18 @@ fn completed_native_turn_does_not_override_independent_incorrect_result() {
     assert_eq!(attempt.native.as_ref().unwrap().tool_executions, 1);
     assert_eq!(attempt.native.as_ref().unwrap().completed_turns, 1);
     assert_eq!(attempt.status, "incorrect");
+    let native = attempt.native.as_ref().unwrap();
+    let raw: Value = serde_json::from_slice(&fs::read(&native.evidence_path).unwrap()).unwrap();
+    assert!(
+        raw.get("verifier").is_none(),
+        "verification must not rewrite native evidence"
+    );
+    assert_eq!(raw, serde_json::to_value(native).unwrap());
+    let analysis_input: Value = serde_json::from_slice(
+        &fs::read(attempt.evidence_directory.join("analysis-input.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(analysis_input["verifier"]["status"], "incorrect");
     assert_eq!(
         attempt.verifier.as_ref().unwrap().status,
         VerificationStatus::Incorrect
@@ -360,6 +513,49 @@ fn completed_native_turn_does_not_override_independent_incorrect_result() {
             .unwrap()
             .iter()
             .any(|row| row["kind"] == "verification_incorrect")
+    );
+}
+
+#[test]
+fn out_of_scope_edit_survives_runner_verification_and_persistence() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut prepared = prepared_peer(temp.path(), false);
+    add_live_fixture(&mut prepared, true);
+    let peer = prepared.directory.join("frozen/peer.ps1");
+    let source = fs::read_to_string(&peer).unwrap();
+    let instructions = prepared
+        .workspace
+        .join("AGENTS.md")
+        .display()
+        .to_string()
+        .replace('\'', "''");
+    fs::write(&peer, source.replace("'turn/start' {", &format!(
+        "'turn/start' {{\n[System.IO.File]::WriteAllText('{instructions}', 'changed instructions')"
+    ))).unwrap();
+    let mut attempt = attempt(&prepared, true, "scope-violation");
+    execute_one(&prepared, &mut attempt, 10000).unwrap();
+    assert_eq!(attempt.native.as_ref().unwrap().status, "completed");
+    assert_eq!(attempt.status, "scope_violation");
+    assert_eq!(
+        attempt.verifier.as_ref().unwrap().status,
+        VerificationStatus::ScopeViolation
+    );
+    assert!(
+        attempt
+            .verifier
+            .as_ref()
+            .unwrap()
+            .detail
+            .contains("AGENTS.md")
+    );
+    let saved: Attempt = read_json(&attempt.evidence_directory.join("attempt.json")).unwrap();
+    assert_eq!(saved.status, "scope_violation");
+    assert!(
+        saved.diagnostics.as_ref().unwrap().reports[0]["runnerDiagnostics"]["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["kind"] == "verification_scope_violation")
     );
 }
 
@@ -496,7 +692,7 @@ fn analysis_only_uses_original_evidence_and_preserves_original_results() {
     assert_eq!(fs::read(&original_attempt_path).unwrap(), original_attempt);
     assert_eq!(fs::read(&original_audit_path).unwrap(), original_audit);
     let rerun: RunResult = read_json(&rerun_path).unwrap();
-    assert_eq!(rerun.original_run, Some(original_path));
+    assert_eq!(rerun.original_run, Some(original_path.clone()));
     assert_eq!(
         rerun.attempts[0].native.as_ref().unwrap().evidence_path,
         native_path
@@ -522,4 +718,432 @@ fn analysis_only_uses_original_evidence_and_preserves_original_results() {
             .unwrap()
             .contains("setup_failed")
     );
+    fs::write(&native_path, b"{}").unwrap();
+    assert!(
+        analysis_only(&original_path)
+            .unwrap_err()
+            .to_string()
+            .contains("changed prepared artifact")
+    );
+    assert!(crate::reports::import(&rerun_path).is_err());
+    assert_eq!(fs::read(&original_path).unwrap(), original_bytes);
+}
+
+#[test]
+fn reports_compare_versioned_behavior_from_all_frozen_audit_sessions() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut prepared = prepared_peer(temp.path(), false);
+    prepared.schedule.retain(|item| {
+        item.segment == Segment::Scripted
+            && item.workload == "direct_tools"
+            && item.cluster == 0
+            && !item.warmup
+    });
+    assert_eq!(prepared.schedule.len(), 3);
+    fs::create_dir_all(&prepared.runs_directory).unwrap();
+    let manifest = prepared.directory.join("prepared.json");
+    write_json(&manifest, &prepared).unwrap();
+    let mut attempts = Vec::new();
+    for scheduled in &prepared.schedule {
+        let mut item = attempt(&prepared, false, &scheduled.id);
+        item.scheduled = scheduled.clone();
+        item.status = "completed".into();
+        fs::create_dir_all(&item.evidence_directory).unwrap();
+        let searches = match scheduled.variant {
+            Variant::Reference => 3,
+            Variant::ForkOff => 4,
+            Variant::ForkOn => 1,
+        };
+        let capture = item.evidence_directory.join("requests.jsonl");
+        fs::write(
+            &capture,
+            "{\"request\":{\"input\":\"x\"}}\n".repeat(searches),
+        )
+        .unwrap();
+        let mut paths = Vec::new();
+        for (session, count) in [searches, 2].into_iter().enumerate() {
+            let path = item
+                .evidence_directory
+                .join(format!("rollout-{session}.jsonl"));
+            let record = |kind, payload| {
+                json!({"type":kind,"timestamp":"2026-08-17T00:00:01Z","payload":payload})
+                    .to_string()
+            };
+            let mut lines = vec![
+                record("session_meta", json!({"cwd": prepared.workspace})),
+                record(
+                    "event_msg",
+                    json!({"type":"task_started","turn_id":format!("turn-{session}")}),
+                ),
+            ];
+            for call in 0..count {
+                lines.push(record("response_item", json!({"type":"function_call","name":"exec_command","call_id":format!("call-{call}"),"arguments":{"cmd":"rg needle src/widget.rs"}})));
+                lines.push(record("response_item", json!({"type":"function_call_output","call_id":format!("call-{call}"),"output":""})));
+            }
+            let terminal = record(
+                "event_msg",
+                json!({
+                    "type":"task_complete", "turn_id":format!("turn-{session}"),
+                    "timing": {
+                        "schemaVersion":25, "profileValid":true, "classificationComplete":true,
+                        "counters": {
+                            "saturationCount":0, "executedValidationCount":1,
+                            "executedValidationDurationNs":count * 100 + session,
+                            "suppressedValidationOutputCount":count + 1,
+                            "noProgressDirectiveCount":count, "provenLoopActivationCount":session,
+                            "planningGenerationCount":count + 2, "planRevisionGenerationCount":session,
+                            "planningFixedPointIterationCount":count + 3, "approvalWaitCount":count,
+                            "permissionWaitCount":0, "userInputWaitCount":session, "mcpElicitationWaitCount":2,
+                            "toolOutputCanonicalTokenCount":count * 1000,
+                            "toolOutputModelTokenCount":count * 100,
+                            "toolOutputRecoveryCallCount":count,
+                            "toolOutputRecoveryRetruncationCount":session
+                        }
+                    }
+                }),
+            );
+            // Replaying a terminal notification must not add another turn's counters.
+            lines.extend([terminal.clone(), terminal]);
+            fs::write(&path, lines.join("\n") + "\n").unwrap();
+            paths.push(path);
+        }
+        let native: crate::native::NativeAttemptEvidence = serde_json::from_value(json!({
+            "schemaVersion":1,"attemptId":scheduled.id,"status":"completed","elapsedMs":100,"cleanupMs":0,
+            "threadId":"synthetic-report-test","completedTurns":2,"toolExecutions":searches + 2,
+            "failure":null,"effectiveConfig":{},"events":[{"message":{"method":"turn/completed","params":{"turn":{"id":"dispatch-turn","status":"completed","timing":{
+                "schemaVersion":25,"profileValid":true,"classificationComplete":true,
+                "counters":{"modelRequestCount":0},"modelRequests":[],
+                "toolCalls":[{"callId":"dispatch","retryCount":searches,"reentryCount":2}]
+            }}}}}],"stdoutPaths":[],"stderrPaths":[],
+            "rolloutPaths":paths,"providerRequestsPath":capture,"adaptations":[],
+            "evidencePath":item.evidence_directory.join("native-evidence.json")
+        })).unwrap();
+        write_json(&native.evidence_path, &native).unwrap();
+        let diagnostics = crate::diagnostics::analyze(
+            &prepared.environment.tools["python"].executable.path,
+            &prepared.analyzer.path,
+            &prepared.analyzer_files,
+            &native,
+            &item.evidence_directory.join("audit"),
+            &prepared.workspace,
+            false,
+            None,
+        );
+        assert_eq!(diagnostics.status, "available", "{:?}", diagnostics.error);
+        assert_eq!(diagnostics.reports.len(), 2);
+        item.native = Some(native);
+        item.diagnostics = Some(diagnostics);
+        attempts.push(item);
+    }
+    let result = RunResult {
+        schema_version: 1,
+        id: "behavior-report".into(),
+        prepared_manifest: manifest.clone(),
+        prepared_manifest_sha256: hash_file(&manifest).unwrap(),
+        directory: prepared.runs_directory.clone(),
+        mode: prepared.mode,
+        original_run: None,
+        attempts,
+        scripted_execution_ms: 300,
+        real_model_execution_ms: 0,
+        finished: true,
+    };
+    write_json(&result.directory.join("result.json"), &result).unwrap();
+    crate::reports::write(&prepared, &result).unwrap();
+    let report: Value = read_json(&result.directory.join("report.json")).unwrap();
+    assert_eq!(report["behaviorSchemaVersion"], 2);
+    assert_eq!(report["completion"]["completed"], 3);
+    let comparisons = report["comparisons"].as_array().unwrap();
+    let retries = comparisons
+        .iter()
+        .find(|value| value["metric"] == "tool_retries" && value["kind"] == "feature_effect")
+        .unwrap();
+    assert_eq!(retries["candidateDistribution"]["median"], 1.0);
+    assert_eq!(retries["baselineDistribution"]["median"], 4.0);
+    let reentries = comparisons
+        .iter()
+        .find(|value| value["metric"] == "tool_reentries" && value["kind"] == "feature_effect")
+        .unwrap();
+    assert_eq!(reentries["candidateDistribution"]["median"], 2.0);
+    assert_eq!(reentries["baselineDistribution"]["median"], 2.0);
+    assert!(
+        fs::read_to_string(result.directory.join("report.md"))
+            .unwrap()
+            .contains("tool_retries (count)")
+    );
+    for (kind, expected) in [("drift", 1.0), ("feature_effect", -3.0), ("overall", -2.0)] {
+        let comparison = comparisons
+            .iter()
+            .find(|value| value["metric"] == "discovery_searches" && value["kind"] == kind)
+            .unwrap();
+        assert_eq!(comparison["observed"]["medianDifference"], expected);
+        assert_eq!(comparison["pairedObserved"]["medianDifference"], expected);
+        assert_eq!(comparison["pairs"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            comparison["intervalUnavailableReason"],
+            "exploratory_behavior_counts"
+        );
+        assert!(comparison["bootstrap"].is_null());
+    }
+    let overall = comparisons
+        .iter()
+        .find(|value| value["metric"] == "discovery_searches" && value["kind"] == "overall")
+        .unwrap();
+    assert_eq!(overall["baselineDistribution"]["samples"][0]["value"], 5.0);
+    assert_eq!(overall["candidateDistribution"]["samples"][0]["value"], 3.0);
+    for (metric, baseline, candidate, unit) in [
+        ("behavior_executed_validations", 2.0, 2.0, "count"),
+        ("behavior_validation_duration_ns", 501.0, 301.0, "ns"),
+        ("behavior_suppressed_validation_outputs", 7.0, 5.0, "count"),
+        ("behavior_no_progress_directives", 5.0, 3.0, "count"),
+        ("behavior_proven_loop_activations", 1.0, 1.0, "count"),
+        ("behavior_planning_generations", 9.0, 7.0, "count"),
+        ("behavior_plan_revision_generations", 1.0, 1.0, "count"),
+        (
+            "behavior_planning_fixed_point_iterations",
+            11.0,
+            9.0,
+            "count",
+        ),
+        ("behavior_approval_waits", 5.0, 3.0, "count"),
+        ("behavior_permission_waits", 0.0, 0.0, "count"),
+        ("behavior_user_input_waits", 1.0, 1.0, "count"),
+        ("behavior_mcp_elicitation_waits", 4.0, 4.0, "count"),
+        (
+            "behavior_tool_output_canonical_tokens",
+            5000.0,
+            3000.0,
+            "tokens",
+        ),
+        ("behavior_tool_output_model_tokens", 500.0, 300.0, "tokens"),
+        ("behavior_tool_output_recovery_calls", 5.0, 3.0, "count"),
+        (
+            "behavior_tool_output_recovery_retruncations",
+            1.0,
+            1.0,
+            "count",
+        ),
+    ] {
+        let comparison = comparisons
+            .iter()
+            .find(|value| value["metric"] == metric && value["kind"] == "overall")
+            .unwrap();
+        assert_eq!(comparison["unit"], unit, "{metric}");
+        assert_eq!(
+            comparison["baselineDistribution"]["samples"][0]["value"], baseline,
+            "{metric}"
+        );
+        assert_eq!(
+            comparison["candidateDistribution"]["samples"][0]["value"], candidate,
+            "{metric}"
+        );
+        assert_eq!(
+            comparison["pairedObserved"]["medianDifference"],
+            candidate - baseline,
+            "{metric}"
+        );
+        assert!(comparison["bootstrap"].is_null(), "{metric}");
+    }
+    assert_eq!(
+        overall["pairs"][0]["baselineId"],
+        overall["baselineDistribution"]["samples"][0]["id"]
+    );
+    let requests = comparisons
+        .iter()
+        .find(|value| value["metric"] == "scripted_request_count" && value["kind"] == "overall")
+        .unwrap();
+    assert_eq!(requests["baselineDistribution"]["median"], 3.0);
+    assert_eq!(requests["candidateDistribution"]["median"], 1.0);
+    assert_eq!(requests["pairedObserved"]["medianDifference"], -2.0);
+    let bytes = comparisons
+        .iter()
+        .find(|value| {
+            value["metric"] == "scripted_serialized_request_bytes" && value["kind"] == "overall"
+        })
+        .unwrap();
+    assert_eq!(bytes["unit"], "bytes");
+    assert_eq!(bytes["baselineDistribution"]["median"], 39.0);
+    assert_eq!(bytes["candidateDistribution"]["median"], 13.0);
+    assert_eq!(bytes["pairedObserved"]["medianDifference"], -26.0);
+    assert!(
+        !comparisons
+            .iter()
+            .any(|value| value["metric"] == "behavior_total_tokens"
+                || value["metric"] == "behavior_model_retries")
+    );
+    let markdown = fs::read_to_string(result.directory.join("report.md")).unwrap();
+    assert!(markdown.contains("discovery_searches (count)"));
+    assert!(markdown.contains("Behavior schema 2"));
+    assert!(markdown.contains("behavior_validation_duration_ns (ns)"));
+    assert!(markdown.contains("\"behaviorMetrics\""));
+    assert!(markdown.contains("scripted_serialized_request_bytes (bytes)"));
+    let request_row = markdown
+        .lines()
+        .find(|line| line.contains("scripted_request_count (count)") && line.contains("overall"))
+        .unwrap();
+    assert!(
+        request_row
+            .ends_with("| unavailable | unavailable | suppressed (n<20) / suppressed (n<20) |"),
+        "{request_row}"
+    );
+}
+
+#[test]
+fn workspace_lock_excludes_another_run_and_releases_on_owner_exit() {
+    let temp = tempfile::tempdir().unwrap();
+    let prepared = prepared_peer(temp.path(), true);
+    let first = lock_workspace(&prepared).unwrap();
+    assert!(
+        lock_workspace(&prepared)
+            .unwrap_err()
+            .to_string()
+            .contains("already in use")
+    );
+    drop(first);
+    let second = lock_workspace(&prepared).unwrap();
+    assert!(lock_workspace(&prepared).is_err());
+    drop(second);
+}
+
+#[test]
+fn evidence_binding_rejects_rollout_changes_and_missing_identities() {
+    let temp = tempfile::tempdir().unwrap();
+    let prepared = prepared_peer(temp.path(), true);
+    let mut attempt = attempt(&prepared, false, "bound-evidence");
+    execute_one(&prepared, &mut attempt, 10000).unwrap();
+    let rollout = attempt.evidence_directory.join("rollout.jsonl");
+    fs::write(&rollout, "{\"original\":true}\n").unwrap();
+    let native = attempt.native.as_mut().unwrap();
+    native.rollout_paths.push(rollout.clone());
+    fs::write(&native.evidence_path, serde_json::to_vec(native).unwrap()).unwrap();
+    freeze_attempt_evidence(&mut attempt).unwrap();
+    verify_attempt_evidence(&attempt).unwrap();
+    fs::write(&rollout, "{\"original\":false}\n").unwrap();
+    assert!(
+        verify_attempt_evidence(&attempt)
+            .unwrap_err()
+            .to_string()
+            .contains("changed prepared artifact")
+    );
+    fs::write(&rollout, "{\"original\":true}\n").unwrap();
+    attempt.evidence_files.clear();
+    assert!(
+        verify_attempt_evidence(&attempt)
+            .unwrap_err()
+            .to_string()
+            .contains("no frozen identity")
+    );
+}
+
+#[test]
+fn per_attempt_checkpoints_recover_an_interrupted_run_without_rewriting_prior_traces() {
+    let temp = tempfile::tempdir().unwrap();
+    let prepared = prepared_peer(temp.path(), true);
+    let mut first = attempt(&prepared, false, "first");
+    first.status = "not_started".into();
+    let mut second = attempt(&prepared, false, "second");
+    second.status = "not_started".into();
+    let directory = prepared.runs_directory.clone();
+    fs::create_dir_all(&directory).unwrap();
+    let result_path = directory.join("result.json");
+    let initial = RunResult {
+        schema_version: 1,
+        id: "interrupted".into(),
+        prepared_manifest: prepared.directory.join("prepared.json"),
+        prepared_manifest_sha256: "test schedule".into(),
+        directory,
+        mode: Mode::Fast,
+        original_run: None,
+        attempts: vec![first.clone(), second.clone()],
+        scripted_execution_ms: 0,
+        real_model_execution_ms: 0,
+        finished: false,
+    };
+    write_json(&result_path, &initial).unwrap();
+    let frozen_bytes = fs::read(&result_path).unwrap();
+    first.status = "setup_failed".into();
+    first.reason = Some("confirmed startup failure".into());
+    first.native = Some(
+        serde_json::from_value(json!({
+            "schemaVersion":1,"attemptId":"first","status":"setup_failed",
+            "elapsedMs":123,"cleanupMs":1,"threadId":null,"completedTurns":0,
+            "toolExecutions":0,"failure":{"kind":"setup_failure","message":"failed"},
+            "effectiveConfig":{},"events":[{"message":"original event"}],
+            "stdoutPaths":[],"stderrPaths":[],"rolloutPaths":[],
+            "providerRequestsPath":null,"adaptations":[],"evidencePath":"raw.json"
+        }))
+        .unwrap(),
+    );
+    checkpoint(&first).unwrap();
+    let first_bytes = fs::read(first.evidence_directory.join("attempt.json")).unwrap();
+    second.status = "running".into();
+    second.started_unix_ms = Some(999);
+    checkpoint(&second).unwrap();
+    assert_eq!(fs::read(&result_path).unwrap(), frozen_bytes);
+    assert_eq!(
+        fs::read(first.evidence_directory.join("attempt.json")).unwrap(),
+        first_bytes
+    );
+    let recovered = RunResult::load(&result_path).unwrap();
+    assert_eq!(recovered.attempts[0].status, "setup_failed");
+    assert_eq!(
+        recovered.attempts[0].native.as_ref().unwrap().events[0]["message"],
+        "original event"
+    );
+    assert_eq!(recovered.scripted_execution_ms, 123);
+    assert_eq!(recovered.real_model_execution_ms, 0);
+    assert_eq!(recovered.attempts[1].status, "incomplete");
+    assert_eq!(recovered.attempts[1].started_unix_ms, Some(999));
+    assert!(!recovered.finished);
+    // Checksum-valid evidence from another workload is still incompatible.
+    first.scheduled.workload = "wrong_task".into();
+    checkpoint(&first).unwrap();
+    assert!(
+        RunResult::load(&result_path)
+            .unwrap_err()
+            .to_string()
+            .contains("frozen schedule")
+    );
+}
+
+#[test]
+fn final_source_evidence_preserves_changes_without_hashing_build_products() {
+    let temp = tempfile::tempdir().unwrap();
+    let snapshot = temp.path().join("snapshot");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&snapshot).unwrap();
+    fs::write(snapshot.join("source.rs"), "original").unwrap();
+    fs::write(snapshot.join("deleted.rs"), "delete me").unwrap();
+    copy_tree(&snapshot, &workspace).unwrap();
+    fs::write(workspace.join("source.rs"), "fixed").unwrap();
+    fs::remove_file(workspace.join("deleted.rs")).unwrap();
+    fs::write(workspace.join("new.rs"), "new behavior").unwrap();
+    for directory in ["target", "node_modules", "__pycache__"] {
+        fs::create_dir(workspace.join(directory)).unwrap();
+        fs::write(workspace.join(directory).join("generated"), "build bytes").unwrap();
+    }
+    let evidence = temp.path().join("evidence");
+    let digest = preserve_final_changes(&snapshot, &workspace, &evidence).unwrap();
+    let changes: Value = read_json(&evidence.join("changes.json")).unwrap();
+    assert_eq!(changes.as_array().unwrap().len(), 3);
+    assert_eq!(
+        fs::read_to_string(evidence.join("source.rs")).unwrap(),
+        "fixed"
+    );
+    assert_eq!(
+        fs::read_to_string(evidence.join("new.rs")).unwrap(),
+        "new behavior"
+    );
+    assert!(
+        changes
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["path"] == "deleted.rs" && row["afterSha256"].is_null())
+    );
+    assert!(!evidence.join("target").exists());
+    fs::write(workspace.join("target/generated"), "different build bytes").unwrap();
+    assert_eq!(source_tree_inventory(&workspace).unwrap().sha256, digest);
+    fs::write(workspace.join("source.rs"), "regression").unwrap();
+    assert_ne!(source_tree_inventory(&workspace).unwrap().sha256, digest);
 }

@@ -1,4 +1,5 @@
 use crate::windows_sandbox::run_strict_read_root_grant;
+use anyhow::Context;
 use anyhow::Result;
 use codex_protocol::models::PermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -17,10 +18,9 @@ pub fn grant_read_root_non_elevated(
     if !read_root.is_absolute() {
         anyhow::bail!("path must be absolute: {}", read_root.display());
     }
-    if !read_root.exists() {
-        anyhow::bail!("path does not exist: {}", read_root.display());
-    }
-    if !read_root.is_dir() {
+    let metadata = std::fs::metadata(read_root)
+        .with_context(|| format!("could not inspect read root: {}", read_root.display()))?;
+    if !metadata.is_dir() {
         anyhow::bail!("path must be a directory: {}", read_root.display());
     }
 

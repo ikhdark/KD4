@@ -24,7 +24,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
     );
     ToolSpec::Function(ResponsesApiTool {
         name: "update_plan".to_string(),
-        description: "Updates the task checklist. At most one step can be in_progress at a time."
+        description: "Updates the task checklist for work with multiple substantive steps. Skip plans for straightforward work; do not create single-step plans. At most one step can be in_progress at a time."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -32,11 +32,11 @@ pub fn create_update_plan_tool() -> ToolSpec {
             BTreeMap::from([
                 (
                     "explanation".to_string(),
-                    JsonSchema::string(Some("Optional explanation for this update.".to_string())),
+                    JsonSchema::string(Some("Optional explanation for this update, including blockers or cancelled work. Do not mark unfinished work completed.".to_string())),
                 ),
                 (
                     "plan".to_string(),
-                    JsonSchema::array(plan_item, Some("Complete task checklist.".to_string())),
+                    JsonSchema::array(plan_item, Some("Complete task checklist, replacing the previous plan. Omitted steps are removed; include every step you want to retain.".to_string())),
                 ),
             ]),
             Some(vec!["plan".to_string()]),

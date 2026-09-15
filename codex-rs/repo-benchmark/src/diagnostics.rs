@@ -3,6 +3,7 @@
 
 use crate::native::NativeAttemptEvidence;
 use crate::prepare::provenance::FileIdentity;
+use crate::workloads::VerificationOutcome;
 use anyhow::{Context, Result, bail, ensure};
 use codex_app_server_test_client::terminate_owned_process;
 use serde::{Deserialize, Serialize};
@@ -14,7 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(120);
-const AUDIT_SCHEMA_VERSION: u64 = 18;
+const AUDIT_SCHEMA_VERSION: u64 = 20;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,9 +24,20 @@ pub struct DiagnosticResult {
     pub reports: Vec<Value>,
     pub stdout_paths: Vec<PathBuf>,
     pub stderr_paths: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_sessions: Vec<DiagnosticSessionFailure>,
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticSessionFailure {
+    pub session_index: usize,
+    pub rollout_path: Option<PathBuf>,
+    pub error: String,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn analyze(
     python: &Path,
     analyzer: &Path,
@@ -34,6 +46,7 @@ pub fn analyze(
     evidence_dir: &Path,
     workspace: &Path,
     tokens: bool,
+    verifier: Option<&VerificationOutcome>,
 ) -> DiagnosticResult {
     analyze_with_timeout(
         python,
@@ -43,6 +56,7 @@ pub fn analyze(
         evidence_dir,
         workspace,
         tokens,
+        verifier,
         ANALYSIS_TIMEOUT,
     )
 }
@@ -56,6 +70,7 @@ fn analyze_with_timeout(
     evidence_dir: &Path,
     workspace: &Path,
     tokens: bool,
+    verifier: Option<&VerificationOutcome>,
     timeout: Duration,
 ) -> DiagnosticResult {
     let mut result = DiagnosticResult {
@@ -63,6 +78,7 @@ fn analyze_with_timeout(
         reports: vec![],
         stdout_paths: vec![],
         stderr_paths: vec![],
+        failed_sessions: vec![],
         error: None,
     };
     if let Err(error) = verify_analyzer(analyzer, analyzer_files) {
@@ -73,6 +89,30 @@ fn analyze_with_timeout(
         result.error = Some(format!("create diagnostics evidence directory: {error}"));
         return result;
     }
+    // Compose analysis inputs separately: the native transcript is immutable
+    // evidence, while verification belongs to the surrounding attempt.
+    let runner_evidence = if let Some(verifier) = verifier {
+        let composed = (|| -> Result<PathBuf> {
+            let mut raw: Value = serde_json::from_slice(&fs::read(&native.evidence_path)?)?;
+            raw["verifier"] = serde_json::to_value(verifier)?;
+            let path = evidence_dir.join("analysis-input.json");
+            let output = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)?;
+            serde_json::to_writer_pretty(output, &raw)?;
+            Ok(path)
+        })();
+        match composed {
+            Ok(path) => path,
+            Err(error) => {
+                result.error = Some(format!("prepare analysis input: {error:#}"));
+                return result;
+            }
+        }
+    } else {
+        native.evidence_path.clone()
+    };
     let sources = if native.rollout_paths.is_empty() {
         vec![None]
     } else {
@@ -87,8 +127,6 @@ fn analyze_with_timeout(
     for (index, source) in sources.iter().enumerate() {
         let stdout = evidence_dir.join(format!("diagnostics-{index}.stdout.json"));
         let stderr = evidence_dir.join(format!("diagnostics-{index}.stderr.log"));
-        result.stdout_paths.push(stdout.clone());
-        result.stderr_paths.push(stderr.clone());
         let analysis = (|| -> Result<Value> {
             // Recheck immediately before every execution, including dependencies.
             verify_analyzer(analyzer, analyzer_files)?;
@@ -96,10 +134,12 @@ fn analyze_with_timeout(
                 .create_new(true)
                 .write(true)
                 .open(&stdout)?;
+            result.stdout_paths.push(stdout.clone());
             let stderr_file = OpenOptions::new()
                 .create_new(true)
                 .write(true)
                 .open(&stderr)?;
+            result.stderr_paths.push(stderr.clone());
             let mut command = Command::new(python);
             command.arg("-B").arg(analyzer);
             if let Some(source) = source {
@@ -108,7 +148,7 @@ fn analyze_with_timeout(
             // Runner evidence describes the whole attempt, so supply it once even
             // when a restart or child session produced multiple rollout files.
             if index == 0 {
-                command.arg("--runner-evidence").arg(&native.evidence_path);
+                command.arg("--runner-evidence").arg(&runner_evidence);
             }
             command
                 .args(["--tokens", if tokens { "on" } else { "off" }])
@@ -175,7 +215,14 @@ fn analyze_with_timeout(
         })();
         match analysis {
             Ok(report) => result.reports.push(report),
-            Err(error) => errors.push(format!("session {index}: {error:#}")),
+            Err(error) => {
+                result.failed_sessions.push(DiagnosticSessionFailure {
+                    session_index: index,
+                    rollout_path: source.map(Path::to_path_buf),
+                    error: format!("{error:#}"),
+                });
+                errors.push(format!("session {index}: {error:#}"));
+            }
         }
     }
     result.status = if errors.is_empty() {
@@ -238,6 +285,117 @@ mod tests {
     }
 
     #[test]
+    fn partial_analysis_identifies_the_failed_session_and_preserves_native_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut native = evidence(temp.path());
+        let original = fs::read(&native.evidence_path).unwrap();
+        let successful = temp.path().join("successful.jsonl");
+        let failed = temp.path().join("failed.jsonl");
+        fs::write(&successful, "successful rollout").unwrap();
+        fs::write(&failed, "failed rollout").unwrap();
+        native.rollout_paths = vec![successful, failed.clone()];
+        let analyzer = temp.path().join("analyzer.py");
+        fs::write(&analyzer, format!(
+            "import json, pathlib, sys\nif pathlib.Path(sys.argv[1]).name == 'failed.jsonl':\n    sys.exit('cannot analyze failed rollout')\nprint(json.dumps({{'schemaVersion': {AUDIT_SCHEMA_VERSION}, 'tokenAnalysisEnabled': False, 'runnerDiagnostics': {{'attemptId': 'failed-startup'}}}}))\n"
+        )).unwrap();
+        let file = FileIdentity::record(&analyzer).unwrap();
+        let python = which::which("python").unwrap();
+        let result = analyze(
+            &python,
+            &analyzer,
+            &[file],
+            &native,
+            &temp.path().join("diagnostics"),
+            temp.path(),
+            false,
+            None,
+        );
+        assert_eq!(result.status, "partial");
+        assert_eq!(result.reports.len(), 1);
+        assert_eq!(
+            result.reports[0]["runnerDiagnostics"]["attemptId"],
+            "failed-startup"
+        );
+        assert_eq!(result.failed_sessions.len(), 1);
+        assert_eq!(result.failed_sessions[0].session_index, 1);
+        assert_eq!(
+            result.failed_sessions[0].rollout_path.as_ref(),
+            Some(&failed)
+        );
+        assert!(
+            result.failed_sessions[0]
+                .error
+                .contains("Python session analyzer failed")
+        );
+        assert_eq!(result.stdout_paths.len(), 2);
+        assert_eq!(result.stderr_paths.len(), 2);
+        assert!(
+            result
+                .stdout_paths
+                .iter()
+                .chain(&result.stderr_paths)
+                .all(|path| path.is_file())
+        );
+        assert!(
+            fs::read_to_string(&result.stderr_paths[1])
+                .unwrap()
+                .contains("cannot analyze failed rollout")
+        );
+        assert_eq!(fs::read(&native.evidence_path).unwrap(), original);
+        assert_eq!(fs::read_to_string(failed).unwrap(), "failed rollout");
+    }
+
+    #[test]
+    fn log_creation_failure_does_not_advertise_a_nonexistent_log() {
+        let temp = tempfile::tempdir().unwrap();
+        let native = evidence(temp.path());
+        let original = fs::read(&native.evidence_path).unwrap();
+        let analyzer = temp.path().join("analyzer.py");
+        fs::write(&analyzer, "raise AssertionError('must not execute')\n").unwrap();
+        let file = FileIdentity::record(&analyzer).unwrap();
+        let directory = temp.path().join("diagnostics");
+        fs::create_dir_all(directory.join("diagnostics-0.stderr.log")).unwrap();
+        let result = analyze(
+            Path::new("must-not-launch-python"),
+            &analyzer,
+            &[file],
+            &native,
+            &directory,
+            temp.path(),
+            false,
+            None,
+        );
+        assert_eq!(result.status, "failed");
+        assert!(result.reports.is_empty());
+        assert_eq!(
+            result.stdout_paths,
+            vec![directory.join("diagnostics-0.stdout.json")]
+        );
+        assert!(result.stdout_paths[0].is_file());
+        assert!(result.stderr_paths.is_empty());
+        assert_eq!(result.failed_sessions.len(), 1);
+        assert_eq!(result.failed_sessions[0].session_index, 0);
+        assert!(result.failed_sessions[0].rollout_path.is_none());
+        assert!(
+            !result.failed_sessions[0]
+                .error
+                .contains("start frozen Python session analyzer")
+        );
+        assert_eq!(fs::read(&native.evidence_path).unwrap(), original);
+    }
+
+    #[test]
+    fn older_diagnostics_without_session_failures_remain_readable() {
+        let old = json!({
+            "status": "available", "reports": [], "stdoutPaths": [],
+            "stderrPaths": [], "error": null
+        });
+        let result: DiagnosticResult = serde_json::from_value(old.clone()).unwrap();
+        assert!(result.failed_sessions.is_empty());
+        assert_eq!(serde_json::to_value(result).unwrap(), old);
+    }
+
+    #[test]
     fn real_python_audit_consumes_startup_failure_and_disables_token_analysis() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -269,6 +427,7 @@ mod tests {
             &temp.path().join("diagnostics"),
             root,
             false,
+            None,
         );
         assert_eq!(result.status, "available", "{:?}", result.error);
         assert_eq!(result.reports.len(), 1);
@@ -301,6 +460,7 @@ mod tests {
             &temp.path().join("invalid"),
             temp.path(),
             true,
+            None,
         );
         assert_eq!(failed.status, "failed");
         assert!(failed.error.unwrap().contains("invalid JSON"));
@@ -318,6 +478,7 @@ mod tests {
             &temp.path().join("tampered"),
             temp.path(),
             true,
+            None,
         );
         assert_eq!(changed.status, "failed");
         assert!(changed.error.unwrap().contains("changed prepared artifact"));
@@ -346,6 +507,7 @@ mod tests {
             &temp.path().join("timeout"),
             temp.path(),
             false,
+            None,
             Duration::from_millis(100),
         );
         assert_eq!(result.status, "failed");

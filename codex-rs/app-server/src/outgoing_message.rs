@@ -197,6 +197,11 @@ impl ComponentNotificationCache {
             .retain(|(cached_connection_id, _), _| *cached_connection_id != connection_id);
         self.rate_limits.remove(&connection_id);
     }
+
+    fn remove_thread(&mut self, thread_id: &str) {
+        self.token_usage
+            .retain(|(_, cached_thread_id), _| cached_thread_id != thread_id);
+    }
 }
 
 struct PendingCallbackEntry {
@@ -887,12 +892,26 @@ impl OutgoingMessageSender {
                 })
                 .collect::<Vec<_>>()
         };
+        let delivery_deadline = tokio::time::Instant::now() + RESOURCE_DELIVERY_TIMEOUT;
         for request_id in request_ids {
-            let permit = match self.sender.reserve().await {
-                Ok(permit) => permit,
-                Err(err) => {
-                    warn!("failed to reserve capacity to resend request to client: {err:?}");
+            let permit = tokio::select! {
+                biased;
+                _ = self.delivery_shutdown.cancelled() => {
+                    warn!("request replay was cancelled by shutdown");
                     return;
+                }
+                result = tokio::time::timeout_at(delivery_deadline, self.sender.reserve()) => {
+                    match result {
+                        Ok(Ok(permit)) => permit,
+                        Ok(Err(err)) => {
+                            warn!(%err, "failed to reserve capacity to resend request to client");
+                            return;
+                        }
+                        Err(_) => {
+                            warn!("request replay exceeded the resource delivery budget");
+                            return;
+                        }
+                    }
                 }
             };
             // Capacity admission can outlive a disconnect. Keep the active
@@ -1077,6 +1096,12 @@ impl OutgoingMessageSender {
         thread_id: ThreadId,
         error: Option<JSONRPCErrorError>,
     ) {
+        // Thread unload reaches this cleanup even when backpressure prevents publishing
+        // ThreadClosed. Do not retain per-thread dedup state until connection shutdown.
+        self.component_notification_cache
+            .lock()
+            .await
+            .remove_thread(&thread_id.to_string());
         let entries = {
             let mut request_id_to_callback = self
                 .request_id_to_callback
@@ -3635,6 +3660,133 @@ mod tests {
             Ok(expected)
         );
         assert_eq!(outgoing.pending_callback_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn replay_capacity_wait_is_bounded_and_does_not_authorize_undelivered_requests() {
+        tokio::time::pause();
+        for shutdown in [false, true] {
+            let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(1);
+            let outgoing = OutgoingMessageSender::new(
+                tx,
+                codex_analytics::AnalyticsEventsClient::disabled(),
+            );
+            let original = ConnectionId(71);
+            let replayed = ConnectionId(72);
+            for connection_id in [original, replayed] {
+                outgoing.connection_opened(connection_id, Arc::new(AtomicBool::new(true))).await;
+            }
+            let thread_id = ThreadId::new();
+            let (request_id, result) = outgoing.send_request_to_connections(
+                Some(&[original]),
+                ServerRequestPayload::DynamicToolCall(DynamicToolCallParams {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "turn-replay-bounded".to_string(),
+                    call_id: "call-replay-bounded".to_string(),
+                    namespace: None,
+                    tool: "test_tool".to_string(),
+                    arguments: json!({}),
+                }),
+                Some(thread_id),
+            ).await.expect("request admitted");
+            let mut replay = Box::pin(outgoing.replay_requests_to_connection_for_thread(replayed, thread_id, true));
+            assert!(futures::poll!(replay.as_mut()).is_pending());
+            if shutdown {
+                outgoing.delivery_shutdown.cancel();
+                timeout(Duration::from_millis(1), replay).await.expect("shutdown releases replay immediately");
+            } else {
+                timeout(RESOURCE_DELIVERY_TIMEOUT + Duration::from_millis(1), replay)
+                    .await.expect("replay has its own delivery deadline");
+            }
+            assert!(matches!(rx.recv().await,
+                Some(OutgoingEnvelope::ToConnection { connection_id, .. }) if connection_id == original));
+            assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+            outgoing.notify_client_response(replayed, request_id.clone(), json!({"stale": true})).await;
+            assert_eq!(outgoing.pending_callback_count().await, 1);
+            let expected = json!({"contentItems": [], "success": true});
+            outgoing.notify_client_response(original, request_id, expected.clone()).await;
+            assert_eq!(result.await.expect("original callback remains live"), Ok(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_cleanup_evicts_token_usage_and_resume_delivers_unchanged_usage() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            AnalyticsEventsClient::disabled(),
+        ));
+        let closed_thread = ThreadId::new();
+        let other_thread = ThreadId::new();
+        let notification = |thread_id: ThreadId| {
+            let usage = json!({"totalTokens": 1, "inputTokens": 1, "cachedInputTokens": 0, "outputTokens": 0, "reasoningOutputTokens": 0});
+            ServerNotification::ThreadTokenUsageUpdated(
+                serde_json::from_value(json!({
+                    "threadId": thread_id.to_string(), "turnId": "turn",
+                    "tokenUsage": {"total": usage, "last": usage, "modelContextWindow": null}
+                }))
+                .unwrap(),
+            )
+        };
+        let closed = ThreadScopedOutgoingMessageSender::new(
+            outgoing.clone(),
+            vec![ConnectionId(1), ConnectionId(2)],
+            closed_thread,
+        );
+        let other = ThreadScopedOutgoingMessageSender::new(
+            outgoing.clone(),
+            vec![ConnectionId(1)],
+            other_thread,
+        );
+        closed
+            .send_component_notification_if_changed(notification(closed_thread))
+            .await;
+        other
+            .send_component_notification_if_changed(notification(other_thread))
+            .await;
+        for _ in 0..3 {
+            rx.try_recv().expect("initial usage delivered");
+        }
+        outgoing
+            .cancel_requests_for_thread(closed_thread, None)
+            .await;
+        assert_eq!(
+            outgoing
+                .component_notification_cache
+                .lock()
+                .await
+                .token_usage
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![(ConnectionId(1), other_thread.to_string())]
+        );
+        other
+            .send_component_notification_if_changed(notification(other_thread))
+            .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "unrelated thread remains deduplicated"
+        );
+        closed
+            .send_component_notification_if_changed(notification(closed_thread))
+            .await;
+        for expected_connection in [ConnectionId(1), ConnectionId(2)] {
+            let OutgoingEnvelope::ToConnection {
+                connection_id,
+                message: OutgoingMessage::AppServerNotification(delivered),
+                ..
+            } = rx.try_recv().expect("resumed usage delivered")
+            else {
+                panic!("expected targeted usage");
+            };
+            assert_eq!(connection_id, expected_connection);
+            assert_eq!(
+                serde_json::to_value(delivered).unwrap(),
+                serde_json::to_value(notification(closed_thread)).unwrap()
+            );
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

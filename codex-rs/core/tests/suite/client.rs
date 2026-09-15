@@ -3160,23 +3160,24 @@ async fn azure_responses_request_includes_store_and_omits_item_ids() {
 
     assert_eq!(body["store"], serde_json::Value::Bool(true));
     assert_eq!(body["stream"], serde_json::Value::Bool(true));
-    assert_eq!(body["input"].as_array().map(Vec::len), Some(10));
-    assert_eq!(body["input"][0].get("id"), None);
-    assert_eq!(body["input"][1].get("id"), None);
-    assert_eq!(body["input"][2].get("id"), None);
-    assert_eq!(body["input"][3].get("id"), None);
-    assert_eq!(
-        body["input"][4]["call_id"].as_str(),
-        Some("function-call-id")
-    );
-    assert_eq!(body["input"][5].get("id"), None);
-    assert_eq!(body["input"][6].get("id"), None);
-    assert_eq!(
-        body["input"][7]["call_id"].as_str(),
-        Some("custom-tool-call-id")
-    );
-    assert_eq!(body["input"][8].get("id"), None);
-    assert_eq!(body["input"][9].get("id"), None);
+    let input = body["input"].as_array().expect("request input");
+    assert_eq!(input.len(), 12);
+    assert!(input.iter().all(|item| item.get("id").is_none()));
+    for (kind, call_id) in [
+        ("function_call", "function-call-id"),
+        ("function_call_output", "function-call-id"),
+        ("custom_tool_call", "custom-tool-call-id"),
+        ("custom_tool_call_output", "custom-tool-call-id"),
+    ] {
+        let matching = input
+            .iter()
+            .filter(|item| item["type"] == kind && item["call_id"] == call_id)
+            .count();
+        assert_eq!(matching, 1, "preserve {kind} correlation without item IDs");
+    }
+    for text in ["legacy message", "empty-id message"] {
+        assert!(input.iter().any(|item| item["content"][0]["text"] == text));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

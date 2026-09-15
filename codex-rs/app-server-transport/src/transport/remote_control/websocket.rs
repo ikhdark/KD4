@@ -2094,8 +2094,10 @@ mod tests {
         let mut reconnect_attempt = 9;
         for _ in 0..3 {
             let delay = next_reconnect_delay(&mut reconnect_attempt);
-            assert_eq!(delay, REMOTE_CONTROL_RECONNECT_BACKOFF_CAP);
-            assert_eq!(reconnect_attempt, 9);
+            assert!(
+                (Duration::from_secs(27)..REMOTE_CONTROL_RECONNECT_BACKOFF_CAP).contains(&delay)
+            );
+            assert!(reconnect_attempt >= 9);
         }
     }
 

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io;
 
 use std::path::Path;
@@ -961,8 +962,10 @@ struct RawExecToolCallOutput {
 #[derive(Debug)]
 struct OutputCapture {
     text: Vec<u8>,
+    tail: VecDeque<u8>,
     max_bytes: Option<usize>,
     truncated: bool,
+    omitted_bytes: usize,
 }
 
 impl OutputCapture {
@@ -973,8 +976,10 @@ impl OutputCapture {
                     AGGREGATE_BUFFER_INITIAL_CAPACITY.min(limit)
                 }),
             ),
+            tail: VecDeque::new(),
             max_bytes,
             truncated: false,
+            omitted_bytes: 0,
         }
     }
 
@@ -983,10 +988,25 @@ impl OutputCapture {
             self.text.extend_from_slice(bytes);
             return;
         };
-        let remaining = max_bytes.saturating_sub(self.text.len());
-        let take = remaining.min(bytes.len());
+        let head_limit = max_bytes / 2;
+        let take = head_limit.saturating_sub(self.text.len()).min(bytes.len());
         self.text.extend_from_slice(&bytes[..take]);
-        self.truncated |= take < bytes.len();
+        let bytes = &bytes[take..];
+        let tail_limit = max_bytes - head_limit;
+        let overflow = self
+            .tail
+            .len()
+            .saturating_add(bytes.len())
+            .saturating_sub(tail_limit);
+        self.omitted_bytes = self.omitted_bytes.saturating_add(overflow);
+        self.truncated |= overflow > 0;
+        if bytes.len() >= tail_limit {
+            self.tail.clear();
+            self.tail.extend(&bytes[bytes.len() - tail_limit..]);
+        } else {
+            self.tail.drain(..overflow);
+            self.tail.extend(bytes);
+        }
     }
 
     fn mark_truncated(&mut self) {
@@ -994,8 +1014,34 @@ impl OutputCapture {
     }
 
     fn snapshot(&self) -> StreamOutput<Vec<u8>> {
+        let mut text = self.text.clone();
+        const MARKER: &[u8] = b"\n[... output truncated ...]\n";
+        let mut tail_start = 0;
+        if self.omitted_bytes > 0 {
+            let include_marker = text.len() >= MARKER.len();
+            if include_marker {
+                text.truncate(text.len() - MARKER.len());
+            }
+            // The retained head and tail can split an otherwise valid UTF-8
+            // character. Drop only those partial characters at the cut.
+            if let Err(error) = std::str::from_utf8(&text)
+                && error.error_len().is_none()
+            {
+                text.truncate(error.valid_up_to());
+            }
+            tail_start = self
+                .tail
+                .iter()
+                .take(3)
+                .take_while(|byte| **byte & 0xc0 == 0x80)
+                .count();
+            if include_marker {
+                text.extend_from_slice(MARKER);
+            }
+        }
+        text.extend(self.tail.iter().skip(tail_start));
         StreamOutput {
-            text: self.text.clone(),
+            text,
             truncated_after_lines: None,
             truncated: self.truncated,
         }
@@ -1003,54 +1049,6 @@ impl OutputCapture {
 }
 
 type SharedOutputCapture = Arc<Mutex<OutputCapture>>;
-
-#[cfg(test)]
-fn aggregate_output(
-    stdout: &StreamOutput<Vec<u8>>,
-    stderr: &StreamOutput<Vec<u8>>,
-    max_bytes: Option<usize>,
-) -> StreamOutput<Vec<u8>> {
-    let Some(max_bytes) = max_bytes else {
-        let total_len = stdout.text.len().saturating_add(stderr.text.len());
-        let mut aggregated = Vec::with_capacity(total_len);
-        aggregated.extend_from_slice(&stdout.text);
-        aggregated.extend_from_slice(&stderr.text);
-        return StreamOutput {
-            text: aggregated,
-            truncated_after_lines: None,
-            truncated: stdout.truncated || stderr.truncated,
-        };
-    };
-
-    let total_len = stdout.text.len().saturating_add(stderr.text.len());
-    let mut aggregated = Vec::with_capacity(total_len.min(max_bytes));
-
-    if total_len <= max_bytes {
-        aggregated.extend_from_slice(&stdout.text);
-        aggregated.extend_from_slice(&stderr.text);
-        return StreamOutput {
-            text: aggregated,
-            truncated_after_lines: None,
-            truncated: stdout.truncated || stderr.truncated,
-        };
-    }
-
-    // Under contention, reserve 1/3 for stdout and 2/3 for stderr; rebalance unused stderr to stdout.
-    let want_stdout = stdout.text.len().min(max_bytes / 3);
-    let want_stderr = stderr.text.len();
-    let stderr_take = want_stderr.min(max_bytes.saturating_sub(want_stdout));
-    let remaining = max_bytes.saturating_sub(want_stdout + stderr_take);
-    let stdout_take = want_stdout + remaining.min(stdout.text.len().saturating_sub(want_stdout));
-
-    aggregated.extend_from_slice(&stdout.text[..stdout_take]);
-    aggregated.extend_from_slice(&stderr.text[..stderr_take]);
-
-    StreamOutput {
-        text: aggregated,
-        truncated_after_lines: None,
-        truncated: true,
-    }
-}
 
 /// This is a general-purpose function for executing a command specified by
 /// [ExecParams]. Events are reported via `stdout_stream`, if specified, and

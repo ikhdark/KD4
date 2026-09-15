@@ -464,7 +464,7 @@ fn validate_windows_environment_info(info: &EnvironmentInfo) -> Result<(), ExecS
             info.operating_system.as_deref().unwrap_or_default()
         )));
     }
-    if !matches!(info.shell.name.as_str(), "powershell" | "cmd") {
+    if !matches!(info.shell.name.as_str(), "powershell" | "pwsh" | "cmd") {
         return Err(ExecServerError::Protocol(format!(
             "remote environment reported unsupported Windows shell `{}`",
             info.shell.name
@@ -495,7 +495,7 @@ fn windows_shell_path_matches_name(shell_name: &str, shell_path: &str) -> bool {
 
     let executable_name = shell_path.rsplit(['/', '\\']).next().unwrap_or(shell_path);
     match shell_name {
-        "powershell" => matches_ignore_ascii_case(
+        "powershell" | "pwsh" => matches_ignore_ascii_case(
             executable_name,
             &["powershell", "powershell.exe", "pwsh", "pwsh.exe"],
         ),
@@ -1680,6 +1680,7 @@ mod tests {
 
         for info in [
             environment_info(Some("windows"), "powershell", Some("file:///C:/workspace")),
+            environment_info(Some("windows"), "pwsh", Some("file:///C:/workspace")),
             environment_info(None, "cmd", Some("file://server/share/workspace")),
             environment_info(None, "powershell", None),
             uppercase_powershell,
@@ -2246,11 +2247,11 @@ mod tests {
                     "-Command".to_string(),
                     "$null = [Console]::In.ReadLine(); [Console]::Out.WriteLine('{\"id\":1,\"result\":{\"sessionId\":\"stdio-test\"}}'); $null = [Console]::In.ReadLine(); Start-Sleep -Seconds 60".to_string(),
                 ],
-                env: HashMap::new(),
+                env: std::env::vars().collect(),
                 cwd: None,
             },
             client_name: "stdio-test-client".to_string(),
-            initialize_timeout: Duration::from_secs(1),
+            initialize_timeout: Duration::from_secs(5),
             resume_session_id: None,
         })
         .await

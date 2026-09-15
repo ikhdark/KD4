@@ -2,7 +2,7 @@ use super::builds;
 use super::environment::{BASE_CONFIG, Environment};
 use super::feature_overrides;
 use super::provenance::{
-    FileIdentity, git, materialize_commit, read_json, reset_workspace, write_json,
+    self, FileIdentity, git, materialize_commit, read_json, reset_workspace, write_json,
 };
 use super::resolve_source;
 use crate::schedule::Variant;
@@ -37,9 +37,121 @@ fn repository(parent: &Path, name: &str, contents: &str) -> PathBuf {
 }
 
 #[test]
-fn native_worktree_uses_the_exact_prepared_absolute_destination() {
+fn atomic_checkpoint_keeps_the_last_record_until_a_complete_replacement_is_published() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("attempt.json");
+    provenance::write_atomic_json(&path, &json!({"status":"running"})).unwrap();
+    // Simulate interruption during an unpublished replacement, without a sidecar.
+    fs::write(temp.path().join("attempt.interrupted.pending"), b"{partial").unwrap();
+    assert_eq!(
+        read_json::<Value>(&path).unwrap(),
+        json!({"status":"running"})
+    );
+    assert!(!path.with_extension("sha256").exists());
+    provenance::write_atomic_json(&path, &json!({"status":"completed"})).unwrap();
+    assert_eq!(
+        read_json::<Value>(&path).unwrap(),
+        json!({"status":"completed"})
+    );
+    let changed = fs::read_to_string(&path)
+        .unwrap()
+        .replace("completed", "incorrect");
+    fs::write(&path, changed).unwrap();
+    assert!(
+        read_json::<Value>(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("changed JSON artifact")
+    );
+}
+
+#[test]
+fn atomic_checkpoint_failed_publication_removes_unpublished_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("attempt.json");
+    fs::create_dir(&path).unwrap();
+    let existing = path.join("existing");
+    fs::write(&existing, b"preserve me").unwrap();
+
+    for attempt in 0..3 {
+        let error = provenance::write_atomic_json(&path, &json!({"attempt": attempt}))
+            .expect_err("a checkpoint cannot replace a directory");
+        assert!(error.to_string().contains("atomically publish checkpoint"));
+        assert_eq!(fs::read(&existing).unwrap(), b"preserve me");
+        let entries = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![path.clone()], "failed attempt {attempt}");
+    }
+}
+
+#[test]
+fn atomic_checkpoint_rejects_invalid_payloads_without_changing_the_record() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("attempt.json");
+    let accepted = json!({"status": "running"});
+    provenance::write_atomic_json(&path, &accepted).unwrap();
+    let original_bytes = fs::read(&path).unwrap();
+
+    for (payload, expected_error) in [
+        (json!([]), "atomic record must be an object"),
+        (
+            json!({"_recordSha256": "forged"}),
+            "reserved record checksum key",
+        ),
+    ] {
+        let error = provenance::write_atomic_json(&path, &payload).unwrap_err();
+        assert_eq!(error.to_string(), expected_error);
+        assert_eq!(fs::read(&path).unwrap(), original_bytes);
+        assert_eq!(read_json::<Value>(&path).unwrap(), accepted);
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+}
+
+#[test]
+fn feature_inventory_comes_from_selected_commit_despite_dirty_inventory() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = repository(temp.path(), "source", "source");
+    let contents = b"# selected commit\r\nfeatures = []\r\n";
+    fs::write(repo.join("kd4_features.toml"), contents).unwrap();
+    git(&repo, &["add", "kd4_features.toml"]).unwrap();
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "inventory",
+        ],
+    )
+    .unwrap();
+    let source = resolve_source(&repo, "HEAD", temp.path().join("checkout"), false).unwrap();
+    fs::write(repo.join("kd4_features.toml"), "features = ['dirty']").unwrap();
+    let frozen = temp.path().join("frozen.toml");
+    super::snapshot_feature_inventory(&source, &frozen).unwrap();
+    assert_eq!(fs::read(frozen).unwrap(), contents);
+    assert_eq!(
+        fs::read_to_string(repo.join("kd4_features.toml")).unwrap(),
+        "features = ['dirty']"
+    );
+}
+
+#[test]
+fn native_checkout_uses_exact_destination_without_origin_registrations() {
     let temp = tempfile::tempdir().unwrap();
     let repo = repository(temp.path(), "source", "pinned native contents\n");
+    // A clone does not inherit the source repository's local core.autocrlf.
+    // Pin this fixture's checkout bytes independently of the user's Git defaults.
+    fs::write(
+        repo.join(".gitattributes"),
+        "*.txt text eol=lf\n*.snap text eol=lf\n",
+    )
+    .unwrap();
     let snapshot = PathBuf::from("nested").join(format!("{}.snap", "long-snapshot-name".repeat(8)));
     fs::write(repo.join(&snapshot), "pinned snapshot bytes\n").unwrap();
     git(&repo, &["add", "."]).unwrap();
@@ -63,7 +175,21 @@ fn native_worktree_uses_the_exact_prepared_absolute_destination() {
         .join("prepared-sources-with-a-fixed-benchmark-owned-location".repeat(2))
         .join("native-checkout");
     let source = resolve_source(&repo, "HEAD", destination.clone(), false).unwrap();
+    let original_worktrees = git(&repo, &["worktree", "list", "--porcelain"]).unwrap();
     super::checkout(&source).unwrap();
+    assert_eq!(
+        git(&repo, &["worktree", "list", "--porcelain"]).unwrap(),
+        original_worktrees,
+        "native preparation must not register a worktree in the user's repository"
+    );
+    assert!(
+        destination.join(".git").is_dir(),
+        "prepared source owns an independent Git directory"
+    );
+    assert!(
+        !destination.join(".git/objects/info/alternates").exists(),
+        "prepared objects must not depend on the user's mutable object store"
+    );
     assert_eq!(fs::canonicalize(&destination).unwrap(), destination);
     assert_eq!(
         fs::read(destination.join("tracked.txt")).unwrap(),
@@ -83,6 +209,91 @@ fn native_worktree_uses_the_exact_prepared_absolute_destination() {
         git(&repo, &["config", "--local", "--get", "core.longpaths"]).unwrap(),
         "false",
         "preparation must not change the user's repository configuration"
+    );
+}
+
+#[test]
+fn failed_native_checkout_cleans_only_its_new_destination() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = repository(temp.path(), "source", "preserved original contents\n");
+    let destination = temp.path().join("prepared/native");
+    let mut source = resolve_source(&repo, "HEAD", destination.clone(), false).unwrap();
+    let original_worktrees = git(&repo, &["worktree", "list", "--porcelain"]).unwrap();
+    source.revision = "0".repeat(40);
+    let error = super::checkout(&source).unwrap_err();
+    assert!(format!("{error:#}").contains("initialize independent local native checkout"));
+    assert!(
+        !destination.exists(),
+        "failed initialization must not leave a partial checkout"
+    );
+    assert_eq!(
+        git(&repo, &["worktree", "list", "--porcelain"]).unwrap(),
+        original_worktrees
+    );
+    assert_eq!(
+        fs::read(repo.join("tracked.txt")).unwrap(),
+        b"preserved original contents\n"
+    );
+    fs::create_dir_all(&destination).unwrap();
+    fs::write(destination.join("existing-build-evidence"), b"keep").unwrap();
+    assert!(
+        super::checkout(&source)
+            .unwrap_err()
+            .to_string()
+            .contains("destination already exists")
+    );
+    assert_eq!(
+        fs::read(destination.join("existing-build-evidence")).unwrap(),
+        b"keep"
+    );
+}
+
+#[test]
+fn selected_reference_toolchain_uses_commit_and_rejects_different_shared_pin() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = repository(temp.path(), "reference", "reference fixture\n");
+    fs::create_dir(repo.join("codex-rs")).unwrap();
+    let declaration = repo.join("codex-rs/rust-toolchain.toml");
+    fs::write(&declaration, "[toolchain]\nchannel = '1.95.0'\n").unwrap();
+    git(&repo, &["add", "."]).unwrap();
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Repo Benchmark",
+            "-c",
+            "user.email=repo-benchmark@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "pin compiler",
+        ],
+    )
+    .unwrap();
+    let source =
+        resolve_source(&repo, "HEAD", temp.path().join("prepared/reference"), false).unwrap();
+    fs::write(&declaration, "[toolchain]\nchannel = '1.96.0'\n").unwrap();
+    super::validate_selected_toolchain(&source, "1.95.0", "reference").unwrap();
+    let error = format!(
+        "{:#}",
+        super::validate_selected_toolchain(&source, "1.94.0", "reference").unwrap_err()
+    );
+    assert!(error.contains(&format!("reference at {}", source.revision)));
+    assert!(error.contains("declares Rust 1.95.0"));
+    assert!(error.contains("shared benchmark toolchain is 1.94.0"));
+    assert!(
+        !source.checkout.exists(),
+        "pin mismatch must fail before native checkout or build"
+    );
+    assert_eq!(
+        fs::read_to_string(&declaration).unwrap(),
+        "[toolchain]\nchannel = '1.96.0'\n"
+    );
+    assert!(
+        builds::validate_toolchain("[toolchain]\ncomponents = []\n", &source.revision, "1.95.0")
+            .unwrap_err()
+            .to_string()
+            .contains("lacks a Rust toolchain channel")
     );
 }
 
@@ -186,7 +397,13 @@ fn reset_restores_the_same_absolute_root_and_shared_inputs() {
     fs::write(snapshot.join("AGENTS.md"), "identical instructions\n").unwrap();
     fs::write(snapshot.join("scripts/helper.py"), "print(7)\n").unwrap();
     let workspace = prepared.join("workspace");
-    reset_workspace(&prepared, &workspace, &snapshot).unwrap();
+    reset_workspace(
+        &prepared,
+        &workspace,
+        &snapshot,
+        &provenance::hash_tree(&snapshot).unwrap(),
+    )
+    .unwrap();
     let first_root = fs::canonicalize(&workspace).unwrap();
     fs::write(
         workspace.join("AGENTS.md"),
@@ -195,7 +412,13 @@ fn reset_restores_the_same_absolute_root_and_shared_inputs() {
     .unwrap();
     fs::write(workspace.join("scripts/helper.py"), "print(99)\n").unwrap();
     fs::write(workspace.join("leftover.txt"), "previous attempt\n").unwrap();
-    reset_workspace(&prepared, &workspace, &snapshot).unwrap();
+    reset_workspace(
+        &prepared,
+        &workspace,
+        &snapshot,
+        &provenance::hash_tree(&snapshot).unwrap(),
+    )
+    .unwrap();
     assert_eq!(fs::canonicalize(&workspace).unwrap(), first_root);
     assert_eq!(
         fs::read(workspace.join("AGENTS.md")).unwrap(),
@@ -222,16 +445,26 @@ fn reset_rejects_wrong_name_or_parent_without_deleting_the_target() {
     fs::write(outside.join("sentinel"), "outside content").unwrap();
     fs::write(wrong_name.join("sentinel"), "source content").unwrap();
     assert!(
-        reset_workspace(&prepared, &outside, &snapshot)
-            .unwrap_err()
-            .to_string()
-            .contains("escaped preparation")
+        reset_workspace(
+            &prepared,
+            &outside,
+            &snapshot,
+            &provenance::hash_tree(&snapshot).unwrap()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("escaped preparation")
     );
     assert!(
-        reset_workspace(&prepared, &wrong_name, &snapshot)
-            .unwrap_err()
-            .to_string()
-            .contains("prepared workspace")
+        reset_workspace(
+            &prepared,
+            &wrong_name,
+            &snapshot,
+            &provenance::hash_tree(&snapshot).unwrap()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("prepared workspace")
     );
     assert_eq!(
         fs::read(outside.join("sentinel")).unwrap(),
@@ -391,6 +624,38 @@ fn base_configuration_contains_exactly_the_approved_settings() {
 }
 
 #[test]
+fn project_configuration_comparison_records_explicit_differences_per_arm_without_values() {
+    use super::environment::ProjectConfigComparison;
+    use crate::schedule::Variant;
+    use std::collections::BTreeMap;
+
+    let temp = tempfile::tempdir().unwrap();
+    let overrides = BTreeMap::from([
+        (Variant::ForkOff, vec!["features.kd4_runtime=false".into()]),
+        (Variant::ForkOn, vec!["features.kd4_runtime=true".into()]),
+        (Variant::Reference, vec![]),
+    ]);
+    assert!(ProjectConfigComparison::capture(temp.path(), BASE_CONFIG, &overrides).unwrap().is_none());
+    std::fs::create_dir(temp.path().join(".codex")).unwrap();
+    let path = temp.path().join(".codex/config.toml");
+    std::fs::write(&path, "approval_policy = 'never'\nmodel = 'private-model-name'\nallow_login_shell = false\n[features]\nkd4_runtime = true\n[reasoning_phase_efforts]\nverify = 'low'\n").unwrap();
+    let comparison = ProjectConfigComparison::capture(temp.path(), BASE_CONFIG, &overrides).unwrap().unwrap();
+    let off = &comparison.by_variant[&Variant::ForkOff];
+    assert_eq!(off.changed, ["features.kd4_runtime", "model"]);
+    assert_eq!(off.project_only, ["allow_login_shell", "reasoning_phase_efforts.verify"]);
+    assert_eq!(off.matching_keys, 1);
+    assert!(off.benchmark_only.contains(&"personality".into()));
+    assert_eq!(comparison.by_variant[&Variant::ForkOn].changed, ["model"]);
+    assert_eq!(comparison.by_variant[&Variant::ForkOn].matching_keys, 2);
+    assert_eq!(comparison.by_variant[&Variant::Reference].project_only, ["allow_login_shell", "features.kd4_runtime", "reasoning_phase_efforts.verify"]);
+    let frozen = serde_json::to_string(&comparison).unwrap();
+    assert!(!frozen.contains("private-model-name"));
+    std::fs::write(&path, "model = 'later-change'\n").unwrap();
+    assert_eq!(serde_json::to_string(&comparison).unwrap(), frozen);
+    assert_ne!(ProjectConfigComparison::capture(temp.path(), BASE_CONFIG, &overrides).unwrap().unwrap().sha256, comparison.sha256);
+}
+
+#[test]
 fn native_shell_identity_matches_pwsh_preference_and_installed_fallbacks() {
     use super::environment::select_windows_shell;
 
@@ -453,7 +718,13 @@ fn reset_establishes_a_git_root_below_parent_instructions_and_config() {
     fs::create_dir_all(snapshot.join("nested")).unwrap();
     fs::write(snapshot.join("AGENTS.md"), "Approved task instructions\n").unwrap();
     let workspace = prepared.join("workspace");
-    reset_workspace(&prepared, &workspace, &snapshot).unwrap();
+    reset_workspace(
+        &prepared,
+        &workspace,
+        &snapshot,
+        &provenance::hash_tree(&snapshot).unwrap(),
+    )
+    .unwrap();
     let expected_root = fs::canonicalize(&workspace).unwrap();
     for cwd in [&workspace, &workspace.join("nested")] {
         let actual = git(cwd, &["rev-parse", "--show-toplevel"]).unwrap();
@@ -537,6 +808,11 @@ fn reused_build_reports_lookup_time_without_replacing_original_build_time() {
         "pinned dependency bytes\n",
     )
     .unwrap();
+    fs::write(
+        source.join("codex-rs/rust-toolchain.toml"),
+        "[toolchain]\nchannel = 'recorded-toolchain'\n",
+    )
+    .unwrap();
     let artifact = temp.path().join("native-artifact");
     fs::write(&artifact, "original native executable\n").unwrap();
     let environment = Environment {
@@ -614,5 +890,189 @@ fn reused_build_reports_lookup_time_without_replacing_original_build_time() {
         fs::read(&record).unwrap(),
         record_bytes,
         "reusing a build must preserve its original timing record"
+    );
+    fs::write(
+        source.join("codex-rs/rust-toolchain.toml"),
+        "[toolchain]\nchannel = 'different-toolchain'\n",
+    )
+    .unwrap();
+    let error = builds::build(
+        &source,
+        "pinned-revision",
+        &target_root,
+        &environment,
+        &requested,
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("native revision pinned-revision declares Rust different-toolchain"),
+        "a cache hit must not bypass the shared-toolchain compatibility boundary"
+    );
+    assert_eq!(fs::read(&record).unwrap(), record_bytes);
+}
+
+#[test]
+fn reset_reuses_unchanged_bytes_but_restores_same_size_same_time_tampering() {
+    let temp = tempfile::tempdir().unwrap();
+    let prepared = temp.path().join("prepared");
+    let snapshot = temp.path().join("snapshot");
+    fs::create_dir(&prepared).unwrap();
+    fs::create_dir(&snapshot).unwrap();
+    fs::write(snapshot.join("unchanged"), "keep").unwrap();
+    fs::write(snapshot.join("changed"), "good").unwrap();
+    fs::write(snapshot.join("deleted"), "restore").unwrap();
+    let expected = provenance::hash_tree(&snapshot).unwrap();
+    let workspace = prepared.join("workspace");
+    reset_workspace(&prepared, &workspace, &snapshot, &expected).unwrap();
+    let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    for name in ["unchanged", "changed"] {
+        fs::File::options()
+            .write(true)
+            .open(workspace.join(name))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+    }
+    fs::write(workspace.join("changed"), "evil").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(workspace.join("changed"))
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(old))
+        .unwrap();
+    fs::remove_file(workspace.join("deleted")).unwrap();
+    fs::create_dir_all(workspace.join("target/cache")).unwrap();
+    fs::write(workspace.join("target/cache/generated"), "large cache").unwrap();
+    fs::write(workspace.join(".git/stale-attempt"), "old state").unwrap();
+    reset_workspace(&prepared, &workspace, &snapshot, &expected).unwrap();
+    assert_eq!(
+        fs::metadata(workspace.join("unchanged"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        old,
+        "unchanged content was recopied"
+    );
+    assert_eq!(fs::read(workspace.join("changed")).unwrap(), b"good");
+    assert_eq!(fs::read(workspace.join("deleted")).unwrap(), b"restore");
+    assert!(!workspace.join("target").exists());
+    assert!(!workspace.join(".git/stale-attempt").exists());
+    assert!(workspace.join(".git/HEAD").is_file());
+}
+
+#[test]
+fn reset_rejects_snapshot_tampering_before_changing_workspace() {
+    let temp = tempfile::tempdir().unwrap();
+    let prepared = temp.path().join("prepared");
+    let workspace = prepared.join("workspace");
+    let snapshot = temp.path().join("snapshot");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir(&snapshot).unwrap();
+    fs::write(snapshot.join("source"), "approved").unwrap();
+    let expected = provenance::hash_tree(&snapshot).unwrap();
+    fs::write(snapshot.join("source"), "tampered").unwrap();
+    fs::write(workspace.join("last-attempt"), "preserve evidence").unwrap();
+    let error = reset_workspace(&prepared, &workspace, &snapshot, &expected).unwrap_err();
+    assert!(error.to_string().contains("changed fixture snapshot"));
+    assert_eq!(
+        fs::read(workspace.join("last-attempt")).unwrap(),
+        b"preserve evidence"
+    );
+    assert!(!workspace.join("source").exists());
+}
+
+#[test]
+fn source_inventory_excludes_generated_trees_but_includes_source_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("src")).unwrap();
+    fs::write(temp.path().join("src/main.rs"), "first").unwrap();
+    let first = provenance::source_tree_inventory(temp.path()).unwrap();
+    for name in [".git", "target", "node_modules", "__pycache__"] {
+        fs::create_dir_all(temp.path().join("src").join(name)).unwrap();
+        fs::write(
+            temp.path().join("src").join(name).join("large-cache"),
+            "generated",
+        )
+        .unwrap();
+    }
+    let cached = provenance::source_tree_inventory(temp.path()).unwrap();
+    assert_eq!(first.sha256, cached.sha256);
+    assert_eq!(cached.files.len(), 1);
+    assert_eq!(
+        cached.files[&PathBuf::from("src/main.rs")],
+        provenance::hash_bytes(b"first")
+    );
+    fs::write(temp.path().join("src/main.rs"), "other").unwrap();
+    let changed = provenance::source_tree_inventory(temp.path()).unwrap();
+    assert_ne!(changed.sha256, first.sha256);
+    assert_eq!(
+        changed.files[&PathBuf::from("src/main.rs")],
+        provenance::hash_bytes(b"other")
+    );
+}
+
+#[test]
+fn reset_rejects_redirected_children_without_touching_external_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let prepared = temp.path().join("prepared");
+    let workspace = prepared.join("workspace");
+    let snapshot = temp.path().join("snapshot");
+    let outside = temp.path().join("outside");
+    for path in [&workspace, &snapshot, &outside] {
+        fs::create_dir_all(path).unwrap();
+    }
+    fs::write(outside.join("sentinel"), "outside").unwrap();
+    fs::write(workspace.join("evidence"), "untouched").unwrap();
+    let link = workspace.join("redirected");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .creation_flags(0x08000000)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let expected = provenance::hash_tree(&snapshot).unwrap();
+    let error = reset_workspace(&prepared, &workspace, &snapshot, &expected).unwrap_err();
+    assert!(error.to_string().contains("redirected fixture path"));
+    assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"outside");
+    assert_eq!(fs::read(workspace.join("evidence")).unwrap(), b"untouched");
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_restores_executable_bits_even_when_content_is_unchanged() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let prepared = temp.path().join("prepared");
+    let snapshot = temp.path().join("snapshot");
+    fs::create_dir(&prepared).unwrap();
+    fs::create_dir(&snapshot).unwrap();
+    fs::write(snapshot.join("run"), "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(snapshot.join("run"), fs::Permissions::from_mode(0o755)).unwrap();
+    let expected = provenance::hash_tree(&snapshot).unwrap();
+    let workspace = prepared.join("workspace");
+    reset_workspace(&prepared, &workspace, &snapshot, &expected).unwrap();
+    fs::set_permissions(workspace.join("run"), fs::Permissions::from_mode(0o644)).unwrap();
+    reset_workspace(&prepared, &workspace, &snapshot, &expected).unwrap();
+    assert_eq!(
+        fs::metadata(workspace.join("run"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
     );
 }

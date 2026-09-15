@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import collections
 import datetime as dt
-import io
+import hashlib
 import json
 import os
 import re
@@ -28,12 +28,14 @@ try:
         _token_intervals,
         _tool_model_visible_at_ms,
         _tool_relay_report,
+        analyze_startup_timing,
         analyze_timing,
     )
     from scripts.kd4_timing_analysis import (
         _token_report as _token_report,
     )
     from scripts.rollout_snapshot import read_rollout_snapshot
+    from scripts.rollout_snapshot import discover_rollouts, existing_rollout_path
 except ImportError:
     import kd4_first_useful_action_analysis
     from kd4_timing_analysis import (
@@ -47,15 +49,18 @@ except ImportError:
         _token_intervals,
         _tool_model_visible_at_ms,
         _tool_relay_report,
+        analyze_startup_timing,
         analyze_timing,
     )
     from kd4_timing_analysis import (
         _token_report as _token_report,
     )
     from rollout_snapshot import read_rollout_snapshot
+    from rollout_snapshot import discover_rollouts, existing_rollout_path
 
 
-REPORT_SCHEMA_VERSION = 18
+REPORT_SCHEMA_VERSION = 20
+BEHAVIOR_SCHEMA_VERSION = 2
 _NANOSECONDS_PER_SECOND = 1_000_000_000
 
 _MAX_RENDERED_TURNS = 10
@@ -66,6 +71,8 @@ _MAX_OPEN_TURN_DETAILS = 100
 _MAX_SOURCE_DISCOVERY_EVENTS = 64
 _MAX_SOURCE_DISCOVERY_PATHS = 16
 _MAX_RENDERED_SOURCE_DISCOVERY_EVENTS = 8
+# Three intervening discovery steps is a review cue, not a correctness threshold.
+_LATE_EVIDENCE_DISCOVERY_STEPS = 3
 _CHILD_WALL_TIME_PATTERN = re.compile(
     r'"wall_time_seconds"\s*:\s*([0-9]+(?:\.[0-9]+)?)'
 )
@@ -78,14 +85,14 @@ _SOURCE_DISCOVERY_SEARCH_PATTERN = re.compile(
     r"(?i)(?<![A-Za-z0-9_])(?:rg(?:\.exe)?|grep|findstr|fd|select-string)\b"
 )
 _SOURCE_DISCOVERY_READ_PATTERN = re.compile(
-    r"(?i)(?<![A-Za-z0-9_])(?:get-content|read_mcp_resource)\b"
+    r"(?i)(?<![A-Za-z0-9_])(?:get-content|read_mcp_resource|cat|head|tail|less|more)\b"
+    r"|(?i:sed\s+-n\b)"
 )
 _SOURCE_DISCOVERY_PATH_PATTERN = re.compile(
-    r"(?i)(?<![A-Za-z0-9_.-])(?:"
-    r"(?:codex-rs|scripts|docs|\.codex)(?:[\\/][A-Za-z0-9_.@+\-]+)+"
-    r"|(?:[A-Za-z0-9_.@+\-]+[\\/])*AGENTS\.md"
-    r"|SOURCEMAP\.md|source_owners\.toml|architecture_index\.json"
-    r")(?:\:\d+(?:\:\d+)?)?"
+    r"(?i)(?<![A-Za-z0-9_.:/\\-])(?:\.[\\/])?(?:"
+    r"(?:\.?[A-Za-z0-9_@+\-][A-Za-z0-9_.@+\-]*[\\/])+[A-Za-z0-9_.@+\-]+"
+    r"|[A-Za-z0-9_@+\-][A-Za-z0-9_.@+\-]*\.(?:rs|py|ts|tsx|js|jsx|json|toml|md|yaml|yml|txt)"
+    r")(?![A-Za-z0-9_.@+\-])(?:\:\d+(?:\:\d+)?)?"
 )
 _SOURCE_DISCOVERY_RG_PATTERN = re.compile(
     r"(?i)(?<![A-Za-z0-9_])(?:rg(?:\.exe)?|grep)\s+([^\r\n;]+)"
@@ -171,6 +178,19 @@ def _ordered_unique(values: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(value for value in values if value))
 
 
+def _discovery_input(text: str) -> str:
+    # Decode literal command strings in function arguments and code-mode input.
+    # This is deliberately not a shell/JavaScript interpreter.
+    commands = []
+    for match in re.finditer(r'''(?:["']?(?:cmd|command)["']?)\s*:\s*("(?:\\.|[^"\\])*"|'[^'\r\n]*')''', text):
+        value = match.group(1)
+        try:
+            commands.append(json.loads(value) if value.startswith('"') else value[1:-1])
+        except json.JSONDecodeError:
+            continue
+    return "\n".join(commands) if commands else text
+
+
 def _source_discovery_paths(text: str) -> list[str]:
     paths = []
     for match in _SOURCE_DISCOVERY_PATH_PATTERN.finditer(text):
@@ -227,7 +247,7 @@ def _safe_source_discovery_queries(text: str) -> list[str]:
 def _source_discovery_event(
     pending: dict[str, Any], output: str, ordinal: int
 ) -> dict[str, Any] | None:
-    source = str(pending.get("input") or "")
+    source = _discovery_input(str(pending.get("input") or ""))
     operations: list[str] = []
     if _SOURCE_DISCOVERY_SEARCH_PATTERN.search(source):
         operations.append("search")
@@ -276,13 +296,9 @@ def _source_discovery_event(
 
     is_search = "search" in operations
     is_broad = is_search and not requested_paths
-    signature = "|".join(
-        (
-            "+".join(operations),
-            ",".join(queries),
-            ",".join(requested_paths),
-        )
-    )
+    # Do not deduplicate on redacted display tokens: private queries collide.
+    # Scope/options stay significant because a glob changes the search.
+    signature = hashlib.sha256(source.strip().encode("utf-8")).hexdigest()
     return {
         "ordinal": ordinal,
         "turnId": pending.get("turnId"),
@@ -302,13 +318,13 @@ def _source_discovery_event(
 
 def _source_discovery_report(events: list[dict[str, Any]]) -> dict[str, Any]:
     events = sorted(events, key=lambda event: int(event["ordinal"]))
-    signatures: collections.Counter[str] = collections.Counter()
+    signatures: collections.Counter[tuple[Any, str]] = collections.Counter()
     signals: list[dict[str, Any]] = []
     by_turn: dict[Any, list[dict[str, Any]]] = collections.defaultdict(list)
     for event in events:
         by_turn[event.get("turnId")].append(event)
         if "search" in event["operations"]:
-            signatures[event["signature"]] += 1
+            signatures[(event.get("turnId"), event["signature"])] += 1
             if event["scope"] == "repository":
                 signals.append(
                     {
@@ -367,7 +383,7 @@ def _source_discovery_report(events: list[dict[str, Any]]) -> dict[str, Any]:
                         "ordinal": first_search["ordinal"],
                     }
                 )
-            elif evidence_events[0]["ordinal"] - first_search["ordinal"] >= 3:
+            elif evidence_events[0]["ordinal"] - first_search["ordinal"] >= _LATE_EVIDENCE_DISCOVERY_STEPS:
                 signals.append(
                     {
                         "code": f"{evidence_kind}_evidence_late",
@@ -377,8 +393,12 @@ def _source_discovery_report(events: list[dict[str, Any]]) -> dict[str, Any]:
                 )
 
     repeated_signatures = {key for key, count in signatures.items() if count > 1}
+    seen_searches: set[tuple[Any, str]] = set()
     for event in events:
-        if event["signature"] in repeated_signatures:
+        if "search" not in event["operations"]:
+            continue
+        key = (event.get("turnId"), event["signature"])
+        if key in seen_searches:
             signals.append(
                 {
                     "code": "repeated_discovery",
@@ -386,6 +406,7 @@ def _source_discovery_report(events: list[dict[str, Any]]) -> dict[str, Any]:
                     "ordinal": event["ordinal"],
                 }
             )
+        seen_searches.add(key)
     signal_counts = collections.Counter(signal["code"] for signal in signals)
     bounded_events = events[:_MAX_SOURCE_DISCOVERY_EVENTS]
     return {
@@ -399,13 +420,17 @@ def _source_discovery_report(events: list[dict[str, Any]]) -> dict[str, Any]:
             for event in events
         ),
         "repeatedSearchSignatureCount": len(repeated_signatures),
+        "repeatedSearchCount": sum(count - 1 for count in signatures.values()),
         "candidateSignalCounts": dict(sorted(signal_counts.items())),
         "candidateSignals": signals[:_MAX_SOURCE_DISCOVERY_EVENTS],
         "omittedCandidateSignals": max(0, len(signals) - _MAX_SOURCE_DISCOVERY_EVENTS),
         "measurementNote": (
             "Candidate signals are deterministic discovery heuristics, not defect "
             "verdicts; ordered events retain only recognized operations, safe query "
-            "tokens, and repository-relative paths, never arbitrary command/output text."
+            "tokens, and recognized relative paths, never arbitrary command/output text. "
+            "Counts are observed tool-call events, not individual shell commands or "
+            "complete semantic read/search counts. Repetition means an identical "
+            "command after literal decoding within one turn; only excess occurrences count."
         ),
     }
 
@@ -689,6 +714,16 @@ def _apply_detailed_tool_timing(
         match: str,
     ) -> None:
         record["detailedTimingMatch"] = match
+        outcome = call.get("outcome")
+        status = {
+            "success": "completed", "no_match": "completed",
+            "failure": "failed", "error": "failed", "timeout": "failed",
+            "rejected": "failed", "cancelled": "failed", "panic": "failed",
+            "yielded": "running", "skipped": "skipped",
+        }.get(outcome)
+        if status is not None:
+            record["status"] = status
+            record["statusSource"] = "toolCalls.outcome"
         accepted_at = call.get("acceptedAtMs")
         model_visible_at = _tool_model_visible_at_ms(call)
         if not (isinstance(accepted_at, int) and model_visible_at is not None):
@@ -858,7 +893,11 @@ def _latency_breakdown(
             },
             "logicalGenerations": logical_generations,
             "physicalAttempts": model_requests,
-            "retryAttempts": max(0, model_requests - logical_generations),
+            "retryAttempts": (
+                max(0, model_requests - logical_generations)
+                if model_requests is not None
+                else None
+            ),
             "decisionLatency": population["decisionLatency"],
             "generationPurposes": population["generationPurposeLatency"],
             "tokenCache": {
@@ -913,8 +952,8 @@ def _turn_report(
         nonprogress = _request_metric(
             requests,
             lambda request: (
-                bool(request.get("unchangedRelevantState"))
-                and not bool(request.get("nextStructuredActionChanged"))
+                request.get("unchangedRelevantState") is True
+                and request.get("nextStructuredActionChanged") is False
             ),
         )
 
@@ -1052,8 +1091,116 @@ def _behavior_report(
     }
 
 
-def analyze_session_path(source: Path | None, repo_root: Path, *, include_tokens: bool = True, runner_evidence: dict[str, Any] | None = None) -> dict[str, Any]:
-    files = ([source] if source.is_file() else sorted(source.rglob("*.jsonl"))) if source else []
+def _behavior_metrics(report: dict[str, Any], records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Small, versioned session vector, computed before any display truncation."""
+    coverage = report["coverage"]
+    discovery = report["sourceDiscovery"]
+    complete_events = (
+        coverage["files"] > 0
+        and coverage["uniqueTerminalTurns"] > 0
+        and coverage["parseErrorCount"] == 0
+        and coverage["startedTurnsWithoutTerminal"] == 0
+        and coverage["terminalTurnsWithoutStart"] == 0
+        and coverage["terminalTurnsWithUnresolvedToolCalls"] == 0
+        and coverage["unpairedToolCalls"] == 0
+    )
+    complete_timing = (
+        complete_events
+        and len(records) == coverage["uniqueTerminalTurns"]
+        and coverage["validCompleteProfiles"] == len(records)
+    )
+    metrics: dict[str, int | None] = {}
+    unavailable: dict[str, str] = {}
+    for name, key in (
+        ("discoveryEvents", "eventCount"),
+        ("searchEvents", "searchCount"),
+        ("readEvents", "readCount"),
+        ("broadSearchEvents", "broadSearchCount"),
+        ("repeatedSearchEvents", "repeatedSearchCount"),
+    ):
+        metrics[name] = discovery[key] if complete_events else None
+        if metrics[name] is None:
+            unavailable[name] = "incomplete_rollout_events"
+    counters = [record["timing"].get("counters", {}) for record in records]
+    for key in (
+        "executedValidationCount", "executedValidationDurationNs",
+        "suppressedValidationOutputCount", "modelRetryCount", "modelFallbackCount",
+        "noProgressDirectiveCount", "provenLoopActivationCount",
+        "planningGenerationCount", "planRevisionGenerationCount",
+        "planningFixedPointIterationCount", "approvalWaitCount", "permissionWaitCount",
+        "userInputWaitCount", "mcpElicitationWaitCount",
+        "toolOutputCanonicalTokenCount", "toolOutputModelTokenCount",
+        "toolOutputRecoveryCallCount", "toolOutputRecoveryRetruncationCount",
+    ):
+        reason = None
+        if not complete_timing:
+            reason = "incomplete_timing_coverage"
+        elif any(type(counter.get(key)) is not int or counter[key] < 0 for counter in counters):
+            reason = "counter_unavailable"
+        elif any(type(counter.get("saturationCount")) is not int for counter in counters):
+            reason = "saturation_status_unavailable"
+        elif any(counter["saturationCount"] != 0 for counter in counters):
+            reason = "saturated_counters"
+        # Some runtime counters saturate directly without incrementing the
+        # profile's saturationCount. Their maximum is only a lower bound.
+        elif any(counter[key] >= (2 ** (64 if key.endswith(("Ns", "TokenCount")) else 32) - 1) for counter in counters):
+            reason = "saturated_counters"
+        metrics[key] = sum(counter[key] for counter in counters) if reason is None else None
+        if reason:
+            unavailable[key] = reason
+    tokens = report["populations"]["all"]["tokens"]
+    metrics["totalTokens"] = tokens["totalTokens"] if complete_timing and tokens.get("complete") is True else None
+    if metrics["totalTokens"] is None:
+        unavailable["totalTokens"] = "token_analysis_disabled" if not report["tokenAnalysisEnabled"] else "incomplete_token_coverage"
+    return {
+        "behaviorSchemaVersion": BEHAVIOR_SCHEMA_VERSION,
+        "metrics": metrics,
+        "unavailableReasons": unavailable,
+        "measurementNote": (
+            "Exploratory observed effort only; fewer actions do not establish better results. "
+            "Discovery values count recognized tool-call events, including batched commands "
+            "as one event. Runtime counters require anchored, complete, unsaturated timing coverage; "
+            "validation duration is summed command wall time in nanoseconds, not an elapsed union. "
+            "Governor counts record interventions, not eligibility or model mistakes. Planning "
+            "counts record generations and fixed-point iterations, not plan quality. Wait counts "
+            "record interactions, not user corrections; compare identical permission policies. "
+            "Tokens require complete provider usage. Missing measurements are null. "
+            "Tool-output tokens are runtime projection estimates, not provider usage or billing; "
+            "compare canonical and model-visible totals alongside recovery calls and retruncated "
+            "recovery sections. These count runtime projection/recovery operations, not model "
+            "round trips; nested operations may contribute. The reserved recursive-spill counter "
+            "is not a measurement and is omitted. "
+            "No edit correctness, unnecessary-read, user-correction or causal regression verdict is inferred."
+        ),
+    }
+
+
+def _startup_log_report(source: Path) -> dict[str, Any]:
+    snapshot = read_rollout_snapshot(source)
+    records = []
+    parse_errors = 0
+    for line in snapshot.data.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+            if not isinstance(event, dict):
+                raise ValueError("log event must be an object")
+        except (ValueError, TypeError):
+            parse_errors += 1
+            continue
+        fields = event.get("fields")
+        if (event.get("target") == "codex_core::session::turn"
+                and isinstance(fields, dict)
+                and fields.get("message") == "startup timing snapshot frozen at first model send"):
+            records.append(fields)
+    return {**analyze_startup_timing(records), "source": str(source.resolve()),
+            "snapshot": snapshot.metadata(), "parseErrorCount": parse_errors}
+
+
+def analyze_session_path(source: Path | None, repo_root: Path, *, include_tokens: bool = True, runner_evidence: dict[str, Any] | None = None, startup_log: Path | None = None) -> dict[str, Any]:
+    source = existing_rollout_path(source) if source else None
+    files = ([source] if source.is_file() else discover_rollouts(source)) if source else []
     started_turns: set[str] = set()
     turn_starts: dict[str, dict[str, Any]] = {}
     unresolved_tools_by_turn: dict[str, list[str]] = collections.defaultdict(list)
@@ -1091,7 +1238,7 @@ def analyze_session_path(source: Path | None, repo_root: Path, *, include_tokens
         snapshots.append(snapshot.metadata())
         byte_count += snapshot.byte_length
         cwd = ""
-        with io.BytesIO(snapshot.data) as handle:
+        with snapshot.open_lines() as handle:
             for line_number, line in enumerate(handle, 1):
                 line_count += 1
                 try:
@@ -1239,6 +1386,7 @@ def analyze_session_path(source: Path | None, repo_root: Path, *, include_tokens
                                 "cwd": pending["cwd"],
                                 "tool": pending["tool"],
                                 "status": _tool_status(output),
+                                "statusSource": "response_output_heuristic",
                                 "roundTripNs": round_trip_ns,
                                 "reportedExecWallNs": (
                                     int(exec_wall_seconds * _NANOSECONDS_PER_SECOND)
@@ -1287,6 +1435,15 @@ def analyze_session_path(source: Path | None, repo_root: Path, *, include_tokens
                         0, timestamp_ns - task_started_at[turn_id]
                     )
                 terminal_turns.add(turn_id)
+                # A late tool result cannot retroactively establish complete
+                # measurement at the terminal boundary.
+                pending_at_terminal = [
+                    str(pending.get("tool") or "unknown")
+                    for pending in pending_tool_calls.values()
+                    if pending.get("turnId") == turn_id
+                ]
+                if pending_at_terminal and turn_id not in unresolved_tools_by_turn:
+                    unresolved_tools_by_turn[turn_id] = pending_at_terminal
                 if active_turn_id == turn_id:
                     active_turn_id = None
                 status_counts[str(payload_type)] += 1
@@ -1304,7 +1461,7 @@ def analyze_session_path(source: Path | None, repo_root: Path, *, include_tokens
                 schema_versions[str(timing.get("schemaVersion", "missing"))] += 1
         for pending in pending_tool_calls.values():
             pending_turn_id = pending.get("turnId")
-            if pending_turn_id is not None:
+            if pending_turn_id is not None and str(pending_turn_id) not in terminal_turns:
                 unresolved_tools_by_turn[str(pending_turn_id)].append(
                     str(pending.get("tool") or "unknown")
                 )
@@ -1445,6 +1602,7 @@ def analyze_session_path(source: Path | None, repo_root: Path, *, include_tokens
         ),
         "terminalTurnsWithoutTiming": len(terminal_without_timing - set(timed_records)),
         "startedTurnsWithoutTerminal": len(started_turns - terminal_turns),
+        "terminalTurnsWithoutStart": len(terminal_turns - started_turns),
         "openTurnStateCounts": dict(sorted(open_turn_state_counts.items())),
         "openTurns": open_turns[:_MAX_OPEN_TURN_DETAILS],
         "omittedOpenTurns": max(0, len(open_turns) - _MAX_OPEN_TURN_DETAILS),
@@ -1505,6 +1663,9 @@ def analyze_session_path(source: Path | None, repo_root: Path, *, include_tokens
     )
     report["auditDecision"] = _audit_decision(report)
     report["runnerDiagnostics"] = analyze_runner_evidence(runner_evidence if runner_evidence is not None else {"schemaVersion": 1, "events": native_events}, include_tokens=include_tokens)
+    report["behaviorMetrics"] = _behavior_metrics(report, records)
+    if startup_log is not None:
+        report["startupTiming"] = _startup_log_report(startup_log)
     return report
 
 
@@ -1521,6 +1682,25 @@ def render_report(report: dict[str, Any]) -> str:
             f"{coverage['parseErrorCount']} parse errors"
         ),
     ]
+    startup = report.get("startupTiming")
+    if startup is not None:
+        lines.append(
+            f"startup timing: {startup['validProfiles']}/{startup['profiles']} valid captured profiles; "
+            f"{startup['excludedProfiles']} excluded; {startup['duplicateSnapshots']} repeated snapshots; "
+            f"{startup['parseErrorCount']} log parse errors"
+        )
+        for name, summary in startup["durationSummariesNs"].items():
+            if summary is not None:
+                lines.append(f"  {name}: mean={summary['total'] / summary['count'] / 1e6:.3f}ms "
+                             f"min={summary['min'] / 1e6:.3f}ms max={summary['max'] / 1e6:.3f}ms")
+        for row in startup["records"][:10]:
+            if not row["valid"]:
+                lines.append(f"  excluded startup {row['correlationId']}: {', '.join(row['exclusionReasons'])}; diagnostics={row['diagnostics']}")
+        if startup["prewarmStatuses"]:
+            lines.append(f"  prewarm statuses: {startup['prewarmStatuses']}")
+        if not startup["available"]:
+            lines.append("  startup durations unavailable: no valid captured snapshots")
+        lines.append("  " + startup["measurementNote"])
     execution_loop = report["executionLoop"]
     if execution_loop.get("samplingPasses") or execution_loop.get("toolCalls"):
         lines.append(
@@ -1746,6 +1926,9 @@ def render_report(report: dict[str, Any]) -> str:
         population = report["populations"].get(name)
         if not population or not population["turns"]:
             continue
+        if population.get("sameAs") == "all":
+            lines.append(f"{name}: {population['turns']} turns; same measurements as all")
+            continue
         ratio = population["modelToolRatio"]
         nonprogress = population["observationalNonprogressLatency"]
         decision = population["decisionLatency"]
@@ -1880,6 +2063,7 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
         "uniqueTimedTerminalTurns",
         "validCompleteProfiles",
         "startedTurnsWithoutTerminal",
+        "terminalTurnsWithoutStart",
         "terminalTurnsWithoutTiming",
         "statusCounts",
         "timingSchemaVersions",
@@ -1920,8 +2104,14 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
                 "signals",
             )
         }
-        bounded_turn["tokenIntervals"] = turn["tokenIntervals"][
-            :_MAX_SUMMARY_TOKEN_INTERVALS
+        # Keep category totals once per turn; per-interval category detail and
+        # explanatory definitions remain available in the full JSON report.
+        bounded_turn["tokenIntervals"] = [
+            {**interval, "tokens": {
+                key: value for key, value in interval["tokens"].items()
+                if key not in ("promptCategories", "promptCategoryAttempts")
+            }}
+            for interval in turn["tokenIntervals"][:_MAX_SUMMARY_TOKEN_INTERVALS]
         ]
         bounded_turn["omittedTokenIntervals"] = max(
             0, len(turn["tokenIntervals"]) - _MAX_SUMMARY_TOKEN_INTERVALS
@@ -1935,6 +2125,14 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
     bounded_populations = {}
     for name, population in report["populations"].items():
         if not population["turns"]:
+            continue
+        # A session entirely in one population otherwise repeats the complete
+        # aggregate. Keep an explicit reference in the bounded representation.
+        if name != "all" and (
+            population == report["populations"]["all"]
+            or population.get("sameAs") == "all"
+        ):
+            bounded_populations[name] = {"turns": population["turns"], "sameAs": "all"}
             continue
         bounded_population = dict(population)
         for key in (
@@ -2051,6 +2249,7 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
     result = {
         "schemaVersion": report["schemaVersion"],
         "observedAt": report["observedAt"].replace("+00:00", "Z"),
+        "behaviorMetrics": report["behaviorMetrics"],
         "source": report["source"],
         "repoRoot": report["repoRoot"],
         "coverage": bounded_coverage,
@@ -2088,20 +2287,35 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
             return [compact_tokens(item) for item in value]
         if isinstance(value, dict):
             # Complete category provenance and full totals remain in --json;
-            # the bounded form retains observed totals and coverage once.
+            # the bounded form keeps observed totals only for partial coverage,
+            # since complete observations duplicate the top-level totals.
             return {key: compact_tokens(item) for key, item in value.items()
-                    if key not in ("promptCategoryEvidence", "accountingNote", "providerTotals", "rankedPromptConsumers", "promptCategoryBasis", "promptCategoryCoverage", "available")}
+                    if not (key in ("observedTotals", "observedBlendedTokens", "observedCacheShare") and value.get("complete") is True)
+                    if not (key == "available" and "observedTotals" in value)
+                    if key not in ("promptCategoryEvidence", "accountingNote", "measurementNote", "providerTotals", "rankedPromptConsumers", "promptCategoryBasis", "promptCategoryCoverage", "billableDefinition", "blendedDefinition")}
         return value
     result["tokenAnalysisEnabled"] = report.get("tokenAnalysisEnabled", True)
     runner = report.get("runnerDiagnostics", {})
     result["runnerDiagnostics"] = {key: runner.get(key) for key in (
         "schemaVersion", "attemptId", "status", "elapsedMs", "coverage", "logicalGenerations",
-        "physicalRequests", "directToolCount", "nestedToolCount", "lastProgress")}
+        "physicalRequests", "directToolCount", "nestedToolCount", "cacheHitRate", "lastProgress", "toolDispatch", "requestRetention")}
+    activity = runner.get("toolActivity", {})
+    result["runnerDiagnostics"]["toolActivity"] = {key: value for key, value in activity.items() if key not in ("turns", "measurementNote")}
+    result["runnerDiagnostics"]["toolActivity"]["omittedTurns"] = len(activity.get("turns", []))
     for key in ("failures", "symptoms", "pendingTools"):
         rows = runner.get(key, [])
         result["runnerDiagnostics"][key] = rows[:8]
         result["runnerDiagnostics"]["omitted" + key[0].upper() + key[1:]] = max(0, len(rows) - 8)
-    return compact_tokens(result)
+    result = compact_tokens(result)
+    # Preserve the explicit available/null distinction for request volume.
+    result["runnerDiagnostics"]["capturedRequests"] = compact_tokens(runner.get("capturedRequests"))
+    if "startupTiming" in report:
+        startup = report["startupTiming"]
+        result["startupTiming"] = {key: value for key, value in startup.items()
+                                   if key not in ("records", "measurementNote")}
+        result["startupTiming"]["records"] = startup["records"][:10]
+        result["startupTiming"]["omittedRecords"] = max(0, len(startup["records"]) - 10)
+    return result
 
 
 def _canonical_session_uuid(value: str) -> str | None:
@@ -2114,7 +2328,7 @@ def _canonical_session_uuid(value: str) -> str | None:
 
 
 def resolve_rollout_source(source: str, sessions_root: Path | None = None) -> Path:
-    path = Path(source).expanduser()
+    path = existing_rollout_path(Path(source).expanduser())
     if path.exists():
         return path.resolve()
 
@@ -2131,8 +2345,7 @@ def resolve_rollout_source(source: str, sessions_root: Path | None = None) -> Pa
     sessions_root = sessions_root.expanduser().resolve(strict=True)
     matches = sorted(
         path.resolve()
-        for path in sessions_root.rglob(f"*-{session_id}.jsonl")
-        if path.is_file()
+        for path in discover_rollouts(sessions_root, f"*-{session_id}.jsonl")
     )
     if not matches:
         raise FileNotFoundError(
@@ -2148,7 +2361,7 @@ def resolve_rollout_source(source: str, sessions_root: Path | None = None) -> Pa
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "source", nargs="?", help="Rollout JSONL path, session directory, or exact session UUID"
+        "source", nargs="?", help="Rollout JSONL or JSONL.zst path, session directory, or exact session UUID"
     )
     parser.add_argument(
         "--sessions-root",
@@ -2171,14 +2384,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Emit bounded JSON without per-record diagnostic arrays",
     )
     parser.add_argument("--runner-evidence", type=Path, help="Version 1 native runner evidence JSON for one attempt")
+    parser.add_argument("--startup-log", type=Path, help="App-server JSON stderr log containing startup timing traces (LOG_FORMAT=json)")
     parser.add_argument("--tokens", choices=("on", "off"), default="on", help="Disable token computation for scripted execution")
     args = parser.parse_args(argv)
-    if args.source is None and args.runner_evidence is None:
-        parser.error("a source or --runner-evidence is required")
+    if args.source is None and args.runner_evidence is None and args.startup_log is None:
+        parser.error("a source, --runner-evidence, or --startup-log is required")
     try:
         source = resolve_rollout_source(args.source, args.sessions_root) if args.source else None
         evidence = json.loads(args.runner_evidence.read_text(encoding="utf-8")) if args.runner_evidence else None
-        report = analyze_session_path(source, args.repo_root, include_tokens=args.tokens == "on", runner_evidence=evidence)
+        report = analyze_session_path(source, args.repo_root, include_tokens=args.tokens == "on", runner_evidence=evidence, startup_log=args.startup_log)
     except (FileNotFoundError, OSError, ValueError, TypeError) as error:
         parser.error(str(error))
     if args.json:

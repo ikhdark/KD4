@@ -11,7 +11,6 @@ use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::QueuedOutgoingMessage;
 use axum::Router;
 use axum::body::Body;
-use axum::body::Bytes;
 use axum::extract::ConnectInfo;
 use axum::extract::State;
 use axum::extract::ws::Message as AxumWebSocketMessage;
@@ -254,7 +253,7 @@ pub(crate) async fn run_websocket_connection<M, SinkError, StreamError>(
     }
 
     let (writer_control_tx, writer_control_rx) =
-        mpsc::channel::<WebSocketControl<M>>(CHANNEL_CAPACITY);
+        mpsc::channel::<WebSocketControl>(CHANNEL_CAPACITY);
     let mut outbound_task = AbortOnDropHandle::new(tokio::spawn(run_websocket_outbound_loop(
         websocket_writer,
         writer_rx,
@@ -309,7 +308,7 @@ pub(crate) async fn run_websocket_connection<M, SinkError, StreamError>(
 pub(crate) enum IncomingWebSocketMessage<'a> {
     Text(&'a str),
     Binary,
-    Ping(Bytes),
+    Ping,
     Pong,
     Close,
 }
@@ -319,7 +318,6 @@ pub(crate) enum IncomingWebSocketMessage<'a> {
 /// sends directly.
 pub(crate) trait AppServerWebSocketMessage: Sized {
     fn text(text: String) -> Self;
-    fn pong(payload: Bytes) -> Self;
     fn incoming(&self) -> Option<IncomingWebSocketMessage<'_>>;
 }
 
@@ -328,15 +326,11 @@ impl AppServerWebSocketMessage for AxumWebSocketMessage {
         Self::Text(text.into())
     }
 
-    fn pong(payload: Bytes) -> Self {
-        Self::Pong(payload)
-    }
-
     fn incoming(&self) -> Option<IncomingWebSocketMessage<'_>> {
         Some(match self {
             Self::Text(text) => IncomingWebSocketMessage::Text(text.as_str()),
             Self::Binary(_) => IncomingWebSocketMessage::Binary,
-            Self::Ping(payload) => IncomingWebSocketMessage::Ping(payload.clone()),
+            Self::Ping(_) => IncomingWebSocketMessage::Ping,
             Self::Pong(_) => IncomingWebSocketMessage::Pong,
             Self::Close(_) => IncomingWebSocketMessage::Close,
         })
@@ -348,15 +342,11 @@ impl AppServerWebSocketMessage for TungsteniteWebSocketMessage {
         Self::Text(text.into())
     }
 
-    fn pong(payload: Bytes) -> Self {
-        Self::Pong(payload)
-    }
-
     fn incoming(&self) -> Option<IncomingWebSocketMessage<'_>> {
         Some(match self {
             Self::Text(text) => IncomingWebSocketMessage::Text(text.as_str()),
             Self::Binary(_) => IncomingWebSocketMessage::Binary,
-            Self::Ping(payload) => IncomingWebSocketMessage::Ping(payload.clone()),
+            Self::Ping(_) => IncomingWebSocketMessage::Ping,
             Self::Pong(_) => IncomingWebSocketMessage::Pong,
             Self::Close(_) => IncomingWebSocketMessage::Close,
             Self::Frame(_) => return None,
@@ -364,15 +354,15 @@ impl AppServerWebSocketMessage for TungsteniteWebSocketMessage {
     }
 }
 
-enum WebSocketControl<M> {
-    Message(M),
+enum WebSocketControl {
+    Flush,
     FlushClose,
 }
 
 async fn run_websocket_outbound_loop<M, SinkError>(
     websocket_writer: impl futures::sink::Sink<M, Error = SinkError> + Send + 'static,
     mut writer_rx: mpsc::Receiver<QueuedOutgoingMessage>,
-    mut writer_control_rx: mpsc::Receiver<WebSocketControl<M>>,
+    mut writer_control_rx: mpsc::Receiver<WebSocketControl>,
     disconnect_token: CancellationToken,
 ) where
     M: AppServerWebSocketMessage + Send + 'static,
@@ -390,8 +380,8 @@ async fn run_websocket_outbound_loop<M, SinkError>(
                     break;
                 };
                 match message {
-                    WebSocketControl::Message(message) => {
-                        if websocket_writer.send(message).await.is_err() {
+                    WebSocketControl::Flush => {
+                        if websocket_writer.flush().await.is_err() {
                             break;
                         }
                     }
@@ -423,7 +413,7 @@ async fn run_websocket_inbound_loop<M, StreamError>(
     websocket_reader: impl futures::stream::Stream<Item = Result<M, StreamError>> + Send + 'static,
     transport_event_tx: mpsc::Sender<TransportEvent>,
     writer_tx_for_reader: mpsc::Sender<QueuedOutgoingMessage>,
-    writer_control_tx: mpsc::Sender<WebSocketControl<M>>,
+    writer_control_tx: mpsc::Sender<WebSocketControl>,
     connection_id: ConnectionId,
     disconnect_token: CancellationToken,
 ) -> bool
@@ -452,8 +442,9 @@ where
                             break;
                         }
                         Some(IncomingWebSocketMessage::Text(_)) => {}
-                        Some(IncomingWebSocketMessage::Ping(payload)) => {
-                            match writer_control_tx.try_send(WebSocketControl::Message(M::pong(payload))) {
+                        Some(IncomingWebSocketMessage::Ping) => {
+                            // Both transports queue an automatic pong while reading.
+                            match writer_control_tx.try_send(WebSocketControl::Flush) {
                                 Ok(()) => {}
                                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
                                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {

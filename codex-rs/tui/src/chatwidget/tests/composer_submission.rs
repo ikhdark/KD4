@@ -1278,6 +1278,52 @@ async fn enqueueing_history_prompt_multiple_times_is_stable() {
 }
 
 #[tokio::test]
+async fn local_path_context_omissions_reach_submitted_model_input() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    let temp = tempfile::tempdir().expect("tempdir");
+    chat.config.cwd = temp.path().to_path_buf().abs();
+    chat.thread_id = Some(ThreadId::new());
+    let names = (0..20)
+        .map(|index| format!("file{index}.rs"))
+        .collect::<Vec<_>>();
+    for (index, name) in names.iter().enumerate() {
+        std::fs::write(temp.path().join(name), format!("CONTENTS_{index}")).expect("write");
+    }
+    chat.submit_user_message(UserMessage::from(names.join(" ")));
+    let Op::UserTurn { items, .. } = next_submit_op(&mut op_rx) else {
+        panic!("expected user turn");
+    };
+    let selected = items
+        .iter()
+        .filter_map(|item| match item {
+            UserInput::LocalPath { content, .. } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(selected.len(), 16);
+    assert!(selected[0].contains("CONTENTS_0"));
+    let last = selected.last().expect("last context");
+    for name in &names[16..] {
+        assert!(last.contains(name), "missing recovery path: {name}");
+    }
+    assert!(!selected.join("").contains("CONTENTS_16"));
+    let model_input = codex_protocol::models::ResponseInputItem::from(
+        items
+            .into_iter()
+            .filter(|item| matches!(item, UserInput::LocalPath { .. }))
+            .map(UserInput::into_core)
+            .collect::<Vec<_>>(),
+    );
+    let rendered = serde_json::to_string(&model_input).expect("model input");
+    for name in &names[16..] {
+        assert!(
+            rendered.contains(name),
+            "recovery lost during model conversion: {name}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn submit_user_message_ignores_inaccessible_app_mentions_from_bindings() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());

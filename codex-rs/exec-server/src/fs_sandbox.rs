@@ -507,7 +507,9 @@ mod tests {
         let network_policy = NetworkSandboxPolicy::Restricted;
         let permission_profile =
             PermissionProfile::from_runtime_permissions(&file_system_policy, network_policy);
-        let sandbox_context = sandbox_context_with_cwd(&file_system_policy, cwd.clone());
+        let mut sandbox_context = sandbox_context_with_cwd(&file_system_policy, cwd.clone());
+        sandbox_context.windows_sandbox_level =
+            codex_protocol::config_types::WindowsSandboxLevel::Elevated;
         let sandbox_cwd = SandboxCwd {
             uri: cwd,
             native: native_cwd,

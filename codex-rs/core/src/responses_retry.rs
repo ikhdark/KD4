@@ -64,33 +64,16 @@ pub(crate) async fn handle_retryable_response_stream_error(
         return Err(err);
     }
 
-    if should_wait_for_connection_recovery(
+    let wait_for_connection_recovery = should_wait_for_connection_recovery(
         request,
         &err,
         &turn_context.session_source,
         turn_context.provider.info(),
-    ) {
-        let retry_delay = retry_state.connection_retry_delay;
-        retry_state.connection_retries = retry_state.connection_retries.saturating_add(1);
-        warn!(
-            turn_id = %turn_context.sub_id,
-            connection_retries = retry_state.connection_retries,
-            ?retry_delay,
-            sampling_error = %err,
-            "stream connection failed; waiting for the network to recover"
-        );
-        // Deliberately does not touch `retry_state.retries`: a lost connection must not
-        // burn the bounded provider retry budget, so the turn survives sleep/wake and
-        // VPN churn instead of failing after `max_retries` quick attempts.
-        sess.notify_stream_error(turn_context, "Reconnecting... waiting for network", err)
-            .await;
-        let _retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
-        wait_for_retry_delay(retry_delay, cancellation_token).await?;
-        retry_state.connection_retry_delay = next_connection_retry_delay(retry_delay);
-        return Ok(());
-    }
-
-    if retry_state.retries >= max_retries
+    );
+    // Connection recovery has its own retry counter. It must still reach the
+    // HTTPS fallback when the WebSocket endpoint remains unavailable.
+    if (retry_state.retries >= max_retries
+        || (wait_for_connection_recovery && retry_state.connection_retries >= max_retries))
         && should_switch_fallback_transport(&err)
         && client_session.try_switch_fallback_transport(&turn_context.session_telemetry)
     {
@@ -108,6 +91,35 @@ pub(crate) async fn handle_retryable_response_stream_error(
         return Ok(());
     }
 
+    if wait_for_connection_recovery {
+        let retry_delay = retry_state.connection_retry_delay;
+        retry_state.connection_retries = retry_state.connection_retries.saturating_add(1);
+        warn!(
+            turn_id = %turn_context.sub_id,
+            connection_retries = retry_state.connection_retries,
+            ?retry_delay,
+            sampling_error = %err,
+            "stream connection failed; waiting for the network to recover"
+        );
+        // Deliberately does not touch `retry_state.retries`: a lost connection must not
+        // burn the bounded provider retry budget, so the turn survives sleep/wake and
+        // VPN churn instead of failing after `max_retries` quick attempts.
+        sess.notify_stream_error(
+            turn_context,
+            format!(
+                "Reconnecting... waiting for network (attempt {}, next retry in {}s)",
+                retry_state.connection_retries,
+                retry_delay.as_secs(),
+            ),
+            err,
+        )
+        .await;
+        let _retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
+        wait_for_retry_delay(retry_delay, cancellation_token).await?;
+        retry_state.connection_retry_delay = next_connection_retry_delay(retry_delay);
+        return Ok(());
+    }
+
     if retry_state.retries < max_retries {
         retry_state.retries += 1;
         let retry_count = retry_state.retries;
@@ -117,7 +129,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
         // Surface retry information from the first attempt so a reconnect never looks frozen.
         sess.notify_stream_error(
             turn_context,
-            format!("Reconnecting... {retry_count}/{max_retries}"),
+            format!("Reconnecting... {retry_count}/{max_retries} (next retry in {delay:.1?})"),
             err,
         )
         .await;
@@ -185,13 +197,12 @@ fn should_switch_fallback_transport(err: &CodexErr) -> bool {
 }
 
 fn response_stream_retry_delay(err: &CodexErr, retry_count: u64) -> Duration {
-    let requested_or_backoff = match err {
-        CodexErr::Stream(_, requested_delay) => {
-            requested_delay.unwrap_or_else(|| backoff(retry_count))
-        }
-        _ => backoff(retry_count),
-    };
-    requested_or_backoff.min(MAX_RESPONSE_STREAM_RETRY_DELAY)
+    // Server delays are a minimum wait, not a suggestion to retry sooner.
+    // Only our own exponential backoff is capped; all waits remain cancellable.
+    if let CodexErr::Stream(_, Some(requested_delay)) = err {
+        return *requested_delay;
+    }
+    backoff(retry_count).min(MAX_RESPONSE_STREAM_RETRY_DELAY)
 }
 
 fn log_retry(
@@ -205,6 +216,8 @@ fn log_retry(
     match request {
         ResponsesStreamRequest::Sampling => {
             warn!(
+                turn_id = %turn_context.sub_id,
+                sampling_error = %err,
                 "stream disconnected - retrying sampling request ({retries}/{max_retries} in {delay:?})...",
             );
         }

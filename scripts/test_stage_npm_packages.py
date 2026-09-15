@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import errno
-import io
 import hashlib
+import io
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -15,8 +17,277 @@ import zipfile
 from pathlib import Path
 from unittest import mock
 
-import scripts.stage_npm_packages as stage
 import scripts.stage_npm_archives as archives
+import scripts.stage_npm_packages as stage
+
+
+class CodexLauncherTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.node = shutil.which("node")
+        if cls.node is None:
+            raise unittest.SkipTest(
+                "Node.js is required for launcher integration tests"
+            )
+        cls.platform_key = subprocess.check_output(
+            [cls.node, "-p", "process.platform + '-' + process.arch"], text=True
+        ).strip()
+
+    def setUp(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.root = Path(temp_dir.name).resolve()
+        self.launcher = self.root / "bin" / "codex.js"
+        self.launcher.parent.mkdir()
+        shutil.copyfile(
+            Path(__file__).resolve().parents[1] / "codex-cli" / "bin" / "codex.js",
+            self.launcher,
+        )
+        self.native_target = {
+            "targetTriple": "test-native-target",
+            "package": "@openai/codex-test-native",
+            "binary": "codex.exe" if os.name == "nt" else "codex",
+        }
+        self.write_manifest({self.platform_key: self.native_target})
+
+    def write_manifest(self, targets: dict) -> None:
+        (self.root / "package.json").write_text(
+            json.dumps({"type": "module", "codexNativeTargets": targets}),
+            encoding="utf-8",
+        )
+
+    def native_path(self, package_root: Path | None = None) -> Path:
+        return (
+            (package_root or self.root)
+            / "vendor"
+            / self.native_target["targetTriple"]
+            / "bin"
+            / self.native_target["binary"]
+        )
+
+    def run_launcher(self, *args: str, imported: bool = False, stdin: str = ""):
+        command = [self.node]
+        if imported:
+            command.extend(
+                [
+                    "--input-type=module",
+                    "-e",
+                    f"await import({json.dumps(self.launcher.as_uri())})",
+                ]
+            )
+        else:
+            command.append(str(self.launcher))
+        command.extend(args)
+        env = {
+            **os.environ,
+            "npm_config_user_agent": "npm/10.0.0",
+            "npm_execpath": "",
+            "CODEX_MANAGED_BY_BUN": "stale",
+            "CODEX_MANAGED_BY_PNPM": "stale",
+        }
+        return subprocess.run(
+            command,
+            check=False,
+            cwd=self.root,
+            env=env,
+            input=stdin,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=20,
+        )
+
+    def assert_startup_failure(self, result, message: str) -> None:
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertTrue(
+            result.stderr.startswith("Codex could not start: "), result.stderr
+        )
+        self.assertIn(message, result.stderr)
+        self.assertNotIn("\n    at ", result.stderr)
+
+    def test_missing_optional_binary_has_actionable_error_without_stack(self) -> None:
+        result = self.run_launcher()
+        self.assert_startup_failure(
+            result, "Missing optional dependency @openai/codex-test-native"
+        )
+        self.assertIn("Reinstall this KD4 package", result.stderr)
+
+    def test_unsupported_platform_has_concise_error(self) -> None:
+        self.write_manifest({})
+        self.assert_startup_failure(self.run_launcher(), "Unsupported platform:")
+
+    def test_malformed_native_target_has_actionable_metadata_error(self) -> None:
+        malformed_targets = [None, "invalid"]
+        for field in ("targetTriple", "package", "binary"):
+            missing_field = dict(self.native_target)
+            del missing_field[field]
+            malformed_targets.append(missing_field)
+            for value in (None, 12, "", " "):
+                malformed_targets.append({**self.native_target, field: value})
+        for target in malformed_targets:
+            with self.subTest(target=target):
+                self.write_manifest({self.platform_key: target})
+                result = self.run_launcher()
+                self.assert_startup_failure(result, "Invalid native target metadata")
+                self.assertIn("Reinstall this KD4 package", result.stderr)
+                self.assertNotIn("Unsupported platform", result.stderr)
+
+    def test_optional_package_resolution_error_does_not_launch_bundled_binary(self) -> None:
+        package_root = self.root / "node_modules" / "@openai" / "codex-test-native"
+        package_root.mkdir(parents=True)
+        (package_root / "package.json").write_text(
+            json.dumps({"exports": {}}), encoding="utf-8"
+        )
+        binary = self.native_path()
+        binary.parent.mkdir(parents=True)
+        shutil.copy2(self.node, binary)
+
+        result = self.run_launcher("-e", "console.log('unexpected bundled launch')")
+
+        self.assert_startup_failure(result, '"exports"')
+        self.assertIn(str(package_root / "package.json"), result.stderr)
+        self.assertNotIn("Missing optional dependency", result.stderr)
+
+    @unittest.skipUnless(os.name == "nt", "Windows exit status contract")
+    def test_signal_terminated_child_preserves_numeric_exit_status(self) -> None:
+        binary = self.native_path()
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b"fixture")
+        for signal, expected in (("SIGINT", 130), ("SIGTERM", 143), ("UNKNOWN", 1)):
+            script = (
+                "import childProcess from 'node:child_process'; "
+                "import { EventEmitter } from 'node:events'; "
+                "import { syncBuiltinESMExports } from 'node:module'; "
+                "childProcess.spawn = () => { const child = new EventEmitter(); "
+                f"setImmediate(() => child.emit('exit', null, {json.dumps(signal)})); "
+                "return child; }; syncBuiltinESMExports(); "
+                f"await import({json.dumps(self.launcher.as_uri())});"
+            )
+            result = subprocess.run(
+                [self.node, "--input-type=module", "-e", script],
+                cwd=self.root,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(result.returncode, expected, result.stderr)
+
+    def test_spawn_failure_has_actionable_error_without_stack(self) -> None:
+        binary = self.native_path()
+        binary.mkdir(parents=True)
+        result = self.run_launcher()
+        self.assert_startup_failure(result, f"Unable to start {binary}")
+        self.assertIn("Reinstall this KD4 package", result.stderr)
+
+    def test_optional_package_launch_forwards_args_environment_and_exit_code(
+        self,
+    ) -> None:
+        package_root = self.root / "node_modules" / "@openai" / "codex-test-native"
+        binary = self.native_path(package_root)
+        binary.parent.mkdir(parents=True)
+        (package_root / "package.json").write_text("{}", encoding="utf-8")
+        shutil.copy2(self.node, binary)
+        result = self.run_launcher(
+            "-e",
+            "console.log(JSON.stringify({args: process.argv.slice(1), "
+            "root: process.env.CODEX_MANAGED_PACKAGE_ROOT, "
+            "npm: process.env.CODEX_MANAGED_BY_NPM, "
+            "bun: process.env.CODEX_MANAGED_BY_BUN ?? null, "
+            "pnpm: process.env.CODEX_MANAGED_BY_PNPM ?? null})); process.exit(7)",
+            "argument with spaces",
+        )
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "args": ["argument with spaces"],
+                "root": str(self.root),
+                "npm": "1",
+                "bun": None,
+                "pnpm": None,
+            },
+        )
+
+    def test_package_manager_discovery_checks_shared_ancestors_once(self) -> None:
+        binary = self.native_path()
+        binary.parent.mkdir(parents=True)
+        shutil.copy2(self.node, binary)
+        for lexical_dir in (self.launcher.parent, self.root / "linked" / "bin"):
+            for pnpm_owner in (None, lexical_dir):
+                with self.subTest(lexical_dir=lexical_dir, pnpm_owner=pnpm_owner):
+                    # Observe filesystem probes through the real launcher entrypoint.
+                    # Simulate a pnpm link without requiring Windows symlink privileges.
+                    script = (
+                        "import fs from 'node:fs'; "
+                        "import path from 'node:path'; "
+                        "import { syncBuiltinESMExports } from 'node:module'; "
+                        "const exists = fs.existsSync, realpath = fs.realpathSync; "
+                        "const probes = []; "
+                        f"const owner = {json.dumps(str(pnpm_owner) if pnpm_owner else None)}; "
+                        "fs.existsSync = (p) => { "
+                        "if (path.basename(p) !== '.modules.yaml') return exists(p); "
+                        "probes.push(p); "
+                        "return owner !== null && "
+                        "p === path.join(owner, 'node_modules', '.modules.yaml'); }; "
+                        "fs.realpathSync = (p, ...args) => { "
+                        "if (owner !== null && "
+                        "p === path.join(owner, 'node_modules', '@openai', 'codex')) "
+                        f"return {json.dumps(str(self.root))}; "
+                        "return realpath(p, ...args); }; "
+                        "syncBuiltinESMExports(); "
+                        f"process.argv = [process.execPath, {json.dumps(str(lexical_dir / 'codex.js'))}, "
+                        "'-e', \"console.log(JSON.stringify({npm: process.env.CODEX_MANAGED_BY_NPM ?? null, "
+                        'pnpm: process.env.CODEX_MANAGED_BY_PNPM ?? null}))"]; '
+                        "process.on('exit', () => console.log(JSON.stringify(probes))); "
+                        f"await import({json.dumps(self.launcher.as_uri())});"
+                    )
+                    result = subprocess.run(
+                        [self.node, "--input-type=module", "-e", script],
+                        cwd=self.root,
+                        env={**os.environ, "npm_config_user_agent": "npm/10.0.0"},
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=20,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, "")
+                    child_env, probes = map(json.loads, result.stdout.splitlines())
+                    self.assertEqual(
+                        child_env,
+                        {"npm": None, "pnpm": "1"}
+                        if pnpm_owner
+                        else {"npm": "1", "pnpm": None},
+                    )
+                    self.assertEqual(len(probes), len(set(probes)), probes)
+                    if pnpm_owner is None:
+                        directories = {
+                            self.root,
+                            *self.root.parents,
+                            lexical_dir,
+                            *lexical_dir.parents,
+                        }
+                        self.assertEqual(
+                            set(probes),
+                            {
+                                str(p / "node_modules" / ".modules.yaml")
+                                for p in directories
+                            },
+                        )
+
+    def test_import_without_argv_entrypoint_launches_bundled_binary(self) -> None:
+        binary = self.native_path()
+        binary.parent.mkdir(parents=True)
+        shutil.copy2(self.node, binary)
+        result = self.run_launcher(
+            imported=True, stdin="console.log('launched without argv[1]')"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "launched without argv[1]")
+        self.assertEqual(result.stderr, "")
 
 
 class StageNpmPackagesTests(unittest.TestCase):

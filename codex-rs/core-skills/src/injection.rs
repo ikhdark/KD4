@@ -48,12 +48,20 @@ impl ContextualUserFragment for SkillInjection {
     fn body(&self) -> String {
         format!(
             "\n<name>{}</name>\n<path>{}</path>\n<scope>{}</scope>\n{}\n",
-            self.name,
-            self.path,
+            escape_fragment_text(&self.name),
+            escape_fragment_text(&self.path),
             crate::skill_scope_label(self.scope),
-            self.contents
+            escape_fragment_text(&self.contents)
         )
     }
+}
+
+// Keep skill-supplied text inside the fragment's delimiters, including examples
+// that themselves contain XML tags. Escape ampersands first to preserve literals.
+fn escape_fragment_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Read-only skill resolution result. Observability is applied separately so a

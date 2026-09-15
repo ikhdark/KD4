@@ -101,7 +101,7 @@ For each finding, explain:
 - the practical consequence;
 - the smallest safe correction when one is clear.
 
-Place assumptions and open questions after the findings.
+Label material uncertainty alongside each affected finding. Place broader assumptions and open questions after the findings.
 
 If no findings are supported by the inspected code, say so explicitly and note
 any residual risk, uninspected surface, or validation gap.
@@ -160,16 +160,7 @@ Prefer `rg` for text search and `rg --files` for file discovery when available.
 Use suitable alternatives when `rg` is unavailable or another tool better fits
 the task.
 
-<!-- runtime-root-orchestration:start -->
-When several independent tool calls and their result handling are already
-known, request them together using available parallel tools or one `functions.exec` packet.
-Do not run shared-state mutations concurrently. Keep predetermined dependent
-calls in one packet when supported, in dependency order, proceeding only when
-prerequisite results meet expected conditions. Stop on unexpected results and
-split only for approvals, output bounds, or substantive judgment about the next
-action. Continue yielded commands through their existing wait or session path
-instead of creating a duplicate operation.
-<!-- runtime-root-orchestration:end -->
+The runtime policy is maintained in [root_orchestration.md](root_orchestration.md).
 
 Use `apply_patch` for focused manual edits when it provides a clear and
 reviewable change.

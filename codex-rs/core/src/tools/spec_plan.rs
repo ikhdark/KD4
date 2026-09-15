@@ -239,6 +239,11 @@ fn build_tool_specs_and_registry(
     promote_deferred_tools_without_search(turn_context, &mut planned_tools);
     apply_direct_model_only_namespace_overrides(turn_context, &mut planned_tools);
     retain_unique_planned_tool_names(&mut planned_tools);
+    if !crate::guardian::is_guardian_reviewer_source(&turn_context.session_source) {
+        for spec in hosted_model_tool_specs(&context, &planned_tools) {
+            planned_tools.add_hosted_spec(spec);
+        }
+    }
     apply_namespace_description_budget(&mut planned_tools);
     append_tool_search_executor(&context, &mut planned_tools);
     prepend_code_mode_executors(&context, &mut planned_tools)?;
@@ -872,9 +877,6 @@ fn add_tool_sources(context: &CoreToolPlanContext<'_>, planned_tools: &mut Plann
     add_mcp_runtime_tools(context, planned_tools);
     add_extension_tools(context, planned_tools);
     add_dynamic_tools(context, planned_tools);
-    for spec in hosted_model_tool_specs(context, planned_tools) {
-        planned_tools.add_hosted_spec(spec);
-    }
 }
 
 fn standalone_web_search_enabled(turn_context: &TurnContext) -> bool {
@@ -931,6 +933,7 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Planne
     let exec_permission_approvals_enabled = features.enabled(Feature::ExecPermissionApprovals);
     let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
     let shell_command_options = ShellCommandHandlerOptions {
+        foreign_environment: primary_environment_uses_foreign_cwd(context.step_context),
         allow_login_shell,
         allow_escalated_sandbox_permissions,
         exec_permission_approvals_enabled,
@@ -1098,10 +1101,6 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
             .model_info
             .input_modalities
             .contains(&InputModality::Image)
-        && !matches!(
-            &turn_context.session_source,
-            SessionSource::SubAgent(SubAgentSource::Review)
-        )
     {
         let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
         planned_tools.add_with_authorization_class(

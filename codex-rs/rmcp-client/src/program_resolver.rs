@@ -1,18 +1,19 @@
 //! Platform-specific program resolution for MCP server execution.
 //!
 //! This module provides a unified interface for resolving executable paths
-//! across different operating systems. The key challenge it addresses is that
+//! using the MCP server's environment. The key challenge it addresses is that
 //! Windows cannot execute script files (e.g., `.cmd`, `.bat`) directly through
 //! `Command::new()` without their file extensions, while Unix systems handle
 //! scripts natively through shebangs.
 //!
-//! The `resolve` function abstracts these platform differences:
-//! - On Unix: Returns the program unchanged (OS handles script execution)
-//! - On Windows: Uses the `which` crate to resolve full paths including extensions
+//! The `resolve` function uses `which` to resolve full paths, including Windows
+//! extensions, against the server's PATH and PATHEXT rather than the host's.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::path::Path;
+use which::sys::Sys;
 
 /// Resolves a program to its executable path on Windows systems.
 ///
@@ -28,14 +29,13 @@ pub fn resolve(
     env: &HashMap<OsString, OsString>,
     cwd: &Path,
 ) -> std::io::Result<OsString> {
-    // Extract PATH from environment for search locations
-    let search_path = env
-        .iter()
-        .find(|(key, _)| crate::utils::env_keys_equal(key, std::ffi::OsStr::new("PATH")))
-        .map(|(_, value)| value);
-
-    // Attempt resolution via which crate
-    match which::which_in(&program, search_path, cwd) {
+    // which_in uses the host's cached PATHEXT. Supply the child's environment
+    // without mutating process-global state shared by concurrent MCP launches.
+    match which::WhichConfig::new_with_sys(ServerEnvironment(env))
+        .binary_name(program.clone())
+        .custom_cwd(cwd.to_path_buf())
+        .first_result()
+    {
         Ok(resolved) => {
             tracing::debug!("Resolved {program:?} to {resolved:?}");
             Ok(resolved.into_os_string())
@@ -48,7 +48,68 @@ pub fn resolve(
     }
 }
 
-#[cfg(test)]
+struct ServerEnvironment<'a>(&'a HashMap<OsString, OsString>);
+
+impl ServerEnvironment<'_> {
+    fn get(&self, name: &str) -> Option<OsString> {
+        self.0
+            .iter()
+            .find(|(key, _)| crate::utils::env_keys_equal(key, OsStr::new(name)))
+            .map(|(_, value)| value.clone())
+    }
+}
+
+// Retain which's filesystem and executable checks; only environment lookup is
+// scoped to the server being launched.
+impl Sys for ServerEnvironment<'_> {
+    type ReadDirEntry = std::fs::DirEntry;
+    type Metadata = std::fs::Metadata;
+
+    fn is_windows(&self) -> bool {
+        which::sys::RealSys.is_windows()
+    }
+
+    fn current_dir(&self) -> std::io::Result<std::path::PathBuf> {
+        which::sys::RealSys.current_dir()
+    }
+
+    fn home_dir(&self) -> Option<std::path::PathBuf> {
+        which::sys::RealSys.home_dir()
+    }
+
+    fn env_split_paths(&self, paths: &OsStr) -> Vec<std::path::PathBuf> {
+        which::sys::RealSys.env_split_paths(paths)
+    }
+
+    fn env_path(&self) -> Option<OsString> {
+        self.get("PATH")
+    }
+
+    fn env_path_ext(&self) -> Option<OsString> {
+        self.get("PATHEXT")
+    }
+
+    fn metadata(&self, path: &Path) -> std::io::Result<Self::Metadata> {
+        which::sys::RealSys.metadata(path)
+    }
+
+    fn symlink_metadata(&self, path: &Path) -> std::io::Result<Self::Metadata> {
+        which::sys::RealSys.symlink_metadata(path)
+    }
+
+    fn read_dir(
+        &self,
+        path: &Path,
+    ) -> std::io::Result<Box<dyn Iterator<Item = std::io::Result<Self::ReadDirEntry>>>> {
+        which::sys::RealSys.read_dir(path)
+    }
+
+    fn is_valid_executable(&self, path: &Path) -> std::io::Result<bool> {
+        which::sys::RealSys.is_valid_executable(path)
+    }
+}
+
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use crate::utils::create_env_for_mcp_server;
@@ -116,6 +177,48 @@ mod tests {
         assert_eq!(
             String::from_utf8(output.stdout)?.trim(),
             "mcp-resolver-fixture"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn server_pathext_controls_the_executed_script() -> Result<()> {
+        let fixture = TestExecutableEnv::new()?;
+        let cwd = fixture._temp_dir.path();
+        fs::write(
+            cwd.join("test_mcp_server.bat"),
+            "@echo off\necho bat-fixture\n",
+        )?;
+        let mut env = fixture.mcp_env.clone();
+        env.retain(|key, _| !crate::utils::env_keys_equal(key, OsStr::new("PATHEXT")));
+
+        // Alternate orders in one process to catch both host-environment lookup
+        // and a cached extension list leaking between server configurations.
+        for (extensions, extension, expected_output) in [
+            (".CMD;.BAT", "cmd", "mcp-resolver-fixture"),
+            (".BAT;.CMD", "bat", "bat-fixture"),
+        ] {
+            env.insert(OsString::from("pAtHeXt"), OsString::from(extensions));
+            let resolved = resolve(OsString::from(&fixture.program_name), &env, cwd)?;
+            assert_eq!(
+                Path::new(&resolved),
+                cwd.join(format!("test_mcp_server.{extension}"))
+            );
+            let output = Command::new(resolved)
+                .env_clear()
+                .envs(&env)
+                .current_dir(cwd)
+                .output()
+                .await?;
+            assert_eq!(output.status.code(), Some(0));
+            assert_eq!(String::from_utf8(output.stdout)?.trim(), expected_output);
+        }
+
+        env.insert(OsString::from("pAtHeXt"), OsString::from(".EXE"));
+        assert_eq!(
+            resolve(OsString::from(&fixture.program_name), &env, cwd)?,
+            OsString::from(&fixture.program_name),
+            "a script excluded by the server's PATHEXT must not be selected"
         );
         Ok(())
     }

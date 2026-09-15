@@ -66,14 +66,16 @@ fn edge_word_piece(text: &str, backwards: bool) -> Range<usize> {
         let mut chars = segment.char_indices().rev();
         let (_, last) = chars.next().expect("nonempty word segment");
         let boundary = chars
-            .find(|(_, ch)| is_word_separator(*ch) != is_word_separator(last))
+            .find(|(_, ch)| ch.is_whitespace() || is_word_separator(*ch) != is_word_separator(last))
             .map_or(0, |(idx, ch)| idx + ch.len_utf8());
         start + boundary..start + segment.len()
     } else {
         let mut chars = segment.char_indices();
         let (_, first) = chars.next().expect("nonempty word segment");
         let boundary = chars
-            .find(|(_, ch)| is_word_separator(*ch) != is_word_separator(first))
+            .find(|(_, ch)| {
+                ch.is_whitespace() || is_word_separator(*ch) != is_word_separator(first)
+            })
             .map_or(segment.len(), |(idx, _)| idx);
         start..start + boundary
     }

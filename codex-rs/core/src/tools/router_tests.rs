@@ -128,7 +128,7 @@ async fn deferred_capability_revision_depends_only_on_provenance_and_schema() {
     .deferred_tool_capability_revisions();
 
     assert_eq!(first, second);
-    assert_eq!(first.len(), 1);
+    assert!(first.contains_key(&ToolName::plain("stable_deferred_revision")));
 }
 
 #[tokio::test]
@@ -166,11 +166,15 @@ async fn serialized_tool_manifest_cache_invalidates_on_activation_revision() {
     };
     assert!(!exposes_tool(&first));
     turn.refresh_deferred_tool_capabilities(router.deferred_tool_capability_revisions());
+    let capability_revision = turn.deferred_tool_activation_revision();
     turn.activate_deferred_tools([ToolName::plain("activate_manifest_tool")]);
     let second = router.tool_manifest(&turn);
     assert_ne!(first.hash, second.hash);
     assert!(exposes_tool(&second));
-    assert_eq!(turn.deferred_tool_activation_revision(), 1);
+    assert_eq!(
+        turn.deferred_tool_activation_revision(),
+        capability_revision + 1
+    );
 }
 
 #[tokio::test]
@@ -297,8 +301,8 @@ async fn model_visible_schema_lookup_does_not_materialize_rollout_manifest() -> 
     turn.release_advertised_deferred_tools(&HashSet::from([hidden_name]));
     let base_again =
         router.tool_manifest_for_rollout(turn.as_ref(), Some(activated_definition.hash.as_str()));
-    assert!(!base_again.is_reference());
-    assert_eq!(base_again.hash, definition.hash);
+    assert!(base_again.is_reference());
+    assert_eq!(base_again.hash, activated_definition.hash);
     assert_eq!(router.schema_snapshot_build_count(), 2);
     assert_eq!(router.manifest_snapshot_build_count(), 2);
 
@@ -812,9 +816,10 @@ async fn specs_filter_deferred_dynamic_tools() -> anyhow::Result<()> {
         .find(|name| name.to_string().contains(hidden_tool))
         .expect("registered deferred dynamic tool name");
     turn.refresh_deferred_tool_capabilities(router.deferred_tool_capability_revisions());
+    let capability_revision = turn.deferred_tool_activation_revision();
     turn.activate_deferred_tools([hidden_name]);
     let (activation_revision, activated) = turn.deferred_tool_activation_snapshot();
-    assert_eq!(activation_revision, 1);
+    assert_eq!(activation_revision, capability_revision + 1);
     assert_eq!(activated.len(), 1);
     let activated_schemas = router.model_visible_schemas_for_turn(turn.as_ref());
     assert_eq!(
@@ -1483,15 +1488,26 @@ async fn router_apply_patch_finalizes_typed_mutation_evidence() -> anyhow::Resul
         vec!["add", "tracked.txt", "executable.sh"],
         vec!["update-index", "--chmod=+x", "executable.sh"],
     ] {
-        assert!(Command::new("git").args(args).current_dir(&repo).status()?.success());
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()?
+                .success()
+        );
     }
 
     let (mut session, mut turn) = make_session_and_context().await;
     set_router_environment(&mut turn, &repo);
     turn.permission_profile = PermissionProfile::Disabled;
     turn.model_info.apply_patch_tool_type = Some(ApplyPatchToolType::Freeform);
-    let (attempt_id, store) =
-        enable_typed_router_task(&mut session, &mut turn, &repo, &["tracked.txt", "executable.sh"]).await;
+    let (attempt_id, store) = enable_typed_router_task(
+        &mut session,
+        &mut turn,
+        &repo,
+        &["tracked.txt", "executable.sh"],
+    )
+    .await;
     let assignment_id = session
         .services
         .agent_control
@@ -1560,7 +1576,11 @@ async fn router_apply_patch_finalizes_typed_mutation_evidence() -> anyhow::Resul
         "after\n"
     );
     assert!(!repo.join("executable.sh").exists());
-    let diff = tracker.lock().await.get_unified_diff().expect("published patch diff");
+    let diff = tracker
+        .lock()
+        .await
+        .get_unified_diff()
+        .expect("published patch diff");
     assert!(diff.contains("deleted file mode 100755"), "{diff}");
     assert!(diff.contains("executable.sh"), "{diff}");
 
@@ -1572,9 +1592,15 @@ async fn router_apply_patch_finalizes_typed_mutation_evidence() -> anyhow::Resul
         .await
         .expect("mutation evidence remains queryable");
     assert_eq!(evidence.len(), 2);
-    let updated = evidence.iter().find(|item| item.path == "tracked.txt").expect("updated-file evidence");
+    let updated = evidence
+        .iter()
+        .find(|item| item.path == "tracked.txt")
+        .expect("updated-file evidence");
     assert_ne!(updated.pre_write_hash, updated.final_hash);
-    let deleted = evidence.iter().find(|item| item.path == "executable.sh").expect("deleted-file evidence");
+    let deleted = evidence
+        .iter()
+        .find(|item| item.path == "executable.sh")
+        .expect("deleted-file evidence");
     assert!(deleted.pre_write_hash.is_some());
     assert!(deleted.final_hash.is_none());
     for item in evidence {
@@ -1905,6 +1931,22 @@ async fn task_authority_fixture(
             .status()?
             .success()
     );
+    assert!(
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "Initial tracked state"
+            ])
+            .current_dir(&repo)
+            .status()?
+            .success()
+    );
     let (mut session, mut turn) = make_session_and_context().await;
     Arc::make_mut(&mut turn.config).cwd = AbsolutePathBuf::from_absolute_path(&repo)?;
     turn.multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
@@ -2080,6 +2122,7 @@ async fn task_authority_fixture(
         },
         &Default::default(),
     ));
+    turn.refresh_deferred_tool_capabilities(router.deferred_tool_capability_revisions());
     let name = if review {
         "get_agent_task"
     } else {
@@ -2143,7 +2186,8 @@ async fn assert_task_authority_success(
     let mut documents = serde_json::Deserializer::from_str(text).into_iter::<serde_json::Value>();
     let first = documents
         .next()
-        .transpose()?
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid authority response: {text}: {error}"))?
         .ok_or_else(|| anyhow::anyhow!("empty authority response"))?;
     let value = if first["selected_text_follows"] == true {
         assert_eq!(first["outcome"], "success");

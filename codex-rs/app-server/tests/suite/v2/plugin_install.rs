@@ -554,6 +554,7 @@ async fn plugin_install_tracks_analytics_when_remote_detail_fetch_fails() -> Res
     mount_backend_analytics_events(&server).await;
 
     let mut mcp = TestAppServer::builder()
+        .with_args(&["-c", "analytics.enabled=true"])
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .build()
@@ -916,6 +917,7 @@ async fn plugin_install_tracks_analytics_event() -> Result<()> {
         AbsolutePathBuf::try_from(repo_root.path().join(".agents/plugins/marketplace.json"))?;
 
     let mut mcp = TestAppServer::builder()
+        .with_args(&["-c", "analytics.enabled=true"])
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .build()
@@ -986,6 +988,7 @@ async fn plugin_install_failure_tracks_analytics_event() -> Result<()> {
         AbsolutePathBuf::try_from(repo_root.path().join(".agents/plugins/marketplace.json"))?;
 
     let mut mcp = TestAppServer::builder()
+        .with_args(&["-c", "analytics.enabled=true"])
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .build()
@@ -1042,6 +1045,7 @@ async fn plugin_install_tracks_remote_plugin_analytics_event() -> Result<()> {
     mount_backend_analytics_events(&server).await;
 
     let mut mcp = TestAppServer::builder()
+        .with_args(&["-c", "analytics.enabled=true"])
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .with_env_overrides(&[(TEST_ALLOW_HTTP_REMOTE_PLUGIN_BUNDLE_DOWNLOADS, Some("1"))])
@@ -1094,6 +1098,7 @@ async fn plugin_install_preserves_status_when_remote_bundle_error_body_is_too_la
     mount_backend_analytics_events(&server).await;
 
     let mut mcp = TestAppServer::builder()
+        .with_args(&["-c", "analytics.enabled=true"])
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .with_env_overrides(&[(TEST_ALLOW_HTTP_REMOTE_PLUGIN_BUNDLE_DOWNLOADS, Some("1"))])

@@ -1,6 +1,9 @@
 mod filter_specs;
 
 use crate::to_wide;
+use crate::token::LocalSid;
+use crate::winutil::resolve_sid;
+use crate::winutil::string_from_sid_bytes;
 use anyhow::Result;
 use std::ffi::OsStr;
 use std::mem::zeroed;
@@ -55,8 +58,8 @@ use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransac
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionCommit0;
 use windows_sys::Win32::Networking::WinSock::IPPROTO_TCP;
 use windows_sys::Win32::Networking::WinSock::IPPROTO_UDP;
-use windows_sys::Win32::Security::Authorization::BuildExplicitAccessWithNameW;
 use windows_sys::Win32::Security::Authorization::BuildSecurityDescriptorW;
+use windows_sys::Win32::Security::Authorization::BuildTrusteeWithSidW;
 use windows_sys::Win32::Security::Authorization::EXPLICIT_ACCESS_W;
 use windows_sys::Win32::Security::Authorization::GRANT_ACCESS;
 use windows_sys::Win32::Security::PSECURITY_DESCRIPTOR;
@@ -299,25 +302,24 @@ struct UserMatchCondition {
 
 impl UserMatchCondition {
     fn for_account(account: &str) -> Result<Self> {
-        let account_w = to_wide(OsStr::new(account));
+        // Resolve through the same account lookup used during provisioning. Name-form ACL
+        // trustees invoke the installed security providers, which may reject this local
+        // account even though Windows has already resolved its SID successfully.
+        let sid_bytes = resolve_sid(account)?;
+        let sid_string = string_from_sid_bytes(&sid_bytes).map_err(anyhow::Error::msg)?;
+        let sid = LocalSid::from_string(&sid_string)?;
         // SAFETY: EXPLICIT_ACCESS_W contains integers and nullable pointers; zero is a valid
-        // representation before the native initializer fills it.
+        // representation before its access mask and trustee are initialized below.
         let mut access: EXPLICIT_ACCESS_W = unsafe { zeroed() };
-        // SAFETY: access is writable and account_w is a live NUL-terminated account name; its
-        // borrowed pointer remains live through the descriptor construction below.
-        unsafe {
-            BuildExplicitAccessWithNameW(
-                &mut access,
-                account_w.as_ptr(),
-                FWP_ACTRL_MATCH_FILTER,
-                GRANT_ACCESS,
-                0,
-            );
-        }
+        access.grfAccessPermissions = FWP_ACTRL_MATCH_FILTER;
+        access.grfAccessMode = GRANT_ACCESS;
+        // SAFETY: access.Trustee is writable, and sid owns a valid native SID allocation
+        // that remains live until descriptor construction has copied the access entry.
+        unsafe { BuildTrusteeWithSidW(&mut access.Trustee, sid.as_ptr()) };
 
         let mut security_descriptor: PSECURITY_DESCRIPTOR = null_mut();
         let mut security_descriptor_len = 0;
-        // SAFETY: The single access record borrows the still-live account name; the descriptor
+        // SAFETY: The single access record borrows the still-live SID; the descriptor
         // pointer and length are writable outputs, and UserMatchCondition owns the
         // successful allocation.
         let result = unsafe {
@@ -420,7 +422,10 @@ fn add_filter(
     )
 }
 
-#[expect(clippy::too_many_arguments, reason = "Fields map directly to FWPM_FILTER0 for static block and dynamic proxy permit rules")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Fields map directly to FWPM_FILTER0 for static block and dynamic proxy permit rules"
+)]
 fn add_filter_parts(
     engine: HANDLE,
     key: GUID,
@@ -638,6 +643,57 @@ mod tests {
     use super::normalized_proxy_ports;
     use pretty_assertions::assert_eq;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn user_match_descriptor_grants_only_the_resolved_account() -> anyhow::Result<()> {
+        use windows_sys::Win32::Security::ACCESS_ALLOWED_ACE;
+        use windows_sys::Win32::Security::EqualSid;
+        use windows_sys::Win32::Security::GetAce;
+        use windows_sys::Win32::Security::GetSecurityDescriptorDacl;
+
+        let condition = super::UserMatchCondition::for_account("SYSTEM")?;
+        let expected_sid = super::LocalSid::from_string("S-1-5-18")?;
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut acl = std::ptr::null_mut();
+        // SAFETY: condition owns the valid descriptor, and all three output slots are
+        // writable; the returned ACL remains borrowed from the live condition below.
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(
+                    condition.security_descriptor,
+                    &mut present,
+                    &mut acl,
+                    &mut defaulted,
+                )
+            },
+            0
+        );
+        assert_ne!(present, 0);
+        assert!(!acl.is_null());
+        // SAFETY: the non-null ACL was returned from the valid descriptor above.
+        assert_eq!(unsafe { (*acl).AceCount }, 1);
+        let mut ace = std::ptr::null_mut();
+        // SAFETY: the ACL has one ACE, index zero is valid, and ace is writable output.
+        assert_ne!(unsafe { GetAce(acl, 0, &mut ace) }, 0);
+        // SAFETY: the descriptor was constructed with one GRANT_ACCESS entry, so its
+        // first ACE has the ACCESS_ALLOWED_ACE layout and a live, complete SID.
+        let ace = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+        assert_eq!(ace.Header.AceType, 0);
+        assert_eq!(ace.Mask, super::FWP_ACTRL_MATCH_FILTER);
+        // SAFETY: SidStart begins the complete SID in this access ACE, and expected_sid
+        // owns the valid independently specified SYSTEM SID.
+        assert_ne!(
+            unsafe {
+                EqualSid(
+                    std::ptr::addr_of!(ace.SidStart).cast_mut().cast(),
+                    expected_sid.as_ptr(),
+                )
+            },
+            0
+        );
+        Ok(())
+    }
 
     #[test]
     fn filter_keys_are_unique() {

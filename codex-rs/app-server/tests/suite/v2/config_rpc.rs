@@ -60,6 +60,16 @@ async fn config_requirements_read_includes_allow_remote_control() -> Result<()> 
         "allow_remote_control = false\n",
     )?;
     let mut mcp = TestAppServer::builder()
+        .with_env_overrides(&[(
+            "CODEX_APP_SERVER_MANAGED_CONFIG_PATH",
+            Some(
+                codex_home
+                    .path()
+                    .join("managed_config.toml")
+                    .to_string_lossy()
+                    .as_ref(),
+            ),
+        )])
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .build()
@@ -96,6 +106,16 @@ service_tier = "priority"
 "#,
     )?;
     let mut mcp = TestAppServer::builder()
+        .with_env_overrides(&[(
+            "CODEX_APP_SERVER_MANAGED_CONFIG_PATH",
+            Some(
+                codex_home
+                    .path()
+                    .join("managed_config.toml")
+                    .to_string_lossy()
+                    .as_ref(),
+            ),
+        )])
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .build()
@@ -1082,7 +1102,6 @@ async fn config_batch_write_hot_reloads_supported_feature_for_loaded_thread() ->
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(&codex_home)
-        .without_auto_env()
         .build()
         .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;

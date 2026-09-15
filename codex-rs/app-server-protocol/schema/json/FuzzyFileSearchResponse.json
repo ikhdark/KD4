@@ -56,6 +56,25 @@
         "$ref": "#/definitions/FuzzyFileSearchResult"
       },
       "type": "array"
+    },
+    "scannedFileCount": {
+      "default": 0,
+      "description": "Number of indexed files and directories, including entries that did not match.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "totalMatchCount": {
+      "default": 0,
+      "description": "Matches found among scanned entries, before the result limit is applied.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "walkComplete": {
+      "default": false,
+      "description": "False if scanning was skipped or paths were omitted due to limits, cancellation, or errors.",
+      "type": "boolean"
     }
   },
   "required": [

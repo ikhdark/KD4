@@ -51,6 +51,14 @@ fn review_rubric_stays_compact_without_losing_output_contracts() {
     );
     for required in [
         "Return every qualifying issue",
+        "including code outside the diff",
+        "generated artifacts, schemas, and required source maps",
+        "relevant tests assert the expected behavior and could catch a plausible regression",
+        "build and test results with their scope and freshness",
+        "do not treat missing validation evidence alone as a demonstrated defect",
+        "Missing requested behavior and violations of preserved invariants qualify",
+        "cite the affected callers or contracts in the body",
+        "only when applicable requirements and preserved invariants are satisfied",
         "Intentional changes remain reportable when direct evidence establishes a defect or violation of an applicable requirement.",
         "Base correctness on defects, not urgency: a lower-priority defect still makes the patch incorrect.",
         "[P0]",

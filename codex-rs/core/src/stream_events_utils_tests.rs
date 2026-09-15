@@ -457,12 +457,9 @@ async fn malformed_client_tool_search_records_correlated_tool_search_output() {
     assert_eq!(output_call_id, request_call_id);
     assert_eq!(status, "incomplete");
     assert_eq!(execution, "client");
-    assert_eq!(
-        tools,
-        &[serde_json::json!({
-            "type": "tool_search_error",
-            "message": "failed to parse function arguments: invalid type: integer `42`, expected a string",
-        })]
+    assert!(
+        tools.is_empty(),
+        "failed searches must not publish invalid tool declarations"
     );
 }
 
@@ -802,7 +799,13 @@ async fn exact_tool_call_replay_is_deduplicated_but_conflicting_reuse_is_rejecte
         &mut eager_prefix_open,
     )
     .await;
-    assert!(matches!(third, Err(CodexErr::Fatal(message)) if message.contains("same call ID")));
+    let Err(CodexErr::Fatal(message)) = third else {
+        panic!("conflicting reuse must be rejected as a fatal duplicate");
+    };
+    assert_eq!(
+        message,
+        "refusing tool call `duplicate-call` because the same call ID was already accepted in this model generation"
+    );
     assert!(!started.load(Ordering::SeqCst));
 
     ctx.response_item_recorder.flush().await;

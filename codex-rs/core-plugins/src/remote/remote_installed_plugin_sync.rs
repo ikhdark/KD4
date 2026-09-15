@@ -97,6 +97,7 @@ struct RemotePluginCacheMutationKey {
 pub struct RemotePluginCacheMutationGuard {
     key: RemotePluginCacheMutationKey,
     sync_registration: Option<Arc<RemoteInstalledPluginBundleSyncGuard>>,
+    invalidates_snapshot: bool,
 }
 
 pub(crate) fn maybe_start_remote_installed_plugin_bundle_sync(
@@ -344,10 +345,11 @@ async fn sync_remote_installed_plugin_bundles_inner(
                 }
             };
 
-            let mut mutation = mark_remote_plugin_cache_mutation_in_flight(
+            let mut mutation = mark_remote_plugin_cache_mutation_in_flight_inner(
                 &codex_home,
                 &marketplace_name,
                 &plugin.name,
+                /*invalidates_snapshot*/ false,
             );
             mutation.sync_registration = sync_registration.clone();
             match crate::remote_bundle::download_and_install_remote_plugin_bundle_with_guard(
@@ -397,6 +399,20 @@ pub fn mark_remote_plugin_cache_mutation_in_flight(
     marketplace_name: &str,
     plugin_name: &str,
 ) -> RemotePluginCacheMutationGuard {
+    mark_remote_plugin_cache_mutation_in_flight_inner(
+        codex_home,
+        marketplace_name,
+        plugin_name,
+        /*invalidates_snapshot*/ true,
+    )
+}
+
+fn mark_remote_plugin_cache_mutation_in_flight_inner(
+    codex_home: &Path,
+    marketplace_name: &str,
+    plugin_name: &str,
+    invalidates_snapshot: bool,
+) -> RemotePluginCacheMutationGuard {
     let key = RemotePluginCacheMutationKey {
         plugin_cache_root: remote_plugin_cache_root(codex_home),
         marketplace_name: marketplace_name.to_string(),
@@ -408,15 +424,20 @@ pub fn mark_remote_plugin_cache_mutation_in_flight(
         Ok(mutations) => mutations,
         Err(err) => err.into_inner(),
     };
-    let generation = mutations
-        .generations
-        .entry(key.plugin_cache_root.clone())
-        .or_default();
-    *generation = generation.wrapping_add(1);
+    // A sync's own install is part of its catalog snapshot. Only independent
+    // mutations invalidate that snapshot; both still participate in exclusion.
+    if invalidates_snapshot {
+        let generation = mutations
+            .generations
+            .entry(key.plugin_cache_root.clone())
+            .or_default();
+        *generation = generation.wrapping_add(1);
+    }
     *mutations.in_flight.entry(key.clone()).or_default() += 1;
     RemotePluginCacheMutationGuard {
         key,
         sync_registration: None,
+        invalidates_snapshot,
     }
 }
 
@@ -429,11 +450,13 @@ impl Drop for RemotePluginCacheMutationGuard {
             Ok(mutations) => mutations,
             Err(err) => err.into_inner(),
         };
-        let generation = mutations
-            .generations
-            .entry(self.key.plugin_cache_root.clone())
-            .or_default();
-        *generation = generation.wrapping_add(1);
+        if self.invalidates_snapshot {
+            let generation = mutations
+                .generations
+                .entry(self.key.plugin_cache_root.clone())
+                .or_default();
+            *generation = generation.wrapping_add(1);
+        }
         if let Some(count) = mutations.in_flight.get_mut(&self.key) {
             *count -= 1;
             if *count == 0 {

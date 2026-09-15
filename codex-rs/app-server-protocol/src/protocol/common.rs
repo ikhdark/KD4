@@ -1742,9 +1742,20 @@ pub enum FuzzyFileSearchMatchType {
     Directory,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, Default)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
 pub struct FuzzyFileSearchResponse {
     pub files: Vec<FuzzyFileSearchResult>,
+    /// Matches found among scanned entries, before the result limit is applied.
+    #[serde(default)]
+    pub total_match_count: usize,
+    /// Number of indexed files and directories, including entries that did not match.
+    #[serde(default)]
+    pub scanned_file_count: usize,
+    /// False if scanning was skipped or paths were omitted due to limits, cancellation, or errors.
+    #[serde(default)]
+    pub walk_complete: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1786,6 +1797,17 @@ pub struct FuzzyFileSearchSessionUpdatedNotification {
     pub session_id: String,
     pub query: String,
     pub files: Vec<FuzzyFileSearchResult>,
+    /// Matches found among scanned entries, before the result limit is applied.
+    /// Zero when the query is empty and results are suppressed.
+    #[serde(default)]
+    pub total_match_count: usize,
+    /// Number of indexed files and directories, including entries that did not match.
+    #[serde(default)]
+    pub scanned_file_count: usize,
+    /// True only after scanning finishes without omitting paths. A completed
+    /// notification with this still false indicates an incomplete traversal.
+    #[serde(default)]
+    pub walk_complete: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1933,6 +1955,27 @@ mod tests {
     fn request_id() -> RequestId {
         const REQUEST_ID: i64 = 1;
         RequestId::Integer(REQUEST_ID)
+    }
+
+    #[test]
+    fn fuzzy_file_search_metadata_accepts_legacy_payloads() -> Result<()> {
+        let response: FuzzyFileSearchResponse = serde_json::from_value(json!({"files": []}))?;
+        assert_eq!(response, FuzzyFileSearchResponse::default());
+        assert_eq!(
+            serde_json::to_value(response)?,
+            json!({"files": [], "totalMatchCount": 0, "scannedFileCount": 0, "walkComplete": false})
+        );
+        let update: FuzzyFileSearchSessionUpdatedNotification = serde_json::from_value(json!({
+            "sessionId": "session", "query": "needle", "files": []
+        }))?;
+        assert_eq!(
+            serde_json::to_value(update)?,
+            json!({
+                "sessionId": "session", "query": "needle", "files": [],
+                "totalMatchCount": 0, "scannedFileCount": 0, "walkComplete": false
+            })
+        );
+        Ok(())
     }
 
     #[test]

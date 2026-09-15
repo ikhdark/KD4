@@ -287,6 +287,60 @@ fn direct_file_read_shells_still_reject_composed_mutations() {
 }
 
 #[test]
+fn shell_syntax_and_literal_arguments_have_distinct_mutation_effects() {
+    for argv in [
+        vec!["rg", " > ", "file"],
+        vec!["rg", ">>", "file"],
+        vec!["grep", "-n", ">>", "file"],
+        vec!["bash", "-lc", "rg ' > ' file"],
+        vec!["bash", "-lc", "rg '>>' file"],
+        vec!["pwsh", "-Command", "cargo check"],
+        vec!["cmd", "/c", "cargo check"],
+        vec!["git", "-ccolor.ui=false", "show", "HEAD"],
+        vec!["git", "blame", "file"],
+        vec!["git", "rev-list", "HEAD"],
+    ] {
+        let command = argv.into_iter().map(str::to_string).collect::<Vec<_>>();
+        let mut tracker = TurnDiffTracker::new();
+        tracker.record_exec_command_end(&command, 0, false);
+        assert_eq!(tracker.current_mutation_revision(), 0, "{command:?}");
+    }
+    for argv in [
+        vec!["bash", "-lc", "cargo build >out.txt"],
+        vec!["bash", "-lc", "git show HEAD >out.txt"],
+        vec!["bash", "-lc", "git status; touch out.txt"],
+        vec!["bash", "-lc", "cargo fmt --check; touch out.txt"],
+        vec!["pwsh", "-Command", "git show HEAD >out.txt"],
+        vec![
+            "pwsh",
+            "-Command",
+            "cargo check; Set-Content out.txt changed",
+        ],
+        vec![
+            "pwsh",
+            "-Command",
+            "git status; Set-Content out.txt changed",
+        ],
+        vec!["cmd", "/c", "git status >out.txt"],
+        vec!["git", "-ccolor.ui=false", "reset", "--hard"],
+        vec!["git", "branch", "-D", "old"],
+        vec!["git", "tag", "new-tag"],
+        vec!["git", "config", "user.name", "changed"],
+    ] {
+        let command = argv.into_iter().map(str::to_string).collect::<Vec<_>>();
+        let mut tracker = TurnDiffTracker::new();
+        tracker.record_exec_command_end(&command, 0, false);
+        assert_eq!(tracker.current_mutation_revision(), 1, "{command:?}");
+    }
+    assert!(command_reads_repository_history(&[
+        "git".into(),
+        "-ccolor.ui=false".into(),
+        "show".into(),
+        "HEAD".into(),
+    ]));
+}
+
+#[test]
 fn arbitrary_script_runners_fail_closed_as_possible_mutations() {
     for command in [
         vec!["python".into(), "edit.py".into()],

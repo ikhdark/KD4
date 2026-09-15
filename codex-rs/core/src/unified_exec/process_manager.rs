@@ -289,6 +289,7 @@ struct PreparedProcessHandles {
     call_id: String,
     hook_command: String,
     process_id: u32,
+    search_exit_one_is_no_match: bool,
     tty: bool,
 }
 
@@ -1143,7 +1144,8 @@ impl UnifiedExecProcessManager {
                     process_id: None,
                     exit_code: Some(0),
                     process_exited: true,
-                    original_token_count: Some(approx_token_count(hit.rendered_output())),
+                    search_no_match: false,
+                    original_token_count: Some(hit.original_token_count()),
                     hook_command: Some(request.hook_command.clone()),
                     raw_output_artifact: Some(hit.raw_output_artifact().clone()),
                     raw_output_reduction_notice: None,
@@ -1460,6 +1462,7 @@ impl UnifiedExecProcessManager {
             process_id: response_process_id,
             exit_code,
             process_exited,
+            search_no_match: request.attempt_key.is_search_no_match(exit_code),
             original_token_count: Some(original_token_count),
             hook_command: Some(request.hook_command.clone()),
             raw_output_artifact: process.raw_output_artifact().await,
@@ -1552,6 +1555,7 @@ impl UnifiedExecProcessManager {
             call_id,
             hook_command,
             process_id,
+            search_exit_one_is_no_match,
             tty,
             ..
         } = self
@@ -1732,6 +1736,7 @@ impl UnifiedExecProcessManager {
             process_id,
             exit_code,
             process_exited,
+            search_no_match: search_exit_one_is_no_match && exit_code == Some(1),
             original_token_count: Some(original_token_count),
             hook_command: Some(hook_command),
             raw_output_artifact: process.raw_output_artifact().await,
@@ -1835,6 +1840,7 @@ impl UnifiedExecProcessManager {
             call_id: entry.call_id.clone(),
             hook_command: entry.hook_command.clone(),
             process_id: entry.process_id,
+            search_exit_one_is_no_match: entry.search_exit_one_is_no_match,
             tty: entry.tty,
         })
     }
@@ -1880,6 +1886,7 @@ impl UnifiedExecProcessManager {
             cwd: cwd.clone(),
             initial_exec_command_active,
             hook_command,
+            search_exit_one_is_no_match: attempt_key.is_search_no_match(Some(1)),
             tty,
             network_approval: network_approval.clone(),
             session: Arc::downgrade(&context.session),
@@ -2384,7 +2391,6 @@ impl UnifiedExecProcessManager {
             pause_state,
             deadline,
             None,
-            false,
         )
         .await
     }
@@ -2407,7 +2413,6 @@ impl UnifiedExecProcessManager {
             pause_state,
             deadline,
             Some(INITIAL_OUTPUT_QUIET_PERIOD),
-            false,
         )
         .await
     }
@@ -2430,7 +2435,6 @@ impl UnifiedExecProcessManager {
             pause_state,
             deadline,
             Some(INITIAL_OUTPUT_QUIET_PERIOD),
-            true,
         )
         .await
     }
@@ -2445,7 +2449,6 @@ impl UnifiedExecProcessManager {
         mut pause_state: Option<watch::Receiver<bool>>,
         mut deadline: Instant,
         quiet_period: Option<Duration>,
-        yield_when_silent: bool,
     ) -> Vec<u8> {
         // Draining frees producer capacity, so the entire collection window needs
         // its own bound. Raw output is still captured by the process artifact writer.
@@ -2454,12 +2457,9 @@ impl UnifiedExecProcessManager {
         let mut wait_attempt = 0_u32;
         let mut exit_signal_received = cancellation_token.is_cancelled();
         let mut post_exit_deadline: Option<Instant> = None;
-        // A silent initial process should return a live session promptly instead
-        // of consuming the full requested yield. Meaningful output resets this
-        // adaptive deadline so a burst can still be collected to quiescence.
-        let mut early_yield_deadline = yield_when_silent
-            .then(|| quiet_period.map(|period| (Instant::now() + period).min(deadline)))
-            .flatten();
+        // Silence alone is not progress. Honor the requested deadline until
+        // meaningful output starts the shorter quiet-period deadline.
+        let mut early_yield_deadline = None;
         loop {
             Self::extend_deadlines_while_paused(
                 &mut pause_state,
@@ -2902,6 +2902,18 @@ impl UnifiedExecProcessManager {
         };
 
         unregister_network_approval_for_entry(&entry).await;
+        if let Some(session) = entry.session.upgrade() {
+            session
+                .services
+                .command_execution
+                .finish_running_process_with_execution_id(
+                    entry.process_id,
+                    entry.command_execution_id,
+                    &entry.parent_tool_execution_id,
+                    Some(entry.process.exit_code().unwrap_or(-1)),
+                )
+                .await;
+        }
         true
     }
 }

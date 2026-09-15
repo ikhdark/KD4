@@ -48,6 +48,7 @@ pub struct PreparedFixture {
 pub enum VerificationStatus {
     Passed,
     Incorrect,
+    ScopeViolation,
     Unavailable,
     TimedOut,
     IntegrityFailure,
@@ -298,6 +299,7 @@ fn verify_fixture_inner(
                 Some(0) => VerificationStatus::Passed,
                 Some(1) => VerificationStatus::Incorrect,
                 Some(3) => VerificationStatus::TimedOut,
+                Some(4) => VerificationStatus::ScopeViolation,
                 _ => VerificationStatus::Unavailable,
             };
             let detail = fs::read_to_string(&stdout_path).unwrap_or_default();

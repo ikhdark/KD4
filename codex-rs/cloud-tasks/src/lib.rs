@@ -2309,14 +2309,14 @@ mod tests {
                 "the rejected apply must not emit a completion"
             );
 
-            app.apply_modal = Some(modal("next"));
+            app.apply_modal = Some(modal("T-1000"));
             assert!(spawn_preflight(
                 &mut app,
                 &backend,
                 &tx,
                 &frame_tx,
                 "Next task".to_string(),
-                job("next"),
+                job("T-1000"),
             ));
             let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
                 .await
@@ -2327,11 +2327,17 @@ mod tests {
             assert_eq!(displayed.title, "Next task");
             assert_eq!(
                 displayed.result_message.as_deref(),
-                Some("Preflight passed for task next (mock)")
+                Some("Preflight passed for task T-1000 (mock)")
             );
             assert_eq!(displayed.result_level, Some(app::ApplyResultLevel::Success));
             assert!(!app.apply_preflight_inflight);
-            assert!(spawn_apply(&mut app, &backend, &tx, &frame_tx, job("next")));
+            assert!(spawn_apply(
+                &mut app,
+                &backend,
+                &tx,
+                &frame_tx,
+                job("T-1000")
+            ));
             let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
                 .await
                 .expect("next apply deadline")
@@ -2342,7 +2348,10 @@ mod tests {
             );
             assert!(!app.apply_inflight);
             assert!(app.apply_modal.is_none());
-            assert_eq!(app.status, "Applied task next locally (mock)");
+            assert_eq!(
+                app.status,
+                "Simulated applying task T-1000 (mock; no files changed)"
+            );
         }
     }
 

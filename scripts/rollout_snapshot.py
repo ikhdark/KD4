@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import io
 import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Sequence
+from typing import BinaryIO, Iterator, Sequence
 
 
 _READ_CHUNK_BYTES = 1024 * 1024
@@ -22,8 +24,32 @@ class RolloutSnapshot:
     sha256: str
     byte_length: int
 
+    @contextlib.contextmanager
+    def open_lines(self) -> Iterator[BinaryIO]:
+        """Decode captured bytes without changing their on-disk identity."""
+        with io.BytesIO(self.data) as raw:
+            if self.path.name.endswith(".jsonl.zst"):
+                try:
+                    from compression import zstd
+                except ImportError:
+                    try:
+                        from backports import zstd
+                    except ImportError as error:
+                        raise ValueError(
+                            "Compressed rollouts require Python 3.14+ or backports.zstd; "
+                            "run through `uv run --project scripts` to install dependencies"
+                        ) from error
+                try:
+                    with zstd.open(raw, "rb") as decoded:
+                        yield decoded
+                except (zstd.ZstdError, EOFError) as error:
+                    raise ValueError(f"cannot decompress rollout {self.path}: {error}") from error
+            else:
+                yield raw
+
     def text_lines(self) -> list[str]:
-        return self.data.decode("utf-8").splitlines()
+        with self.open_lines() as handle:
+            return handle.read().decode("utf-8").splitlines()
 
     def metadata(self) -> dict[str, str | int]:
         return {
@@ -74,8 +100,28 @@ def _open_shared_binary(path: Path) -> BinaryIO:
     return os.fdopen(fd, "rb")
 
 
+def existing_rollout_path(path: Path) -> Path:
+    """Resolve a canonical path after the rollout compression worker moves it."""
+    if path.exists():
+        return path
+    if path.name.endswith(".jsonl"):
+        compressed = path.with_name(path.name + ".zst")
+        if compressed.is_file():
+            return compressed
+    return path
+
+
+def discover_rollouts(root: Path, pattern: str = "*.jsonl") -> list[Path]:
+    """Include cold rollouts, preferring plain siblings as the runtime does."""
+    paths = {path for path in root.rglob(pattern) if path.is_file()}
+    for compressed in root.rglob(pattern + ".zst"):
+        if compressed.is_file() and compressed.with_suffix("") not in paths:
+            paths.add(compressed)
+    return sorted(paths)
+
+
 def read_rollout_snapshot(path: Path) -> RolloutSnapshot:
-    resolved = path.resolve(strict=True)
+    resolved = existing_rollout_path(path).resolve(strict=True)
     with (
         _open_shared_binary(resolved) if os.name == "nt" else resolved.open("rb")
     ) as handle:
@@ -108,7 +154,7 @@ def _parser() -> argparse.ArgumentParser:
             "and report its SHA-256 identity."
         )
     )
-    parser.add_argument("path", type=Path, help="Exact rollout JSONL path")
+    parser.add_argument("path", type=Path, help="Rollout JSONL or JSONL.zst path")
     parser.add_argument(
         "--output",
         type=Path,

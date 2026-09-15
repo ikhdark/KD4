@@ -1083,7 +1083,6 @@ mod tests {
     use super::*;
     use anyhow::Result;
     use codex_keyring_store::tests::MockKeyringStore;
-    use codex_secrets::compute_keyring_account;
     use keyring::Error as KeyringError;
     use pretty_assertions::assert_eq;
     use std::sync::Arc;
@@ -1406,12 +1405,43 @@ mod tests {
     fn save_oauth_tokens_with_secrets_backend_falls_back_to_file_when_keyring_fails() -> Result<()>
     {
         let env = TempCodexHome::new();
-        let store = MockKeyringStore::default();
-        store.set_error(
-            KEYRING_SERVICE,
-            &compute_keyring_account(env.path()),
-            KeyringError::Invalid("error".into(), "save".into()),
-        );
+        #[derive(Debug, Clone, Default)]
+        struct FailingSaveKeyring {
+            save_attempts: Arc<AtomicUsize>,
+        }
+
+        impl KeyringStore for FailingSaveKeyring {
+            fn load(
+                &self,
+                _service: &str,
+                _account: &str,
+            ) -> std::result::Result<Option<String>, codex_keyring_store::CredentialStoreError>
+            {
+                Ok(None)
+            }
+
+            fn save(
+                &self,
+                _service: &str,
+                _account: &str,
+                _value: &str,
+            ) -> std::result::Result<(), codex_keyring_store::CredentialStoreError> {
+                self.save_attempts.fetch_add(1, Ordering::SeqCst);
+                Err(codex_keyring_store::CredentialStoreError::new(
+                    KeyringError::Invalid("error".into(), "save".into()),
+                ))
+            }
+
+            fn delete(
+                &self,
+                _service: &str,
+                _account: &str,
+            ) -> std::result::Result<bool, codex_keyring_store::CredentialStoreError> {
+                panic!("failed secure save must not delete credentials");
+            }
+        }
+
+        let store = FailingSaveKeyring::default();
         let tokens = sample_tokens();
 
         super::save_oauth_tokens_with_keyring_with_fallback_to_file(
@@ -1426,6 +1456,11 @@ mod tests {
             super::read_fallback_file_unlocked(env.path())?.expect("fallback file should load");
         let key = super::compute_store_key(&tokens.server_name, &tokens.url)?;
         assert!(saved.contains_key(&key));
+        assert_eq!(store.save_attempts.load(Ordering::SeqCst), 1);
+        let loaded =
+            super::load_oauth_tokens_from_file(env.path(), &tokens.server_name, &tokens.url)?
+                .expect("fallback preserves saved credentials");
+        assert_tokens_match_without_expiry(&loaded, &tokens);
         Ok(())
     }
 
@@ -1544,7 +1579,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::await_holding_invalid_type, reason = "Holds write ordering while replacing credentials to prove persistence samples after admission")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Holds write ordering while replacing credentials to prove persistence samples after admission"
+    )]
     async fn persistence_samples_credentials_after_acquiring_write_order() -> Result<()> {
         use rmcp::transport::auth::AuthorizationMetadata;
         use rmcp::transport::auth::CredentialStore;

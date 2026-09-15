@@ -1659,6 +1659,19 @@ async fn plugin_list_sync_upgrades_and_removes_remote_installed_plugin_bundles()
     mount_remote_installed_plugins(&server, "WORKSPACE", empty_remote_installed_plugins_body())
         .await;
     mount_empty_user_installed_plugins(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/ps/plugins/suggested"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "enabled": true,
+            "plugins": [],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/plugins/featured"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .mount(&server)
+        .await;
 
     let old_path = codex_home
         .path()
@@ -1672,6 +1685,7 @@ async fn plugin_list_sync_upgrades_and_removes_remote_installed_plugin_bundles()
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
+        .with_plugin_startup_tasks()
         .without_auto_env()
         .with_env_overrides(&[(TEST_ALLOW_HTTP_REMOTE_PLUGIN_BUNDLE_DOWNLOADS, Some("1"))])
         .build()

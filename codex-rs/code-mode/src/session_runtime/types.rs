@@ -144,6 +144,7 @@ pub(crate) trait SessionRuntimeDelegate: Send + Sync + 'static {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Error {
     ShuttingDown,
+    ActiveCellLimit,
     CellIdSpaceExhausted,
     DuplicateCell(CellId),
     MissingCell(CellId),
@@ -157,6 +158,9 @@ impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ShuttingDown => formatter.write_str("code mode session is shutting down"),
+            Self::ActiveCellLimit => formatter.write_str(
+                "code mode has reached its active cell limit; wait for an existing cell to finish or terminate one before starting another exec",
+            ),
             Self::CellIdSpaceExhausted => {
                 formatter.write_str("code mode session exhausted its cell ID space")
             }

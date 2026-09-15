@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
 use std::io::Error as IoError;
+use std::io::ErrorKind;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
@@ -1211,9 +1212,14 @@ impl RolloutRecorder {
     ) -> std::io::Result<(bool, crate::ToolManifestDictionary)> {
         let mut has_session_meta = false;
         let mut manifests = crate::ToolManifestDictionary::default();
+        let mut parse_errors = 0usize;
         let mut reader = compression::open_rollout_line_reader(path).await?;
         while let Some(line) = reader.next_line().await? {
+            if line.trim().is_empty() {
+                continue;
+            }
             let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(line.trim()) else {
+                parse_errors = parse_errors.saturating_add(1);
                 continue;
             };
             match rollout_line.item {
@@ -1226,11 +1232,24 @@ impl RolloutRecorder {
                 _ => {}
             }
         }
+        if parse_errors > 0 {
+            warn!(
+                ?path,
+                parse_errors,
+                "skipped malformed rollout records while reconstructing persisted state"
+            );
+        }
         Ok((has_session_meta, manifests))
     }
 
     pub async fn get_rollout_history(path: &Path) -> std::io::Result<InitialHistory> {
-        let (items, thread_id, _parse_errors) = Self::load_rollout_items(path).await?;
+        let (items, thread_id, parse_errors) = Self::load_rollout_items(path).await?;
+        if parse_errors > 0 {
+            warn!(
+                ?path,
+                parse_errors, "rollout history is incomplete: malformed records were skipped"
+            );
+        }
         let conversation_id = thread_id
             .ok_or_else(|| IoError::other("failed to parse thread ID from rollout file"))?;
 
@@ -1285,7 +1304,12 @@ pub(crate) fn reject_unknown_thread_history_mode(value: &Value) -> std::io::Resu
     };
     serde_json::from_value::<ThreadHistoryMode>(history_mode.clone())
         .map(|_| ())
-        .map_err(|err| IoError::other(format!("invalid session metadata history_mode: {err}")))
+        .map_err(|err| {
+            IoError::new(
+                ErrorKind::InvalidData,
+                format!("invalid session metadata history_mode: {err}"),
+            )
+        })
 }
 
 fn migrate_v0_ghost_snapshot_rollout_line(value: &mut Value) -> bool {
@@ -1779,7 +1803,11 @@ impl RolloutWriterState {
             match item {
                 // The recorder owns the single canonical metadata slot. Inherited history must
                 // never append another session_meta record.
-                RolloutItem::SessionMeta(_) => {}
+                RolloutItem::SessionMeta(_) => {
+                    trace!(
+                        "ignoring inherited session metadata; recorder owns the canonical record"
+                    );
+                }
                 RolloutItem::ToolManifest(manifest) => {
                     match self.tool_manifests.encode_item(&manifest) {
                         Ok(manifest) => {
@@ -2079,7 +2107,12 @@ async fn rollout_writer(
             }
         }
         if let Some(message) = state.retry_blocked_error.as_ref() {
-            let err = IoError::other(message.clone());
+            let pending_records =
+                state.pending_items.len() + usize::from(state.pending_token_count.is_some());
+            let err = IoError::other(format!(
+                "{message}; {pending_records} buffered rollout records could not be confirmed persisted"
+            ));
+            error!(pending_records, path = %state.rollout_path.display(), "rollout writer stopped with unconfirmed buffered records");
             writer_task.mark_failed(&err);
             return Err(err);
         }

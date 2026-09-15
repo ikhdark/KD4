@@ -131,7 +131,10 @@ export class CodexExec {
     }
 
     if (args.modelReasoningEffort) {
-      commandArgs.push("--config", `model_reasoning_effort="${args.modelReasoningEffort}"`);
+      commandArgs.push(
+        "--config",
+        `model_reasoning_effort=${toTomlValue(args.modelReasoningEffort, "model_reasoning_effort")}`,
+      );
     }
 
     if (args.networkAccessEnabled !== undefined) {
@@ -142,7 +145,7 @@ export class CodexExec {
     }
 
     if (args.webSearchMode) {
-      commandArgs.push("--config", `web_search="${args.webSearchMode}"`);
+      commandArgs.push("--config", `web_search=${toTomlValue(args.webSearchMode, "web_search")}`);
     } else if (args.webSearchEnabled === true) {
       commandArgs.push("--config", `web_search="live"`);
     } else if (args.webSearchEnabled === false) {
@@ -150,7 +153,10 @@ export class CodexExec {
     }
 
     if (args.approvalPolicy) {
-      commandArgs.push("--config", `approval_policy="${args.approvalPolicy}"`);
+      commandArgs.push(
+        "--config",
+        `approval_policy=${toTomlValue(args.approvalPolicy, "approval_policy")}`,
+      );
     }
 
     if (args.threadId) {

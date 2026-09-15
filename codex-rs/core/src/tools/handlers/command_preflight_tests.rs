@@ -7,6 +7,177 @@ fn strings(args: &[&str]) -> Vec<String> {
 }
 
 #[test]
+fn rg_argument_roles_preserve_flag_like_patterns_and_dependencies() {
+    use crate::tools::handlers::command_search::rg_search_path_operands;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::create_dir(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/input.txt"),
+        "--files\n--help\n--follow\n-e\n-L\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("patterns.txt"), "--files\n").unwrap();
+    let scope = std::fs::canonicalize(root.join("src")).unwrap();
+    for args in [
+        vec!["rg", "--", "--files", "src"],
+        vec!["rg", "--", "--help", "src"],
+        vec!["rg", "--", "--follow", "src"],
+        vec!["rg", "--", "-e", "src"],
+        vec!["rg", "-e", "--files", "src"],
+        vec!["rg", "-e", "--help", "src"],
+        vec!["rg", "-e-L", "src"],
+        vec!["rg", "-ne", "--files", "src"],
+        vec!["rg", "-nfpatterns.txt", "src"],
+    ] {
+        let command = strings(&args);
+        assert_eq!(
+            rg_search_path_operands(std::slice::from_ref(&command)),
+            Some(strings(&["src"])),
+            "{args:?}"
+        );
+        let search = classify_rg_search_narrowing(&command, None, root, root)
+            .unwrap()
+            .expect("pattern values must not disable search classification");
+        assert_eq!(search.scope_identity, scope.to_string_lossy(), "{args:?}");
+        assert_eq!(search.breadth, RgSearchBreadth::Narrow, "{args:?}");
+        assert!(
+            search.can_record_miss,
+            "pattern values must not enable link following: {args:?}"
+        );
+        assert!(!search.query_identity.contains("src"));
+        if args.contains(&"-nfpatterns.txt") {
+            assert!(
+                search
+                    .state_paths
+                    .contains(&std::fs::canonicalize(root.join("patterns.txt")).unwrap())
+            );
+        }
+        let actual = std::process::Command::new("rg")
+            .args(&command[1..])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            actual.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&actual.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&actual.stdout).contains("input.txt"),
+            "{args:?}"
+        );
+    }
+    for args in [
+        vec!["rg", "--files", "src"],
+        vec!["rg", "-L", "needle", "src"],
+    ] {
+        let command = strings(&args);
+        let search = classify_rg_search_narrowing(&command, None, root, root)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rg_search_path_operands(&[command]), Some(strings(&["src"])));
+        assert_eq!(search.can_record_miss, !args.contains(&"-L"));
+    }
+    for args in [vec!["rg", "--help"], vec!["rg", "-V"]] {
+        let command = strings(&args);
+        assert_eq!(
+            classify_rg_search_narrowing(&command, None, root, root).unwrap(),
+            None
+        );
+        assert_eq!(rg_search_path_operands(&[command]), None);
+    }
+}
+
+#[test]
+fn rg_supported_executables_share_scope_and_dependency_classification() {
+    use crate::tools::handlers::command_search::rg_search_path_operands;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::create_dir(root.join("src")).unwrap();
+    for program in ["rg", "rga", "ripgrep", "RIPGREP.EXE", "C:\\tools\\rg.exe"] {
+        let command = strings(&[program, "needle", "src"]);
+        let search = classify_rg_search_narrowing(&command, None, root, root)
+            .unwrap()
+            .expect(program);
+        assert_eq!(
+            search.scope_identity,
+            std::fs::canonicalize(root.join("src"))
+                .unwrap()
+                .to_string_lossy()
+        );
+        assert_eq!(rg_search_path_operands(&[command]), Some(strings(&["src"])));
+    }
+    let command = strings(&["pwsh", "-Command", "ripgrep needle src"]);
+    let search = classify_rg_search_narrowing(&command, Some(ShellType::PowerShell), root, root)
+        .unwrap()
+        .expect("shell spelling");
+    assert_eq!(search.breadth, RgSearchBreadth::Narrow);
+}
+
+#[test]
+fn search_operands_respect_option_values_and_terminators() {
+    use crate::tools::handlers::command_search::rg_search_path_operands;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = &std::fs::canonicalize(temp.path()).unwrap();
+    std::fs::create_dir(root.join("src")).unwrap();
+    for args in [
+        vec!["rg", "--", "-error", "src"],
+        vec!["rg", "--", "--files", "src"],
+        vec!["rg", "--", "--help", "src"],
+        vec!["rg", "-g", "-error", "needle", "src"],
+        vec!["rg", "-g", "--files", "needle", "src"],
+        vec!["rg", "-e", "--help", "src"],
+        vec!["rg", "--regexp=needle", "--", "src"],
+        vec!["rg", "needle", "-e", "other", "src"],
+    ] {
+        let command = strings(&args);
+        let expected = if args == vec!["rg", "needle", "-e", "other", "src"] {
+            strings(&["needle", "src"])
+        } else {
+            strings(&["src"])
+        };
+        assert_eq!(
+            rg_search_path_operands(&[command.clone()]),
+            Some(expected.clone())
+        );
+        let search = classify_rg_search_narrowing(&command, None, root, root)
+            .unwrap()
+            .expect("search remains eligible after parsing its actual options");
+        for path in expected {
+            assert!(search.state_paths.contains(&root.join(path)));
+        }
+        if args.get(1) == Some(&"--") {
+            assert!(search.query_identity.contains(args[2]));
+            assert!(!search.state_paths.contains(&root.join(args[2])));
+        }
+    }
+}
+
+#[test]
+fn search_executable_aliases_have_consistent_dependency_extraction() {
+    use crate::tools::handlers::command_search::rg_search_path_operands;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = &std::fs::canonicalize(temp.path()).unwrap();
+    for program in ["rg", "rga", "ripgrep", "RIPGREP.EXE"] {
+        let command = strings(&[program, "needle", "src"]);
+        assert_eq!(
+            rg_search_path_operands(&[command.clone()]),
+            Some(strings(&["src"]))
+        );
+        let search = classify_rg_search_narrowing(&command, None, root, root)
+            .unwrap()
+            .expect("every supported executable must be classified");
+        assert!(search.query_identity.contains("needle"));
+        assert!(search.state_paths.contains(&root.join("src")));
+    }
+}
+
+#[test]
 fn search_root_is_discovered_only_after_a_search_is_identified() {
     use crate::tools::handlers::command_search::classify_rg_search_with_repository;
     let root = Path::new("workspace");
@@ -432,7 +603,7 @@ async fn search_scope_state_ignores_unrelated_content_and_detects_target_changes
 }
 
 #[test]
-fn repairs_direct_argv_git_status_to_disable_optional_locks() {
+fn normalizes_direct_argv_git_status_without_reporting_a_repair() {
     let invocation = CommandInvocation::Argv {
         program: "git".to_string(),
         args: strings(&["status", "--short", "--branch"]),
@@ -443,7 +614,7 @@ fn repairs_direct_argv_git_status_to_disable_optional_locks() {
         &invocation.to_direct_argv().expect("argv"),
         None,
     )
-    .expect("git status should receive a read-only equivalent repair");
+    .expect("git status should disable optional locks");
 
     assert_eq!(
         outcome.invocation,
@@ -452,12 +623,8 @@ fn repairs_direct_argv_git_status_to_disable_optional_locks() {
             args: strings(&["--no-optional-locks", "status", "--short", "--branch"]),
         }
     );
-    assert!(
-        outcome
-            .repair_notice
-            .as_deref()
-            .is_some_and(|notice| notice.contains("git_status_optional_locks"))
-    );
+    assert!(!outcome.repaired());
+    assert_eq!(outcome.repair_notice, None);
 }
 
 #[test]
@@ -675,6 +842,53 @@ fn rejects_known_flag_typos_case_insensitively() {
             ],
         })
     );
+}
+
+#[test]
+fn recurse_typo_advice_is_limited_to_cmdlets_that_support_recurse() {
+    for script in ["Get-Content -recuse src", "Select-String -recuse TODO src"] {
+        assert_eq!(
+            preflight_command(
+                &strings(&["pwsh", "-Command", script]),
+                Some(ShellType::PowerShell)
+            ),
+            Ok(()),
+            "{script} must not receive an invalid -Recurse correction"
+        );
+    }
+    let error = preflight_command(
+        &strings(&["pwsh", "-Command", "Get-ChildItem -recuse src"]),
+        Some(ShellType::PowerShell),
+    )
+    .expect_err("Get-ChildItem supports the suggested flag");
+    assert!(error.contains("-Recurse"));
+}
+
+#[test]
+fn rejects_bare_rg_path_globs_but_preserves_patterns_and_glob_options() {
+    for glob in ["*.rs", "?file.rs"] {
+        assert!(preflight_command(&strings(&["rg", "--files", glob]), None).is_err());
+        assert!(preflight_command(&strings(&["rg", "TODO", glob]), None).is_err());
+        assert_eq!(
+            preflight_command(&strings(&["rg", "--files", "--glob", glob]), None),
+            Ok(())
+        );
+        assert_eq!(
+            preflight_command(&strings(&["rg", "-e", glob, "src"]), None),
+            Ok(())
+        );
+    }
+}
+
+#[test]
+fn rg_named_powershell_scripts_are_not_treated_as_native_ripgrep() {
+    for program in ["rg.ps1", "./rg.psm1"] {
+        assert_eq!(
+            preflight_command(&strings(&[program, "--ignorecase", "*.rs"]), None),
+            Ok(())
+        );
+    }
+    assert!(preflight_command(&strings(&["rg.exe", "--ignorecase", "TODO", "src"]), None).is_err());
 }
 
 #[test]

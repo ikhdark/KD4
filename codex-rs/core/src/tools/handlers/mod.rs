@@ -29,6 +29,8 @@ pub(crate) mod request_plugin_install_spec;
 mod request_user_input;
 pub(crate) mod request_user_input_spec;
 mod shell;
+#[cfg(test)]
+pub(crate) use shell::validation_environment_hash;
 pub(crate) mod shell_spec;
 mod sleep;
 mod test_sync;
@@ -574,7 +576,9 @@ mod tests {
     #[tokio::test]
     async fn ordinary_exec_and_shell_handlers_skip_search_discovery_but_track_mutations() {
         use crate::session::step_context::StepContext;
-        use crate::tools::context::{ToolCallSource, ToolInvocation, ToolPayload};
+        use crate::tools::context::ToolCallSource;
+        use crate::tools::context::ToolInvocation;
+        use crate::tools::context::ToolPayload;
         use crate::turn_diff_tracker::TurnDiffTracker;
         use codex_tools::ToolExecutor;
         use std::sync::Arc;

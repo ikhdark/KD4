@@ -1,6 +1,6 @@
 """Canonical runtime timing analysis shared by KD4 measurement commands.
 
-This library consumes terminal timing records only. Capture, rollout discovery,
+This library consumes runtime timing records. Capture, rollout discovery,
 harness observations, experiment scoring, and report rendering stay in callers.
 Nanosecond unions and exclusive ownership are distinct from summed diagnostics.
 """
@@ -8,8 +8,11 @@ Nanosecond unions and exclusive ownership are distinct from summed diagnostics.
 from __future__ import annotations
 
 import collections
+import json
 import re
+import shlex
 from collections.abc import Callable, Iterable
+from pathlib import Path
 from typing import Any
 
 try:
@@ -57,6 +60,141 @@ def timing_profile_valid(timing: Any) -> bool:
     return isinstance(timing, dict) and timing.get("profileValid") is True
 
 
+def analyze_startup_timing(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Analyze frozen startup trace fields, independently of terminal turn timing."""
+    duration_fields = {
+        "inclusiveDurationNs": "startup_timing_duration_ns",
+        "sessionInitializationNs": "startup_session_initialization_ns",
+        "transportPreconnectNs": "startup_transport_preconnect_ns",
+        "prewarmPreparationNs": "startup_prewarm_preparation_ns",
+        "prewarmRequestNs": "startup_prewarm_request_ns",
+        "firstTurnPrewarmWaitNs": "startup_first_turn_wait_ns",
+        "executorReadinessNs": "startup_executor_readiness_ns",
+        "preconnectPreparationOverlapNs": "startup_preconnect_preparation_overlap_ns",
+        "preconnectExecutorOverlapNs": "startup_preconnect_executor_overlap_ns",
+    }
+    counter_fields = {
+        "invalidTransitionCount": "startup_timing_invalid_transition_count",
+        "clockRegressionCount": "startup_timing_clock_regression_count",
+        "saturationCount": "startup_timing_saturation_count",
+    }
+
+    def unsigned(value: Any, bits: int) -> int | None:
+        # tracing may serialize u128 via Debug as a decimal JSON string.
+        if isinstance(value, str) and re.fullmatch(r"[0-9]{1,39}", value):
+            value = int(value)
+        return value if type(value) is int and 0 <= value < 2**bits - 1 else None
+
+    profiles = []
+    identities = {}
+    duplicates = 0
+    conflicts = set()
+    for fields in records:
+        fields = {key: value for key, value in fields.items() if key.startswith("startup_")}
+        identity = fields.get("startup_timing_correlation_id")
+        started = fields.get("startup_timing_started_at_unix_ms")
+        key = (identity, started) if isinstance(identity, str) and identity and type(started) is int else None
+        if key is not None and key in identities:
+            index = identities[key]
+            if json.dumps(profiles[index], sort_keys=True) == json.dumps(fields, sort_keys=True):
+                duplicates += 1
+            else:
+                conflicts.add(index)
+            continue
+        if key is not None:
+            identities[key] = len(profiles)
+        profiles.append(fields)
+
+    rows = []
+    schemas = collections.Counter()
+    statuses = collections.Counter()
+    for index, fields in enumerate(profiles):
+        schema = fields.get("startup_timing_schema_version")
+        schemas[str(schema) if schema is not None else "missing"] += 1
+        reasons = []
+        if type(schema) is not int or schema != 1:
+            reasons.append("unsupported_schema")
+        if fields.get("startup_timing_profile_valid") is not True:
+            reasons.append("profile_invalid")
+        if index in conflicts:
+            reasons.append("conflicting_snapshots")
+        identity = fields.get("startup_timing_correlation_id")
+        started = fields.get("startup_timing_started_at_unix_ms")
+        completed = fields.get("startup_timing_completed_at_unix_ms")
+        if not (isinstance(identity, str) and identity and type(started) is int
+                and type(completed) is int and -(2**63) <= started <= completed < 2**63):
+            reasons.append("invalid_identity_or_timestamps")
+        durations = {name: unsigned(fields.get(field), 128) for name, field in duration_fields.items()}
+        counters = {name: unsigned(fields.get(field), 32) for name, field in counter_fields.items()}
+        if any(value is None for value in (*durations.values(), *counters.values())):
+            reasons.append("missing_invalid_or_saturated_fields")
+        if any(value is not None and value > 0 for value in counters.values()):
+            reasons.append("runtime_diagnostics_nonzero")
+        if all(value is not None for value in durations.values()):
+            if (any(value > durations["inclusiveDurationNs"] for value in durations.values())
+                    or durations["preconnectPreparationOverlapNs"] > min(durations["transportPreconnectNs"], durations["prewarmPreparationNs"])
+                    or durations["preconnectExecutorOverlapNs"] > min(durations["transportPreconnectNs"], durations["executorReadinessNs"])):
+                reasons.append("inconsistent_phase_durations")
+        status = fields.get("startup_prewarm_status")
+        if isinstance(status, str):
+            statuses[status] += 1
+        rows.append({"correlationId": identity, "startedAtUnixMs": started,
+                     "schemaVersion": schema, "prewarmStatus": status,
+                     "valid": not reasons, "exclusionReasons": reasons,
+                     "durationsNs": durations, "diagnostics": counters})
+    valid = [row for row in rows if row["valid"]]
+    return {
+        "schemaVersion": 1, "available": bool(valid),
+        "profiles": len(rows), "validProfiles": len(valid),
+        "excludedProfiles": len(rows) - len(valid), "duplicateSnapshots": duplicates,
+        "conflictingProfiles": len(conflicts), "schemaVersions": dict(sorted(schemas.items())),
+        "prewarmStatuses": dict(sorted(statuses.items())),
+        "durationSummariesNs": {
+            name: {"count": len(valid), "total": sum(row["durationsNs"][name] for row in valid),
+                   "min": min(row["durationsNs"][name] for row in valid),
+                   "max": max(row["durationsNs"][name] for row in valid)} if valid else None
+            for name in duration_fields
+        },
+        "records": rows,
+        "measurementNote": "Session construction through first real model send; may include user idle time. Phase unions overlap and must not be added or subtracted from turn timing. Captured profiles do not establish cold/warm startup or prewarm effectiveness.",
+    }
+
+
+def _request_retention(timings: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Compare retained request rows with the uncapped runtime request counter."""
+    rows = []
+    for timing in timings:
+        retained = len(_selected_requests(timing))
+        expected = timing.get("counters", {}).get("modelRequestCount")
+        known = type(expected) is int and 0 <= expected < 2**32 - 1
+        complete = retained == expected if known else False if expected is not None else None
+        if not isinstance(timing.get("modelRequests"), list) or len(timing["modelRequests"]) != retained:
+            complete = False
+        rows.append({"retained": retained, "expected": expected if known else None, "complete": complete})
+    complete = (False if any(row["complete"] is False for row in rows) else
+                True if rows and all(row["complete"] is True for row in rows) else None)
+    return {"complete": complete, "retainedRequests": sum(row["retained"] for row in rows),
+            "recordedRequests": sum(row["expected"] for row in rows) if rows and all(row["expected"] is not None for row in rows) else None,
+            "unknownProfiles": sum(row["complete"] is None for row in rows),
+            "incompleteProfiles": sum(row["complete"] is False for row in rows),
+            "basis": "retained modelRequests versus runtime counters.modelRequestCount; missing counters leave retention unknown"}
+
+
+def _tool_dispatch_counts(calls: Iterable[dict[str, Any]], overflow: int, *, available: bool) -> dict[str, Any]:
+    calls = list(calls)
+    result = {"schemaVersion": 1, "available": available, "retainedCalls": len(calls),
+              "overflowCalls": overflow, "scope": "retained native tool dispatch counters; missing or overflowing evidence excludes totals"}
+    covered = [call for call in calls if all(type(call.get(key)) is int and 0 <= call[key] < 2**32 - 1
+                                           for key in ("retryCount", "reentryCount"))]
+    complete = available and len(covered) == len(calls) and overflow == 0
+    result.update(complete=complete, coveredCalls=len(covered))
+    for key in ("retryCount", "reentryCount"):
+        observed = sum(call[key] for call in covered)
+        result[key] = observed if complete else None
+        result["observed" + key[0].upper() + key[1:]] = observed
+    return result
+
+
 def turn_measurements(event: dict[str, Any]) -> tuple[float | None, int | None]:
     """Return union wait and explicitly flagged continuations, not retry count."""
     timing = event.get("timing")
@@ -74,7 +212,7 @@ def turn_measurements(event: dict[str, Any]) -> tuple[float | None, int | None]:
 
 
 def continuation_count(timing: dict[str, Any]) -> int | None:
-    if not isinstance(timing.get("modelRequests"), list):
+    if not isinstance(timing.get("modelRequests"), list) or _request_retention([timing])["complete"] is False:
         return None
     return sum(row.get("isContinuation") is True for row in _selected_requests(timing))
 
@@ -124,6 +262,7 @@ def _token_report(requests: Iterable[dict[str, Any]]) -> dict[str, Any]:
     totals = collections.Counter()
     prompt_categories = collections.Counter()
     covered_attempts = 0
+    invalid_usage_attempts = 0
     categorized_attempts = 0
     for request in request_list:
         usage = request.get("tokenUsage")
@@ -131,21 +270,26 @@ def _token_report(requests: Iterable[dict[str, Any]]) -> dict[str, Any]:
             type(usage.get(key)) is int and usage[key] >= 0
             for key in ("inputTokens", "cachedInputTokens", "visibleOutputTokens", "reasoningTokens")
         ):
-            covered_attempts += 1
             input_tokens = max(0, int(usage.get("inputTokens", 0)))
             cached_input_tokens = max(0, int(usage.get("cachedInputTokens", 0)))
             visible_output_tokens = max(0, int(usage.get("visibleOutputTokens", 0)))
             reasoning_tokens = max(0, int(usage.get("reasoningTokens", 0)))
-            total_tokens = max(
-                0,
-                int(
-                    usage.get(
-                        "totalTokens",
-                        input_tokens + visible_output_tokens + reasoning_tokens,
-                    )
-                ),
+            expected_total = input_tokens + visible_output_tokens + reasoning_tokens
+            total_tokens = usage.get("totalTokens", expected_total)
+            coherent = cached_input_tokens <= input_tokens and all(
+                key not in usage or (type(usage[key]) is int and usage[key] == expected)
+                for key, expected in (
+                    ("totalTokens", expected_total),
+                    ("outputTokens", visible_output_tokens + reasoning_tokens),
+                    ("nonCachedInputTokens", input_tokens - cached_input_tokens),
+                )
             )
+            covered_attempts += int(coherent)
+            invalid_usage_attempts += int(not coherent)
+            if type(total_tokens) is not int or total_tokens < 0:
+                total_tokens = expected_total
         else:
+            invalid_usage_attempts += int(isinstance(usage, dict))
             input_tokens = 0
             cached_input_tokens = 0
             output_tokens = max(0, int(request.get("outputTokens", 0)))
@@ -195,10 +339,12 @@ def _token_report(requests: Iterable[dict[str, Any]]) -> dict[str, Any]:
     return {
         "physicalAttempts": physical_attempts,
         "providerUsageAttempts": covered_attempts,
+        "invalidUsageAttempts": invalid_usage_attempts,
         "coverage": covered_attempts / physical_attempts if physical_attempts else None,
         "complete": usage_complete,
         "providerTotals": dict(totals) if usage_complete else None,
-        **dict(totals),
+        **{key: value if usage_complete else None for key, value in totals.items()},
+        "observedTotals": dict(totals),
         "billableTokens": observed_billable_tokens if usage_complete else None,
         "observedBillableTokens": observed_billable_tokens,
         "billableDefinition": "provider_input_including_cached_plus_output",
@@ -220,11 +366,32 @@ def _token_report(requests: Iterable[dict[str, Any]]) -> dict[str, Any]:
             for key, value in sorted(prompt_categories.items(), key=lambda pair: pair[1], reverse=True)
             if key not in ("logicalTotal", "localInputEstimate", "repeatedUnchangedContext")
         ],
-        "accountingNote": "Counts are observed subtotals when coverage is partial; cached input and reasoning output are subsets.",
+        "accountingNote": "Top-level totals require complete provider coverage. observedTotals retains partial provider counts and output-only fallbacks; absent input is unmeasured. Cached input and reasoning output are subsets.",
         "available": bool(covered_attempts or any("outputTokens" in request for request in request_list)),
         "cacheShare": totals["cachedInputTokens"] / input_tokens
-        if input_tokens
+        if usage_complete and input_tokens
         else None,
+        "observedCacheShare": totals["cachedInputTokens"] / input_tokens
+        if covered_attempts and input_tokens
+        else None,
+    }
+
+
+def _invalidate_token_totals(tokens: dict[str, Any]) -> None:
+    """Keep observed evidence while withdrawing totals for an incomplete population."""
+    tokens["complete"] = False
+    for key in (*tokens.get("observedTotals", {}), "providerTotals", "billableTokens", "blendedTokens", "cacheShare"):
+        tokens[key] = None
+
+
+def _classification_summary(classifications: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    rows = list(classifications)
+    return {
+        "requestRecords": len(rows),
+        "primaryCounts": dict(sorted(collections.Counter(row["primary"] for row in rows).items())),
+        "tagCounts": dict(sorted(collections.Counter(tag for row in rows for tag in row["tags"]).items())),
+        "confidenceCounts": dict(sorted(collections.Counter(row["confidence"] for row in rows).items())),
+        "measurementNote": "Counts describe retained request records before display truncation, not physical attempts or causal necessity. Tags can overlap.",
     }
 
 
@@ -859,8 +1026,8 @@ def _population_report(records: list[dict[str, Any]], *, include_tokens: bool = 
                 _request_metric(
                     requests,
                     lambda request: (
-                        bool(request.get("unchangedRelevantState"))
-                        and not bool(request.get("nextStructuredActionChanged"))
+                        request.get("unchangedRelevantState") is True
+                        and request.get("nextStructuredActionChanged") is False
                     ),
                 ),
             )
@@ -879,6 +1046,10 @@ def _population_report(records: list[dict[str, Any]], *, include_tokens: bool = 
     machine = totals["machineDurationNs"]
     model = totals["modelOnlyNs"]
     tool = totals["toolOnlyNs"]
+    retention = _request_retention(record["timing"] for record in records)
+    tokens = _token_report(all_requests) if include_tokens else disabled_tokens()
+    if include_tokens and retention["complete"] is False:
+        _invalidate_token_totals(tokens)
     return {
         "turns": len(records),
         "statusCounts": dict(sorted(status_counts.items())),
@@ -898,7 +1069,8 @@ def _population_report(records: list[dict[str, Any]], *, include_tokens: bool = 
             for record in records
         ),
         "decisionLatency": {
-            "physicalAttempts": request_count,
+            "physicalAttempts": request_count if retention["complete"] is not False else None,
+            "retainedPhysicalAttempts": request_count,
             "decisionReadyAttempts": decision_ready_attempts,
             "coverage": decision_ready_attempts / request_count
             if request_count
@@ -937,7 +1109,8 @@ def _population_report(records: list[dict[str, Any]], *, include_tokens: bool = 
             },
         },
         "generationPurposeLatency": _generation_purpose_latency_report(all_requests),
-        "tokens": _token_report(all_requests) if include_tokens else disabled_tokens(),
+        "requestRetention": retention,
+        "tokens": tokens,
         "observationalNonprogressTokens": _diagnostic_token_report(
             nonprogress_token_aggregates
         ) if include_tokens else {},
@@ -986,6 +1159,88 @@ def _native_usage(usage: Any) -> dict[str, Any] | None:
     return counts
 
 
+def _is_rg_no_match(command: Any, exit_code: Any, item: dict[str, Any]) -> bool:
+    # Restrict this exception to a single rg process with no error output.
+    # Compound shell commands may return another process's exit code.
+    if type(exit_code) is not int or exit_code != 1 or not isinstance(command, str):
+        return False
+    if any(char in command for char in "|&;<>`$()\n\r") or item.get("error"):
+        return False
+    if any(item.get(key) for key in ("output", "aggregatedOutput", "stderr")):
+        return False
+    try:
+        words = shlex.split(command, posix=False)
+    except ValueError:
+        return False
+    return bool(words and words[0].strip('"\'').replace("\\", "/").rsplit("/", 1)[-1].lower() in ("rg", "rg.exe"))
+
+
+def _captured_request_metrics(evidence: dict[str, Any]) -> dict[str, Any]:
+    result = {
+        "available": False, "requestCount": None, "serializedRequestBytes": None,
+        "error": None,
+        "measurementNote": "Compact, sorted-key UTF-8 JSON request bodies, including tools and input; a request-volume proxy, not tokens, wire bytes, or provider cache hits.",
+    }
+    path = evidence.get("providerRequestsPath")
+    if not path:
+        return result
+    count = size = 0
+    try:
+        with Path(path).open(encoding="utf-8") as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if not isinstance(row, dict) or not isinstance(row.get("request"), dict):
+                    raise ValueError("captured provider record has no request object")
+                body = json.dumps(row["request"], sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+                size += len(body.encode("utf-8"))
+                count += 1
+    except (OSError, ValueError, TypeError) as error:
+        result["error"] = f"captured request metrics unavailable: {type(error).__name__}"
+        return result
+    result.update(available=True, requestCount=count, serializedRequestBytes=size)
+    return result
+
+
+_NATIVE_TOOL_ITEM_TYPES = (
+    "commandExecution", "mcpToolCall", "dynamicToolCall", "fileChange",
+    "webSearch", "toolCall", "collabAgentToolCall",
+)
+
+
+def _observed_tool_activity(calls: Iterable[dict[str, Any]], *, terminal_observed: bool) -> dict[str, Any]:
+    """Count native item lifecycles, not inferred model decisions or nested work."""
+    def counts(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "observedCount": len(rows),
+            "startedCount": sum("startEventIndex" in row for row in rows),
+            "completedCount": sum("completionEventIndex" in row for row in rows),
+            "pendingCount": sum("completionEventIndex" not in row for row in rows),
+            "byKind": {kind: sum(row["itemType"] == kind for row in rows) for kind in _NATIVE_TOOL_ITEM_TYPES},
+        }
+
+    rows = [row for row in calls if row["itemType"] in _NATIVE_TOOL_ITEM_TYPES]
+    turns: dict[tuple[str | None, str], list[dict[str, Any]]] = collections.defaultdict(list)
+    for row in rows:
+        turns[row["threadId"], row["turnId"]].append(row)
+    return {
+        "schemaVersion": 1,
+        "available": bool(rows) or terminal_observed,
+        "scope": "observed_native_items",
+        **counts(rows),
+        "turns": [{"threadId": thread_id, "turnId": turn_id, **counts(items)}
+                  for (thread_id, turn_id), items in turns.items()],
+        "measurementNote": (
+            "Unique (thread, turn, item) lifecycles in captured native notifications. "
+            "Completed means a terminal item notification, including failed or interrupted work. "
+            "Counts include observed child threads but do not establish complete child coverage, "
+            "model decisions, nested dispatch counts, or edit correctness. Durations require both "
+            "observed start and completion and measure notification latency, not exclusive execution."
+        ),
+    }
+
+
 def analyze_runner_evidence(evidence: dict[str, Any], *, include_tokens: bool = True) -> dict[str, Any]:
     """Analyze one attempt's captured native events; never schedule or compare runs.
 
@@ -999,8 +1254,8 @@ def analyze_runner_evidence(evidence: dict[str, Any], *, include_tokens: bool = 
     if not isinstance(events, list) or any(not isinstance(row, dict) for row in events):
         raise ValueError("runner evidence events must be objects")
     profiles: dict[str, dict[str, Any]] = {}
-    pending: dict[str, dict[str, Any]] = {}
-    calls: dict[str, dict[str, Any]] = {}
+    pending: dict[tuple[str | None, str, str], dict[str, Any]] = {}
+    calls: dict[tuple[str | None, str, str], dict[str, Any]] = {}
     failures: list[dict[str, Any]] = []
     symptoms: list[dict[str, Any]] = []
     terminal: dict[str, str] = {}
@@ -1010,6 +1265,7 @@ def analyze_runner_evidence(evidence: dict[str, Any], *, include_tokens: bool = 
     first_output = None
     first_tool = None
     active_turn = "unknown"
+    active_turn_by_thread: dict[str | None, str] = {}
     event_gaps = []
     previous_event = None
     for index, row in enumerate(events):
@@ -1028,12 +1284,16 @@ def analyze_runner_evidence(evidence: dict[str, Any], *, include_tokens: bool = 
             previous_event = location
         turn = params.get("turn", {})
         turn = turn if isinstance(turn, dict) else {}
-        active_turn = str(params.get("turnId", params.get("turn_id", turn.get("id", active_turn))))
+        thread_id = params.get("threadId", params.get("thread_id"))
+        thread_id = thread_id if isinstance(thread_id, str) else None
+        active_turn = str(params.get("turnId", params.get("turn_id", turn.get("id", active_turn_by_thread.get(thread_id, "unknown")))))
+        active_turn_by_thread[thread_id] = active_turn
         payload_type = params.get("type", "")
         if method == "sampling_boundary":
             sampling_count += 1
         if method in ("turn/completed", "turn.completed") or payload_type in ("task_complete", "turn_aborted"):
-            status = str(turn.get("status", "aborted" if payload_type == "turn_aborted" else "completed"))
+            default_status = "aborted" if payload_type == "turn_aborted" else "failed" if turn.get("error") is not None else "completed"
+            status = str(turn.get("status") or default_status)
             terminal[active_turn] = status
             if status not in ("completed", "complete"):
                 failures.append({"kind": "turn_" + status, **location, "evidence": turn.get("error")})
@@ -1054,27 +1314,40 @@ def analyze_runner_evidence(evidence: dict[str, Any], *, include_tokens: bool = 
         if not isinstance(item, dict):
             continue
         item_type = item.get("type", "")
-        is_call = item_type in ("commandExecution", "mcpToolCall", "dynamicToolCall", "fileChange", "function_call", "custom_tool_call", "webSearch")
+        is_call = item_type in (*_NATIVE_TOOL_ITEM_TYPES, "function_call", "custom_tool_call")
         is_output = item_type in ("function_call_output", "custom_tool_call_output")
         call_id = str(item.get("id", item.get("call_id", params.get("itemId", ""))))
         if is_call and call_id:
-            key = active_turn + ":" + call_id
-            call = calls.setdefault(key, {"id": call_id, "turnId": active_turn, "tool": item.get("name", item_type), "startedMs": elapsed, "eventIndex": index})
-            call.update({"status": item.get("status", "in_progress"), "lastEventIndex": index})
+            key = (thread_id, active_turn, call_id)
+            call = calls.setdefault(key, {"id": call_id, "threadId": thread_id, "turnId": active_turn, "itemType": item_type, "tool": item.get("name", item_type), "eventIndex": index})
+            if "completionEventIndex" not in call:
+                call.update({"status": item.get("status", "in_progress"), "lastEventIndex": index})
+            for field in ("command", "exitCode"):
+                if field in item:
+                    call[field] = item[field]
             if first_tool is None:
                 first_tool = elapsed
             if method in ("item/completed", "item.completed"):
-                call["completedMs"] = elapsed
+                call.setdefault("completionEventIndex", index)
+                call.setdefault("completedMs", elapsed)
                 pending.pop(key, None)
-            else:
+            elif "completionEventIndex" not in call:
+                if method in ("item/started", "item.started"):
+                    call.setdefault("startEventIndex", index)
+                    call.setdefault("startedMs", elapsed)
                 pending[key] = call
             exit_code = item.get("exitCode", item.get("exit_code"))
-            if item.get("status") == "failed" or (type(exit_code) is int and exit_code != 0):
+            no_match = _is_rg_no_match(call.get("command"), exit_code, item)
+            if no_match:
+                call["outcome"] = "no_match"
+            if not no_match and (item.get("status") == "failed" or (type(exit_code) is int and exit_code != 0)):
                 failures.append({"kind": "tool_execution_failure", "toolId": call_id, "exitCode": exit_code, **location})
         if is_output and call_id:
-            key = active_turn + ":" + call_id
+            key = (thread_id, active_turn, call_id)
             if key in calls:
-                calls[key].update(completedMs=elapsed, status="output_observed", lastEventIndex=index)
+                calls[key].setdefault("completionEventIndex", index)
+                calls[key].setdefault("completedMs", elapsed)
+                calls[key].update(status="output_observed", lastEventIndex=index)
                 pending.pop(key, None)
         error = message.get("error", params.get("error"))
         if method == "error" or error:
@@ -1106,6 +1379,8 @@ def analyze_runner_evidence(evidence: dict[str, Any], *, include_tokens: bool = 
         failures.append({"kind": "verification_" + str(verifier["status"]), "source": "verifier", "evidence": verifier})
     valid_profiles = [record for record in profiles.values() if timing_profile_valid(record["timing"]) and record["timing"].get("classificationComplete") is True]
     runtime = _population_report(valid_profiles, include_tokens=include_tokens) if valid_profiles else None
+    if runtime is not None:
+        runtime["population"] = {"scope": "valid complete timing profiles only", "turnIds": [record["turn_id"] for record in valid_profiles]}
     requests = [dict(request, _turnId=record["turn_id"], _eventIndex=record["eventIndex"]) for record in profiles.values() for request in _selected_requests(record["timing"])]
     generations = []
     for request in requests:
@@ -1129,22 +1404,77 @@ def analyze_runner_evidence(evidence: dict[str, Any], *, include_tokens: bool = 
             projection = {key: value for key, value in call.items() if any(word in key.lower() for word in ("truncat", "cutoff", "recover", "artifact"))}
             if projection:
                 symptoms.append({"kind": "native_output_projection", "toolId": call.get("callId"), "eventIndex": record["eventIndex"], "evidence": projection, "causallyEstablished": False})
-    totals = runtime["tokens"] if runtime and include_tokens else disabled_tokens() if not include_tokens else None
+    # Timing classification validity does not establish or invalidate provider
+    # usage. Account every captured request, including profiles rejected above.
+    totals = _token_report(requests) if include_tokens and requests else disabled_tokens() if not include_tokens else None
+    retention = _request_retention(record["timing"] for record in profiles.values())
+    usage_turns = {request["_turnId"] for request in requests} if include_tokens else set()
+    missing_usage_turns = sorted(set(terminal) - usage_turns) if include_tokens else []
+    usage_coverage = {
+        "requestRetention": retention,
+        "requestProfileTurns": len(usage_turns),
+        "terminalTurns": len(terminal),
+        "missingTerminalTurnIds": missing_usage_turns,
+        "unfinishedProfileTurnIds": sorted(set(profiles) - set(terminal)),
+        "timingValidityRequired": False,
+    } if include_tokens else None
+    if include_tokens and totals is not None:
+        totals["source"] = "captured_request_usage"
+        totals["scope"] = "all captured native request profiles, independent of timing validity"
+        totals["turnCoverage"] = usage_coverage
+        totals["complete"] = bool(totals["complete"] and terminal and not missing_usage_turns and not usage_coverage["unfinishedProfileTurnIds"] and retention["complete"] is not False)
+        if not totals["complete"]:
+            _invalidate_token_totals(totals)
     native_tools = {(record["turn_id"], call.get("callId")): call for record in profiles.values() for call in record["timing"].get("toolCalls", []) if isinstance(call, dict) and call.get("callId")}
     nested = sum(bool(call.get("parentCallId")) for call in native_tools.values()) if native_tools else None
-    if totals is None and usage_by_thread:
-        totals = {key: sum(row[key] for row in usage_by_thread.values()) if all(row.get(key) is not None for row in usage_by_thread.values()) else None
+    dispatch = _tool_dispatch_counts(
+        native_tools.values(), sum(max(0, int(record["timing"].get("toolCallTimingOverflow", 0))) for record in profiles.values()),
+        available=bool(profiles) and set(profiles) == set(terminal)
+        and all(isinstance(record["timing"].get("toolCalls"), list) for record in profiles.values()),
+    )
+    cumulative = None
+    reconciliation = None
+    if include_tokens and usage_by_thread:
+        cumulative = {key: sum(row[key] for row in usage_by_thread.values()) if all(row.get(key) is not None for row in usage_by_thread.values()) else None
                   for key in ("inputTokens", "cachedInputTokens", "nonCachedInputTokens", "outputTokens", "visibleOutputTokens", "reasoningTokens", "totalTokens")}
-        totals.update(available=True, complete=None, source="native_thread_cumulative_usage", promptCategories=None, promptCategoryCoverage=None)
+        cumulative.update(available=True, complete=None, source="native_thread_cumulative_usage", promptCategories=None, promptCategoryCoverage=None)
+        if totals is not None:
+            reconciliation = {
+                "basis": "latest native cumulative snapshots minus captured request usage; populations may differ (including resumed-session history)",
+                "residuals": {key: cumulative[key] - totals["observedTotals"][key] if type(cumulative.get(key)) is int and type(totals["observedTotals"].get(key)) is int else None
+                              for key in ("inputTokens", "cachedInputTokens", "outputTokens", "reasoningTokens", "totalTokens")},
+                "addedToRequestTotals": False,
+            }
+            if any(value not in (None, 0) for value in reconciliation["residuals"].values()):
+                _invalidate_token_totals(totals)
+        else:
+            totals = dict(cumulative, turnCoverage=usage_coverage, observedTotals={key: cumulative[key] for key in ("inputTokens", "cachedInputTokens", "nonCachedInputTokens", "outputTokens", "visibleOutputTokens", "reasoningTokens", "totalTokens")})
+            _invalidate_token_totals(totals)
     if totals is None and include_tokens:
         totals = {"available": False, "complete": False, "promptCategories": None, "providerTotals": None}
+    for call in calls.values():
+        start, end = call.get("startedMs"), call.get("completedMs")
+        call["durationMs"] = end - start if type(start) in (int, float) and type(end) in (int, float) and end >= start else None
+    cache_hit_rate = None
+    if include_tokens and totals and totals.get("complete") is True and all(
+        request["tokenUsage"]["cachedInputTokens"] <= request["tokenUsage"]["inputTokens"]
+        for request in requests
+    ):
+        input_tokens, cached_tokens = totals.get("inputTokens"), totals.get("cachedInputTokens")
+        if type(input_tokens) is int and type(cached_tokens) is int and 0 <= cached_tokens <= input_tokens and input_tokens > 0:
+            cache_hit_rate = cached_tokens / input_tokens
     return {
         "schemaVersion": 1, "attemptId": evidence.get("attemptId"),
-        "status": evidence.get("status", "completed" if terminal else "unfinished"),
+        "status": evidence.get("status", next((status for status in terminal.values() if status not in ("completed", "complete")), "completed" if terminal else "unfinished")),
         "elapsedMs": evidence.get("elapsedMs"), "units": {"eventTime": "milliseconds", "runtimeTime": "nanoseconds", "tokens": "tokens"},
         "coverage": {"events": len(events), "nativeTimingProfiles": len(profiles), "validCompleteTimingProfiles": len(valid_profiles), "terminalTurns": len(terminal), "tokenAnalysisEnabled": include_tokens},
         "logicalGenerations": runtime.get("logicalGenerations") if runtime else sampling_count or None,
-        "physicalRequests": runtime["decisionLatency"]["physicalAttempts"] if runtime else None,
+        "physicalRequests": runtime["decisionLatency"]["physicalAttempts"] if runtime and retention["complete"] is not False else None,
+        "capturedRequests": _captured_request_metrics(evidence),
+        "toolActivity": _observed_tool_activity(calls.values(), terminal_observed=bool(terminal)),
+        "toolDispatch": dispatch,
+        "requestRetention": retention,
+        "cacheHitRate": cache_hit_rate,
         "directToolCount": len(native_tools) - nested if native_tools else len(calls), "nestedToolCount": nested,
         "toolCountCoverage": "retained_native_timing" if native_tools else "observed_native_items",
         "tools": list(calls.values()), "pendingTools": list(pending.values()),
@@ -1155,7 +1485,10 @@ def analyze_runner_evidence(evidence: dict[str, Any], *, include_tokens: bool = 
         "lastProgress": last_progress, "terminalTurns": terminal,
         "failures": failures, "symptoms": symptoms, "retryEvidence": retry_evidence,
         "generations": generations, "runtime": runtime,
+        "requestClassification": _classification_summary(row["classification"] for row in generations),
         "tokens": totals, "nativeProviderUsage": list(usage_by_thread.values()) if include_tokens else None,
+        "nativeCumulativeTokens": cumulative, "tokenReconciliation": reconciliation,
+        "tokenCoverage": usage_coverage,
         "measurementNote": "Missing native telemetry is unavailable. Event order and text symptoms do not prove retry causality. Thread usage updates are cumulative snapshots, not additive generations.",
     }
 
@@ -1175,7 +1508,7 @@ def classify_model_request(
 ) -> dict[str, Any]:
     """Classify a request from observed runtime facts without claiming causality."""
 
-    if request.get("isContinuation") is not True and request.get("attemptKind") not in _RETRY_ATTEMPT_KINDS:
+    if request.get("isContinuation") is False and request.get("attemptKind") not in _RETRY_ATTEMPT_KINDS:
         return {
             "primary": "initial",
             "tags": [],
@@ -1239,6 +1572,12 @@ def classify_model_request(
         (category for category in CONTINUATION_CLASS_PRECEDENCE if category in tags),
         "necessary",
     )
+    if primary == "necessary" and request.get("isContinuation") is not True:
+        return {
+            "primary": "unknown", "tags": tags, "confidence": "unknown",
+            "basis": [*basis, "isContinuation is unavailable or not a boolean"],
+            "interpretation": None, "necessityCausallyEstablished": False,
+        }
     if primary == "necessary":
         tags.append("necessary")
         if progress:

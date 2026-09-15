@@ -1475,6 +1475,12 @@ impl ToolRegistry {
         // already claimed the terminal outcome. Do not continue into
         // projection, persistence, or finish notification for that result.
         if dispatch_state.is_aborted() {
+            if invocation.tool_name.name == "apply_patch" {
+                if let Err(error) = result {
+                    dispatch_trace.record_failed(&error).await;
+                    return Err(error);
+                }
+            }
             let err = FunctionCallError::RespondToModel(
                 "tool cancelled after runtime cleanup".to_string(),
             );
@@ -1622,7 +1628,11 @@ impl ToolRegistry {
                 notify_tool_finish(&invocation, lifecycle_outcome).await;
                 record_lifecycle_phase(&invocation, "notify_finish", phase_started);
                 dispatch_trace.record_failed(&err).await;
-                if dispatch_state.try_complete() {
+                if dispatch_state.try_complete()
+                    || (dispatch_state.is_aborted() && invocation.tool_name.name == "apply_patch")
+                {
+                    // The cancellation owner retains patch recovery information after
+                    // joining the committed mutation cleanup. It still owns publication.
                     Err(err)
                 } else {
                     Err(FunctionCallError::RespondToModel(
@@ -2742,7 +2752,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
                 artifact_sha256: canonical.sha256,
                 original_output_sha256,
                 original_tokens: original_output_tokens,
-                preserved_non_text_tokens: non_text_tokens as u64,
+                preserved_non_text_tokens: Some(non_text_tokens as u64),
                 bounded_model_output: original_output_text.clone(),
                 complete: canonical.complete,
                 projection_eligible,
@@ -2877,7 +2887,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             artifact_sha256: canonical.sha256,
             original_output_sha256,
             original_tokens: original_output_tokens,
-            preserved_non_text_tokens: retained_non_text_tokens as u64,
+            preserved_non_text_tokens: Some(retained_non_text_tokens as u64),
             bounded_model_output: rendered,
             complete: canonical.complete,
             projection_eligible,
@@ -3481,12 +3491,18 @@ fn preserved_non_text_content(response: &ResponseInputItem) -> Vec<Value> {
 }
 
 fn non_text_projection_token_cost(content: &[Value]) -> usize {
+    if content.is_empty() {
+        return 0;
+    }
     serde_json::to_string(content)
         .map(|serialized| approx_token_count(&serialized))
         .unwrap_or(usize::MAX)
 }
 
 fn non_text_projection_byte_cost(content: &[Value]) -> usize {
+    if content.is_empty() {
+        return 0;
+    }
     serde_json::to_vec(content)
         .map(|serialized| serialized.len())
         .unwrap_or(usize::MAX)

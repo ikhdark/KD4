@@ -264,6 +264,36 @@ impl AppliedPatchDelta {
         self.exact
     }
 
+    /// Recovery guidance for a failed or cancelled operation, including any
+    /// earlier attempts whose changes have been appended to this delta.
+    pub fn failure_summary(&self) -> String {
+        if self.is_empty() && self.is_exact() {
+            return String::new();
+        }
+        let mut summary = String::from("Patch failed after applying these changes:\n");
+        for applied in self.changes() {
+            let path = applied.path.display();
+            match &applied.change {
+                AppliedPatchFileChange::Add { .. } => summary.push_str(&format!("A {path}\n")),
+                AppliedPatchFileChange::Delete { .. } => summary.push_str(&format!("D {path}\n")),
+                AppliedPatchFileChange::Update { move_path, .. } => {
+                    if let Some(destination) = move_path {
+                        summary.push_str(&format!("M {path} -> {}\n", destination.display()));
+                    } else {
+                        summary.push_str(&format!("M {path}\n"));
+                    }
+                }
+            }
+        }
+        if !self.is_exact() {
+            summary.push_str("Additional filesystem changes may not be listed.\n");
+        }
+        summary.push_str(
+            "Inspect the current files before retrying the remaining changes; do not retry the whole patch.\n",
+        );
+        summary
+    }
+
     /// Appends a later committed prefix while preserving the aggregate exactness.
     pub fn append(&mut self, other: Self) {
         self.changes.extend(other.changes);
@@ -406,14 +436,18 @@ async fn apply_hunks_with_cancellation(
     let mut delta = AppliedPatchDelta::empty();
     match apply_hunks_to_files(hunks, cwd, fs, sandbox, &mut delta, is_cancelled).await {
         Ok(affected_paths) => {
-            print_summary(&affected_paths, stdout).map_err(|error| {
-                ApplyPatchFailure::new(ApplyPatchError::from(error), delta.clone())
-            })?;
+            if let Err(error) = print_summary(&affected_paths, stdout) {
+                let _ = write!(stderr, "{error}\n{}", delta.failure_summary());
+                return Err(ApplyPatchFailure::new(ApplyPatchError::from(error), delta));
+            }
             Ok(delta)
         }
         Err(error) => {
             let msg = error.to_string();
             writeln!(stderr, "{msg}").map_err(|error| {
+                ApplyPatchFailure::new(ApplyPatchError::from(error), delta.clone())
+            })?;
+            write!(stderr, "{}", delta.failure_summary()).map_err(|error| {
                 ApplyPatchFailure::new(ApplyPatchError::from(error), delta.clone())
             })?;
             let error = match error.downcast::<ApplyPatchError>() {
@@ -806,16 +840,33 @@ async fn derive_new_contents_from_chunks(
         });
     }
 
-    let mut original_lines: Vec<String> = original_contents.split('\n').map(String::from).collect();
-
-    // Drop the trailing empty element that results from the final newline so
-    // that line counts match the behaviour of standard `diff`.
-    if original_lines.last().is_some_and(String::is_empty) {
-        original_lines.pop();
-    }
+    // Match logical lines, but keep the original physical lines for untouched
+    // regions so updates do not normalize their line endings.
+    let physical_lines: Vec<String> = original_contents
+        .split_inclusive('\n')
+        .map(String::from)
+        .collect();
+    let original_lines: Vec<String> = physical_lines
+        .iter()
+        .map(|line| {
+            line.strip_suffix("\r\n")
+                .or_else(|| line.strip_suffix('\n'))
+                .unwrap_or(line)
+                .to_string()
+        })
+        .collect();
+    let newline = if physical_lines
+        .iter()
+        .find(|line| line.ends_with('\n'))
+        .is_some_and(|line| line.ends_with("\r\n"))
+    {
+        "\r\n"
+    } else {
+        "\n"
+    };
 
     let path_text = path.inferred_native_path_string();
-    let replacements = compute_replacements(
+    let mut replacements = compute_replacements(
         &original_lines,
         &original_contents,
         path,
@@ -823,11 +874,28 @@ async fn derive_new_contents_from_chunks(
         hunk_ordinal,
         chunks,
     )?;
-    let new_lines = apply_replacements(original_lines, &replacements);
-    let mut new_contents = new_lines.join("\n");
-    if !new_lines.is_empty() {
-        new_contents.push('\n');
+    for (_, _, lines) in &mut replacements {
+        for line in lines {
+            line.push_str(newline);
+        }
     }
+    let mut new_lines = apply_replacements(physical_lines, &replacements);
+    let last_index = new_lines.len().saturating_sub(1);
+    for (index, line) in new_lines.iter_mut().enumerate() {
+        if index < last_index && !line.ends_with('\n') {
+            // Appending after an unterminated last line needs a separator.
+            line.push_str(newline);
+        }
+    }
+    if !original_contents.is_empty()
+        && !original_contents.ends_with('\n')
+        && let Some(last) = new_lines.last_mut()
+        && last.ends_with('\n')
+    {
+        let ending_len = if last.ends_with("\r\n") { 2 } else { 1 };
+        last.truncate(last.len() - ending_len);
+    }
+    let new_contents = new_lines.concat();
     Ok(AppliedPatch {
         original_contents,
         new_contents,
@@ -847,6 +915,8 @@ fn compute_replacements(
 ) -> std::result::Result<Vec<(usize, usize, Vec<String>)>, ApplyPatchError> {
     let mut replacements: Vec<(usize, usize, Vec<String>)> = Vec::new();
     let mut line_index: usize = 0;
+    let ambiguous_match =
+        |error| ApplyPatchError::ComputeReplacements(format!("{error} in {path}"));
 
     for (chunk_index, chunk) in chunks.iter().enumerate() {
         // If a chunk has a `change_context`, we use seek_sequence to find it, then
@@ -857,7 +927,9 @@ fn compute_replacements(
                 std::slice::from_ref(ctx_line),
                 line_index,
                 /*eof*/ false,
-            ) {
+            )
+            .map_err(ambiguous_match)?
+            {
                 line_index = idx + 1;
             } else {
                 let context = bounded_expected_lines(std::iter::once(ctx_line.as_str()));
@@ -900,7 +972,8 @@ fn compute_replacements(
 
         let mut pattern: &[String] = &chunk.old_lines;
         let mut found =
-            seek_sequence::seek_sequence(original_lines, pattern, line_index, chunk.is_end_of_file);
+            seek_sequence::seek_sequence(original_lines, pattern, line_index, chunk.is_end_of_file)
+                .map_err(ambiguous_match)?;
 
         let mut new_slice: &[String] = &chunk.new_lines;
 
@@ -917,11 +990,38 @@ fn compute_replacements(
                 pattern,
                 line_index,
                 chunk.is_end_of_file,
-            );
+            )
+            .map_err(ambiguous_match)?;
         }
 
         if let Some(start_idx) = found {
-            replacements.push((start_idx, pattern.len(), new_slice.to_vec()));
+            for operation in
+                similar::capture_diff_slices(similar::Algorithm::Myers, pattern, new_slice)
+            {
+                // Context identifies the location; preserve its original bytes even
+                // when it matched only after whitespace or Unicode normalization.
+                if matches!(operation, similar::DiffOp::Equal { .. }) {
+                    continue;
+                }
+                let old_range = operation.old_range();
+                for old_index in old_range.clone() {
+                    let expected = &pattern[old_index];
+                    let actual = &original_lines[start_idx + old_index];
+                    if !expected.trim().is_empty()
+                        && expected[..expected.len() - expected.trim_start().len()]
+                            != actual[..actual.len() - actual.trim_start().len()]
+                    {
+                        return Err(ApplyPatchError::ComputeReplacements(format!(
+                            "Indentation differs on a removed line in {path}; reread the file and use its exact indentation."
+                        )));
+                    }
+                }
+                replacements.push((
+                    start_idx + old_range.start,
+                    old_range.len(),
+                    new_slice[operation.new_range()].to_vec(),
+                ));
+            }
             line_index = start_idx + pattern.len();
         } else {
             let message = format!(
@@ -1579,6 +1679,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_preserves_line_endings_and_final_newline() {
+        let dir = tempdir().unwrap();
+        let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
+        let path = dir.path().join("update.txt");
+        for (original, body, expected) in [
+            (
+                "foo\r\nbar\r\nend\r\n",
+                "@@\n-bar\n+baz",
+                "foo\r\nbaz\r\nend\r\n",
+            ),
+            ("foo\r\nbar", "@@\n-bar\n+baz", "foo\r\nbaz"),
+            ("foo\nbar", "@@\n-bar\n+baz", "foo\nbaz"),
+            (
+                "foo\r\nbar\nend\r\n",
+                "@@\n-foo\n+new",
+                "new\r\nbar\nend\r\n",
+            ),
+            ("foo", "@@\n+bar", "foo\nbar"),
+            ("foo\r\nbar", "@@\n+baz", "foo\r\nbar\r\nbaz"),
+            ("foo", "@@\n-foo", ""),
+            ("", "@@\n+foo", "foo\n"),
+            ("foo\n\n", "@@\n-foo\n+bar", "bar\n\n"),
+        ] {
+            fs::write(&path, original).unwrap();
+            let patch = wrap_patch(&format!("*** Update File: update.txt\n{body}"));
+            apply_patch(
+                &patch,
+                &cwd,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                LOCAL_FS.as_ref(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                expected.as_bytes(),
+                "original: {original:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_update_file_hunk_can_move_file() {
         let dir = tempdir().unwrap();
         let src = dir.path().join("src.txt");
@@ -2117,6 +2261,54 @@ f
 g
 "#
         );
+    }
+
+    #[tokio::test]
+    async fn test_failure_summary_survives_cancellation_and_output_failure() {
+        struct BrokenOutput;
+        impl io::Write for BrokenOutput {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "output closed"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        for cancel in [false, true] {
+            let dir = tempdir().unwrap();
+            let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
+            let created = dir.path().join("created.txt");
+            let mut stderr = Vec::new();
+            let failure = apply_patch_with_cancellation(
+                &wrap_patch("*** Add File: created.txt\n+created\n*** Add File: later.txt\n+later"),
+                &cwd,
+                &mut BrokenOutput,
+                &mut stderr,
+                LOCAL_FS.as_ref(),
+                None,
+                &|| cancel && created.exists(),
+            )
+            .await
+            .unwrap_err();
+            let stderr = String::from_utf8(stderr).unwrap();
+            assert!(failure.delta().is_exact());
+            assert_eq!(fs::read_to_string(&created).unwrap(), "created\n");
+            assert_eq!(dir.path().join("later.txt").exists(), !cancel);
+            assert_eq!(
+                stderr.matches(&format!("A {}", created.display())).count(),
+                1
+            );
+            assert_eq!(
+                stderr.contains(&format!("A {}", dir.path().join("later.txt").display())),
+                !cancel
+            );
+            assert!(stderr.contains("do not retry the whole patch"), "{stderr}");
+            assert!(
+                stderr.contains(if cancel { "cancelled" } else { "output closed" }),
+                "{stderr}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -104,6 +104,7 @@ def command_needs_rust_tooling(command: str) -> bool:
     return bool(
         RUST_COMMAND_PATTERN.search(command)
         or "rust_build_status.py" in command
+        or "rust_test_runner.py" in command
         or "cargo-lane" in command
     )
 
@@ -489,7 +490,8 @@ def read_cached_tool_run(
         return None
     path = tool_run_cache_path(command, cache_dir)
     try:
-        if time.time() - path.stat().st_mtime > ttl_seconds:
+        age = time.time() - path.stat().st_mtime
+        if not 0 <= age <= ttl_seconds:
             return None
         value = path.read_text(encoding="utf-8").strip()
     except OSError:
@@ -542,7 +544,8 @@ def warn_once(
     if cache_dir is not None:
         path = cache_dir / f"{sanitize_cache_part(key)}.warn"
         try:
-            if time.time() - path.stat().st_mtime <= PROBE_CACHE_TTL_SECONDS:
+            age = time.time() - path.stat().st_mtime
+            if 0 <= age <= PROBE_CACHE_TTL_SECONDS:
                 return
         except OSError:
             pass
@@ -581,7 +584,7 @@ def run_powershell(
     if pwsh is None:
         print(
             "PowerShell ('pwsh') is required for Windows just recipes. "
-            "Run 'just install' to install it.",
+            "Install PowerShell 7.5 or newer, then rerun the recipe.",
             file=stderr,
         )
         return 1
@@ -590,7 +593,7 @@ def run_powershell(
     ):
         print(
             "PowerShell 7.5 or newer is required for Windows just recipes. "
-            "Upgrade pwsh or run 'just install'.",
+            "Upgrade pwsh, then rerun the recipe.",
             file=stderr,
         )
         return 1
@@ -604,6 +607,7 @@ def run_powershell(
                 pwsh,
                 "-NoLogo",
                 "-NoProfile",
+                "-NonInteractive",
                 "-CommandWithArgs",
                 command,
                 recipe_name,
@@ -626,6 +630,7 @@ def powershell_supports_command_with_args(
         pwsh,
         "-NoLogo",
         "-NoProfile",
+        "-NonInteractive",
         "-Command",
         "if ($PSVersionTable.PSVersion -lt [version]'7.5') { exit 1 }",
     ]

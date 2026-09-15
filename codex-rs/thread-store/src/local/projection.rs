@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::ThreadHistoryChangeSet;
@@ -39,6 +41,7 @@ pub(super) type SharedLocalThreadProjection = Arc<LocalThreadProjectionEntry>;
 pub(super) struct LocalThreadProjectionEntry {
     state: Mutex<LocalThreadProjection>,
     operation_gate: Arc<Semaphore>,
+    source_version: Mutex<Option<(PathBuf, u64, Option<SystemTime>)>>,
 }
 
 struct ProjectedItem {
@@ -484,6 +487,7 @@ impl LocalThreadProjectionEntry {
         Self {
             state: Mutex::new(LocalThreadProjection::default()),
             operation_gate: Arc::new(Semaphore::new(1)),
+            source_version: Mutex::new(None),
         }
     }
 
@@ -546,9 +550,33 @@ pub(super) async fn initialize_from_store(
     store: &LocalThreadStore,
     thread_id: ThreadId,
     include_archived: bool,
+    rollout_path: Option<PathBuf>,
 ) -> ThreadStoreResult<SharedLocalThreadProjection> {
     let projection = projection_entry(store, thread_id).await;
     let _operation = projection.acquire_operation().await?;
+    if !store.live_recorders.lock().await.contains_key(&thread_id) {
+        // Unloaded rollouts may be appended or rolled back by another process.
+        // Compare the durable source before reusing its pagination projection.
+        let source_version = if let Some(path) = rollout_path {
+            tokio::fs::metadata(&path)
+                .await
+                .ok()
+                .map(|metadata| (path, metadata.len(), metadata.modified().ok()))
+        } else {
+            None
+        };
+        let mut previous_version = projection.source_version.lock().await;
+        if source_version.is_none() || *previous_version != source_version {
+            let history = store
+                .load_history(LoadThreadHistoryParams {
+                    thread_id,
+                    include_archived,
+                })
+                .await?;
+            projection.initialize(history.items.as_slice()).await?;
+            *previous_version = source_version;
+        }
+    }
     initialize_entry_from_store(store, thread_id, include_archived, &projection).await?;
     Ok(projection)
 }
@@ -617,9 +645,15 @@ pub(super) async fn list_turns(
     params: ListTurnsParams,
 ) -> ThreadStoreResult<TurnPage> {
     require_positive_page_size(params.page_size)?;
-    validate_thread_visibility(store, params.thread_id, params.include_archived).await?;
-    let projection =
-        initialize_from_store(store, params.thread_id, params.include_archived).await?;
+    let rollout_path =
+        validate_thread_visibility(store, params.thread_id, params.include_archived).await?;
+    let projection = initialize_from_store(
+        store,
+        params.thread_id,
+        params.include_archived,
+        rollout_path,
+    )
+    .await?;
     projection.list_turns(&params).await
 }
 
@@ -628,9 +662,15 @@ pub(super) async fn list_items(
     params: ListItemsParams,
 ) -> ThreadStoreResult<ItemPage> {
     require_positive_page_size(params.page_size)?;
-    validate_thread_visibility(store, params.thread_id, params.include_archived).await?;
-    let projection =
-        initialize_from_store(store, params.thread_id, params.include_archived).await?;
+    let rollout_path =
+        validate_thread_visibility(store, params.thread_id, params.include_archived).await?;
+    let projection = initialize_from_store(
+        store,
+        params.thread_id,
+        params.include_archived,
+        rollout_path,
+    )
+    .await?;
     projection.list_items(&params).await
 }
 
@@ -638,7 +678,7 @@ async fn validate_thread_visibility(
     store: &LocalThreadStore,
     thread_id: ThreadId,
     include_archived: bool,
-) -> ThreadStoreResult<()> {
+) -> ThreadStoreResult<Option<PathBuf>> {
     super::read_thread::read_thread(
         store,
         ReadThreadParams {
@@ -648,7 +688,7 @@ async fn validate_thread_visibility(
         },
     )
     .await
-    .map(|_| ())
+    .map(|thread| thread.rollout_path)
 }
 
 async fn projection_entry(

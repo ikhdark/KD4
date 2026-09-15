@@ -31,10 +31,14 @@ fn request_user_input_tool_includes_questions_schema() {
             parameters: JsonSchema::object(BTreeMap::from([
                 (
                     "autoResolutionMs".to_string(),
-                    JsonSchema::integer(Some(
-                        "Optional auto-resolution window in milliseconds, from 60000 to 240000. Include this only when the question is useful but non-blocking and continuing with best judgment is acceptable if the user does not answer; omit it when explicit user input is required before continuing. Use 60000 for lightly helpful context and up to 240000 when the answer would materially unblock better work."
+                    JsonSchema {
+                        minimum: Some(60_000.into()),
+                        maximum: Some(240_000.into()),
+                        ..JsonSchema::integer(Some(
+                        "Optional auto-resolution window in milliseconds, from 60000 to 240000. Include this only when the question is useful but non-blocking and continuing with best judgment is acceptable if the user does not answer; omit it when explicit user input is required before continuing. Use 60000 for lightly helpful context and up to 240000 when the answer would materially improve the work. If no answer arrives, disclose the assumption used to continue; elapsed time is not user approval."
                             .to_string(),
-                    )),
+                        ))
+                    },
                 ),
                 (
                     "questions".to_string(),
@@ -82,7 +86,7 @@ fn request_user_input_tool_includes_questions_schema() {
                                             Some(false.into()),
                                         ),
                                         Some(
-                                            "Provide exactly 4 mutually exclusive choices. Put the recommended option first and suffix its label with \"(Recommended)\". Do not include an \"Other\" option in this list; the client will add a free-form \"Other\" option automatically."
+                                            "Provide 2-4 meaningful, mutually exclusive choices; do not add filler options. Put the recommended option first and suffix its label with \"(Recommended)\". Do not include an \"Other\" option in this list; the client will add a free-form \"Other\" option automatically."
                                                 .to_string(),
                                         ),
                                     ),
@@ -251,10 +255,10 @@ fn request_user_input_unavailable_messages_respect_default_mode_feature_flag() {
 fn request_user_input_tool_description_mentions_available_modes() {
     assert_eq!(
         request_user_input_tool_description(&default_available_modes()),
-        "Request user input for one to three short questions and wait for the response. Use this when the user prompt leaves meaningful uncertainty about intent, scope, constraints, or preferences; ask early instead of spending turns trying to infer context only the user can provide. Each question must offer exactly four mutually exclusive suggested answers; the client adds a free-text response. Set autoResolutionMs, from 60000 to 240000 milliseconds, only when the question is useful but non-blocking and continuing with best judgment is acceptable if the user does not answer; omit it when explicit user input is required. This tool is only available in Default or Plan mode.".to_string()
+        "Request user input for one to three short questions and wait for the response. Use this when the user prompt leaves meaningful uncertainty about intent, scope, constraints, or preferences; ask early instead of spending turns trying to infer context only the user can provide. Each question should offer two to four meaningful, mutually exclusive suggested answers without filler; the client adds a free-text response. Set autoResolutionMs, from 60000 to 240000 milliseconds, only when the question is useful but non-blocking and continuing with best judgment is acceptable if the user does not answer; omit it when explicit user input is required. If no answer arrives, disclose the assumption used to continue; elapsed time is not user approval. This tool is only available in Default or Plan mode.".to_string()
     );
     assert_eq!(
         request_user_input_tool_description(&default_mode_disabled_available_modes()),
-        "Request user input for one to three short questions and wait for the response. Use this when the user prompt leaves meaningful uncertainty about intent, scope, constraints, or preferences; ask early instead of spending turns trying to infer context only the user can provide. Each question must offer exactly four mutually exclusive suggested answers; the client adds a free-text response. Set autoResolutionMs, from 60000 to 240000 milliseconds, only when the question is useful but non-blocking and continuing with best judgment is acceptable if the user does not answer; omit it when explicit user input is required. This tool is only available in Plan mode.".to_string()
+        "Request user input for one to three short questions and wait for the response. Use this when the user prompt leaves meaningful uncertainty about intent, scope, constraints, or preferences; ask early instead of spending turns trying to infer context only the user can provide. Each question should offer two to four meaningful, mutually exclusive suggested answers without filler; the client adds a free-text response. Set autoResolutionMs, from 60000 to 240000 milliseconds, only when the question is useful but non-blocking and continuing with best judgment is acceptable if the user does not answer; omit it when explicit user input is required. If no answer arrives, disclose the assumption used to continue; elapsed time is not user approval. This tool is only available in Plan mode.".to_string()
     );
 }

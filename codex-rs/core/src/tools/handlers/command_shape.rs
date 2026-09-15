@@ -125,7 +125,7 @@ impl CommandInvocation {
                 .derive_exec_args(script, use_login_shell)
                 .map_err(|error| FunctionCallError::RespondToModel(error.to_string())),
             Self::PowerShellScript(script_body) => {
-                Ok(self.to_powershell_exec_args(shell, script_body, use_login_shell))
+                self.to_powershell_exec_args(shell, script_body, use_login_shell)
             }
             Self::Argv { program, args } => {
                 let mut command = Vec::with_capacity(args.len() + 1);
@@ -292,7 +292,7 @@ impl CommandInvocation {
         shell: &Shell,
         script_body: &str,
         use_login_shell: bool,
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>, FunctionCallError> {
         debug_assert_eq!(shell.shell_type, ShellType::PowerShell);
         let mut command = powershell_base_args(shell, use_login_shell);
         command.extend(encoded_command_args(&format!(
@@ -300,7 +300,22 @@ impl CommandInvocation {
             codex_shell_command::powershell::UTF8_OUTPUT_PREFIX,
             script_body
         )));
-        command
+        // CreateProcessW counts UTF-16 units including separators, executable
+        // quoting and the terminating NUL. Flags and base64 need no quoting.
+        if cfg!(windows)
+            && command
+                .iter()
+                .map(|arg| arg.encode_utf16().count())
+                .sum::<usize>()
+                + command.len()
+                + 2
+                > 32_767
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "powershell_script exceeds Windows' 32767-character command-line limit after UTF-16/base64 encoding; split the script into smaller calls or save it to a .ps1 file and invoke PowerShell with -File.".to_string(),
+            ));
+        }
+        Ok(command)
     }
 
     fn to_powershell_safety_args(
@@ -413,7 +428,8 @@ pub(crate) fn powershell_script_failure_advisory(
         "unexpected token",
         "missing expression",
         "missing closing",
-        "terminator",
+        "the string is missing the terminator",
+        "terminatorexpectedatendofstring",
         "positionalparameternotfound",
         "parameter cannot be processed",
     ]

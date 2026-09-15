@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 
 from scripts import check_duplicate_deps
 
@@ -15,6 +18,7 @@ class CheckDuplicateDepsTest(unittest.TestCase):
                     [
                         "cargo",
                         "tree",
+                        "--locked",
                         "-d",
                         "-p",
                         "codex-cli",
@@ -53,6 +57,41 @@ class CheckDuplicateDepsTest(unittest.TestCase):
         self.assertEqual(
             check_duplicate_deps.check_duplicate_deps([], runner=runner), 7
         )
+
+    @unittest.skipUnless(shutil.which("cargo"), "cargo is required")
+    def test_manifest_drift_fails_without_rewriting_lockfile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "src").mkdir()
+            (root / "src" / "main.rs").write_text("fn main() {}", encoding="utf-8")
+            manifest = root / "Cargo.toml"
+            manifest.write_text(
+                '[package]\nname = "codex-cli"\nversion = "0.1.0"\nedition = "2021"\n',
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["cargo", "generate-lockfile", "--offline"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            before = (root / "Cargo.lock").read_bytes()
+            manifest.write_text(
+                manifest.read_text("utf-8").replace('"0.1.0"', '"0.2.0"'),
+                encoding="utf-8",
+            )
+
+            def runner(
+                *args: object, **kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
+                check = kwargs.pop("check")
+                return subprocess.run(*args, cwd=root, check=check, **kwargs)
+
+            self.assertNotEqual(
+                check_duplicate_deps.check_duplicate_deps(["--offline"], runner=runner),
+                0,
+            )
+            self.assertEqual((root / "Cargo.lock").read_bytes(), before)
 
 
 if __name__ == "__main__":

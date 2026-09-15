@@ -42,13 +42,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
     let turn_context = &step_context.turn;
     let mut history = sess.clone_history().await;
     let base_instructions = sess.get_base_instructions().await;
-    let tool_router = built_tools(
-        sess.as_ref(),
-        step_context.as_ref(),
-        &[],
-        cancellation_token,
-    )
-    .await?;
+    let tool_router = built_tools(sess.as_ref(), step_context, &[], cancellation_token).await?;
     let mut owned_client_session = None;
     let client_session = match client_session {
         Some(client_session) => client_session,

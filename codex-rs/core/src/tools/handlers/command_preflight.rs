@@ -18,7 +18,6 @@ pub(crate) enum CommandPreflightIssueCode {
     ShellMismatch,
     WindowsLiteralPathRequired,
     DirectArgvPowerShellCmdlet,
-    GitStatusOptionalLocks,
     KnownFlagTypo,
     RgLiteralGlobPath,
 }
@@ -110,7 +109,6 @@ impl CommandPreflightIssueCode {
             Self::ShellMismatch => "command_preflight_shell_mismatch",
             Self::WindowsLiteralPathRequired => "windows_literal_path_required",
             Self::DirectArgvPowerShellCmdlet => "direct_argv_powershell_cmdlet",
-            Self::GitStatusOptionalLocks => "git_status_optional_locks",
             Self::KnownFlagTypo => "known_flag_typo",
             Self::RgLiteralGlobPath => "rg_literal_glob_path",
         }
@@ -257,11 +255,9 @@ fn preflight_invocation_with_equivalent_repair_detailed(
                 let repaired_argv_commands =
                     preflight_command_issue(&repaired_command, /*shell_type*/ None)?;
                 return Ok(CommandPreflightOutcome {
-                    repair_notice: Some(read_only_repair_notice(
-                        CommandPreflightIssueCode::GitStatusOptionalLocks,
-                        invocation,
-                        &repaired,
-                    )),
+                    // Status is already valid. Disabling optional locks is
+                    // normalization, so it must not bypass retry admission.
+                    repair_notice: None,
                     validation_invocations: validation_invocations(
                         repaired_argv_commands,
                         &repaired,
@@ -503,7 +499,7 @@ fn command_may_invoke_rg(command: &[String]) -> bool {
                     )
             })
             .map(|token| token.trim_matches([',', '`']))
-            .any(|token| matches_ignore_ascii_case(program_name(token), &["rg", "rga"]))
+            .any(is_rg_program)
     })
 }
 
@@ -1013,7 +1009,7 @@ fn lint_rg_literal_glob_paths(
                 CommandPreflightRejected::Argv(argv.to_vec()),
                 detail,
                 Some(
-                    "search the parent directory and pass wildcards through `--glob`, for example `rg --files .codex/skills --glob */SKILL.md`."
+                    "search the parent directory and pass wildcards through `--glob`, for example `rg --files .codex/skills --glob '*/SKILL.md'`."
                         .to_string(),
                 ),
                 None,
@@ -1072,7 +1068,7 @@ fn known_flag_fix<'a>(program: &str, arg: &'a str) -> Option<(&'a str, &'static 
         ("cargo", "--pakage") => Some((flag, "--package")),
         ("npm", "--workpace") => Some((flag, "--workspace")),
         ("pytest", "--max-fail") => Some((flag, "--maxfail")),
-        ("get-childitem" | "get-content" | "select-string", "-recuse") => Some((flag, "-Recurse")),
+        ("get-childitem", "-recuse") => Some((flag, "-Recurse")),
         ("select-string", "-patern") => Some((flag, "-Pattern")),
         ("select-string", "-casesensitve") => Some((flag, "-CaseSensitive")),
         _ => None,
@@ -1113,6 +1109,10 @@ fn is_bare_powershell_arg(arg: &str) -> bool {
         && arg
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | '=' | ':'))
+}
+
+pub(super) fn is_rg_program(program: &str) -> bool {
+    matches_ignore_ascii_case(program_name(program), &["rg", "rga", "ripgrep"])
 }
 
 pub(super) fn rg_option_consumes_next(arg: &str) -> bool {
@@ -1170,7 +1170,6 @@ pub(super) fn rg_option_consumes_next(arg: &str) -> bool {
 
 fn looks_like_unexpanded_glob_path(arg: &str) -> bool {
     (arg.contains('*') || arg.contains('?'))
-        && (arg.contains('/') || arg.contains('\\'))
         && !arg.starts_with("http://")
         && !arg.starts_with("https://")
 }
@@ -1201,7 +1200,7 @@ fn strip_matching_quotes(value: &str) -> &str {
 }
 
 fn is_windows_executable_extension(extension: &str) -> bool {
-    matches_ignore_ascii_case(extension, &["bat", "cmd", "com", "exe", "ps1", "psm1"])
+    matches_ignore_ascii_case(extension, &["bat", "cmd", "com", "exe"])
 }
 
 fn starts_with_powershell_cmdlet(script: &str) -> bool {

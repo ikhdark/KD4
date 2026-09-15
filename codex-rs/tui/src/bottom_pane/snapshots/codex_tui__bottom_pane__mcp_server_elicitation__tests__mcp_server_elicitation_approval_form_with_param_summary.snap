@@ -8,12 +8,12 @@ expression: "render_snapshot(&overlay, Rect::new(0, 0, 120, 16))"
                                                                                                                         
   Calendar: primary                                                                                                     
   Title: Roadmap review                                                                                                 
-  Notes: This is a deliberately long note that should truncate bef...                                                   
+  Notes: This is a deliberately long note that should truncate before it turns the approval body into a giant wall of   
+  text in the TUI overlay.                                                                                              
+  Ignored: fourth param                                                                                                 
                                                                                                                         
   › 1. Allow   Run the tool and continue.                                                                               
     2. Cancel  Cancel this tool call                                                                                    
                                                                                                                         
                                                                                                                         
-                                                                                                                        
-                                                                                                                        
-  enter to submit | esc to cancel
+  enter to submit | esc to cancel | ctrl + pgup/pgdn scroll arguments

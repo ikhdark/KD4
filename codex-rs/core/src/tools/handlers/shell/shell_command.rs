@@ -44,6 +44,7 @@ use crate::validation_admission::admit_validation_invocations;
 use codex_tools::ToolSpec;
 
 use super::super::shell_spec::CommandToolOptions;
+use super::super::shell_spec::create_foreign_shell_command_tool;
 use super::super::shell_spec::create_shell_command_tool_for_policy;
 use super::super::unified_exec::ExecCommandHandler;
 use super::super::unified_exec::ExecCommandHandlerOptions;
@@ -72,6 +73,7 @@ pub struct ShellCommandHandler {
 
 #[derive(Clone, Copy)]
 pub(crate) struct ShellCommandHandlerOptions {
+    pub(crate) foreign_environment: bool,
     pub(crate) allow_login_shell: bool,
     pub(crate) allow_escalated_sandbox_permissions: bool,
     pub(crate) exec_permission_approvals_enabled: bool,
@@ -208,6 +210,7 @@ impl ShellCommandHandler {
 impl Default for ShellCommandHandler {
     fn default() -> Self {
         Self::new(ShellCommandHandlerOptions {
+            foreign_environment: false,
             allow_login_shell: false,
             allow_escalated_sandbox_permissions: false,
             exec_permission_approvals_enabled: false,
@@ -221,6 +224,17 @@ impl ToolExecutor<ToolInvocation> for ShellCommandHandler {
     }
 
     fn spec(&self) -> ToolSpec {
+        if self.options.foreign_environment {
+            return create_foreign_shell_command_tool(
+                CommandToolOptions {
+                    allow_login_shell: self.options.allow_login_shell,
+                    exec_permission_approvals_enabled: self
+                        .options
+                        .exec_permission_approvals_enabled,
+                },
+                self.options.allow_escalated_sandbox_permissions,
+            );
+        }
         create_shell_command_tool_for_policy(
             CommandToolOptions {
                 allow_login_shell: self.options.allow_login_shell,
@@ -353,6 +367,7 @@ impl ShellCommandHandler {
         let validation_invocations = preflight.validation_invocations;
         let command_invocation = preflight.invocation;
         let repair_notice = preflight.repair_notice;
+        let invocation_changed = command_invocation != original_invocation;
         let validation_admission = admit_validation_invocations(
             &turn.validation_authorization,
             &validation_invocations,
@@ -385,7 +400,7 @@ impl ShellCommandHandler {
         let hook_command = command_invocation.display_command();
         maybe_emit_implicit_skill_invocation(session.as_ref(), turn.as_ref(), &hook_command, &cwd)
             .await;
-        let safety_shell = if command_repaired {
+        let safety_shell = if invocation_changed {
             resolve_command_shell_async(
                 &command_invocation,
                 &turn_environment,
@@ -395,7 +410,7 @@ impl ShellCommandHandler {
         } else {
             original_safety_shell
         };
-        let safety_command = if command_repaired {
+        let safety_command = if invocation_changed {
             command_invocation.to_safety_args(&safety_shell, use_login_shell)?
         } else {
             original_safety_command.clone()
@@ -649,22 +664,192 @@ impl CoreToolRuntime for ShellCommandHandler {
 
 #[cfg(test)]
 mod tests {
+    use futures::SinkExt;
+    use futures::StreamExt;
     use serde_json::json;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     use super::ShellCommandHandler;
 
+    #[tokio::test]
+    async fn foreign_shell_command_dispatches_to_executor_and_rejects_deadlines_before_launch() {
+        use crate::session::step_context::StepContext;
+        use crate::session::turn_context::TurnEnvironment;
+        use crate::tools::context::ToolCallSource;
+        use crate::tools::context::ToolInvocation;
+        use crate::tools::context::ToolPayload;
+        use crate::tools::registry::ToolExecutor;
+        use codex_utils_path_uri::PathUri;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let launches = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&launches);
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = tokio::select! {
+                accepted = listener.accept() => accepted.unwrap(),
+                _ = &mut stopped => return,
+            };
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            loop {
+                let frame = tokio::select! {
+                    frame = socket.next() => frame,
+                    _ = &mut stopped => break,
+                };
+                let Some(Ok(frame)) = frame else { break };
+                let request: serde_json::Value = match frame {
+                    Message::Text(text) => serde_json::from_str(&text).unwrap(),
+                    Message::Binary(bytes) => serde_json::from_slice(&bytes).unwrap(),
+                    _ => continue,
+                };
+                let result = match request["method"].as_str().unwrap() {
+                    "initialize" => json!({"sessionId": "foreign-shell"}),
+                    "initialized" => continue,
+                    "environment/info" => {
+                        // The executor handshake is Windows-only. Its optional
+                        // default cwd is separate from the turn's foreign URI.
+                        json!({"operatingSystem": "windows", "shell": {"name": "pwsh", "path": "pwsh.exe"}, "cwd": null})
+                    }
+                    "fs/canonicalize" => json!({"path": request["params"]["path"]}),
+                    "fs/getMetadata" => {
+                        json!({"isDirectory": true, "isFile": false, "isSymlink": false, "size": 0})
+                    }
+                    "process/start" => {
+                        observed.lock().unwrap().push(request["params"].clone());
+                        json!({"processId": request["params"]["processId"]})
+                    }
+                    "process/read" => json!({
+                        "chunks": if request["params"]["afterSeq"].as_u64().unwrap_or(0) == 0 {
+                            vec![json!({"seq": 1, "stream": "stdout", "chunk": "cmVtb3RlIG9rCg=="})]
+                        } else { vec![] },
+                        "nextSeq": 4, "exited": true, "exitCode": 0, "closed": true, "failure": null,
+                    }),
+                    "process/terminate" => json!({"running": false}),
+                    method => panic!("unexpected executor operation {method}: {request}"),
+                };
+                socket
+                    .send(Message::Text(
+                        json!({"id": request["id"], "result": result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                if request["method"] == "process/start" {
+                    let process_id = &request["params"]["processId"];
+                    // Normal execution consumes the ordered notification stream;
+                    // process/read is only the recovery path.
+                    for (method, params) in [
+                        (
+                            "process/output",
+                            json!({"processId": process_id, "seq": 1, "stream": "stdout", "chunk": "cmVtb3RlIG9rCg=="}),
+                        ),
+                        (
+                            "process/exited",
+                            json!({"processId": process_id, "seq": 2, "exitCode": 0, "sandboxDenied": false}),
+                        ),
+                        ("process/closed", json!({"processId": process_id, "seq": 3})),
+                    ] {
+                        socket
+                            .send(Message::Text(
+                                json!({"method": method, "params": params})
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+        });
+        let home = tempfile::tempdir().unwrap();
+        let (session, mut turn, _) =
+            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                codex_login::CodexAuth::from_api_key("test key"),
+                Vec::new(),
+                home.path(),
+                |config| {
+                    config.permissions.approval_policy = crate::config::Constrained::allow_any(
+                        codex_protocol::protocol::AskForApproval::Never,
+                    );
+                    config
+                        .permissions
+                        .set_permission_profile(codex_protocol::models::PermissionProfile::Disabled)
+                        .unwrap();
+                },
+            )
+            .await;
+        Arc::get_mut(&mut turn)
+            .unwrap()
+            .environments
+            .turn_environments = vec![TurnEnvironment::new(
+            "foreign".into(),
+            Arc::new(codex_exec_server::Environment::create_for_tests(Some(url)).unwrap()),
+            PathUri::parse("file:///workspace").unwrap(),
+            None,
+        )];
+        let handler = ShellCommandHandler::new(super::ShellCommandHandlerOptions {
+            foreign_environment: true,
+            allow_login_shell: false,
+            allow_escalated_sandbox_permissions: false,
+            exec_permission_approvals_enabled: false,
+        });
+        let invocation = |arguments: serde_json::Value| ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            tracker: Arc::new(tokio::sync::Mutex::new(
+                crate::turn_diff_tracker::TurnDiffTracker::new(),
+            )),
+            call_id: "foreign-command".into(),
+            tool_name: handler.tool_name(),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: arguments.to_string(),
+            },
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+        };
+        for deadline in ["timeout_ms", "stall_timeout_ms"] {
+            let mut args = json!({"kind": "argv", "program": "printf", "args": ["remote ok\\n"]});
+            args[deadline] = json!(60_000);
+            let error = handler
+                .handle_call(invocation(args))
+                .await
+                .err()
+                .expect("unsupported deadline rejected");
+            assert!(error.to_string().contains(deadline));
+            assert!(launches.lock().unwrap().is_empty());
+        }
+        let output = tokio::time::timeout(Duration::from_secs(5), handler.handle_call(invocation(
+            json!({"kind": "argv", "program": "printf", "args": ["remote ok\\n"], "yield_time_ms": 1000})
+        ))).await.unwrap().unwrap();
+        assert_eq!(output.log_preview(), "remote ok\n");
+        assert_eq!(
+            output.outcome_for_logging(),
+            codex_tools::ToolOutputOutcome::Success
+        );
+        let starts = launches.lock().unwrap().clone();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0]["argv"], json!(["printf", "remote ok\\n"]));
+        assert_eq!(starts[0]["cwd"], json!("file:///workspace"));
+        stop.send(()).unwrap();
+        server.await.unwrap();
+    }
+
     #[test]
-    fn forwarding_timeout_to_unified_exec_preserves_default_yield() {
+    fn forwarded_timeout_is_rejected_by_unified_exec() {
         let forwarded = ShellCommandHandler::forward_arguments_to_unified_exec(
             &json!({"command": "long-running", "timeout_ms": 60_000}).to_string(),
             "remote",
             true,
         )
         .expect("forward shell_command arguments");
-        let forwarded: serde_json::Value =
-            serde_json::from_str(&forwarded).expect("parse forwarded arguments");
-
-        assert_eq!(forwarded["timeout_ms"], 60_000);
-        assert!(forwarded.get("yield_time_ms").is_none());
+        let error =
+            crate::tools::handlers::unified_exec::validate_exec_command_arguments(&forwarded)
+                .expect_err("forwarding must not silently discard a requested deadline");
+        assert!(error.contains("does not support `timeout_ms`"), "{error}");
+        assert!(error.contains("no command was started"), "{error}");
     }
 }

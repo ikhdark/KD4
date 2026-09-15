@@ -495,12 +495,16 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
                     if let Ok(native_cwd) = req.action.cwd.to_abs_path() {
                         let workspace_root = get_git_repo_root(&native_cwd)
                             .unwrap_or_else(|| native_cwd.to_path_buf());
-                        Some(
-                            crate::workspace_operation_gate::acquire_workspace_operation(
+                        Some(tokio::select! {
+                            biased;
+                            _ = req.cancellation_token.cancelled() => {
+                                self.finish_mutation_evidence(ctx, true).await;
+                                return Err(ToolError::Codex(CodexErr::TurnAborted));
+                            }
+                            permit = crate::workspace_operation_gate::acquire_workspace_operation(
                                 &workspace_root,
-                            )
-                            .await,
-                        )
+                            ) => permit,
+                        })
                     } else {
                         None
                     };

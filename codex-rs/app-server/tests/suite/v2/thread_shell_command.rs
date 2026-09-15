@@ -1,6 +1,5 @@
 use anyhow::Result;
 use app_test_support::TestAppServer;
-use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_shell_command_sse_response;
 use app_test_support::format_with_current_shell_display;
@@ -287,7 +286,7 @@ async fn thread_shell_command_uses_selected_remote_environment_without_local_env
     .await??;
     let _: EnvironmentAddResponse = to_response(add_response)?;
 
-    let remote_cwd = PathUri::parse("file:///home/remote/workspace")?;
+    let remote_cwd = PathUri::parse("file:///C:/remote/workspace")?;
     let start_id = mcp
         .send_thread_start_request(ThreadStartParams {
             environments: Some(vec![TurnEnvironmentParams {
@@ -315,7 +314,7 @@ async fn thread_shell_command_uses_selected_remote_environment_without_local_env
     let shell_id = mcp
         .send_thread_shell_command_request(ThreadShellCommandParams {
             thread_id: thread.id,
-            command: "printf remote-shell".to_string(),
+            command: "Write-Output remote-shell".to_string(),
         })
         .await?;
     let shell_response = timeout(
@@ -329,7 +328,7 @@ async fn thread_shell_command_uses_selected_remote_environment_without_local_env
     let ThreadItem::CommandExecution { id, cwd, .. } = started.item else {
         unreachable!("helper returns command execution item");
     };
-    assert_eq!(cwd.as_str(), "/home/remote/workspace");
+    assert_eq!(cwd.as_str(), r"C:\remote\workspace");
     let completed = wait_for_command_execution_completed(&mut mcp, Some(&id)).await?;
     let ThreadItem::CommandExecution {
         status,
@@ -352,9 +351,9 @@ async fn serve_remote_user_shell(listener: TcpListener) -> Result<()> {
     let mut websocket = accept_exec_server_environment(
         listener,
         json!({
-            "operatingSystem": "linux",
-            "shell": {"name": "bash", "path": "/bin/bash"},
-            "cwd": "file:///home/remote/workspace",
+            "operatingSystem": "windows",
+            "shell": {"name": "powershell", "path": r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"},
+            "cwd": "file:///C:/remote/workspace",
         }),
     )
     .await?;
@@ -372,13 +371,13 @@ async fn serve_remote_user_shell(listener: TcpListener) -> Result<()> {
                 if process_id.contains("-shell-snapshot-") {
                     shell_snapshot_process_id = Some(process_id.clone());
                 } else {
-                    assert_eq!(request["params"]["cwd"], "file:///home/remote/workspace");
+                    assert_eq!(request["params"]["cwd"], "file:///C:/remote/workspace");
                     assert_eq!(
                         request["params"]["argv"]
                             .as_array()
                             .and_then(|argv| argv.last())
                             .and_then(Value::as_str),
-                        Some("printf remote-shell")
+                        Some("Write-Output remote-shell")
                     );
                     shell_process_id = Some(process_id.clone());
                 }
@@ -485,19 +484,16 @@ async fn thread_shell_command_uses_existing_active_turn() -> Result<()> {
     let workspace = tmp.path().join("workspace");
     std::fs::create_dir(&workspace)?;
 
-    let responses = vec![
-        create_shell_command_sse_response(
-            vec![
-                "python3".to_string(),
-                "-c".to_string(),
-                "print(42)".to_string(),
-            ],
-            /*workdir*/ None,
-            Some(5000),
-            "call-approve",
-        )?,
-        create_final_assistant_message_sse_response("done")?,
-    ];
+    let responses = vec![create_shell_command_sse_response(
+        vec![
+            "python3".to_string(),
+            "-c".to_string(),
+            "print(42)".to_string(),
+        ],
+        /*workdir*/ None,
+        Some(5000),
+        "call-approve",
+    )?];
     let server = create_mock_responses_server_sequence(responses).await;
     create_config_toml(
         codex_home.as_path(),

@@ -1227,7 +1227,8 @@ impl FileWatcher {
                 let mut changed_paths = BTreeSet::new();
                 let mut rescan_required = false;
                 for (subscriber_watch, subscriber_watch_state) in &mut subscriber.watched_paths {
-                    if !event_paths.is_empty()
+                    if !subscriber_watch_state.fallback
+                        && !event_paths.is_empty()
                         && !event_paths.iter().any(|event_path| {
                             path_namespaces_overlap(event_path, &subscriber_watch.requested.path)
                                 || path_namespaces_overlap(

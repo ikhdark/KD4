@@ -204,7 +204,7 @@ async fn windows_command_corpus_measures_phase2_exit_gate() {
         false,
         ShellOutputSummaryOptions {
             enabled: true,
-            turn_cost_guard: false,
+            applied_token_limit: None,
             command_text: Some("cargo test"),
         },
     )

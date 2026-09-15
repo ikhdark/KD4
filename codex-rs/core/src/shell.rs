@@ -39,12 +39,14 @@ impl Shell {
                     args.push("-NoProfile".to_string());
                 }
 
+                args.push("-NonInteractive".to_string());
                 args.push("-Command".to_string());
                 args.push(command.to_string());
                 Ok(args)
             }
             ShellType::Cmd => {
                 let mut args = vec![self.shell_path.to_string_lossy().to_string()];
+                args.push("/d".to_string());
                 args.push("/c".to_string());
                 args.push(command.to_string());
                 Ok(args)
@@ -64,14 +66,8 @@ impl From<DetectedShell> for Shell {
 
 impl Shell {
     pub(crate) fn from_environment_shell_info(shell_info: ShellInfo) -> anyhow::Result<Self> {
-        let shell_type = match shell_info.name.as_str() {
-            "zsh" => ShellType::Zsh,
-            "bash" => ShellType::Bash,
-            "powershell" => ShellType::PowerShell,
-            "sh" => ShellType::Sh,
-            "cmd" => ShellType::Cmd,
-            name => anyhow::bail!("unknown environment shell `{name}`"),
-        };
+        let shell_type = ShellType::from_name(&shell_info.name)
+            .ok_or_else(|| anyhow::anyhow!("unknown environment shell `{}`", shell_info.name))?;
 
         Ok(Self {
             shell_type,

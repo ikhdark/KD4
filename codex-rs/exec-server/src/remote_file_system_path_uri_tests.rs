@@ -215,6 +215,26 @@ async fn complete_websocket_initialize(websocket: &mut WebSocketStream<TcpStream
         }
         other => panic!("expected initialized notification, got {other:?}"),
     }
+    let request = match read_jsonrpc_websocket(websocket).await {
+        JSONRPCMessage::Request(request)
+            if request.method == crate::protocol::ENVIRONMENT_INFO_METHOD =>
+        {
+            request
+        }
+        other => panic!("expected environment/info request, got {other:?}"),
+    };
+    write_jsonrpc_websocket(
+        websocket,
+        JSONRPCMessage::Response(JSONRPCResponse {
+            id: request.id,
+            result: serde_json::json!({
+                "operatingSystem": "windows",
+                "shell": {"name": "powershell", "path": "powershell.exe"},
+                "cwd": "file:///C:/workspace"
+            }),
+        }),
+    )
+    .await;
 }
 
 async fn read_jsonrpc_websocket(websocket: &mut WebSocketStream<TcpStream>) -> JSONRPCMessage {

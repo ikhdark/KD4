@@ -31,6 +31,10 @@ class GitDoctorTest(unittest.TestCase):
             self.assertFalse(git_doctor.timed_status(1).failed)
         self.assertIs(run.call_args.kwargs["stdout"], subprocess.DEVNULL)
         self.assertIs(run.call_args.kwargs["stderr"], subprocess.PIPE)
+        self.assertEqual(
+            run.call_args.args[0],
+            ["git", "status", "--short", "--untracked-files=all"],
+        )
 
     def test_repository_root_probe_failure_is_fatal(self) -> None:
         with mock.patch.object(

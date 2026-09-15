@@ -1,5 +1,7 @@
 use super::provenance::FileIdentity;
 use super::provenance::command_output;
+use super::provenance::hash_bytes;
+use crate::schedule::Variant;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::ensure;
@@ -22,6 +24,122 @@ model_reasoning_summary = "concise"
 model_auto_compact_token_limit = 129000
 model_auto_compact_token_limit_scope = "total"
 "#;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigDifferences {
+    pub project_only: Vec<String>,
+    pub benchmark_only: Vec<String>,
+    pub changed: Vec<String>,
+    pub matching_keys: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectConfigComparison {
+    pub path: PathBuf,
+    pub sha256: String,
+    pub by_variant: BTreeMap<Variant, ConfigDifferences>,
+}
+
+pub(super) fn configured_value(base: &str, overrides: &[String]) -> Result<serde_json::Value> {
+    let mut config: toml::Value = toml::from_str(base)?;
+    for setting in overrides {
+        let parsed: toml::Value = toml::from_str(setting)?;
+        if let Some(features) = parsed.get("features").and_then(toml::Value::as_table) {
+            let table = config
+                .as_table_mut()
+                .context("config table")?
+                .entry("features")
+                .or_insert_with(|| toml::Value::Table(Default::default()))
+                .as_table_mut()
+                .context("features table")?;
+            table.extend(features.clone());
+        }
+    }
+    Ok(serde_json::to_value(config)?)
+}
+
+impl ProjectConfigComparison {
+    /// Freeze explicit project settings, not the layered daily effective config.
+    /// Persist only key names and a content hash; values can contain credentials.
+    pub fn capture(
+        repo: &Path,
+        base: &str,
+        overrides: &BTreeMap<Variant, Vec<String>>,
+    ) -> Result<Option<Self>> {
+        let path = repo.join(".codex/config.toml");
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("read project config comparison"),
+        };
+        let project: toml::Value = toml::from_str(std::str::from_utf8(&bytes)?)
+            .context("parse project config comparison")?;
+        fn leaves(
+            value: &serde_json::Value,
+            prefix: &str,
+            result: &mut BTreeMap<String, serde_json::Value>,
+        ) {
+            if let Some(table) = value.as_object() {
+                for (key, value) in table {
+                    let key = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    leaves(value, &key, result);
+                }
+            } else {
+                result.insert(prefix.into(), value.clone());
+            }
+        }
+        let mut project_keys = BTreeMap::new();
+        leaves(&serde_json::to_value(project)?, "", &mut project_keys);
+        let mut by_variant = BTreeMap::new();
+        for variant in Variant::ALL {
+            let mut benchmark_keys = BTreeMap::new();
+            leaves(
+                &configured_value(base, &overrides[&variant])?,
+                "",
+                &mut benchmark_keys,
+            );
+            by_variant.insert(
+                variant,
+                ConfigDifferences {
+                    project_only: project_keys
+                        .keys()
+                        .filter(|key| !benchmark_keys.contains_key(*key))
+                        .cloned()
+                        .collect(),
+                    benchmark_only: benchmark_keys
+                        .keys()
+                        .filter(|key| !project_keys.contains_key(*key))
+                        .cloned()
+                        .collect(),
+                    changed: project_keys
+                        .iter()
+                        .filter(|(key, value)| {
+                            benchmark_keys
+                                .get(*key)
+                                .is_some_and(|other| other != *value)
+                        })
+                        .map(|(key, _)| key.clone())
+                        .collect(),
+                    matching_keys: project_keys
+                        .iter()
+                        .filter(|(key, value)| benchmark_keys.get(*key) == Some(*value))
+                        .count(),
+                },
+            );
+        }
+        Ok(Some(Self {
+            path,
+            sha256: hash_bytes(&bytes),
+            by_variant,
+        }))
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

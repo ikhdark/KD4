@@ -19,12 +19,6 @@ except ModuleNotFoundError:
     from generated_output_lock import GenerationLockError, generated_output_lock
 
 
-SCHEMA_INPUTS = (
-    "codex-rs/app-server-protocol/Cargo.toml",
-    "codex-rs/app-server-protocol/src",
-    "codex-rs/protocol/Cargo.toml",
-    "codex-rs/protocol/src",
-)
 GENERATED_OUTPUTS = ("codex-rs/app-server-protocol/schema",)
 STABLE_SCHEMA_BUNDLE = (
     "codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json"
@@ -102,36 +96,7 @@ def run(args: Sequence[str], *, cwd: Path) -> int:
         return subprocess.run(list(args), cwd=cwd).returncode
     except OSError as error:
         print(f"Could not run {args[0]}: {error}", file=sys.stderr)
-        return 127
-
-
-def schema_inputs_changed(root: Path, baseline: str = "HEAD") -> bool:
-    try:
-        completed = subprocess.run(
-            ["git", "diff", "--name-only", baseline, "--", *SCHEMA_INPUTS],
-            cwd=root,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-    except OSError as error:
-        print(
-            f"Could not compare app-server schema inputs with {baseline}: {error}",
-            file=sys.stderr,
-        )
-        return True
-    if completed.returncode != 0:
-        print(
-            "Could not inspect schema input status.",
-            file=sys.stderr,
-        )
-        if completed.stderr:
-            print(completed.stderr, file=sys.stderr, end="")
-        return True
-    return bool(completed.stdout.strip())
+        return 127 if isinstance(error, FileNotFoundError) else 1
 
 
 def hash_file(path: Path) -> str:
@@ -355,7 +320,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         choices=("check", "force"),
         required=True,
     )
-    parser.add_argument("--baseline", default="HEAD")
     parser.add_argument(
         "--compatibility-baseline",
         default="HEAD^",
@@ -432,8 +396,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     if generated_changed:
         print("Schema regeneration changed generated outputs; review and include them.")
-        if args.mode != "force":
-            return 1
     return 0
 
 

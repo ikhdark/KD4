@@ -72,6 +72,8 @@ const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 16_000;
 const COMPACT_AGENT_MESSAGE_MAX_TOKENS: usize = 8_000;
 const COMPACT_TASK_STATE_MAX_TOKENS: usize = 2_400;
 const COMPACT_UNSTRUCTURED_UPDATE_MAX_TOKENS: usize = 1_000;
+// Keep introductory prose subordinate to the structured task-state sections.
+const COMPACT_PREAMBLE_MAX_TOKENS: usize = 300;
 const GOAL_HEADING: &str = "## Goal";
 const CURRENT_STATE_HEADING: &str = "## Current state";
 const COMPLETED_WORK_HEADING: &str = "## Completed work";
@@ -198,7 +200,10 @@ pub(crate) struct InlineAutoCompactReuse<'a> {
         Option<&'a Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
 }
 
-#[expect(clippy::too_many_arguments, reason = "Preserve explicit compaction context, publication options, and cancellation")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Preserve explicit compaction context, publication options, and cancellation"
+)]
 pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
@@ -314,6 +319,7 @@ async fn run_compact_task_inner(
             .await;
         return Err(error);
     }
+    let mut analytics_details = CompactionAnalyticsDetails::default();
     let result = run_compact_task_inner_impl(
         Arc::clone(&sess),
         Arc::clone(&turn_context),
@@ -322,6 +328,7 @@ async fn run_compact_task_inner(
         input,
         initial_context_injection,
         compaction_metadata,
+        &mut analytics_details,
         emit_error_event,
         cancellation_token,
     )
@@ -332,22 +339,12 @@ async fn run_compact_task_inner(
         && run_post_compact_hook_gate(&sess, &turn_context, trigger, Some(summary)).await
     {
         attempt
-            .track(
-                sess.as_ref(),
-                status,
-                codex_error,
-                CompactionAnalyticsDetails::default(),
-            )
+            .track(sess.as_ref(), status, codex_error, analytics_details)
             .await;
         return Err(CodexErr::TurnAborted);
     }
     attempt
-        .track(
-            sess.as_ref(),
-            status,
-            codex_error,
-            CompactionAnalyticsDetails::default(),
-        )
+        .track(sess.as_ref(), status, codex_error, analytics_details)
         .await;
     result.map(|_| ())
 }
@@ -361,6 +358,7 @@ async fn run_compact_task_inner_impl(
     mut input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
+    analytics_details: &mut CompactionAnalyticsDetails,
     emit_error_event: bool,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<String> {
@@ -368,25 +366,28 @@ async fn run_compact_task_inner_impl(
     sess.emit_turn_item_started(&turn_context, &compaction_item)
         .await;
     let mut history = sess.clone_history().await;
-    let (mut unresolved_history, _retained_image_count, omitted_images, omitted_user_text) =
-        build_bounded_unresolved_input_history(history.raw_items());
-    let text_recovery_sidecar = match persist_compaction_text_recovery(
-        sess.as_ref(),
-        history.raw_items(),
-        &unresolved_history,
-    )
-    .await
-    {
-        Ok(sidecar) => sidecar,
-        Err(error) => {
-            sess.track_turn_codex_error(turn_context.as_ref(), &error);
-            if emit_error_event {
-                sess.send_event(&turn_context, EventMsg::Error(error.to_error_event(None)))
-                    .await;
+    let (
+        mut unresolved_history,
+        retained_image_count,
+        omitted_images,
+        omitted_user_text,
+        omitted_text,
+    ) = build_bounded_unresolved_input_history(history.raw_items());
+    analytics_details.retained_image_count = Some(retained_image_count);
+    let text_recovery_sidecar =
+        match persist_compaction_text_recovery(sess.as_ref(), history.raw_items(), omitted_text)
+            .await
+        {
+            Ok(sidecar) => sidecar,
+            Err(error) => {
+                sess.track_turn_codex_error(turn_context.as_ref(), &error);
+                if emit_error_event {
+                    sess.send_event(&turn_context, EventMsg::Error(error.to_error_event(None)))
+                        .await;
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
-    };
+        };
     let previous_summary = latest_summary_message(history.raw_items()).map(str::to_string);
     let reuse_previous_summary = previous_summary.is_some()
         && can_reuse_previous_summary(history.raw_items(), omitted_user_text);
@@ -445,13 +446,14 @@ async fn run_compact_task_inner_impl(
             CodexResponsesRequestKind::Compaction(compaction_metadata),
         );
 
-        let prompt = Prompt {
+        let mut prompt = Prompt {
             input: turn_input.into(),
             base_instructions: base_instructions.clone(),
             ..Default::default()
         };
         turn_context.turn_timing_state.begin_compaction_generation();
         let mut retry_state = ResponsesStreamRetryState::default();
+        let mut retried_invalid_summary = false;
         loop {
             let attempt_result = drain_to_completed(
                 &sess,
@@ -482,6 +484,24 @@ async fn run_compact_task_inner_impl(
                             sess.record_conversation_items(turn_context.as_ref(), &output.items)
                                 .await;
                             break Ok(summary_text);
+                        }
+                        Err(error) if !retried_invalid_summary => {
+                            // Keep rejected output out of durable and live history. Give the
+                            // model one corrective attempt, without replaying an unbounded
+                            // malformed answer into the already-full compaction request.
+                            retried_invalid_summary = true;
+                            let correction = ResponseItem::from(ResponseInputItem::from(vec![
+                                UserInput::Text {
+                                    text: format!(
+                                        "The previous compaction handoff was rejected: {error}. Regenerate the handoff with every required checkpoint section and a non-empty body for each section."
+                                    ),
+                                    text_elements: Vec::new(),
+                                },
+                            ]));
+                            let mut corrected_input = prompt.input.to_vec();
+                            corrected_input.push(correction);
+                            prompt.input = corrected_input.into();
+                            turn_context.turn_timing_state.record_model_retry();
                         }
                         Err(error) => break Err(error),
                     }
@@ -563,8 +583,6 @@ async fn run_compact_task_inner_impl(
         // belongs to this compaction turn.
         summary_item.set_turn_id_if_missing(&turn_context.sub_id);
     }
-    let (window_number, window_ids) = sess.advance_auto_compact_window().await;
-
     let (initial_context, world_state_baseline, fragment_digests) =
         build_compaction_initial_context(
             sess.as_ref(),
@@ -594,10 +612,11 @@ async fn run_compact_task_inner_impl(
         // Persist the exact new eviction shape. Older records with `None` still use the legacy
         // reconstruction path that retained raw user messages.
         replacement_history: Some(new_history.clone()),
-        window_number: Some(window_number),
-        first_window_id: Some(window_ids.first_window_id.to_string()),
-        previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
-        window_id: Some(window_ids.window_id.to_string()),
+        // The ordered history commit assigns and publishes the next window.
+        window_number: None,
+        first_window_id: None,
+        previous_window_id: None,
+        window_id: None,
     };
     sess.replace_compacted_history(
         &turn_context,
@@ -631,8 +650,9 @@ async fn workspace_identity_for_compaction(
         None => {
             sess.services
                 .git_workspace
-                .workspace_evidence_identity(turn_context.config.cwd.as_path())
+                .workspace_evidence_for_turn(turn_context, turn_context.config.cwd.as_path())
                 .await
+                .identity
         }
     }
 }
@@ -847,7 +867,7 @@ fn truncate_compaction_summary(summary: &str, max_tokens: usize) -> String {
 
     let full_preamble = preamble.join("\n");
     let mut low = 0usize;
-    let mut high = 300usize.min(max_tokens);
+    let mut high = COMPACT_PREAMBLE_MAX_TOKENS.min(max_tokens);
     while low < high {
         let candidate_budget = low.saturating_add(high).saturating_add(1) / 2;
         let candidate = truncate_text_to_token_ceiling(&full_preamble, candidate_budget);
@@ -1289,7 +1309,7 @@ fn is_compaction_model_generated_item(item: &ResponseItem) -> bool {
 }
 
 pub(crate) fn build_unresolved_user_history(items: &[ResponseItem]) -> (Vec<ResponseItem>, usize) {
-    let (mut history, retained_image_count, omitted_images, _omitted_user_text) =
+    let (mut history, retained_image_count, omitted_images, _, _) =
         build_bounded_unresolved_input_history(items);
     if omitted_images {
         history.push(ResponseItem::Message {
@@ -1307,7 +1327,7 @@ pub(crate) fn build_unresolved_user_history(items: &[ResponseItem]) -> (Vec<Resp
 
 fn build_bounded_unresolved_input_history(
     items: &[ResponseItem],
-) -> (Vec<ResponseItem>, usize, bool, bool) {
+) -> (Vec<ResponseItem>, usize, bool, bool, bool) {
     let unresolved = unresolved_compaction_items(items);
     let (user_source_indices, messages): (Vec<_>, Vec<_>) = unresolved
         .iter()
@@ -1415,6 +1435,7 @@ fn build_bounded_unresolved_input_history(
 
     // Detailed provenance is useful, but its envelope must also fit a fixed
     // budget. Exact text remains recoverable from the mandatory sidecar.
+    let omitted_text = !omission_receipts.is_empty();
     let mut receipt_tokens = 0usize;
     let mut omitted_receipt_count = 0usize;
     let mut first_omitted_index = None;
@@ -1469,6 +1490,7 @@ fn build_bounded_unresolved_input_history(
         retained_image_count,
         omitted_images,
         omitted_user_text,
+        omitted_text,
     )
 }
 
@@ -1550,9 +1572,9 @@ fn compaction_text_omission_receipt(
 async fn persist_compaction_text_recovery(
     sess: &Session,
     source_items: &[ResponseItem],
-    bounded_history: &[ResponseItem],
+    omitted_text: bool,
 ) -> CodexResult<Option<String>> {
-    let Some(canonical) = compaction_text_recovery_canonical(source_items, bounded_history) else {
+    let Some(canonical) = compaction_text_recovery_canonical(source_items, omitted_text) else {
         return Ok(None);
     };
     let codex_home = sess.codex_home().await;
@@ -1580,13 +1602,9 @@ async fn persist_compaction_text_recovery(
 
 fn compaction_text_recovery_canonical(
     source_items: &[ResponseItem],
-    bounded_history: &[ResponseItem],
+    omitted_text: bool,
 ) -> Option<CanonicalToolResult> {
-    let omitted = bounded_history.iter().any(|item| {
-        serde_json::to_string(item)
-            .is_ok_and(|rendered| rendered.contains(COMPACT_TEXT_OMISSION_MARKER))
-    });
-    if !omitted {
+    if !omitted_text {
         return None;
     }
     let exact_items = unresolved_compaction_items(source_items)

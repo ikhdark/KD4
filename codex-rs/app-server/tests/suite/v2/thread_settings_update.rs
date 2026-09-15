@@ -301,7 +301,7 @@ async fn thread_settings_update_rejects_sandbox_policy_with_permissions() -> Res
 
     assert_eq!(
         error.error.message,
-        "`permissions` cannot be combined with `sandboxPolicy`"
+        "`permissions` cannot be combined with `sandboxPolicy` or `permissionProfile`"
     );
     Ok(())
 }

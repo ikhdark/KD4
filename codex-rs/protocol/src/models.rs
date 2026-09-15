@@ -1804,44 +1804,48 @@ impl From<Vec<UserInput>> for ResponseInputItem {
     }
 }
 
+// Shared across selected paths in one user message, including their envelopes.
 const LOCAL_PATH_CONTEXT_TOKEN_BUDGET: usize = 10_000;
 const LOCAL_PATH_CONTEXT_RETRY_AVOIDANCE_TOKEN_MARGIN: usize = 128;
+const LOCAL_PATH_CONTEXT_METADATA_OMISSION: &str = "<local_path_context_omission recovery=\"Select fewer paths or shorter path names; do not infer missing content\" />";
 
-fn render_local_path_context(path: &Path, content: &str) -> String {
-    let rendered = format!("<local_path_context path={path:?}>\n{content}\n</local_path_context>");
-    let original_tokens = approx_token_count(&rendered);
-    if original_tokens
-        <= LOCAL_PATH_CONTEXT_TOKEN_BUDGET
-            .saturating_add(LOCAL_PATH_CONTEXT_RETRY_AVOIDANCE_TOKEN_MARGIN)
-    {
-        return rendered;
-    }
-
+fn render_local_path_context(
+    path: &Path,
+    content: &str,
+    token_budget: usize,
+    retry_margin: usize,
+) -> String {
+    // Escape the attribute delimiter, not native path separators as Rust Debug does.
+    let path = path
+        .to_string_lossy()
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\r', "&#13;")
+        .replace('\n', "&#10;")
+        .replace('\t', "&#9;");
+    let prefix = format!("<local_path_context path=\"{path}\">\n");
+    let suffix = "\n</local_path_context>";
+    let envelope_tokens = approx_token_count(&prefix) + approx_token_count(suffix);
     let content_tokens = approx_token_count(content);
-    let omission = format!(
-        "<local_path_context_omission original_content_tokens={content_tokens} \
-         recovery=\"read the original local path {path:?}; do not infer missing content\" />"
-    );
-    let empty_envelope =
-        format!("<local_path_context path={path:?}>\n\n{omission}\n</local_path_context>");
-    let mut content_budget =
-        LOCAL_PATH_CONTEXT_TOKEN_BUDGET.saturating_sub(approx_token_count(&empty_envelope));
-
-    loop {
-        let bounded_content = truncate_middle_with_token_budget(content, content_budget).0;
-        let bounded = format!(
-            "<local_path_context path={path:?}>\n{bounded_content}\n{omission}\n</local_path_context>"
-        );
-        let bounded_tokens = approx_token_count(&bounded);
-        if bounded_tokens <= LOCAL_PATH_CONTEXT_TOKEN_BUDGET || content_budget == 0 {
-            return bounded;
-        }
-        content_budget = content_budget.saturating_sub(
-            bounded_tokens
-                .saturating_sub(LOCAL_PATH_CONTEXT_TOKEN_BUDGET)
-                .max(1),
-        );
+    if envelope_tokens.saturating_add(content_tokens) <= token_budget.saturating_add(retry_margin) {
+        return format!("{prefix}{content}{suffix}");
     }
+
+    let omission = format!(
+        "\n<local_path_context_omission original_content_tokens={content_tokens} \
+         recovery=\"read the original local path above; do not infer missing content\" />"
+    );
+    let metadata_tokens = envelope_tokens + approx_token_count(&omission);
+    if metadata_tokens > token_budget {
+        return LOCAL_PATH_CONTEXT_METADATA_OMISSION.to_string();
+    }
+    // These pieces are separated by whitespace, so the sum of their estimates
+    // bounds the joined estimate. The truncator already includes its own marker.
+    let bounded_content =
+        truncate_middle_with_token_budget(content, token_budget - metadata_tokens).0;
+    format!("{prefix}{bounded_content}{omission}{suffix}")
 }
 
 impl ResponseInputItem {
@@ -1850,6 +1854,22 @@ impl ResponseInputItem {
         local_image_preparation: LocalImagePreparation,
     ) -> Self {
         let mut image_index = 0;
+        let mut remaining_paths = items
+            .iter()
+            .filter(|item| matches!(item, UserInput::LocalPath { .. }))
+            .count();
+        let mut remaining_path_tokens = LOCAL_PATH_CONTEXT_TOKEN_BUDGET;
+        // Preserve the existing marginal-overage behavior for one selected path;
+        // multiple paths must not multiply that allowance.
+        let retry_margin = if remaining_paths == 1 {
+            LOCAL_PATH_CONTEXT_RETRY_AVOIDANCE_TOKEN_MARGIN
+        } else {
+            0
+        };
+        let omit_path_group = remaining_paths
+            > LOCAL_PATH_CONTEXT_TOKEN_BUDGET
+                / approx_token_count(LOCAL_PATH_CONTEXT_METADATA_OMISSION);
+        let mut path_group_omission_emitted = false;
         Self::Message {
             role: "user".to_string(),
             content: items
@@ -1890,9 +1910,25 @@ impl ResponseInputItem {
                         }
                     }
                     UserInput::LocalPath { path, content } => {
-                        vec![ContentItem::InputText {
-                            text: render_local_path_context(&path, &content),
-                        }]
+                        if omit_path_group {
+                            if path_group_omission_emitted {
+                                return Vec::new();
+                            }
+                            path_group_omission_emitted = true;
+                            return vec![ContentItem::InputText {
+                                text: LOCAL_PATH_CONTEXT_METADATA_OMISSION.to_string(),
+                            }];
+                        }
+                        let text = render_local_path_context(
+                            &path,
+                            &content,
+                            remaining_path_tokens / remaining_paths,
+                            retry_margin,
+                        );
+                        remaining_paths -= 1;
+                        remaining_path_tokens =
+                            remaining_path_tokens.saturating_sub(approx_token_count(&text));
+                        vec![ContentItem::InputText { text }]
                     }
                     UserInput::Skill { .. } | UserInput::Mention { .. } => Vec::new(), // Tool bodies are injected later in core
                 })
@@ -2435,6 +2471,103 @@ mod tests {
         assert!(text.contains("original_content_tokens="));
         assert!(text.contains("recovery=\"read the original local path"));
         assert!(text.contains("do not infer missing content"));
+        assert_eq!(text.matches("large-context.txt").count(), 1);
+    }
+
+    #[test]
+    fn local_path_context_shares_budget_across_selected_paths() {
+        let paths = (0..16).map(|index| UserInput::LocalPath {
+            path: format!("file-{index}.txt").into(),
+            content: format!("BEGIN_{index}\n{}\nEND_{index}", "{}[](),".repeat(20_000)),
+        });
+        let item = ResponseInputItem::from(
+            std::iter::once(UserInput::Text {
+                text: "Inspect these files".to_string(),
+                text_elements: Vec::new(),
+            })
+            .chain(paths)
+            .collect::<Vec<_>>(),
+        );
+        let ResponseInputItem::Message { content, .. } = item else {
+            panic!("expected user message");
+        };
+        assert_eq!(content.len(), 17);
+        assert_eq!(
+            content[0],
+            ContentItem::InputText {
+                text: "Inspect these files".to_string(),
+            }
+        );
+        let mut tokens = 0;
+        for (index, item) in content[1..].iter().enumerate() {
+            let ContentItem::InputText { text } = item else {
+                panic!("expected local path text");
+            };
+            tokens += approx_token_count(text);
+            assert!(text.starts_with(&format!("<local_path_context path=\"file-{index}.txt\">")));
+            assert!(text.contains(&format!("BEGIN_{index}")));
+            assert!(text.contains(&format!("END_{index}")));
+            assert!(text.contains("local_path_context_omission"));
+            assert!(text.ends_with("</local_path_context>"));
+        }
+        assert!(tokens <= LOCAL_PATH_CONTEXT_TOKEN_BUDGET, "{tokens}");
+    }
+
+    #[test]
+    fn local_path_context_preserves_native_paths_and_escapes_attributes() {
+        for (path, escaped) in [
+            (
+                r"C:\Users\name\文档\file.txt",
+                r"C:\Users\name\文档\file.txt",
+            ),
+            ("a\"&<>\n\r\t.txt", "a&quot;&amp;&lt;&gt;&#10;&#13;&#9;.txt"),
+        ] {
+            let item = ResponseInputItem::from(vec![UserInput::LocalPath {
+                path: path.into(),
+                content: "full content".to_string(),
+            }]);
+            let ResponseInputItem::Message { content, .. } = item else {
+                panic!("expected user message");
+            };
+            assert_eq!(
+                content,
+                vec![ContentItem::InputText {
+                    text: format!(
+                        "<local_path_context path=\"{escaped}\">\nfull content\n</local_path_context>"
+                    ),
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn local_path_context_bounds_oversized_metadata_and_path_counts() {
+        for paths in [
+            vec![UserInput::LocalPath {
+                path: "x".repeat(100_000).into(),
+                content: "hidden content".to_string(),
+            }],
+            (0..10_000)
+                .map(|index| UserInput::LocalPath {
+                    path: format!("file-{index}.txt").into(),
+                    content: "hidden content".to_string(),
+                })
+                .collect(),
+        ] {
+            let ResponseInputItem::Message { content, .. } = ResponseInputItem::from(paths) else {
+                panic!("expected user message");
+            };
+            assert_eq!(
+                content,
+                vec![ContentItem::InputText {
+                    text: LOCAL_PATH_CONTEXT_METADATA_OMISSION.to_string(),
+                }]
+            );
+            assert!(
+                approx_token_count(LOCAL_PATH_CONTEXT_METADATA_OMISSION)
+                    <= LOCAL_PATH_CONTEXT_TOKEN_BUDGET
+            );
+        }
     }
 
     #[test]
@@ -2450,7 +2583,12 @@ mod tests {
                     + LOCAL_PATH_CONTEXT_RETRY_AVOIDANCE_TOKEN_MARGIN
         );
 
-        assert_eq!(render_local_path_context(&path, &content), exact);
+        let ResponseInputItem::Message { content: items, .. } =
+            ResponseInputItem::from(vec![UserInput::LocalPath { path, content }])
+        else {
+            panic!("expected user message");
+        };
+        assert_eq!(items, vec![ContentItem::InputText { text: exact }]);
     }
 
     #[test]

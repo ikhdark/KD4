@@ -100,6 +100,9 @@ pub fn file_name_from_path(path: &str) -> String {
 pub struct FileSearchResults {
     pub matches: Vec<FileMatch>,
     pub total_match_count: usize,
+    pub scanned_file_count: usize,
+    /// False if walk limits, cancellation, or traversal errors left paths unsearched.
+    pub walk_complete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
@@ -108,6 +111,7 @@ pub struct FileSearchSnapshot {
     pub matches: Vec<FileMatch>,
     pub total_match_count: usize,
     pub scanned_file_count: usize,
+    /// True only after the walker finishes without omitting paths due to limits or errors.
     pub walk_complete: bool,
 }
 
@@ -258,6 +262,8 @@ pub fn run(
     Ok(FileSearchResults {
         matches: snapshot.matches,
         total_match_count: snapshot.total_match_count,
+        scanned_file_count: snapshot.scanned_file_count,
+        walk_complete: snapshot.walk_complete,
     })
 }
 
@@ -310,10 +316,15 @@ struct SessionInner {
     latest_query: LatestQuery,
 }
 
+struct IndexedPath {
+    full_path: Arc<str>,
+    match_type: MatchType,
+}
+
 enum WorkSignal {
     QueryUpdated,
     NucleoNotify,
-    WalkComplete,
+    WalkComplete { complete: bool },
     Shutdown,
 }
 
@@ -419,14 +430,18 @@ fn get_file_path<'a>(path: &'a Path, search_directories: &[PathBuf]) -> Option<(
 fn walker_worker(
     inner: Arc<SessionInner>,
     override_matcher: Option<ignore::overrides::Override>,
-    injector: Injector<Arc<str>>,
+    injector: Injector<IndexedPath>,
 ) {
     if inner.cancelled.load(Ordering::Relaxed) || inner.shutdown.load(Ordering::Relaxed) {
-        let _ = inner.work_tx.send(WorkSignal::WalkComplete);
+        let _ = inner
+            .work_tx
+            .send(WorkSignal::WalkComplete { complete: false });
         return;
     }
     let Some(first_root) = inner.search_directories.first() else {
-        let _ = inner.work_tx.send(WorkSignal::WalkComplete);
+        let _ = inner
+            .work_tx
+            .send(WorkSignal::WalkComplete { complete: true });
         return;
     };
 
@@ -439,26 +454,21 @@ fn walker_worker(
         .iter()
         .filter_map(|root| fs::canonicalize(root).ok())
         .collect::<Vec<_>>();
-    let root_directory_count = inner
-        .search_directories
-        .iter()
-        .filter(|root| fs::metadata(root).is_ok_and(|metadata| metadata.is_dir()))
-        .count();
     let entries_seen = Arc::new(AtomicUsize::new(0));
-    let directories_seen = Arc::new(AtomicUsize::new(
-        root_directory_count.min(inner.walk_limits.max_directories),
-    ));
-    let walk_limit_hit = Arc::new(AtomicBool::new(
-        root_directory_count > inner.walk_limits.max_directories,
-    ));
+    let directories_seen = Arc::new(AtomicUsize::new(0));
+    let walk_limit_hit = Arc::new(AtomicBool::new(false));
     let filter_entries_seen = Arc::clone(&entries_seen);
     let filter_directories_seen = Arc::clone(&directories_seen);
     let filter_walk_limit_hit = Arc::clone(&walk_limit_hit);
+    let walk_complete = Arc::new(AtomicBool::new(true));
+    let filter_walk_complete = Arc::clone(&walk_complete);
     let walk_limits = inner.walk_limits;
     let filter_inner = Arc::clone(&inner);
     walk_builder
         // Allow hidden entries.
         .hidden(false)
+        // Keep directory iteration streaming: sorting collects the entire
+        // directory before either our work budget or cancellation can run.
         // Follow links only when their canonical targets remain in a search root.
         .follow_links(true)
         // Keep ignore behavior aligned with git repositories: only apply
@@ -469,7 +479,8 @@ fn walker_worker(
             if filter_inner.cancelled.load(Ordering::Relaxed)
                 || filter_inner.shutdown.load(Ordering::Relaxed)
             {
-                return false;
+                // Yield one entry so the outer loop can stop the walker.
+                return true;
             }
             let is_directory = entry
                 .file_type()
@@ -478,6 +489,7 @@ fn walker_worker(
                 .max_depth
                 .saturating_add(usize::from(!is_directory));
             if entry.depth() > max_entry_depth {
+                filter_walk_complete.store(false, Ordering::Relaxed);
                 return false;
             }
             if entry.depth() > 0
@@ -522,23 +534,49 @@ fn walker_worker(
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => {
+                walk_complete.store(false, Ordering::Relaxed);
                 if !reserve_walk_slot(&entries_seen, walk_limits.max_entries) {
                     break;
                 }
                 continue;
             }
         };
+        // The ignore walker does not call filter_entry for roots. Admit each
+        // root as it is visited so excess roots retain earlier partial results.
+        if entry.depth() == 0
+            && entry.file_type().is_some_and(|kind| kind.is_dir())
+            && !reserve_walk_slot(&directories_seen, walk_limits.max_directories)
+        {
+            walk_limit_hit.store(true, Ordering::Relaxed);
+            break;
+        }
         let path = entry.path();
         let Some(full_path) = path.to_str() else {
             continue;
         };
         if let Some((_, relative_path)) = get_file_path(path, &inner.search_directories) {
-            injector.push(Arc::from(full_path), |_, cols| {
-                cols[0] = Utf32String::from(relative_path);
-            });
+            let match_type = if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                MatchType::Directory
+            } else {
+                MatchType::File
+            };
+            injector.push(
+                IndexedPath {
+                    full_path: Arc::from(full_path),
+                    match_type,
+                },
+                |_, cols| {
+                    cols[0] = Utf32String::from(relative_path);
+                },
+            );
         }
     }
-    let _ = inner.work_tx.send(WorkSignal::WalkComplete);
+    let _ = inner.work_tx.send(WorkSignal::WalkComplete {
+        complete: walk_complete.load(Ordering::Relaxed)
+            && !walk_limit_hit.load(Ordering::Relaxed)
+            && !inner.cancelled.load(Ordering::Relaxed)
+            && !inner.shutdown.load(Ordering::Relaxed),
+    });
 }
 
 fn reserve_walk_slot(counter: &AtomicUsize, limit: usize) -> bool {
@@ -553,7 +591,7 @@ fn matcher_worker(
     inner: Arc<SessionInner>,
     work_rx: Receiver<WorkSignal>,
     nucleo_notify_queued: Arc<AtomicBool>,
-    mut nucleo: Nucleo<Arc<str>>,
+    mut nucleo: Nucleo<IndexedPath>,
 ) -> anyhow::Result<()> {
     const TICK_TIMEOUT_MS: u64 = 10;
     let config = Config::DEFAULT.match_paths();
@@ -566,6 +604,7 @@ fn matcher_worker(
     let mut next_notify = never();
     let mut will_notify = false;
     let mut walk_complete = false;
+    let mut walk_finished = false;
 
     loop {
         if cancel_requested() || shutdown_requested() {
@@ -599,8 +638,9 @@ fn matcher_worker(
                             next_notify = after(Duration::from_millis(TICK_TIMEOUT_MS));
                         }
                     }
-                    WorkSignal::WalkComplete => {
-                        walk_complete = true;
+                    WorkSignal::WalkComplete { complete } => {
+                        walk_finished = true;
+                        walk_complete = complete;
                         metadata_changed = true;
                         if !will_notify {
                             will_notify = true;
@@ -631,7 +671,7 @@ fn matcher_worker(
                         .take(limit)
                         .filter_map(|match_| {
                             let item = snapshot.get_item(match_.idx)?;
-                            let full_path = item.data.as_ref();
+                            let full_path = item.data.full_path.as_ref();
                             let (root_idx, relative_path) = get_file_path(Path::new(full_path), &inner.search_directories)?;
                             let indices = if let Some(indices_matcher) = indices_matcher.as_mut() {
                                 let mut idx_vec = Vec::<u32>::new();
@@ -643,15 +683,10 @@ fn matcher_worker(
                             } else {
                                 None
                             };
-                            let match_type = if Path::new(full_path).is_dir() {
-                                MatchType::Directory
-                            } else {
-                                MatchType::File
-                            };
                             Some(FileMatch {
                                 score: match_.score,
                                 path: PathBuf::from(relative_path),
-                                match_type,
+                                match_type: item.data.match_type,
                                 root: inner.search_directories[root_idx].clone(),
                                 indices,
                             })
@@ -668,7 +703,7 @@ fn matcher_worker(
                     inner.reporter.on_update(&snapshot);
                     metadata_changed = false;
                 }
-                if !status.running && walk_complete {
+                if !status.running && walk_finished {
                     inner.reporter.on_complete(query);
                 }
             }
@@ -982,6 +1017,7 @@ mod tests {
                 .iter()
                 .any(|m| m.path == Path::new("root-needle.txt"))
         );
+        assert!(!depth_snapshot.walk_complete);
 
         let directory_snapshot = run_with_walk_limits(
             "needle",
@@ -998,6 +1034,7 @@ mod tests {
                 .iter()
                 .all(|file_match| !file_match.path.starts_with("nested"))
         );
+        assert!(!directory_snapshot.walk_complete);
         let allowed_root = tempfile::tempdir().unwrap();
         fs::write(allowed_root.path().join("allowed-needle.txt"), "allowed").unwrap();
         let allowed_snapshot = run_with_walk_limits(
@@ -1010,14 +1047,15 @@ mod tests {
             },
         );
         assert_eq!(allowed_snapshot.matches.len(), 1);
+        assert!(allowed_snapshot.walk_complete);
         assert_eq!(
             allowed_snapshot.matches[0].path,
             Path::new("allowed-needle.txt")
         );
 
         let entry_root = tempfile::tempdir().unwrap();
-        fs::write(entry_root.path().join("a-needle.txt"), "a").unwrap();
         fs::write(entry_root.path().join("b-needle.txt"), "b").unwrap();
+        fs::write(entry_root.path().join("a-needle.txt"), "a").unwrap();
         let entry_snapshot = run_with_walk_limits(
             "needle",
             vec![entry_root.path().to_path_buf()],
@@ -1028,6 +1066,84 @@ mod tests {
             },
         );
         assert_eq!(entry_snapshot.matches.len(), 1);
+        assert!(
+            [Path::new("a-needle.txt"), Path::new("b-needle.txt")]
+                .contains(&entry_snapshot.matches[0].path.as_path())
+        );
+        assert!(!entry_snapshot.walk_complete);
+    }
+
+    #[test]
+    fn fuzzy_walk_large_flat_directory_stops_at_entry_budget() {
+        let root = create_temp_tree(10_000);
+        fs::write(root.path().join("File-99999.txt"), "sort sentinel").unwrap();
+        let native_entries = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| PathBuf::from(entry.unwrap().file_name()))
+            .collect::<Vec<_>>();
+        let mut expected = native_entries.iter().take(8).cloned().collect::<Vec<_>>();
+        expected.sort();
+        let mut sorted_entries = native_entries;
+        sorted_entries.sort();
+        assert_ne!(
+            expected,
+            sorted_entries[..8],
+            "the fixture must distinguish native traversal from eager filename sorting"
+        );
+        let snapshot = run_with_walk_limits(
+            "file-",
+            vec![root.path().to_path_buf()],
+            FileSearchWalkLimits {
+                max_depth: 0,
+                max_directories: 1,
+                max_entries: 8,
+            },
+        );
+        assert_eq!(snapshot.total_match_count, 8);
+        assert_eq!(snapshot.matches.len(), 8);
+        assert!(!snapshot.walk_complete);
+        let mut actual = snapshot
+            .matches
+            .into_iter()
+            .map(|found| found.path)
+            .collect::<Vec<_>>();
+        actual.sort();
+        assert_eq!(
+            actual, expected,
+            "the budget ends native streaming traversal"
+        );
+    }
+
+    #[test]
+    fn fuzzy_walk_preserves_results_before_exceeding_root_directory_budget() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        fs::write(first.path().join("first-needle.txt"), "first").unwrap();
+        fs::write(second.path().join("second-needle.txt"), "second").unwrap();
+
+        for max_directories in 0..=2 {
+            let snapshot = run_with_walk_limits(
+                "needle",
+                vec![first.path().to_path_buf(), second.path().to_path_buf()],
+                FileSearchWalkLimits {
+                    max_directories,
+                    ..FILE_SEARCH_WALK_LIMITS
+                },
+            );
+            let mut paths = snapshot
+                .matches
+                .iter()
+                .map(|file_match| file_match.path.clone())
+                .collect::<Vec<_>>();
+            paths.sort();
+            let expected = ["first-needle.txt", "second-needle.txt"]
+                .into_iter()
+                .take(max_directories)
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            assert_eq!(paths, expected, "directory budget {max_directories}");
+            assert_eq!(snapshot.walk_complete, max_directories == 2);
+        }
     }
 
     #[test]
@@ -1122,9 +1238,15 @@ mod tests {
         let worker = thread::spawn(move || matcher_worker(matcher_inner, work_rx, queued, nucleo));
         let session = FileSearchSession { inner };
         let path = dir.path().join("file-0000.txt");
-        injector.push(Arc::from(path.to_str().unwrap()), |_, cols| {
-            cols[0] = Utf32String::from("file-0000.txt");
-        });
+        injector.push(
+            IndexedPath {
+                full_path: Arc::from(path.to_str().unwrap()),
+                match_type: MatchType::File,
+            },
+            |_, cols| {
+                cols[0] = Utf32String::from("file-0000.txt");
+            },
+        );
         session.update_query("file-0");
         assert!(reporter.wait_for_updates_at_least(1, Duration::from_secs(5)));
         let snapshot = reporter.snapshot();
@@ -1132,7 +1254,9 @@ mod tests {
         assert_eq!(snapshot.query, "file-0");
         assert_eq!(snapshot.matches.len(), 1);
         assert_eq!(snapshot.matches[0].path, Path::new("file-0000.txt"));
-        work_tx.send(WorkSignal::WalkComplete).unwrap();
+        work_tx
+            .send(WorkSignal::WalkComplete { complete: true })
+            .unwrap();
         let completed = reporter.wait_for_complete(Duration::from_secs(5));
         assert!(completed);
         assert!(reporter.snapshot().walk_complete);
@@ -1296,21 +1420,69 @@ mod tests {
             respect_gitignore: true,
         };
         let results = run(
-            "file-000",
+            "file-",
             vec![dir.path().to_path_buf()],
             options,
             /*cancel_flag*/ None,
         )
         .expect("run ok");
 
-        assert!(!results.matches.is_empty());
-        assert!(results.total_match_count >= results.matches.len());
+        assert_eq!(results.matches.len(), 20);
+        assert_eq!(results.total_match_count, 40);
+        // The index includes the root directory as well as its 40 files.
+        assert_eq!(results.scanned_file_count, 41);
+        assert!(results.walk_complete);
         assert!(
             results
                 .matches
                 .iter()
-                .any(|m| m.path.to_string_lossy().contains("file-0000.txt"))
+                .all(|m| m.match_type == MatchType::File && dir.path().join(&m.path).is_file())
         );
+    }
+
+    #[test]
+    fn session_reuses_indexed_file_types_after_query_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory = dir.path().join("needle-directory");
+        let file = dir.path().join("needle-file.txt");
+        fs::create_dir(&directory).unwrap();
+        fs::write(&file, "contents").unwrap();
+        let reporter = Arc::new(RecordingReporter::default());
+        let session = create_session(
+            vec![dir.path().to_path_buf()],
+            FileSearchOptions::default(),
+            reporter.clone(),
+            None,
+        )
+        .unwrap();
+        session.update_query("needle");
+        assert!(reporter.wait_for_complete(Duration::from_secs(5)));
+        let expected = [
+            (PathBuf::from("needle-directory"), MatchType::Directory),
+            (PathBuf::from("needle-file.txt"), MatchType::File),
+        ];
+        let indexed_types = |snapshot: FileSearchSnapshot| {
+            let mut types: Vec<_> = snapshot
+                .matches
+                .into_iter()
+                .map(|entry| (entry.path, entry.match_type))
+                .collect();
+            types.sort_by(|a, b| a.0.cmp(&b.0));
+            types
+        };
+        assert_eq!(indexed_types(reporter.snapshot()), expected);
+
+        // Query changes reuse the same walk snapshot, including its metadata.
+        // Swapping the live types exposes accidental per-result filesystem reads.
+        fs::remove_dir(&directory).unwrap();
+        fs::write(&directory, "now a file").unwrap();
+        fs::remove_file(&file).unwrap();
+        fs::create_dir(&file).unwrap();
+        reporter.clear();
+        session.update_query("needle-");
+        assert!(reporter.wait_for_complete(Duration::from_secs(5)));
+        assert_eq!(reporter.snapshot().query, "needle-");
+        assert_eq!(indexed_types(reporter.snapshot()), expected);
     }
 
     #[test]

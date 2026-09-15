@@ -96,6 +96,24 @@ async fn thread_start_reports_selected_environment_metadata() -> Result<()> {
         )
     );
 
+    let _response_mock = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("resp-seed"),
+            responses::ev_assistant_message("msg-seed", "done"),
+            responses::ev_completed("resp-seed"),
+        ]),
+    )
+    .await;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        app_server.start_turn_and_wait_for_completion(text_turn_params(
+            thread.id.clone(),
+            "materialize the selected environment thread",
+        )),
+    )
+    .await??;
+
     let resume_id = app_server
         .send_thread_resume_request(ThreadResumeParams {
             thread_id: thread.id.clone(),
@@ -184,7 +202,10 @@ async fn thread_start_reports_selected_environment_instruction_source() -> Resul
     .await??;
     let response: ThreadStartResponse = to_response(response)?;
 
-    assert_eq!(response.instruction_sources, vec![agents_source.into()]);
+    assert_eq!(
+        response.instruction_sources,
+        vec![agents_source.clone().into()]
+    );
     timeout(
         DEFAULT_READ_TIMEOUT,
         app_server.start_turn_and_wait_for_completion(text_turn_params(
@@ -200,8 +221,9 @@ async fn thread_start_reports_selected_environment_instruction_source() -> Resul
         .find(|text| text.starts_with("# AGENTS.md instructions"))
         .context("selected environment instructions should be model visible")?;
     let expected_instructions = format!(
-        "# AGENTS.md instructions for {}\n\n<INSTRUCTIONS>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n\n{AGENTS_INSTRUCTIONS}\n</INSTRUCTIONS>",
-        environment_cwd.inferred_native_path_string()
+        "# AGENTS.md instructions for {}\n\n<INSTRUCTIONS>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n\n## AGENTS.md instructions from {}\n\n{AGENTS_INSTRUCTIONS}\n</INSTRUCTIONS>",
+        environment_cwd.inferred_native_path_string(),
+        agents_source.inferred_native_path_string()
     );
     assert_eq!(instructions, &expected_instructions);
 

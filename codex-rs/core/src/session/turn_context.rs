@@ -89,6 +89,7 @@ pub(crate) struct TurnEnvironment {
     pub(crate) environment: Arc<Environment>,
     cwd: PathUri,
     pub(crate) shell: Option<shell::Shell>,
+    pub(crate) operating_system: Option<String>,
     pub(crate) shell_snapshot: ShellSnapshotTask,
     lifecycle: Option<Arc<TurnEnvironmentLifecycle>>,
 }
@@ -102,6 +103,7 @@ impl TurnEnvironment {
     ) -> Self {
         Self {
             environment_id,
+            operating_system: (!environment.is_remote()).then(|| std::env::consts::OS.to_string()),
             environment,
             cwd,
             shell,
@@ -642,7 +644,10 @@ impl TurnContext {
             .then_some(file_system_sandbox_policy)
     }
 
-    #[expect(clippy::expect_used, reason = "A failed permission projection must not publish an invented turn context")]
+    #[expect(
+        clippy::expect_used,
+        reason = "A failed permission projection must not publish an invented turn context"
+    )]
     pub(crate) async fn to_turn_context_item_async(self: &Arc<Self>) -> TurnContextItem {
         let turn = Arc::clone(self);
         tokio::task::spawn_blocking(move || turn.to_turn_context_item())
@@ -829,7 +834,7 @@ impl Session {
         let extension_data = Arc::new(codex_extension_api::ExtensionData::new(sub_id.clone()));
         extension_data.insert(skills_snapshot.clone());
         let base_instructions = Arc::new(BaseInstructions {
-            text: session_configuration.base_instructions.clone(),
+            text: model_info.base_instructions.clone(),
         });
         let effective_workspace_roots = per_turn_config.effective_workspace_roots().into();
         TurnContext {

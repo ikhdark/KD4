@@ -86,6 +86,18 @@ fn unchanged_plan_output_remains_compact() {
 #[test]
 fn update_plan_schema_is_the_simple_checklist_contract() {
     let tool = serde_json::to_value(create_update_plan_tool()).expect("serialize update_plan");
+    assert!(
+        tool["parameters"]["properties"]["plan"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("replacing the previous plan. Omitted steps are removed")
+    );
+    assert!(
+        tool["parameters"]["properties"]["explanation"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Do not mark unfinished work completed")
+    );
     let properties = tool["parameters"]["properties"]
         .as_object()
         .expect("top-level checklist properties");
@@ -303,6 +315,144 @@ async fn cancellation_before_plan_commit_does_not_emit_plan_update() {
             .await
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn registered_plan_output_restores_after_history_serialization() {
+    let (session, turn, _events) = make_session_and_context_with_rx().await;
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let router = Arc::new(ToolRouter::from_context(
+        step_context.as_ref(),
+        ToolRouterParams {
+            tool_suggest_candidates: None,
+            deferred_mcp_tools: None,
+            mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: &[],
+            exposure_identity: Default::default(),
+        },
+        &Default::default(),
+    ));
+    assert!(step_context.set_tool_router(router).is_ok());
+    let runtime = ToolCallRuntime::new(
+        Arc::clone(&session),
+        step_context,
+        Arc::new(Mutex::new(TurnDiffTracker::new())),
+    );
+    let arguments = plan_arguments("Restore the accepted checklist", StepStatus::Completed);
+    let response = runtime
+        .handle_tool_call(
+            ToolCall {
+                tool_name: ToolName::plain("update_plan"),
+                call_id: "plan-replay".to_string(),
+                payload: ToolPayload::Function {
+                    arguments: arguments.clone(),
+                },
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("registered plan update");
+    let ResponseInputItem::FunctionCallOutput { call_id, output } = response else {
+        panic!("plan response must be a function output");
+    };
+    let history = vec![
+        codex_protocol::models::ResponseItem::FunctionCall {
+            id: None,
+            name: "update_plan".to_string(),
+            namespace: None,
+            arguments,
+            call_id: call_id.clone(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        codex_protocol::models::ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id,
+            output,
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+    let serialized = serde_json::to_string(&history).expect("serialize persisted history");
+    let history = serde_json::from_str::<Vec<codex_protocol::models::ResponseItem>>(&serialized)
+        .expect("deserialize persisted history");
+    let restored = crate::plan_store::PlanStore::default();
+    assert!(restored.restore_from_history(&history).await);
+    let expected = plan_update_args("Restore the accepted checklist", StepStatus::Completed);
+    assert_eq!(restored.current_for_test().await, Some(expected.clone()));
+    assert_eq!(
+        restored.update(expected).await.effect,
+        PlanUpdateEffect::NoOp
+    );
+}
+
+#[tokio::test]
+async fn registered_plan_rejects_multiple_active_steps_without_mutation_or_event() {
+    let (session, turn, events) = make_session_and_context_with_rx().await;
+    let step_context = StepContext::for_test(turn);
+    let router = Arc::new(ToolRouter::from_context(
+        step_context.as_ref(),
+        ToolRouterParams {
+            tool_suggest_candidates: None,
+            deferred_mcp_tools: None,
+            mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: &[],
+            exposure_identity: Default::default(),
+        },
+        &Default::default(),
+    ));
+    assert!(step_context.set_tool_router(router).is_ok());
+    let runtime = ToolCallRuntime::new(
+        Arc::clone(&session),
+        step_context,
+        Arc::new(Mutex::new(TurnDiffTracker::new())),
+    );
+    let accepted = plan_update_args("Implement the fix", StepStatus::InProgress);
+    let mut rejected = accepted.clone();
+    rejected.plan.push(PlanItemArg {
+        step: "Verify the fix".to_string(),
+        status: StepStatus::InProgress,
+    });
+    for (call_id, args, expected_success) in [
+        ("accepted-plan", accepted.clone(), true),
+        ("rejected-plan", rejected, false),
+    ] {
+        let response = runtime
+            .clone()
+            .handle_tool_call(
+                ToolCall {
+                    tool_name: ToolName::plain("update_plan"),
+                    call_id: call_id.to_string(),
+                    payload: ToolPayload::Function {
+                        arguments: serde_json::to_string(&args).expect("serialize plan"),
+                    },
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("tool response");
+        let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
+            panic!("expected function output");
+        };
+        assert_eq!(output.success, Some(expected_success));
+        if !expected_success {
+            assert!(
+                output
+                    .body
+                    .to_text()
+                    .expect("error text")
+                    .contains("at most one in_progress")
+            );
+        }
+        assert_eq!(
+            session.services.plan_store.current_for_test().await,
+            Some(accepted.clone())
+        );
+        let plan_events = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|event| matches!(event.msg, EventMsg::PlanUpdate(_)))
+            .count();
+        assert_eq!(plan_events, usize::from(expected_success));
+    }
 }
 
 #[tokio::test]

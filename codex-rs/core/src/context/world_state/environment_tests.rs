@@ -272,6 +272,7 @@ fn single_environment_diff_reports_newly_known_shell() -> Result<()> {
                 cwd: PathUri::parse("file:///repo")?,
                 status: EnvironmentStatus::Available,
                 shell: None,
+                os: None,
             },
         )]
         .into_iter()
@@ -341,6 +342,7 @@ fn known_unknown_and_changed_shell_are_communicated_before_snapshot_advances() -
                     cwd: PathUri::parse("file:///repo")?,
                     status: EnvironmentStatus::Available,
                     shell: shell.map(str::to_string),
+                    os: None,
                 },
             )]
             .into_iter()
@@ -514,12 +516,70 @@ fn environment_ids_are_escaped_in_current_and_removed_entries() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn environment_text_keeps_quotes_and_escapes_markup() -> Result<()> {
+    let mut world_state = WorldState::default();
+    world_state.add_section(EnvironmentsState {
+        environments: [(
+            "local".to_string(),
+            available("file:///repo", "shell \"quoted\" 'value' <tag>&")?,
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    });
+    let snapshot = world_state.snapshot();
+    assert_eq!(
+        render_fragments(world_state.render_full()),
+        vec![user_message(
+            "<environment_context>\n  <cwd>/repo</cwd>\n  <shell>shell \"quoted\" 'value' &lt;tag&gt;&amp;</shell>\n</environment_context>"
+        )]
+    );
+    assert!(world_state.render_diff(&snapshot).is_empty());
+    Ok(())
+}
+
 fn available(cwd: &str, shell: &str) -> Result<EnvironmentState> {
     Ok(EnvironmentState {
         cwd: PathUri::parse(cwd)?,
         status: EnvironmentStatus::Available,
         shell: Some(shell.to_string()),
+        os: None,
     })
+}
+
+#[test]
+fn environment_os_survives_snapshot_and_reports_changes() -> Result<()> {
+    let mut state = EnvironmentsState {
+        environments: [("remote".into(), available("file:///repo", "bash")?)]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let previous = state.snapshot();
+    state.environments.get_mut("remote").unwrap().os = Some("linux<&".into());
+    assert_eq!(
+        render_fragment(state.render_diff(PreviousSectionState::Known(&previous))),
+        Some(user_message(
+            "<environment_context>\n  <cwd>/repo</cwd>\n  <os>linux&lt;&amp;</os>\n  <shell>bash</shell>\n</environment_context>"
+        ))
+    );
+    let saved: EnvironmentsSnapshot =
+        serde_json::from_value(serde_json::to_value(state.snapshot())?)?;
+    assert!(
+        state
+            .render_diff(PreviousSectionState::Known(&saved))
+            .is_none()
+    );
+    let legacy: EnvironmentsSnapshot = serde_json::from_value(
+        json!({"environments":{"remote":{"cwd":"/repo","status":"available","shell":"bash"}},"current_date":null,"timezone":null,"network":null,"filesystem":null,"subagents":null}),
+    )?;
+    assert!(
+        state
+            .render_diff(PreviousSectionState::Known(&legacy))
+            .is_some()
+    );
+    Ok(())
 }
 
 fn starting(cwd: &str) -> Result<EnvironmentState> {
@@ -527,6 +587,7 @@ fn starting(cwd: &str) -> Result<EnvironmentState> {
         cwd: PathUri::parse(cwd)?,
         status: EnvironmentStatus::Starting,
         shell: None,
+        os: None,
     })
 }
 

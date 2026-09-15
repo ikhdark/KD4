@@ -38,6 +38,20 @@ def repository_owned_paths() -> list[Path]:
 
 
 class BuildToolingPolicyTest(unittest.TestCase):
+    def test_advisory_ignores_match_between_audit_and_deny(self) -> None:
+        audit = load_toml(REPO_ROOT / "codex-rs" / ".cargo" / "audit.toml")
+        deny = load_toml(REPO_ROOT / "codex-rs" / "deny.toml")
+        audit_ids = audit["advisories"]["ignore"]
+        deny_ids = [
+            entry if isinstance(entry, str) else entry["id"]
+            for entry in deny["advisories"]["ignore"]
+        ]
+        self.assertCountEqual(
+            audit_ids,
+            deny_ids,
+            "cargo audit and cargo deny must use the same advisory exceptions",
+        )
+
     def test_python_launcher_bounds_only_the_capability_probe(self) -> None:
         node = shutil.which("node")
         if node is None:
@@ -173,7 +187,12 @@ console.log(JSON.stringify(results));
         self.assertEqual(calls[0]["encoded"], "--cfg\x1fexisting\x1f-Ddead_code")
 
     def run_just_recipe(
-        self, *args: str, missing: str = "", from_subdirectory: bool = False
+        self,
+        *args: str,
+        missing: str = "",
+        from_subdirectory: bool = False,
+        fail_program: str = "",
+        child_exit: int = 0,
     ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
         if os.name != "nt" or not shutil.which("just") or not shutil.which("pwsh"):
             self.skipTest("Windows, just, and pwsh are required for recipe tests")
@@ -188,7 +207,8 @@ console.log(JSON.stringify(results));
 function Record-Call($program, $arguments) {
     @{ program = $program; args = @($arguments); cwd = (Get-Location).Path } |
         ConvertTo-Json -Compress | Add-Content -LiteralPath $env:RECIPE_CALLS
-    $global:LASTEXITCODE = 0
+    $global:LASTEXITCODE = if ($program -eq $env:RECIPE_FAIL_PROGRAM) { [int]$env:RECIPE_CHILD_EXIT } else { 0 }
+    if ($global:LASTEXITCODE -ne 0) { exit $global:LASTEXITCODE }
 }
 function python { Record-Call 'python' $args }
 function cargo { Record-Call 'cargo' $args }
@@ -218,6 +238,8 @@ function Get-Command($Name) {
                 **os.environ,
                 "RECIPE_CALLS": str(calls_path),
                 "RECIPE_MISSING": missing,
+                "RECIPE_FAIL_PROGRAM": fail_program,
+                "RECIPE_CHILD_EXIT": str(child_exit),
                 "CODEX_RELEASE_CERTIFICATE_IDENTITY": "fixture-identity",
                 "CODEX_RELEASE_OIDC_ISSUER": "fixture-issuer",
             }
@@ -367,18 +389,54 @@ function Get-Command($Name) {
             responses_stream,
             r"#\[allow\(dead_code\)\]\s*struct ResponseCompleted",
         )
-        self.assertRegex(
-            responses_stream,
-            r"#\[allow\(dead_code\)\]\s*struct Error",
-        )
+        self.assertNotRegex(responses_stream, r"#\[allow\(dead_code\)\]\s*struct Error")
 
     def test_skills_build_script_requires_bundled_samples(self) -> None:
         text = (REPO_ROOT / "codex-rs" / "skills" / "build.rs").read_text(
             encoding="utf-8"
         )
 
-        self.assertIn('let samples_dir = Path::new("src/assets/samples");', text)
-        self.assertIn("if !samples_dir.exists()", text)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / (
+                "skills-build.exe" if os.name == "nt" else "skills-build"
+            )
+            compile_result = subprocess.run(
+                [
+                    "rustc",
+                    str(REPO_ROOT / "codex-rs/skills/build.rs"),
+                    "-o",
+                    str(executable),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+            self.assertEqual(compile_result.returncode, 0, compile_result.stderr)
+            missing = subprocess.run(
+                [str(executable)],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn(
+                "bundled skills directory src/assets/samples is missing", missing.stderr
+            )
+            (root / "src/assets/samples").mkdir(parents=True)
+            present = subprocess.run(
+                [str(executable)],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(present.returncode, 0, present.stderr)
+            self.assertIn("cargo:rerun-if-changed=src/assets/samples", present.stdout)
 
     def test_retired_repo_local_harness_has_no_registration(self) -> None:
         features = load_toml(REPO_ROOT / "kd4_features.toml")["features"]
@@ -473,14 +531,19 @@ function Get-Command($Name) {
             '--focus "<task description>" --max-relationships 32'
         )
 
-        self.assertIn(slice_command, normalized)
-        self.assertLess(
-            normalized.index(slice_command),
-            normalized.index("[`SOURCEMAP.md`](SOURCEMAP.md)"),
-            "the bounded owner query must be available before the broad map route",
+        self.assertIn("(SOURCEMAP.md#how-to-use-this-map)", text)
+        source_map = (REPO_ROOT / "SOURCEMAP.md").read_text(encoding="utf-8")
+        section = source_map.split("## How to use this map\n", 1)[1].split("\n## ", 1)[
+            0
+        ]
+        guidance = " ".join(section.split())
+        self.assertIn(slice_command, guidance)
+        self.assertIn("Expand truncated or omitted relationships", guidance)
+        self.assertIn("Resolve material unknowns", guidance)
+        self.assertIn(
+            "read the broad map only when a focused slice cannot resolve the boundary",
+            normalized,
         )
-        self.assertIn("Require an untruncated result", normalized)
-        self.assertIn("no omitted relationships or material unknowns", normalized)
 
     def test_agents_desktop_boundary_is_top_level_guidance(self) -> None:
         text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
@@ -488,9 +551,11 @@ function Get-Command($Name) {
         # Assert the section exists as top-level (H2) guidance and carries the
         # rebuild contract, without pinning it to a line window that breaks
         # whenever earlier sections grow.
-        self.assertIn("\n## Repository identity and runtime boundary\n", text)
-        section = text.split("\n## Repository identity and runtime boundary\n", 1)[1]
-        section = section.split("\n## ", 1)[0]
+        heading = re.search(
+            r"(?m)^## Repository identity and runtime boundary\s*$", text
+        )
+        self.assertIsNotNone(heading)
+        section = re.split(r"(?m)^## ", text[heading.end() :], maxsplit=1)[0]
         self.assertIn(
             "Source changes become Desktop-visible only after rebuilding", section
         )
@@ -1123,13 +1188,17 @@ function Get-Command($Name) {
         retired_assets = sorted(
             relative_path
             for path in repository_paths
-            if retired_asset_pattern.search(
+            if path.suffix
+            != ".rs"  # Platform library modules are not retired deployment assets.
+            and retired_asset_pattern.search(
                 relative_path := path.relative_to(REPO_ROOT).as_posix()
             )
         )
         self.assertEqual(retired_assets, [])
 
-    def test_windows_only_rust_policy_has_no_host_platform_branches(self) -> None:
+    def test_windows_distribution_keeps_library_platform_dependencies_gated(
+        self,
+    ) -> None:
         cargo = load_toml(REPO_ROOT / "codex-rs" / "Cargo.toml")
         self.assertEqual(cargo["workspace"]["dependencies"]["arboard"], "3")
 
@@ -1146,20 +1215,41 @@ function Get-Command($Name) {
             with self.subTest(schema_key=retired_key):
                 self.assertNotIn(retired_key, schema)
 
-        repository_paths = repository_owned_paths()
-        conditional_dependencies: list[str] = []
-        for manifest_path in repository_paths:
-            if (
-                manifest_path.name != "Cargo.toml"
-                or "codex-rs" not in manifest_path.relative_to(REPO_ROOT).parts
-            ):
-                continue
-            manifest = manifest_path.read_text(encoding="utf-8")
-            if "[target.'cfg(" in manifest:
-                conditional_dependencies.append(
-                    str(manifest_path.relative_to(REPO_ROOT))
+        # The product ships on Windows; libraries may retain foreign-platform
+        # implementations. Ask Cargo which dependencies each shipped target
+        # actually selects instead of banning cfg syntax across every source.
+        for target in sorted(deny["graph"]["targets"]):
+            with self.subTest(target=target):
+                result = subprocess.run(
+                    [
+                        "cargo",
+                        "metadata",
+                        "--offline",
+                        "--locked",
+                        "--format-version",
+                        "1",
+                        "--filter-platform",
+                        target,
+                    ],
+                    cwd=REPO_ROOT / "codex-rs",
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=60,
                 )
-        self.assertEqual(conditional_dependencies, [])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                metadata = json.loads(result.stdout)
+                packages = {p["id"]: p["name"] for p in metadata["packages"]}
+                dependencies = {
+                    packages[node["id"]]: {packages[d["pkg"]] for d in node["deps"]}
+                    for node in metadata["resolve"]["nodes"]
+                }
+                self.assertIn("windows-sys", dependencies["codex-http-client"])
+                self.assertNotIn(
+                    "system-configuration", dependencies["codex-http-client"]
+                )
+                self.assertIn("winapi", dependencies["codex-utils-pty"])
+                self.assertNotIn("close_fds", dependencies["codex-utils-pty"])
 
         response_proxy_launcher = (
             REPO_ROOT
@@ -1184,84 +1274,6 @@ function Get-Command($Name) {
         for retired_platform in ("macos-", "linux-", "apple-darwin", "unknown-linux"):
             with self.subTest(dotslash_platform=retired_platform):
                 self.assertNotIn(retired_platform, dotslash_manifest)
-
-        host_cfg_pattern = re.compile(
-            r"(?:#\s*\[\s*cfg(?:_attr)?|cfg!)\s*\([^)]{0,500}"
-            r"\b(?:target_family|target_os|unix|windows)\b"
-        )
-        host_cfg_branches: list[str] = []
-        unix_imports: list[str] = []
-        retired_platform_test_residue: list[str] = []
-        retired_platform_test_pattern = re.compile(
-            r"(?m)\b(?:async\s+)?fn\s+(?:linux|macos)_[A-Za-z0-9_]+\s*\(|"
-            r"\b_unix_script\b|\bconst\s+IS_(?:MACOS|WINDOWS)\s*:|"
-            r"#\[ignore\s*=\s*[\"'][^\"']*(?:linux|macos|unix|windows)[^\"']*[\"']\]"
-        )
-        source_suffixes = {".js", ".md", ".ps1", ".py", ".rs", ".toml", ".ts"}
-        policy_path = Path(__file__).resolve()
-        retired_harness_pattern = re.compile(
-            r"\b(?:DOCKER_CERT_PATH|DOCKER_HOST|DOCKER_TLS_VERIFY|WINEDEBUG|"
-            r"WINEPREFIX|WSL_DISTRO_NAME|WSLENV|CODEX_[A-Z0-9_]*(?:DOCKER|WINE|WSL)"
-            r"[A-Z0-9_]*)\b"
-        )
-        retired_harness_variables: list[str] = []
-        compatibility_parser_roots = (
-            (REPO_ROOT / "codex-rs" / "apply-patch").resolve(),
-            (REPO_ROOT / "codex-rs" / "shell-command").resolve(),
-        )
-        posix_runtime_launcher_pattern = re.compile(
-            r"(?m)^\s*#!\s*/(?:usr/bin/env\s+)?(?:ba|z|)sh\b|"
-            r"Command::new\s*\(\s*[\"'](?:bash|zsh|sh|/bin/(?:bash|zsh|sh))[\"']|"
-            r"(?:exec|execFile|spawn)\s*\(\s*[\"']"
-            r"(?:bash|zsh|sh|/bin/(?:bash|zsh|sh))[\"']|"
-            r"Start-Process\s+(?:-FilePath\s+)?[\"']?(?:bash|zsh|sh)\b|"
-            r"subprocess\.(?:Popen|call|check_call|check_output|run)\s*\(\s*"
-            r"[\[(]?\s*[\"'](?:bash|zsh|sh|/bin/(?:bash|zsh|sh))[\"']"
-        )
-        posix_runtime_launchers: list[str] = []
-        for path in repository_paths:
-            if path.suffix.lower() not in source_suffixes:
-                continue
-            source = path.read_text(encoding="utf-8")
-            relative_path = path.relative_to(REPO_ROOT).as_posix()
-            if path.suffix == ".rs":
-                if host_cfg_pattern.search(source):
-                    host_cfg_branches.append(relative_path)
-                if "std::os::unix" in source:
-                    unix_imports.append(relative_path)
-                if retired_platform_test_pattern.search(source):
-                    retired_platform_test_residue.append(relative_path)
-            resolved_path = path.resolve()
-            if resolved_path == policy_path:
-                continue
-            if retired_harness_pattern.search(source):
-                retired_harness_variables.append(relative_path)
-            if not any(
-                resolved_path == root or root in resolved_path.parents
-                for root in compatibility_parser_roots
-            ):
-                if posix_runtime_launcher_pattern.search(source):
-                    posix_runtime_launchers.append(relative_path)
-        self.assertEqual(sorted(host_cfg_branches), [])
-        self.assertEqual(sorted(unix_imports), [])
-        self.assertEqual(sorted(retired_platform_test_residue), [])
-        self.assertEqual(sorted(retired_harness_variables), [])
-        self.assertEqual(sorted(posix_runtime_launchers), [])
-
-        runtime_docs = "\n".join(
-            (REPO_ROOT / relative_path).read_text(encoding="utf-8")
-            for relative_path in (
-                "codex-rs/app-server/README.md",
-                "codex-rs/exec-server/README.md",
-            )
-        )
-        for retired_runtime_example in (
-            "/Users/",
-            "/usr/bin:/bin",
-            "file:///tmp",
-        ):
-            with self.subTest(runtime_example=retired_runtime_example):
-                self.assertNotIn(retired_runtime_example, runtime_docs)
 
     def test_ignore_rules_have_single_owners_for_generated_artifacts(self) -> None:
         root_ignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
@@ -1555,6 +1567,81 @@ function Get-Command($Name) {
 
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows native launcher")
+    def test_codex_cli_launcher_handles_native_startup_failures(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is not available")
+        target = subprocess.check_output(
+            [node, "-p", 'process.platform + "-" + process.arch'], text=True
+        ).strip()
+        with tempfile.TemporaryDirectory(prefix="codex-launcher-") as temp_dir:
+            root = Path(temp_dir)
+            launcher = root / "bin" / "codex.js"
+            launcher.parent.mkdir()
+            shutil.copy2(REPO_ROOT / "codex-cli" / "bin" / "codex.js", launcher)
+            manifest = root / "package.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "type": "module",
+                        "codexNativeTargets": {
+                            target: {
+                                "targetTriple": "fixture",
+                                "package": "@codex-test/native",
+                                "binary": "native.exe",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def run(*args: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [node, *args], input="", capture_output=True, text=True, timeout=15
+                )
+
+            native = root / "vendor" / "fixture" / "bin" / "native.exe"
+            native.parent.mkdir(parents=True)
+            for invalid_executable in [False, True]:
+                with self.subTest(invalid_executable=invalid_executable):
+                    if invalid_executable:
+                        native.write_bytes(b"not a Windows executable")
+                    result = run(str(launcher))
+                    self.assertEqual(result.returncode, 1, result)
+                    self.assertIn("Reinstall this KD4 package", result.stderr)
+                    self.assertIn(
+                        "Unable to start"
+                        if invalid_executable
+                        else "Missing optional dependency",
+                        result.stderr,
+                    )
+                    self.assertNotIn("\n    at ", result.stderr)
+
+            # Use a real native process to verify argument and exit-code forwarding.
+            shutil.copy2(node, native)
+            result = run(
+                str(launcher),
+                "-e",
+                'process.stdout.write("forwarded"); process.exitCode = 7',
+            )
+            self.assertEqual(result.returncode, 7, result)
+            self.assertEqual(result.stdout, "forwarded")
+            result = run(
+                "--input-type=module",
+                "-e",
+                f"await import({json.dumps(launcher.as_uri())})",
+            )
+            self.assertEqual(result.returncode, 0, result)
+            self.assertEqual(result.stderr, "")
+
+            manifest.write_text(json.dumps({"type": "module"}), encoding="utf-8")
+            result = run(str(launcher))
+            self.assertEqual(result.returncode, 1, result)
+            self.assertIn("Unsupported platform", result.stderr)
+            self.assertNotIn("\n    at ", result.stderr)
+
     def test_run_python_enforces_the_supported_interpreter_version(self) -> None:
         node = shutil.which("node")
         if node is None:
@@ -1633,6 +1720,56 @@ function Get-Command($Name) {
             "node scripts/run-python.js scripts/root_maintenance.py test-python --changed",
         )
         self.assertNotIn("test:scripts:target", package["scripts"])
+
+    def test_gate_for_routes_repository_paths_from_another_workdir(self) -> None:
+        just = shutil.which("just")
+        if just is None:
+            self.skipTest("just is unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(
+                [
+                    just,
+                    "--justfile",
+                    str(REPO_ROOT / "justfile"),
+                    "gate-for",
+                    "scripts/rust_test_runner.py",
+                ],
+                cwd=directory,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        routes = json.loads(result.stdout)
+        self.assertEqual(routes["status"], "declared")
+        self.assertEqual(routes["unowned_paths"], [])
+        self.assertEqual(
+            [route["owner"] for route in routes["validation"]],
+            ["rust-test-routing", "rust-test-routing"],
+        )
+        self.assertEqual(
+            [route["argv"] for route in routes["validation"]],
+            [
+                ["python", "-m", "unittest", "scripts.test_rust_test_runner"],
+                ["just", "core-test-manifest-check"],
+            ],
+        )
+
+    def test_hooks_schema_check_selects_the_fixture_comparison(self) -> None:
+        result = subprocess.run(
+            ["just", "--dry-run", "hooks-schema-check"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (result.stdout + result.stderr).strip(),
+            "cargo nextest run --profile local --no-tests=fail -p codex-hooks --lib "
+            "-E 'test(=schema::tests::generated_hook_schemas_match_fixtures)'",
+        )
 
     def test_justfile_only_exposes_canonical_developer_tooling_recipes(self) -> None:
         justfile = "\n" + (REPO_ROOT / "justfile").read_text(encoding="utf-8")
@@ -1723,7 +1860,7 @@ function Get-Command($Name) {
         self.assertIn('run-lane --lane "main"', result.stdout + result.stderr)
 
         canonical_command_sources = {
-            "codex-rs/app-server/README.md": "app-server-schema-regenerate <owner>",
+            "SOURCEMAP.md": "app-server-schema-regenerate <owner>",
             "codex-rs/app-server-protocol/tests/schema_fixtures.rs": (
                 "app-server-schema-regenerate <owner>"
             ),
@@ -2024,9 +2161,12 @@ function Get-Command($Name) {
             ),
         )
         for call, (package, tests) in zip(calls[:2], expected, strict=True):
-            self.assertEqual(call["args"][:5], ["nextest", "run", "-p", package, "-E"])
+            self.assertEqual(call["args"][:2], ["nextest", "run"])
+            self.assertEqual(call["args"][call["args"].index("--profile") + 1], "local")
+            self.assertEqual(call["args"][call["args"].index("-p") + 1], package)
             self.assertEqual(
-                set(call["args"][5].split(" | ")), {f"test({test})" for test in tests}
+                set(call["args"][call["args"].index("-E") + 1].split(" | ")),
+                {f"test({test})" for test in tests},
             )
         self.assertEqual(calls[2]["args"], ["check", "-p", "codex-app-server"])
 
@@ -2068,10 +2208,12 @@ function Get-Command($Name) {
         self.assertIn("just core-gate windows-sandbox-core-exec", sandbox_recipe)
         self.assertIn("-p codex-utils-pty", justfile)
         self.assertIn("CODEX_REQUIRE_WINDOWS_SANDBOX_PROCESS_TESTS", justfile)
-        self.assertIn("CODEX_REQUIRE_WINDOWS_SANDBOX_PROCESS_TESTS", sandbox_tests)
+        # Sandbox tests require their prerequisite unconditionally. The flag
+        # controls only PTY tests that can also run as ordinary developer tests.
+        self.assertIn("fn require_legacy_process_sandbox()", sandbox_tests)
         self.assertIn("CODEX_REQUIRE_WINDOWS_SANDBOX_PROCESS_TESTS", pty_tests)
         self.assertIn(
-            "required legacy sandbox prerequisite is",
+            "Windows sandbox process test prerequisite unavailable",
             sandbox_tests,
         )
         self.assertIn(
@@ -2145,6 +2287,107 @@ function Get-Command($Name) {
         rendered_argument = unicode_argument.encode("unicode_escape").decode("ascii")
         self.assertIn(rendered_argument, rejected.stderr)
 
+    def test_dependency_audit_prerequisite_runs_and_gates_cargo_audit(self) -> None:
+        for fail_program in ("", "python", "cargo"):
+            with self.subTest(fail_program=fail_program):
+                result, calls = self.run_just_recipe(
+                    "deps-audit",
+                    fail_program=fail_program,
+                    child_exit=7,
+                )
+                if fail_program:
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    [call["program"] for call in calls],
+                    ["python"] if fail_program == "python" else ["python", "cargo"],
+                )
+                self.assertEqual(
+                    calls[0]["args"],
+                    [
+                        "-m",
+                        "unittest",
+                        "scripts.test_build_tooling_policy.BuildToolingPolicyTest.test_advisory_ignores_match_between_audit_and_deny",
+                    ],
+                )
+                if fail_program != "python":
+                    self.assertEqual(calls[1]["args"], ["audit"])
+
+    def test_install_rejects_old_powershell_before_running_setup(self) -> None:
+        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+        body = justfile.split("\ninstall:\n", 1)[1].split("\n\n", 1)[0]
+        body = "\n".join(line[4:] for line in body.splitlines()[1:])
+        body = body.replace("{{ python }}", "python").replace(
+            "{{ justfile_directory() }}", str(REPO_ROOT)
+        )
+        prefix = r"""
+function Test-PwshVersion { $env:TEST_PWSH_VERSION }
+function Get-Command { @{ Source = 'Test-PwshVersion' } }
+function Record-Setup($program, $arguments) {
+    @{program=$program; args=@($arguments)} | ConvertTo-Json -Compress |
+        Add-Content -LiteralPath $env:TEST_SETUP_CALLS
+    $global:LASTEXITCODE = 0
+}
+function rustup { Record-Setup 'rustup' $args }
+function cargo { Record-Setup 'cargo' $args }
+function python { Record-Setup 'python' $args; 'test-toolchain' }
+"""
+        for version, accepted in (
+            ("7.4.9", False),
+            ("7.5", True),
+            ("7.5.2", True),
+            ("7.6", True),
+        ):
+            with (
+                self.subTest(version=version),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                script = Path(directory) / "setup.ps1"
+                calls = Path(directory) / "calls.jsonl"
+                script.write_text(prefix + body, encoding="utf-8")
+                result = subprocess.run(
+                    [powershell(), "-NoProfile", "-File", str(script)],
+                    env={
+                        **os.environ,
+                        "TEST_PWSH_VERSION": version,
+                        "TEST_SETUP_CALLS": str(calls),
+                    },
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=20,
+                )
+                self.assertEqual(result.returncode, 0 if accepted else 2, result.stderr)
+                observed = (
+                    [
+                        json.loads(line)
+                        for line in calls.read_text(encoding="utf-8-sig").splitlines()
+                    ]
+                    if calls.exists()
+                    else []
+                )
+                self.assertEqual(
+                    [call["program"] for call in observed],
+                    ["rustup", "python", "rustup", "cargo"] if accepted else [],
+                )
+                if accepted:
+                    self.assertEqual(observed[-1]["args"], ["fetch", "--locked"])
+                    self.assertEqual(
+                        observed[2]["args"],
+                        [
+                            "toolchain",
+                            "install",
+                            "test-toolchain",
+                            "--profile",
+                            "minimal",
+                            "--component",
+                            "rustfmt",
+                        ],
+                    )
+                else:
+                    self.assertIn("7.5 or newer is required", result.stderr)
+
     def test_release_packaging_policy_is_explicit_and_pinned(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
         cargo_manifest = (REPO_ROOT / "codex-rs" / "Cargo.toml").read_text(
@@ -2155,8 +2398,12 @@ function Get-Command($Name) {
         )
 
         self.assertIn('rust_parallelism := "8"', justfile)
-        self.assertIn('$requiredPwshVersion = [version]"7.5.2"', justfile)
-        self.assertIn("just test-release-tooling", justfile)
+        self.assertIn('$requiredPwshVersion = [version]"7.5"', justfile)
+        self.assertIn("\ntest-release-tooling:\n", justfile)
+        self.assertIn(
+            "scripts.test_build_tooling_policy scripts.test_check_blob_size scripts.test_stage_npm_packages",
+            justfile,
+        )
         self.assertIn("prepare-codex-release version:", justfile)
         self.assertIn("cosign verify-blob", justfile)
         self.assertIn('strip = "symbols"', cargo_manifest)

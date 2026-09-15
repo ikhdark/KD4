@@ -53,12 +53,10 @@ use crate::environment_selection::TurnEnvironmentSnapshot;
 
 const GIT_DEPENDENCY_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKSPACE_GENERATION_DEADLINE: Duration = Duration::from_secs(5);
-const WORKSPACE_GENERATION_MAX_PATHS: usize = 256;
 const WORKSPACE_GENERATION_MAX_DECLARED_BYTES: u64 = 64 * 1024 * 1024;
 const WORKSPACE_WATCHER_DEBOUNCE: Duration = Duration::from_millis(50);
 const SOURCE_CHANGE_JOURNAL_CAPACITY: usize = 4_096;
 const RETAINED_REPOSITORY_CAPACITY: usize = 64;
-const GENERATED_CODEX_EVAL_PATHSPEC: &str = ":(exclude).codex/evals/**";
 const PROJECT_DISCOVERY_REUSE_METRIC: &str = "codex.project_discovery_reuse";
 const ROOT_DISCOVERY_CONCURRENCY: usize = 4;
 static NEXT_WATCHER_EPOCH: AtomicU64 = AtomicU64::new(1);
@@ -305,6 +303,157 @@ async fn resolve_workspace_evidence_root(cwd: &Path) -> std::io::Result<Option<P
     .map_err(std::io::Error::other)?
 }
 
+async fn remote_workspace_evidence_capture(
+    environment: &codex_exec_server::Environment,
+    cwd: &PathUri,
+) -> WorkspaceEvidenceCapture {
+    match timeout(
+        WORKSPACE_GENERATION_DEADLINE,
+        capture_remote_workspace_evidence(environment, cwd),
+    )
+    .await
+    {
+        Ok(Some(identity)) => WorkspaceEvidenceCapture {
+            identity,
+            timed_out_git_dependencies: Vec::new(),
+        },
+        result => WorkspaceEvidenceCapture {
+            identity: Some(WorkspaceEvidenceIdentity::unavailable(None)),
+            timed_out_git_dependencies: if result.is_err() {
+                vec![
+                    WorkspaceEvidenceGitDependency::Head,
+                    WorkspaceEvidenceGitDependency::Index,
+                    WorkspaceEvidenceGitDependency::Worktree,
+                    WorkspaceEvidenceGitDependency::Untracked,
+                ]
+            } else {
+                Vec::new()
+            },
+        },
+    }
+}
+
+async fn capture_remote_workspace_evidence(
+    environment: &codex_exec_server::Environment,
+    cwd: &PathUri,
+) -> Option<Option<WorkspaceEvidenceIdentity>> {
+    let fs = environment.get_filesystem();
+    let cwd = fs.canonicalize(cwd, None).await.ok()?;
+    if !fs.get_metadata(&cwd, None).await.ok()?.is_directory {
+        return None;
+    }
+    let mut root = cwd;
+    loop {
+        match fs.get_metadata(&root.join(".git").ok()?, None).await {
+            Ok(metadata) if metadata.is_file || metadata.is_directory => break,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let Some(parent) = root.parent() else {
+                    return Some(None);
+                };
+                root = parent;
+            }
+            _ => return None,
+        }
+    }
+    let deadline = tokio::time::Instant::now() + WORKSPACE_GENERATION_DEADLINE;
+    let mut argv = vec![
+        "git".to_string(),
+        "-c".to_string(),
+        format!("core.hooksPath={DISABLED_HOOKS_PATH}"),
+        "-c".to_string(),
+        "core.fsmonitor=false".to_string(),
+    ];
+    argv.extend(
+        workspace_generation_status_args()
+            .iter()
+            .map(|arg| (*arg).to_string()),
+    );
+    let status = crate::shell_snapshot::run_remote_snapshot_process_before(
+        environment.get_exec_backend(),
+        codex_exec_server::ExecParams {
+            process_id: format!("workspace-evidence-{}", uuid::Uuid::new_v4()).into(),
+            argv,
+            cwd: root.clone(),
+            env_policy: None,
+            env: HashMap::from([("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string())]),
+            tty: false,
+            pipe_stdin: false,
+            arg0: None,
+            sandbox: None,
+            enforce_managed_network: false,
+            managed_network: None,
+        },
+        deadline,
+        "git workspace evidence",
+    )
+    .await
+    .ok()?;
+    let mut reader = WorkspaceStatusReader::new();
+    reader.push(status.as_bytes())?;
+    let (status, paths) = reader.finish()?;
+    let head_identity = workspace_head_identity(&status)?;
+    let mut manifest = format!("total_paths={}\n", paths.len()).into_bytes();
+    let mut remaining = WORKSPACE_GENERATION_MAX_DECLARED_BYTES as usize;
+    let mut deletions = Vec::new();
+    for observation in paths {
+        let path = root.join(&observation.path).ok()?;
+        let metadata = match fs.get_metadata(&path, None).await {
+            Ok(metadata) if !observation.deleted => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound && observation.deleted => {
+                manifest.extend_from_slice(observation.path.as_bytes());
+                manifest.extend_from_slice(b"\0deleted\0\n");
+                deletions.push(path);
+                continue;
+            }
+            _ => return None,
+        };
+        // The filesystem protocol cannot read symlink targets without following them.
+        // Never publish a complete identity when that evidence is unavailable.
+        if metadata.is_symlink || (!metadata.is_file && !metadata.is_directory) {
+            return None;
+        }
+        manifest.extend_from_slice(observation.path.as_bytes());
+        manifest.push(0);
+        manifest.extend_from_slice(if metadata.is_file {
+            b"file"
+        } else {
+            b"directory"
+        });
+        manifest.push(0);
+        manifest.extend_from_slice(metadata.size.to_string().as_bytes());
+        manifest.push(0);
+        if metadata.is_file {
+            let contents = fs.read_file_bounded(&path, remaining, None).await.ok()??;
+            remaining = remaining.checked_sub(contents.len())?;
+            if contents.len() as u64 != metadata.size
+                || fs.get_metadata(&path, None).await.ok()? != metadata
+            {
+                return None;
+            }
+            manifest.extend_from_slice(format!("{:x}", Sha256::digest(&contents)).as_bytes());
+        }
+        manifest.push(b'\n');
+    }
+    for path in deletions {
+        if !matches!(fs.get_metadata(&path, None).await, Err(error) if error.kind() == ErrorKind::NotFound)
+        {
+            return None;
+        }
+    }
+    let mut index = Sha256::new();
+    index.update(&status);
+    let mut worktree = Sha256::new();
+    worktree.update(&status);
+    worktree.update(&manifest);
+    Some(Some(WorkspaceEvidenceIdentity {
+        unavailable: false,
+        repository_root: Some(format!("{}:{root}", environment.approval_scope_id())),
+        head_identity,
+        index_identity: Some(format!("{:x}", index.finalize())),
+        worktree_identity: Some(format!("{:x}", worktree.finalize())),
+    }))
+}
+
 async fn within_workspace_generation_deadline<T, Capture>(
     deadline: Duration,
     capture: Capture,
@@ -324,7 +473,6 @@ fn workspace_generation_status_args() -> &'static [&'static str] {
         "--untracked-files=all",
         "--",
         ".",
-        GENERATED_CODEX_EVAL_PATHSPEC,
     ]
 }
 
@@ -376,6 +524,8 @@ struct WorkspaceStatusReader {
 }
 
 impl WorkspaceStatusReader {
+    const MAX_STATUS_BYTES: usize = 2 * 1024 * 1024;
+
     fn new() -> Self {
         Self {
             bytes: Vec::new(),
@@ -386,8 +536,7 @@ impl WorkspaceStatusReader {
     }
 
     fn push(&mut self, chunk: &[u8]) -> Option<()> {
-        const MAX_STATUS_BYTES: usize = 2 * 1024 * 1024;
-        if self.bytes.len().checked_add(chunk.len())? > MAX_STATUS_BYTES {
+        if self.bytes.len().checked_add(chunk.len())? > Self::MAX_STATUS_BYTES {
             return None;
         }
         let start = self.bytes.len();
@@ -431,9 +580,6 @@ impl WorkspaceStatusReader {
             if let Some(previous) = self.paths.insert(path.to_owned(), deleted)
                 && previous != deleted
             {
-                return None;
-            }
-            if self.paths.len() > WORKSPACE_GENERATION_MAX_PATHS {
                 return None;
             }
         }
@@ -599,7 +745,8 @@ async fn capture_workspace_metadata(
     control: WorkspaceCaptureControl,
 ) -> Option<WorkspaceGenerationMetadata> {
     tokio::task::spawn_blocking(move || {
-        if paths.len() > WORKSPACE_GENERATION_MAX_PATHS { return None; }
+        // The status byte budget bounds the path list; the content byte budget
+        // and deadline bound this scan even for large sets of small dirty files.
         let total_paths = paths.len();
         let mut manifest = format!("total_paths={total_paths}\n").into_bytes();
         let mut observed_bytes = 0_u64;
@@ -1296,6 +1443,70 @@ fn index_has_generation_after(
 }
 
 impl GitWorkspaceCache {
+    /// Capture in the selected executor, keeping foreign paths out of host discovery.
+    pub(crate) async fn workspace_evidence_for_environment(
+        &self,
+        environments: &TurnEnvironmentSnapshot,
+        host_cwd: &Path,
+        cwd: &Path,
+    ) -> WorkspaceEvidenceCapture {
+        let Some(selected) = environments
+            .primary()
+            .filter(|selected| selected.environment.is_remote())
+        else {
+            return self.workspace_evidence_identity_with_attribution(cwd).await;
+        };
+        let remote_cwd = if let Ok(relative) = cwd.strip_prefix(host_cwd) {
+            selected
+                .cwd()
+                .join(&relative.to_string_lossy().replace('\\', "/"))
+                .ok()
+        } else {
+            AbsolutePathBuf::from_absolute_path(cwd)
+                .ok()
+                .map(|path| PathUri::from_abs_path(&path))
+        };
+        match remote_cwd {
+            Some(cwd) => remote_workspace_evidence_capture(&selected.environment, &cwd).await,
+            None => WorkspaceEvidenceCapture {
+                identity: Some(WorkspaceEvidenceIdentity::unavailable(None)),
+                timed_out_git_dependencies: Vec::new(),
+            },
+        }
+    }
+
+    pub(crate) async fn workspace_evidence_for_uri(
+        &self,
+        turn: &crate::session::turn_context::TurnContext,
+        cwd: &PathUri,
+        environment_id: &str,
+    ) -> Option<WorkspaceEvidenceIdentity> {
+        match turn
+            .environments
+            .turn_environments
+            .iter()
+            .find(|selected| selected.environment_id == environment_id)
+        {
+            Some(selected) if selected.environment.is_remote() => {
+                remote_workspace_evidence_capture(&selected.environment, cwd)
+                    .await
+                    .identity
+            }
+            _ => match cwd.to_abs_path() {
+                Ok(cwd) => self.workspace_evidence_identity(cwd.as_path()).await,
+                Err(_) => Some(WorkspaceEvidenceIdentity::unavailable(None)),
+            },
+        }
+    }
+
+    pub(crate) async fn workspace_evidence_for_turn(
+        &self,
+        turn: &crate::session::turn_context::TurnContext,
+        cwd: &Path,
+    ) -> WorkspaceEvidenceCapture {
+        self.workspace_evidence_for_environment(&turn.environments, turn.config.cwd.as_path(), cwd)
+            .await
+    }
     pub(crate) fn new() -> Arc<Self> {
         if tokio::runtime::Handle::try_current().is_err() {
             warn!("Git workspace cache disabled because no Tokio runtime is available");

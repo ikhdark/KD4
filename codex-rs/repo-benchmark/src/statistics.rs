@@ -8,6 +8,8 @@ use crate::schedule::{Segment, Variant};
 
 pub const BOOTSTRAP_REPLICATES: usize = 10_000;
 pub const BOOTSTRAP_SEED: u64 = 0x4b44_345f_4142_7631;
+// An explicit reporting floor, not a claim that five clusters give high power.
+pub const MIN_INTERVAL_CLUSTERS: usize = 5;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,32 +22,32 @@ pub struct Observation {
     pub repetition: u32,
     pub warmup: bool,
     pub completed: bool,
-    pub elapsed_ms: u64,
+    pub metrics: BTreeMap<String, f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Distribution {
     pub count: usize,
-    /// Sorted by elapsed time; IDs stay attached to their measurements.
+    /// Sorted by metric value; IDs stay attached to their measurements.
     pub samples: Vec<Sample>,
-    pub median_ms: Option<f64>,
-    pub p95_ms: Option<f64>,
+    pub median: Option<f64>,
+    pub p95: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Sample {
     pub id: String,
-    pub elapsed_ms: u64,
+    pub value: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Contrast {
-    /// Candidate minus baseline, in milliseconds. Negative means less latency.
-    pub median_difference_ms: f64,
-    pub p95_difference_ms: f64,
+    /// Candidate minus baseline, in the named metric's units.
+    pub median_difference: f64,
+    pub p95_difference: f64,
     /// Candidate / baseline; unavailable when the denominator is zero.
     pub median_ratio: Option<f64>,
     pub p95_ratio: Option<f64>,
@@ -66,8 +68,8 @@ pub struct Bootstrap {
     pub seed: u64,
     pub cluster_count: usize,
     pub pair_count: usize,
-    pub median_difference_ms: Interval,
-    pub p95_difference_ms: Interval,
+    pub median_difference: Interval,
+    pub p95_difference: Interval,
     pub median_ratio: Option<Interval>,
     pub p95_ratio: Option<Interval>,
     pub ratio_unavailable_reason: Option<String>,
@@ -97,6 +99,8 @@ pub struct Exclusion {
 pub struct Comparison {
     pub segment: Segment,
     pub workload: String,
+    pub metric: String,
+    pub unit: String,
     pub kind: String,
     pub baseline: Variant,
     pub candidate: Variant,
@@ -107,10 +111,14 @@ pub struct Comparison {
     /// Uses only the pairs listed below. Intervals describe this population.
     pub paired_observed: Option<Contrast>,
     pub pairs: Vec<Pair>,
+    /// Distinct non-warmup schedule slots represented by either selected arm.
+    pub scheduled_pair_slots: usize,
+    pub excluded_pair_rate: Option<f64>,
     pub exclusions: Vec<Exclusion>,
     pub missing_variants: Vec<Variant>,
     /// These are the same original observations in another comparison table.
     pub reused_sample_ids: Vec<String>,
+    pub cluster_count: usize,
     pub bootstrap: Option<Bootstrap>,
     pub interval_unavailable_reason: Option<String>,
     pub quantile_method: String,
@@ -134,18 +142,27 @@ pub fn summarize(observations: &[Observation]) -> Vec<Comparison> {
             .iter()
             .filter(|sample| sample.segment == segment && sample.workload == workload)
             .collect();
-        for (kind, baseline, candidate) in COMPARISONS {
-            results.push(compare(
-                segment, &workload, kind, baseline, candidate, &samples,
-            ));
+        let metrics: BTreeSet<_> = samples
+            .iter()
+            .flat_map(|sample| sample.metrics.keys().map(String::as_str))
+            .chain(["elapsed_ms"])
+            .collect();
+        for metric in metrics {
+            for (kind, baseline, candidate) in COMPARISONS {
+                results.push(compare(
+                    segment, &workload, metric, kind, baseline, candidate, &samples,
+                ));
+            }
         }
     }
     results
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compare(
     segment: Segment,
     workload: &str,
+    metric: &str,
     kind: &str,
     baseline: Variant,
     candidate: Variant,
@@ -169,6 +186,10 @@ fn compare(
             Some("not_completed")
         } else if ids.get(&sample.id).copied().unwrap_or_default() > 1 {
             Some("duplicate_sample_identity")
+        } else if !sample.metrics.contains_key(metric) {
+            Some("metric_unavailable")
+        } else if !sample.metrics[metric].is_finite() || sample.metrics[metric] < 0.0 {
+            Some("invalid_metric_value")
         } else {
             None
         };
@@ -178,8 +199,8 @@ fn compare(
             eligible.push(*sample);
         }
     }
-    let baseline_distribution = distribution(&eligible, baseline);
-    let candidate_distribution = distribution(&eligible, candidate);
+    let baseline_distribution = distribution(&eligible, baseline, metric);
+    let candidate_distribution = distribution(&eligible, candidate, metric);
     let observed = distribution_contrast(&baseline_distribution, &candidate_distribution);
     let mut slots: BTreeMap<(u32, u32), Vec<&Observation>> = BTreeMap::new();
     for sample in &eligible {
@@ -209,7 +230,7 @@ fn compare(
             clusters
                 .entry(cluster)
                 .or_default()
-                .push((a[0].elapsed_ms as f64, b[0].elapsed_ms as f64));
+                .push((a[0].metrics[metric], b[0].metrics[metric]));
         } else {
             let reason = if a.len() > 1 || b.len() > 1 {
                 "ambiguous_schedule_slot"
@@ -226,19 +247,19 @@ fn compare(
     a.sort_by(f64::total_cmp);
     b.sort_by(f64::total_cmp);
     let paired_observed = contrast(&a, &b);
-    // One run cannot estimate repeat-to-repeat uncertainty. For scripted data,
-    // require more than one run cluster rather than treating within-run events
-    // as independent runs. Live repetitions, when explicitly scheduled, may be
-    // represented within a single task cluster.
-    let interval_unavailable_reason = if pairs.len() < 2 {
-        Some("insufficient_paired_repetitions".to_string())
-    } else if segment == Segment::Scripted && clusters.len() < 2 {
-        Some("insufficient_independent_run_clusters".to_string())
-    } else {
-        None
-    };
+    // Within-run observations cannot substitute for independent run clusters.
+    let interval_unavailable_reason =
+        if metric.starts_with("behavior_") || metric.starts_with("discovery_") {
+            Some("exploratory_behavior_counts".to_string())
+        } else if pairs.len() < 2 {
+            Some("insufficient_paired_repetitions".to_string())
+        } else if clusters.len() < MIN_INTERVAL_CLUSTERS {
+            Some("insufficient_independent_run_clusters".to_string())
+        } else {
+            None
+        };
     let bootstrap = if interval_unavailable_reason.is_none() {
-        Some(bootstrap(&clusters))
+        Some(bootstrap(&clusters, metric))
     } else {
         None
     };
@@ -252,9 +273,32 @@ fn compare(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    let scheduled_pair_slots = selected
+        .iter()
+        .filter(|sample| !sample.warmup)
+        .map(|sample| (sample.cluster, sample.repetition))
+        .collect::<BTreeSet<_>>()
+        .len();
+    let excluded_pair_rate = (scheduled_pair_slots > 0)
+        .then(|| (scheduled_pair_slots - pairs.len()) as f64 / scheduled_pair_slots as f64);
     Comparison {
         segment,
         workload: workload.to_string(),
+        metric: metric.to_string(),
+        unit: if metric == "cache_hit_rate" {
+            "fraction"
+        } else if metric.ends_with("_ms") {
+            "ms"
+        } else if metric.ends_with("_ns") {
+            "ns"
+        } else if metric.ends_with("_bytes") {
+            "bytes"
+        } else if metric.starts_with("tokens_") || metric.ends_with("_tokens") {
+            "tokens"
+        } else {
+            "count"
+        }
+        .into(),
         kind: kind.to_string(),
         baseline,
         candidate,
@@ -263,12 +307,15 @@ fn compare(
         observed,
         paired_observed,
         pairs,
+        scheduled_pair_slots,
+        excluded_pair_rate,
         exclusions,
         missing_variants,
         reused_sample_ids,
+        cluster_count: clusters.len(),
         bootstrap,
         interval_unavailable_reason,
-        quantile_method: "sorted[ceil((n-1)*q)]".to_string(),
+        quantile_method: "linear interpolation at (n-1)*q".to_string(),
     }
 }
 
@@ -281,35 +328,27 @@ fn exclude(sample: &Observation, scope: &str, reason: &str) -> Exclusion {
     }
 }
 
-fn distribution(samples: &[&Observation], variant: Variant) -> Distribution {
+fn distribution(samples: &[&Observation], variant: Variant, metric: &str) -> Distribution {
     let mut samples: Vec<_> = samples
         .iter()
         .filter(|sample| sample.variant == variant)
         .map(|sample| Sample {
             id: sample.id.clone(),
-            elapsed_ms: sample.elapsed_ms,
+            value: sample.metrics[metric],
         })
         .collect();
-    samples.sort_by(|a, b| a.elapsed_ms.cmp(&b.elapsed_ms).then(a.id.cmp(&b.id)));
-    let values: Vec<_> = samples
-        .iter()
-        .map(|sample| sample.elapsed_ms as f64)
-        .collect();
+    samples.sort_by(|a, b| a.value.total_cmp(&b.value).then(a.id.cmp(&b.id)));
+    let values: Vec<_> = samples.iter().map(|sample| sample.value).collect();
     Distribution {
         count: samples.len(),
-        median_ms: percentile(&values, 0.5),
-        p95_ms: percentile(&values, 0.95),
+        median: percentile(&values, 0.5),
+        p95: percentile(&values, 0.95),
         samples,
     }
 }
 
 fn distribution_contrast(a: &Distribution, b: &Distribution) -> Option<Contrast> {
-    Some(contrast_values(
-        a.median_ms?,
-        a.p95_ms?,
-        b.median_ms?,
-        b.p95_ms?,
-    ))
+    Some(contrast_values(a.median?, a.p95?, b.median?, b.p95?))
 }
 
 fn contrast(a: &[f64], b: &[f64]) -> Option<Contrast> {
@@ -323,28 +362,35 @@ fn contrast(a: &[f64], b: &[f64]) -> Option<Contrast> {
 
 fn contrast_values(a_median: f64, a_p95: f64, b_median: f64, b_p95: f64) -> Contrast {
     Contrast {
-        median_difference_ms: b_median - a_median,
-        p95_difference_ms: b_p95 - a_p95,
+        median_difference: b_median - a_median,
+        p95_difference: b_p95 - a_p95,
         median_ratio: (a_median > 0.0).then(|| b_median / a_median),
         p95_ratio: (a_p95 > 0.0).then(|| b_p95 / a_p95),
     }
 }
 
-/// Preserve the previous runner's upper-order quantile convention.
+/// Match the canonical Python analyzer, including even-sized medians.
 fn percentile(sorted: &[f64], q: f64) -> Option<f64> {
-    (!sorted.is_empty()).then(|| sorted[((sorted.len() - 1) as f64 * q).ceil() as usize])
+    if sorted.is_empty() {
+        return None;
+    }
+    let position = (sorted.len() - 1) as f64 * q;
+    let lower = position.floor() as usize;
+    let upper = position.ceil() as usize;
+    let weight = position - lower as f64;
+    Some(sorted[lower] * (1.0 - weight) + sorted[upper] * weight)
 }
 
 fn interval(mut values: Vec<f64>) -> Interval {
     values.sort_by(f64::total_cmp);
     Interval {
-        lower: values[((values.len() - 1) as f64 * 0.025).ceil() as usize],
-        upper: values[((values.len() - 1) as f64 * 0.975).ceil() as usize],
+        lower: percentile(&values, 0.025).expect("bootstrap samples"),
+        upper: percentile(&values, 0.975).expect("bootstrap samples"),
     }
 }
 
-fn bootstrap(clusters: &[Vec<(f64, f64)>]) -> Bootstrap {
-    let seed = b"elapsed_ms".iter().fold(BOOTSTRAP_SEED, |seed, byte| {
+fn bootstrap(clusters: &[Vec<(f64, f64)>], metric: &str) -> Bootstrap {
+    let seed = metric.as_bytes().iter().fold(BOOTSTRAP_SEED, |seed, byte| {
         seed.rotate_left(5) ^ u64::from(*byte)
     });
     let mut rng = StdRng::seed_from_u64(seed);
@@ -368,8 +414,8 @@ fn bootstrap(clusters: &[Vec<(f64, f64)>]) -> Bootstrap {
         a.sort_by(f64::total_cmp);
         b.sort_by(f64::total_cmp);
         if let Some(estimate) = contrast(&a, &b) {
-            median_differences.push(estimate.median_difference_ms);
-            p95_differences.push(estimate.p95_difference_ms);
+            median_differences.push(estimate.median_difference);
+            p95_differences.push(estimate.p95_difference);
             if let Some(ratio) = estimate.median_ratio {
                 median_ratios.push(ratio);
             }
@@ -386,8 +432,8 @@ fn bootstrap(clusters: &[Vec<(f64, f64)>]) -> Bootstrap {
         seed,
         cluster_count: clusters.len(),
         pair_count: clusters.iter().map(Vec::len).sum(),
-        median_difference_ms: interval(median_differences),
-        p95_difference_ms: interval(p95_differences),
+        median_difference: interval(median_differences),
+        p95_difference: interval(p95_differences),
         median_ratio: if median_ratios.len() == BOOTSTRAP_REPLICATES {
             Some(interval(median_ratios))
         } else {
@@ -417,8 +463,43 @@ mod tests {
             repetition,
             warmup: false,
             completed: true,
-            elapsed_ms,
+            metrics: BTreeMap::from([("elapsed_ms".into(), elapsed_ms as f64)]),
         }
+    }
+
+    #[test]
+    fn comparison_quantiles_match_python_linear_interpolation_and_report_pair_coverage() {
+        let mut observations: Vec<_> = [10, 20, 30, 40]
+            .into_iter()
+            .enumerate()
+            .flat_map(|(cluster, value)| {
+                [
+                    sample(Variant::Reference, cluster as u32, 0, value),
+                    sample(Variant::ForkOn, cluster as u32, 0, value + 20),
+                ]
+            })
+            .collect();
+        let results = summarize(&observations);
+        let comparison = &results[2];
+        assert_eq!(
+            comparison.quantile_method,
+            "linear interpolation at (n-1)*q"
+        );
+        assert_eq!(comparison.baseline_distribution.median, Some(25.0));
+        assert_eq!(comparison.baseline_distribution.p95, Some(38.5));
+        assert_eq!(
+            comparison.observed.as_ref().unwrap().median_difference,
+            20.0
+        );
+        assert_eq!(comparison.scheduled_pair_slots, 4);
+        assert_eq!(comparison.excluded_pair_rate, Some(0.0));
+        observations[1].completed = false;
+        let results = summarize(&observations);
+        assert_eq!(results[2].pairs.len(), 3);
+        assert_eq!(results[2].scheduled_pair_slots, 4);
+        assert_eq!(results[2].excluded_pair_rate, Some(0.25));
+        assert_eq!(results[2].baseline_distribution.count, 4);
+        assert_eq!(results[2].candidate_distribution.count, 3);
     }
 
     #[test]
@@ -431,7 +512,7 @@ mod tests {
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].kind, "drift");
         assert_eq!(
-            results[0].observed.as_ref().unwrap().median_difference_ms,
+            results[0].observed.as_ref().unwrap().median_difference,
             -20.0
         );
         assert_eq!(
@@ -452,6 +533,45 @@ mod tests {
     }
 
     #[test]
+    fn reported_quantiles_handle_singleton_equal_and_outlier_samples() {
+        for (name, elapsed, median, p95) in [
+            ("singleton", vec![7], 7.0, 7.0),
+            ("all equal", vec![7, 7, 7], 7.0, 7.0),
+            // With eleven samples, p95 lies halfway between the last two.
+            (
+                "outlier",
+                vec![1001, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+                1.0,
+                501.0,
+            ),
+        ] {
+            let observations: Vec<_> = elapsed
+                .into_iter()
+                .enumerate()
+                .flat_map(|(repetition, elapsed)| {
+                    [
+                        sample(Variant::Reference, 0, repetition as u32, elapsed),
+                        sample(Variant::ForkOn, 0, repetition as u32, elapsed * 2),
+                    ]
+                })
+                .collect();
+            let results = summarize(&observations);
+            let result = &results[2];
+            assert_eq!(result.baseline_distribution.median, Some(median), "{name}");
+            assert_eq!(result.baseline_distribution.p95, Some(p95), "{name}");
+            assert_eq!(
+                result.candidate_distribution.median,
+                Some(median * 2.0),
+                "{name}"
+            );
+            assert_eq!(result.candidate_distribution.p95, Some(p95 * 2.0), "{name}");
+            let observed = result.observed.as_ref().unwrap();
+            assert_eq!(observed.median_difference, median, "{name}");
+            assert_eq!(observed.p95_difference, p95, "{name}");
+        }
+    }
+
+    #[test]
     fn failure_and_warmup_exclusions_do_not_shift_pairing() {
         let mut failed = sample(Variant::ForkOn, 0, 0, 999);
         failed.completed = false;
@@ -464,8 +584,8 @@ mod tests {
             sample(Variant::ForkOn, 1, 0, 50),
         ]);
         let result = &results[2];
-        assert_eq!(result.baseline_distribution.median_ms, Some(100.0));
-        assert_eq!(result.candidate_distribution.median_ms, Some(50.0));
+        assert_eq!(result.baseline_distribution.median, Some(100.0));
+        assert_eq!(result.candidate_distribution.median, Some(50.0));
         assert!(result.pairs.is_empty());
         assert!(result.paired_observed.is_none());
         for (id, reason) in [
@@ -484,23 +604,31 @@ mod tests {
 
     #[test]
     fn bootstrap_keeps_paired_values_together_across_clusters() {
-        let observations: Vec<_> = [(0, 0, 100), (0, 1, 300), (1, 0, 600), (1, 1, 900)]
-            .into_iter()
-            .flat_map(|(cluster, repetition, elapsed)| {
-                [
-                    sample(Variant::Reference, cluster, repetition, elapsed),
-                    sample(Variant::ForkOn, cluster, repetition, elapsed / 2),
-                ]
-            })
-            .collect();
+        let observations: Vec<_> = [
+            (0, 0, 100),
+            (0, 1, 300),
+            (1, 0, 600),
+            (1, 1, 900),
+            (2, 0, 600),
+            (3, 0, 600),
+            (4, 0, 600),
+        ]
+        .into_iter()
+        .flat_map(|(cluster, repetition, elapsed)| {
+            [
+                sample(Variant::Reference, cluster, repetition, elapsed),
+                sample(Variant::ForkOn, cluster, repetition, elapsed / 2),
+            ]
+        })
+        .collect();
         let results = summarize(&observations);
         let result = &results[2];
-        assert_eq!(result.baseline_distribution.median_ms, Some(600.0));
-        assert_eq!(result.baseline_distribution.p95_ms, Some(900.0));
+        assert_eq!(result.baseline_distribution.median, Some(600.0));
+        assert!((result.baseline_distribution.p95.unwrap() - 810.0).abs() < 1e-9);
         let bootstrap = result.bootstrap.as_ref().unwrap();
         assert_eq!(bootstrap.replicates, 10_000);
-        assert_eq!(bootstrap.cluster_count, 2);
-        assert_eq!(bootstrap.pair_count, 4);
+        assert_eq!(bootstrap.cluster_count, 5);
+        assert_eq!(bootstrap.pair_count, 7);
         assert_eq!(
             bootstrap.median_ratio,
             Some(Interval {
@@ -517,9 +645,109 @@ mod tests {
         );
         let again = summarize(&observations);
         assert_eq!(
-            bootstrap.median_difference_ms,
-            again[2].bootstrap.as_ref().unwrap().median_difference_ms
+            bootstrap.median_difference,
+            again[2].bootstrap.as_ref().unwrap().median_difference
         );
+    }
+
+    #[test]
+    fn metrics_keep_their_own_coverage_pairing_and_fractional_values() {
+        let mut observations = Vec::new();
+        for cluster in 0..5 {
+            for variant in [Variant::Reference, Variant::ForkOn] {
+                let mut observation = sample(variant, cluster, 0, 100);
+                let candidate = variant == Variant::ForkOn;
+                observation.metrics.insert(
+                    "first_output_ms".into(),
+                    if candidate {
+                        0.0
+                    } else {
+                        f64::from(cluster) + 0.5
+                    },
+                );
+                observation.metrics.insert(
+                    "scripted_serialized_request_bytes".into(),
+                    if candidate { 20.0 } else { 40.0 },
+                );
+                if candidate && cluster == 3 {
+                    observation.metrics.remove("first_output_ms");
+                }
+                if candidate && cluster == 4 {
+                    observation
+                        .metrics
+                        .insert("first_output_ms".into(), f64::NAN);
+                }
+                observations.push(observation);
+            }
+        }
+        let comparisons = summarize(&observations);
+        let overall = |metric| {
+            comparisons
+                .iter()
+                .find(|row| row.metric == metric && row.kind == "overall")
+                .unwrap()
+        };
+        let elapsed = overall("elapsed_ms");
+        assert_eq!(elapsed.pairs.len(), 5);
+        assert!(elapsed.bootstrap.is_some());
+        let first = overall("first_output_ms");
+        assert_eq!(first.unit, "ms");
+        assert_eq!(first.baseline_distribution.median, Some(2.5));
+        assert_eq!(first.candidate_distribution.median, Some(0.0));
+        assert_eq!(first.observed.as_ref().unwrap().median_difference, -2.5);
+        assert_eq!(
+            first.paired_observed.as_ref().unwrap().median_difference,
+            -1.5
+        );
+        assert_eq!(
+            first.paired_observed.as_ref().unwrap().median_ratio,
+            Some(0.0)
+        );
+        assert_eq!(
+            first
+                .pairs
+                .iter()
+                .map(|pair| pair.cluster)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(first.cluster_count, 3);
+        assert!(first.bootstrap.is_none());
+        assert_eq!(
+            first.interval_unavailable_reason.as_deref(),
+            Some("insufficient_independent_run_clusters")
+        );
+        for (id, reason) in [
+            ("fork_on-3-0", "metric_unavailable"),
+            ("fork_on-4-0", "invalid_metric_value"),
+        ] {
+            assert!(
+                first
+                    .exclusions
+                    .iter()
+                    .any(|row| row.sample_id == id && row.reason == reason)
+            );
+        }
+        let bytes = overall("scripted_serialized_request_bytes");
+        assert_eq!(bytes.unit, "bytes");
+        let bootstrap = bytes.bootstrap.as_ref().unwrap();
+        assert_eq!(
+            bootstrap.median_difference,
+            Interval {
+                lower: -20.0,
+                upper: -20.0
+            }
+        );
+        assert_ne!(bootstrap.seed, elapsed.bootstrap.as_ref().unwrap().seed);
+        let saved = serde_json::to_value(first).unwrap();
+        assert_eq!(
+            saved["candidateDistribution"]["samples"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(saved["baselineDistribution"]["samples"][0]["value"], 0.5);
     }
 
     #[test]
@@ -551,6 +779,59 @@ mod tests {
     }
 
     #[test]
+    fn intervals_require_five_paired_clusters_and_retain_exclusions() {
+        let mut observations: Vec<_> = (0..5)
+            .flat_map(|cluster| {
+                let baseline = 100 + u64::from(cluster) * 100;
+                [
+                    sample(Variant::Reference, cluster, 0, baseline),
+                    sample(Variant::ForkOn, cluster, 0, baseline + 20),
+                ]
+            })
+            .collect();
+        let results = summarize(&observations);
+        let bootstrap = results[2].bootstrap.as_ref().unwrap();
+        assert_eq!(bootstrap.cluster_count, 5);
+        assert_eq!(bootstrap.pair_count, 5);
+        assert_eq!(
+            bootstrap.median_difference,
+            Interval {
+                lower: 20.0,
+                upper: 20.0
+            }
+        );
+        assert!((bootstrap.p95_difference.lower - 20.0).abs() < 1e-9);
+        assert!((bootstrap.p95_difference.upper - 20.0).abs() < 1e-9);
+        let three = summarize(&observations[..6]);
+        assert_eq!(three[2].cluster_count, 3);
+        assert!(three[2].bootstrap.is_none());
+        assert_eq!(
+            three[2].interval_unavailable_reason.as_deref(),
+            Some("insufficient_independent_run_clusters")
+        );
+        for observation in &mut observations {
+            if observation.variant == Variant::ForkOn && observation.cluster > 0 {
+                observation.completed = false;
+            }
+        }
+        let incomplete = summarize(&observations);
+        assert_eq!(incomplete[2].pairs.len(), 1);
+        assert!(incomplete[2].bootstrap.is_none());
+        assert_eq!(
+            incomplete[2].interval_unavailable_reason.as_deref(),
+            Some("insufficient_paired_repetitions")
+        );
+        for id in ["fork_on-1-0", "fork_on-2-0"] {
+            assert!(
+                incomplete[2]
+                    .exclusions
+                    .iter()
+                    .any(|sample| sample.sample_id == id && sample.reason == "not_completed")
+            );
+        }
+    }
+
+    #[test]
     fn ambiguous_slots_are_unpaired_and_missing_variants_are_reported() {
         let mut duplicate_slot = sample(Variant::ForkOn, 0, 0, 25);
         duplicate_slot.id = "distinct-attempt-same-slot".to_string();
@@ -572,7 +853,7 @@ mod tests {
 
     #[test]
     fn zero_baseline_preserves_differences_without_infinite_ratios() {
-        let observations: Vec<_> = (0..2)
+        let observations: Vec<_> = (0..5)
             .flat_map(|cluster| {
                 [
                     sample(Variant::Reference, cluster, 0, 0),
@@ -582,11 +863,11 @@ mod tests {
             .collect();
         let results = summarize(&observations);
         let result = &results[2];
-        assert_eq!(result.observed.as_ref().unwrap().median_difference_ms, 10.0);
+        assert_eq!(result.observed.as_ref().unwrap().median_difference, 10.0);
         assert!(result.observed.as_ref().unwrap().median_ratio.is_none());
         let bootstrap = result.bootstrap.as_ref().unwrap();
         assert_eq!(
-            bootstrap.median_difference_ms,
+            bootstrap.median_difference,
             Interval {
                 lower: 10.0,
                 upper: 10.0

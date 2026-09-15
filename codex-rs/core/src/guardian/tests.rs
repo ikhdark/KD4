@@ -333,6 +333,7 @@ async fn guardian_test_session_turn_and_rx(
         .thread_id = fixed_guardian_parent_session_id();
     let mut config = (*turn.config).clone();
     config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+    config.model_provider.supports_websockets = false;
     let config = Arc::new(config);
     let models_manager = test_support::models_manager_with_provider(
         config.codex_home.to_path_buf(),
@@ -514,7 +515,10 @@ fn normalize_guardian_snapshot_paths(text: String) -> String {
     let mut text = text;
     for canonical_path in ["/repo/codex-rs/core", "/repo"] {
         let platform_uri = PathUri::from_abs_path(&test_path_buf(canonical_path).abs());
-        text = text.replace(&platform_uri.to_string(), &format!("file://{canonical_path}"));
+        text = text.replace(
+            &platform_uri.to_string(),
+            &format!("file://{canonical_path}"),
+        );
         let platform_path = test_path_buf(canonical_path).display().to_string();
         if platform_path == canonical_path {
             continue;
@@ -1985,7 +1989,12 @@ fn guardian_review_request_layout_matches_model_visible_request_snapshot() -> an
         let temp_cwd = TempDir::new()?;
         let mut config = (*turn.config).clone();
         config.cwd = temp_cwd.abs();
+        config.reasoning_phase_efforts = Some(codex_config::config_toml::ReasoningPhaseEfforts {
+            orient: Some(codex_protocol::openai_models::ReasoningEffort::High),
+            ..Default::default()
+        });
         config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+        config.model_provider.supports_websockets = false;
         config.memories.use_memories = true;
         config
             .features
@@ -2146,6 +2155,7 @@ fn guardian_review_request_layout_matches_model_visible_request_snapshot() -> an
             .and_then(|reasoning| reasoning.get("effort"))
             .and_then(|value| value.as_str());
         assert_eq!(metadata.guardian_model.as_deref(), Some(request_model));
+        assert_eq!(request_reasoning_effort, Some("low"));
         assert_eq!(
             metadata.guardian_reasoning_effort.as_deref(),
             request_reasoning_effort
@@ -2670,6 +2680,7 @@ async fn guardian_review_surfaces_responses_api_errors_in_rejection_reason() -> 
         crate::session::tests::make_session_and_context_with_rx().await;
     let mut config = (*turn.config).clone();
     config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+    config.model_provider.supports_websockets = false;
     let config = Arc::new(config);
     let models_manager = test_support::models_manager_with_provider(
         config.codex_home.to_path_buf(),
@@ -2916,7 +2927,10 @@ fn guardian_review_does_not_retry_parse_failure() -> anyhow::Result<()> {
             second_metadata.guardian_session_kind,
             Some(codex_analytics::GuardianReviewSessionKind::TrunkReused)
         ));
-        assert_eq!(second_metadata.guardian_thread_id, metadata.guardian_thread_id);
+        assert_eq!(
+            second_metadata.guardian_thread_id,
+            metadata.guardian_thread_id
+        );
         assert_eq!(request_log.requests().len(), 2);
         session.guardian_review_session.shutdown().await;
         Ok(())
@@ -2928,25 +2942,13 @@ async fn guardian_review_parse_failure_emits_one_terminal_event() -> anyhow::Res
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let request_log = mount_sse_sequence(
+    let request_log = mount_sse_once(
         &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-parse-failure-1"),
-                ev_assistant_message("msg-parse-failure-1", "invalid one"),
-                ev_completed("resp-parse-failure-1"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-parse-failure-2"),
-                ev_assistant_message("msg-parse-failure-2", "invalid two"),
-                ev_completed("resp-parse-failure-2"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-parse-failure-3"),
-                ev_assistant_message("msg-parse-failure-3", "invalid three"),
-                ev_completed("resp-parse-failure-3"),
-            ]),
-        ],
+        sse(vec![
+            ev_response_created("resp-parse-failure-1"),
+            ev_assistant_message("msg-parse-failure-1", "invalid one"),
+            ev_completed("resp-parse-failure-1"),
+        ]),
     )
     .await;
     let (session, turn, rx) = guardian_test_session_turn_and_rx(&server).await;
@@ -3285,6 +3287,11 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
 #[tokio::test]
 async fn guardian_review_session_config_preserves_parent_network_proxy() {
     let mut parent_config = test_config().await;
+    parent_config.reasoning_phase_efforts =
+        Some(codex_config::config_toml::ReasoningPhaseEfforts {
+            orient: Some(codex_protocol::openai_models::ReasoningEffort::High),
+            ..Default::default()
+        });
     let network = NetworkProxySpec::from_config_and_constraints(
         NetworkProxyConfig::default(),
         Some(NetworkConstraints {
@@ -3319,6 +3326,7 @@ async fn guardian_review_session_config_preserves_parent_network_proxy() {
         guardian_config.model_reasoning_effort,
         Some(codex_protocol::openai_models::ReasoningEffort::Low)
     );
+    assert_eq!(guardian_config.reasoning_phase_efforts, None);
     assert_eq!(
         guardian_config.permissions.approval_policy,
         Constrained::allow_only(AskForApproval::Never)
@@ -3569,6 +3577,11 @@ async fn guardian_review_session_config_uses_requirements_guardian_policy_config
             "Use the workspace-managed guardian policy."
         ))
     );
+    let prompt = guardian_config.base_instructions.as_deref().unwrap();
+    assert!(prompt.starts_with("You are the Codex Guardian."));
+    assert!(prompt.contains("\nUse the workspace-managed guardian policy.\n"));
+    assert!(!prompt.contains("Default tenant policy"));
+    assert!(!prompt.contains("{tenant_policy_config}"));
 }
 
 #[tokio::test]
@@ -3605,6 +3618,11 @@ async fn guardian_review_session_config_uses_default_guardian_policy_without_req
         guardian_config.base_instructions,
         Some(guardian_policy_prompt())
     );
+    let prompt = guardian_config.base_instructions.as_deref().unwrap();
+    assert!(prompt.starts_with("You are the Codex Guardian."));
+    assert!(prompt.contains("## Default tenant policy"));
+    assert!(prompt.contains("Return only the structured assessment"));
+    assert!(!prompt.contains("{tenant_policy_config}"));
 }
 
 #[tokio::test]

@@ -58,8 +58,8 @@ struct RawExecCommandArgs {
     login: Option<bool>,
     #[serde(default = "default_tty")]
     tty: bool,
-    #[serde(default = "default_exec_yield_time_ms")]
-    yield_time_ms: u64,
+    #[serde(default)]
+    yield_time_ms: Option<u64>,
     #[serde(default)]
     max_output_tokens: Option<usize>,
     #[serde(default)]
@@ -74,9 +74,8 @@ struct RawExecCommandArgs {
     force_fresh: bool,
     #[serde(default)]
     validation: Option<codex_protocol::validation::ValidationCommandContext>,
-    // Compatibility-only shell_command fields. The foreign-environment shell
-    // adapter has historically forwarded these while unified exec retained its
-    // own foreground-yield semantics.
+    // Decode unsupported deadlines to report an explicit error, including when
+    // they arrive through the foreign-environment shell_command adapter.
     #[serde(default)]
     timeout_ms: Option<u64>,
     #[serde(default)]
@@ -91,12 +90,24 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
     type Error = String;
 
     fn try_from(raw: RawExecCommandArgs) -> Result<Self, Self::Error> {
-        if !(crate::unified_exec::MIN_YIELD_TIME_MS..=crate::unified_exec::MAX_YIELD_TIME_MS)
-            .contains(&raw.yield_time_ms)
+        for (field, value) in [
+            ("timeout_ms", raw.timeout_ms),
+            ("stall_timeout_ms", raw.stall_timeout_ms),
+        ] {
+            if value.is_some() {
+                return Err(format!(
+                    "exec_command does not support `{field}`; no command was started. `yield_time_ms` controls the observation wait, not a process deadline."
+                ));
+            }
+        }
+
+        if let Some(yield_time_ms) = raw.yield_time_ms
+            && !(crate::unified_exec::MIN_YIELD_TIME_MS..=crate::unified_exec::MAX_YIELD_TIME_MS)
+                .contains(&yield_time_ms)
         {
             return Err(format!(
                 "exec_command schema error at `$.yield_time_ms`: actual value {} violates the inclusive bound {}..={}",
-                raw.yield_time_ms,
+                yield_time_ms,
                 crate::unified_exec::MIN_YIELD_TIME_MS,
                 crate::unified_exec::MAX_YIELD_TIME_MS,
             ));
@@ -116,19 +127,24 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
         // in a separate boundary pass before the command arguments are
         // decoded. Reading these fields here keeps this decoder permissive for
         // that shared surface without retaining either value internally.
-        let _compatibility_only_fields = (
-            &raw.timeout_ms,
-            &raw.stall_timeout_ms,
-            &raw.environment_id,
-            &raw.workdir,
-        );
+        let _compatibility_only_fields = (&raw.environment_id, &raw.workdir);
 
+        let yield_time_ms = raw.yield_time_ms.unwrap_or_else(|| {
+            if matches!(
+                crate::validation_admission::classify_validation(&command),
+                crate::validation_admission::ValidationClassification::Validation { .. }
+            ) {
+                crate::unified_exec::MAX_YIELD_TIME_MS
+            } else {
+                default_exec_yield_time_ms()
+            }
+        });
         Ok(Self {
             command,
             shell: raw.shell,
             login: raw.login,
             tty: raw.tty,
-            yield_time_ms: raw.yield_time_ms,
+            yield_time_ms,
             max_output_tokens: raw.max_output_tokens,
             sandbox_permissions: raw.sandbox_permissions,
             additional_permissions: raw.additional_permissions,

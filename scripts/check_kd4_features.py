@@ -9,6 +9,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
@@ -20,6 +21,8 @@ import tomllib
 if __package__:
     from scripts import rust_test_runner
 else:
+    # runpy-based just recipes do not put this script's directory on sys.path.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
     import rust_test_runner
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -72,6 +75,136 @@ class CheckResult:
             "runtimeStatusCounts": self.runtime_status_counts,
             "findings": [asdict(finding) for finding in self.findings],
         }
+
+
+def _rust_scope_items(
+    text: str,
+) -> dict[tuple[str, str], list[tuple[str | None, str | None]]]:
+    """Read named module/function declarations at this scope, excluding literal bodies."""
+    token = re.compile(
+        r'//[^\n]*|/\*|r(?P<hashes>\#*)".*?"(?P=hashes)|'
+        r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])\'|[A-Za-z_][A-Za-z_0-9]*|[^\s]',
+        re.DOTALL,
+    )
+    tokens = []
+    cursor = 0
+    while match := token.search(text, cursor):
+        value = match.group()
+        cursor = match.end()
+        if value.startswith("//"):
+            continue
+        if value == "/*":
+            depth = 1
+            while depth:
+                nested = re.search(r"/\*|\*/", text[cursor:])
+                if nested is None:
+                    raise ValueError("unclosed Rust comment in verification source")
+                cursor += nested.end()
+                depth += 1 if nested.group() == "/*" else -1
+            continue
+        tokens.append((value, match.start(), cursor))
+    items: dict[tuple[str, str], list[tuple[str | None, str | None]]] = {}
+    index = 0
+    path = None
+    while index < len(tokens):
+        value = tokens[index][0]
+        if (
+            value == "#"
+            and index + 5 < len(tokens)
+            and [item[0] for item in tokens[index : index + 4]]
+            == ["#", "[", "path", "="]
+            and tokens[index + 5][0] == "]"
+        ):
+            literal = tokens[index + 4][0]
+            if not literal.startswith('"'):
+                raise ValueError(
+                    "unsupported Rust path attribute in verification route"
+                )
+            path = json.loads(literal)
+            index += 6
+            continue
+        if value in {"mod", "fn"} and index + 2 < len(tokens):
+            name = tokens[index + 1][0]
+            after_name = index + 2
+            if value == "fn":
+                items.setdefault((value, name), []).append((None, None))
+            elif tokens[after_name][0] == ";":
+                items.setdefault((value, name), []).append((path, None))
+                path = None
+                index += 3
+                continue
+            elif tokens[after_name][0] == "{":
+                depth = 1
+                end = after_name + 1
+                while end < len(tokens) and depth:
+                    depth += (tokens[end][0] == "{") - (tokens[end][0] == "}")
+                    end += 1
+                if depth:
+                    raise ValueError("unclosed Rust module in verification source")
+                body = text[tokens[after_name][2] : tokens[end - 1][1]]
+                items.setdefault((value, name), []).append((path, body))
+                path = None
+                index = end
+                continue
+        if value in {"{", "[", "("}:
+            closing = {"{": "}", "[": "]", "(": ")"}[value]
+            depth = 1
+            index += 1
+            while index < len(tokens) and depth:
+                depth += (tokens[index][0] == value) - (tokens[index][0] == closing)
+                index += 1
+            if value == "{":
+                path = None
+            continue
+        if value == ";":
+            path = None
+        index += 1
+    return items
+
+
+def _rust_test_source(binary_root: Path, identity: str, repo_root: Path) -> Path | None:
+    """Resolve the exact selected module chain, including #[path] and inline modules."""
+    source = binary_root.resolve()
+    if not source.is_file():
+        return None
+    text = source.read_text(encoding="utf-8")
+    module_dir = attribute_dir = source.parent
+    components = identity.split("::")
+    for component in components[:-1]:
+        declarations = _rust_scope_items(text).get(("mod", component), [])
+        if len(declarations) != 1:
+            return None
+        path, body = declarations[0]
+        if body is not None:
+            module_dir = attribute_dir / path if path else module_dir / component
+            attribute_dir = module_dir
+            text = body
+            continue
+        if path:
+            candidates = [attribute_dir / path]
+        else:
+            candidates = [
+                module_dir / f"{component}.rs",
+                module_dir / component / "mod.rs",
+            ]
+        candidates = [
+            candidate.resolve() for candidate in candidates if candidate.is_file()
+        ]
+        if len(candidates) != 1 or not candidates[0].is_relative_to(
+            repo_root.resolve()
+        ):
+            return None
+        source = candidates[0]
+        text = source.read_text(encoding="utf-8")
+        attribute_dir = source.parent
+        module_dir = (
+            source.parent if source.name == "mod.rs" else source.with_suffix("")
+        )
+    return (
+        source
+        if len(_rust_scope_items(text).get(("fn", components[-1]), [])) == 1
+        else None
+    )
 
 
 def _verification_route(
@@ -136,9 +269,11 @@ def _verification_route(
     package = cargo["package"]["name"]
     relative = source.relative_to(cargo_path.parent)
     selector = ["--lib"]
+    binary_root = cargo_path.parent / cargo.get("lib", {}).get("path", "src/lib.rs")
     if relative.parts[0] == "tests":
         if len(relative.parts) == 2:
             selector = ["--test", source.stem]
+            binary_root = source
         else:
             # Legacy aggregators use `mod suite;`; bounded shards keep `suite`
             # inline and explicitly register the selected source within it.
@@ -170,10 +305,12 @@ def _verification_route(
                     "verification source must resolve to one integration test binary"
                 )
             selector = ["--test", candidates[0].stem]
+            binary_root = candidates[0]
     else:
         for binary in cargo.get("bin", []):
             if binary.get("path") == relative.as_posix():
                 selector = ["--bin", binary["name"]]
+                binary_root = source
     if (
         len(command) != 6
         or command[:3] != ["python", "scripts/rust_test_runner.py", "run-gate"]
@@ -187,16 +324,27 @@ def _verification_route(
             repo_root / "codex-rs/.config/kd4-rust-tests.toml"
         )
     gate = rust_manifest.gates.get(command[3])
-    if gate is None or len(gate.steps) != 1:
-        raise ValueError("capability gate must name one test target")
-    step = gate.steps[0]
-    target = rust_manifest.targets[step.target]
-    if target.selection_args() != ["-p", package, *selector]:
+    if gate is None:
+        raise ValueError("capability gate must name an existing gate")
+    matching_steps = [
+        step
+        for step in gate.steps
+        if rust_manifest.targets[step.target].selection_args()
+        == ["-p", package, *selector]
+    ]
+    if not matching_steps:
         raise ValueError(
             "capability gate must select the declared source's package and test binary"
         )
-    if not any(test.split("::")[-1] == symbol for test in step.tests):
-        raise ValueError("capability gate must require the declared test symbol")
+    if not any(
+        test.split("::")[-1] == symbol
+        and _rust_test_source(binary_root, test, repo_root) == source.resolve()
+        for step in matching_steps
+        for test in step.tests
+    ):
+        raise ValueError(
+            "capability gate must require the exact source-qualified test identity"
+        )
     return "nextest"
 
 

@@ -312,7 +312,7 @@ async fn incompatible_or_invalid_handshake_is_rejected() {
 }
 
 #[tokio::test]
-async fn cancelled_queued_execute_never_starts_and_host_shuts_down() {
+async fn saturated_execute_is_rejected_without_side_effects_and_host_shuts_down() {
     use codex_code_mode_protocol::host::WireRuntimeResponse;
 
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -403,22 +403,16 @@ async fn cancelled_queued_execute_never_starts_and_host_shuts_down() {
                 },
             })
             .await
-            .expect("queue ninth execution");
-        // The direct admission test below proves the pending state; this IPC
-        // scenario proves cancellation and shutdown across the connection.
-        writer
-            .write(&ClientToHost::CancelRequest { id: request_id(10) })
-            .await
-            .expect("cancel queued execution");
+            .expect("submit ninth execution");
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(2), reader.read::<HostToClient>())
                 .await
-                .expect("queued cancellation must respond without a free cell")
-                .expect("cancellation response"),
+                .expect("capacity rejection must respond without a free cell")
+                .expect("capacity response"),
             Some(HostToClient::Response {
                 id: request_id(10),
                 result: WireResult::Err {
-                    message: "code-mode request cancelled".to_string(),
+                    message: "code mode has reached its active cell limit; wait for an existing cell to finish or terminate one before starting another exec".to_string(),
                 },
             })
         );
@@ -466,7 +460,7 @@ async fn cancelled_queued_execute_never_starts_and_host_shuts_down() {
         host.await.expect("host task").expect("clean EOF shutdown");
     })
     .await
-    .expect("queued cancellation and shutdown must finish");
+    .expect("saturated execution and shutdown must finish");
 }
 
 #[tokio::test]
@@ -718,11 +712,7 @@ async fn execute_request_id_remains_active_until_initial_response() {
 }
 
 #[tokio::test]
-async fn cancellation_interrupts_polled_session_admission() {
-    use std::future::Future;
-    use std::task::Context;
-    use std::task::Waker;
-
+async fn saturated_session_admission_releases_host_permit() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(16);
         let peer = Arc::new(HostPeer::new(outgoing_tx));
@@ -749,33 +739,20 @@ async fn cancellation_interrupts_polled_session_admission() {
                 .await
                 .expect("occupying cell");
         }
-        let cancellation = CancellationToken::new();
-        let mut request = Box::pin(state.handle_request(
+        state.handle_request(
             request_id(1),
             HostRequest::Execute {
                 session_id: id,
                 request: execute_request("notify('must never run');"),
             },
-            cancellation.clone(),
-        ));
-        assert!(
-            request
-                .as_mut()
-                .poll(&mut Context::from_waker(Waker::noop()))
-                .is_pending()
-        );
-        assert_eq!(
-            state.active_cell_permits.available_permits(),
-            MAX_ACTIVE_CELLS - 1
-        );
-        cancellation.cancel();
-        request.await;
+            CancellationToken::new(),
+        ).await;
         assert_eq!(
             decode_frame(outgoing_rx.recv().await.expect("response")).await,
             HostToClient::Response {
                 id: request_id(1),
                 result: WireResult::Err {
-                    message: "code-mode request cancelled".to_string()
+                    message: "code mode has reached its active cell limit; wait for an existing cell to finish or terminate one before starting another exec".to_string()
                 },
             }
         );
@@ -792,7 +769,7 @@ async fn cancellation_interrupts_polled_session_admission() {
         ));
     })
     .await
-    .expect("queued admission must cancel and shut down");
+    .expect("saturated admission must return and shut down");
 }
 
 #[tokio::test]

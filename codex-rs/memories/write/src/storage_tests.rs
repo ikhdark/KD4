@@ -55,7 +55,7 @@ fn rollout_summary_file_stem_sanitizes_and_truncates_slug() {
     assert_eq!(slug.len(), 60);
     assert_eq!(
         slug,
-        "unsafe_slug_with_spaces___symbols___extra_long_12345_67890_abcd"
+        "unsafe_slug_with_spaces___symbols___extra_long_12345_67890_a"
     );
 }
 

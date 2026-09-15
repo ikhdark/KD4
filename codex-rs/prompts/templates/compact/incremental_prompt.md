@@ -11,3 +11,10 @@ Use only the applicable standard checkpoint headings: `## Goal`,
 `## Current state`, `## Completed work`, `## Unresolved work`, `## Evidence`,
 and `## Next action`. Omit unchanged sections. Prefer the latest observed state
 and explicitly invalidate superseded evidence.
+If the user changes the goal or constraints, include `## Goal` with the complete
+current goal and explicitly retire the superseded goal or constraints. The latest
+explicit replacement governs subsequent work.
+Record newly edited files and partial changes, changed ownership or handoffs,
+pending consumer updates, regeneration and validation obligations, and newly
+ruled-out causes with observed evidence. Keep supplied provenance labels and
+freshness attached to the claims they support.

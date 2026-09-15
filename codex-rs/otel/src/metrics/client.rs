@@ -718,8 +718,10 @@ mod counter_cache_tests {
             default_tags: BTreeMap::new(),
         }));
         let error = metrics.shutdown().unwrap_err();
-        assert!(matches!(error, MetricsError::ProviderShutdown { .. }));
-        assert!(error.to_string().contains("flush failed"));
+        let MetricsError::ProviderShutdown { source } = error else {
+            panic!("expected provider shutdown error: {error}");
+        };
+        assert!(source.to_string().contains("flush failed"));
         assert_eq!(*calls.lock().unwrap(), vec!["flush", "shutdown"]);
     }
 

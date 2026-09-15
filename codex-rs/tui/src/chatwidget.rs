@@ -1518,7 +1518,7 @@ impl ChatWidget {
 
     fn rename_confirmation_cell(name: &str, thread_id: Option<ThreadId>) -> PlainHistoryCell {
         let mut line = vec![
-            "â€¢ ".into(),
+            "• ".into(),
             "Session renamed to ".into(),
             name.to_string().cyan(),
         ];

@@ -631,10 +631,25 @@ fn sandbox_outcome_from_tool_error(err: &ToolError) -> Option<&'static str> {
     }
 }
 
-fn build_denial_reason_from_output(_output: &ExecToolCallOutput) -> String {
-    // Keep approval reason terse and stable for UX/tests, but accept the
-    // output so we can evolve heuristics later without touching call sites.
-    "command failed; retry without sandbox?".to_string()
+fn build_denial_reason_from_output(output: &ExecToolCallOutput) -> String {
+    let reason = "command failed; retry without sandbox?";
+    let diagnostic = [
+        &output.stderr.text,
+        &output.aggregated_output.text,
+        &output.stdout.text,
+    ]
+    .into_iter()
+    .map(|text| text.trim())
+    .find(|text| !text.is_empty());
+    let Some(diagnostic) = diagnostic else {
+        return reason.to_string();
+    };
+    let mut chars = diagnostic.chars();
+    let mut excerpt: String = chars.by_ref().take(1_024).collect();
+    if chars.next().is_some() {
+        excerpt.push('…');
+    }
+    format!("{reason}\nCommand output:\n{excerpt}")
 }
 
 #[cfg(test)]
@@ -651,8 +666,12 @@ mod tests {
     use futures::future::BoxFuture;
     use std::sync::Arc;
 
+    #[derive(Default)]
     struct DeniedAfterDispatchRuntime {
         attempts: usize,
+        replay_safe: bool,
+        denial_output: ExecToolCallOutput,
+        approval_reason: Option<String>,
     }
 
     impl Sandboxable for DeniedAfterDispatchRuntime {
@@ -662,6 +681,10 @@ mod tests {
 
         fn escalate_on_failure(&self) -> bool {
             true
+        }
+
+        fn sandbox_denial_replay_is_safe(&self) -> bool {
+            self.replay_safe
         }
     }
 
@@ -682,9 +705,10 @@ mod tests {
         fn start_approval_async<'a>(
             &'a mut self,
             _req: &'a (),
-            _ctx: ApprovalCtx<'a>,
+            ctx: ApprovalCtx<'a>,
         ) -> BoxFuture<'a, ReviewDecision> {
-            Box::pin(async { ReviewDecision::Approved })
+            self.approval_reason = ctx.retry_reason;
+            Box::pin(async { ReviewDecision::Denied })
         }
 
         fn approval_action(
@@ -706,7 +730,7 @@ mod tests {
             self.attempts += 1;
             if self.attempts == 1 {
                 Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
-                    output: Box::new(ExecToolCallOutput::default()),
+                    output: Box::new(self.denial_output.clone()),
                     network_policy_decision: None,
                 })))
             } else {
@@ -729,7 +753,7 @@ mod tests {
             call_id: "denied-call".to_string(),
             tool_name: ToolName::plain("denied_after_dispatch"),
         };
-        let mut runtime = DeniedAfterDispatchRuntime { attempts: 0 };
+        let mut runtime = DeniedAfterDispatchRuntime::default();
 
         let result = ToolOrchestrator::new()
             .run(
@@ -748,5 +772,84 @@ mod tests {
             )))
         ));
         assert_eq!(runtime.attempts, 1);
+        assert!(runtime.approval_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn sandbox_retry_approval_includes_bounded_diagnostics_and_denial_stops_execution() {
+        use codex_protocol::exec_output::StreamOutput;
+
+        let (session, mut turn) = make_session_and_context().await;
+        turn.approval_policy
+            .set(AskForApproval::UnlessTrusted)
+            .expect("test setup should allow updating approval policy");
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let tool_ctx = ToolCtx {
+            session: Arc::clone(&session),
+            turn: Arc::clone(&turn),
+            call_id: "diagnostic-denial".to_string(),
+            tool_name: ToolName::plain("denied_after_dispatch"),
+        };
+        for (stderr, aggregated, stdout, excerpt) in [
+            (
+                " Permission denied: /private/data ".to_string(),
+                "other".to_string(),
+                "".to_string(),
+                Some("Permission denied: /private/data".to_string()),
+            ),
+            (
+                "".to_string(),
+                "blocked by sandbox".to_string(),
+                "".to_string(),
+                Some("blocked by sandbox".to_string()),
+            ),
+            (
+                "".to_string(),
+                "".to_string(),
+                "stdout diagnostic".to_string(),
+                Some("stdout diagnostic".to_string()),
+            ),
+            (
+                "é".repeat(1_100),
+                "".to_string(),
+                "".to_string(),
+                Some(format!("{}…", "é".repeat(1_024))),
+            ),
+            (" \n".to_string(), "".to_string(), "".to_string(), None),
+        ] {
+            let mut runtime = DeniedAfterDispatchRuntime {
+                replay_safe: true,
+                denial_output: ExecToolCallOutput {
+                    exit_code: 1,
+                    stderr: StreamOutput::new(stderr),
+                    aggregated_output: StreamOutput::new(aggregated),
+                    stdout: StreamOutput::new(stdout),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let result = ToolOrchestrator::new()
+                .run(
+                    &mut runtime,
+                    &(),
+                    &tool_ctx,
+                    turn.as_ref(),
+                    AskForApproval::UnlessTrusted,
+                )
+                .await;
+            assert!(matches!(result, Err(ToolError::Denied(_))));
+            assert_eq!(
+                runtime.attempts, 1,
+                "denied approval must not rerun the command"
+            );
+            let expected = match excerpt {
+                Some(excerpt) => {
+                    format!("command failed; retry without sandbox?\nCommand output:\n{excerpt}")
+                }
+                None => "command failed; retry without sandbox?".to_string(),
+            };
+            assert_eq!(runtime.approval_reason.as_deref(), Some(expected.as_str()));
+        }
     }
 }

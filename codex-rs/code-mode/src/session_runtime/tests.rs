@@ -256,7 +256,7 @@ async fn terminal_result_remains_observable_after_active_cell_removal() {
 }
 
 #[tokio::test]
-async fn ninth_cell_waits_until_a_terminal_cell_releases_its_permit() {
+async fn ninth_cell_is_rejected_until_a_terminal_cell_releases_its_permit() {
     let runtime = Arc::new(SessionRuntime::new(Arc::new(RecordingDelegate)));
     let mut active_cell_ids = Vec::new();
     for _ in 0..MAX_ACTIVE_CELLS {
@@ -270,30 +270,51 @@ async fn ninth_cell_waits_until_a_terminal_cell_releases_its_permit() {
         active_cell_ids.push(started.cell_id);
     }
 
-    let ninth_runtime = Arc::clone(&runtime);
-    let ninth = tokio::spawn(async move {
-        ninth_runtime
-            .execute(
-                execute_request("await new Promise(() => {});"),
-                ObserveMode::YieldAfter(Duration::from_millis(1)),
-            )
-            .await
-    });
-    tokio::time::sleep(Duration::from_millis(25)).await;
-    assert!(!ninth.is_finished());
+    let ninth = tokio::time::timeout(
+        Duration::from_secs(1),
+        runtime.execute(
+            execute_request("store('rejected', true);"),
+            ObserveMode::YieldAfter(Duration::from_millis(1)),
+        ),
+    )
+    .await
+    .expect("full capacity must return control to the caller");
+    assert!(matches!(ninth, Err(Error::ActiveCellLimit)));
+    assert_eq!(runtime.inner.cells.lock().await.len(), MAX_ACTIVE_CELLS);
 
     runtime
         .terminate(&active_cell_ids[0])
         .await
         .expect("terminal cell should release its permit");
-    let ninth_cell_id = tokio::time::timeout(Duration::from_secs(2), ninth)
-        .await
-        .expect("ninth cell should be admitted after permit release")
-        .expect("ninth task should not panic")
-        .expect("ninth cell should start")
-        .cell_id;
+    let next = tokio::time::timeout(
+        Duration::from_secs(2),
+        runtime.execute(
+            execute_request("text(load('rejected') === undefined);"),
+            ObserveMode::YieldAfter(Duration::from_secs(1)),
+        ),
+    )
+    .await
+    .expect("cell should be admitted after permit release")
+    .expect("cell should start");
+    assert_eq!(
+        next.initial_event().await,
+        Ok(CellEvent::Completed {
+            content_items: vec![OutputItem::Text {
+                text: "true".to_string()
+            }],
+            error_text: None,
+        })
+    );
+    assert!(
+        !runtime
+            .inner
+            .stored_values
+            .lock()
+            .await
+            .contains_key("rejected")
+    );
 
-    for cell_id in active_cell_ids.into_iter().skip(1).chain([ninth_cell_id]) {
+    for cell_id in active_cell_ids.into_iter().skip(1) {
         runtime
             .terminate(&cell_id)
             .await
@@ -358,6 +379,55 @@ async fn shutdown_rejects_cell_admission_queued_before_the_registry_lock() {
     drop(cells);
     assert!(matches!(execution.await, Err(Error::ShuttingDown)));
     assert_eq!(shutdown.await, Ok(()));
+}
+
+#[tokio::test]
+async fn shutdown_cancels_native_runtime_startup_without_registering_or_running_the_cell() {
+    use crate::runtime::STARTUP_TEST_GATE;
+    use crate::runtime::StartupTestGate;
+
+    let (release, receiver) = std::sync::mpsc::channel();
+    let gate = Arc::new(StartupTestGate {
+        entered: tokio::sync::Notify::new(),
+        release: std::sync::Mutex::new(receiver),
+        exited: tokio::sync::Notify::new(),
+    });
+    let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+    let execution = STARTUP_TEST_GATE.scope(
+        Arc::clone(&gate),
+        runtime.execute(
+            execute_request("store('unexpected', true); while (true) {}"),
+            ObserveMode::YieldAfter(Duration::from_millis(1)),
+        ),
+    );
+    tokio::pin!(execution);
+    std::future::poll_fn(|cx| {
+        assert!(execution.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(1), gate.entered.notified())
+        .await
+        .unwrap();
+
+    let (shutdown, execution) = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(runtime.shutdown(), execution)
+    })
+    .await
+    .expect("shutdown must finish while native startup is still held");
+    assert_eq!(shutdown, Ok(()));
+    assert!(matches!(execution, Err(Error::ShuttingDown)));
+    assert!(runtime.inner.cells.lock().await.is_empty());
+    assert_eq!(
+        runtime.inner.active_cell_permits.available_permits(),
+        MAX_ACTIVE_CELLS
+    );
+    assert!(runtime.inner.cell_tasks.is_empty());
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), gate.exited.notified())
+        .await
+        .unwrap();
+    assert!(runtime.inner.stored_values.lock().await.is_empty());
 }
 
 #[tokio::test]

@@ -90,50 +90,6 @@ pub fn run_apply_patch(patch: &str) -> i32 {
                 }
             }
         }
-        Err(failure) => {
-            let _ = print_failure_delta(failure.delta(), &mut stderr);
-            1
-        }
+        Err(_) => 1,
     }
-}
-
-fn print_failure_delta(
-    delta: &crate::AppliedPatchDelta,
-    stderr: &mut impl Write,
-) -> std::io::Result<()> {
-    if !delta.is_empty() {
-        writeln!(
-            stderr,
-            "Changes committed before the failure (do not retry the whole patch):"
-        )?;
-        for change in delta.changes() {
-            match &change.change {
-                crate::AppliedPatchFileChange::Add { .. } => {
-                    writeln!(stderr, "A {}", change.path.display())?;
-                }
-                crate::AppliedPatchFileChange::Delete { .. } => {
-                    writeln!(stderr, "D {}", change.path.display())?;
-                }
-                crate::AppliedPatchFileChange::Update { move_path, .. } => {
-                    if let Some(destination) = move_path {
-                        writeln!(
-                            stderr,
-                            "M {} -> {}",
-                            change.path.display(),
-                            destination.display()
-                        )?;
-                    } else {
-                        writeln!(stderr, "M {}", change.path.display())?;
-                    }
-                }
-            }
-        }
-    }
-    if !delta.is_exact() {
-        writeln!(
-            stderr,
-            "The change list is incomplete; additional partial filesystem effects may exist."
-        )?;
-    }
-    Ok(())
 }

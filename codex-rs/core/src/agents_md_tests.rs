@@ -741,7 +741,7 @@ async fn doc_smaller_than_limit_is_returned() {
 }
 
 #[tokio::test]
-async fn project_doc_invalid_utf8_uses_lossy_text() {
+async fn project_doc_invalid_utf8_discloses_lossy_text() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = tmp.path().join("AGENTS.md");
     fs::write(&path, b"project\xFF doc").unwrap();
@@ -750,7 +750,17 @@ async fn project_doc_invalid_utf8_uses_lossy_text() {
     let res = load_agents_md(&config).await.expect("doc expected").text();
 
     let source = PathUri::from_abs_path(&path.abs());
-    assert_eq!(res, rendered_project_doc(&source, "project\u{FFFD} doc"));
+    assert_eq!(
+        res,
+        rendered_project_doc(
+            &source,
+            "project\u{FFFD} doc\n\n[Project documentation encoding notice: invalid UTF-8 bytes were replaced with U+FFFD; instructions may be incomplete.]",
+        )
+    );
+
+    fs::write(&path, "project\u{FFFD} doc").unwrap();
+    let valid = load_agents_md(&config).await.expect("doc expected").text();
+    assert_eq!(valid, rendered_project_doc(&source, "project\u{FFFD} doc"));
 }
 
 #[tokio::test]
@@ -1871,6 +1881,13 @@ async fn secondary_environment_invalid_utf8_does_not_suppress_other_docs() {
 
     assert!(loaded.text().contains("primary doc"));
     assert!(loaded.text().contains("secondary\u{FFFD}doc"));
+    assert_eq!(
+        loaded
+            .text()
+            .matches("Project documentation encoding notice:")
+            .count(),
+        1
+    );
 }
 
 /// If there are existing system instructions but AGENTS.md docs are

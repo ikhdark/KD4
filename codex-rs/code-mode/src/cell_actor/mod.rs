@@ -49,7 +49,7 @@ const STATE_CHANGE_COMPLETION_GRACE: Duration = Duration::from_millis(500);
 pub(crate) struct CellActor;
 
 impl CellActor {
-    pub(crate) fn prepare<H: CellHost>(
+    pub(crate) async fn prepare<H: CellHost>(
         request: CellRequest,
         stored_values: HashMap<String, JsonValue>,
         host: Arc<H>,
@@ -76,7 +76,8 @@ impl CellActor {
             event_tx,
             Arc::clone(&output_admission),
             task_failure_handler.clone(),
-        )?;
+        )
+        .await?;
         let handle = CellHandle::new(command_tx, Arc::clone(&cell_state));
         let task = run_cell(
             host,

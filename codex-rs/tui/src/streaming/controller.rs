@@ -1125,6 +1125,8 @@ mod tests {
         ctrl.push("AAAA BBBB CCCC DDDD EEEE FFFF GGGG HHHH IIII JJJJ\n");
         ctrl.push("second line\n");
 
+        ctrl.flush_render_for_frame();
+
         let (cell, idle) = ctrl.on_commit_tick();
         assert!(cell.is_some(), "expected 1 emitted line");
         assert!(!idle, "queue should still have lines");

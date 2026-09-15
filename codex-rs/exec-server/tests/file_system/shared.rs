@@ -459,7 +459,7 @@ async fn file_system_walk_returns_a_bounded_tree(
         WalkOutcome {
             entries: root_entries.clone(),
             errors: Vec::new(),
-            truncated: false,
+            truncated: true,
         }
     );
 

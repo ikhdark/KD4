@@ -6,6 +6,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use codex_app_server_protocol::FuzzyFileSearchMatchType;
+use codex_app_server_protocol::FuzzyFileSearchResponse;
 use codex_app_server_protocol::FuzzyFileSearchResult;
 use codex_app_server_protocol::FuzzyFileSearchSessionCompletedNotification;
 use codex_app_server_protocol::FuzzyFileSearchSessionUpdatedNotification;
@@ -24,9 +25,12 @@ pub(crate) async fn run_fuzzy_file_search(
     query: String,
     roots: Vec<String>,
     cancellation_flag: Arc<AtomicBool>,
-) -> anyhow::Result<Vec<FuzzyFileSearchResult>> {
-    if roots.is_empty() {
-        return Ok(Vec::new());
+) -> anyhow::Result<FuzzyFileSearchResponse> {
+    if roots.is_empty() || query.is_empty() {
+        return Ok(FuzzyFileSearchResponse {
+            walk_complete: roots.is_empty(),
+            ..Default::default()
+        });
     }
 
     #[expect(clippy::expect_used)]
@@ -54,32 +58,12 @@ pub(crate) async fn run_fuzzy_file_search(
         )
     })
     .await??;
-    let mut files = result
-        .matches
-        .into_iter()
-        .map(|m| {
-            let file_name = m.path.file_name().unwrap_or_default();
-            FuzzyFileSearchResult {
-                root: m.root.to_string_lossy().to_string(),
-                path: m.path.to_string_lossy().to_string(),
-                match_type: match m.match_type {
-                    file_search::MatchType::File => FuzzyFileSearchMatchType::File,
-                    file_search::MatchType::Directory => FuzzyFileSearchMatchType::Directory,
-                },
-                file_name: file_name.to_string_lossy().to_string(),
-                score: m.score,
-                indices: m.indices,
-            }
-        })
-        .collect::<Vec<_>>();
-
-    files.sort_by(file_search::cmp_by_score_desc_then_path_asc::<
-        FuzzyFileSearchResult,
-        _,
-        _,
-    >(|f| f.score, |f| f.path.as_str()));
-
-    Ok(files)
+    Ok(FuzzyFileSearchResponse {
+        files: collect_files(&result.matches),
+        total_match_count: result.total_match_count,
+        scanned_file_count: result.scanned_file_count,
+        walk_complete: result.walk_complete,
+    })
 }
 
 pub(crate) struct FuzzyFileSearchSession {
@@ -303,7 +287,7 @@ impl SessionReporterImpl {
         let files = if query.is_empty() {
             Vec::new()
         } else {
-            collect_files(snapshot)
+            collect_files(&snapshot.matches)
         };
 
         let notification = ServerNotification::FuzzyFileSearchSessionUpdated(
@@ -311,6 +295,13 @@ impl SessionReporterImpl {
                 session_id: self.shared.session_id.clone(),
                 query: query.clone(),
                 files,
+                total_match_count: if query.is_empty() {
+                    0
+                } else {
+                    snapshot.total_match_count
+                },
+                scanned_file_count: snapshot.scanned_file_count,
+                walk_complete: snapshot.walk_complete,
             },
         );
         self.shared
@@ -350,9 +341,8 @@ impl file_search::SessionReporter for SessionReporterImpl {
     }
 }
 
-fn collect_files(snapshot: &file_search::FileSearchSnapshot) -> Vec<FuzzyFileSearchResult> {
-    let mut files = snapshot
-        .matches
+fn collect_files(matches: &[file_search::FileMatch]) -> Vec<FuzzyFileSearchResult> {
+    let mut files = matches
         .iter()
         .map(|m| {
             let file_name = m.path.file_name().unwrap_or_default();

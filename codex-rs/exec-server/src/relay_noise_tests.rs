@@ -579,14 +579,14 @@ async fn repeated_cancellation_during_validation_exhausts_budget(reset: bool) ->
         harness_websocket
             .send(Message::Binary(encode_relay_message_frame(&frame).into()))
             .await?;
-        timeout(Duration::from_secs(1), async {
+        timeout(Duration::from_secs(5), async {
             while calls.load(Ordering::SeqCst) != attempt + 1 {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await?;
         let frame = if reset {
-            RelayMessageFrame::reset(stream_id.clone(), String::new())
+            RelayMessageFrame::reset(stream_id.clone(), "cancelled".to_string())
         } else {
             RelayMessageFrame::data(stream_id.clone(), 0, vec![0])
         };

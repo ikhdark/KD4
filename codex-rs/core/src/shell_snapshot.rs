@@ -1003,7 +1003,7 @@ async fn run_remote_script_with_timeout(
     .await
 }
 
-async fn run_remote_snapshot_process_before(
+pub(crate) async fn run_remote_snapshot_process_before(
     exec_backend: Arc<dyn ExecBackend>,
     params: ExecParams,
     deadline: tokio::time::Instant,
@@ -1064,7 +1064,7 @@ async fn run_remote_snapshot_process_before(
                     String::from_utf8_lossy(&stderr)
                 );
             }
-            Ok::<_, anyhow::Error>(String::from_utf8_lossy(&stdout).into_owned())
+            String::from_utf8(stdout).context("Remote snapshot output was not UTF-8")
         };
         let output = tokio::select! {
             biased;

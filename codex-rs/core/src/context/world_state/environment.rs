@@ -3,6 +3,7 @@ use super::WorldStateSection;
 use crate::context::ContextualUserFragment;
 use crate::context::environment_context::FileSystemContext;
 use crate::context::environment_context::NetworkContext;
+use crate::context::environment_context::push_xml_escaped_attribute;
 use crate::context::environment_context::push_xml_escaped_text;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::session::turn_context::TurnContext;
@@ -87,6 +88,7 @@ impl WorldStateSection for EnvironmentsState {
                             cwd: environment.cwd.inferred_native_path_string(),
                             status: environment.status,
                             shell: environment.shell.clone(),
+                            os: environment.os.clone(),
                         },
                     )
                 })
@@ -239,7 +241,7 @@ impl ContextualUserFragment for RenderedEnvironments {
                 match update {
                     EnvironmentUpdate::Current(environment) => {
                         rendered.push_str("    <environment id=\"");
-                        push_xml_escaped_text(&mut rendered, id);
+                        push_xml_escaped_attribute(&mut rendered, id);
                         rendered.push('"');
                         rendered.push_str(">\n");
                         push_environment_values(&mut rendered, environment, "      ");
@@ -247,7 +249,7 @@ impl ContextualUserFragment for RenderedEnvironments {
                     }
                     EnvironmentUpdate::Unavailable => {
                         rendered.push_str("    <environment id=\"");
-                        push_xml_escaped_text(&mut rendered, id);
+                        push_xml_escaped_attribute(&mut rendered, id);
                         rendered.push_str("\" status=\"unavailable\" />\n");
                     }
                 }
@@ -292,6 +294,12 @@ fn push_environment_values(rendered: &mut String, environment: &EnvironmentState
     rendered.push_str("<cwd>");
     push_xml_escaped_text(rendered, &environment.cwd.inferred_native_path_string());
     rendered.push_str("</cwd>\n");
+    if let Some(os) = &environment.os {
+        rendered.push_str(indent);
+        rendered.push_str("<os>");
+        push_xml_escaped_text(rendered, os);
+        rendered.push_str("</os>\n");
+    }
     if environment.status == EnvironmentStatus::Starting {
         rendered.push_str(indent);
         rendered.push_str("<status>starting</status>\n");
@@ -322,6 +330,7 @@ struct EnvironmentState {
     cwd: PathUri,
     status: EnvironmentStatus,
     shell: Option<String>,
+    os: Option<String>,
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -339,11 +348,16 @@ struct EnvironmentSnapshot {
     cwd: String,
     status: EnvironmentStatus,
     shell: Option<String>,
+    #[serde(default)]
+    os: Option<String>,
 }
 
 impl EnvironmentSnapshot {
     fn has_same_diff_value(&self, other: &Self) -> bool {
-        self.cwd == other.cwd && self.status == other.status && self.shell == other.shell
+        self.cwd == other.cwd
+            && self.status == other.status
+            && self.shell == other.shell
+            && self.os == other.os
     }
 }
 
@@ -363,6 +377,7 @@ fn environment_states(snapshot: &TurnEnvironmentSnapshot) -> BTreeMap<String, En
                 environment.environment_id.clone(),
                 EnvironmentState {
                     cwd: environment.cwd().clone(),
+                    os: environment.operating_system.clone(),
                     status: EnvironmentStatus::Available,
                     shell: environment
                         .shell
@@ -377,6 +392,7 @@ fn environment_states(snapshot: &TurnEnvironmentSnapshot) -> BTreeMap<String, En
             .entry(environment.selection.environment_id.clone())
             .or_insert_with(|| EnvironmentState {
                 cwd: environment.selection.cwd.clone(),
+                os: None,
                 status: EnvironmentStatus::Starting,
                 shell: None,
             });

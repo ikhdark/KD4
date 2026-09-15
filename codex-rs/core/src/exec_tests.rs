@@ -99,8 +99,11 @@ fn output_capture_preserves_observed_order_and_requires_excess_for_truncation() 
 
     capture.append(b"g");
     let overflowed = capture.snapshot();
-    assert_eq!(overflowed.text, b"aBCdef");
+    assert_eq!(overflowed.text, b"aBCefg");
     assert!(overflowed.truncated);
+
+    capture.append(b"0123456789");
+    assert_eq!(capture.snapshot().text, b"aBC789");
 }
 
 impl ChunkedReader {
@@ -298,7 +301,9 @@ fn sandbox_detection_ignores_network_policy_text_with_zero_exit_code() {
 #[tokio::test]
 async fn read_output_limits_retained_bytes_for_shell_capture() {
     let (mut writer, reader) = tokio::io::duplex(1024);
-    let bytes = vec![b'a'; EXEC_OUTPUT_MAX_BYTES.saturating_add(128 * 1024)];
+    let mut bytes = vec![b'a'; EXEC_OUTPUT_MAX_BYTES.saturating_add(128 * 1024)];
+    bytes[..5].copy_from_slice(b"HEAD\n");
+    bytes.extend_from_slice(b"\nerror: could not compile\nTAIL\n");
     tokio::spawn(async move {
         writer.write_all(&bytes).await.expect("write");
     });
@@ -314,6 +319,13 @@ async fn read_output_limits_retained_bytes_for_shell_capture() {
     .expect("read");
     assert_eq!(out.text.len(), EXEC_OUTPUT_MAX_BYTES);
     assert!(out.truncated);
+    assert!(out.text.starts_with(b"HEAD\n"));
+    assert!(out.text.ends_with(b"\nerror: could not compile\nTAIL\n"));
+    assert!(
+        String::from_utf8(out.text)
+            .expect("ASCII output")
+            .contains("[... output truncated ...]")
+    );
 }
 
 #[tokio::test]
@@ -502,98 +514,11 @@ async fn read_output_flushes_terminal_incomplete_utf8_once() {
     assert_eq!(rendered, "x�");
 }
 
-#[test]
-fn aggregate_output_prefers_stderr_on_contention() {
-    let stdout = StreamOutput {
-        text: vec![b'a'; EXEC_OUTPUT_MAX_BYTES],
-        truncated_after_lines: None,
-        truncated: false,
-    };
-    let stderr = StreamOutput {
-        text: vec![b'b'; EXEC_OUTPUT_MAX_BYTES],
-        truncated_after_lines: None,
-        truncated: false,
-    };
-
-    let aggregated = aggregate_output(&stdout, &stderr, Some(EXEC_OUTPUT_MAX_BYTES));
-    let stdout_cap = EXEC_OUTPUT_MAX_BYTES / 3;
-    let stderr_cap = EXEC_OUTPUT_MAX_BYTES.saturating_sub(stdout_cap);
-
-    assert_eq!(aggregated.text.len(), EXEC_OUTPUT_MAX_BYTES);
-    assert_eq!(aggregated.text[..stdout_cap], vec![b'a'; stdout_cap]);
-    assert_eq!(aggregated.text[stdout_cap..], vec![b'b'; stderr_cap]);
-}
-
-#[test]
-fn aggregate_output_fills_remaining_capacity_with_stderr() {
-    let stdout_len = EXEC_OUTPUT_MAX_BYTES / 10;
-    let stdout = StreamOutput {
-        text: vec![b'a'; stdout_len],
-        truncated_after_lines: None,
-        truncated: false,
-    };
-    let stderr = StreamOutput {
-        text: vec![b'b'; EXEC_OUTPUT_MAX_BYTES],
-        truncated_after_lines: None,
-        truncated: false,
-    };
-
-    let aggregated = aggregate_output(&stdout, &stderr, Some(EXEC_OUTPUT_MAX_BYTES));
-    let stderr_cap = EXEC_OUTPUT_MAX_BYTES.saturating_sub(stdout_len);
-
-    assert_eq!(aggregated.text.len(), EXEC_OUTPUT_MAX_BYTES);
-    assert_eq!(aggregated.text[..stdout_len], vec![b'a'; stdout_len]);
-    assert_eq!(aggregated.text[stdout_len..], vec![b'b'; stderr_cap]);
-}
-
-#[test]
-fn aggregate_output_rebalances_when_stderr_is_small() {
-    let stdout = StreamOutput {
-        text: vec![b'a'; EXEC_OUTPUT_MAX_BYTES],
-        truncated_after_lines: None,
-        truncated: false,
-    };
-    let stderr = StreamOutput {
-        text: vec![b'b'; 1],
-        truncated_after_lines: None,
-        truncated: false,
-    };
-
-    let aggregated = aggregate_output(&stdout, &stderr, Some(EXEC_OUTPUT_MAX_BYTES));
-    let stdout_len = EXEC_OUTPUT_MAX_BYTES.saturating_sub(1);
-
-    assert_eq!(aggregated.text.len(), EXEC_OUTPUT_MAX_BYTES);
-    assert_eq!(aggregated.text[..stdout_len], vec![b'a'; stdout_len]);
-    assert_eq!(aggregated.text[stdout_len..], vec![b'b'; 1]);
-}
-
-#[test]
-fn aggregate_output_keeps_stdout_then_stderr_when_under_cap() {
-    let stdout = StreamOutput {
-        text: vec![b'a'; 4],
-        truncated_after_lines: None,
-        truncated: false,
-    };
-    let stderr = StreamOutput {
-        text: vec![b'b'; 3],
-        truncated_after_lines: None,
-        truncated: false,
-    };
-
-    let aggregated = aggregate_output(&stdout, &stderr, Some(EXEC_OUTPUT_MAX_BYTES));
-    let mut expected = Vec::new();
-    expected.extend_from_slice(&stdout.text);
-    expected.extend_from_slice(&stderr.text);
-
-    assert_eq!(aggregated.text, expected);
-    assert_eq!(aggregated.truncated_after_lines, None);
-}
-
 #[tokio::test]
 async fn read_output_retains_all_bytes_for_full_buffer_capture() {
     let (mut writer, reader) = tokio::io::duplex(1024);
     let bytes = vec![b'a'; EXEC_OUTPUT_MAX_BYTES.saturating_add(128 * 1024)];
-    let expected_len = bytes.len();
+    let expected = bytes.clone();
     // The duplex pipe is smaller than `bytes`, so the writer must run concurrently
     // with `read_output()` or `write_all()` will block once the buffer fills up.
     tokio::spawn(async move {
@@ -609,33 +534,112 @@ async fn read_output_retains_all_bytes_for_full_buffer_capture() {
     )
     .await
     .expect("read");
-    assert_eq!(out.text.len(), expected_len);
+    assert_eq!(out.text, expected);
+    assert!(!out.truncated);
 }
 
-#[test]
-fn aggregate_output_keeps_all_bytes_when_uncapped() {
-    let stdout = StreamOutput {
-        text: vec![b'a'; EXEC_OUTPUT_MAX_BYTES],
-        truncated_after_lines: None,
-        truncated: false,
-    };
-    let stderr = StreamOutput {
-        text: vec![b'b'; EXEC_OUTPUT_MAX_BYTES],
-        truncated_after_lines: None,
-        truncated: false,
-    };
+#[tokio::test]
+async fn aggregate_capture_retains_observed_head_and_tail_from_both_streams() {
+    let marker = "\n[... output truncated ...]\n";
+    for (stdout, stderr, cap, expected, truncated) in [
+        (
+            "a".repeat(128),
+            "b".repeat(128),
+            Some(128),
+            format!("{}{marker}{}", "a".repeat(36), "b".repeat(64)),
+            true,
+        ),
+        (
+            "a".repeat(10),
+            "b".repeat(128),
+            Some(128),
+            format!(
+                "{}{}{marker}{}",
+                "a".repeat(10),
+                "b".repeat(26),
+                "b".repeat(64)
+            ),
+            true,
+        ),
+        (
+            "a".repeat(128),
+            "b".to_string(),
+            Some(128),
+            format!("{}{marker}{}b", "a".repeat(36), "a".repeat(63)),
+            true,
+        ),
+        (
+            "aaaa".to_string(),
+            "bbb".to_string(),
+            Some(128),
+            "aaaabbb".to_string(),
+            false,
+        ),
+        (
+            "a".repeat(128),
+            "b".repeat(128),
+            None,
+            format!("{}{}", "a".repeat(128), "b".repeat(128)),
+            false,
+        ),
+    ] {
+        let aggregate = Arc::new(Mutex::new(OutputCapture::new(cap)));
+        for (bytes, is_stderr) in [(stdout.into_bytes(), false), (stderr.into_bytes(), true)] {
+            let capture = Arc::new(Mutex::new(OutputCapture::new(cap)));
+            read_output_into_capture(
+                ChunkedReader::new([bytes]),
+                None,
+                is_stderr,
+                capture,
+                Some(Arc::clone(&aggregate)),
+                Arc::new(OutputDeltaLimiter::default()),
+            )
+            .await
+            .expect("read production output path");
+        }
+        let output = aggregate.lock().expect("capture lock").snapshot();
+        assert_eq!(output.text, expected.as_bytes());
+        assert_eq!(output.truncated, truncated);
+    }
+}
 
-    let aggregated = aggregate_output(&stdout, &stderr, /*max_bytes*/ None);
-
-    assert_eq!(aggregated.text.len(), EXEC_OUTPUT_MAX_BYTES * 2);
-    assert_eq!(
-        aggregated.text[..EXEC_OUTPUT_MAX_BYTES],
-        vec![b'a'; EXEC_OUTPUT_MAX_BYTES]
-    );
-    assert_eq!(
-        aggregated.text[EXEC_OUTPUT_MAX_BYTES..],
-        vec![b'b'; EXEC_OUTPUT_MAX_BYTES]
-    );
+#[tokio::test]
+async fn retained_output_truncation_preserves_utf8_at_both_cuts() {
+    let input = format!("{}END", "é🙂".repeat(30));
+    for (cap, expected, truncated) in [
+        (
+            127,
+            format!(
+                "{}é\n[... output truncated ...]\n{}END",
+                "é🙂".repeat(5),
+                "é🙂".repeat(10)
+            ),
+            true,
+        ),
+        (input.len(), input.clone(), false),
+    ] {
+        let capture = Arc::new(Mutex::new(OutputCapture::new(Some(cap))));
+        let aggregate = Arc::new(Mutex::new(OutputCapture::new(Some(cap))));
+        read_output_into_capture(
+            ChunkedReader::new(input.as_bytes().chunks(3).map(<[u8]>::to_vec)),
+            None,
+            false,
+            Arc::clone(&capture),
+            Some(Arc::clone(&aggregate)),
+            Arc::new(OutputDeltaLimiter::default()),
+        )
+        .await
+        .expect("read production output path");
+        for capture in [capture, aggregate] {
+            let output = capture.lock().expect("capture lock").snapshot();
+            assert!(output.text.len() <= cap);
+            assert_eq!(
+                String::from_utf8(output.text).expect("valid UTF-8"),
+                expected
+            );
+            assert_eq!(output.truncated, truncated);
+        }
+    }
 }
 
 #[test]
@@ -749,11 +753,13 @@ async fn windows_direct_exec_completes_for_trivial_command() -> Result<()> {
 
 #[tokio::test]
 async fn forced_direct_exec_termination_reaps_the_child() -> Result<()> {
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::FromRawHandle;
+    use std::os::windows::io::OwnedHandle;
     use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
-    };
+    use windows_sys::Win32::System::Threading::OpenProcess;
+    use windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     let cwd = codex_utils_absolute_path::AbsolutePathBuf::current_dir()?;
     let managed_root = ManagedRootProcess::reserve_with_reclaim().await?;
@@ -1662,11 +1668,14 @@ fn powershell_literal_path(path: &std::path::Path) -> String {
 
 #[tokio::test]
 async fn direct_exec_cancellation_terminates_windows_descendants() -> Result<()> {
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
-    };
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::FromRawHandle;
+    use std::os::windows::io::OwnedHandle;
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+    use windows_sys::Win32::System::Threading::OpenProcess;
+    use windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     let temp_dir = tempfile::TempDir::new()?;
     let ready_marker = temp_dir.path().join("descendant.ready");

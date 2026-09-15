@@ -229,7 +229,8 @@ fn enforce_history_limit(
     // Keep both generations locked across publication. Waiting users of the old
     // generation must reopen; users of the new one wait for publication to finish.
     replacement.as_file().lock()?;
-    replacement.persist(path).map_err(|error| error.error)?;
+    // Preserve open readers of the old generation on Windows as well as Unix.
+    std::fs::rename(replacement.path(), path)?;
     Ok(())
 }
 

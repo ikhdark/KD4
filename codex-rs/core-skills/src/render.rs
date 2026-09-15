@@ -31,19 +31,24 @@ pub const SKILLS_HOW_TO_USE: &str = r###"- Use the smallest skill set named by t
 - If a named skill or required read is unavailable, state it and use the safest fallback; retry a rejected shell read through a dedicated read-only route."###;
 
 pub fn render_available_skills_body(skill_root_lines: &[String], skill_lines: &[String]) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    lines.push("## Skills".to_string());
+    let mut rendered = String::from("\n## Skills\n");
     if skill_root_lines.is_empty() {
-        lines.push(SKILLS_INTRO_WITH_ABSOLUTE_PATHS.to_string());
+        rendered.push_str(SKILLS_INTRO_WITH_ABSOLUTE_PATHS);
+        rendered.push('\n');
     } else {
-        lines.push(SKILLS_INTRO_WITH_ALIASES.to_string());
-        lines.push("### Skill roots".to_string());
-        lines.extend(skill_root_lines.iter().cloned());
+        rendered.push_str(SKILLS_INTRO_WITH_ALIASES);
+        rendered.push_str("\n### Skill roots\n");
+        for line in skill_root_lines {
+            rendered.push_str(line);
+            rendered.push('\n');
+        }
     }
-    lines.push("### Available skills".to_string());
-    lines.extend(skill_lines.iter().cloned());
-
-    format!("\n{}\n", lines.join("\n"))
+    rendered.push_str("### Available skills\n");
+    for line in skill_lines {
+        rendered.push_str(line);
+        rendered.push('\n');
+    }
+    rendered
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -722,6 +727,31 @@ mod tests {
     }
 
     #[test]
+    fn catalog_render_preserves_roots_and_skill_order() {
+        let skills = vec![
+            "- alpha: first (skill:one)".to_string(),
+            "- beta: second (skill:two)".to_string(),
+        ];
+        for roots in [
+            vec![],
+            vec!["- r0 = /skills".to_string(), "- r1 = /plugins".to_string()],
+        ] {
+            let text = render_available_skills_body(&roots, &skills);
+            let (heading, catalog) = text.split_once("### Available skills\n").unwrap();
+            assert!(heading.starts_with("\n## Skills\n"));
+            assert_eq!(
+                catalog,
+                "- alpha: first (skill:one)\n- beta: second (skill:two)\n"
+            );
+            if roots.is_empty() {
+                assert!(!heading.contains("### Skill roots"));
+            } else {
+                assert!(heading.ends_with("### Skill roots\n- r0 = /skills\n- r1 = /plugins\n"));
+            }
+        }
+    }
+
+    #[test]
     fn implicit_catalog_uses_opaque_ids_without_host_paths_or_roots() {
         let root = test_path_buf("/Users/private/.codex/skills").abs();
         let skills = vec![
@@ -974,8 +1004,9 @@ mod tests {
         // characters. The extra separator and two exclamation marks add three.
         let budget = SkillMetadataBudget::Tokens(18);
 
-        let rendered = build_available_skills_from_metadata(std::slice::from_ref(&long_skill), budget)
-            .expect("skills should render");
+        let rendered =
+            build_available_skills_from_metadata(std::slice::from_ref(&long_skill), budget)
+                .expect("skills should render");
 
         assert_eq!(rendered.report.total_count, 1);
         assert_eq!(rendered.report.included_count, 1);

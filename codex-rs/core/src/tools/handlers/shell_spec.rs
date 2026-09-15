@@ -26,12 +26,12 @@ fn validation_context_schema() -> JsonSchema {
     schema
 }
 
-const LEGACY_SHELL_SCRIPT_DESCRIPTION: &str = "Shell script to execute. Read-only inspection may be batched in a single script call. For a standalone native executable with known arguments, you may use `kind: \"argv\"` with `program` and `args`. Keep pipelines, redirection, shell expansion, compound statements, builtins, and `.cmd`/`.bat` semantics in script form. Arbitrary command strings remain shell scripts and must not be heuristically split. For complex PowerShell, prefer `kind: \"powershell_script\"`. Keep read-only PowerShell to direct cmdlet pipelines when possible; variables, loops, or script blocks may require the repository mutation lane.";
+const LEGACY_SHELL_SCRIPT_DESCRIPTION: &str = "Shell script to execute in the user's default shell. For a standalone native executable with known arguments, you may use `kind: \"argv\"` with `program` and `args`. Keep pipelines, redirection, shell expansion, compound statements, and builtins in script form. On Windows, also keep `.cmd`/`.bat` calls in script form; for complex PowerShell, prefer `kind: \"powershell_script\"`.";
 
 fn bounded_integer(description: String, minimum: u64, maximum: u64) -> JsonSchema {
     JsonSchema {
         minimum: Some(Number::from(minimum)),
-        maximum: Some(Number::from(maximum)),
+        maximum: Some(Number::from(maximum.min((1_u64 << 53) - 1))),
         ..JsonSchema::integer(Some(description))
     }
 }
@@ -43,11 +43,9 @@ fn command_parameters_schema(
     // The runtime decoder (`CommandInvocation::from_parts`) accepts the
     // historical untagged script string and infers `argv` or
     // `powershell_script` from their fields, so the advertised and
-    // preflight-enforced schema must accept exactly that surface. Field
-    // combination rules stay in the decoder, which reports violations with
-    // prescriptive field-level messages; a stricter schema here rejects
-    // shapes the runtime supports and buries the reason in an opaque
-    // validation error.
+    // preflight-enforced schema must accept that surface. Require a command
+    // field, while leaving conflicting combinations to the decoder's
+    // prescriptive field-level messages.
     properties.insert(
         "kind".to_string(),
         JsonSchema::string_enum(
@@ -61,7 +59,18 @@ fn command_parameters_schema(
             )),
         ),
     );
-    JsonSchema::object(properties, /*required*/ None, Some(false.into()))
+    JsonSchema {
+        any_of: Some(
+            [script_field, "program", "script_body"]
+                .into_iter()
+                .map(|field| JsonSchema {
+                    required: Some(vec![field.to_string()]),
+                    ..JsonSchema::default()
+                })
+                .collect(),
+        ),
+        ..JsonSchema::object(properties, /*required*/ None, Some(false.into()))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +127,7 @@ pub(crate) fn create_exec_command_tool_for_policy(
         (
             "script_body".to_string(),
             JsonSchema::string(Some(
-                "Plain PowerShell script for `kind: \"powershell_script\"`; Codex encodes it at runtime. Read-only PowerShell that uses variables, loops, or script blocks may require the repository mutation lane."
+                "Plain PowerShell script for `kind: \"powershell_script\"`; Codex encodes it at runtime."
                     .to_string(),
             )),
         ),
@@ -139,7 +148,7 @@ pub(crate) fn create_exec_command_tool_for_policy(
         (
             "yield_time_ms".to_string(),
             bounded_integer(
-                "Wait before yielding output. Defaults to 2000 ms; effective range is 250-30000 ms.".to_string(),
+                format!("Wait before yielding output. Defaults to 30000 ms for recognized validation commands and 2000 ms otherwise; explicit values use 250-30000 ms. Windows initial waits are floored to {} ms.", crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS),
                 crate::unified_exec::MIN_YIELD_TIME_MS,
                 crate::unified_exec::MAX_YIELD_TIME_MS,
             ),
@@ -189,13 +198,13 @@ pub(crate) fn create_exec_command_tool_for_policy(
     properties.insert(
         "force_fresh".to_string(),
         JsonSchema::boolean(Some(
-            "Execute without reusing prior immutable evidence.".to_string(),
+            "Force execution instead of reusing equivalent evidence. By default, unchanged file reads, searches, and deterministic failures may reuse a prior result; reused results are labeled. Set true when external state changed or a fresh observation is required.".to_string(),
         )),
     );
     ToolSpec::Function(ResponsesApiTool {
         name: "exec_command".to_string(),
         description: format!(
-            "Runs a command, returning output or a session ID for ongoing interaction. For commands needing no shell interpretation, you may use program and args (kind: argv). Read-only inspection may be batched in a single script call. Use kind: powershell_script with script_body for PowerShell semantics. Keep pipelines, redirections, and shell expansion in script form.\n\n{}\n\n{}",
+            "Runs a command, returning output or a session ID for ongoing interaction. For commands needing no shell interpretation, you may use program and args (kind: argv). Use kind: powershell_script with script_body for PowerShell semantics. Keep pipelines, redirections, and shell expansion in script form.\n\n{}\n\n{}",
             rg_search_admission_guidance(),
             filesystem_safety_guidance(),
         ),
@@ -204,6 +213,30 @@ pub(crate) fn create_exec_command_tool_for_policy(
         parameters: command_parameters_schema(properties, "cmd"),
         output_schema: Some(unified_exec_output_schema()),
     })
+}
+
+pub(crate) fn create_foreign_shell_command_tool(
+    options: CommandToolOptions,
+    allow_escalated_sandbox_permissions: bool,
+) -> ToolSpec {
+    let ToolSpec::Function(mut tool) = create_exec_command_tool_for_policy(
+        options,
+        false,
+        true,
+        allow_escalated_sandbox_permissions,
+    ) else {
+        unreachable!("exec_command has a function schema")
+    };
+    tool.name = "shell_command".to_string();
+    let mut properties = tool
+        .parameters
+        .properties
+        .take()
+        .expect("command properties");
+    let command = properties.remove("cmd").expect("script command");
+    properties.insert("command".to_string(), command);
+    tool.parameters = command_parameters_schema(properties, "command");
+    ToolSpec::Function(tool)
 }
 
 pub fn create_write_stdin_tool() -> ToolSpec {
@@ -225,7 +258,7 @@ pub fn create_write_stdin_tool() -> ToolSpec {
         (
             "yield_time_ms".to_string(),
             bounded_integer(
-                "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms; empty polls wait for output or completion for at least 60000 ms even when a shorter yield is requested. A wait deadline does not terminate the process.".to_string(),
+                "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms. Empty polls default to 60000 ms; explicit shorter waits are honored down to 250 ms. A wait deadline does not terminate the process.".to_string(),
                 crate::unified_exec::MIN_YIELD_TIME_MS,
                 crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
             ),
@@ -285,7 +318,7 @@ pub(crate) fn create_shell_command_tool_for_policy(
         (
             "script_body".to_string(),
             JsonSchema::string(Some(
-                "Plain PowerShell script for `kind: \"powershell_script\"`; Codex encodes it at runtime. Read-only PowerShell that uses variables, loops, or script blocks may require the repository mutation lane."
+                "Plain PowerShell script for `kind: \"powershell_script\"`; Codex encodes it at runtime."
                     .to_string(),
             )),
         ),
@@ -333,27 +366,14 @@ pub(crate) fn create_shell_command_tool_for_policy(
     properties.insert(
         "force_fresh".to_string(),
         JsonSchema::boolean(Some(
-            "Execute without reusing prior immutable evidence.".to_string(),
+            "Force execution instead of reusing equivalent evidence. By default, unchanged file reads, searches, and deterministic failures may reuse a prior result; reused results are labeled. Set true when external state changed or a fresh observation is required.".to_string(),
         )),
     );
 
     let description = format!(
-        r#"Runs a Powershell command (Windows) and returns its output.
-
-Examples of valid command strings:
-
-- ls -a (show hidden): "Get-ChildItem -Force"
-- recursive find by name: "Get-ChildItem -Recurse -Filter *.py"
-- recursive grep: "Get-ChildItem -Path C:\\myrepo -Recurse | Select-String -Pattern 'TODO' -CaseSensitive"
-- ps aux | grep python: "Get-Process | Where-Object {{ $_.ProcessName -like '*python*' }}"
-- setting an env var: "$env:FOO='bar'; echo $env:FOO"
-- running an inline Python script: "@'\\nprint('Hello, world!')\\n'@ | python -"
-
-{}
-
-{}"#,
+        "Runs a command in the user's default shell and returns its output. Use syntax supported by that shell. For commands needing no shell interpretation, you may use program and args (kind: argv). Use kind: powershell_script with script_body for PowerShell semantics.\n\n{}\n\n{}",
         rg_search_admission_guidance(),
-        windows_shell_guidance(),
+        filesystem_safety_guidance(),
     );
 
     ToolSpec::Function(ResponsesApiTool {
@@ -416,15 +436,15 @@ fn unified_exec_output_schema() -> Value {
                 "description": "Elapsed wall time spent waiting for output in seconds."
             },
             "exit_code": {
-                "type": "number",
+                "type": "integer",
                 "description": "Process exit code when the command finished during this call."
             },
             "session_id": {
-                "type": "number",
+                "type": "integer",
                 "description": "Session identifier to pass to write_stdin when the process is still running."
             },
             "original_token_count": {
-                "type": "number",
+                "type": "integer",
                 "description": "Approximate token count before output truncation."
             },
             "raw_output_artifact": {
@@ -432,7 +452,7 @@ fn unified_exec_output_schema() -> Value {
                 "description": "Path to output retained before model summarization."
             },
             "raw_output_artifact_bytes": {
-                "type": "number",
+                "type": "integer",
                 "description": "Cumulative bytes retained in the raw output artifact."
             },
             "raw_output_artifact_error": {
@@ -577,19 +597,23 @@ fn file_system_permissions_schema() -> JsonSchema {
 }
 
 fn windows_shell_guidance() -> &'static str {
-    r#"Windows safety rules:
+    r#"Filesystem safety: keep destructive operations in one shell, resolve recursive delete or move targets inside the intended directory first, and avoid unresolved variables or globs.
+
+Windows safety rules (apply when executing in a Windows environment, regardless of the host OS):
 - Do not compose destructive filesystem commands across shells. Do not enumerate paths in PowerShell and then pass them to `cmd /c`, batch builtins, or another shell for deletion or moving. Use one shell end-to-end, prefer native PowerShell cmdlets such as `Remove-Item` / `Move-Item` with `-LiteralPath`, and avoid string-built shell commands for file operations.
 - Before any recursive delete or move on Windows, verify the resolved absolute target paths stay within the intended workspace or explicitly named target directory. Never issue a recursive delete or move against a computed path if the final target has not been checked.
 - When using `Start-Process` to launch a background helper or service, pass `-WindowStyle Hidden` unless the user explicitly asked for a visible interactive window. Use visible windows only for interactive tools the user needs to see or control."#
 }
 
 fn filesystem_safety_guidance() -> &'static str {
-    "Filesystem safety: keep destructive operations in one shell, resolve recursive delete or move targets inside the intended directory first, and avoid unresolved variables or globs."
+    windows_shell_guidance()
 }
 
 fn rg_search_admission_guidance() -> &'static str {
     r#"Search guidance:
-- Start repository `rg` searches in a likely owning path. Expand after a miss or when the request genuinely requires a repository-wide inventory."#
+- Start repository `rg` searches in a likely owning path. Use `rg -l` to identify files, then `rg -n -C 2` on the shortlist. Exclude build output with `-g '!target'` and bound matches with `--max-count`. Expand after a miss or when the request requires a repository-wide inventory.
+- Search windows locate code. Before editing, read the complete enclosing function, type, or configuration unit and refresh it after intervening writes.
+- Output above the token budget is truncated. For a known source file, request enough `max_output_tokens` to read the needed range in one call."#
 }
 
 #[cfg(test)]

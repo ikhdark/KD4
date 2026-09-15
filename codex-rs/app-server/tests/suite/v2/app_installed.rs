@@ -261,6 +261,7 @@ async fn installed_apps_global_disable_retains_tool_derived_identities() -> Resu
 async fn installed_apps_thread_id_uses_effective_thread_config() -> Result<()> {
     let fixture = InstalledAppsFixture::start().await?;
     let codex_home = configured_codex_home(fixture.base_url())?;
+    app_test_support::write_models_cache(codex_home.path())?;
     let mut app_server = start_app_server(codex_home.path()).await?;
     let mut expected = send_installed_request(&mut app_server, /*force_refresh*/ true).await?;
 

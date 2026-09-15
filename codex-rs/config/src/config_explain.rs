@@ -314,16 +314,6 @@ pub const CONFIG_OPTION_DOCS: &[ConfigOptionDoc] = &[
         "Lifecycle hooks configured inline in config.toml.",
     ),
     doc(
-        "profile",
-        "Project and profile",
-        "Legacy profile selector kept to fail fast; use `--profile <name>` with `<name>.config.toml`.",
-    ),
-    doc(
-        "profiles",
-        "Project and profile",
-        "Legacy inline profile tables kept to fail fast; move each profile to `<name>.config.toml`.",
-    ),
-    doc(
         "projects",
         "Project and profile",
         "Per-project settings such as trust level.",
@@ -455,11 +445,6 @@ pub const CONFIG_OPTION_DOCS: &[ConfigOptionDoc] = &[
         "experimental_thread_store",
         "Experimental and compatibility",
         "Thread store implementation selector.",
-    ),
-    doc(
-        "experimental_thread_store_endpoint",
-        "Experimental and compatibility",
-        "Removed thread-store endpoint setting kept to fail fast.",
     ),
 ];
 

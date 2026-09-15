@@ -142,6 +142,7 @@ async fn turn_steer_rejections_emit_analytics_for_preflight_and_queue_failures()
     )?;
     mount_analytics_capture(&server, codex_home.path()).await?;
     let mut mcp = TestAppServer::builder()
+        .with_args(&["-c", "analytics.enabled=true"])
         .with_codex_home(codex_home.path())
         .without_managed_config()
         .build()

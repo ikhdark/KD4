@@ -1109,10 +1109,14 @@ fn terminal_claim_and_interrupt_fence_have_one_atomic_winner() {
         move || {
             for index in 0..ROUNDS {
                 start.wait();
-                if let Some(_permit) = coordinators[index].try_claim() {
-                    claim_wins[index].store(true, Ordering::Release);
-                }
+                let permit = coordinators[index].try_claim();
+                claim_wins[index].store(permit.is_some(), Ordering::Release);
                 finish.wait();
+                // An abandoned permit intentionally releases its claim. Keep the
+                // winning claim committed while the main thread observes it.
+                if let Some(permit) = permit {
+                    permit.complete_cleanup();
+                }
             }
         }
     });

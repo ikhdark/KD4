@@ -114,6 +114,6 @@ fn local_personality_template_contains_the_base_prompt_once() {
     let rendered =
         model.get_model_instructions(Some(codex_protocol::config_types::Personality::Friendly));
 
-    assert_eq!(rendered.matches(BASE_INSTRUCTIONS).count(), 1);
+    assert_eq!(rendered.matches(&model.base_instructions).count(), 1);
     assert!(rendered.contains(LOCAL_FRIENDLY_TEMPLATE));
 }

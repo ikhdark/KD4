@@ -209,7 +209,7 @@ impl ThreadEnvironments {
                 tracing::warn!("turn environment `{environment_id}` failed to start: {err}");
                 return Err(Arc::new(err));
             }
-            let shell = if environment.is_remote() {
+            let (shell, operating_system) = if environment.is_remote() {
                 let info = tokio::select! {
                     _ = cancellation.cancelled() => {
                         return Err(cancelled_environment_resolution());
@@ -222,15 +222,16 @@ impl ThreadEnvironments {
                         "invalid shell for environment `{environment_id}`: {err}"
                     )))
                 })?;
-                Some(shell)
+                (Some(shell), info.operating_system)
             } else {
-                Some(local_shell)
+                (Some(local_shell), Some(std::env::consts::OS.to_string()))
             };
             let Some(lifecycle) = lifecycle.upgrade() else {
                 return Err(cancelled_environment_resolution());
             };
             let mut turn_environment =
                 TurnEnvironment::new(selection.environment_id, environment, selection.cwd, shell);
+            turn_environment.operating_system = operating_system;
             turn_environment.attach_lifecycle(lifecycle);
             let mut snapshot_environment = turn_environment.clone();
             snapshot_environment.detach_lifecycle();
@@ -471,8 +472,8 @@ mod tests {
                     "result": {
                         "operatingSystem": "windows",
                         "shell": {
-                            "name": "powershell",
-                            "path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+                            "name": "pwsh",
+                            "path": "C:\\Program Files\\PowerShell\\7\\pwsh.exe"
                         },
                         "cwd": "file:///C:/workspace"
                     }
@@ -710,6 +711,25 @@ url = "ws://127.0.0.1:8765"
 
         assert!(snapshot.starting.is_empty());
         assert_eq!(snapshot.to_selections(), vec![selection]);
+        assert_eq!(
+            snapshot.primary().unwrap().operating_system.as_deref(),
+            Some("windows")
+        );
+        let (_session, turn_context) = crate::session::tests::make_session_and_context().await;
+        let mut state = crate::context::world_state::WorldState::default();
+        state.add_section(
+            crate::context::world_state::EnvironmentsState::from_turn_context_with_environments(
+                &turn_context,
+                &snapshot,
+            ),
+        );
+        let rendered = state
+            .render_full()
+            .into_iter()
+            .map(|fragment| serde_json::to_string(&fragment.into_boxed_response_item()).unwrap())
+            .collect::<String>();
+        assert!(rendered.contains("<os>windows</os>"), "{rendered}");
+        assert!(rendered.contains("<shell>powershell</shell>"), "{rendered}");
         server.await.expect("server task");
     }
 

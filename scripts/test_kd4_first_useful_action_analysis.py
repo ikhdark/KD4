@@ -14,6 +14,51 @@ def record(timestamp: str, record_type: str, payload: dict[str, object]) -> str:
 
 
 class FirstUsefulActionAnalysisTest(unittest.TestCase):
+    def test_mixed_schema_coverage_quantiles_and_exclusions_from_snapshot(self):
+        rows = []
+        for version, latency in ((25, 10), (26, 20), (27, 30), (27, 40)):
+            milestones = {"firstUsefulActionMs": latency, "firstDomainActionMs": latency}
+            if version >= 26:
+                milestones["firstModelOutputMs"] = latency / 2
+            if version >= 27:
+                milestones["firstVisibleOutputMs"] = latency / 2 + 1
+            rows.extend([
+                record("2026-08-17T00:00:00Z", "event_msg", {"type": "task_started"}),
+                record("2026-08-17T00:00:01Z", "event_msg", {"type": "task_complete", "timing": {"schemaVersion": version, "milestones": milestones}}),
+            ])
+        rows.extend([
+            "invalid json",
+            record("bad timestamp", "event_msg", {"type": "task_started"}),
+            record("2026-08-17T00:00:02Z", "event_msg", {"type": "task_started"}),
+            record("2026-08-17T00:00:03Z", "event_msg", {"type": "task_started"}),
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rollout.jsonl"
+            path.write_text("\n".join(rows), encoding="utf-8")
+            result = analysis.analyze_snapshots([read_rollout_snapshot(path)])
+        self.assertEqual(result["recordCount"], 12)
+        self.assertEqual(result["startedTurnCount"], 6)
+        self.assertEqual(result["completedTurnCount"], 4)
+        self.assertEqual(result["timingSchemaVersions"], {"25": 1, "26": 1, "27": 2})
+        self.assertEqual(result["canonical"]["startToFirstDomainActionMs"], {
+            "count": 4, "p50": 25, "p95": 38.5, "min": 10, "mean": 25,
+            "max": 40, "populationStdDev": 11.18, "eligibleTurnCount": 4, "coverage": 1,
+        })
+        model_output = result["canonical"]["startToFirstModelOutputMs"]
+        self.assertEqual((model_output["count"], model_output["coverage"], model_output["p50"]), (3, .75, 15))
+        visible = result["canonical"]["startToFirstVisibleOutputMs"]
+        self.assertEqual((visible["count"], visible["coverage"], visible["p50"]), (2, .5, 18.5))
+        self.assertEqual(result["canonical"]["startToFirstActionableOutputMs"]["coverage"], 0)
+        self.assertIsNone(result["canonical"]["startToFirstActionableOutputMs"]["p50"])
+        self.assertEqual(result["exclusionRates"], {
+            "invalidJsonLines": {"count": 1, "denominator": 12, "rate": 1 / 12},
+            "invalidTimestamps": {"count": 1, "denominator": 11, "rate": 1 / 11},
+            "incompleteTurns": {"count": 2, "denominator": 6, "rate": 1 / 3},
+            "supersededTurns": {"count": 1, "denominator": 6, "rate": 1 / 6},
+            "unterminatedTurns": {"count": 1, "denominator": 6, "rate": 1 / 6},
+            "incompleteCanonicalMilestones": {"count": 0, "denominator": 4, "rate": 0},
+        })
+
     def test_partial_canonical_milestone_is_not_admitted(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "rollout.jsonl"

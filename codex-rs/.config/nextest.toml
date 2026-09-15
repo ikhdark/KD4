@@ -25,6 +25,14 @@ path = "junit.xml"
 
 [profile.local]
 inherits = "default"
+# Finish the selected tests so local fixes can address failures in batches.
+fail-fast = false
+# Report failures without masking flakes with retries.
+retries = 0
+# Report counts and failures; gate commands capture PASS lines to verify selection.
+status-level = "fail"
+final-status-level = "fail"
+failure-output = "final"
 
 [profile.fast]
 inherits = "local"

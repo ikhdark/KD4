@@ -207,7 +207,14 @@ async fn websocket_fallback_surfaces_every_websocket_retry_stream_error() -> Res
     }
 
     let expected_stream_errors = vec!["Reconnecting... 1/2", "Reconnecting... 2/2"];
-    assert_eq!(stream_error_messages, expected_stream_errors);
+    assert_eq!(stream_error_messages.len(), expected_stream_errors.len());
+    for (actual, expected) in stream_error_messages.iter().zip(expected_stream_errors) {
+        let delay = actual
+            .strip_prefix(&format!("{expected} (next retry in "))
+            .and_then(|message| message.strip_suffix("ms)"))
+            .expect("retry notice includes the millisecond backoff");
+        assert!(delay.parse::<f64>()? > 0.0);
+    }
 
     Ok(())
 }

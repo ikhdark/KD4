@@ -158,6 +158,24 @@ impl ExecutorFileSystem for SyntheticFileSystem {
         Box::pin(async move { self.metadata(path) })
     }
 
+    fn read_directory_bounded<'a>(
+        &'a self,
+        path: &'a PathUri,
+        max_entries: usize,
+        _sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, codex_exec_server::ReadDirectoryOutcome> {
+        Box::pin(async move {
+            let mut entries = SyntheticFileSystem::read_directory(self, path).await?;
+            let limit_reached = entries.len() >= max_entries;
+            entries.truncate(max_entries);
+            Ok(codex_exec_server::ReadDirectoryOutcome {
+                entries_examined: entries.len(),
+                entries,
+                limit_reached,
+            })
+        })
+    }
+
     fn read_directory<'a>(
         &'a self,
         path: &'a PathUri,

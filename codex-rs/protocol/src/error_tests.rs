@@ -199,6 +199,61 @@ fn unexpected_response(status: StatusCode) -> CodexErr {
 }
 
 #[test]
+fn sandbox_timeout_reports_partial_output_without_debug_dump() {
+    for aggregated in [true, false] {
+        let mut output = ExecToolCallOutput {
+            duration: Duration::from_millis(250),
+            timed_out: true,
+            ..Default::default()
+        };
+        if aggregated {
+            output.aggregated_output.text = "build started\ncompiling crate".to_string();
+        } else {
+            output.stdout.text = "compiling crate".to_string();
+            output.stderr.text = "build started".to_string();
+        }
+        let err = CodexErr::Sandbox(SandboxErr::Timeout {
+            output: Box::new(output),
+        });
+        assert_eq!(
+            get_error_message_ui(&err),
+            "error: command timed out after 250 ms\nbuild started\ncompiling crate"
+        );
+    }
+}
+
+#[test]
+fn sandbox_denied_display_bounds_output_and_keeps_diagnostics() {
+    let output = ExecToolCallOutput {
+        exit_code: 77,
+        aggregated_output: StreamOutput::new(format!(
+            "denial-head\n{}\ndenial-tail",
+            "detail ".repeat(10_000)
+        )),
+        ..Default::default()
+    };
+    let err = CodexErr::Sandbox(SandboxErr::Denied {
+        output: Box::new(output),
+        network_policy_decision: None,
+    });
+    let text = err.to_string();
+    assert!(text.starts_with(
+        "sandbox error: sandbox denied exec error, exit code: 77, output: denial-head\n"
+    ));
+    assert!(text.ends_with("denial-tail"));
+    assert!(text.len() < 2_200);
+}
+
+#[test]
+fn ordinary_interrupts_do_not_suggest_reporting_a_bug() {
+    assert_eq!(get_error_message_ui(&CodexErr::TurnAborted), "turn aborted");
+    assert_eq!(
+        get_error_message_ui(&CodexErr::Interrupted),
+        "interrupted (Ctrl-C)"
+    );
+}
+
+#[test]
 fn sandbox_denied_uses_aggregated_output_when_stderr_empty() {
     let output = ExecToolCallOutput {
         exit_code: 77,

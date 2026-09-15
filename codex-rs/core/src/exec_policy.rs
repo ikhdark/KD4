@@ -98,6 +98,45 @@ static BANNED_PREFIX_SUGGESTIONS: &[&[&str]] = &[
     &["lua"],
     &["lua", "-e"],
     &["osascript"],
+    &["deno"],
+    &["deno", "run"],
+    &["deno", "eval"],
+    &["bun"],
+    &["bun", "run"],
+    &["bun", "-e"],
+    &["bun", "--eval"],
+    &["uv"],
+    &["uv", "run"],
+    &["uv", "tool", "run"],
+    &["uvx"],
+    &["pipx"],
+    &["pipx", "run"],
+    &["julia"],
+    &["julia", "-e"],
+    &["Rscript"],
+    &["Rscript", "-e"],
+    &["go"],
+    &["go", "run"],
+    &["awk"],
+    &["gawk"],
+    &["mawk"],
+    &["tclsh"],
+    &["dotnet"],
+    &["dotnet", "run"],
+    &["dotnet", "exec"],
+    &["cmd"],
+    &["cmd", "/c"],
+    &["cmd", "/C"],
+    &["mshta"],
+    &["rundll32"],
+    &["regsvr32"],
+    &["wscript"],
+    &["cscript"],
+    &["msbuild"],
+    &["installutil"],
+    &["wsl"],
+    &["wsl", "-e"],
+    &["wsl", "--exec"],
 ];
 
 /// Describes which unmatched-command heuristics should classify the command
@@ -952,12 +991,44 @@ fn derive_requested_execpolicy_amendment_from_prefix_rule(
     if prefix_rule.is_empty() {
         return None;
     }
+    // A runtime remains broad when addressed by an absolute path or its Windows
+    // executable spelling. Preserve argument matching for specific scripts.
+    let program = prefix_rule[0]
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let program = program.strip_suffix(".exe").unwrap_or(&program);
+    // A cmd prefix containing only switches still permits an arbitrary command
+    // body. Recognize combinations and casing without banning a fixed body.
+    if program == "cmd"
+        && prefix_rule[1..].iter().all(|arg| {
+            matches!(
+                arg.to_ascii_lowercase().as_str(),
+                "/c" | "/k"
+                    | "/d"
+                    | "/q"
+                    | "/s"
+                    | "/a"
+                    | "/u"
+                    | "/e:on"
+                    | "/e:off"
+                    | "/f:on"
+                    | "/f:off"
+                    | "/v:on"
+                    | "/v:off"
+            )
+        })
+    {
+        return None;
+    }
     if BANNED_PREFIX_SUGGESTIONS.iter().any(|banned| {
         prefix_rule.len() == banned.len()
-            && prefix_rule
+            && program.eq_ignore_ascii_case(banned[0])
+            && prefix_rule[1..]
                 .iter()
                 .map(String::as_str)
-                .eq(banned.iter().copied())
+                .eq(banned[1..].iter().copied())
     }) {
         return None;
     }
@@ -1034,7 +1105,8 @@ fn derive_prompt_reason(command_args: &[String], evaluation: &Evaluation) -> Opt
 }
 
 fn render_shlex_command(args: &[String]) -> String {
-    shlex_try_join(args.iter().map(String::as_str)).unwrap_or_else(|_| args.join(" "))
+    shlex_try_join(args.iter().map(String::as_str))
+        .unwrap_or_else(|_| format!("argv {args:?} (cannot be represented as a shell command)"))
 }
 
 /// Derive a string explaining why the command was forbidden. If `justification`

@@ -53,9 +53,12 @@ def run_version(command: Sequence[str]) -> str | None:
     if completed.returncode != 0:
         return None
     for stream in (completed.stdout, completed.stderr):
-        output = (stream or "").strip().splitlines()
-        if output:
-            return output[0].strip()
+        for line in (stream or "").splitlines():
+            line = line.strip()
+            # Accept bare versions or the tool's name and optional "version";
+            # banners and warnings can precede either output stream's version.
+            if re.match(r"^(?:[\w.-]+\s+(?:version\s+)?)?v?\d+\.\d+(?:[.\s+-]|$)", line):
+                return line
     return None
 
 
@@ -202,6 +205,15 @@ def collect_checks() -> list[ToolCheck]:
             required_version=package_manager_version(pnpm_pin),
         ),
     ]
+    checks.append(
+        partial(
+            check_tool,
+            "rg",
+            ["rg", "--version"],
+            required=True,
+            guidance="Install ripgrep and make rg available on PATH for repository search.",
+        )
+    )
     checks.append(
         partial(
             check_tool,

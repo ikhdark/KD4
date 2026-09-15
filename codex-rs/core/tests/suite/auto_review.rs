@@ -162,7 +162,8 @@ async fn remote_model_override_uses_catalog_model_for_strict_auto_review() -> Re
 
     let cwd_path = cwd.abs();
     let (sandbox_policy, permission_profile) =
-        turn_permission_fields(PermissionProfile::read_only(), cwd_path.as_path());
+        // Strict review must reach Guardian even for a patch the base policy permits.
+        turn_permission_fields(PermissionProfile::Disabled, cwd_path.as_path());
     codex
         .submit(Op::UserInput {
             items: vec![UserInput::Text {

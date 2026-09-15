@@ -405,6 +405,7 @@ async fn list_apps_uses_thread_feature_flag_when_thread_id_is_provided() -> Resu
         AuthCredentialsStoreMode::File,
     )?;
 
+    app_test_support::write_models_cache(codex_home.path())?;
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .build()
@@ -429,7 +430,7 @@ chatgpt_base_url = "{server_url}"
 mcp_oauth_credentials_store = "file"
 
 [features]
-connectors = false
+apps = false
 "#
         ),
     )?;

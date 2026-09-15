@@ -522,13 +522,8 @@ pub(crate) async fn admit_validation_invocations(
     explicitly_tagged: bool,
 ) -> ValidationAdmission {
     let authorization = authorization.read().await;
-    if !authorization.is_enabled() {
-        return ValidationAdmission::Execute {
-            authorization_revision: authorization.revision,
-            is_validation: false,
-            classification: ValidationClassification::NonValidation,
-        };
-    }
+    // Classification also drives execution diagnostics. Only denial enforcement
+    // is disabled when production validation authorization is inactive.
     let classification = classify_validation_invocations(invocations);
     if let Some(skipped) =
         prohibited_skip_for_classification(&authorization, &classification, explicitly_tagged)
@@ -777,6 +772,13 @@ fn classify_argv_at_depth(
     }
     let binary = normalized_program_name(program);
 
+    if binary == "uv" && args.first().is_some_and(|arg| arg == "run") {
+        let Some(program) = args.get(1).filter(|arg| !arg.starts_with('-')) else {
+            return ValidationClassification::Opaque;
+        };
+        return classify_argv_at_depth(program, &args[2..], depth + 1);
+    }
+
     if matches!(binary.as_str(), "env" | "command" | "time") {
         let Some(index) = wrapper_program_index(&binary, args) else {
             return ValidationClassification::Opaque;
@@ -1003,7 +1005,30 @@ fn python_operation(args: &[String]) -> Option<ValidationOperation> {
                 .is_some_and(|module| matches!(module.as_str(), "pytest" | "unittest"))
                 .then_some(ValidationOperation::Test);
         }
-        if argument == "--" || !argument.starts_with('-') || argument == "-" {
+        if argument == "--" {
+            return None;
+        }
+        if !argument.starts_with('-') {
+            if normalized_program_name(argument) == "rust_test_runner.py" {
+                let mut runner_index = index + 1;
+                while let Some(option) = args.get(runner_index) {
+                    if matches!(option.as_str(), "--manifest" | "--target-dir" | "--profile") {
+                        args.get(runner_index + 1)?;
+                        runner_index += 2;
+                    } else if option.starts_with("--manifest=")
+                        || option.starts_with("--target-dir=")
+                        || option.starts_with("--profile=")
+                    {
+                        runner_index += 1;
+                    } else {
+                        return matches!(option.as_str(), "run-target" | "run-gate" | "parity")
+                            .then_some(ValidationOperation::Test);
+                    }
+                }
+            }
+            return None;
+        }
+        if argument == "-" {
             return None;
         }
 
@@ -1136,6 +1161,22 @@ fn wrapper_operations(binary: &str, args: &[String]) -> (Vec<ValidationOperation
         if selector == "--" || selector.starts_with('-') || selector.contains('=') {
             index += 1;
             continue;
+        }
+        // Named fork recipes own their remaining arguments (target, gate, and
+        // filters). These are not additional recipes or validation operations.
+        if binary == "just" && operations.is_empty() && !has_unclassified_targets {
+            match selector.as_str() {
+                "core-test"
+                | "core-test-fast"
+                | "core-test-lane"
+                | "_core-test-lane-reserved"
+                | "core-gate"
+                | "core-test-parity" => {
+                    return (vec![ValidationOperation::Test], false);
+                }
+                "core-test-list" | "core-test-plan" => return (Vec::new(), false),
+                _ => {}
+            }
         }
         let found = exact_selector_operations(selector);
         if found.is_empty() {
@@ -1499,7 +1540,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_turn_keeps_validation_authorization_inactive() {
+    async fn production_turn_keeps_validation_classification_without_enforcement() {
         let (_session, turn) = crate::session::tests::make_session_and_context().await;
         turn.update_validation_authorization(&[codex_protocol::user_input::UserInput::Text {
             text: "do not run tests".to_string(),
@@ -1515,12 +1556,24 @@ mod tests {
             )
             .await,
             ValidationAdmission::Execute {
-                is_validation: false,
+                is_validation: true,
                 authorization_revision: 0,
-                ..
+                classification: ValidationClassification::Validation { .. },
             }
         ));
-        assert_eq!(validation_classification_count(), 0);
+        assert_eq!(validation_classification_count(), 1);
+        for (invocation, tagged, expected) in [
+            (argv("cargo", &["test"]), false, true),
+            (argv("custom-runner", &["verify"]), true, true),
+            (argv("git", &["status"]), false, false),
+        ] {
+            let ValidationAdmission::Execute { is_validation, .. } =
+                admit_validation(&turn.validation_authorization, &invocation, tagged).await
+            else {
+                panic!("inactive authorization cannot deny a command");
+            };
+            assert_eq!(is_validation, expected);
+        }
     }
 
     #[test]
@@ -1559,6 +1612,57 @@ mod tests {
             argv("task", &["check"]),
         ] {
             assert!(is_validation(&invocation), "{invocation:?}");
+        }
+    }
+
+    #[test]
+    fn fork_validation_routes_exclude_inventory_and_unrelated_scripts() {
+        for invocation in [
+            argv(
+                "just",
+                &[
+                    "--justfile",
+                    "justfile",
+                    "core-test-fast",
+                    "core_lib",
+                    "-E",
+                    "test(parser)",
+                ],
+            ),
+            argv("just", &["core-gate", "tool-output-recovery"]),
+            argv(
+                "python",
+                &["scripts/rust_test_runner.py", "run-target", "core_lib"],
+            ),
+            argv(
+                "python",
+                &[
+                    "scripts/rust_test_runner.py",
+                    "--manifest",
+                    "tests.toml",
+                    "run-gate",
+                    "demo",
+                ],
+            ),
+            argv("uv", &["run", "python", "-m", "pytest"]),
+        ] {
+            assert!(is_validation(&invocation), "{invocation:?}");
+        }
+        for invocation in [
+            argv("just", &["core-test-list"]),
+            argv("just", &["core-test-plan", "core_lib"]),
+            argv(
+                "python",
+                &["scripts/rust_test_runner.py", "plan", "core_lib"],
+            ),
+            argv("python", &["scripts/rust_test_runner.py", "list-targets"]),
+            argv(
+                "python",
+                &["scripts/not_rust_test_runner.py", "run-target", "core_lib"],
+            ),
+            argv("uv", &["run", "python", "script.py", "pytest"]),
+        ] {
+            assert!(!is_validation(&invocation), "{invocation:?}");
         }
     }
 

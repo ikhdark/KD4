@@ -337,6 +337,7 @@ struct ProcessEntry {
     cwd: PathUri,
     initial_exec_command_active: Arc<std::sync::atomic::AtomicBool>,
     hook_command: String,
+    search_exit_one_is_no_match: bool,
     tty: bool,
     network_approval: Option<DeferredNetworkApproval>,
     session: Weak<Session>,

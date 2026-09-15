@@ -302,6 +302,8 @@ async fn probe_with(
     inputs: ToolPlanInputs,
 ) -> ToolPlanProbe {
     let (_session, mut turn) = make_session_and_context().await;
+    // Direct-exposure scenarios opt into tool search explicitly when needed.
+    turn.model_info.supports_search_tool = false;
     configure_turn(&mut turn);
     let turn = Arc::new(turn);
     let step_context = StepContext::for_test(Arc::clone(&turn));
@@ -1051,6 +1053,31 @@ async fn shell_family_follows_default_unified_exec_policy() {
 }
 
 #[tokio::test]
+async fn shell_command_schema_matches_the_selected_environment_runtime() {
+    for foreign in [false, true] {
+        let plan = probe(|turn| {
+            if foreign {
+                set_foreign_primary_environment(turn);
+            }
+            turn.permission_profile = PermissionProfile::Disabled;
+            set_feature(turn, Feature::ShellTool, true);
+            set_feature(turn, Feature::UnifiedExec, false);
+            turn.model_info.shell_type = ConfigShellToolType::ShellCommand;
+        })
+        .await;
+        let spec = plan.visible_spec("shell_command");
+        assert!(has_parameter(spec, "command"));
+        assert!(!has_parameter(spec, "cmd"));
+        assert_eq!(has_parameter(spec, "yield_time_ms"), foreign);
+        assert_eq!(has_parameter(spec, "timeout_ms"), !foreign);
+        assert_eq!(has_parameter(spec, "stall_timeout_ms"), !foreign);
+        if foreign {
+            plan.assert_registered_contains(&["write_stdin"]);
+        }
+    }
+}
+
+#[tokio::test]
 async fn foreign_primary_hides_exec_command_only_when_platform_sandboxing_is_required() {
     let sandboxed = probe(|turn| {
         set_foreign_primary_environment(turn);
@@ -1161,8 +1188,16 @@ async fn view_image_registration_requires_image_input_support() {
         turn.model_info.input_modalities = vec![InputModality::Text, InputModality::Image];
     })
     .await;
-    review_image_capable.assert_visible_lacks(&["view_image"]);
-    review_image_capable.assert_registered_lacks(&["view_image"]);
+    review_image_capable.assert_visible_contains(&["view_image"]);
+    review_image_capable.assert_registered_contains(&["view_image"]);
+
+    let review_text_only = probe(|turn| {
+        turn.session_source = SessionSource::SubAgent(SubAgentSource::Review);
+        turn.model_info.input_modalities = vec![InputModality::Text];
+    })
+    .await;
+    review_text_only.assert_visible_lacks(&["view_image"]);
+    review_text_only.assert_registered_lacks(&["view_image"]);
 
     let text_only = probe(|turn| {
         turn.model_info.input_modalities = vec![InputModality::Text];
@@ -1360,6 +1395,10 @@ async fn mcp_and_tool_search_follow_direct_and_deferred_tool_exposure() {
         |_| {},
         ToolPlanInputs {
             mcp_tools: Some(vec![mcp_tool("direct", "mcp__direct", "lookup")]),
+            exposure_identity: ToolExposureIdentity {
+                mcp_resources_available: true,
+                ..Default::default()
+            },
             ..ToolPlanInputs::default()
         },
     )
@@ -1393,6 +1432,7 @@ async fn mcp_and_tool_search_follow_direct_and_deferred_tool_exposure() {
 
     let missing_deferred_tools = probe(|turn| {
         set_feature(turn, Feature::Collab, /*enabled*/ false);
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ false);
         turn.model_info.supports_search_tool = true;
     })
     .await;
@@ -1572,7 +1612,8 @@ async fn winning_registered_runtime_owns_its_external_mutation_intent() {
     )
     .await;
     assert_eq!(
-        plan.external_mutation_intents.get("mcp__shared.lookup"),
+        plan.external_mutation_intents
+            .get(&ToolName::namespaced("mcp__shared", "lookup").to_string()),
         Some(&ExternalMutationIntent::ProvenReadOnly)
     );
 
@@ -1591,7 +1632,8 @@ async fn winning_registered_runtime_owns_its_external_mutation_intent() {
     )
     .await;
     assert_eq!(
-        plan.external_mutation_intents.get("mcp__shared.lookup"),
+        plan.external_mutation_intents
+            .get(&ToolName::namespaced("mcp__shared", "lookup").to_string()),
         Some(&ExternalMutationIntent::MayMutate)
     );
 }

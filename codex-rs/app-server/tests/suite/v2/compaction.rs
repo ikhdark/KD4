@@ -39,7 +39,7 @@ use tokio::time::timeout;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-const AUTO_COMPACT_LIMIT: i64 = 1_000;
+const AUTO_COMPACT_LIMIT: i64 = 200_000;
 const COMPACT_PROMPT: &str = "Summarize the conversation.";
 const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
 
@@ -147,6 +147,10 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
         "mock_provider",
         COMPACT_PROMPT,
     )?;
+    let config_path = codex_home.path().join("config.toml");
+    let mut config: toml::Table = std::fs::read_to_string(&config_path)?.parse()?;
+    config.remove("compact_prompt");
+    std::fs::write(config_path, toml::to_string(&config)?)?;
     write_chatgpt_auth(
         codex_home.path(),
         ChatGptAuthFixture::new("access-chatgpt").plan_type("pro"),

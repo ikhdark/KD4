@@ -364,7 +364,7 @@ mod tests {
         );
         for (i, l) in non_blank.iter().enumerate() {
             assert_eq!(
-                l.spans[0].style.fg,
+                l.style.patch(l.spans[0].style).fg,
                 Some(Color::Green),
                 "wrapped line {} should preserve green style, got {:?}",
                 i,

@@ -300,7 +300,6 @@ async fn run_remote_compact_task_inner_impl(
     let (compacted_history, retained_images) =
         build_v2_compacted_history(prompt_input, compaction_output);
     analytics_details.retained_image_count = Some(retained_images);
-    let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
     let (new_history, world_state_baseline, fragment_digests) = process_compacted_history(
         sess.as_ref(),
         compaction_turn_context.as_ref(),
@@ -322,13 +321,7 @@ async fn run_remote_compact_task_inner_impl(
     let compacted_request_prefix = new_history
         .split_last()
         .map_or_else(Vec::new, |(_, prefix)| prefix.to_vec());
-    let compacted_item = persisted_v2_compacted_item(
-        new_history.clone(),
-        new_window_number,
-        new_window_ids.first_window_id.to_string(),
-        new_window_ids.previous_window_id.map(|id| id.to_string()),
-        new_window_ids.window_id.to_string(),
-    );
+    let compacted_item = persisted_v2_compacted_item(new_history.clone());
     let trace_replacement_history = trace_input_history.as_ref().map(|_| new_history.clone());
     sess.replace_compacted_history(
         compaction_turn_context,
@@ -559,22 +552,17 @@ fn build_v2_compacted_history(
     (history, retained_image_count)
 }
 
-fn persisted_v2_compacted_item(
-    replacement_history: Vec<ResponseItem>,
-    window_number: u64,
-    first_window_id: String,
-    previous_window_id: Option<String>,
-    window_id: String,
-) -> CompactedItem {
+fn persisted_v2_compacted_item(replacement_history: Vec<ResponseItem>) -> CompactedItem {
     CompactedItem {
         message: String::new(),
         // Resume and fork reconstruction must install the same opaque checkpoint and bounded
         // unresolved user tail that became live above. `None` is reserved for legacy records.
         replacement_history: Some(replacement_history),
-        window_number: Some(window_number),
-        first_window_id: Some(first_window_id),
-        previous_window_id,
-        window_id: Some(window_id),
+        // The ordered history commit assigns and publishes the next window.
+        window_number: None,
+        first_window_id: None,
+        previous_window_id: None,
+        window_id: None,
     }
 }
 
@@ -1130,13 +1118,7 @@ mod tests {
             },
         ];
 
-        let persisted = persisted_v2_compacted_item(
-            replacement_history.clone(),
-            2,
-            "first".to_string(),
-            Some("previous".to_string()),
-            "current".to_string(),
-        );
+        let persisted = persisted_v2_compacted_item(replacement_history.clone());
 
         assert_eq!(persisted.replacement_history, Some(replacement_history));
     }

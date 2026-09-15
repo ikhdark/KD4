@@ -50,12 +50,25 @@ def _number(value: Any, *, nonnegative: bool = True) -> float | None:
 def _event_fields(value: Any) -> tuple[str, dict[str, Any]] | None:
     if not isinstance(value, dict):
         return None
-    fields = dict(value)
+    layers = [value]
     for key in ("fields", "attributes", "body"):
         nested = value.get(key)
         if isinstance(nested, dict):
-            fields.update(nested)
-    event_name = fields.get("event.name", fields.get("event_name"))
+            layers.append(nested)
+    fields: dict[str, Any] = {}
+    for layer in layers:
+        for key, field_value in layer.items():
+            fields.setdefault(key, field_value)
+    # Resolve aliases at each layer so a nested event.name cannot override a
+    # top-level event_name (or vice versa).
+    event_name = next(
+        (
+            layer.get("event.name", layer.get("event_name"))
+            for layer in layers
+            if "event.name" in layer or "event_name" in layer
+        ),
+        None,
+    )
     if event_name == "codex.model_attempt":
         return "attempt", fields
     if event_name == "codex.model_context_component":

@@ -5925,7 +5925,7 @@ async fn bounded_validation_operation_suspends_only_until_its_hard_deadline() {
             .store
             .reserve_stalled_nudge(
                 assignment.assignment_id,
-                before_deadline - Duration::seconds(120),
+                before_deadline - Duration::seconds(60),
             )
             .await
     })
@@ -5940,7 +5940,7 @@ async fn bounded_validation_operation_suspends_only_until_its_hard_deadline() {
             .store
             .recover_nonproductive_assignment(
                 assignment.assignment_id,
-                before_deadline - Duration::seconds(120),
+                before_deadline - Duration::seconds(60),
             )
             .await
     })
@@ -5951,7 +5951,7 @@ async fn bounded_validation_operation_suspends_only_until_its_hard_deadline() {
         NonproductiveRecovery::Suspended(ProductivitySummary {
             active_owned_operation_count: 1,
             cancelled_expired_operation_count: 0,
-            recovery_threshold_seconds: 120,
+            recovery_threshold_seconds: 60,
             recovery_policy_version: NONPRODUCTIVE_RECOVERY_POLICY_VERSION,
         })
     );

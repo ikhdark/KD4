@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import io
 import json
+import math
+import statistics
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Iterable, Sequence
@@ -83,11 +84,14 @@ def _percentile(values: Sequence[float], fraction: float) -> float:
 def _summary(values: Iterable[float]) -> dict[str, float | int | None]:
     samples = list(values)
     if not samples:
-        return {"count": 0, "p50": None, "p95": None, "max": None}
+        return {"count": 0, "p50": None, "p95": None, "min": None, "mean": None, "populationStdDev": None, "max": None}
     return {
         "count": len(samples),
         "p50": round(_percentile(samples, 0.50), 3),
         "p95": round(_percentile(samples, 0.95), 3),
+        "min": round(min(samples), 3),
+        "mean": round(statistics.fmean(samples), 3),
+        "populationStdDev": round(statistics.pstdev(samples), 3),
         "max": round(max(samples), 3),
     }
 
@@ -107,7 +111,7 @@ class _Turn:
 
 
 def decoded_records(snapshot: RolloutSnapshot) -> Iterable[Any]:
-    with io.BytesIO(snapshot.data) as handle:
+    with snapshot.open_lines() as handle:
         for line in handle:
             try:
                 yield json.loads(line)
@@ -123,7 +127,7 @@ def analyze_snapshots(snapshots: Sequence[RolloutSnapshot]) -> dict[str, Any]:
 
 
 def canonical_milestones(timing: Any) -> dict[str, float] | None:
-    """Return complete canonical milestones; legacy reconstruction needs events."""
+    """Require the domain/useful pair; other boundaries have separate coverage."""
     if not isinstance(timing, dict):
         return None
     version = timing.get("schemaVersion")
@@ -135,6 +139,8 @@ def canonical_milestones(timing: Any) -> dict[str, float] | None:
         and all(
             isinstance(milestones.get(key), (int, float))
             and not isinstance(milestones[key], bool)
+            and math.isfinite(milestones[key])
+            and milestones[key] >= 0
             for key in ("firstDomainActionMs", "firstUsefulActionMs")
         )
     ):
@@ -142,6 +148,7 @@ def canonical_milestones(timing: Any) -> dict[str, float] | None:
             key: float(value)
             for key, value in milestones.items()
             if isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value >= 0
         }
     return None
 
@@ -154,17 +161,23 @@ def analyze_records(
         "invalidJsonLines": 0,
         "invalidTimestamps": 0,
         "incompleteTurns": 0,
+        "supersededTurns": 0,
+        "unterminatedTurns": 0,
         "incompleteCanonicalMilestones": 0,
     }
     legacy_rows: list[dict[str, float]] = []
     canonical_rows: list[dict[str, float]] = []
     snapshot_metadata: list[dict[str, str | int]] = []
     completed_turns = 0
+    record_count = 0
+    started_turns = 0
+    schema_versions: dict[str, int] = {}
 
     for metadata, records in record_sets:
         snapshot_metadata.append(metadata)
         active: _Turn | None = None
         for record in records:
+            record_count += 1
             if not isinstance(record, dict):
                 exclusions["invalidJsonLines"] += 1
                 continue
@@ -179,8 +192,10 @@ def analyze_records(
             payload_type = payload.get("type")
 
             if record_type == "event_msg" and payload_type == "task_started":
+                started_turns += 1
                 if active is not None:
                     exclusions["incompleteTurns"] += 1
+                    exclusions["supersededTurns"] += 1
                 active = _Turn(started_ms=timestamp_ms)
                 continue
             if active is None:
@@ -208,6 +223,8 @@ def analyze_records(
             schema_version = (
                 timing.get("schemaVersion") if isinstance(timing, dict) else None
             )
+            version_key = str(schema_version) if type(schema_version) is int else "missing"
+            schema_versions[version_key] = schema_versions.get(version_key, 0) + 1
             if milestones is not None:
                 canonical_rows.append(milestones)
             elif (
@@ -231,6 +248,7 @@ def analyze_records(
             active = None
         if active is not None:
             exclusions["incompleteTurns"] += 1
+            exclusions["unterminatedTurns"] += 1
 
     canonical_metrics = {
         "startToUserInputRecordedMs": _summary(
@@ -311,9 +329,35 @@ def analyze_records(
             "startToUsefulToolEmittedMs",
         )
     }
+    # These boundaries were added after schema 25. Missing events remain
+    # unavailable, including completed turns that never enter a tool handler.
+    for metric, key in (
+        ("startToFirstToolHandlerEntryMs", "firstToolHandlerEntryMs"),
+        ("startToFirstModelOutputMs", "firstModelOutputMs"),
+        ("startToFirstActionableOutputMs", "firstActionableOutputMs"),
+        ("startToFirstVisibleOutputMs", "firstVisibleOutputMs"),
+        ("startToFirstAgentMessageMs", "firstAgentMessageMs"),
+    ):
+        canonical_metrics[metric] = _summary(row[key] for row in canonical_rows if key in row)
+    for metrics in (canonical_metrics, legacy_metrics):
+        for summary in metrics.values():
+            summary["eligibleTurnCount"] = completed_turns
+            summary["coverage"] = summary["count"] / completed_turns if completed_turns else None
+    denominators = {
+        "invalidJsonLines": record_count,
+        "invalidTimestamps": record_count - exclusions["invalidJsonLines"],
+        "incompleteTurns": started_turns,
+        "supersededTurns": started_turns,
+        "unterminatedTurns": started_turns,
+        "incompleteCanonicalMilestones": sum(count for version, count in schema_versions.items() if version != "missing" and int(version) >= CANONICAL_TIMING_SCHEMA_VERSION),
+    }
     return {
         "schemaVersion": 1,
         "measurementContract": {
+            "quantileMethod": "linear interpolation at (n-1)*q",
+            "spread": "population standard deviation of observed values",
+            "coverage": "Each metric reports its observed count over all completed turns. Optional or inapplicable milestones are not zero latency.",
+            "incompleteTurns": "supersededTurns counts a start before the active turn completed; unterminatedTurns counts an active turn at end of input. These describe evidence shape, not its cause.",
             "canonical": (
                 "timing schema 25+: separate authorized infrastructure, tool-discovery, "
                 "domain, and successful-domain handler boundaries"
@@ -326,9 +370,16 @@ def analyze_records(
         "sourceFileCount": len(snapshot_metadata),
         "sourceSnapshots": snapshot_metadata,
         "completedTurnCount": completed_turns,
+        "startedTurnCount": started_turns,
+        "recordCount": record_count,
+        "timingSchemaVersions": schema_versions,
         "canonicalTurnCount": len(canonical_rows),
         "legacyReconstructedTurnCount": len(legacy_rows),
         "canonical": canonical_metrics,
         "legacyReconstructed": legacy_metrics,
         "exclusions": exclusions,
+        "exclusionRates": {
+            key: {"count": count, "denominator": denominators[key], "rate": count / denominators[key] if denominators[key] else None}
+            for key, count in exclusions.items()
+        },
     }

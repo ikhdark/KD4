@@ -41,6 +41,12 @@ mod tests {
             assert!(INCREMENTAL_SUMMARIZATION_PROMPT.contains(heading));
         }
         assert!(INCREMENTAL_SUMMARIZATION_PROMPT.contains("latest observed state"));
+        let normalized = INCREMENTAL_SUMMARIZATION_PROMPT
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(normalized.contains("include `## Goal` with the complete current goal"));
+        assert!(normalized.contains("explicitly retire the superseded goal or constraints"));
         assert!(
             INCREMENTAL_SUMMARIZATION_PROMPT
                 .split_whitespace()
@@ -73,6 +79,9 @@ mod tests {
 
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(normalized_prompt.contains("self-contained recovery checkpoint"));
+        assert!(normalized_prompt.contains("including prohibitions and out-of-scope work"));
+        assert!(normalized_prompt.contains("remaining predicted change surface: owners, files, and affected contracts"));
+        assert!(normalized_prompt.contains("preserved invariants that still need verification"));
         assert!(normalized_prompt.contains("without rediscovering the repository"));
         assert!(
             normalized_prompt.contains("evidence identifier or command, scope, observed outcome")
@@ -81,6 +90,8 @@ mod tests {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
+        assert!(normalized_prefix.contains("remain binding until superseded by an applicable instruction"));
+        assert!(normalized_prefix.contains("stale evidence alone does not retire them"));
         assert!(
             normalized_prefix.contains(
                 "do not repeat discovery or validation solely because compaction occurred"

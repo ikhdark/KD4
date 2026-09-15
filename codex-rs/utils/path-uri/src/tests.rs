@@ -761,6 +761,10 @@ fn join_uses_the_base_uri_path_convention() {
 fn starts_with_uses_uri_segment_boundaries() {
     for (path, base, expected) in [
         ("file:///workspace/plugin", "file:///", true),
+        ("file:///project", "file:///pro%6Aect", true),
+        ("file:///pro%6Aect/file", "file:///project", true),
+        ("file:///project-other", "file:///pro%6Aect", false),
+        ("file:///C:/pro%6Aect/file", "file:///C:/project", true),
         ("file:///workspace/plugin", "file:///workspace/plugin", true),
         (
             "file:///workspace/plugin/assets/icon.svg",

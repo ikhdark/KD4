@@ -88,6 +88,43 @@ function newlineFreeStderrOverCap(): Buffer {
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 describe("CodexExec", () => {
+  it.each([
+    {
+      value: "high",
+      literal: '"high"',
+    },
+    {
+      value: 'x"\\\nflag=true\t',
+      literal: String.raw`"x\"\\\nflag=true\t"`,
+    },
+  ])("escapes public thread config arguments for $literal", async ({ value, literal }) => {
+    const { Codex } = await import("../src/codex");
+    spawnMock.mockClear();
+    spawnMock.mockReturnValue(
+      createCompletedChild(Buffer.alloc(0), 0) as unknown as child_process.ChildProcess,
+    );
+    const thread = new Codex({ codexPathOverride: "codex" }).startThread({
+      // JavaScript callers can supply strings outside the TypeScript unions.
+      modelReasoningEffort: value as "high",
+      webSearchMode: value as "live",
+      approvalPolicy: value as "never",
+    });
+
+    await thread.run("hello");
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(spawnMock.mock.calls[0]?.[1]).toEqual([
+      "exec",
+      "--experimental-json",
+      "--config",
+      `model_reasoning_effort=${literal}`,
+      "--config",
+      `web_search=${literal}`,
+      "--config",
+      `approval_policy=${literal}`,
+    ]);
+  });
+
   it("rejects the public turn when the child closes stdin before accepting the prompt", async () => {
     const { Codex } = await import("../src/codex");
     spawnMock.mockClear();

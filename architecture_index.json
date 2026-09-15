@@ -1,7 +1,7 @@
 {
-  "index_sha256": "5b65c7a15ad4d199f9dd85c680efc34a45e850459da753eae07202b70aa17e93",
+  "index_sha256": "d32c74235509792e0a407b242d32977b2fedc983535a545e4ec349868ac60f0c",
   "index_version": 1,
-  "manifest_sha256": "c444eac5825b5ed5ecffa2d84b01edaed0859edcec6490590fc0a04db880b679",
+  "manifest_sha256": "963e2f72ed11f770848ce86743671edf0d2ea1a011f513420af8100733675b27",
   "omitted": {
     "relationships": 0
   },
@@ -473,6 +473,45 @@
     },
     {
       "configuration": [
+        "codex-rs/hooks/src/schema.rs"
+      ],
+      "facet_exclusions": {
+        "configuration_and_gates": "Schema freshness compares the declared Rust wire types with fixtures independently of runtime hook configuration."
+      },
+      "feature_ids": [],
+      "generated_artifacts": [
+        "codex-rs/hooks/schema/generated"
+      ],
+      "id": "hooks-schema-contracts",
+      "invariants": [],
+      "primary_entries": [
+        {
+          "path": "codex-rs/hooks/src/schema.rs",
+          "symbol": "write_schema_fixtures"
+        }
+      ],
+      "roots": [
+        "codex-rs/hooks/src/schema.rs",
+        "codex-rs/hooks/src/bin/write_hooks_schema_fixtures.rs",
+        "codex-rs/hooks/schema/generated"
+      ],
+      "tests": [
+        "codex-rs/hooks/src/schema.rs"
+      ],
+      "validation": [
+        {
+          "argv": [
+            "just",
+            "hooks-schema-check"
+          ],
+          "cwd": ".",
+          "id": "hooks-schema-freshness",
+          "role": "generated_contract_check"
+        }
+      ]
+    },
+    {
+      "configuration": [
         "kd4_features.toml"
       ],
       "facet_exclusions": {
@@ -584,6 +623,70 @@
           ],
           "cwd": "codex-rs",
           "id": "models-manager-focused",
+          "role": "focused_tests"
+        }
+      ]
+    },
+    {
+      "configuration": [
+        "codex-rs/protocol/src/protocol.rs"
+      ],
+      "facet_exclusions": {
+        "configuration_and_gates": "The producing tool supplies TruncationPolicy or OutputLimitResolution; these helpers do not read repository configuration.",
+        "generated_artifacts": "Formatted output is runtime text and does not generate checked-in artifacts."
+      },
+      "feature_ids": [],
+      "generated_artifacts": [],
+      "id": "output-truncation",
+      "invariants": [
+        {
+          "evidence": [
+            {
+              "path": "codex-rs/utils/output-truncation/src/lib.rs",
+              "symbol": "formatted_truncate_text"
+            },
+            {
+              "path": "codex-rs/utils/output-truncation/src/lib.rs",
+              "symbol": "looks_like_validation_command"
+            }
+          ],
+          "id": "formatted-output-obeys-token-ceiling",
+          "kind": "semantic",
+          "statement": "Formatted token-limited output, including warnings and markers, fits the approximate token ceiling for prose, punctuation and Unicode; merely mentioning validation commands in arguments does not raise the diagnostic budget.",
+          "tests": [
+            "codex-rs/utils/output-truncation/src/truncate_tests.rs"
+          ]
+        }
+      ],
+      "primary_entries": [
+        {
+          "path": "codex-rs/utils/output-truncation/src/lib.rs",
+          "symbol": "formatted_truncate_text"
+        },
+        {
+          "path": "codex-rs/utils/output-truncation/src/lib.rs",
+          "symbol": "resolve_output_limits"
+        }
+      ],
+      "roots": [
+        "codex-rs/utils/output-truncation"
+      ],
+      "tests": [
+        "codex-rs/utils/output-truncation/src/truncate_tests.rs"
+      ],
+      "validation": [
+        {
+          "argv": [
+            "just",
+            "test-fast",
+            "-p",
+            "codex-utils-output-truncation",
+            "--lib",
+            "-E",
+            "test(truncate_tests)"
+          ],
+          "cwd": ".",
+          "id": "output-truncation-focused",
           "role": "focused_tests"
         }
       ]
@@ -1052,6 +1155,25 @@
             "scripts/test_kd4_timing_analysis.py",
             "scripts/test_kd4_turn_latency_audit.py"
           ]
+        },
+        {
+          "evidence": [
+            {
+              "path": "scripts/kd4_timing_analysis.py",
+              "symbol": "analyze_runner_evidence"
+            },
+            {
+              "path": "codex-rs/repo-benchmark/src/reports.rs",
+              "symbol": "attempt_metrics"
+            }
+          ],
+          "id": "repo-benchmark-observed-tool-activity",
+          "kind": "semantic",
+          "statement": "The audit CLI replays native evidence into seven independently expected tool items across root and child threads, with six observed starts, six completions and one pending interrupted item. Duplicate notifications cannot add items or reopen completed calls; equal turn/item IDs in distinct threads remain distinct. Rust consumes the Python vector once per attempt, labels cache hit rate as a fraction, and excludes failed or unverified attempts from comparisons. Item counts do not prove complete child coverage, model decisions, nested work, or edit correctness.",
+          "tests": [
+            "scripts/test_kd4_timing_analysis.py",
+            "codex-rs/repo-benchmark/src/reports.rs"
+          ]
         }
       ],
       "primary_entries": [
@@ -1074,6 +1196,8 @@
         "scripts/kd4_timing_analysis.py",
         "scripts/kd4_turn_latency_audit.py",
         "scripts/kd4_first_useful_action_analysis.py",
+        "scripts/rollout_snapshot.py",
+        "scripts/test_rollout_snapshot.py",
         "scripts/test_kd4_timing_analysis.py",
         "scripts/test_kd4_turn_latency_audit.py",
         "scripts/test_kd4_first_useful_action_analysis.py"
@@ -1087,7 +1211,8 @@
         "codex-rs/repo-benchmark/src/reports.rs",
         "scripts/test_kd4_timing_analysis.py",
         "scripts/test_kd4_turn_latency_audit.py",
-        "scripts/test_kd4_first_useful_action_analysis.py"
+        "scripts/test_kd4_first_useful_action_analysis.py",
+        "scripts/test_rollout_snapshot.py"
       ],
       "validation": [
         {
@@ -1112,7 +1237,8 @@
             "unittest",
             "scripts.test_kd4_timing_analysis",
             "scripts.test_kd4_turn_latency_audit",
-            "scripts.test_kd4_first_useful_action_analysis"
+            "scripts.test_kd4_first_useful_action_analysis",
+            "scripts.test_rollout_snapshot"
           ],
           "cwd": ".",
           "id": "session-diagnostics-focused",
@@ -1182,6 +1308,69 @@
           "cwd": "codex-rs",
           "id": "repository-context-focused",
           "role": "focused_tests"
+        }
+      ]
+    },
+    {
+      "configuration": [
+        "codex-rs/.config/kd4-rust-tests.toml"
+      ],
+      "facet_exclusions": {
+        "generated_artifacts": "The runner consumes Cargo metadata and nextest results; it has no checked-in generated contract."
+      },
+      "feature_ids": [],
+      "generated_artifacts": [],
+      "id": "rust-test-routing",
+      "invariants": [
+        {
+          "evidence": [
+            {
+              "path": "scripts/rust_test_runner.py",
+              "symbol": "run_gates"
+            }
+          ],
+          "id": "declared-tests-must-run",
+          "kind": "semantic",
+          "statement": "A named gate cannot pass with an empty selection or missing required test IDs.",
+          "tests": [
+            "scripts/test_rust_test_runner.py"
+          ]
+        }
+      ],
+      "primary_entries": [
+        {
+          "path": "scripts/rust_test_runner.py",
+          "symbol": "main"
+        }
+      ],
+      "roots": [
+        "scripts/rust_test_runner.py",
+        "scripts/test_rust_test_runner.py",
+        "codex-rs/.config/kd4-rust-tests.toml"
+      ],
+      "tests": [
+        "scripts/test_rust_test_runner.py"
+      ],
+      "validation": [
+        {
+          "argv": [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.test_rust_test_runner"
+          ],
+          "cwd": ".",
+          "id": "rust-test-routing-focused",
+          "role": "focused_tests"
+        },
+        {
+          "argv": [
+            "just",
+            "core-test-manifest-check"
+          ],
+          "cwd": ".",
+          "id": "rust-test-manifest-contract",
+          "role": "generated_contract_check"
         }
       ]
     },
@@ -1400,10 +1589,13 @@
       ],
       "roots": [
         "codex-rs/core/src/tools/command_output_artifact.rs",
-        "codex-rs/core/src/tools/handlers/read_tool_output.rs"
+        "codex-rs/core/src/tools/handlers/read_tool_output.rs",
+        "codex-rs/core/src/tool_history.rs",
+        "codex-rs/core/src/tool_history_tests.rs"
       ],
       "tests": [
-        "codex-rs/core/src/tools/command_output_artifact_tests.rs"
+        "codex-rs/core/src/tools/command_output_artifact_tests.rs",
+        "codex-rs/core/src/tool_history_tests.rs"
       ],
       "validation": [
         {
@@ -1412,7 +1604,7 @@
             "core-test-fast",
             "core_lib",
             "-E",
-            "test(tools::command_output_artifact::hardening_tests)"
+            "test(tools::command_output_artifact::hardening_tests) | test(tool_history::tests)"
           ],
           "cwd": "codex-rs",
           "id": "tool-output-focused",
@@ -1736,6 +1928,60 @@
           ],
           "cwd": "codex-rs",
           "id": "session-log",
+          "role": "focused_tests"
+        }
+      ]
+    },
+    {
+      "configuration": [
+        "codex-rs/core/src/tasks/mod.rs"
+      ],
+      "facet_exclusions": {
+        "generated_artifacts": "Turn orchestration returns runtime task state and does not generate checked-in contracts."
+      },
+      "feature_ids": [],
+      "generated_artifacts": [],
+      "id": "turn-orchestration",
+      "invariants": [
+        {
+          "evidence": [
+            {
+              "path": "codex-rs/core/src/session/turn.rs",
+              "symbol": "run_turn"
+            }
+          ],
+          "id": "turn-results-survive-compaction-failure",
+          "kind": "semantic",
+          "statement": "A regular user turn retains its completed assistant message when follow-up compaction fails; a proposed generation cancelled by deterministic completion causes neither another model request nor a residual-generation timing count.",
+          "tests": [
+            "codex-rs/core/src/session/turn_tests.rs"
+          ]
+        }
+      ],
+      "primary_entries": [
+        {
+          "path": "codex-rs/core/src/session/turn.rs",
+          "symbol": "run_turn"
+        }
+      ],
+      "roots": [
+        "codex-rs/core/src/session/turn.rs",
+        "codex-rs/core/src/session/turn_tests.rs"
+      ],
+      "tests": [
+        "codex-rs/core/src/session/turn_tests.rs"
+      ],
+      "validation": [
+        {
+          "argv": [
+            "just",
+            "core-test-fast",
+            "core_lib",
+            "-E",
+            "test(session::turn::tests)"
+          ],
+          "cwd": ".",
+          "id": "turn-orchestration-focused",
           "role": "focused_tests"
         }
       ]
@@ -2459,6 +2705,72 @@
     },
     {
       "category": "callers_consumers",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/hooks/src/lib.rs",
+          "symbol": "pub use schema::write_schema_fixtures"
+        }
+      ],
+      "kind": "consumed_by",
+      "source": "owner:hooks-schema-contracts",
+      "target": "path:codex-rs/hooks/src/lib.rs"
+    },
+    {
+      "category": "control_flow",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/hooks/src/bin/write_hooks_schema_fixtures.rs",
+          "symbol": "write_schema_fixtures"
+        }
+      ],
+      "kind": "calls",
+      "source": "owner:hooks-schema-contracts",
+      "target": "path:codex-rs/hooks/src/schema.rs"
+    },
+    {
+      "category": "generated_artifacts",
+      "confidence": "generated",
+      "evidence": [
+        {
+          "path": "codex-rs/hooks/src/schema.rs",
+          "symbol": "write_schema_fixtures"
+        }
+      ],
+      "kind": "generates",
+      "source": "owner:hooks-schema-contracts",
+      "target": "generated:codex-rs/hooks/schema/generated"
+    },
+    {
+      "category": "runtime_registration",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "justfile",
+          "symbol": "hooks-schema-check:"
+        }
+      ],
+      "kind": "registers",
+      "source": "owner:hooks-schema-contracts",
+      "target": "path:justfile"
+    },
+    {
+      "category": "tests_contracts",
+      "confidence": "declared",
+      "description": "Generate every hook schema in a temporary directory and compare its content with the checked-in fixture, leaving the fixtures unchanged.",
+      "evidence": [
+        {
+          "path": "codex-rs/hooks/src/schema.rs",
+          "symbol": "generated_hook_schemas_match_fixtures"
+        }
+      ],
+      "kind": "validated_by",
+      "source": "owner:hooks-schema-contracts",
+      "target": "path:codex-rs/hooks/src/schema.rs"
+    },
+    {
+      "category": "callers_consumers",
       "confidence": "compiler_resolved",
       "evidence": [
         {
@@ -2560,6 +2872,57 @@
       "kind": "validated_by",
       "source": "owner:model-catalog-runtime",
       "target": "path:codex-rs/models-manager/src/prompt_contract_tests.rs"
+    },
+    {
+      "category": "callers_consumers",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/core/src/tools/context.rs",
+          "symbol": "formatted_truncate_text_with_output_limit(content, limits)"
+        },
+        {
+          "path": "codex-rs/core/src/tools/code_mode/mod.rs",
+          "symbol": "truncate_code_mode_result"
+        }
+      ],
+      "kind": "consumed_by",
+      "source": "owner:output-truncation",
+      "target": "path:codex-rs/core/src/tools/context.rs"
+    },
+    {
+      "category": "control_flow",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/utils/output-truncation/src/lib.rs",
+          "symbol": "formatted_truncate_text_to_token_ceiling"
+        },
+        {
+          "path": "codex-rs/utils/output-truncation/src/lib.rs",
+          "symbol": "truncate_text_to_token_ceiling"
+        }
+      ],
+      "kind": "calls",
+      "source": "owner:output-truncation",
+      "target": "path:codex-rs/utils/output-truncation/src/lib.rs"
+    },
+    {
+      "category": "tests_contracts",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/utils/output-truncation/src/truncate_tests.rs",
+          "symbol": "formatted_token_policies_bound_dense_output_including_metadata"
+        },
+        {
+          "path": "codex-rs/utils/output-truncation/src/truncate_tests.rs",
+          "symbol": "validation_mentions_in_command_arguments_do_not_raise_output_budget"
+        }
+      ],
+      "kind": "validated_by",
+      "source": "owner:output-truncation",
+      "target": "path:codex-rs/utils/output-truncation/src/truncate_tests.rs"
     },
     {
       "category": "callers_consumers",
@@ -3023,6 +3386,10 @@
         {
           "path": "scripts/test_kd4_timing_analysis.py",
           "symbol": "test_no_token_function_runs_in_scripted_audit_or_runner"
+        },
+        {
+          "path": "scripts/test_kd4_timing_analysis.py",
+          "symbol": "test_native_tool_activity_replays_thread_scoped_lifecycles_through_audit_cli"
         }
       ],
       "kind": "validated_by",
@@ -3080,6 +3447,80 @@
       "kind": "validated_by",
       "source": "owner:repository-context-discovery",
       "target": "path:codex-rs/core/src/git_workspace_tests.rs"
+    },
+    {
+      "category": "callers_consumers",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "scripts/check_kd4_features.py",
+          "symbol": "run_gates"
+        }
+      ],
+      "kind": "consumed_by",
+      "source": "owner:rust-test-routing",
+      "target": "path:scripts/check_kd4_features.py"
+    },
+    {
+      "category": "configuration",
+      "confidence": "manifest_derived",
+      "evidence": [
+        {
+          "path": "scripts/rust_test_runner.py",
+          "symbol": "Manifest.load"
+        }
+      ],
+      "kind": "reads_config",
+      "source": "owner:rust-test-routing",
+      "target": "config:codex-rs/.config/kd4-rust-tests.toml"
+    },
+    {
+      "category": "control_flow",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "scripts/rust_test_runner.py",
+          "symbol": "runner.run_gate"
+        }
+      ],
+      "kind": "calls",
+      "source": "owner:rust-test-routing",
+      "target": "path:scripts/rust_test_runner.py"
+    },
+    {
+      "category": "runtime_registration",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "justfile",
+          "symbol": "core-test-fast target"
+        },
+        {
+          "path": "justfile",
+          "symbol": "core-gate gate"
+        }
+      ],
+      "kind": "registers",
+      "source": "owner:rust-test-routing",
+      "target": "path:justfile"
+    },
+    {
+      "category": "tests_contracts",
+      "confidence": "declared",
+      "description": "Named gates verify every step's selected test IDs before executing any tests; missing or renamed required tests fail the gate.",
+      "evidence": [
+        {
+          "path": "scripts/test_rust_test_runner.py",
+          "symbol": "test_gate_verifies_every_step_before_running_any"
+        },
+        {
+          "path": "scripts/test_rust_test_runner.py",
+          "symbol": "test_zero_selected_tests_fails_before_anything_is_built"
+        }
+      ],
+      "kind": "validated_by",
+      "source": "owner:rust-test-routing",
+      "target": "path:scripts/test_rust_test_runner.py"
     },
     {
       "category": "callers_consumers",
@@ -3281,6 +3722,23 @@
     },
     {
       "category": "control_flow",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/core/src/compact_remote.rs",
+          "symbol": "process_compacted_history"
+        },
+        {
+          "path": "codex-rs/core/src/tool_history.rs",
+          "symbol": "artifact_pin_payload_for_items"
+        }
+      ],
+      "kind": "calls",
+      "source": "owner:tool-output-recovery",
+      "target": "path:codex-rs/core/src/tool_history.rs"
+    },
+    {
+      "category": "control_flow",
       "confidence": "compiler_resolved",
       "evidence": [
         {
@@ -3304,6 +3762,20 @@
       "kind": "registers",
       "source": "owner:tool-output-recovery",
       "target": "path:codex-rs/core/src/tools/spec_plan.rs"
+    },
+    {
+      "category": "tests_contracts",
+      "confidence": "declared",
+      "description": "Remote compaction retains bounded exact artifact handles in newest-first order and a single shared retrieval instruction.",
+      "evidence": [
+        {
+          "path": "codex-rs/core/src/tool_history_tests.rs",
+          "symbol": "remote_compaction_bounds_recovery_metadata_and_keeps_newest_exact_handles"
+        }
+      ],
+      "kind": "validated_by",
+      "source": "owner:tool-output-recovery",
+      "target": "path:codex-rs/core/src/tool_history_tests.rs"
     },
     {
       "category": "tests_contracts",
@@ -3580,6 +4052,79 @@
       "confidence": "declared",
       "evidence": [
         {
+          "path": "codex-rs/core/src/tasks/regular.rs",
+          "symbol": "run_turn("
+        }
+      ],
+      "kind": "consumed_by",
+      "source": "owner:turn-orchestration",
+      "target": "path:codex-rs/core/src/tasks/regular.rs"
+    },
+    {
+      "category": "configuration",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/core/src/session/turn.rs",
+          "symbol": "Feature::Kd4Runtime"
+        }
+      ],
+      "kind": "gated_by",
+      "source": "owner:turn-orchestration",
+      "target": "owner:feature-registry"
+    },
+    {
+      "category": "control_flow",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/core/src/session/turn.rs",
+          "symbol": "run_sampling_request("
+        },
+        {
+          "path": "codex-rs/core/src/session/turn.rs",
+          "symbol": "run_auto_compact("
+        }
+      ],
+      "kind": "calls",
+      "source": "owner:turn-orchestration",
+      "target": "path:codex-rs/core/src/session/turn.rs"
+    },
+    {
+      "category": "runtime_registration",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/core/src/tasks/regular.rs",
+          "symbol": "impl SessionTask for RegularTask"
+        }
+      ],
+      "kind": "constructs",
+      "source": "owner:turn-orchestration",
+      "target": "path:codex-rs/core/src/tasks/regular.rs"
+    },
+    {
+      "category": "tests_contracts",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/core/src/session/turn_tests.rs",
+          "symbol": "mid_turn_compaction_failure_preserves_completed_message"
+        },
+        {
+          "path": "codex-rs/core/src/session/turn_tests.rs",
+          "symbol": "deterministic_protocol_completion_does_not_count_a_cancelled_generation"
+        }
+      ],
+      "kind": "validated_by",
+      "source": "owner:turn-orchestration",
+      "target": "path:codex-rs/core/src/session/turn_tests.rs"
+    },
+    {
+      "category": "callers_consumers",
+      "confidence": "declared",
+      "evidence": [
+        {
           "path": "codex-rs/app-server-client/src/remote.rs",
           "symbol": "connect_unix_socket_endpoint"
         }
@@ -3799,7 +4344,7 @@
       "target": "path:codex-rs/windows-sandbox-rs/src/winutil.rs"
     }
   ],
-  "repository_revision": "manifest:c444eac5825b5ed5ecffa2d84b01edaed0859edcec6490590fc0a04db880b679:sources:7baba78ac33f001d99eba1a8508e62d9a66069797cbc6665c296f0857c363127",
+  "repository_revision": "manifest:963e2f72ed11f770848ce86743671edf0d2ea1a011f513420af8100733675b27:sources:3f2c528a27693fcd83d420d3820b40164dbc1c3ef2df469005fecf03c75b2e0b",
   "schema_version": 2,
   "status": "complete",
   "unresolved": []

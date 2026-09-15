@@ -215,8 +215,8 @@ pub(crate) struct ToolHistoryCandidate {
     pub(crate) artifact_sha256: String,
     pub(crate) original_output_sha256: String,
     pub(crate) original_tokens: u64,
-    #[serde(default)]
-    pub(crate) preserved_non_text_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) preserved_non_text_tokens: Option<u64>,
     #[serde(rename = "bounded_digest")]
     pub(crate) bounded_model_output: String,
     pub(crate) complete: bool,
@@ -254,7 +254,7 @@ impl ToolHistoryCandidate {
             "sha256": self.artifact_sha256,
             "retrieval": {
                 "tool": "read_tool_output",
-                "instruction": "Call read_tool_output with artifact_id to recover the exact output."
+                "instruction": "search lines bytes section json_pointer; continuation or child_selectors"
             }
         }))
     }
@@ -438,8 +438,21 @@ impl ProjectedResponseItems {
     }
 
     fn retain(&mut self, mut keep: impl FnMut(&ResponseItem) -> bool) {
-        if self.iter().any(|item| !keep(item)) {
-            self.make_owned().retain(keep);
+        if let Self::Owned(items) = self {
+            items.retain(keep);
+        } else if let Some(first_removed) = self.iter().position(|item| !keep(item)) {
+            // Preserve the shared allocation when nothing changes, and do not
+            // evaluate a stateful predicate again for the prefix already visited.
+            let mut index = 0;
+            self.make_owned().retain(|item| {
+                let retain = match index.cmp(&first_removed) {
+                    std::cmp::Ordering::Less => true,
+                    std::cmp::Ordering::Equal => false,
+                    std::cmp::Ordering::Greater => keep(item),
+                };
+                index += 1;
+                retain
+            });
         }
     }
 
@@ -1075,11 +1088,10 @@ impl ToolHistoryState {
                     structured_tokens: None,
                     // Legacy ledgers omitted this cost. The current response body
                     // still proves whether image/encrypted payload must be charged.
-                    non_text_tokens: if candidate.preserved_non_text_tokens == 0 {
-                        non_text_output_token_cost(item)
-                    } else {
-                        usize::try_from(candidate.preserved_non_text_tokens).unwrap_or(usize::MAX)
-                    },
+                    non_text_tokens: candidate.preserved_non_text_tokens.map_or_else(
+                        || non_text_output_token_cost(item),
+                        |tokens| usize::try_from(tokens).unwrap_or(usize::MAX),
+                    ),
                 })
             })
             .collect::<Vec<_>>();
@@ -1206,17 +1218,57 @@ impl ToolHistoryState {
                     .min()
                     .unwrap_or(0)
             };
-        let mut reserved_competing_tokens = admission_candidates
+        let reservations = admission_candidates
             .iter()
-            .map(&cheapest_receiptable_representation_tokens)
+            .map(cheapest_receiptable_representation_tokens)
+            .collect::<Vec<_>>();
+        // The transport fallback cannot use projection receipts. Reserve its
+        // raw-or-pin costs separately so raw output cannot consume another
+        // result's recovery handle.
+        let fallback_reservations = admission_candidates
+            .iter()
+            .map(|admission| {
+                if admission.structured_tokens.is_some() {
+                    // Structured results have no exact artifact fallback. Retain
+                    // their raw forms by priority after protecting artifact handles.
+                    return 0;
+                }
+                let Some((_, output)) = projected
+                    .get(admission.item_index.0)
+                    .and_then(canonical_textual_output_identity)
+                else {
+                    return 0;
+                };
+                let raw_tokens =
+                    approx_token_count(&output).saturating_add(admission.non_text_tokens);
+                let pin_tokens = (admission.non_text_tokens == 0)
+                    .then(|| self.candidates.get(&admission.call_id)?.artifact_pin())
+                    .flatten()
+                    .map(|(_, tokens)| tokens);
+                pin_tokens.map_or(raw_tokens, |tokens| tokens.min(raw_tokens))
+            })
+            .collect::<Vec<_>>();
+        let mut reserved_fallback_tokens = fallback_reservations
+            .iter()
+            .copied()
+            .fold(0usize, usize::saturating_add);
+        let mut reserved_competing_tokens = reservations
+            .iter()
+            .copied()
             .fold(0usize, usize::saturating_add);
         let mut decisions = BTreeMap::<String, AdmissionDecision>::new();
         let mut remaining_tokens = MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET;
         let mut remaining_fallback_tokens = MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET;
-        for admission_candidate in admission_candidates {
-            reserved_competing_tokens = reserved_competing_tokens.saturating_sub(
-                cheapest_receiptable_representation_tokens(&admission_candidate),
-            );
+        for ((admission_candidate, reservation), fallback_reservation) in admission_candidates
+            .into_iter()
+            .zip(reservations)
+            .zip(fallback_reservations)
+        {
+            reserved_competing_tokens = reserved_competing_tokens.saturating_sub(reservation);
+            reserved_fallback_tokens =
+                reserved_fallback_tokens.saturating_sub(fallback_reservation);
+            let available_fallback_tokens =
+                remaining_fallback_tokens.saturating_sub(reserved_fallback_tokens);
             let remaining_raw_tokens = remaining_tokens.saturating_sub(reserved_competing_tokens);
             let item_index = admission_candidate.item_index.0;
             let call_id = admission_candidate.call_id;
@@ -1226,14 +1278,17 @@ impl ToolHistoryState {
                 });
                 let (representation, retain_raw_fallback) = if raw_tokens <= remaining_raw_tokens {
                     remaining_tokens = remaining_tokens.saturating_sub(raw_tokens);
-                    remaining_fallback_tokens =
-                        remaining_fallback_tokens.saturating_sub(raw_tokens);
-                    (AdmissionRepresentation::Raw, true)
+                    let retain_raw = raw_tokens <= available_fallback_tokens;
+                    if retain_raw {
+                        remaining_fallback_tokens =
+                            remaining_fallback_tokens.saturating_sub(raw_tokens);
+                    }
+                    (AdmissionRepresentation::Raw, retain_raw)
                 } else if let Some((item, receipt_tokens)) = receipt
                     && receipt_tokens <= remaining_tokens
                 {
                     remaining_tokens = remaining_tokens.saturating_sub(receipt_tokens);
-                    let retain_raw = raw_tokens <= remaining_fallback_tokens;
+                    let retain_raw = raw_tokens <= available_fallback_tokens;
                     if retain_raw {
                         remaining_fallback_tokens =
                             remaining_fallback_tokens.saturating_sub(raw_tokens);
@@ -1290,7 +1345,7 @@ impl ToolHistoryState {
             // Preserve the newest such result through its first exposure, even
             // when its encoded size alone exceeds the shared history budget.
             let preserve_newest_non_text = Some(item_index) == newest_unconsumed_non_text_item;
-            let decision = if raw_tokens <= remaining_raw_tokens || preserve_newest_non_text {
+            let mut decision = if raw_tokens <= remaining_raw_tokens || preserve_newest_non_text {
                 if !raw_results_fit
                     && candidate.consumed_by_generation.is_some()
                     && let Some((receipt_id, text, receipt_tokens)) = savings_receipt
@@ -1303,21 +1358,13 @@ impl ToolHistoryState {
                             receipt_id: receipt_id.to_string(),
                             text: text.to_string(),
                         },
-                        retain_raw_fallback: if raw_tokens <= remaining_fallback_tokens {
-                            remaining_fallback_tokens =
-                                remaining_fallback_tokens.saturating_sub(raw_tokens);
-                            true
-                        } else {
-                            false
-                        },
+                        retain_raw_fallback: false,
                     }
                 } else {
                     remaining_tokens = remaining_tokens.saturating_sub(raw_tokens);
-                    remaining_fallback_tokens =
-                        remaining_fallback_tokens.saturating_sub(raw_tokens);
                     AdmissionDecision {
                         representation: AdmissionRepresentation::Raw,
-                        retain_raw_fallback: true,
+                        retain_raw_fallback: false,
                     }
                 }
             } else if let Some((receipt_id, text, receipt_tokens)) = admission_receipt
@@ -1335,13 +1382,7 @@ impl ToolHistoryState {
                         receipt_id: receipt_id.to_string(),
                         text: text.to_string(),
                     },
-                    retain_raw_fallback: if raw_tokens <= remaining_fallback_tokens {
-                        remaining_fallback_tokens =
-                            remaining_fallback_tokens.saturating_sub(raw_tokens);
-                        true
-                    } else {
-                        false
-                    },
+                    retain_raw_fallback: false,
                 }
             } else if let Some((text, pin_tokens)) = artifact_pin
                 && pin_tokens <= remaining_tokens
@@ -1359,6 +1400,19 @@ impl ToolHistoryState {
                     retain_raw_fallback: false,
                 }
             };
+            if !matches!(decision.representation, AdmissionRepresentation::Drop) {
+                decision.retain_raw_fallback =
+                    raw_tokens <= available_fallback_tokens || non_text_tokens > 0;
+                let fallback_tokens = if decision.retain_raw_fallback {
+                    raw_tokens
+                } else {
+                    candidate
+                        .artifact_pin()
+                        .map_or(raw_tokens, |(_, tokens)| tokens)
+                };
+                remaining_fallback_tokens =
+                    remaining_fallback_tokens.saturating_sub(fallback_tokens);
+            }
             decisions.insert(call_id, decision);
         }
 
@@ -1367,11 +1421,16 @@ impl ToolHistoryState {
             item_call_id(item).is_none_or(|call_id| {
                 decisions.get(call_id).is_none_or(|decision| {
                     decision.retain_raw_fallback
-                        || matches!(
-                            &decision.representation,
-                            AdmissionRepresentation::Receipt { .. }
-                                | AdmissionRepresentation::ArtifactPin { .. }
-                        )
+                        || (self
+                            .candidates
+                            .get(call_id)
+                            .is_some_and(|candidate| candidate.artifact_pin().is_some())
+                            && matches!(
+                                &decision.representation,
+                                AdmissionRepresentation::Raw
+                                    | AdmissionRepresentation::Receipt { .. }
+                                    | AdmissionRepresentation::ArtifactPin { .. }
+                            ))
                 })
             })
         });
@@ -1478,7 +1537,8 @@ impl ToolHistoryState {
             !decision.retain_raw_fallback
                 && matches!(
                     &decision.representation,
-                    AdmissionRepresentation::Receipt { .. }
+                    AdmissionRepresentation::Raw
+                        | AdmissionRepresentation::Receipt { .. }
                         | AdmissionRepresentation::ArtifactPin { .. }
                 )
         }) {
@@ -1500,7 +1560,8 @@ impl ToolHistoryState {
                 if decision.retain_raw_fallback
                     || !matches!(
                         &decision.representation,
-                        AdmissionRepresentation::Receipt { .. }
+                        AdmissionRepresentation::Raw
+                            | AdmissionRepresentation::Receipt { .. }
                             | AdmissionRepresentation::ArtifactPin { .. }
                     )
                 {
@@ -1605,7 +1666,6 @@ impl ToolHistoryState {
     ) {
         let requirements = self.workspace_evidence_requirements(items);
 
-        let mut stale_exec_call_ids = BTreeSet::new();
         for item_index in 0..items.len() {
             let replacement = {
                 let item = &items[item_index];
@@ -1635,7 +1695,7 @@ impl ToolHistoryState {
                 let (reason_code, reason) = if observation.is_none() {
                     (
                         "missing_observation",
-                        "no workspace observation was recorded for this tool result; rerun the tool before relying on it",
+                        "no workspace observation is available for this tool result; it may be unrecorded or evicted; rerun the tool before relying on it",
                     )
                 } else if observation
                     .is_some_and(|observation| !observation.source_dependencies_current)
@@ -1684,9 +1744,23 @@ impl ToolHistoryState {
                 } else {
                     Vec::new()
                 };
-                Some((call_id.to_string(), reason, current_nested_results))
+                let mut notice = serde_json::json!({
+                    "call_id": call_id,
+                    "rerun": { "force_fresh": true },
+                    "reason": reason,
+                    "reason_code": reason_code,
+                    "stale_workspace_evidence": true,
+                    "valid_for_current_workspace": false,
+                    "observed_revision": observation.and_then(|observation| observation.revision.as_ref()),
+                    "current_revision": workspace_identity,
+                    "if_rerun_unavailable": "Report the affected claim as unverified; this result does not validate the current workspace.",
+                });
+                if !current_nested_results.is_empty() {
+                    notice["current_nested_results"] = current_nested_results.into();
+                }
+                Some(notice)
             };
-            let Some((call_id, reason, current_nested_results)) = replacement else {
+            let Some(notice) = replacement else {
                 continue;
             };
             let Some((_call_id, body)) =
@@ -1694,46 +1768,7 @@ impl ToolHistoryState {
             else {
                 continue;
             };
-            let mut notice = serde_json::json!({
-                "call_id": call_id,
-                "rerun": { "force_fresh": true },
-                "reason": reason,
-                "stale_workspace_evidence": true,
-            });
-            if !current_nested_results.is_empty() {
-                notice["current_nested_results"] = current_nested_results.into();
-            }
             replace_model_visible_output_text(body, notice.to_string());
-            stale_exec_call_ids.insert(call_id);
-        }
-
-        if stale_exec_call_ids.is_empty() {
-            return;
-        }
-        for item in items.make_owned() {
-            let ResponseItem::FunctionCall {
-                name,
-                arguments,
-                call_id,
-                ..
-            } = item
-            else {
-                continue;
-            };
-            if !stale_exec_call_ids.contains(call_id)
-                || name.rsplit('.').next() != Some("exec_command")
-            {
-                continue;
-            }
-            let Ok(serde_json::Value::Object(mut arguments_value)) =
-                serde_json::from_str(arguments)
-            else {
-                continue;
-            };
-            arguments_value.insert("force_fresh".to_string(), serde_json::Value::Bool(true));
-            if let Ok(projected_arguments) = serde_json::to_string(&arguments_value) {
-                *arguments = projected_arguments;
-            }
         }
     }
 
@@ -1941,13 +1976,16 @@ impl ToolHistoryState {
         let mut payload = serde_json::json!({
             "version": 1,
             "kind": "tool_history_artifact_pins",
-            "instruction": "Use read_tool_output with an artifact_id below to recover exact prior output. Older references may be omitted to bound context; saved outputs are unchanged.",
+            "instruction": "Use read_tool_output with an artifact_id below and selectors (search, lines, bytes, section, or json_pointer) to recover relevant exact prior output. After overflow, use the returned continuation or child_selectors. Older references may be omitted to bound context; saved outputs are unchanged.",
             "omitted_artifact_count": total,
             "artifacts": [],
         });
         // Charge the serialized envelope as well as the pins. Do not truncate JSON or a
         // recovery handle, and prefer the newest references rather than call-id ordering.
-        for pin in pins.into_iter().take(COMPACTION_ARTIFACT_PIN_MAX_ITEMS) {
+        for mut pin in pins.into_iter().take(COMPACTION_ARTIFACT_PIN_MAX_ITEMS) {
+            // The sidecar explains retrieval once for all pins. Standalone pins
+            // still carry their own instructions when projected without it.
+            pin.as_object_mut()?.remove("retrieval");
             payload["artifacts"].as_array_mut()?.push(pin);
             if approx_token_count(&serde_json::to_string(&payload).ok()?)
                 > COMPACTION_ARTIFACT_PIN_TOKEN_BUDGET
@@ -3458,6 +3496,7 @@ fn workspace_call_observes_from_arguments(arguments: Option<&serde_json::Value>)
     ) && !crate::turn_diff_tracker::command_reads_repository_history(&command)
 }
 
+#[cfg(test)]
 pub(crate) fn source_dependencies_for_tool_call(
     tool_identity: &str,
     payload: &ToolPayload,
@@ -3584,6 +3623,18 @@ fn cargo_test_dependencies(
         SourceDependencyV1::new(&workspace.path.join("Cargo.toml"), false),
         SourceDependencyV1::new(&workspace.path.join("Cargo.lock"), false),
     ]);
+    // Cargo and rustup discover configuration from the invocation directory's
+    // ancestors. Track absent files too, so creating one invalidates old proof.
+    for directory in cwd.ancestors() {
+        for input in [
+            ".cargo/config",
+            ".cargo/config.toml",
+            "rust-toolchain",
+            "rust-toolchain.toml",
+        ] {
+            dependencies.insert(SourceDependencyV1::new(&directory.join(input), false));
+        }
+    }
     let mut visited = BTreeSet::new();
     if !collect_cargo_package_dependencies(
         package_root,
@@ -3957,8 +4008,9 @@ fn collect_cargo_package_dependencies(
                     workspace_graph,
                     visited,
                     dependencies,
-                ) {
-                    return false;
+                )
+            {
+                return false;
             }
         }
     }

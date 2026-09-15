@@ -134,6 +134,92 @@ async fn search_rollout_matches_uses_logical_path_for_compressed_rollout() -> an
     Ok(())
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn append_materialized_rollout_survives_compressed_cleanup_sharing_violation()
+-> anyhow::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let home = TempDir::new()?;
+    let uuid = Uuid::from_u128(101);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let rollout_path = rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
+    write_rollout(&rollout_path, thread_id, "before materialization")?;
+    let (mut expected, _, _) = RolloutRecorder::load_rollout_items(&rollout_path).await?;
+    compress_now(&rollout_path)?;
+    let compressed_path = compressed_rollout_path(&rollout_path);
+    // Allow decompression to read the source, but prevent deleting it.
+    let held_source = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&compressed_path)?;
+    assert_eq!(
+        fs::remove_file(&compressed_path)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(32)
+    );
+    let appended = RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+        message: "after materialization".to_string(),
+        ..Default::default()
+    }));
+    append_rollout_item_to_path(&compressed_path, &appended).await?;
+    expected.push(appended);
+    assert!(rollout_path.exists());
+    assert!(compressed_path.exists());
+    // Readers of either representation must see the newly appended canonical history.
+    for path in [&rollout_path, &compressed_path] {
+        let (items, loaded_thread_id, parse_errors) =
+            RolloutRecorder::load_rollout_items(path).await?;
+        assert_eq!(loaded_thread_id, Some(thread_id));
+        assert_eq!(parse_errors, 0);
+        assert_eq!(
+            serde_json::to_value(items)?,
+            serde_json::to_value(&expected)?
+        );
+    }
+    drop(held_source);
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn rollout_reader_retries_windows_sharing_violation() -> anyhow::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let home = TempDir::new()?;
+    let uuid = Uuid::from_u128(102);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let rollout_path = rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
+    write_rollout(&rollout_path, thread_id, "survives replacement")?;
+    let expected = fs::read_to_string(&rollout_path)?;
+    let held_source = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&rollout_path)?;
+    assert_eq!(
+        fs::File::open(&rollout_path).unwrap_err().raw_os_error(),
+        Some(32)
+    );
+    let mut opening = Box::pin(open_rollout_line_reader(&rollout_path));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut opening)
+            .await
+            .is_err()
+    );
+    drop(held_source);
+    let mut reader = tokio::time::timeout(Duration::from_secs(2), opening).await??;
+    let mut actual = Vec::new();
+    while let Some(line) = reader.next_line().await? {
+        actual.push(line);
+    }
+    assert_eq!(
+        actual,
+        expected.lines().map(str::to_string).collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn search_rollout_matches_fallback_returns_plain_and_compressed_snippets()
 -> anyhow::Result<()> {

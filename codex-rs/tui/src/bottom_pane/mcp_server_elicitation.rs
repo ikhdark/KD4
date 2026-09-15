@@ -1,6 +1,9 @@
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[cfg(test)]
 use crate::app_command::AppCommand as Op;
@@ -53,7 +56,6 @@ use crate::key_hint::KeyBindingListExt;
 use crate::keymap::ListKeymap;
 use crate::render::renderable::Renderable;
 use crate::text_formatting::format_json_compact;
-use crate::text_formatting::truncate_text;
 
 const ANSWER_PLACEHOLDER: &str = "Type your answer";
 const OPTIONAL_ANSWER_PLACEHOLDER: &str = "Type your answer (optional)";
@@ -66,8 +68,6 @@ const APPROVAL_ACCEPT_SESSION_VALUE: &str = "accept_session";
 const APPROVAL_ACCEPT_ALWAYS_VALUE: &str = "accept_always";
 const APPROVAL_DECLINE_VALUE: &str = "decline";
 const APPROVAL_CANCEL_VALUE: &str = "cancel";
-const APPROVAL_TOOL_PARAM_DISPLAY_LIMIT: usize = 3;
-const APPROVAL_TOOL_PARAM_VALUE_TRUNCATE_GRAPHEMES: usize = 60;
 const TOOL_TYPE_KEY: &str = "tool_type";
 const TOOL_ID_KEY: &str = "tool_id";
 const TOOL_SUGGEST_SUGGEST_TYPE_KEY: &str = "suggest_type";
@@ -431,7 +431,7 @@ fn parse_tool_approval_display_params(meta: Option<&Value>) -> Vec<McpToolApprov
         return Vec::new();
     };
 
-    let display_params = meta
+    let mut display_params = meta
         .get(APPROVAL_TOOL_PARAMS_DISPLAY_KEY)
         .and_then(Value::as_array)
         .map(|display_params| {
@@ -441,10 +441,6 @@ fn parse_tool_approval_display_params(meta: Option<&Value>) -> Vec<McpToolApprov
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    if !display_params.is_empty() {
-        return display_params;
-    }
-
     let mut fallback_params = meta
         .get(APPROVAL_TOOL_PARAMS_KEY)
         .and_then(Value::as_object)
@@ -460,7 +456,19 @@ fn parse_tool_approval_display_params(meta: Option<&Value>) -> Vec<McpToolApprov
         })
         .unwrap_or_default();
     fallback_params.sort_by(|left, right| left.name.cmp(&right.name));
-    fallback_params
+    // Display metadata controls labels and ordering, but must not hide or replace
+    // the arguments the server actually requested approval for.
+    for param in fallback_params {
+        if let Some(display) = display_params
+            .iter_mut()
+            .find(|display| display.name == param.name)
+        {
+            display.value = param.value;
+        } else {
+            display_params.push(param);
+        }
+    }
+    display_params
 }
 
 fn parse_tool_approval_display_param(value: &Value) -> Option<McpToolApprovalDisplayParam> {
@@ -499,7 +507,6 @@ fn format_tool_approval_display_message(
     }
     let param_lines = approval_display_params
         .iter()
-        .take(APPROVAL_TOOL_PARAM_DISPLAY_LIMIT)
         .map(format_tool_approval_display_param_line)
         .collect::<Vec<_>>();
     if !param_lines.is_empty() {
@@ -519,14 +526,13 @@ fn format_tool_approval_display_param_line(param: &McpToolApprovalDisplayParam) 
 }
 
 fn format_tool_approval_display_param_value(value: &Value) -> String {
-    let formatted = match value {
-        Value::String(text) => text.split_whitespace().collect::<Vec<_>>().join(" "),
+    match value {
+        Value::String(text) if !text.chars().any(char::is_control) => text.clone(),
         _ => {
             let compact_json = value.to_string();
             format_json_compact(&compact_json).unwrap_or(compact_json)
         }
-    };
-    truncate_text(&formatted, APPROVAL_TOOL_PARAM_VALUE_TRUNCATE_GRAPHEMES)
+    }
 }
 
 fn parse_fields_from_schema(requested_schema: &Value) -> Option<Vec<McpServerElicitationField>> {
@@ -714,6 +720,9 @@ pub(crate) struct McpServerElicitationOverlay {
     done: bool,
     validation_error: Option<String>,
     list_keymap: ListKeymap,
+    prompt_offset: Cell<usize>,
+    prompt_viewport: Cell<(u16, u16)>,
+    prompt_layouts: RefCell<VecDeque<(usize, u16, Arc<Vec<String>>)>>,
 }
 
 impl McpServerElicitationOverlay {
@@ -762,6 +771,9 @@ impl McpServerElicitationOverlay {
             done: false,
             validation_error: None,
             list_keymap,
+            prompt_offset: Cell::new(0),
+            prompt_viewport: Cell::new((0, 0)),
+            prompt_layouts: RefCell::new(VecDeque::new()),
         };
         overlay.reset_for_request();
         overlay.restore_current_draft();
@@ -769,6 +781,7 @@ impl McpServerElicitationOverlay {
     }
 
     fn reset_for_request(&mut self) {
+        self.prompt_layouts.get_mut().clear();
         self.answers = self
             .request
             .fields
@@ -792,6 +805,7 @@ impl McpServerElicitationOverlay {
             })
             .collect();
         self.current_idx = 0;
+        self.prompt_offset.set(0);
         self.validation_error = None;
         self.composer
             .set_text_content(String::new(), Vec::new(), Vec::new());
@@ -945,11 +959,28 @@ impl McpServerElicitationOverlay {
             .collect()
     }
 
-    fn wrapped_prompt_lines(&self, width: u16) -> Vec<String> {
-        textwrap::wrap(&self.current_prompt_text(), width.max(1) as usize)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect()
+    fn wrapped_prompt_lines(&self, width: u16) -> Arc<Vec<String>> {
+        let width = width.max(1);
+        let mut layouts = self.prompt_layouts.borrow_mut();
+        if let Some((_, _, lines)) = layouts
+            .iter()
+            .find(|(field, cached_width, _)| *field == self.current_idx && *cached_width == width)
+        {
+            return Arc::clone(lines);
+        }
+        let lines = Arc::new(
+            textwrap::wrap(&self.current_prompt_text(), width as usize)
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect(),
+        );
+        // Layout and rendering can use different widths; retain both without
+        // accumulating a copy of a large payload for every terminal resize.
+        if layouts.len() == 2 {
+            layouts.pop_front();
+        }
+        layouts.push_back((self.current_idx, width, Arc::clone(&lines)));
+        lines
     }
 
     fn current_prompt_text(&self) -> String {
@@ -1008,6 +1039,9 @@ impl McpServerElicitationOverlay {
             }
         }
         tips.push(FooterTip::new("esc to cancel"));
+        if !self.request.approval_display_params.is_empty() {
+            tips.push(FooterTip::new("ctrl + pgup/pgdn scroll arguments"));
+        }
         tips
     }
 
@@ -1052,6 +1086,7 @@ impl McpServerElicitationOverlay {
         self.save_current_draft();
         let offset = if next { 1 } else { len.saturating_sub(1) };
         self.current_idx = (self.current_idx + offset) % len;
+        self.prompt_offset.set(0);
         self.validation_error = None;
         self.restore_current_draft();
     }
@@ -1062,6 +1097,7 @@ impl McpServerElicitationOverlay {
         }
         self.save_current_draft();
         self.current_idx = idx;
+        self.prompt_offset.set(0);
         self.restore_current_draft();
     }
 
@@ -1283,11 +1319,23 @@ impl McpServerElicitationOverlay {
     }
 
     fn render_prompt(&self, area: Rect, buf: &mut Buffer) {
+        self.prompt_viewport.set((area.width, area.height));
         if area.width == 0 || area.height == 0 {
             return;
         }
         let answered = self.is_current_field_answered();
-        for (offset, line) in self.wrapped_prompt_lines(area.width).iter().enumerate() {
+        let lines = self.wrapped_prompt_lines(area.width);
+        let start = self
+            .prompt_offset
+            .get()
+            .min(lines.len().saturating_sub(usize::from(area.height)));
+        self.prompt_offset.set(start);
+        for (offset, line) in lines
+            .iter()
+            .skip(start)
+            .take(usize::from(area.height))
+            .enumerate()
+        {
             let y = area.y.saturating_add(offset as u16);
             if y >= area.y + area.height {
                 break;
@@ -1514,6 +1562,23 @@ impl BottomPaneView for McpServerElicitationOverlay {
 
     fn handle_key_event(&mut self, key_event: KeyEvent) {
         if key_event.kind == KeyEventKind::Release {
+            return;
+        }
+
+        if !self.request.approval_display_params.is_empty()
+            && key_event.modifiers == KeyModifiers::CONTROL
+            && matches!(key_event.code, KeyCode::PageUp | KeyCode::PageDown)
+        {
+            let (width, height) = self.prompt_viewport.get();
+            let step = usize::from(height.max(1));
+            let max_offset = self.wrapped_prompt_lines(width).len().saturating_sub(step);
+            let offset = self.prompt_offset.get().min(max_offset);
+            self.prompt_offset
+                .set(if key_event.code == KeyCode::PageUp {
+                    offset.saturating_sub(step)
+                } else {
+                    offset.saturating_add(step).min(max_offset)
+                });
             return;
         }
 
@@ -2205,8 +2270,111 @@ mod tests {
                     value: Value::String("Roadmap review".to_string()),
                     display_name: "Title".to_string(),
                 },
+                McpToolApprovalDisplayParam {
+                    name: "alpha".to_string(),
+                    value: serde_json::json!(1),
+                    display_name: "alpha".to_string(),
+                },
+                McpToolApprovalDisplayParam {
+                    name: "zeta".to_string(),
+                    value: serde_json::json!(3),
+                    display_name: "zeta".to_string(),
+                },
             ]
         );
+    }
+
+    #[test]
+    fn tool_approval_arguments_are_complete_scrollable_and_cancel_does_not_accept() {
+        let (tx, mut rx) = test_sender();
+        let path = format!("C:/workspace/{}/critical-target.rs", "nested/".repeat(400));
+        let request = from_form_request(
+            ThreadId::default(),
+            form_request(
+                "Allow file operation?",
+                empty_object_schema(),
+                tool_approval_meta(
+                    &[],
+                    Some(serde_json::json!({
+                        "path": path,
+                        "second": "SECOND_ARGUMENT",
+                        "third": "THIRD_ARGUMENT",
+                        "fourth": "FOURTH_ARGUMENT",
+                    })),
+                    Some(vec![(
+                        "path",
+                        Value::String("misleading preview".to_string()),
+                        "Path",
+                    )]),
+                ),
+            ),
+        )
+        .expect("approval form");
+        let mut overlay = McpServerElicitationOverlay::new(request, tx, true, false, false);
+        assert!(overlay.current_prompt_text().contains(&path));
+        assert!(!overlay.current_prompt_text().contains("misleading preview"));
+        let area = Rect::new(0, 0, 60, 14);
+        let first = render_snapshot(&overlay, area);
+        assert!(!first.contains("critical-target.rs"));
+        let width = overlay.prompt_viewport.get().0;
+        let original_layout = overlay.wrapped_prompt_lines(width);
+        let mut rendered = first.clone();
+        for _ in 0..original_layout.len() {
+            let previous = overlay.prompt_offset.get();
+            overlay.handle_key_event(KeyEvent::new(KeyCode::PageDown, KeyModifiers::CONTROL));
+            rendered.push_str(&render_snapshot(&overlay, area));
+            assert!(
+                Arc::ptr_eq(&original_layout, &overlay.wrapped_prompt_lines(width)),
+                "scrolling and rendering must reuse the full argument layout"
+            );
+            if overlay.prompt_offset.get() == previous {
+                break;
+            }
+        }
+        for expected in [
+            "critical-target.rs",
+            "SECOND_ARGUMENT",
+            "THIRD_ARGUMENT",
+            "FOURTH_ARGUMENT",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing rendered argument: {expected}"
+            );
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "scrolling must not resolve the approval"
+        );
+        while overlay.prompt_offset.get() > 0 {
+            overlay.handle_key_event(KeyEvent::new(KeyCode::PageUp, KeyModifiers::CONTROL));
+        }
+        assert_eq!(render_snapshot(&overlay, area), first);
+        let resized = Rect::new(0, 0, 80, 14);
+        render_snapshot(&overlay, resized);
+        let resized_width = overlay.prompt_viewport.get().0;
+        assert_ne!(resized_width, width);
+        assert!(!Arc::ptr_eq(
+            &original_layout,
+            &overlay.wrapped_prompt_lines(resized_width)
+        ));
+        assert_eq!(render_snapshot(&overlay, area), first);
+        assert!(Arc::ptr_eq(
+            &original_layout,
+            &overlay.wrapped_prompt_lines(width)
+        ));
+        overlay.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(
+            rx.try_recv().expect("cancellation"),
+            AppEvent::SubmitThreadOp {
+                op: Op::ResolveElicitation {
+                    decision: McpServerElicitationAction::Cancel,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(rx.try_recv().is_err(), "cancellation must not also accept");
     }
 
     #[test]

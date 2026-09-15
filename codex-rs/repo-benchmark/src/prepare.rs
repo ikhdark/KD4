@@ -8,7 +8,7 @@ mod v8;
 use crate::schedule::{Mode, ScheduledAttempt, Variant, schedule};
 use crate::workloads::{LiveTask, PreparedFixture, prepare_dependencies_with_env, prepare_fixture};
 use anyhow::{Context, Result, ensure};
-use environment::{BASE_CONFIG, Environment};
+use environment::{BASE_CONFIG, Environment, ProjectConfigComparison, configured_value};
 use provenance::{
     FileIdentity, command_output, copy_tree, find_repo_root, git, hash_bytes, hash_tree,
     materialize_commit, read_json, reset_workspace, write_json,
@@ -23,7 +23,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub const MANIFEST_VERSION: u32 = 1;
+pub const MANIFEST_VERSION: u32 = 2;
 
 #[derive(Clone, Debug)]
 pub struct PrepareOptions {
@@ -62,6 +62,7 @@ pub struct Prepared {
     pub mode: Mode,
     pub schedule: Vec<ScheduledAttempt>,
     pub workspace: PathBuf,
+    pub workspace_lock: PathBuf,
     pub additional_roots: Vec<PathBuf>,
     pub runs_directory: PathBuf,
     pub import_directory: PathBuf,
@@ -72,6 +73,8 @@ pub struct Prepared {
     pub harness_sources: FileIdentity,
     pub environment: Environment,
     pub base_config: FileIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_config_comparison: Option<ProjectConfigComparison>,
     pub features: Vec<Value>,
     pub feature_inventory: FileIdentity,
     pub overrides: BTreeMap<Variant, Vec<String>>,
@@ -124,19 +127,94 @@ pub fn resolve_source(
 }
 
 fn checkout(source: &SourceIdentity) -> Result<()> {
-    command_output(
+    ensure!(
+        source.checkout.is_absolute(),
+        "prepared native checkout must be absolute"
+    );
+    let parent = source.checkout.parent().context("native checkout parent")?;
+    fs::create_dir_all(parent)?;
+    // Exclusive creation establishes ownership; never clean an existing destination.
+    fs::create_dir(&source.checkout)
+        .context("native checkout destination already exists or cannot be created")?;
+    let owned_path = fs::canonicalize(&source.checkout)?;
+    let result = (|| -> Result<()> {
+        command_output(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "core.longpaths=true",
+                    "clone",
+                    "--local",
+                    "--no-hardlinks",
+                    "--no-checkout",
+                    "--no-tags",
+                    "--config",
+                    "core.longpaths=true",
+                    "--",
+                ])
+                .arg(provenance::git_path(&source.origin))
+                .arg(provenance::git_path(&source.checkout)),
+        )?;
+        git(
+            &source.checkout,
+            &["checkout", "--detach", &source.revision],
+        )?;
+        ensure!(
+            git(&source.checkout, &["rev-parse", "HEAD"])? == source.revision,
+            "wrong prepared native revision"
+        );
+        ensure!(
+            git(&source.checkout, &["rev-parse", "HEAD^{tree}"])? == source.tree,
+            "wrong prepared native tree"
+        );
+        Ok(())
+    })();
+    if let Err(error) = result {
+        ensure!(
+            fs::canonicalize(&source.checkout)? == owned_path,
+            "failed native checkout changed location; retained evidence: {error:#}"
+        );
+        fs::remove_dir_all(&owned_path).with_context(|| {
+            format!(
+                "clean newly created failed checkout {} after {error:#}",
+                owned_path.display()
+            )
+        })?;
+        return Err(error).context("initialize independent local native checkout");
+    }
+    Ok(())
+}
+
+fn validate_selected_toolchain(
+    source: &SourceIdentity,
+    expected: &str,
+    variant: &str,
+) -> Result<()> {
+    let declaration = git(
+        &source.origin,
+        &[
+            "show",
+            &format!("{}:codex-rs/rust-toolchain.toml", source.revision),
+        ],
+    )
+    .with_context(|| {
+        format!(
+            "{variant} at {} lacks a committed Rust toolchain declaration",
+            source.revision
+        )
+    })?;
+    builds::validate_toolchain(&declaration, &source.revision, expected)
+        .with_context(|| format!("{variant} at {}", source.revision))
+}
+
+fn snapshot_feature_inventory(source: &SourceIdentity, destination: &Path) -> Result<()> {
+    let bytes = command_output(
         Command::new("git")
-            .args(["-c", "core.longpaths=true"])
             .arg("-C")
             .arg(&source.origin)
-            .args(["worktree", "add", "--detach"])
-            .arg(provenance::git_path(&source.checkout))
-            .arg(&source.revision),
+            .args(["show", &format!("{}:kd4_features.toml", source.revision)]),
     )?;
-    ensure!(
-        git(&source.checkout, &["rev-parse", "HEAD"])? == source.revision,
-        "wrong prepared native revision"
-    );
+    fs::write(destination, bytes)?;
     Ok(())
 }
 
@@ -294,11 +372,13 @@ pub fn prepare(options: PrepareOptions) -> Result<PathBuf> {
         )?,
     };
     let environment = Environment::capture(&repo)?;
+    validate_selected_toolchain(&fork, &environment.rust_toolchain, "fork variants")?;
+    validate_selected_toolchain(&reference, &environment.rust_toolchain, "reference")?;
     fs::create_dir_all(directory.join("frozen"))?;
     let base_config_path = directory.join("frozen/config.toml");
     fs::write(&base_config_path, BASE_CONFIG)?;
     let inventory_path = directory.join("frozen/kd4_features.toml");
-    fs::copy(repo.join("kd4_features.toml"), &inventory_path)?;
+    snapshot_feature_inventory(&fork, &inventory_path)?;
     let inventory: toml::Value = toml::from_str(&fs::read_to_string(&inventory_path)?)?;
     let features: Vec<Value> =
         serde_json::from_value(serde_json::to_value(&inventory["features"])?)?;
@@ -307,6 +387,7 @@ pub fn prepare(options: PrepareOptions) -> Result<PathBuf> {
         (Variant::ForkOn, feature_overrides(&features, true)?),
         (Variant::Reference, vec![]),
     ]);
+    let project_config_comparison = ProjectConfigComparison::capture(&repo, BASE_CONFIG, &overrides)?;
     let shared_inputs = directory.join("frozen/shared");
     snapshot_shared_inputs(&repo, &shared_inputs)?;
     let shared_sha256 = hash_tree(&shared_inputs)?;
@@ -417,7 +498,7 @@ pub fn prepare(options: PrepareOptions) -> Result<PathBuf> {
         }
         strip_inherited_configuration(&snapshot)?;
         copy_tree(&shared_inputs, &snapshot)?;
-        reset_workspace(&directory, &workspace, &snapshot)?;
+        reset_workspace(&directory, &workspace, &snapshot, &hash_tree(&snapshot)?)?;
         let protected = directory.join("protected").join(task.id());
         fs::create_dir_all(&protected)?;
         let descriptor = prepare_fixture(task, &workspace, &protected)?;
@@ -440,6 +521,7 @@ pub fn prepare(options: PrepareOptions) -> Result<PathBuf> {
         mode: options.mode,
         schedule: schedule(options.mode),
         workspace,
+        workspace_lock: directory.join("workspace.lock"),
         additional_roots: vec![],
         runs_directory: directory.join("runs"),
         import_directory: repo.join("docs/benchmarks/repo-benchmark/accepted"),
@@ -450,6 +532,7 @@ pub fn prepare(options: PrepareOptions) -> Result<PathBuf> {
         harness_sources,
         environment,
         base_config: FileIdentity::record(&base_config_path)?,
+        project_config_comparison,
         features,
         feature_inventory: FileIdentity::record(&inventory_path)?,
         overrides,
@@ -528,20 +611,6 @@ impl Prepared {
         Ok(())
     }
     pub fn expected_config(&self, variant: Variant) -> Result<Value> {
-        let mut config: toml::Value = toml::from_str(&fs::read_to_string(&self.base_config.path)?)?;
-        for setting in &self.overrides[&variant] {
-            let parsed: toml::Value = toml::from_str(setting)?;
-            if let Some(features) = parsed.get("features").and_then(toml::Value::as_table) {
-                let table = config
-                    .as_table_mut()
-                    .context("config table")?
-                    .entry("features")
-                    .or_insert_with(|| toml::Value::Table(Default::default()))
-                    .as_table_mut()
-                    .context("features table")?;
-                table.extend(features.clone());
-            }
-        }
-        Ok(serde_json::to_value(config)?)
+        configured_value(&fs::read_to_string(&self.base_config.path)?, &self.overrides[&variant])
     }
 }

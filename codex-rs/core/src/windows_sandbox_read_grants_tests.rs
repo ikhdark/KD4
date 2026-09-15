@@ -39,7 +39,37 @@ fn rejects_missing_path() {
         missing.as_path(),
     )
     .expect_err("missing path should fail");
-    assert!(err.to_string().contains("path does not exist"));
+    assert!(err.to_string().contains("could not inspect read root"));
+    assert!(err.to_string().contains(&missing.display().to_string()));
+    assert_eq!(
+        err.downcast_ref::<std::io::Error>()
+            .expect("I/O cause")
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
+}
+
+#[test]
+fn preserves_metadata_errors_other_than_not_found() {
+    let tmp = TempDir::new().expect("tempdir");
+    let invalid = tmp.path().join("invalid\0root");
+    let err = grant_read_root_non_elevated(
+        &PermissionProfile::workspace_write(),
+        &workspace_roots_for(tmp.path()),
+        tmp.path(),
+        &HashMap::new(),
+        tmp.path(),
+        &invalid,
+    )
+    .expect_err("invalid path should fail before granting access");
+
+    assert!(err.to_string().contains("could not inspect read root"));
+    assert_eq!(
+        err.downcast_ref::<std::io::Error>()
+            .expect("I/O cause")
+            .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
 }
 
 #[test]

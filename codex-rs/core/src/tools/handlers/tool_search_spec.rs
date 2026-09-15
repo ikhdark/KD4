@@ -13,7 +13,7 @@ pub(crate) fn create_tool_search_tool(
         (
             "query".to_string(),
             JsonSchema::string(Some(
-                "Search query for deferred tools. Must contain non-whitespace text and must not exceed 4,096 UTF-8 bytes."
+                "Short search terms or an exact name for deferred tools; omit unrelated task context. Must contain non-whitespace text and must not exceed 4,096 UTF-8 bytes."
                     .to_string(),
             )),
         ),
@@ -23,7 +23,7 @@ pub(crate) fn create_tool_search_tool(
                 minimum: Some(serde_json::Number::from(1_u64)),
                 maximum: Some(serde_json::Number::from(64_u64)),
                 ..JsonSchema::integer(Some(format!(
-                    "Maximum number of tools to return. Must be an integer from 1 through 64. Defaults to {default_limit}."
+                    "Maximum number of tools to return and activate. Choose the smallest useful limit to avoid loading unrelated schemas. Must be an integer from 1 through 64. Defaults to {default_limit}."
                 )))
             },
         ),
@@ -118,7 +118,7 @@ mod tests {
                                 minimum: Some(serde_json::Number::from(1_u64)),
                                 maximum: Some(serde_json::Number::from(64_u64)),
                                 ..JsonSchema::integer(Some(
-                                    "Maximum number of tools to return. Must be an integer from 1 through 64. Defaults to 8."
+                                    "Maximum number of tools to return and activate. Choose the smallest useful limit to avoid loading unrelated schemas. Must be an integer from 1 through 64. Defaults to 8."
                                         .to_string(),
                                 ))
                             },
@@ -126,7 +126,7 @@ mod tests {
                         (
                             "query".to_string(),
                             JsonSchema::string(Some(
-                                    "Search query for deferred tools. Must contain non-whitespace text and must not exceed 4,096 UTF-8 bytes."
+                                    "Short search terms or an exact name for deferred tools; omit unrelated task context. Must contain non-whitespace text and must not exceed 4,096 UTF-8 bytes."
                                         .to_string(),
                                 ),),
                         ),

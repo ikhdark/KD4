@@ -1531,8 +1531,16 @@ mod tests {
             .await
             .expect_err("mismatch should fail");
 
-        assert!(matches!(err, ThreadStoreError::Internal { .. }));
-        assert!(err.to_string().contains("metadata id mismatch"));
+        assert!(matches!(
+            err,
+            ThreadStoreError::InvalidRequest { message } if message == format!(
+                "rollout session metadata id mismatch: expected {filename_uuid}, found {metadata_uuid}"
+            )
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read rejected rollout"),
+            content.replace(&filename_uuid.to_string(), &metadata_uuid.to_string())
+        );
     }
 
     #[tokio::test]

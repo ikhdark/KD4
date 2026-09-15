@@ -69,7 +69,11 @@ prefix_rule(pattern=["echo"])
                 r#"prefix_rule(pattern=["rg"], match=[["git"]])"#,
             )
             .expect_err("later examples must still be checked");
-        assert!(error.to_string().contains("second.rules"), "{error}");
+        assert_eq!(
+            error.location().expect("example location").path,
+            "second.rules"
+        );
+        assert!(matches!(error, Error::ExampleDidNotMatch { .. }));
     }
 }
 

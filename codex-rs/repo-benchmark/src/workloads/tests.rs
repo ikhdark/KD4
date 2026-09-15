@@ -22,7 +22,7 @@ fn final_state_rejects_instruction_changes_and_unexpected_files() {
     )
     .unwrap();
     let result = verify_fixture(&fixture).unwrap();
-    assert_eq!(result.status, VerificationStatus::Incorrect);
+    assert_eq!(result.status, VerificationStatus::ScopeViolation);
     assert!(
         result.detail.contains("outside permitted task scope")
             && result.detail.contains("AGENTS.md")
@@ -34,7 +34,7 @@ fn final_state_rejects_instruction_changes_and_unexpected_files() {
     )
     .unwrap();
     let result = verify_fixture(&fixture).unwrap();
-    assert_eq!(result.status, VerificationStatus::Incorrect);
+    assert_eq!(result.status, VerificationStatus::ScopeViolation);
     assert!(result.detail.contains("scripts/extra.py"));
 }
 
@@ -84,6 +84,68 @@ fn rust_oracle_accepts_correct_parser_and_rejects_overflow_bug() {
 }
 
 #[test]
+fn rust_regression_accepts_expect_unwrap_err_and_should_panic() {
+    for regression in [
+        r#"#[test] fn regression() { assert_eq!(parse_duration("2m15s").expect("compound duration"), 135000); }"#,
+        r#"#[test] fn regression() { parse_duration("+1s").unwrap_err(); }"#,
+        r#"#[test] #[should_panic] fn regression() { parse_duration("+1s").unwrap(); }"#,
+    ] {
+        let (_temp, fixture) = setup(LiveTask::RustBugfix);
+        fs::write(fixture.workspace.join("src/lib.rs"), CORRECT_RUST).unwrap();
+        let tests = fixture.workspace.join("tests/regression.rs");
+        let baseline = fs::read_to_string(&tests).unwrap();
+        fs::write(
+            tests,
+            format!("{baseline}\n{regression}\n{RUST_INVALID_OVERFLOW_TESTS}\n"),
+        )
+        .unwrap();
+        let result = verify_fixture(&fixture).unwrap();
+        assert_eq!(
+            result.status,
+            VerificationStatus::Passed,
+            "valid regression form rejected: {regression}; {result:?}"
+        );
+    }
+}
+
+#[test]
+fn rust_regression_rejects_mutation_compile_failure_and_early_process_exit() {
+    let cases = [
+        (
+            "pub fn regression_helper() -> u64 { 135000 }",
+            r#"#[test] fn regression() { assert_eq!(parse_duration("2m15s").unwrap(), duration_fixture::regression_helper()); }"#,
+            "cannot find function `regression_helper`",
+        ),
+        (
+            "",
+            r#"#[test] fn regression() {
+                if parse_duration("2m15s").is_err() { std::process::exit(101); }
+                assert_eq!(parse_duration("2m15s"), Ok(135000));
+            }"#,
+            "completed rust test run",
+        ),
+    ];
+    for (helper, regression, expected_reason) in cases {
+        let (_temp, fixture) = setup(LiveTask::RustBugfix);
+        fs::write(
+            fixture.workspace.join("src/lib.rs"),
+            format!("{CORRECT_RUST}\n{helper}\n"),
+        )
+        .unwrap();
+        let tests = fixture.workspace.join("tests/regression.rs");
+        let baseline = fs::read_to_string(&tests).unwrap();
+        fs::write(
+            tests,
+            format!("{baseline}\n{regression}\n{RUST_INVALID_OVERFLOW_TESTS}\n"),
+        )
+        .unwrap();
+        let result = verify_fixture(&fixture).unwrap();
+        assert_eq!(result.status, VerificationStatus::Incorrect, "{result:?}");
+        assert!(result.detail.contains(expected_reason), "{result:?}");
+    }
+}
+
+#[test]
 fn typescript_oracle_requires_aggregation_and_tests_that_catch_it() {
     let (_temp, fixture) = setup(LiveTask::TypescriptFeature);
     fs::write(fixture.workspace.join("src/parser.ts"), CORRECT_TS_PARSER).unwrap();
@@ -94,8 +156,24 @@ fn typescript_oracle_requires_aggregation_and_tests_that_catch_it() {
     fs::write(&test_path, format!("{initial}\n// Added tests.\n")).unwrap();
     let result = verify_fixture(&fixture).unwrap();
     assert_eq!(result.status, VerificationStatus::Incorrect, "{result:?}");
-    assert!(result.detail.contains("model tests did not reject"));
+    assert!(
+        result.detail.contains("model tests did not reject"),
+        "{result:?}"
+    );
     fs::write(&test_path, format!("{initial}\ntest('merge duplicate names', () => {{ assert.equal(renderReport('apples,2\\npears,3\\napples,4'), 'apples: 6\\npears: 3\\nTOTAL: 9'); }});\n")).unwrap();
+    let result = verify_fixture(&fixture).unwrap();
+    assert_eq!(result.status, VerificationStatus::Incorrect, "{result:?}");
+    assert!(
+        result.detail.contains("Regression coverage: parsing"),
+        "{result:?}"
+    );
+    fs::write(&test_path, format!("{initial}\n{TS_REQUIRED_TESTS}\n")).unwrap();
+    let result = verify_fixture(&fixture).unwrap();
+    assert_eq!(result.status, VerificationStatus::Passed, "{result:?}");
+    // Node counts describe blocks separately from leaf tests. Exercise the
+    // real Node process and mutation oracle with nested passing suites.
+    let nested = TS_REQUIRED_TESTS.replace("import { parseRows } from '../src/parser.ts';", "");
+    fs::write(&test_path, format!("{initial}\nimport {{ describe }} from 'node:test';\nimport {{ parseRows }} from '../src/parser.ts';\ndescribe('report', () => {{ describe('regressions', () => {{ {nested} }}); }});\n")).unwrap();
     let result = verify_fixture(&fixture).unwrap();
     assert_eq!(result.status, VerificationStatus::Passed, "{result:?}");
     fs::write(
@@ -130,6 +208,9 @@ fn python_refactor_checks_real_helper_use_and_preserved_results() {
     );
     fs::write(workspace.join("scripts/readme_toc.py"), &updated).unwrap();
     fs::write(workspace.join("test_repo_benchmark_refactor.py"), "import unittest\nfrom scripts.readme_toc import generate_toc_lines, format_toc_entry\nclass Regression(unittest.TestCase):\n    def test_heading(self):\n        self.assertEqual(generate_toc_lines(['## Hello']), ['- [Hello](#hello)'])\n    def test_indent(self):\n        self.assertEqual(generate_toc_lines(['### Child']), ['  - [Child](#child)'])\n    def test_escaping(self):\n        self.assertEqual(format_toc_entry(2, 'A[B]', 'a'), '- [A\\\\[B\\\\]](#a)')\n").unwrap();
+    let tests = workspace.join("test_repo_benchmark_refactor.py");
+    let existing = fs::read_to_string(&tests).unwrap();
+    fs::write(tests, format!("{existing}\n    def test_repeated_headings(self):\n        self.assertEqual(generate_toc_lines(['## A','## A']), ['- [A](#a)','- [A](#a-1)'])\n    def test_fenced_code(self):\n        self.assertEqual(generate_toc_lines(['```','## Hidden','```','## Visible']), ['- [Visible](#visible)'])\n")).unwrap();
     let result = verify_fixture(&fixture).unwrap();
     assert_eq!(result.status, VerificationStatus::Passed, "{result:?}");
     let wrong = updated.replace(
@@ -174,3 +255,178 @@ export function renderReport(text:string):string {const sums=new Map<string,numb
  if(!Number.isSafeInteger(value)||!Number.isSafeInteger(total)) throw new Error('overflow'); sums.set(name,value); }
  return [...sums].map(([n,q])=>`${n}: ${q}`).concat(`TOTAL: ${total}`).join('\n'); }
 "#;
+
+const RUST_INVALID_OVERFLOW_TESTS: &str = r#"
+#[test] fn rejects_invalid_spacing() { assert!(parse_duration("1 s").is_err()); }
+#[test] fn rejects_integer_overflow() { assert!(parse_duration("18446744073709551616ms").is_err()); }
+"#;
+
+const TS_REQUIRED_TESTS: &str = r#"
+import { parseRows } from '../src/parser.ts';
+test('parsing whitespace', () => { assert.deepEqual(parseRows(' apples , 2 \n'), [{name:'apples', quantity:2}]); });
+test('merge duplicates and preserve order', () => { assert.equal(renderReport('apples,2\npears,3\napples,4'), 'apples: 6\npears: 3\nTOTAL: 9'); });
+test('malformed rows', () => { assert.throws(() => parseRows('x,-1'), Error); });
+test('overflow', () => { assert.throws(() => renderReport('x,9007199254740991\nx,1'), Error); });
+"#;
+
+#[test]
+fn typescript_early_success_exit_cannot_pass_tests_or_protected_oracle() {
+    for conditional in [false, true] {
+        let (_temp, fixture) = setup(LiveTask::TypescriptFeature);
+        fs::write(fixture.workspace.join("src/parser.ts"), CORRECT_TS_PARSER).unwrap();
+        let exit = if conditional {
+            "if (text.includes('pears,3')) process.exit(0);"
+        } else {
+            "process.exit(0);"
+        };
+        let broken = CORRECT_TS_REPORT.replace("{const sums", &format!("{{{exit} const sums"));
+        assert_ne!(broken, CORRECT_TS_REPORT);
+        fs::write(fixture.workspace.join("src/report.ts"), broken).unwrap();
+        let tests = fixture.workspace.join("tests/regression.test.ts");
+        let baseline = fs::read_to_string(&tests).unwrap();
+        fs::write(tests, format!("{baseline}\n{TS_REQUIRED_TESTS}\n")).unwrap();
+        let result = verify_fixture(&fixture).unwrap();
+        assert_eq!(result.status, VerificationStatus::Incorrect, "{result:?}");
+        assert!(
+            result.detail.contains(if conditional {
+                "protected oracle did not complete"
+            } else {
+                "required node tests did not complete"
+            }),
+            "{result:?}"
+        );
+    }
+}
+
+#[test]
+fn python_early_success_exit_cannot_pass_supervised_verification() {
+    for (exit, expected_reason) in [
+        (
+            "import sys; sys.exit(0)",
+            "required python tests did not complete",
+        ),
+        (
+            "import os; os._exit(0)",
+            "required python tests did not complete",
+        ),
+        (
+            "if __name__ == 'benchmark_readme_toc':\n    import sys; sys.exit(0)",
+            "protected oracle did not complete",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let protected = temp.path().join("protected");
+        fs::create_dir_all(workspace.join("scripts")).unwrap();
+        fs::create_dir(&protected).unwrap();
+        fs::write(
+            workspace.join("scripts/readme_toc.py"),
+            include_str!("../../../../scripts/readme_toc.py"),
+        )
+        .unwrap();
+        let fixture = prepare_fixture(LiveTask::Kd4PythonRefactor, &workspace, &protected).unwrap();
+        let source = if exit.starts_with("if ") {
+            format!(
+                "{}\n{exit}\n",
+                include_str!("../../../../scripts/readme_toc.py")
+            )
+        } else {
+            exit.to_owned()
+        };
+        fs::write(workspace.join("scripts/readme_toc.py"), source).unwrap();
+        let tests = workspace.join("test_repo_benchmark_refactor.py");
+        let baseline = fs::read_to_string(&tests).unwrap();
+        fs::write(tests, format!("{baseline}\n# Claimed regression tests.\n")).unwrap();
+        let result = verify_fixture(&fixture).unwrap();
+        assert_eq!(result.status, VerificationStatus::Incorrect, "{result:?}");
+        assert!(result.detail.contains(expected_reason), "{result:?}");
+    }
+}
+
+#[test]
+fn rust_requested_invalid_and_overflow_regressions_are_both_required() {
+    for (extra, missing_category) in [
+        (
+            r#"#[test] fn checks_overflow() { assert!(parse_duration("18446744073709551616ms").is_err()); }"#,
+            "invalid-input",
+        ),
+        (
+            r#"#[test] fn checks_invalid() { assert!(parse_duration("1 s").is_err()); }"#,
+            "overflow",
+        ),
+    ] {
+        let (_temp, fixture) = setup(LiveTask::RustBugfix);
+        fs::write(fixture.workspace.join("src/lib.rs"), CORRECT_RUST).unwrap();
+        let tests = fixture.workspace.join("tests/regression.rs");
+        let baseline = fs::read_to_string(&tests).unwrap();
+        fs::write(
+            tests,
+            format!(
+                r#"{baseline}
+#[test] fn compound() {{ assert_eq!(parse_duration("2m15s"), Ok(135000)); }}
+{extra}
+"#
+            ),
+        )
+        .unwrap();
+        let result = verify_fixture(&fixture).unwrap();
+        assert_eq!(result.status, VerificationStatus::Incorrect, "{result:?}");
+        assert!(
+            result
+                .detail
+                .contains(&format!("Regression coverage: {missing_category}")),
+            "{result:?}"
+        );
+        assert!(
+            result.detail.contains("completed rust test run"),
+            "{result:?}"
+        );
+    }
+}
+
+#[test]
+fn typescript_requested_malformed_and_overflow_regressions_are_required() {
+    for missing in ["malformed", "overflow"] {
+        let (_temp, fixture) = setup(LiveTask::TypescriptFeature);
+        fs::write(fixture.workspace.join("src/parser.ts"), CORRECT_TS_PARSER).unwrap();
+        fs::write(fixture.workspace.join("src/report.ts"), CORRECT_TS_REPORT).unwrap();
+        let tests = fixture.workspace.join("tests/regression.test.ts");
+        let baseline = fs::read_to_string(&tests).unwrap();
+        let partial = TS_REQUIRED_TESTS
+            .lines()
+            .filter(|line| !line.starts_with(&format!("test('{missing}")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(tests, format!("{baseline}\n{partial}\n")).unwrap();
+        let result = verify_fixture(&fixture).unwrap();
+        assert_eq!(result.status, VerificationStatus::Incorrect, "{result:?}");
+        assert!(
+            result
+                .detail
+                .contains(&format!("Regression coverage: {missing}")),
+            "{result:?}"
+        );
+        assert!(
+            result.detail.contains("completed node test run"),
+            "{result:?}"
+        );
+    }
+}
+
+#[test]
+fn typescript_submitted_tests_must_complete_after_positive_oracle() {
+    let (_temp, fixture) = setup(LiveTask::TypescriptFeature);
+    fs::write(fixture.workspace.join("src/parser.ts"), CORRECT_TS_PARSER).unwrap();
+    fs::write(fixture.workspace.join("src/report.ts"), CORRECT_TS_REPORT).unwrap();
+    let tests = fixture.workspace.join("tests/regression.test.ts");
+    let baseline = fs::read_to_string(&tests).unwrap();
+    fs::write(tests, format!("{baseline}\n{TS_REQUIRED_TESTS}\ntest('premature success', () => {{process.exit(0);}});\n")).unwrap();
+    let result = verify_fixture(&fixture).unwrap();
+    assert_eq!(result.status, VerificationStatus::Incorrect, "{result:?}");
+    assert!(
+        result
+            .detail
+            .contains("required node tests did not complete"),
+        "{result:?}"
+    );
+}

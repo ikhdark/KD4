@@ -53,6 +53,7 @@ impl CodeModeElicitationHarness {
                 .with_model("test-gpt-5.1-codex")
                 .with_config(move |config| {
                     let _ = config.features.enable(Feature::CodeMode);
+                    config.set_windows_sandbox_enabled(true);
                     configure(config);
                 });
         let test = builder.build_with_auto_env(&server).await?;
@@ -189,6 +190,7 @@ await tools.exec_command({
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(codex_home)]
 async fn code_mode_holds_yielded_result_during_patch_approval() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -196,7 +198,7 @@ async fn code_mode_holds_yielded_result_during_patch_approval() -> Result<()> {
         r#"// @exec: {"yield_time_ms": 1000}
 await tools.apply_patch("*** Begin Patch\n*** Add File: code_mode_patch_approval.txt\n+held\n*** End Patch\n");"#,
         PermissionProfile::read_only(),
-        |_| {},
+        |config| config.set_windows_elevated_sandbox_enabled(true),
     )
     .await?;
     let approval = wait_for_event_match_with_timeout(
@@ -267,6 +269,7 @@ await tools.request_permissions({
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(codex_home)]
 async fn code_mode_nested_denial_completes_without_follow_up_or_error() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -274,7 +277,7 @@ async fn code_mode_nested_denial_completes_without_follow_up_or_error() -> Resul
         r#"// @exec: {"yield_time_ms": 1000}
 await tools.apply_patch("*** Begin Patch\n*** Add File: code_mode_denied_patch.txt\n+denied\n*** End Patch\n");"#,
         PermissionProfile::read_only(),
-        |_| {},
+        |config| config.set_windows_elevated_sandbox_enabled(true),
     )
     .await?;
     let approval = wait_for_event_match_with_timeout(

@@ -607,13 +607,15 @@ fn build_token_limited_compacted_history_truncates_overlong_user_messages() {
     };
 
     assert!(
-        truncated_text.contains("tokens truncated"),
+        truncated_text.contains("[...]"),
         "expected truncation marker in truncated user message"
     );
     assert!(
         !truncated_text.contains(&big),
         "truncated user message should not include the full oversized user text"
     );
+
+    assert!(approx_token_count(&truncated_text) <= max_tokens);
 
     let summary_text = match summary_message {
         ResponseItem::Message { role, content, .. } if role == "user" => {
@@ -719,11 +721,12 @@ fn compaction_section_allocations_preserve_evidence_and_next_action_under_pressu
             .join("\n\n")
     );
 
-    let undersized_summary = truncate_compaction_summary(&generated, 1_800);
     assert!(
-        !undersized_summary.contains(next_action_sentinel),
-        "pressure fixture no longer reproduces the former task-state budget loss"
+        approx_token_count(&generated) > COMPACT_TASK_STATE_MAX_TOKENS,
+        "the fixture must require truncation even at the larger budget"
     );
+    let undersized_summary = truncate_compaction_summary(&generated, 1_800);
+    assert!(approx_token_count(&undersized_summary) <= 1_800);
 
     let summary = truncate_compaction_summary(&generated, COMPACT_TASK_STATE_MAX_TOKENS);
 
@@ -736,6 +739,33 @@ fn compaction_section_allocations_preserve_evidence_and_next_action_under_pressu
         summary.contains(next_action_sentinel),
         "bounded checkpoint lost meaningful Next action content: {summary}"
     );
+}
+
+#[test]
+fn structured_compaction_summary_respects_feasible_token_budgets() {
+    let source = format!(
+        "{}\n{}",
+        "preamble ".repeat(400),
+        COMPACTION_SECTIONS
+            .iter()
+            .map(|(heading, _)| {
+                format!("{heading}\n{}", r#"{"a":1,"b":2} 漢字🦀 "#.repeat(100))
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    );
+    // Structured handoffs retain all six headings and a body for each section;
+    // budgets below that irreducible minimum intentionally preserve structure.
+    for max_tokens in [100, 300, 1_800, 2_400] {
+        let result = truncate_compaction_summary(&source, max_tokens);
+        assert!(
+            approx_token_count(&result) <= max_tokens,
+            "budget {max_tokens}: {result}"
+        );
+        for (heading, _) in COMPACTION_SECTIONS {
+            assert!(result.lines().any(|line| line == heading), "{result}");
+        }
+    }
 }
 
 #[test]
@@ -867,7 +897,7 @@ fn summary_reuse_is_disabled_when_post_summary_user_tail_is_truncated() {
         user_message(&"unresolved constraint ".repeat(COMPACT_USER_MESSAGE_MAX_TOKENS * 3)),
     ];
 
-    let (_, _, _, omitted_user_text) = build_bounded_unresolved_input_history(&items);
+    let (_, _, _, omitted_user_text, _) = build_bounded_unresolved_input_history(&items);
 
     assert!(omitted_user_text);
     assert!(!can_reuse_previous_summary(&items, omitted_user_text));
@@ -888,7 +918,7 @@ fn bounded_user_history_emits_text_omission_receipt() {
         user_message(&"exact constraint ".repeat(COMPACT_USER_MESSAGE_MAX_TOKENS * 3)),
     ];
 
-    let (history, _, _, omitted_user_text) = build_bounded_unresolved_input_history(&items);
+    let (history, _, _, omitted_user_text, _) = build_bounded_unresolved_input_history(&items);
     let rendered = serde_json::to_string(&history).expect("history serializes");
 
     assert!(omitted_user_text);
@@ -910,7 +940,7 @@ fn unresolved_text_omission_reports_stable_provenance_and_exact_counts() {
         }),
     }];
 
-    let (history, _, _, omitted_user_text) = build_bounded_unresolved_input_history(&items);
+    let (history, _, _, omitted_user_text, _) = build_bounded_unresolved_input_history(&items);
     let receipt = history
         .iter()
         .filter_map(|item| match item {
@@ -955,7 +985,7 @@ fn over_truncation_moderate_unresolved_user_text_is_retained_without_a_retry() {
     assert!(approx_token_count(&text) > 4_000);
     assert!(approx_token_count(&text) < COMPACT_USER_MESSAGE_MAX_TOKENS);
 
-    let (history, _, _, omitted_user_text) =
+    let (history, _, _, omitted_user_text, _) =
         build_bounded_unresolved_input_history(&[user_message(&text)]);
     let rendered = serde_json::to_string(&history).expect("history serializes");
 
@@ -974,10 +1004,10 @@ fn over_truncation_large_unresolved_text_gets_exact_artifact_recovery_payload() 
         " trailing constraint".repeat(COMPACT_USER_MESSAGE_MAX_TOKENS)
     );
     let items = vec![user_message(&text)];
-    let (bounded, _, _, omitted_user_text) = build_bounded_unresolved_input_history(&items);
+    let (_, _, _, omitted_user_text, omitted_text) = build_bounded_unresolved_input_history(&items);
 
     assert!(omitted_user_text);
-    let canonical = compaction_text_recovery_canonical(&items, &bounded)
+    let canonical = compaction_text_recovery_canonical(&items, omitted_text)
         .expect("omitted unresolved text must get a canonical recovery payload");
     assert!(String::from_utf8_lossy(&canonical.bytes).contains(sentinel));
     assert_eq!(
@@ -1002,11 +1032,33 @@ fn bounded_agent_history_emits_text_omission_receipt() {
         agent_message(&"worker evidence ".repeat(COMPACT_AGENT_MESSAGE_MAX_TOKENS * 3)),
     ];
 
-    let (history, _, _, _) = build_bounded_unresolved_input_history(&items);
+    let (history, _, _, omitted_user_text, omitted_text) =
+        build_bounded_unresolved_input_history(&items);
     let rendered = serde_json::to_string(&history).expect("history serializes");
 
     assert!(rendered.contains(COMPACT_TEXT_OMISSION_MARKER));
-    assert!(rendered.contains("\"role\":\"agent\""));
+    let receipt = history
+        .iter()
+        .find_map(|item| match item {
+            ResponseItem::Message { content, .. } => content.iter().find_map(|content| {
+                let ContentItem::InputText { text } = content else {
+                    return None;
+                };
+                let value: serde_json::Value = serde_json::from_str(text).ok()?;
+                (value["kind"] == COMPACT_TEXT_OMISSION_MARKER).then_some(value)
+            }),
+            _ => None,
+        })
+        .expect("agent omission receipt");
+    assert_eq!(receipt["role"], "agent");
+    assert!(receipt["omitted_tokens"].as_u64().unwrap() > 0);
+    assert!(!omitted_user_text);
+    let canonical = compaction_text_recovery_canonical(&items, omitted_text)
+        .expect("agent text omissions also need exact recovery");
+    assert_eq!(
+        canonical.value.as_ref().unwrap()["items"],
+        json!([items[1]])
+    );
 }
 
 #[test]
@@ -1029,7 +1081,7 @@ fn unresolved_tool_output_survives_local_compaction_as_typed_receipt() {
     };
     let items = vec![user_message("request"), call.clone(), output.clone()];
 
-    let (history, _, _, _) = build_bounded_unresolved_input_history(&items);
+    let (history, _, _, _, _) = build_bounded_unresolved_input_history(&items);
 
     assert_eq!(history, vec![call, output]);
 }
@@ -1645,7 +1697,7 @@ fn compaction_omission_metadata_has_a_fixed_budget() {
     let items = (0..5000)
         .map(|_| user_message("unresolved constraint "))
         .collect::<Vec<_>>();
-    let (bounded, _, _, omitted) = build_bounded_unresolved_input_history(&items);
+    let (bounded, _, _, omitted, omitted_text) = build_bounded_unresolved_input_history(&items);
     assert!(omitted);
     let receipts = bounded
         .iter()
@@ -1667,13 +1719,80 @@ fn compaction_omission_metadata_has_a_fixed_budget() {
             .sum::<usize>()
             < 1200
     );
-    let canonical = compaction_text_recovery_canonical(&items, &bounded).unwrap();
+    let canonical = compaction_text_recovery_canonical(&items, omitted_text).unwrap();
     assert_eq!(
         canonical.value.as_ref().unwrap()["items"]
             .as_array()
             .unwrap()
             .len(),
         5000
+    );
+}
+
+#[tokio::test]
+async fn local_compaction_retains_literal_omission_markers_and_reports_retained_images() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let literal = format!("Explain the marker {COMPACT_TEXT_OMISSION_MARKER} in this image.");
+    let mut encoded_image = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(
+        1,
+        1,
+        image::Rgba([10u8, 20, 30, 255]),
+    ))
+    .write_to(&mut encoded_image, image::ImageFormat::Png)
+    .expect("encode retained image");
+    let image = ContentItem::InputImage {
+        image_url: codex_utils_image::data_url_from_bytes("image/png", encoded_image.get_ref()),
+        detail: Some(DEFAULT_IMAGE_DETAIL),
+    };
+    let mut request = user_message(&literal);
+    if let ResponseItem::Message { content, .. } = &mut request {
+        content.push(image.clone());
+    }
+    session
+        .record_conversation_items(&turn, &[summary_message("settled state"), request])
+        .await;
+    // No text was omitted, so compaction must succeed even if recovery storage is unavailable.
+    let artifact_path = turn.config.codex_home.join("tool-output");
+    std::fs::create_dir_all(&turn.config.codex_home).unwrap();
+    std::fs::write(&artifact_path, "blocked").unwrap();
+    let session = Arc::new(session);
+    let mut details = CompactionAnalyticsDetails::default();
+    let summary = run_compact_task_inner_impl(
+        Arc::clone(&session),
+        Arc::new(turn),
+        None,
+        Some(&None),
+        Vec::new(),
+        InitialContextInjection::DoNotInject,
+        CompactionTurnMetadata::new(
+            CompactionTrigger::Manual,
+            CompactionReason::UserRequested,
+            CompactionImplementation::Responses,
+            CompactionPhase::StandaloneTurn,
+        ),
+        &mut details,
+        true,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("literal marker text must not require a recovery artifact");
+
+    assert_eq!(summary, format!("{SUMMARY_PREFIX}\nsettled state"));
+    assert_eq!(details.retained_image_count, Some(1));
+    let history = session.clone_history().await;
+    assert_eq!(history.raw_items().len(), 2);
+    let ResponseItem::Message { content, .. } = &history.raw_items()[0] else {
+        panic!("expected retained user request");
+    };
+    assert_eq!(
+        content,
+        &vec![ContentItem::InputText { text: literal }, image]
+    );
+    assert_eq!(std::fs::read_to_string(artifact_path).unwrap(), "blocked");
+    assert_eq!(
+        session.current_window_id().await,
+        format!("{}:1", session.thread_id)
     );
 }
 
@@ -1685,9 +1804,10 @@ async fn compaction_recovery_failure_keeps_unresolved_text() {
         .record_conversation_items(&turn, &[user_message(&text)])
         .await;
     let history = session.clone_history().await;
-    let (_, _, _, omitted) = build_bounded_unresolved_input_history(history.raw_items());
+    let (_, _, _, omitted, _) = build_bounded_unresolved_input_history(history.raw_items());
     assert!(omitted);
     // Block the artifact directory with a file, forcing the real storage path to fail.
+    std::fs::create_dir_all(&turn.config.codex_home).unwrap();
     std::fs::write(turn.config.codex_home.join("tool-output"), "blocked").unwrap();
     let session = Arc::new(session);
     let window_before = session.current_window_id().await;

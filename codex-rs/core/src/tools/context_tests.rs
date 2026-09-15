@@ -966,6 +966,7 @@ fn token_efficiency_exec_output_omits_redundant_headers() {
         process_id: None,
         exit_code: Some(0),
         process_exited: true,
+        search_no_match: false,
         original_token_count: Some(100),
         hook_command: None,
         raw_output_artifact: None,
@@ -982,7 +983,8 @@ fn token_efficiency_exec_output_omits_redundant_headers() {
                 .body
                 .to_text()
                 .expect("exec output should serialize as text");
-            assert!(text.starts_with("Process exited with code 0; wall time: 1.2500 seconds"));
+            assert!(text.starts_with("Process"), "{text}");
+            assert!(text.contains("\n[...]\n"), "{text}");
             assert!(!text.contains("Chunk ID:"));
             assert!(!text.contains("Original token count:"));
             assert!(codex_utils_string::approx_token_count(&text) <= 20);
@@ -1008,6 +1010,7 @@ fn retained_exec_command_process_is_yielded_not_timed_out() {
         process_id: Some(4242),
         exit_code: None,
         process_exited: false,
+        search_no_match: false,
         original_token_count: Some(3),
         hook_command: None,
         raw_output_artifact: None,
@@ -1016,7 +1019,7 @@ fn retained_exec_command_process_is_yielded_not_timed_out() {
     };
 
     assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Yielded);
-    assert!(output.success_for_logging());
+    assert!(!output.success_for_logging());
     assert_eq!(
         output.model_output_max_tokens(),
         codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS
@@ -1035,7 +1038,7 @@ fn retained_exec_command_process_is_yielded_not_timed_out() {
         },
     ) {
         ResponseInputItem::FunctionCallOutput { output, .. } => {
-            assert_eq!(output.success, Some(true));
+            assert_eq!(output.success, Some(false));
         }
         other => panic!("expected FunctionCallOutput, got {other:?}"),
     }
@@ -1054,6 +1057,7 @@ fn tool_result_correctness_missing_exit_code_is_not_reported_as_success() {
         process_id: None,
         exit_code: None,
         process_exited: true,
+        search_no_match: false,
         original_token_count: Some(3),
         hook_command: None,
         raw_output_artifact: None,
@@ -1076,6 +1080,82 @@ fn tool_result_correctness_missing_exit_code_is_not_reported_as_success() {
 }
 
 #[test]
+fn exec_output_discloses_lossy_decoding_without_changing_canonical_bytes() {
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    let mut output = ExecCommandToolOutput {
+        validation: None,
+        event_call_id: "decoding-call".to_string(),
+        chunk_id: "decoding-chunk".to_string(),
+        wall_time: std::time::Duration::from_millis(10),
+        raw_output: b"invalid: \xff".to_vec(),
+        truncation_policy: TruncationPolicy::Tokens(10_000),
+        max_output_tokens: Some(1_000),
+        process_id: None,
+        exit_code: Some(1),
+        process_exited: true,
+        search_no_match: false,
+        original_token_count: None,
+        hook_command: None,
+        raw_output_artifact: None,
+        raw_output_reduction_notice: None,
+        repair_notice: None,
+    };
+    let expected_notice = "Output contained invalid UTF-8 bytes, which were replaced with U+FFFD. The displayed text is not byte-exact.";
+    let ResponseInputItem::FunctionCallOutput {
+        output: response, ..
+    } = output.to_response_item("decoding-call", &payload)
+    else {
+        panic!("function output")
+    };
+    let text = response.body.to_text().expect("text output");
+    assert!(text.contains(expected_notice));
+    assert!(text.contains("invalid: \u{fffd}"));
+    let code_mode = output.code_mode_result(&payload);
+    assert_eq!(code_mode["output_decoding_notice"], expected_notice);
+    assert_eq!(code_mode["exit_code"], 1);
+    assert!(
+        code_mode
+            .get("original_token_count_is_approximate")
+            .is_none()
+    );
+    assert!(
+        output
+            .projection_metadata()
+            .unwrap()
+            .essential_inline
+            .get("original_token_count_is_approximate")
+            .is_none()
+    );
+    assert_eq!(
+        output.projection_metadata().unwrap().essential_inline["output_decoding_notice"],
+        expected_notice
+    );
+    assert_eq!(
+        output.canonical_result(&payload).unwrap().bytes,
+        b"invalid: \xff"
+    );
+
+    // A literal replacement character in valid UTF-8 is not evidence of loss.
+    output.raw_output = "valid: \u{fffd}".as_bytes().to_vec();
+    assert!(
+        output
+            .code_mode_result(&payload)
+            .get("output_decoding_notice")
+            .is_none()
+    );
+    assert!(
+        output
+            .projection_metadata()
+            .unwrap()
+            .essential_inline
+            .get("output_decoding_notice")
+            .is_none()
+    );
+}
+
+#[test]
 fn tool_result_correctness_exited_process_with_pending_output_is_not_live() {
     let output = ExecCommandToolOutput {
         validation: None,
@@ -1088,6 +1168,7 @@ fn tool_result_correctness_exited_process_with_pending_output_is_not_live() {
         process_id: Some(4242),
         exit_code: Some(7),
         process_exited: true,
+        search_no_match: false,
         original_token_count: Some(2),
         hook_command: None,
         raw_output_artifact: None,
@@ -1128,6 +1209,7 @@ fn exec_command_projection_metadata_preserves_authoritative_first_output() {
         process_id: Some(42),
         exit_code: None,
         process_exited: false,
+        search_no_match: false,
         original_token_count: Some(300),
         hook_command: None,
         raw_output_artifact: None,
@@ -1174,6 +1256,7 @@ fn token_efficiency_exec_projection_reports_truncation_once() {
         process_id: None,
         exit_code: Some(0),
         process_exited: true,
+        search_no_match: false,
         original_token_count: Some(100),
         hook_command: Some("echo ok".to_string()),
         raw_output_artifact: None,
@@ -1184,10 +1267,7 @@ fn token_efficiency_exec_projection_reports_truncation_once() {
     let raw_output = String::from_utf8_lossy(&output.raw_output);
     let projected = output.projected_model_output(raw_output.as_ref());
     assert!(projected.reduced);
-    assert_eq!(
-        projected.text.matches("Warning: truncated output").count(),
-        1
-    );
+    assert_eq!(projected.text.matches('…').count(), 1);
     assert!(!projected.text.contains("tokens truncated"));
 }
 
@@ -1204,6 +1284,7 @@ fn exec_command_projection_reports_reduction_from_per_call_limit() {
         process_id: None,
         exit_code: Some(0),
         process_exited: true,
+        search_no_match: false,
         original_token_count: Some(10),
         hook_command: None,
         raw_output_artifact: None,
@@ -1235,6 +1316,7 @@ fn token_backfire_unified_exec_keeps_complete_output_that_fits_budget() {
         process_id: None,
         exit_code: Some(0),
         process_exited: true,
+        search_no_match: false,
         original_token_count: Some(codex_utils_string::approx_token_count(&raw_output)),
         hook_command: Some("enumerate evidence".to_string()),
         raw_output_artifact: None,
@@ -1321,6 +1403,7 @@ fn token_efficiency_exec_output_preserves_live_process_state_for_large_output() 
         process_id: Some(42),
         exit_code: None,
         process_exited: false,
+        search_no_match: false,
         original_token_count: Some(20_000),
         hook_command: Some("cargo test".to_string()),
         raw_output_artifact: None,
@@ -1352,7 +1435,7 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
     let artifact_id: ToolOutputArtifactId = "019fa782-f8e1-7533-a3f7-60d3f9a42997".parse().unwrap();
     let artifact_path =
         std::path::PathBuf::from(format!(r"C:\codex\tool-output\{artifact_id}.log"));
-    let output = ExecCommandToolOutput {
+    let mut output = ExecCommandToolOutput {
         validation: None,
         event_call_id: "call-summary".to_string(),
         chunk_id: "chunk-summary".to_string(),
@@ -1363,6 +1446,7 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
         process_id: None,
         exit_code: Some(1),
         process_exited: true,
+        search_no_match: false,
         original_token_count: Some(20_000),
         hook_command: Some("cargo test".to_string()),
         raw_output_artifact: Some(RawOutputArtifact::Stored {
@@ -1393,11 +1477,43 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
     });
     assert_eq!(code_mode["raw_output_artifact_id"], artifact_id.to_string());
     assert_eq!(code_mode["raw_output_artifact_bytes"], raw_output.len());
+    assert_eq!(code_mode["original_token_count"], 20_000);
+    assert_eq!(code_mode["original_token_count_is_approximate"], true);
+    let essential = output
+        .projection_metadata()
+        .expect("exec projection")
+        .essential_inline;
+    assert_eq!(essential["original_token_count"], 20_000);
+    assert_eq!(essential["original_token_count_is_approximate"], true);
     assert!(
         code_mode["output"]
             .as_str()
             .is_some_and(|value| value.contains("Shell output summary:"))
     );
+
+    let summary = summarize_shell_output_for_model(
+        &raw_output,
+        1,
+        false,
+        ShellOutputSummaryOptions {
+            enabled: true,
+            applied_token_limit: None,
+            command_text: Some("cargo test"),
+        },
+    )
+    .expect("large output should summarize");
+    let summary_tokens = codex_utils_string::approx_token_count(&summary);
+    output.max_output_tokens = Some(summary_tokens);
+    let tight = output.code_mode_result(&ToolPayload::Function {
+        arguments: "{}".to_string(),
+    });
+    let tight_output = tight["output"].as_str().expect("projected output");
+    assert_eq!(
+        tight_output, summary,
+        "a notice must not replace a summary that fits"
+    );
+    assert!(tight_output.contains("error: exact retained failure marker 450"));
+    assert!(codex_utils_string::approx_token_count(tight_output) <= summary_tokens);
 }
 
 async fn artifact_backed_exec_output(
@@ -1432,6 +1548,7 @@ async fn artifact_backed_exec_output(
         process_id: None,
         exit_code: Some(0),
         process_exited: true,
+        search_no_match: false,
         original_token_count: None,
         hook_command: None,
         raw_output_artifact: Some(artifact),

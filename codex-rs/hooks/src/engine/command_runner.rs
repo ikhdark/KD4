@@ -278,6 +278,10 @@ async fn run_owned_command(
             Err(err) => Err(err),
         }
     };
+    // Keep the captures outside the timed future so cancellation preserves bytes
+    // already read, including when another pipe or stdin remains blocked.
+    let mut stdout_capture = CapturedOutput::default();
+    let mut stderr_capture = CapturedOutput::default();
     let wait_for_output = async {
         let wait_for_tree = async {
             #[cfg(unix)]
@@ -294,22 +298,30 @@ async fn run_owned_command(
             managed.terminate()?;
             Ok::<_, io::Error>(status)
         };
-        let (status, (), stdout, stderr) = tokio::try_join!(
+        let (status, (), (), ()) = tokio::try_join!(
             async { wait_for_tree.await.map_err(CommandRunError::Wait) },
             async { write_stdin.await.map_err(CommandRunError::Stdin) },
-            async { capture_output(stdout).await.map_err(CommandRunError::Wait) },
-            async { capture_output(stderr).await.map_err(CommandRunError::Wait) },
+            async {
+                capture_output(stdout, &mut stdout_capture)
+                    .await
+                    .map_err(CommandRunError::Wait)
+            },
+            async {
+                capture_output(stderr, &mut stderr_capture)
+                    .await
+                    .map_err(CommandRunError::Wait)
+            },
         )?;
-        Ok::<_, CommandRunError>((status, stdout, stderr))
+        Ok::<_, CommandRunError>(status)
     };
     let result = match timeout_at(timeout_deadline, wait_for_output).await {
-        Ok(Ok((status, stdout, stderr))) => {
+        Ok(Ok(status)) => {
             let exit_code = status.code();
             // A successful hook's stdout can be structured JSON, so never parse a
             // partial document as if it were complete. Exit-code-2 denials use
             // stderr and can safely retain the bounded head/tail preview.
             let stdout_exceeded_limit =
-                stdout_is_protocol && exit_code == Some(0) && stdout.was_truncated();
+                stdout_is_protocol && exit_code == Some(0) && stdout_capture.was_truncated();
             let error = stdout_exceeded_limit.then(|| {
                 format!(
                     "hook stdout exceeded the {HOOK_STREAM_CAPTURE_MAX_BYTES}-byte capture limit"
@@ -320,8 +332,8 @@ async fn run_owned_command(
                 started,
                 CommandRunCompletion {
                     exit_code,
-                    stdout: stdout.into_string(),
-                    stderr: stderr.into_string(),
+                    stdout: stdout_capture.into_string(),
+                    stderr: stderr_capture.into_string(),
                     error,
                     outcome: if stdout_exceeded_limit {
                         "output_limit"
@@ -344,8 +356,8 @@ async fn run_owned_command(
                 started,
                 CommandRunCompletion {
                     exit_code: None,
-                    stdout: String::new(),
-                    stderr: String::new(),
+                    stdout: stdout_capture.into_string(),
+                    stderr: stderr_capture.into_string(),
                     error: Some(error),
                     outcome,
                 },
@@ -353,7 +365,10 @@ async fn run_owned_command(
         }
         Err(_) => {
             terminate_command_tree(&mut child, &managed).await;
-            finish_timeout(started_at, started, timeout_sec)
+            let mut result = finish_timeout(started_at, started, timeout_sec);
+            result.stdout = stdout_capture.into_string();
+            result.stderr = stderr_capture.into_string();
+            result
         }
     };
     #[cfg(unix)]
@@ -481,13 +496,15 @@ impl CapturedOutput {
     }
 }
 
-async fn capture_output(mut output: impl AsyncRead + Unpin) -> io::Result<CapturedOutput> {
-    let mut captured = CapturedOutput::default();
+async fn capture_output(
+    mut output: impl AsyncRead + Unpin,
+    captured: &mut CapturedOutput,
+) -> io::Result<()> {
     let mut buffer = [0_u8; HOOK_STREAM_READ_BUFFER_BYTES];
     loop {
         let bytes_read = output.read(&mut buffer).await?;
         if bytes_read == 0 {
-            return Ok(captured);
+            return Ok(());
         }
         captured.push(&buffer[..bytes_read]);
     }
@@ -686,6 +703,34 @@ mod tests {
             program: "/bin/sh".to_string(),
             args: vec!["-lc".to_string()],
         }
+    }
+
+    #[tokio::test]
+    async fn timeout_preserves_output_read_before_a_blocked_stdin_write() {
+        let cwd = AbsolutePathBuf::current_dir().expect("current directory");
+        #[cfg(windows)]
+        let command = "[Console]::Out.WriteLine('stdout-before-timeout'); [Console]::Error.WriteLine('stderr-before-timeout'); Start-Sleep -Seconds 60";
+        #[cfg(not(windows))]
+        let command =
+            "printf 'stdout-before-timeout\\n'; printf 'stderr-before-timeout\\n' >&2; sleep 60";
+        let handler = test_handler(command.to_string(), 2, &cwd);
+        let input_json = "x".repeat(4 * 1024 * 1024);
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_command(
+                &explicit_test_shell(),
+                &handler,
+                0,
+                &input_json,
+                cwd.as_path(),
+            ),
+        )
+        .await
+        .expect("hook timeout must finish despite blocked stdin");
+        assert_eq!(result.exit_code, None);
+        assert_eq!(result.stdout.trim(), "stdout-before-timeout");
+        assert_eq!(result.stderr.trim(), "stderr-before-timeout");
+        assert_eq!(result.error.as_deref(), Some("hook timed out after 2s"));
     }
 
     #[tokio::test]

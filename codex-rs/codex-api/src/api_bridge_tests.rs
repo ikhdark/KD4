@@ -14,7 +14,7 @@ fn bad_request_transport_errors_publish_bad_request_events() {
         ("invalid model parameter", "invalid model parameter"),
         (
             "The image data you provided does not represent a valid image",
-            "Image poisoning",
+            "The provided image data is invalid. Remove or replace the image and try again.",
         ),
     ] {
         let error = map_api_error(ApiError::Transport(TransportError::Http {

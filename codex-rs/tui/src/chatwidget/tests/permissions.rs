@@ -165,6 +165,7 @@ async fn profile_permissions_selection_emits_named_profile_event_only() {
 
     {
         chat.set_windows_sandbox_mode(Some(WindowsSandboxModeToml::Unelevated));
+        chat.config.notices.hide_world_writable_warning = Some(true);
     }
     chat.config.explicit_permission_profile_mode = true;
     chat.config
@@ -174,6 +175,13 @@ async fn profile_permissions_selection_emits_named_profile_event_only() {
             ActivePermissionProfile::new(":workspace"),
         ))
         .expect("set active profile");
+
+    chat.config
+        .permissions
+        .approval_policy
+        .set(AskForApproval::OnRequest.to_core())
+        .expect("set approval policy");
+    chat.config.approvals_reviewer = ApprovalsReviewer::User;
 
     chat.open_permissions_popup();
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));

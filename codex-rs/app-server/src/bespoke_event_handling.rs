@@ -2171,7 +2171,11 @@ mod tests {
     #[tokio::test]
     async fn reasoning_policy_summary_emits_live_notification() -> Result<()> {
         let codex_home = TempDir::new()?;
-        let config = load_default_config_for_test(&codex_home).await;
+        let mut config = load_default_config_for_test(&codex_home).await;
+        config.model_catalog = Some(codex_models_manager::bundled_models_response()?);
+        // Build the thread models manager from this fixture catalog, not the
+        // shared OpenAI manager, which otherwise refreshes through ChatGPT.
+        config.model_provider_id = "event-test".to_string();
         let fallback_model_provider = config.model_provider_id.clone();
         let thread_manager = Arc::new(
             codex_core::test_support::thread_manager_with_models_provider_and_home(
@@ -2729,7 +2733,11 @@ mod tests {
     #[tokio::test]
     async fn guardian_command_execution_notifications_wrap_review_lifecycle() -> Result<()> {
         let codex_home = TempDir::new()?;
-        let config = load_default_config_for_test(&codex_home).await;
+        let mut config = load_default_config_for_test(&codex_home).await;
+        config.model_catalog = Some(codex_models_manager::bundled_models_response()?);
+        // Build the thread models manager from this fixture catalog, not the
+        // shared OpenAI manager, which otherwise refreshes through ChatGPT.
+        config.model_provider_id = "event-test".to_string();
         let thread_manager = Arc::new(
             codex_core::test_support::thread_manager_with_models_provider_and_home(
                 CodexAuth::create_dummy_chatgpt_auth_for_testing(),
@@ -3442,7 +3450,11 @@ mod tests {
     #[tokio::test]
     async fn turn_started_omits_active_snapshot_items() -> Result<()> {
         let codex_home = TempDir::new()?;
-        let config = load_default_config_for_test(&codex_home).await;
+        let mut config = load_default_config_for_test(&codex_home).await;
+        config.model_catalog = Some(codex_models_manager::bundled_models_response()?);
+        // Build the thread models manager from this fixture catalog, not the
+        // shared OpenAI manager, which otherwise refreshes through ChatGPT.
+        config.model_provider_id = "event-test".to_string();
         let thread_manager = Arc::new(
             codex_core::test_support::thread_manager_with_models_provider_and_home(
                 CodexAuth::create_dummy_chatgpt_auth_for_testing(),
@@ -3530,7 +3542,11 @@ mod tests {
     #[tokio::test]
     async fn interrupted_subagent_activity_removes_missing_thread_watch() -> Result<()> {
         let codex_home = TempDir::new()?;
-        let config = load_default_config_for_test(&codex_home).await;
+        let mut config = load_default_config_for_test(&codex_home).await;
+        config.model_catalog = Some(codex_models_manager::bundled_models_response()?);
+        // Build the thread models manager from this fixture catalog, not the
+        // shared OpenAI manager, which otherwise refreshes through ChatGPT.
+        config.model_provider_id = "event-test".to_string();
         let thread_manager = Arc::new(
             codex_core::test_support::thread_manager_with_models_provider_and_home(
                 CodexAuth::create_dummy_chatgpt_auth_for_testing(),
@@ -3622,7 +3638,11 @@ mod tests {
     #[tokio::test]
     async fn canonical_dynamic_tool_start_emits_item_and_requests_client() -> Result<()> {
         let codex_home = TempDir::new()?;
-        let config = load_default_config_for_test(&codex_home).await;
+        let mut config = load_default_config_for_test(&codex_home).await;
+        config.model_catalog = Some(codex_models_manager::bundled_models_response()?);
+        // Build the thread models manager from this fixture catalog, not the
+        // shared OpenAI manager, which otherwise refreshes through ChatGPT.
+        config.model_provider_id = "event-test".to_string();
         let thread_manager = Arc::new(
             codex_core::test_support::thread_manager_with_models_provider_and_home(
                 CodexAuth::create_dummy_chatgpt_auth_for_testing(),

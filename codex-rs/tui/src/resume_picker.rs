@@ -2874,7 +2874,9 @@ fn footer_part_ranges(parts: &[FooterPart], width: u16) -> Vec<std::ops::Range<u
     let mut ranges = Vec::new();
     let mut start = 0;
     for end in 1..parts.len() {
-        if footer_parts_width(&parts[start..=end], cwd_width) > available {
+        if footer_parts_width(&parts[start..=end], cwd_width) > available
+            && !(end + 1 < parts.len() && matches!(parts[end], FooterPart::Cwd(_)))
+        {
             ranges.push(start..end);
             start = end;
         }
@@ -5531,6 +5533,7 @@ session_picker_view = "dense"
             render_list(&mut frame, area, &state);
         }
         terminal.flush().expect("flush");
+        terminal.swap_buffers();
         assert!(terminal.backend().to_string().contains("↓ more"));
 
         state.density = SessionListDensity::Dense;
@@ -5541,6 +5544,7 @@ session_picker_view = "dense"
             render_list(&mut frame, area, &state);
         }
         terminal.flush().expect("flush");
+        terminal.swap_buffers();
 
         assert!(!terminal.backend().to_string().contains("↓ more"));
     }

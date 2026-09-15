@@ -508,10 +508,25 @@ fn wait_agent_tool_v2_uses_timeout_only_summary_output() {
 fn assert_wait_timeout_schema_matches_runtime_bounds(parameters: &JsonSchema) {
     let schema = serde_json::to_value(parameters).expect("serialize wait_agent schema");
     let validator = jsonschema::validator_for(&schema).expect("compile wait_agent schema");
-    assert!(validator.is_valid(&json!({ "timeout_ms": 10_000 })));
-    assert!(!validator.is_valid(&json!({ "timeout_ms": 3_600_001 })));
-    assert!(!validator.is_valid(&json!({ "timeout_ms": 9_999 })));
-    assert!(!validator.is_valid(&json!({ "timeout_ms": 10_000.5 })));
+    let mut arguments = if parameters
+        .properties
+        .as_ref()
+        .unwrap()
+        .contains_key("targets")
+    {
+        json!({"targets": ["/root/worker"]})
+    } else {
+        json!({})
+    };
+    for (timeout, expected) in [
+        (json!(10_000), true),
+        (json!(3_600_001), false),
+        (json!(9_999), false),
+        (json!(10_000.5), false),
+    ] {
+        arguments["timeout_ms"] = timeout;
+        assert_eq!(validator.is_valid(&arguments), expected, "{arguments}");
+    }
 }
 
 #[test]

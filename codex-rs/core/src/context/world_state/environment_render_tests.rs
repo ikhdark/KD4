@@ -35,6 +35,7 @@ fn environment(id: &str, cwd: PathUri, shell: impl Into<String>) -> (String, Env
             cwd,
             status: EnvironmentStatus::Available,
             shell: Some(shell.into()),
+            os: None,
         },
     )
 }
@@ -157,7 +158,7 @@ fn serialize_network_context_escapes_domain_values() {
             vec!["\"blocked'.example.com".to_string()],
         )
         .render(),
-        r#"<network enabled="true"><allowed>api&amp;&lt;example&gt;.com</allowed><denied>&quot;blocked&apos;.example.com</denied></network>"#
+        r#"<network enabled="true"><allowed>api&amp;&lt;example&gt;.com</allowed><denied>"blocked'.example.com</denied></network>"#
     );
 }
 

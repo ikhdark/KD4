@@ -1,26 +1,26 @@
 const DEFERRED_NESTED_TOOLS_GUIDANCE: &str =
     "Some deferred nested tools may be omitted from this description.";
 const LAZY_NESTED_TOOL_SCHEMA_GUIDANCE: &str = r#"Nested tool schemas are discovered lazily at runtime. When `tool_search` is advertised, use it to activate tools that are not yet listed."#;
-pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript; input JS, not JSON/Markdown; no Node/filesystem/network.
+pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript, not JSON/Markdown; no Node/filesystem/network.
 - Nested tools live on the global `tools` object: `await tools.exec_command({ cmd: "..." })`, `await tools.apply_patch(patchText)` when declared below. Bare `exec(...)` / `exec_command(...)` alias `tools.exec_command`; `console.log(...)` aliases `text(...)`. Only `ALL_TOOL_NAMES` entries are callable.
 - Edit with `apply_patch`: nested when registered, otherwise direct (`*** Begin Patch` envelope); never pipe a patch through a shell wrapper.
-- Returns printed `text(...)` values; on failure or no output, the host also retains bounded nested-tool results.
+- `text(...)` emits values; on failure/no output, the host also retains bounded nested-tool results.
 - Reuse current schemas, CLI usage, and results. Resolve missing/stale tool schemas before calling; consult CLI `--help` only for uncertain arguments/subcommands.
 - Nested tools: use a present schema; else `resolve_tool(name)` when the name is known, or inspect `ALL_TOOL_NAMES`. Never scan/filter/stringify/print `ALL_TOOLS`.
 - Do not rediscover known paths. Read/list known locations directly; otherwise search narrowly within that path. Reuse current applicable `AGENTS.md`; retrieve missing scopes or invalidated content.
-- Start useful work in the initial exec. Batch independent known reads/probes with `Promise.allSettled`; inspect every result. Find unknown paths first; sequence dependent calls. Keep status and file outputs distinct; independent calls may share one exec.
+- Start useful work in the initial exec. Await `Promise.allSettled` for independent known reads/probes and inspect every result. Finish discovery before choosing dependent mutations. Keep status and file outputs distinct; independent calls may share one exec.
 - Prefer a purpose-built tool over shell; consolidate related read-only probes in one call. Never spawn a subprocess merely to re-filter a result already returned.
 - Nested calls: hard 60s default deadline. After a timeout, resume a returned live session/cell ID. Do not rerun while the original is live or its effects are uncertain. Retry only if it never started, stopped and is safe to repeat, or the tool permits retry.
-- A cell runs to completion within its initial 10s budget and yields only on `yield_control()`, new user input, or when that budget expires. Keep long commands in the same awaited evaluation; call `yield_control()` only for a new model decision.
-- Run required validation after the final relevant edit. Parallelize only tool-permitted commands with independent build locks, output paths, and services. Propagate sequential failures with `&&` or exit-code checks; never mask them with `|| true`. Complete requested work and checks, or report failures/blockers. Follow plans while they match the current request.
+- A cell yields on `yield_control()`, new input, or expiry of its initial 10s budget. Keep long commands in the same awaited evaluation; use `yield_control()` only for a new model decision.
+- Run required validation after the final relevant edit. Parallelize only tool-permitted commands with independent build locks, output paths, and services. Propagate failures with `&&` or exit-code checks; never mask them with `|| true`. Complete work and checks, or report failures/blockers. Follow plans while they match the current request.
 - Do not repeat unchanged deterministic failures. Change route/state or report the blocker; resume live operations through documented wait interfaces.
-- Keep evidence bounded and complete: relevant ranges for large files; whole files when small or required. Use retained-artifact selectors after truncation.
+- Read relevant ranges for large files; whole files when small or required. Before editing, read the complete enclosing unit and refresh it after intervening writes. Use retained-artifact selectors after truncation.
 - Output defaults to the 10000-token hard cap. Set the smallest useful budget with first-line `// @exec: {"max_output_tokens": 2000}`. Nested-call deadlines use the documented `{ timeout_ms }` option.
 - When evaluation ends, unawaited work is discarded.
 
 Helpers:
-- Values/media include `{ type: "image" }` / `{ type: "audio" }` blocks.
-- `notify(value): Promise<void>` queues an extra model-visible message without yielding the cell; prefer `text(...)`.
+- Media: `{ type: "image" }` / `{ type: "audio" }` blocks.
+- `notify(value): Promise<void>` queues a model-visible message without yielding.
 - `setTimeout(callback: () => void, delayMs?: number)` returns an ID; `clearTimeout(timeoutId?: number)` cancels it. Await a promise resolved by the callback to wait."#;
 const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- `exec` owns its initial 10s completion budget and internally drains ordinary empty observations. Use `wait` only after `exec` returns a genuinely live `Script running with cell ID ...` result, such as an explicit `yield_control()` or input interruption; a completed cell never needs `wait`.
 - `cell_id` identifies the running `exec` cell to resume.
@@ -44,7 +44,7 @@ pub fn build_exec_tool_description(
             .collect::<Vec<_>>()
             .join(", ");
         sections.push(format!(
-            "Direct-only tools omitted from `ALL_TOOLS`: {names}. Call these through their direct model tool interface, not through `exec`."
+            "Direct-only tools omitted from `ALL_TOOLS`: {names}. Call these through their direct model tool interface using the schema advertised there, not through `exec`."
         ));
     }
     if code_mode_only {
@@ -103,7 +103,7 @@ mod tests {
         let direct = build_exec_tool_description(false, false, &["apply_patch".to_string()]);
         assert_eq!(
             direct.split("\n\n").last().unwrap(),
-            "Direct-only tools omitted from `ALL_TOOLS`: `apply_patch`. Call these through their direct model tool interface, not through `exec`."
+            "Direct-only tools omitted from `ALL_TOOLS`: `apply_patch`. Call these through their direct model tool interface using the schema advertised there, not through `exec`."
         );
         for description in [nested, direct] {
             assert!(description.contains("Edit with `apply_patch`: nested when registered, otherwise direct (`*** Begin Patch` envelope); never pipe a patch through a shell wrapper."));
@@ -117,11 +117,14 @@ mod tests {
                 let description =
                     build_exec_tool_description(code_mode_only, has_deferred_tools, &[]);
                 for required in [
-                    "Complete requested work and checks, or report failures/blockers.",
+                    "Complete work and checks, or report failures/blockers.",
                     "Follow plans while they match the current request.",
                     "Do not repeat unchanged deterministic failures.",
                     "resume live operations through documented wait interfaces.",
                     "whole files when small or required.",
+                    "Before editing, read the complete enclosing unit and refresh it after intervening writes.",
+                    "Finish discovery before choosing dependent mutations.",
+                    "Await `Promise.allSettled`",
                     "Reuse current schemas, CLI usage, and results.",
                     "consult CLI `--help` only for uncertain arguments/subcommands.",
                     "Reuse current applicable `AGENTS.md`; retrieve missing scopes or invalidated content.",

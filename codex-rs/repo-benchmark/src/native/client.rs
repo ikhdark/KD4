@@ -4,10 +4,10 @@ use codex_app_server_test_client::{native_stdio_command, terminate_owned_process
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::process::{Child, Stdio};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -22,14 +22,15 @@ impl std::error::Error for DeadlineExpired {}
 
 pub(super) struct NativeClient {
     child: Child,
-    stdin: Option<ChildStdin>,
+    outgoing: Option<Sender<(Value, Sender<Result<()>>)>>,
+    writer: Option<JoinHandle<()>>,
+    writer_done: Receiver<()>,
     incoming: Receiver<Result<Value>>,
     reader: Option<JoinHandle<()>>,
     pending: VecDeque<Value>,
     next_id: u64,
     started: Instant,
     deadline: Instant,
-    requests: File,
     pub events: Vec<Value>,
 }
 
@@ -78,7 +79,35 @@ impl NativeClient {
         let mut child = command.spawn().with_context(|| {
             format!("launch native app-server {}", request.app_server.display())
         })?;
-        let stdin = child.stdin.take();
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("native app-server stdin unavailable")?;
+        let (outgoing, writes) = mpsc::channel::<(Value, Sender<Result<()>>)>();
+        let (writer_finished, writer_done) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            let mut requests = requests;
+            while let Ok((message, acknowledged)) = writes.recv() {
+                let result = (|| -> Result<()> {
+                    writeln!(
+                        requests,
+                        "{}",
+                        json!({"elapsedMs":started.elapsed().as_millis() as u64,"message":message})
+                    )?;
+                    requests.flush()?;
+                    serde_json::to_writer(&mut stdin, &message)?;
+                    stdin.write_all(b"\n")?;
+                    stdin.flush()?;
+                    Ok(())
+                })();
+                let failed = result.is_err();
+                if acknowledged.send(result).is_err() || failed {
+                    break;
+                }
+            }
+            drop(stdin);
+            let _ = writer_finished.send(());
+        });
         let stdout = child
             .stdout
             .take()
@@ -105,14 +134,15 @@ impl NativeClient {
         });
         Ok(Self {
             child,
-            stdin,
+            outgoing: Some(outgoing),
+            writer: Some(writer),
+            writer_done,
             incoming,
             reader: Some(reader),
             pending: VecDeque::new(),
             next_id: 1,
             started,
             deadline,
-            requests,
             events: vec![],
         })
     }
@@ -121,17 +151,23 @@ impl NativeClient {
         if Instant::now() >= self.deadline {
             return Err(DeadlineExpired.into());
         }
-        writeln!(
-            self.requests,
-            "{}",
-            json!({"elapsedMs": self.started.elapsed().as_millis() as u64, "message": message})
-        )?;
-        self.requests.flush()?;
-        let stdin = self.stdin.as_mut().context("app-server stdin is closed")?;
-        serde_json::to_writer(&mut *stdin, &message)?;
-        stdin.write_all(b"\n")?;
-        stdin.flush()?;
-        Ok(())
+        let (acknowledge, written) = mpsc::channel();
+        self.outgoing
+            .as_ref()
+            .context("app-server stdin is closed")?
+            .send((message, acknowledge))
+            .context("app-server writer stopped")?;
+        let remaining = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(DeadlineExpired)?;
+        match written.recv_timeout(remaining) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(DeadlineExpired.into()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("app-server writer stopped before acknowledging request")
+            }
+        }
     }
 
     pub fn notify(&mut self, method: &str, params: Value) -> Result<()> {
@@ -139,13 +175,24 @@ impl NativeClient {
     }
 
     fn receive(&mut self) -> Result<Value> {
+        self.receive_before(self.deadline)?
+            .ok_or_else(|| DeadlineExpired.into())
+    }
+
+    fn receive_before(&mut self, until: Instant) -> Result<Option<Value>> {
         let remaining = self
             .deadline
+            .min(until)
             .checked_duration_since(Instant::now())
             .ok_or(DeadlineExpired)?;
         let event = match self.incoming.recv_timeout(remaining) {
             Ok(event) => event?,
-            Err(mpsc::RecvTimeoutError::Timeout) => return Err(DeadlineExpired.into()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if Instant::now() >= self.deadline {
+                    return Err(DeadlineExpired.into());
+                }
+                return Ok(None);
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 bail!("native app-server stdout closed before the expected response/terminal event")
             }
@@ -159,7 +206,7 @@ impl NativeClient {
                 message["method"]
             );
         }
-        Ok(message)
+        Ok(Some(message))
     }
 
     pub fn rpc(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -185,12 +232,35 @@ impl NativeClient {
         &mut self,
         thread_id: &str,
         turn_id: &str,
-        cancel: bool,
+        mut cancellation_checkpoint: Option<&mut dyn FnMut() -> Result<Option<Value>>>,
     ) -> Result<TurnTerminal> {
         let mut tools = BTreeSet::new();
         let mut interrupted = false;
+        let mut tool_started = false;
         loop {
+            if Instant::now() >= self.deadline {
+                return Err(DeadlineExpired.into());
+            }
+            if tool_started && !interrupted {
+                if let Some(checkpoint) = cancellation_checkpoint.as_mut() {
+                    if let Some(evidence) = checkpoint()? {
+                        self.events.push(json!({"elapsedMs":self.started.elapsed().as_millis() as u64,"message":{"method":"repoBenchmark/cancellationStarted","params":evidence}}));
+                        self.rpc(
+                            "turn/interrupt",
+                            json!({"threadId":thread_id,"turnId":turn_id}),
+                        )?;
+                        interrupted = true;
+                    }
+                }
+            }
             let message = if let Some(message) = self.pending.pop_front() {
+                message
+            } else if cancellation_checkpoint.is_some() && !interrupted {
+                let Some(message) =
+                    self.receive_before(Instant::now() + Duration::from_millis(25))?
+                else {
+                    continue;
+                };
                 message
             } else {
                 self.receive()?
@@ -217,19 +287,15 @@ impl NativeClient {
                         tools.insert(id.to_owned());
                     }
                 }
-                if cancel && !interrupted && method == "item/started" && is_tool {
-                    self.rpc(
-                        "turn/interrupt",
-                        json!({"threadId":thread_id,"turnId":turn_id}),
-                    )?;
-                    interrupted = true;
-                }
+                tool_started |= method == "item/started" && is_tool;
             }
             if method == "turn/completed"
                 && params.pointer("/turn/id").and_then(Value::as_str) == Some(turn_id)
             {
-                if cancel && !interrupted {
-                    bail!("turn completed without exercising cancellation after a tool started");
+                if cancellation_checkpoint.is_some() && !interrupted {
+                    bail!(
+                        "turn completed without exercising cancellation after its running-child checkpoint"
+                    );
                 }
                 return Ok(TurnTerminal {
                     status: params
@@ -245,12 +311,20 @@ impl NativeClient {
     }
 
     pub fn stop(&mut self) -> Result<()> {
-        self.stdin.take();
+        self.outgoing.take();
         let until = Instant::now() + Duration::from_secs(1);
         while self.child.try_wait()?.is_none() && Instant::now() < until {
             thread::sleep(Duration::from_millis(10));
         }
         terminate_owned_process(&mut self.child)?;
+        if let Some(writer) = self.writer.take() {
+            self.writer_done
+                .recv_timeout(Duration::from_secs(2))
+                .context("app-server writer did not stop after native process cleanup")?;
+            writer
+                .join()
+                .map_err(|_| anyhow::anyhow!("app-server stdin writer panicked"))?;
+        }
         if let Some(reader) = self.reader.take() {
             reader
                 .join()

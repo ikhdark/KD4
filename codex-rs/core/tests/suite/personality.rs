@@ -99,7 +99,8 @@ async fn personality_does_not_mutate_base_instructions_without_template() {
         .expect("test config should allow feature update");
     config.personality = Some(Personality::Friendly);
 
-    let model_info = codex_core::test_support::construct_model_info_offline("gpt-5.4", &config);
+    let mut model_info = codex_core::test_support::construct_model_info_offline("gpt-5.4", &config);
+    model_info.model_messages = None;
     assert_eq!(
         model_info.get_model_instructions(config.personality),
         model_info.base_instructions
@@ -201,14 +202,17 @@ async fn config_personality_some_adds_developer_personality_spec() -> anyhow::Re
     .await;
 
     let request = resp_mock.single_request();
-    let instructions_text = request.instructions_text();
+    let developer_texts = request.message_input_texts("developer");
+    let instructions_text = developer_texts
+        .first()
+        .expect("Responses Lite must prepend base instructions as a developer message");
     // Delivery is the contract here; these assertions cannot prove model obedience.
     assert_eq!(
-        instructions_text,
+        instructions_text.as_str(),
         codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim()
     );
     assert!(
-        instructions_text.contains("one plausible incorrect implementation the test would reject")
+        instructions_text.contains("Every added or modified test must assert the intended result.")
     );
     assert!(!instructions_text.contains("{{ personality }}"));
 
@@ -222,7 +226,12 @@ async fn config_personality_some_adds_developer_personality_spec() -> anyhow::Re
         .iter()
         .find(|text| text.contains("<personality_spec>"))
         .expect("expected personality message in developer input");
-    assert!(personality_text.contains(LOCAL_FRIENDLY_TEMPLATE));
+    assert!(
+        personality_text.contains(
+            "Be warm, collaborative, and candid. Keep momentum while explaining decisions clearly; never trade truthfulness for agreement."
+        ),
+        "local prompt policy models should receive the generic friendly personality: {personality_text:?}"
+    );
 
     Ok(())
 }

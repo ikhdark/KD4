@@ -9,6 +9,125 @@ fn apply_patch_command() -> anyhow::Result<Command> {
 }
 
 #[test]
+fn test_apply_patch_cli_rejects_ambiguous_matches_without_writes() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    for (original, body) in [
+        ("old\nold\n", "-old\n+new"),
+        ("old  \nold\t\n", "-old\n+new"),
+        ("  old\n    old\n", "-old\n+new"),
+        ("‘old’\n‘old’\n", "-'old'\n+new"),
+        ("anchor\nold\nanchor\nold\n", "@@ anchor\n-old\n+new"),
+    ] {
+        fs::write(tmp.path().join("a.txt"), original)?;
+        let header = if body.starts_with("@@") { "" } else { "@@\n" };
+        let patch =
+            format!("*** Begin Patch\n*** Update File: a.txt\n{header}{body}\n*** End Patch");
+        let output = apply_patch_command()?
+            .arg(patch)
+            .current_dir(tmp.path())
+            .assert()
+            .failure();
+        let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+        assert!(stderr.contains("Ambiguous"), "{stderr}");
+        assert!(stderr.contains("context"), "{stderr}");
+        assert_eq!(fs::read_to_string(tmp.path().join("a.txt"))?, original);
+    }
+    Ok(())
+}
+
+#[test]
+fn test_apply_patch_cli_respects_indentation_sensitive_files() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    for file in ["a.py", "a.pyi", "a.yaml", "a.yml"] {
+        for old in ["value = 1", "value = ‘one’"] {
+            let original = format!("    {old}\n");
+            fs::write(tmp.path().join(file), &original)?;
+            let pattern = old.replace(['‘', '’'], "'");
+            let patch = format!(
+                "*** Begin Patch\n*** Update File: {file}\n@@\n-{pattern}\n+value = 2\n*** End Patch"
+            );
+            apply_patch_command()?
+                .arg(patch)
+                .current_dir(tmp.path())
+                .assert()
+                .failure();
+            assert_eq!(fs::read_to_string(tmp.path().join(file))?, original);
+        }
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {file}\n@@\n-    value = 'one'\n+    value = 2\n*** End Patch"
+        );
+        apply_patch_command()?
+            .arg(patch)
+            .current_dir(tmp.path())
+            .assert()
+            .success();
+        assert_eq!(
+            fs::read_to_string(tmp.path().join(file))?,
+            "    value = 2\n"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_apply_patch_cli_preserves_fuzzy_context_bytes() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    for (original, body, expected) in [
+        (
+            "‘before’\nold\n‘after’\n",
+            " 'before'\n-old\n+new\n 'after'",
+            "‘before’\nnew\n‘after’\n",
+        ),
+        (
+            "anchor  \nold\ntail\t\n",
+            " anchor\n-old\n+new\n tail",
+            "anchor  \nnew\ntail\t\n",
+        ),
+        (
+            "    anchor\n    old\n    tail\n",
+            " anchor\n-    old\n+    new\n tail",
+            "    anchor\n    new\n    tail\n",
+        ),
+    ] {
+        fs::write(tmp.path().join("a.txt"), original)?;
+        let patch = format!("*** Begin Patch\n*** Update File: a.txt\n@@\n{body}\n*** End Patch");
+        apply_patch_command()?
+            .arg(patch)
+            .current_dir(tmp.path())
+            .assert()
+            .success();
+        assert_eq!(fs::read_to_string(tmp.path().join("a.txt"))?, expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn test_apply_patch_cli_disambiguates_with_exact_context_and_eof() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    for (original, body, expected) in [
+        ("old  \nold\n", "-old\n+new", "old  \nnew\n"),
+        (
+            "old\nanchor\nold\n",
+            "@@ anchor\n-old\n+new",
+            "old\nanchor\nnew\n",
+        ),
+        ("old\nold\n", "-old\n+new\n*** End of File", "old\nnew\n"),
+    ] {
+        fs::write(tmp.path().join("a.txt"), original)?;
+        let header = if body.starts_with("@@") { "" } else { "@@\n" };
+        let patch =
+            format!("*** Begin Patch\n*** Update File: a.txt\n{header}{body}\n*** End Patch");
+        apply_patch_command()?
+            .arg(patch)
+            .current_dir(tmp.path())
+            .assert()
+            .success();
+        assert_eq!(fs::read_to_string(tmp.path().join("a.txt"))?, expected);
+    }
+    Ok(())
+}
+
+#[test]
 fn test_apply_patch_cli_add_and_update() -> anyhow::Result<()> {
     let tmp = tempdir()?;
     let file = "cli_test.txt";
@@ -91,6 +210,72 @@ fn test_apply_patch_cli_stdin_add_and_update() -> anyhow::Result<()> {
 }
 
 #[test]
+fn test_apply_patch_cli_preserves_fuzzy_context() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    let path = tmp.path().join("context.py");
+    fs::write(
+        &path,
+        "# \u{2018}quoted\u{2019}\u{2014}context\r\nif True:\r\n    first = 1\r\n    # retained  \n    second = 2\r\n",
+    )?;
+    apply_patch_command()?
+        .arg("*** Begin Patch\n*** Update File: context.py\n@@\n # 'quoted'-context\n if True:\n-    first = 1\n+    first = 10\n # retained\n-    second = 2\n+    second = 20\n*** End Patch")
+        .current_dir(tmp.path())
+        .assert()
+        .success();
+    assert_eq!(fs::read(&path)?, "# \u{2018}quoted\u{2019}\u{2014}context\r\nif True:\r\n    first = 10\r\n    # retained  \n    second = 20\r\n".as_bytes());
+    Ok(())
+}
+
+#[test]
+fn test_apply_patch_cli_requires_exact_removed_indentation() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    let path = tmp.path().join("indent.py");
+    fs::write(&path, "if True:\n    value = 1\n")?;
+    let rejected = apply_patch_command()?
+        .arg("*** Begin Patch\n*** Update File: indent.py\n@@\n if True:\n-value = 1\n+value = 2\n*** End Patch")
+        .current_dir(tmp.path())
+        .assert()
+        .failure();
+    assert!(String::from_utf8_lossy(&rejected.get_output().stderr).contains("exact indentation"));
+    assert_eq!(fs::read_to_string(&path)?, "if True:\n    value = 1\n");
+    apply_patch_command()?
+        .arg("*** Begin Patch\n*** Update File: indent.py\n@@\n if True:\n-    value = 1\n+value = 2\n*** End Patch")
+        .current_dir(tmp.path())
+        .assert()
+        .success();
+    assert_eq!(fs::read_to_string(&path)?, "if True:\nvalue = 2\n");
+    Ok(())
+}
+
+#[test]
+fn test_apply_patch_cli_reports_committed_files_on_failure() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    fs::write(tmp.path().join("first.txt"), "before\n")?;
+    fs::write(tmp.path().join("second.txt"), "current\n")?;
+    let rejected = apply_patch_command()?
+        .arg("*** Begin Patch\n*** Update File: first.txt\n@@\n-before\n+after\n*** Update File: second.txt\n@@\n-stale\n+new\n*** End Patch")
+        .current_dir(tmp.path())
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&rejected.get_output().stderr);
+    assert!(
+        stderr.contains("Patch failed after applying these changes:"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("M {}", tmp.path().join("first.txt").display())),
+        "{stderr}"
+    );
+    assert!(stderr.contains("remaining changes"), "{stderr}");
+    assert_eq!(fs::read_to_string(tmp.path().join("first.txt"))?, "after\n");
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("second.txt"))?,
+        "current\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_apply_patch_cli_rejects_same_endpoint_moves() -> anyhow::Result<()> {
     let tmp = tempdir()?;
     fs::write(tmp.path().join("a.txt"), "keep\n\n")?;
@@ -169,13 +354,17 @@ fn test_apply_patch_cli_reports_committed_prefix() -> anyhow::Result<()> {
         .current_dir(tmp.path()).assert().failure();
     let stderr = String::from_utf8_lossy(&output.get_output().stderr);
     assert!(
-        stderr.contains("Changes committed before the failure"),
+        stderr.contains("Patch failed after applying these changes:"),
         "{stderr}"
     );
-    assert!(
-        stderr.contains(&format!("A {}", tmp.path().join("created.txt").display())),
-        "{stderr}"
+    assert_eq!(
+        stderr
+            .matches(&format!("A {}", tmp.path().join("created.txt").display()))
+            .count(),
+        1,
+        "committed files must be reported exactly once: {stderr}"
     );
+    assert!(stderr.contains("do not retry the whole patch"), "{stderr}");
     assert_eq!(
         fs::read_to_string(tmp.path().join("created.txt"))?,
         "created\n"

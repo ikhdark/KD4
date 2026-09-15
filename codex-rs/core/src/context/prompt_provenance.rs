@@ -2,7 +2,9 @@ use crate::stable_context::StableContextKind;
 use crate::stable_context::StableContextManifest;
 use codex_extension_api::PromptFragment;
 use codex_extension_api::PromptFragmentKind;
+use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
 use codex_utils_output_truncation::approx_token_count;
 use serde::Deserialize;
@@ -15,7 +17,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 const CATEGORY_HASH_DOMAIN: &[u8] = b"codex.prompt-context-category.v1";
-const RESPONSE_ITEM_FINGERPRINT_DOMAIN: &[u8] = b"codex.prompt-response-item.v1";
+// These identities live only in the in-memory sidecar. One JSON message follows
+// the domain, so no length prefix or serialized buffer is needed.
+const RESPONSE_ITEM_FINGERPRINT_DOMAIN: &[u8] = b"codex.prompt-response-item.v2";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum PromptContextCategory {
@@ -236,7 +240,7 @@ impl PromptProvenanceSidecar {
                 &categories,
                 current_input_index == Some(index),
             ) {
-                response_item_fingerprint(item).ok()
+                response_item_fingerprint(item)
             } else {
                 None
             };
@@ -312,7 +316,7 @@ impl PromptProvenanceSidecar {
                     changed = true;
                 }
             }
-            if changed && let Ok(fingerprint) = response_item_fingerprint(item) {
+            if changed && let Some(fingerprint) = response_item_fingerprint(item) {
                 Arc::make_mut(&mut contributions_by_item)
                     .insert(fingerprint, categories.clone().into());
             }
@@ -349,7 +353,7 @@ impl PromptProvenanceSidecar {
         };
         aligned.categories = vec![Some(category); content.len()].into();
         let mut contributions_by_item = self.contributions_by_item.as_ref().clone();
-        if let Ok(fingerprint) = response_item_fingerprint(item) {
+        if let Some(fingerprint) = response_item_fingerprint(item) {
             contributions_by_item.insert(fingerprint, vec![Some(category); content.len()].into());
         }
         Self {
@@ -377,7 +381,7 @@ impl PromptProvenanceSidecar {
                 let fingerprint = if !self.contributions_by_item.is_empty()
                     || (self.current_turn_id.is_none() && self.current_input_fingerprint.is_some())
                 {
-                    response_item_fingerprint(item).ok()
+                    response_item_fingerprint(item)
                 } else {
                     None
                 };
@@ -407,7 +411,7 @@ impl PromptProvenanceSidecar {
         if self.contributions_by_item.is_empty() {
             return None;
         }
-        let fingerprint = response_item_fingerprint(item).ok()?;
+        let fingerprint = response_item_fingerprint(item)?;
         self.contributions_by_item
             .get(&fingerprint)
             .map(AsRef::as_ref)
@@ -420,7 +424,7 @@ impl PromptProvenanceSidecar {
         let Some(expected) = self.current_input_fingerprint else {
             return false;
         };
-        response_item_fingerprint(item).is_ok_and(|actual| expected == actual)
+        response_item_fingerprint(item).is_some_and(|actual| expected == actual)
     }
 }
 
@@ -750,17 +754,47 @@ fn sequence_envelope_bytes(item_count: usize) -> u64 {
     u64::try_from(2_usize.saturating_add(separators)).unwrap_or(u64::MAX)
 }
 
-fn response_item_fingerprint(item: &ResponseItem) -> serde_json::Result<[u8; 32]> {
+fn response_item_fingerprint(item: &ResponseItem) -> Option<[u8; 32]> {
+    // Only messages have provenance contributions. Borrow their serialized
+    // fields while excluding provider-specific turn metadata from identity.
+    #[derive(Serialize)]
+    struct MessageIdentity<'a> {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<&'a ResponseItemId>,
+        role: &'a str,
+        content: &'a [ContentItem],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        phase: Option<&'a MessagePhase>,
+    }
+
+    let ResponseItem::Message {
+        id,
+        role,
+        content,
+        phase,
+        internal_chat_message_metadata_passthrough: _,
+    } = item
+    else {
+        return None;
+    };
     #[cfg(test)]
     tests::FINGERPRINT_CALLS.with(|calls| calls.set(calls.get() + 1));
-    let mut normalized = item.clone();
-    normalized.clear_internal_chat_message_metadata_passthrough();
-    let serialized = serde_json::to_vec(&normalized)?;
     let mut hasher = Sha256::new();
     hasher.update(RESPONSE_ITEM_FINGERPRINT_DOMAIN);
-    hasher.update((serialized.len() as u64).to_be_bytes());
-    hasher.update(serialized);
-    Ok(hasher.finalize().into())
+    serde_json::to_writer(
+        &mut hasher,
+        &MessageIdentity {
+            kind: "message",
+            id: id.as_ref(),
+            role,
+            content,
+            phase: phase.as_ref(),
+        },
+    )
+    .ok()?;
+    Some(hasher.finalize().into())
 }
 
 fn prompt_item_requires_fingerprint(
@@ -804,7 +838,13 @@ fn category_for_stable_kind(kind: StableContextKind) -> PromptContextCategory {
 }
 
 fn hex_hash(hash: &[u8; 32]) -> String {
-    hash.iter().map(|byte| format!("{byte:02x}")).collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in hash {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 #[cfg(test)]
@@ -852,6 +892,82 @@ mod tests {
                     turn_id: Some(turn_id.to_string()),
                 }
             }),
+        }
+    }
+
+    #[test]
+    fn fingerprint_stream_matches_protocol_message_without_turn_metadata() {
+        for phase in [
+            None,
+            Some(MessagePhase::Commentary),
+            Some(MessagePhase::FinalAnswer),
+        ] {
+            let mut item = message(
+                "assistant",
+                &"large \"text\" & Unicode 😀\n".repeat(1024),
+                Some("turn"),
+            );
+            if let ResponseItem::Message {
+                id,
+                phase: item_phase,
+                content,
+                ..
+            } = &mut item
+            {
+                *id = Some(ResponseItemId::from_server("message-id".to_string()));
+                *item_phase = phase;
+                content.push(ContentItem::InputImage {
+                    image_url: "data:image/png;base64,abc".to_string(),
+                    detail: None,
+                });
+            }
+            let fingerprint = response_item_fingerprint(&item).unwrap();
+            item.clear_internal_chat_message_metadata_passthrough();
+            let mut expected = Sha256::new();
+            expected.update(RESPONSE_ITEM_FINGERPRINT_DOMAIN);
+            expected.update(serde_json::to_vec(&item).unwrap());
+            assert_eq!(fingerprint, <[u8; 32]>::from(expected.finalize()));
+            assert_eq!(response_item_fingerprint(&item), Some(fingerprint));
+        }
+        let bytes = std::array::from_fn(|index| (index * 8) as u8);
+        assert_eq!(
+            hex_hash(&bytes),
+            "0008101820283038404850586068707880889098a0a8b0b8c0c8d0d8e0e8f0f8"
+        );
+    }
+
+    #[test]
+    fn replay_matches_injected_context_after_provider_metadata_is_removed() {
+        let original = vec![
+            message("developer", "remember café & quotes \"here\"", Some("turn")),
+            message("user", "request", None),
+        ];
+        let sidecar = PromptProvenanceSidecar::from_assembled_items(
+            &original,
+            &StableContextManifest::default(),
+        )
+        .with_exact_fragment(
+            &original,
+            "remember café & quotes \"here\"",
+            PromptContextCategory::Memory,
+        );
+        let mut replay = original.clone();
+        replay[0].clear_internal_chat_message_metadata_passthrough();
+        replay.push(message("developer", "different context", None));
+        let recovered = sidecar.for_reprojected_items(&replay);
+        for measured in measure_both(&replay, &recovered) {
+            assert_eq!(
+                measured.bytes(PromptContextCategory::Memory),
+                item_bytes(&replay[0])
+            );
+            assert_eq!(
+                measured.bytes(PromptContextCategory::TaskInput),
+                item_bytes(&replay[1])
+            );
+            assert_eq!(
+                measured.bytes(PromptContextCategory::OtherInjected),
+                item_bytes(&replay[2]) + 4 // Two array brackets and two item separators.
+            );
         }
     }
 
@@ -1040,7 +1156,7 @@ mod tests {
                 );
                 assert_eq!(
                     measured.bytes(PromptContextCategory::Memory),
-                    item_bytes(&replay[2])
+                    item_bytes(&replay[2]) + 4 // Two array brackets and two item separators.
                 );
             }
             assert_eq!(FINGERPRINT_CALLS.get(), 0);

@@ -12,5 +12,6 @@ Budget:
 - Tokens remaining: {{ remaining_tokens }}
 
 Adjust the current turn to pursue the updated objective. Avoid continuing work that only served the previous objective unless it also helps the updated objective.
+Report edits that only served the superseded objective. Preserve unrelated user work.
 
 Do not call update_goal unless the updated goal is actually complete.

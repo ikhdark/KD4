@@ -960,11 +960,6 @@ where
         .expect("session test thread panicked")
 }
 
-struct InstructionsTestCase {
-    slug: &'static str,
-    expects_apply_patch_description: bool,
-}
-
 fn user_message(text: &str) -> ResponseItem {
     ResponseItem::Message {
         id: None,
@@ -1239,14 +1234,10 @@ async fn startup_prepared_router_handoff_is_one_shot() {
     let (sess, turn_context, _rx) = make_session_and_context_with_rx().await;
     let planning_generation = sess.services.planning_generation();
     let step_context = sess.capture_step_context(Arc::clone(&turn_context)).await;
-    let router = super::turn::built_tools(
-        sess.as_ref(),
-        step_context.as_ref(),
-        &[],
-        &CancellationToken::new(),
-    )
-    .await
-    .expect("startup router should build");
+    let router =
+        super::turn::built_tools(sess.as_ref(), &step_context, &[], &CancellationToken::new())
+            .await
+            .expect("startup router should build");
     sess.startup_prepared_router
         .publish(crate::session_startup_prewarm::PreparedStartupRouter {
             planning_generation,
@@ -2159,8 +2150,6 @@ async fn user_shell_commands_do_not_inherit_managed_network_proxy() -> anyhow::R
 
 #[tokio::test]
 async fn get_base_instructions_no_user_content() {
-    let prompt_with_apply_patch_instructions =
-        include_str!("../../prompt_with_apply_patch_instructions.md");
     let models_response = bundled_models_response()
         .unwrap_or_else(|err| panic!("bundled models.json should parse: {err}"));
     let model_info_for_slug = |slug: &str, config: &Config| {
@@ -2172,36 +2161,12 @@ async fn get_base_instructions_no_user_content() {
             .unwrap_or_else(|| panic!("model slug {slug} is missing from models.json"));
         model_info::with_config_overrides(model, &config.to_models_manager_config())
     };
-    let test_cases = vec![
-        InstructionsTestCase {
-            slug: "gpt-5.4",
-            expects_apply_patch_description: false,
-        },
-        InstructionsTestCase {
-            slug: "gpt-5.4-mini",
-            expects_apply_patch_description: false,
-        },
-        InstructionsTestCase {
-            slug: "gpt-5.5",
-            expects_apply_patch_description: false,
-        },
-        InstructionsTestCase {
-            slug: "gpt-5.2",
-            expects_apply_patch_description: false,
-        },
-    ];
-
     let (session, _turn_context) = make_session_and_context().await;
     let config = test_config().await;
 
-    for test_case in test_cases {
-        let model_info = model_info_for_slug(test_case.slug, &config);
-        if test_case.expects_apply_patch_description {
-            assert_eq!(
-                model_info.base_instructions.as_str(),
-                prompt_with_apply_patch_instructions
-            );
-        }
+    for slug in ["gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-5.2"] {
+        let model_info = model_info_for_slug(slug, &config);
+        assert!(!model_info.base_instructions.trim().is_empty(), "{slug}");
 
         {
             let mut state = session.state.lock().await;
@@ -2459,6 +2424,68 @@ async fn refresh_runtime_config_refreshes_hooks() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn refresh_runtime_config_cancelled_during_hook_preparation_keeps_accepted_state() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        let (session, _turn_context) = make_session_and_context().await;
+        let original = session.get_config().await;
+        let original_hooks = session.hooks();
+        let was_enabled = original.features.enabled(Feature::CodexHooks);
+        let mut next_config = (*original).clone();
+        next_config
+            .features
+            .set_enabled(Feature::CodexHooks, !was_enabled)
+            .expect("toggle hooks for refresh");
+
+        // Hook discovery uses spawn_blocking. Occupy its sole worker so the
+        // refresh can be cancelled deterministically before discovery finishes.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+        });
+        started_rx.await.expect("blocking worker started");
+        let refreshed_features = [Feature::CodexHooks];
+        let mut refresh = Box::pin(
+            session.refresh_runtime_config_features(next_config.clone(), &refreshed_features),
+        );
+        assert!(futures::poll!(&mut refresh).is_pending());
+        assert_eq!(
+            session
+                .get_config()
+                .await
+                .features
+                .enabled(Feature::CodexHooks),
+            was_enabled,
+            "configuration must remain accepted until its hooks are ready"
+        );
+        assert!(Arc::ptr_eq(&session.hooks(), &original_hooks));
+        drop(refresh);
+        assert!(Arc::ptr_eq(&session.get_config().await, &original));
+        release_tx.send(()).expect("release hook discovery");
+        blocker.await.expect("blocking worker completed");
+
+        session
+            .refresh_runtime_config_features(next_config, &refreshed_features)
+            .await;
+        assert_eq!(
+            session
+                .get_config()
+                .await
+                .features
+                .enabled(Feature::CodexHooks),
+            !was_enabled
+        );
+        assert!(!Arc::ptr_eq(&session.hooks(), &original_hooks));
+    });
+}
+
 #[tokio::test]
 async fn reload_user_config_layer_updates_effective_tool_suggest_config() {
     let (session, _turn_context) = make_session_and_context().await;
@@ -2608,6 +2635,26 @@ fn collect_explicit_app_ids_from_skill_items_resolves_unambiguous_plain_mentions
 }
 
 #[test]
+fn collect_explicit_app_ids_from_skill_items_includes_later_text_parts() {
+    let connectors = vec![
+        make_connector("calendar", "Calendar"),
+        make_connector("mail", "Mail"),
+    ];
+    let mut item = skill_message("use [$calendar](app://calendar)");
+    let ResponseItem::Message { content, .. } = &mut item else {
+        panic!("expected skill message");
+    };
+    content.push(ContentItem::InputText {
+        text: "use [$mail](app://mail)".to_string(),
+    });
+    let ids = collect_explicit_app_ids_from_skill_items(&[item], &connectors, &HashMap::new());
+    assert_eq!(
+        ids,
+        HashSet::from(["calendar".to_string(), "mail".to_string()])
+    );
+}
+
+#[test]
 fn collect_explicit_app_ids_from_skill_items_skips_plain_mentions_with_skill_conflicts() {
     let connectors = vec![make_connector("calendar", "Calendar")];
     let skill_items = vec![skill_message(
@@ -2634,7 +2681,10 @@ async fn reconstruct_history_matches_live_compactions() {
         .reconstruct_history_from_rollout(reconstruction_turn.as_ref(), &rollout_items)
         .await;
 
-    assert_eq!(expected, reconstructed.history);
+    assert_eq!(
+        strip_response_item_ids(&expected),
+        strip_response_item_ids(&reconstructed.history)
+    );
     assert_eq!(2, reconstructed.window_number);
     assert_eq!(
         reconstructed
@@ -2707,7 +2757,10 @@ async fn record_initial_history_reconstructs_resumed_transcript() {
         .await;
 
     let history = session.state.lock().await.clone_history();
-    assert_eq!(expected, strip_response_item_ids(history.raw_items()));
+    assert_eq!(
+        strip_response_item_ids(&expected),
+        strip_response_item_ids(history.raw_items())
+    );
 }
 
 /// N1 regression: raw response items mirror every recorded history item, including full
@@ -3265,7 +3318,7 @@ async fn resumed_history_injects_initial_context_on_first_context_update_only() 
 
     let history_before_seed = session.state.lock().await.clone_history();
     assert_eq!(
-        expected,
+        strip_response_item_ids(&expected),
         strip_response_item_ids(history_before_seed.raw_items())
     );
 
@@ -3280,7 +3333,7 @@ async fn resumed_history_injects_initial_context_on_first_context_update_only() 
     expected.extend(initial_context);
     let history_after_seed = session.clone_history().await;
     assert_eq!(
-        expected,
+        strip_response_item_ids(&expected),
         strip_response_item_ids(history_after_seed.raw_items())
     );
 
@@ -3415,7 +3468,6 @@ fn startup_rollout_facts_reduce_startup_consumers_in_one_pass() {
 
     let facts = StartupRolloutFacts::reduce(&history);
 
-    assert_eq!(facts.initial_messages.as_ref().map(Vec::len), Some(2));
     assert_eq!(
         facts.mailbox_communication_ids,
         vec![codex_protocol::ResponseItemId::from_server(
@@ -3967,6 +4019,81 @@ disabled_tools = [
 }
 
 #[tokio::test]
+async fn record_initial_history_warns_when_restored_history_cannot_be_flushed() {
+    for resumed in [false, true] {
+        let (mut session, _turn, rx) = make_session_and_context_with_rx().await;
+        let rollout_path = attach_thread_persistence_with_materialization(
+            Arc::get_mut(&mut session).expect("unique session"),
+            false,
+        )
+        .await;
+        tokio::fs::create_dir_all(&rollout_path)
+            .await
+            .expect("block rollout file with a directory");
+        let item = crate::context_manager::updates::build_developer_update_item(vec![
+            "Restored guidance.".to_string(),
+        ])
+        .expect("developer message");
+        let items = vec![RolloutItem::ResponseItem(item.clone())];
+        let history = if resumed {
+            session.persist_rollout_items(&items).await;
+            InitialHistory::Resumed(ResumedHistory {
+                conversation_id: session.thread_id(),
+                history: Arc::new(items),
+                rollout_path: Some(rollout_path.clone()),
+            })
+        } else {
+            InitialHistory::Forked(items)
+        };
+        session.record_initial_history(history).await;
+        let expected = if resumed {
+            "Could not save the resumed session history:"
+        } else {
+            "Could not save the forked session history:"
+        };
+        let mut warned = false;
+        while let Ok(event) = rx.try_recv() {
+            if let EventMsg::Warning(warning) = event.msg {
+                warned |= warning.message.starts_with(expected);
+            }
+        }
+        assert!(
+            warned,
+            "failed startup flush must emit a visible warning: {expected}"
+        );
+        assert!(
+            rollout_path.is_dir(),
+            "failed persistence must preserve the obstruction"
+        );
+        tokio::fs::remove_dir(&rollout_path)
+            .await
+            .expect("remove exact empty obstruction");
+        session
+            .flush_rollout()
+            .await
+            .expect("buffered history recovers after obstruction is removed");
+        let saved = session
+            .live_thread()
+            .expect("live writer")
+            .load_history(false)
+            .await
+            .expect("saved history");
+        let saved_items = saved
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                RolloutItem::ResponseItem(item) => Some(item.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            strip_response_item_ids(&saved_items),
+            strip_response_item_ids(&[item])
+        );
+    }
+}
+
+#[tokio::test]
 async fn record_initial_history_reconstructs_forked_transcript() {
     let (session, turn_context) = make_session_and_context().await;
     let (rollout_items, expected) = sample_rollout(&session, &turn_context).await;
@@ -3976,7 +4103,10 @@ async fn record_initial_history_reconstructs_forked_transcript() {
         .await;
 
     let history = session.state.lock().await.clone_history();
-    assert_eq!(expected, strip_response_item_ids(history.raw_items()));
+    assert_eq!(
+        strip_response_item_ids(&expected),
+        strip_response_item_ids(history.raw_items())
+    );
 }
 
 #[tokio::test]
@@ -4283,6 +4413,13 @@ async fn record_initial_history_forked_hydrates_previous_turn_settings() {
         .clone()
         .expect("thread settings should have turn_id");
     let rollout_items = vec![
+        RolloutItem::SessionMeta(codex_protocol::protocol::SessionMetaLine {
+            meta: codex_protocol::protocol::SessionMeta {
+                model_provider: Some(turn_context.config.model_provider_id.clone()),
+                ..Default::default()
+            },
+            git: None,
+        }),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: turn_id.clone(),
@@ -4456,7 +4593,7 @@ async fn thread_rollback_fails_without_persisted_thread_history() {
     );
     assert_eq!(
         strip_response_item_ids(sess.clone_history().await.raw_items()),
-        initial_context
+        strip_response_item_ids(&initial_context)
     );
 }
 
@@ -4575,7 +4712,7 @@ async fn thread_rollback_recomputes_previous_turn_settings_and_reference_context
         sess.previous_turn_settings().await,
         Some(PreviousTurnSettings {
             model: tc.model_info.slug.clone(),
-            comp_hash: None,
+            comp_hash: first_context_item.comp_hash.clone(),
         })
     );
     assert_eq!(
@@ -4889,7 +5026,7 @@ async fn thread_rollback_fails_when_turn_in_progress() {
 
     let history = sess.clone_history().await;
     assert_eq!(
-        initial_context,
+        strip_response_item_ids(&initial_context),
         strip_response_item_ids(history.raw_items())
     );
 }
@@ -4913,7 +5050,7 @@ async fn thread_rollback_fails_when_num_turns_is_zero() {
 
     let history = sess.clone_history().await;
     assert_eq!(
-        initial_context,
+        strip_response_item_ids(&initial_context),
         strip_response_item_ids(history.raw_items())
     );
 }
@@ -8616,7 +8753,7 @@ async fn completed_tool_consumption_does_not_wait_for_persistence() {
                     bounded_model_output.as_bytes(),
                 ),
                 original_tokens: 100,
-                preserved_non_text_tokens: 0,
+                preserved_non_text_tokens: Some(0),
                 bounded_model_output: bounded_model_output.clone(),
                 complete: true,
                 projection_eligible: true,
@@ -10069,7 +10206,7 @@ async fn compaction_persistence_fixture_with_rollout(
                     bounded_model_output.as_bytes(),
                 ),
                 original_tokens: 100,
-                preserved_non_text_tokens: 0,
+                preserved_non_text_tokens: Some(0),
                 bounded_model_output: bounded_model_output.clone(),
                 complete: true,
                 projection_eligible: true,
@@ -10155,6 +10292,8 @@ async fn compacted_history_rejects_failed_initial_drain_without_changing_history
     let old_tool_history = serde_json::to_value(session.state.lock().await.tool_history_state())
         .expect("serialize live candidate before compaction");
     let old_generation = session.services.planning_generation();
+    let old_window = session.current_window_id().await;
+    let old_window_ids = session.state.lock().await.auto_compact_window_ids();
     let old_rollout = tokio::fs::read(&fixture.rollout_path)
         .await
         .expect("read old rollout");
@@ -10179,6 +10318,11 @@ async fn compacted_history_rejects_failed_initial_drain_without_changing_history
     assert!(matches!(result, Err(CodexErr::Fatal(_))));
     assert_eq!(session.clone_history().await.into_raw_items(), old_history);
     assert_eq!(session.services.planning_generation(), old_generation);
+    assert_eq!(session.current_window_id().await, old_window);
+    assert_eq!(
+        session.state.lock().await.auto_compact_window_ids(),
+        old_window_ids
+    );
     assert_eq!(
         serde_json::to_value(session.state.lock().await.tool_history_state())
             .expect("serialize candidate after rejected compaction"),
@@ -10221,6 +10365,13 @@ async fn compacted_history_rollout_failure_preserves_live_history_durable_ledger
         .join(format!("{}.json", session.thread_id));
     let old_history = session.clone_history().await.into_raw_items();
     let old_generation = session.services.planning_generation();
+    let old_window = session.current_window_id().await;
+    let old_window_ids = session.state.lock().await.auto_compact_window_ids();
+    session
+        .state
+        .lock()
+        .await
+        .set_auto_compact_window_estimated_prefill(123);
     let old_ledger = tokio::fs::read(&ledger_path)
         .await
         .expect("read durable original ledger");
@@ -10254,6 +10405,20 @@ async fn compacted_history_rollout_failure_preserves_live_history_durable_ledger
     assert!(matches!(result, Err(CodexErr::Fatal(_))));
     assert_eq!(session.clone_history().await.into_raw_items(), old_history);
     assert_eq!(session.services.planning_generation(), old_generation);
+    assert_eq!(session.current_window_id().await, old_window);
+    assert_eq!(
+        session.state.lock().await.auto_compact_window_ids(),
+        old_window_ids
+    );
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .auto_compact_window_snapshot()
+            .prefill_input_tokens,
+        Some(123),
+    );
     assert_eq!(
         tokio::fs::read(&fixture.rollout_path)
             .await
@@ -10434,6 +10599,7 @@ async fn compacted_history_caller_cancellation_preserves_commit_and_prune_owners
     let fixture = compaction_persistence_fixture(/*block_initial_persistence*/ false).await;
     let session = &fixture.session;
     let original = session.clone_history().await.into_raw_items();
+    let old_window_ids = session.state.lock().await.auto_compact_window_ids();
     let commit_blocker = session
         .durable_history_commit_gate
         .acquire()
@@ -10457,6 +10623,11 @@ async fn compacted_history_caller_cancellation_preserves_commit_and_prune_owners
         "terminal flush must await the accepted compaction after caller cancellation"
     );
     assert_eq!(session.clone_history().await.into_raw_items(), original);
+    assert_eq!(session.state.lock().await.auto_compact_window_number(), 0);
+    assert_eq!(
+        session.state.lock().await.auto_compact_window_ids(),
+        old_window_ids
+    );
     assert!(
         fixture.marker_path.exists(),
         "queued commit cannot release prior protection early"
@@ -10496,6 +10667,30 @@ async fn compacted_history_caller_cancellation_preserves_commit_and_prune_owners
         })
         .collect::<Vec<_>>();
     assert_eq!(compacted.len(), 1);
+    let committed_window_ids = session.state.lock().await.auto_compact_window_ids();
+    assert_eq!(session.state.lock().await.auto_compact_window_number(), 1);
+    assert_eq!(compacted[0].window_number, Some(1));
+    assert_eq!(
+        compacted[0].first_window_id,
+        Some(old_window_ids.first_window_id.to_string())
+    );
+    assert_eq!(
+        compacted[0].previous_window_id,
+        Some(old_window_ids.window_id.to_string())
+    );
+    assert_eq!(
+        compacted[0].window_id,
+        Some(committed_window_ids.window_id.to_string())
+    );
+    assert_ne!(committed_window_ids.window_id, old_window_ids.window_id);
+    assert_eq!(
+        committed_window_ids.previous_window_id,
+        Some(old_window_ids.window_id)
+    );
+    assert_eq!(
+        committed_window_ids.first_window_id,
+        old_window_ids.first_window_id
+    );
     assert_eq!(
         compacted[0].replacement_history.as_ref(),
         Some(&replacement)
@@ -10881,7 +11076,7 @@ async fn built_tools_uses_the_step_mcp_runtime() -> anyhow::Result<()> {
 
     let router = crate::session::turn::built_tools(
         session.as_ref(),
-        step_context.as_ref(),
+        &step_context,
         &[],
         &CancellationToken::new(),
     )
@@ -11481,6 +11676,14 @@ async fn build_initial_context_includes_prompt_fragments_from_extensions() {
 
     let initial_context = build_initial_context(&session, &turn_context).await;
     let developer_messages = developer_message_texts(&initial_context);
+    let root_policy = developer_messages
+        .iter()
+        .flatten()
+        .filter(|text| text.starts_with("<root_orchestration_instructions>"))
+        .collect::<Vec<_>>();
+    assert_eq!(root_policy.len(), 1);
+    assert!(root_policy[0].contains("Do not run shared-state mutations concurrently."));
+    assert!(root_policy[0].len() <= 1_200);
 
     assert!(
         developer_messages
@@ -12274,7 +12477,12 @@ async fn build_initial_context_adds_multi_agent_v2_root_usage_hint_as_developer_
     let initial_context = build_initial_context(&session, &turn_context).await;
 
     let usage_hints = multi_agent_usage_hint_payloads(&initial_context);
-    assert_eq!(usage_hints, ["Root guidance."]);
+    assert_eq!(
+        usage_hints,
+        [
+            "Root guidance.\n\nTool availability does not authorize spawning agents. The active <multi_agent_mode> and its applicable instructions govern whether delegation is allowed."
+        ]
+    );
 }
 
 #[tokio::test]
@@ -12301,7 +12509,12 @@ async fn build_initial_context_adds_multi_agent_v2_subagent_usage_hint_as_develo
     let initial_context = build_initial_context(&session, &turn_context).await;
 
     let usage_hints = multi_agent_usage_hint_payloads(&initial_context);
-    assert_eq!(usage_hints, ["Subagent guidance."]);
+    assert_eq!(
+        usage_hints,
+        [
+            "Subagent guidance.\n\nTool availability does not authorize spawning agents. The active <multi_agent_mode> and its applicable instructions govern whether delegation is allowed."
+        ]
+    );
 }
 
 #[tokio::test]
@@ -12482,14 +12695,14 @@ fn emit_thread_start_skill_metrics_records_description_truncated_chars_without_o
     .expect("skills should render");
 
     assert_eq!(rendered.report.omitted_count, 0);
-    assert_eq!(rendered.report.truncated_description_chars, 4);
+    assert_eq!(rendered.report.truncated_description_chars, 8);
     let snapshot = session_telemetry
         .snapshot_metrics()
         .expect("runtime metrics snapshot");
     assert_eq!(histogram_sum(&snapshot, THREAD_SKILLS_TRUNCATED_METRIC), 0);
     assert_eq!(
         histogram_sum(&snapshot, THREAD_SKILLS_DESCRIPTION_TRUNCATED_CHARS_METRIC),
-        4
+        8
     );
 }
 
@@ -12624,7 +12837,7 @@ async fn record_context_updates_and_set_reference_context_item_injects_full_cont
     let initial_context = build_initial_context(&session, &turn_context).await;
     assert_eq!(
         strip_response_item_ids(history.raw_items()),
-        initial_context
+        strip_response_item_ids(&initial_context)
     );
 
     assert_context_matches_with_accepted_provenance(
@@ -12659,6 +12872,7 @@ async fn record_context_updates_and_set_reference_context_item_reinjects_full_co
     {
         let mut state = session.state.lock().await;
         state.set_reference_context_item(/*item*/ None);
+        state.clear_pending_context_baseline();
     }
     session
         .replace_history(
@@ -12677,7 +12891,7 @@ async fn record_context_updates_and_set_reference_context_item_reinjects_full_co
     expected_history.extend(initial_context);
     assert_eq!(
         strip_response_item_ids(history.raw_items()),
-        expected_history
+        strip_response_item_ids(&expected_history)
     );
 }
 
@@ -12774,8 +12988,8 @@ async fn record_context_updates_reinjects_full_context_when_model_visible_fragme
 
     let current_step = StepContext::for_test(Arc::clone(&current_context));
     assert_eq!(
-        session.estimate_context_update_items(&current_step).await,
-        expected_reinjection,
+        strip_response_item_ids(&session.estimate_context_update_items(&current_step).await),
+        strip_response_item_ids(&expected_reinjection),
         "pre-turn accounting should estimate the same full context reinjection"
     );
     session
@@ -12785,7 +12999,7 @@ async fn record_context_updates_reinjects_full_context_when_model_visible_fragme
     let history = session.clone_history().await;
     assert_eq!(
         strip_response_item_ids(&history.raw_items()[previous_history_len..]),
-        expected_reinjection,
+        strip_response_item_ids(&expected_reinjection),
         "changed model-visible context fragments should invalidate the accepted baseline"
     );
     let projection = crate::stable_context::project_stable_context(
@@ -12828,8 +13042,8 @@ async fn record_context_updates_reinjects_full_context_when_multi_agent_usage_hi
     let changed_step = StepContext::for_test(Arc::clone(&changed_context));
 
     assert_eq!(
-        session.estimate_context_update_items(&changed_step).await,
-        expected_changed_reinjection,
+        strip_response_item_ids(&session.estimate_context_update_items(&changed_step).await),
+        strip_response_item_ids(&expected_changed_reinjection),
         "changing the usage hint should invalidate the accepted fragment baseline"
     );
     session
@@ -12839,7 +13053,7 @@ async fn record_context_updates_reinjects_full_context_when_multi_agent_usage_hi
     let changed_history = session.clone_history().await;
     assert_eq!(
         strip_response_item_ids(&changed_history.raw_items()[previous_history_len..]),
-        expected_changed_reinjection,
+        strip_response_item_ids(&expected_changed_reinjection),
         "changing the usage hint should reinject authoritative full context"
     );
     let changed_history_len = changed_history.raw_items().len();
@@ -12857,8 +13071,8 @@ async fn record_context_updates_reinjects_full_context_when_multi_agent_usage_hi
     let removed_step = StepContext::for_test(Arc::clone(&removed_context));
 
     assert_eq!(
-        session.estimate_context_update_items(&removed_step).await,
-        expected_removed_reinjection,
+        strip_response_item_ids(&session.estimate_context_update_items(&removed_step).await),
+        strip_response_item_ids(&expected_removed_reinjection),
         "removing the usage hint should invalidate the accepted fragment baseline"
     );
     session
@@ -12867,7 +13081,7 @@ async fn record_context_updates_reinjects_full_context_when_multi_agent_usage_hi
     let removed_history = session.clone_history().await;
     assert_eq!(
         strip_response_item_ids(&removed_history.raw_items()[changed_history_len..]),
-        expected_removed_reinjection,
+        strip_response_item_ids(&expected_removed_reinjection),
         "removing the usage hint should reinject authoritative full context"
     );
     assert!(
@@ -13244,7 +13458,9 @@ mod terminal_store_fault {
     use super::*;
     use codex_thread_store::*;
     use pretty_assertions::assert_eq;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     // The external store commits, then loses the acknowledgment before LiveThread observes it.
     struct CommitThenPanicStore {
@@ -13656,7 +13872,10 @@ impl SessionTask for SelfAbortingTask {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn self_aborting_task_runs_interrupt_hook_before_durable_abort() -> anyhow::Result<()> {
-    let (session, turn_context, rx_event) = make_session_and_context_with_rx().await;
+    let (session, mut turn_context, rx_event) = make_session_and_context_with_rx().await;
+    let context = Arc::get_mut(&mut turn_context).expect("single context owner");
+    Arc::make_mut(&mut context.config).agent_interrupt_message_enabled = true;
+    context.multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
     let config = session.get_config().await;
     let config_toml_path = config.codex_home.join(CONFIG_TOML_FILE);
     let user_config: codex_config::TomlValue = serde_json::from_value(serde_json::json!({
@@ -13739,7 +13958,7 @@ async fn self_aborting_task_runs_interrupt_hook_before_durable_abort() -> anyhow
         history.raw_items().iter().any(|item| matches!(
             item,
             ResponseItem::Message { role, content, .. }
-                if role == "user" && content.iter().any(|content_item| matches!(
+                if role == "developer" && content.iter().any(|content_item| matches!(
                     content_item,
                     ContentItem::InputText { text } if TurnAborted::matches_text(text)
                 ))
@@ -15231,6 +15450,26 @@ async fn ordinary_and_ordered_history_commits_share_rollout_order() {
     assert_eq!(live_order, stored_order);
 }
 
+fn assert_interruption_recovery_guidance(event: EventMsg) {
+    let EventMsg::RawResponseItem(RawResponseItemEvent {
+        item: ResponseItem::Message { content, .. },
+    }) = event
+    else {
+        panic!("expected an interruption marker, got {event:?}");
+    };
+    let [ContentItem::InputText { text }] = content.as_slice() else {
+        panic!("expected interruption guidance, got {content:?}");
+    };
+    assert!(text.starts_with("<turn_aborted>\n"));
+    assert!(text.ends_with("\n</turn_aborted>"));
+    assert!(text.contains(
+        "Any tools, commands, or nested code-mode work may have partially executed or may still be running."
+    ));
+    assert!(text.contains(
+        "Before continuing, inspect the affected state and any live sessions; do not assume pre-interruption evidence is still current or repeat operations whose effects are uncertain."
+    ));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[test_log::test]
 async fn abort_regular_task_emits_marker_before_turn_aborted() {
@@ -15259,7 +15498,7 @@ async fn abort_regular_task_emits_marker_before_turn_aborted() {
         .await
         .expect("timeout waiting for marker event")
         .expect("event");
-    assert!(matches!(marker_evt.msg, EventMsg::RawResponseItem(_)));
+    assert_interruption_recovery_guidance(marker_evt.msg);
 
     let evt = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
         .await
@@ -15307,7 +15546,7 @@ async fn abort_gracefully_emits_marker_before_turn_aborted() {
         .await
         .expect("timeout waiting for marker event")
         .expect("event");
-    assert!(matches!(marker_evt.msg, EventMsg::RawResponseItem(_)));
+    assert_interruption_recovery_guidance(marker_evt.msg);
 
     let evt = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
         .await
@@ -17374,7 +17613,12 @@ async fn resumed_legacy_artifact_recovery_enforces_workspace_freshness_at_sampli
                     serde_json::json!({
                         "call_id": recovery_call_id,
                         "stale_workspace_evidence": true,
-                        "reason": "no workspace observation was recorded for this tool result; rerun the tool before relying on it",
+                        "reason": "no workspace observation is available for this tool result; it may be unrecorded or evicted; rerun the tool before relying on it",
+                        "reason_code": "missing_observation",
+                        "valid_for_current_workspace": false,
+                        "observed_revision": null,
+                        "current_revision": null,
+                        "if_rerun_unavailable": "Report the affected claim as unverified; this result does not validate the current workspace.",
                         "rerun": {"force_fresh": true}
                     }),
                     "{case}/{route}: recovered workspace bytes need a fresh observation"
@@ -18038,6 +18282,130 @@ async fn accepted_user_input_interruption_fences_before_consumer_terminal_admiss
 }
 
 #[tokio::test]
+async fn thread_settings_update_only_publishes_after_durable_persistence() {
+    for fail_persistence in [false, true] {
+        let (mut session, _, rx_event) = make_session_and_context_with_rx().await;
+        let rollout_path = attach_thread_persistence(
+            Arc::get_mut(&mut session).expect("session should be uniquely owned"),
+        )
+        .await;
+        let previous = session.thread_settings_applied_event().await;
+        let rollout_before = tokio::fs::read(&rollout_path).await.unwrap();
+        if fail_persistence {
+            session.live_thread().unwrap().shutdown().await.unwrap();
+        }
+
+        super::handlers::update_thread_settings(
+            &session,
+            "durable-settings".to_string(),
+            ThreadSettingsOverrides {
+                model: Some("gpt-5.2".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let event = rx_event.recv().await.expect("settings result");
+        assert_eq!(event.id, "durable-settings");
+        let current = session.thread_settings_applied_event().await;
+        if fail_persistence {
+            let EventMsg::Error(error) = event.msg else {
+                panic!("failed persistence must reject the settings update");
+            };
+            assert_eq!(
+                error.codex_error_info,
+                Some(CodexErrorInfo::InternalServerError)
+            );
+            assert!(
+                error
+                    .message
+                    .contains("failed to persist thread settings override")
+            );
+            assert_eq!(
+                serde_json::to_value(&current).unwrap(),
+                serde_json::to_value(&previous).unwrap()
+            );
+            assert_eq!(
+                tokio::fs::read(&rollout_path).await.unwrap(),
+                rollout_before
+            );
+        } else {
+            let EventMsg::ThreadSettingsApplied(applied) = &event.msg else {
+                panic!("durable settings must be acknowledged");
+            };
+            assert_eq!(applied.thread_settings.model, "gpt-5.2");
+            assert_ne!(
+                serde_json::to_value(&current).unwrap(),
+                serde_json::to_value(&previous).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&current).unwrap(),
+                serde_json::to_value(&event.msg).unwrap()
+            );
+            let rollout = tokio::fs::read_to_string(&rollout_path).await.unwrap();
+            assert!(rollout.lines().any(|line| {
+                matches!(serde_json::from_str::<codex_protocol::protocol::RolloutLine>(line),
+                    Ok(line) if matches!(&line.item, RolloutItem::EventMsg(msg) if serde_json::to_value(msg).unwrap() == serde_json::to_value(&event.msg).unwrap()))
+            }), "acknowledged settings must already be present in durable history");
+        }
+        assert!(
+            rx_event.try_recv().is_err(),
+            "emit exactly one settings result"
+        );
+    }
+}
+
+#[tokio::test]
+async fn turn_input_does_not_acknowledge_settings_when_initial_persistence_fails() {
+    let (mut session, _, rx_event) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_thread_persistence_with_materialization(
+        Arc::get_mut(&mut session).expect("unique session"),
+        false,
+    )
+    .await;
+    session.live_thread().unwrap().shutdown().await.unwrap();
+
+    super::handlers::user_input_or_turn_inner(
+        &session,
+        "initial-settings-failure".to_string(),
+        Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "start a turn".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: ThreadSettingsOverrides {
+                model: Some("gpt-5.2".to_string()),
+                ..Default::default()
+            },
+        },
+        None,
+    )
+    .await;
+
+    let event = rx_event.recv().await.expect("submission result");
+    assert_eq!(event.id, "initial-settings-failure");
+    let EventMsg::Error(error) = event.msg else {
+        panic!("persistence failure must not acknowledge settings or start a turn");
+    };
+    assert_eq!(
+        error.codex_error_info,
+        Some(CodexErrorInfo::InternalServerError)
+    );
+    assert!(
+        error
+            .message
+            .contains("failed to persist initial thread settings")
+    );
+    assert!(rx_event.try_recv().is_err(), "only the failure is emitted");
+    assert!(session.active_turn.lock().await.is_none());
+    assert!(session.clone_history().await.raw_items().is_empty());
+    assert!(!rollout_path.exists());
+}
+
+#[tokio::test]
 async fn thread_settings_update_preserves_only_matching_profile_roots() {
     let (session, initial_turn, rx_event) = make_session_and_context_with_rx().await;
     let profile_directory = tempfile::tempdir().expect("profile workspace");
@@ -18567,12 +18935,12 @@ fn attach_session_trace_bundle(
     Ok(dirs.remove(0))
 }
 
-struct SessionTraceWriterGate {
+struct SessionTracePayloadGate {
     release: Option<std::sync::mpsc::Sender<()>>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
-impl SessionTraceWriterGate {
+impl SessionTracePayloadGate {
     fn release(mut self) {
         self.finish();
     }
@@ -18582,21 +18950,21 @@ impl SessionTraceWriterGate {
             let _ = release.send(());
         }
         if let Some(worker) = self.worker.take() {
-            worker.join().expect("trace writer lock holder completes");
+            worker.join().expect("trace payload serializer completes");
         }
     }
 }
 
-impl Drop for SessionTraceWriterGate {
+impl Drop for SessionTracePayloadGate {
     fn drop(&mut self) {
         self.finish();
     }
 }
 
-async fn hold_session_trace_writer(
+async fn hold_session_trace_payload(
     session: &Session,
     turn_context: &TurnContext,
-) -> SessionTraceWriterGate {
+) -> SessionTracePayloadGate {
     struct GatePayload {
         entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
         release: std::sync::mpsc::Receiver<()>,
@@ -18608,7 +18976,10 @@ async fn hold_session_trace_writer(
             }
             // Watchdog makes the old synchronous implementation fail without wedging teardown.
             let _ = self.release.recv_timeout(std::time::Duration::from_secs(5));
-            serde::Serialize::serialize(&serde_json::json!({"held_real_writer": true}), serializer)
+            serde::Serialize::serialize(
+                &serde_json::json!({"held_payload_serializer": true}),
+                serializer,
+            )
         }
     }
     let context = session
@@ -18622,7 +18993,9 @@ async fn hold_session_trace_writer(
         );
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let owned_payload = session.terminal_tasks.token();
     let worker = std::thread::spawn(move || {
+        let _owned_payload = owned_payload;
         context
             .start_attempt(&GatePayload {
                 entered: std::sync::Mutex::new(Some(entered_tx)),
@@ -18630,13 +19003,13 @@ async fn hold_session_trace_writer(
             })
             .record_failed("test writer gate released");
     });
-    let gate = SessionTraceWriterGate {
+    let gate = SessionTracePayloadGate {
         release: Some(release_tx),
         worker: Some(worker),
     };
     tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx)
         .await
-        .expect("real writer enters serialization with its mutex held")
+        .expect("trace payload enters serialization before acquiring the writer")
         .expect("writer gate signal");
     gate
 }
@@ -18660,8 +19033,8 @@ fn session_trace_turn_started(turn_context: &TurnContext) -> EventMsg {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn session_trace_cancelled_send_keeps_accepted_write_owned_without_live_delivery()
--> anyhow::Result<()> {
+async fn session_trace_send_is_not_blocked_by_unrelated_payload_serialization() -> anyhow::Result<()>
+{
     use codex_rollout_trace::RawTraceEventPayload;
     let temp = tempfile::tempdir()?;
     let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
@@ -18670,56 +19043,39 @@ async fn session_trace_cancelled_send_keeps_accepted_write_owned_without_live_de
         &turn_context,
         temp.path(),
     )?;
-    let gate = hold_session_trace_writer(&session, &turn_context).await;
-    let mut send =
-        Box::pin(session.send_event(&turn_context, session_trace_turn_started(&turn_context)));
-    assert!(
-        futures::poll!(send.as_mut()).is_pending(),
-        "real writer lock must not block the executor"
-    );
-    tokio::select! {
-        biased;
-        _ = &mut send => panic!("event cannot finish while the real writer remains locked"),
-        _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
-    }
-    assert!(
-        rx.try_recv().is_err(),
-        "no event delivery before its trace write"
-    );
-    drop(send);
-    session.terminal_tasks.close();
-    assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(20),
-            session.terminal_tasks.wait()
-        )
-        .await
-        .is_err(),
-        "cancelled waiter must leave the accepted write owned by shutdown"
-    );
-    gate.release();
+    let gate = hold_session_trace_payload(&session, &turn_context).await;
+    let expected = session_trace_turn_started(&turn_context);
     tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        session.terminal_tasks.wait(),
+        Duration::from_secs(2),
+        session.send_event(&turn_context, expected.clone()),
     )
     .await
-    .expect("accepted real writer operation drains after lock release");
+    .expect("payload serialization must not hold the shared writer lock");
+    let live = rx
+        .try_recv()
+        .expect("event delivered while the unrelated payload remains blocked");
+    assert_eq!(live.id, turn_context.sub_id);
+    assert_eq!(
+        serde_json::to_value(&live.msg)?,
+        serde_json::to_value(&expected)?
+    );
     let events = session_trace_events(&bundle);
     assert_eq!(events.iter().filter(|event| matches!(&event.payload,
         RawTraceEventPayload::CodexTurnStarted { codex_turn_id, thread_id }
         if codex_turn_id == &turn_context.sub_id && thread_id == &session.thread_id.to_string()
-    )).count(), 1, "the accepted typed event survives caller cancellation exactly once");
-    assert!(
-        !events.iter().any(|event| matches!(
-            event.payload,
-            RawTraceEventPayload::ProtocolEventObserved { .. }
-        )),
-        "cancellation before raw dispatch must not advance to protocol delivery"
-    );
+    )).count(), 1);
+    assert_eq!(events.iter().filter(|event| matches!(&event.payload,
+        RawTraceEventPayload::ProtocolEventObserved { event_type, .. } if event_type == "turn_started"
+    )).count(), 1);
     assert!(
         rx.try_recv().is_err(),
-        "cancelled sender cannot deliver a late live event"
+        "one send delivers exactly one live event"
     );
+    gate.release();
+    session.terminal_tasks.close();
+    tokio::time::timeout(Duration::from_secs(2), session.terminal_tasks.wait())
+        .await
+        .expect("owned payload drains after release");
     Ok(())
 }
 
@@ -18966,15 +19322,15 @@ async fn shutdown_waits_for_owned_trace_and_finishes_bundle_before_acknowledgmen
         &turn_context,
         root.path(),
     )?;
-    let writer_gate = hold_session_trace_writer(&session, &turn_context).await;
+    let writer_gate = hold_session_trace_payload(&session, &turn_context).await;
     let shutdown = tokio::spawn({
         let session = Arc::clone(&session);
         async move { handlers::shutdown(&session, "trace-shutdown".to_string()).await }
     });
 
     // Normal shutdown first drains earlier terminal work, then owns the final
-    // trace transaction. Pausing the actual writer must keep that transaction
-    // tracked without blocking this current-thread runtime or acknowledging early.
+    // trace transaction. Pausing an owned payload must keep shutdown waiting
+    // without blocking this current-thread runtime or acknowledging early.
     tokio::time::timeout(Duration::from_secs(2), async {
         while session.terminal_tasks.is_empty() && !shutdown.is_finished() {
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -18984,7 +19340,7 @@ async fn shutdown_waits_for_owned_trace_and_finishes_bundle_before_acknowledgmen
     .expect("normal shutdown reaches its trace transaction");
     assert!(
         !shutdown.is_finished() && !session.terminal_tasks.is_empty(),
-        "shutdown must retain its accepted write while the actual writer is blocked"
+        "shutdown must await its owned payload before finalizing the trace"
     );
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert!(

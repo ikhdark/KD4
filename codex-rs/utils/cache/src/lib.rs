@@ -9,8 +9,9 @@ use tokio::sync::Mutex;
 use tokio::sync::MutexGuard;
 
 /// A minimal LRU cache protected by a Tokio mutex.
-/// Calls outside a Tokio runtime are no-ops.
-/// On a current-thread runtime, contended calls bypass the cache instead of blocking.
+/// Uncontended calls work with or without a Tokio runtime.
+/// Unless a multi-thread runtime can support blocking, contended calls bypass
+/// the cache. This cache is best-effort storage, not authoritative state.
 pub struct BlockingLruCache<K, V> {
     inner: Mutex<LruCache<K, V>>,
 }
@@ -78,18 +79,15 @@ where
         }
     }
 
-    /// Executes `callback` with a mutable reference to the underlying cache.
-    pub fn with_mut<R>(&self, callback: impl FnOnce(&mut LruCache<K, V>) -> R) -> R {
-        if let Some(mut guard) = lock_if_runtime(&self.inner) {
-            callback(&mut guard)
-        } else {
-            let mut disabled = LruCache::unbounded();
-            callback(&mut disabled)
-        }
+    /// Executes `callback` on the stored cache, or returns `None` without calling
+    /// it when contention cannot be resolved by blocking.
+    pub fn with_mut<R>(&self, callback: impl FnOnce(&mut LruCache<K, V>) -> R) -> Option<R> {
+        let mut guard = lock_if_runtime(&self.inner)?;
+        Some(callback(&mut guard))
     }
 
-    /// Provides direct access to the cache guard when a Tokio runtime is available.
-    /// Returns `None` on contention if the runtime cannot support blocking.
+    /// Provides direct access to the cache guard.
+    /// Returns `None` on contention unless a multi-thread runtime supports blocking.
     pub fn blocking_lock(&self) -> Option<MutexGuard<'_, LruCache<K, V>>> {
         lock_if_runtime(&self.inner)
     }
@@ -99,10 +97,10 @@ fn lock_if_runtime<K, V>(m: &Mutex<LruCache<K, V>>) -> Option<MutexGuard<'_, Lru
 where
     K: Eq + Hash,
 {
-    let runtime = tokio::runtime::Handle::try_current().ok()?;
     if let Ok(guard) = m.try_lock() {
         return Some(guard);
     }
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
     if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
         Some(tokio::task::block_in_place(|| m.blocking_lock()))
     } else {
@@ -162,7 +160,10 @@ mod tests {
         assert_eq!(cache.insert("second", 3), None);
         assert_eq!(cache.remove(&"first"), None);
         cache.clear();
-        assert_eq!(cache.with_mut(|inner| inner.put("third", 4)), None);
+        assert_eq!(
+            cache.with_mut(|_| panic!("contended callback must not run")),
+            None::<()>
+        );
 
         drop(guard);
         assert_eq!(cache.get(&"first"), Some(1));
@@ -184,25 +185,60 @@ mod tests {
         assert_eq!(cache.get(&"c"), Some(3));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn contended_multi_thread_callback_waits_and_mutates_the_cache() {
+        // Run on the only worker so the guard-release task can progress only
+        // after with_mut enters block_in_place.
+        tokio::spawn(async {
+            let cache = std::sync::Arc::new(BlockingLruCache::new(
+                NonZeroUsize::new(2).expect("capacity"),
+            ));
+            cache.insert("first", 1);
+            let holder_cache = std::sync::Arc::clone(&cache);
+            let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let holder = tokio::spawn(async move {
+                let guard = holder_cache.inner.lock().await;
+                locked_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                drop(guard);
+            });
+            locked_rx.await.unwrap();
+            assert!(cache.inner.try_lock().is_err());
+            release_tx.send(()).unwrap();
+            assert_eq!(cache.with_mut(|inner| inner.put("first", 2)), Some(Some(1)));
+            holder.await.unwrap();
+            assert_eq!(cache.get(&"first"), Some(2));
+        })
+        .await
+        .unwrap();
+    }
+
     #[test]
-    fn disabled_without_runtime() {
+    fn stores_and_retrieves_values_without_runtime() {
         let cache = BlockingLruCache::new(NonZeroUsize::new(2).expect("capacity"));
-        cache.insert("first", /*value*/ 1);
-        assert!(cache.get(&"first").is_none());
-
-        assert_eq!(cache.get_or_insert_with("first", || 2), 2);
-        assert!(cache.get(&"first").is_none());
-
-        assert!(cache.remove(&"first").is_none());
-        cache.clear();
+        assert_eq!(cache.insert("first", 1), None);
+        assert_eq!(cache.get(&"first"), Some(1));
+        assert_eq!(cache.get_or_insert_with("first", || panic!("cache hit")), 1);
+        assert_eq!(cache.get_or_insert_with("second", || 2), 2);
+        assert_eq!(cache.get(&"second"), Some(2));
+        assert_eq!(cache.remove(&"first"), Some(1));
 
         let result = cache.with_mut(|inner| {
             inner.put("tmp", 3);
             inner.get(&"tmp").cloned()
         });
-        assert_eq!(result, Some(3));
-        assert!(cache.get(&"tmp").is_none());
-
-        assert!(cache.blocking_lock().is_none());
+        assert_eq!(result, Some(Some(3)));
+        assert_eq!(cache.get(&"tmp"), Some(3));
+        let guard = cache.blocking_lock().expect("uncontended cache");
+        assert_eq!(guard.len(), 2);
+        assert_eq!(
+            cache.with_mut(|_| panic!("contended callback must not run")),
+            None::<()>
+        );
+        drop(guard);
+        cache.clear();
+        assert_eq!(cache.get(&"second"), None);
+        assert_eq!(cache.get(&"tmp"), None);
     }
 }

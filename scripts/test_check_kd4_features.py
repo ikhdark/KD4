@@ -226,7 +226,9 @@ class CheckKd4FeaturesTest(unittest.TestCase):
                         rust,
                     )
 
-    def test_inline_suite_shard_verification_requires_the_registered_binary(self) -> None:
+    def test_inline_suite_shard_verification_requires_the_registered_binary(
+        self,
+    ) -> None:
         owner = self.repo_root / "owner"
         (owner / "Cargo.toml").write_text('[package]\nname = "fixture"\n')
         suite = owner / "tests/suite"
@@ -246,7 +248,7 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         gates = self.repo_root / "codex-rs/.config/kd4-rust-tests.toml"
         gates.parent.mkdir(parents=True)
         gates.write_text(
-            'version = 1\n[helpers]\n'
+            "version = 1\n[helpers]\n"
             '[targets.alpha]\npackage = "fixture"\ntest = "alpha"\nhelpers = []\n'
             '[targets.beta]\npackage = "fixture"\ntest = "beta"\nhelpers = []\n'
             '[gates.alpha]\n[[gates.alpha.steps]]\ntarget = "alpha"\n'
@@ -257,8 +259,23 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         verification = {
             "path": "owner/tests/suite/behavior.rs",
             "symbol": "expected_behavior",
-            "command": ["python", "scripts/rust_test_runner.py", "run-gate", "alpha", "--profile", "fast"],
+            "command": [
+                "python",
+                "scripts/rust_test_runner.py",
+                "run-gate",
+                "alpha",
+                "--profile",
+                "fast",
+            ],
         }
+        self.assertEqual(
+            check_kd4_features._verification_route(verification, self.repo_root),
+            "nextest",
+        )
+        gates.write_text(
+            gates.read_text() + '\n[[gates.alpha.steps]]\ntarget = "beta"\n'
+            'tests = ["suite::other::independent_behavior"]\nhelpers = []\n'
+        )
         self.assertEqual(
             check_kd4_features._verification_route(verification, self.repo_root),
             "nextest",
@@ -267,9 +284,91 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         wrong_binary["command"][3] = "beta"
         with self.assertRaisesRegex(ValueError, "source's package and test binary"):
             check_kd4_features._verification_route(wrong_binary, self.repo_root)
-        shard.write_text('mod suite {}\n')
-        with self.assertRaisesRegex(ValueError, "resolve to one integration test binary"):
+        shard.write_text("mod suite {}\n")
+        with self.assertRaisesRegex(
+            ValueError, "resolve to one integration test binary"
+        ):
             check_kd4_features._verification_route(verification, self.repo_root)
+
+    def test_rust_gate_rejects_same_named_test_in_another_module_of_same_binary(
+        self,
+    ) -> None:
+        owner = self.repo_root / "owner"
+        (owner / "Cargo.toml").write_text('[package]\nname = "fixture"\n')
+        source = owner / "src"
+        source.mkdir()
+        (source / "lib.rs").write_text(
+            'mod unrelated;\n#[path = "correct_owner.rs"] mod actual;\n'
+        )
+        body = "#[test]\nfn proves_feature() { assert_eq!(2 + 2, 4); }\n"
+        (source / "correct_owner.rs").write_text(body)
+        (source / "unrelated.rs").write_text(body)
+        gate_path = self.repo_root / "codex-rs/.config/kd4-rust-tests.toml"
+        gate_path.parent.mkdir(parents=True)
+        gate_template = (
+            'version = 1\n[helpers]\n[targets.fixture_lib]\npackage = "fixture"\nlib = true\nhelpers = []\n'
+            '[gates.proof]\n[[gates.proof.steps]]\ntarget = "fixture_lib"\ntests = ["%s::proves_feature"]\nhelpers = []\n'
+        )
+        verification = {
+            "path": "owner/src/correct_owner.rs",
+            "symbol": "proves_feature",
+            "command": [
+                "python",
+                "scripts/rust_test_runner.py",
+                "run-gate",
+                "proof",
+                "--profile",
+                "fast",
+            ],
+        }
+        gate_path.write_text(gate_template % "actual")
+        self.assertEqual(
+            check_kd4_features._verification_route(verification, self.repo_root),
+            "nextest",
+        )
+        gate_path.write_text(gate_template % "unrelated")
+        with self.assertRaisesRegex(ValueError, "exact source-qualified test identity"):
+            check_kd4_features._verification_route(verification, self.repo_root)
+        # A filename-shaped selector is also wrong when the source is registered under an alias.
+        gate_path.write_text(gate_template % "correct_owner")
+        with self.assertRaisesRegex(ValueError, "exact source-qualified test identity"):
+            check_kd4_features._verification_route(verification, self.repo_root)
+
+    def test_rust_gate_binds_inline_module_and_ignores_same_named_literal_text(
+        self,
+    ) -> None:
+        source = self.repo_root / "inline.rs"
+        for name, decoy in (
+            (
+                "raw string",
+                'const EXAMPLE: &str = r#"mod desired { #[test] fn proves_feature() {} }"#;\n',
+            ),
+            (
+                "block comment",
+                "/* mod desired { #[test] fn proves_feature() {} } */\n",
+            ),
+        ):
+            with self.subTest(scenario=name):
+                source.write_text(
+                    decoy
+                    + "mod unrelated { #[test] fn proves_feature() { assert_eq!(2 + 2, 4); } }\n"
+                )
+                self.assertIsNone(
+                    check_kd4_features._rust_test_source(
+                        source, "desired::proves_feature", self.repo_root
+                    )
+                )
+                self.assertEqual(
+                    check_kd4_features._rust_test_source(
+                        source, "unrelated::proves_feature", self.repo_root
+                    ),
+                    source.resolve(),
+                )
+                self.assertIsNone(
+                    check_kd4_features._rust_test_source(
+                        source, "proves_feature", self.repo_root
+                    )
+                )
 
     def test_desktop_runtime_receipt_feature_is_absent(self) -> None:
         with check_kd4_features.DEFAULT_MANIFEST.open("rb") as manifest_file:

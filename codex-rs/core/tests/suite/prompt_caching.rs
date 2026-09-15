@@ -90,6 +90,15 @@ fn persisted_reasoning_items(path: &Path) -> Vec<ResponseItem> {
 fn assert_default_env_context(text: &str, cwd: &str) {
     assert_env_context_fragment(text);
     assert!(
+        text.contains("<current_date>") && text.contains("</current_date>"),
+        "expected current_date in environment context: {text}"
+    );
+    assert!(
+        text.contains("<timezone>") && text.contains("</timezone>"),
+        "expected timezone in environment context: {text}"
+    );
+
+    assert!(
         text.contains(&format!("<cwd>{cwd}</cwd>")),
         "expected cwd in environment context: {text}"
     );
@@ -103,14 +112,6 @@ fn assert_env_context_fragment(text: &str) {
     assert!(
         text.starts_with(ENVIRONMENT_CONTEXT_OPEN_TAG),
         "expected environment context fragment: {text}"
-    );
-    assert!(
-        text.contains("<current_date>") && text.contains("</current_date>"),
-        "expected current_date in environment context: {text}"
-    );
-    assert!(
-        text.contains("<timezone>") && text.contains("</timezone>"),
-        "expected timezone in environment context: {text}"
     );
     assert!(
         text.ends_with("</environment_context>"),

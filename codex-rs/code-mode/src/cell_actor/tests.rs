@@ -93,11 +93,11 @@ struct CellActorHarness {
     _runtime_event_rx: mpsc::UnboundedReceiver<RuntimeEvent>,
 }
 
-fn spawn_cell_actor_harness(initial_observe_mode: ObserveMode) -> CellActorHarness {
-    spawn_cell_actor_harness_with_host(initial_observe_mode, Arc::new(TestHost))
+async fn spawn_cell_actor_harness(initial_observe_mode: ObserveMode) -> CellActorHarness {
+    spawn_cell_actor_harness_with_host(initial_observe_mode, Arc::new(TestHost)).await
 }
 
-fn spawn_cell_actor_harness_with_host<H: CellHost>(
+async fn spawn_cell_actor_harness_with_host<H: CellHost>(
     initial_observe_mode: ObserveMode,
     host: Arc<H>,
 ) -> CellActorHarness {
@@ -106,9 +106,10 @@ fn spawn_cell_actor_harness_with_host<H: CellHost>(
         host,
         /*task_failure_handler*/ None,
     )
+    .await
 }
 
-fn spawn_cell_actor_harness_with_host_and_failure_handler<H: CellHost>(
+async fn spawn_cell_actor_harness_with_host_and_failure_handler<H: CellHost>(
     initial_observe_mode: ObserveMode,
     host: Arc<H>,
     task_failure_handler: Option<TaskFailureHandler>,
@@ -132,6 +133,7 @@ fn spawn_cell_actor_harness_with_host_and_failure_handler<H: CellHost>(
         Arc::clone(&output_admission),
         /*task_failure_handler*/ None,
     )
+    .await
     .unwrap();
     let cell_state = Arc::new(CellState::new(CancellationToken::new()));
     let handle = CellHandle::new(command_tx, Arc::clone(&cell_state));
@@ -170,7 +172,8 @@ async fn unexpected_runtime_thread_exit_is_reported_to_the_session_owner() {
         Some(Arc::new(move |reason| {
             let _ = failure_tx.send(reason);
         })),
-    );
+    )
+    .await;
     drop(harness.event_tx);
 
     assert_eq!(
@@ -192,7 +195,7 @@ async fn unexpected_runtime_thread_exit_is_reported_to_the_session_owner() {
 
 #[tokio::test]
 async fn runtime_thread_panic_remains_a_cell_error_without_owner_supervision() {
-    let harness = spawn_cell_actor_harness(ObserveMode::YieldAfter(Duration::from_secs(60)));
+    let harness = spawn_cell_actor_harness(ObserveMode::YieldAfter(Duration::from_secs(60))).await;
     harness
         .event_tx
         .send(RuntimeEvent::ThreadPanicked)
@@ -221,7 +224,7 @@ async fn wait_for_notification(host: &RecordingHost) {
 
 #[tokio::test]
 async fn yield_timer_preempts_buffered_runtime_output() {
-    let harness = spawn_cell_actor_harness(ObserveMode::YieldAfter(Duration::ZERO));
+    let harness = spawn_cell_actor_harness(ObserveMode::YieldAfter(Duration::ZERO)).await;
     harness.event_tx.send(RuntimeEvent::Started).unwrap();
     harness
         .event_tx
@@ -255,7 +258,7 @@ async fn yield_timer_preempts_buffered_runtime_output() {
 
 #[tokio::test]
 async fn state_change_observer_wakes_on_output_after_the_completion_grace() {
-    let mut harness = spawn_cell_actor_harness(ObserveMode::StateChange);
+    let mut harness = spawn_cell_actor_harness(ObserveMode::StateChange).await;
     harness.event_tx.send(RuntimeEvent::Started).unwrap();
 
     assert!(
@@ -306,9 +309,11 @@ async fn state_change_observer_wakes_on_output_after_the_completion_grace() {
     harness.task.await.unwrap();
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn state_change_observer_coalesces_output_with_imminent_completion() {
-    let mut harness = spawn_cell_actor_harness(ObserveMode::StateChange);
+    let mut harness = spawn_cell_actor_harness(ObserveMode::StateChange).await;
+    // Native V8 startup uses wall-clock time; pause only after its async handshake.
+    tokio::time::pause();
     harness.event_tx.send(RuntimeEvent::Started).unwrap();
     harness
         .event_tx
@@ -356,7 +361,8 @@ async fn orchestration_correctness_state_change_delivers_already_buffered_output
     let harness = spawn_cell_actor_harness_with_host(
         ObserveMode::YieldAfter(Duration::ZERO),
         Arc::clone(&host),
-    );
+    )
+    .await;
     harness.event_tx.send(RuntimeEvent::Started).unwrap();
     assert_eq!(
         harness.initial_event_rx.await.unwrap(),
@@ -411,7 +417,7 @@ async fn orchestration_correctness_state_change_delivers_already_buffered_output
 
 #[tokio::test]
 async fn state_change_observer_preserves_an_explicit_empty_yield() {
-    let mut harness = spawn_cell_actor_harness(ObserveMode::StateChange);
+    let mut harness = spawn_cell_actor_harness(ObserveMode::StateChange).await;
     harness.event_tx.send(RuntimeEvent::Started).unwrap();
 
     assert!(
@@ -442,7 +448,7 @@ async fn state_change_observer_preserves_an_explicit_empty_yield() {
 
 #[tokio::test]
 async fn queued_termination_preempts_unobserved_runtime_completion() {
-    let harness = spawn_cell_actor_harness(ObserveMode::YieldAfter(Duration::from_secs(60)));
+    let harness = spawn_cell_actor_harness(ObserveMode::YieldAfter(Duration::from_secs(60))).await;
     harness
         .event_tx
         .send(RuntimeEvent::Result {
@@ -466,7 +472,8 @@ async fn observation_dropped_before_dequeue_does_not_consume_output() {
     let harness = spawn_cell_actor_harness_with_host(
         ObserveMode::YieldAfter(Duration::from_secs(60)),
         Arc::clone(&host),
-    );
+    )
+    .await;
     harness.event_tx.send(RuntimeEvent::YieldRequested).unwrap();
     assert!(harness.initial_event_rx.await.unwrap().is_ok());
 
@@ -524,7 +531,8 @@ async fn dropped_yield_observer_preserves_output_for_the_next_observation() {
     let harness = spawn_cell_actor_harness_with_host(
         ObserveMode::YieldAfter(Duration::from_secs(60)),
         Arc::clone(&host),
-    );
+    )
+    .await;
     harness.event_tx.send(RuntimeEvent::YieldRequested).unwrap();
     assert!(harness.initial_event_rx.await.unwrap().is_ok());
 

@@ -458,8 +458,14 @@ fn user_disablement_filters_non_managed_hooks_but_not_managed_hooks() {
     );
     let config_path =
         AbsolutePathBuf::try_from(temp.path().join("config.toml")).expect("absolute path");
-    let managed_disabled_key = format!("{}:pre_tool_use:0:0", managed_dir.display());
-    let user_disabled_key = format!("{}:pre_tool_use:0:0", config_path.display());
+    let managed_disabled_key = format!(
+        "{}:pre_tool_use:v2:sha256:ed501694d4601b0456d85eb46c43f24891ef6e098c9624c4320ed3b5cf33fbf2:0",
+        managed_dir.display()
+    );
+    let user_disabled_key = format!(
+        "{}:pre_tool_use:v2:sha256:83db5236fa18d938c7325b4ac9ca1b91e3a2ea99949c12cd06024ae44ca37480:0",
+        config_path.display()
+    );
     let user_config = config_with_pre_tool_use_hook_and_states(
         "python3 /tmp/user.py",
         [&managed_disabled_key, &user_disabled_key],
@@ -529,7 +535,10 @@ fn user_disablement_does_not_filter_managed_layer_hooks() {
         AbsolutePathBuf::try_from(temp.path().join("managed_config.toml")).expect("absolute path");
     let user_config_path =
         AbsolutePathBuf::try_from(temp.path().join("config.toml")).expect("absolute path");
-    let managed_key = format!("{}:pre_tool_use:0:0", managed_config_path.display());
+    let managed_key = format!(
+        "{}:pre_tool_use:v2:sha256:f113f36b4f5a5e9f3048ac7c81446ddc2e35a2118a235a68ed735f4d8dea3dda:0",
+        managed_config_path.display()
+    );
 
     let config_layer_stack = ConfigLayerStack::new(
         vec![
@@ -740,6 +749,210 @@ fn trusted_plugin_hook_stack(
         ConfigRequirementsToml::default(),
     )
     .expect("config layer stack")
+}
+
+#[tokio::test]
+async fn hook_state_follows_handlers_after_insertion_and_reordering() {
+    for legacy in [false, true] {
+        for bypass_hook_trust in [false, true] {
+            let temp = tempdir().expect("create temp dir");
+            let root = AbsolutePathBuf::try_from(temp.path().to_path_buf()).unwrap();
+            let command = |text: &str| HookHandlerConfig::Command {
+                command: text.to_string(),
+                command_windows: None,
+                timeout_sec: Some(10),
+                r#async: false,
+                status_message: None,
+            };
+            let disabled = command("echo disabled > disabled.txt");
+            let active = command("echo active > active.txt");
+            let inserted = command("echo inserted > inserted.txt");
+            let mut source = PluginHookSource {
+                plugin_id: PluginId::parse("state@test").unwrap(),
+                plugin_root: root.clone(),
+                plugin_data_root: root.join("data"),
+                source_path: root.join("hooks.json"),
+                source_relative_path: "hooks.json".to_string(),
+                hooks: HookEventsToml {
+                    pre_tool_use: vec![MatcherGroup {
+                        matcher: Some("Bash".to_string()),
+                        hooks: vec![disabled.clone(), active.clone()],
+                    }],
+                    ..Default::default()
+                },
+            };
+            let initial = crate::list_hooks(crate::HooksConfig {
+                feature_enabled: true,
+                plugin_hook_sources: vec![source.clone()],
+                ..Default::default()
+            });
+            assert_eq!(initial.hooks.len(), 2);
+            let state = initial
+                .hooks
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| {
+                    let key = if legacy {
+                        crate::hook_key(
+                            "state@test:hooks.json",
+                            HookEventName::PreToolUse,
+                            0,
+                            index,
+                        )
+                    } else {
+                        entry.key.clone()
+                    };
+                    (
+                        key,
+                        serde_json::json!({
+                            "enabled": index != 0,
+                            "trusted_hash": entry.current_hash,
+                        }),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            let stack = ConfigLayerStack::new(
+                vec![ConfigLayerEntry::new(
+                    ConfigLayerSource::User {
+                        file: root.join("config.toml"),
+                        profile: None,
+                    },
+                    serde_json::from_value(serde_json::json!({"hooks": {"state": state}})).unwrap(),
+                )],
+                ConfigRequirements::default(),
+                ConfigRequirementsToml::default(),
+            )
+            .unwrap();
+            // Insert a group and a handler, and move both existing handlers.
+            source.hooks.pre_tool_use = vec![
+                MatcherGroup {
+                    matcher: Some("Bash".to_string()),
+                    hooks: vec![active],
+                },
+                MatcherGroup {
+                    matcher: Some("Bash".to_string()),
+                    hooks: vec![inserted, disabled],
+                },
+            ];
+            let config = crate::HooksConfig {
+                feature_enabled: true,
+                bypass_hook_trust,
+                config_layer_stack: Some(stack),
+                plugin_hook_sources: vec![source.clone()],
+                ..Default::default()
+            };
+            let listed = crate::list_hooks(config.clone());
+            assert!(listed.warnings.is_empty(), "{:?}", listed.warnings);
+            assert_eq!(listed.hooks[0].key, initial.hooks[1].key);
+            assert_eq!(listed.hooks[2].key, initial.hooks[0].key);
+            assert!(listed.hooks[0].enabled);
+            assert!(listed.hooks[1].enabled);
+            assert!(!listed.hooks[2].enabled);
+            assert_eq!(listed.hooks[0].trust_status, HookTrustStatus::Trusted);
+            assert_eq!(listed.hooks[1].trust_status, HookTrustStatus::Untrusted);
+            let declarations = crate::plugin_hook_declarations(&[source]);
+            assert_eq!(
+                declarations
+                    .iter()
+                    .map(|hook| (&hook.key, hook.event_name))
+                    .collect::<Vec<_>>(),
+                listed
+                    .hooks
+                    .iter()
+                    .map(|hook| (&hook.key, hook.event_name))
+                    .collect::<Vec<_>>(),
+            );
+            let outcome = crate::Hooks::new(config)
+                .run_pre_tool_use(PreToolUseRequest {
+                    session_id: ThreadId::new(),
+                    turn_id: "state-turn".to_string(),
+                    subagent: None,
+                    cwd: root,
+                    transcript_path: None,
+                    model: "gpt-test".to_string(),
+                    permission_mode: "default".to_string(),
+                    tool_name: "Bash".to_string(),
+                    matcher_aliases: Vec::new(),
+                    tool_use_id: "state-tool".to_string(),
+                    tool_input: serde_json::json!({}),
+                })
+                .await;
+            assert_eq!(
+                outcome.hook_events.len(),
+                if bypass_hook_trust { 2 } else { 1 }
+            );
+            assert!(
+                outcome
+                    .hook_events
+                    .iter()
+                    .all(|event| event.run.status == HookRunStatus::Completed)
+            );
+            assert_eq!(
+                fs::read_to_string(temp.path().join("active.txt"))
+                    .unwrap()
+                    .trim(),
+                "active"
+            );
+            assert!(!temp.path().join("disabled.txt").exists());
+            assert_eq!(temp.path().join("inserted.txt").exists(), bypass_hook_trust);
+        }
+    }
+}
+
+#[test]
+fn ambiguous_legacy_hook_disablement_requires_explicit_state() {
+    let temp = tempdir().expect("create temp dir");
+    let config_path = AbsolutePathBuf::try_from(temp.path().join("config.toml")).unwrap();
+    let legacy_key = crate::hook_key(
+        &config_path.display().to_string(),
+        HookEventName::PreToolUse,
+        0,
+        0,
+    );
+    let mut config = config_with_pre_tool_use_hook_and_states("echo original", [&legacy_key]);
+    let stack = |config| {
+        ConfigLayerStack::new(
+            vec![ConfigLayerEntry::new(
+                ConfigLayerSource::User {
+                    file: config_path.clone(),
+                    profile: None,
+                },
+                config,
+            )],
+            ConfigRequirements::default(),
+            ConfigRequirementsToml::default(),
+        )
+        .unwrap()
+    };
+    let first =
+        super::discovery::discover_handlers(Some(&stack(config.clone())), vec![], vec![], true);
+    assert_eq!(first.hook_entries.len(), 1);
+    assert!(!first.hook_entries[0].enabled);
+    assert!(first.handlers.is_empty());
+    assert_eq!(first.warnings.len(), 1);
+    assert!(first.warnings[0].contains("no identity hash"));
+
+    let value = config
+        .as_table_mut()
+        .unwrap()
+        .get_mut("hooks")
+        .unwrap()
+        .as_table_mut()
+        .unwrap();
+    value
+        .get_mut("state")
+        .unwrap()
+        .as_table_mut()
+        .unwrap()
+        .insert(
+            first.hook_entries[0].key.clone(),
+            serde_json::from_value(serde_json::json!({"enabled": true})).unwrap(),
+        );
+    let resolved = super::discovery::discover_handlers(Some(&stack(config)), vec![], vec![], true);
+    assert!(resolved.warnings.is_empty());
+    assert_eq!(resolved.handlers.len(), 1);
+    assert_eq!(resolved.handlers[0].command, "echo original");
+    assert!(resolved.hook_entries[0].enabled);
 }
 
 #[test]

@@ -24,15 +24,12 @@ pub fn summarize_sandbox_policy(sandbox_policy: &SandboxPolicy) -> String {
             writable_roots,
             network_access,
             exclude_tmpdir_env_var,
-            exclude_slash_tmp,
+            exclude_slash_tmp: _,
         } => {
             let mut summary = "workspace-write".to_string();
 
             let mut writable_entries = Vec::<String>::new();
             writable_entries.push("workdir".to_string());
-            if !*exclude_slash_tmp {
-                writable_entries.push("/tmp".to_string());
-            }
             if !*exclude_tmpdir_env_var {
                 writable_entries.push("$TMPDIR".to_string());
             }
@@ -60,14 +57,10 @@ pub fn summarize_permission_profile(
         Ok(SandboxPolicy::WorkspaceWrite {
             network_access,
             exclude_tmpdir_env_var,
-            exclude_slash_tmp,
             ..
         }) => {
             let mut summary = "workspace-write".to_string();
             let mut writable_entries = vec!["workdir".to_string()];
-            if !exclude_slash_tmp {
-                writable_entries.push("/tmp".to_string());
-            }
             if !exclude_tmpdir_env_var {
                 writable_entries.push("$TMPDIR".to_string());
             }
@@ -145,6 +138,22 @@ mod tests {
     }
 
     #[test]
+    fn workspace_write_summary_ignores_legacy_slash_tmp_flag() {
+        for exclude_slash_tmp in [false, true] {
+            let policy = SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: true,
+                exclude_slash_tmp,
+            };
+            assert_eq!(
+                summarize_sandbox_policy(&policy),
+                "workspace-write [workdir]"
+            );
+        }
+    }
+
+    #[test]
     fn permission_profile_summary_uses_runtime_workspace_roots_and_hides_internal_writes() {
         let base = std::env::current_dir().unwrap();
         let cwd = AbsolutePathBuf::try_from(base.join("repo")).unwrap();
@@ -163,7 +172,7 @@ mod tests {
         assert_eq!(
             summary,
             format!(
-                "workspace-write [workdir, /tmp, $TMPDIR, {}]",
+                "workspace-write [workdir, $TMPDIR, {}]",
                 extra_root.display()
             )
         );

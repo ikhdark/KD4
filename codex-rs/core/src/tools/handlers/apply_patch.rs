@@ -506,19 +506,25 @@ impl ApplyPatchHandler {
         .await
         {
             codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
-                let _workspace_operation_permit =
-                    if let Ok(native_cwd) = turn_environment.cwd().to_abs_path() {
-                        let workspace_root = get_git_repo_root(&native_cwd)
-                            .unwrap_or_else(|| native_cwd.to_path_buf());
-                        Some(
-                            crate::workspace_operation_gate::acquire_workspace_operation(
-                                &workspace_root,
-                            )
-                            .await,
-                        )
-                    } else {
-                        None
-                    };
+                let _workspace_operation_permit = if let Ok(native_cwd) =
+                    turn_environment.cwd().to_abs_path()
+                {
+                    let workspace_root =
+                        get_git_repo_root(&native_cwd).unwrap_or_else(|| native_cwd.to_path_buf());
+                    Some(tokio::select! {
+                        biased;
+                        _ = cancellation_token.cancelled() => {
+                            return Err(FunctionCallError::RespondToModel(
+                                "apply_patch cancelled while waiting for the workspace".to_string(),
+                            ));
+                        }
+                        permit = crate::workspace_operation_gate::acquire_workspace_operation(
+                            &workspace_root,
+                        ) => permit,
+                    })
+                } else {
+                    None
+                };
                 let (file_paths, effective_additional_permissions, file_system_sandbox_policy) =
                     effective_patch_permissions(
                         session.as_ref(),
@@ -731,7 +737,7 @@ async fn run_owned_patch(
         }
         let (out, delta) = match out {
             Ok(output) => (Ok(output.exec_output), Some(output.delta)),
-            Err(error)
+            Err(_)
                 if req.cancellation_token.is_cancelled()
                     && (!runtime.committed_delta().is_empty()
                         || !runtime.committed_delta().is_exact()) =>
@@ -739,11 +745,10 @@ async fn run_owned_patch(
                 // Declined means no mutation to the event consumer. A cancelled
                 // retry can follow real writes, so publish a failed output and
                 // retain the delta for invalidation and the visible turn diff.
-                let message = match error {
-                    crate::tools::sandboxing::ToolError::Denied(message)
-                    | crate::tools::sandboxing::ToolError::Rejected(message) => message,
-                    error => format!("apply_patch cancelled after mutation: {error:?}"),
-                };
+                let message = format!(
+                    "apply_patch cancelled after mutation\n{}",
+                    runtime.committed_delta().failure_summary(),
+                );
                 let output = codex_protocol::exec_output::ExecToolCallOutput {
                     exit_code: 1,
                     stdout: codex_protocol::exec_output::StreamOutput::new(String::new()),
@@ -814,10 +819,17 @@ pub(crate) async fn intercept_apply_patch(
             let _workspace_operation_permit = if let Ok(native_cwd) = cwd.to_abs_path() {
                 let workspace_root =
                     get_git_repo_root(&native_cwd).unwrap_or_else(|| native_cwd.to_path_buf());
-                Some(
-                    crate::workspace_operation_gate::acquire_workspace_operation(&workspace_root)
-                        .await,
-                )
+                Some(tokio::select! {
+                    biased;
+                    _ = cancellation_token.cancelled() => {
+                        return Err(FunctionCallError::RespondToModel(
+                            "apply_patch cancelled while waiting for the workspace".to_string(),
+                        ).into());
+                    }
+                    permit = crate::workspace_operation_gate::acquire_workspace_operation(
+                        &workspace_root,
+                    ) => permit,
+                })
             } else {
                 None
             };

@@ -267,6 +267,9 @@ fn on_request_keeps_inline_and_direct_tool_guidance_separate() {
     let text = instructions.body();
     assert!(text.contains("with_additional_permissions"));
     assert_eq!(text.matches("# request_permissions Tool").count(), 1);
+    assert!(text.contains("precedence is forbidden > prompt > allow"));
+    assert!(text.contains("A forbidden decision is terminal"));
+    assert!(text.contains("Unmatched commands follow the active approval and sandbox policies"));
 }
 
 #[test]
@@ -384,6 +387,8 @@ fn missing_catalog_key_and_non_on_request_policy_use_legacy_approval_text() {
 
     assert!(on_request.contains("## Requesting escalation"));
     assert_eq!(never, APPROVAL_POLICY_NEVER);
+    assert!(never.contains("continue permitted independent work and report the missing permission"));
+    assert!(never.contains("Do not retry escalation or evade the restriction through another tool"));
 }
 
 #[test]

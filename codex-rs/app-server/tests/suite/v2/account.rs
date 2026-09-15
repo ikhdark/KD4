@@ -2114,7 +2114,7 @@ async fn get_account_transient_refresh_failure_is_observable() -> Result<()> {
             .account_id(WORKSPACE_ID_STALE)
             .email("user@example.com")
             .plan_type("pro")
-            .last_refresh(Some(Utc::now() - ChronoDuration::days(9))),
+            .last_refresh(Some(Utc::now())),
         AuthCredentialsStoreMode::File,
     )?;
 
@@ -2122,7 +2122,7 @@ async fn get_account_transient_refresh_failure_is_observable() -> Result<()> {
     Mock::given(method("POST"))
         .and(path("/oauth/token"))
         .respond_with(ResponseTemplate::new(500))
-        .expect(1..=2)
+        .expect(1)
         .mount(&server)
         .await;
 

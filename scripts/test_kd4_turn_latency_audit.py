@@ -198,6 +198,335 @@ def _timing(*, valid: bool = True, complete: bool = True) -> dict:
 
 
 class Kd4TurnLatencyAuditTest(unittest.TestCase):
+    @staticmethod
+    def startup_event(**overrides):
+        fields = {
+            "message": "startup timing snapshot frozen at first model send",
+            "startup_timing_schema_version": 1,
+            "startup_timing_correlation_id": "session-a",
+            "startup_timing_started_at_unix_ms": 1000,
+            "startup_timing_completed_at_unix_ms": 1100,
+            "startup_timing_duration_ns": "100000000",
+            "startup_timing_profile_valid": True,
+            "startup_prewarm_status": 'Some("ready")',
+            "startup_session_initialization_ns": "60000000",
+            "startup_transport_preconnect_ns": "40000000",
+            "startup_prewarm_preparation_ns": "30000000",
+            "startup_prewarm_request_ns": "20000000",
+            "startup_first_turn_wait_ns": "10000000",
+            "startup_executor_readiness_ns": "50000000",
+            "startup_preconnect_preparation_overlap_ns": "15000000",
+            "startup_preconnect_executor_overlap_ns": "25000000",
+            "startup_timing_invalid_transition_count": 0,
+            "startup_timing_clock_regression_count": 0,
+            "startup_timing_saturation_count": 0,
+        }
+        fields.update(overrides)
+        return {"target": "codex_core::session::turn", "fields": fields}
+
+    def test_startup_log_cli_deduplicates_and_keeps_overlapping_phases_separate(self):
+        event = self.startup_event()
+        restarted = self.startup_event(startup_timing_started_at_unix_ms=2000,
+                                       startup_timing_completed_at_unix_ms=2100)
+        unrelated = {**event, "target": "unrelated"}
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "stderr.jsonl"
+            source.write_text("\n".join(json.dumps(row) for row in [event, event, restarted, unrelated]), encoding="utf-8")
+            reports = []
+            for output_flag in ("--json", "--summary-json"):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    result = kd4_turn_latency_audit.main(["--startup-log", str(source), "--tokens", "off", output_flag])
+                self.assertEqual(result, 0)
+                report = json.loads(stdout.getvalue())
+                self.assertFalse(report["tokenAnalysisEnabled"])
+                reports.append(report["startupTiming"])
+            for startup in reports:
+                self.assertTrue(startup["available"])
+                self.assertEqual(startup["profiles"], 2)
+                self.assertEqual(startup["validProfiles"], 2)
+                self.assertEqual(startup["excludedProfiles"], 0)
+                self.assertEqual(startup["duplicateSnapshots"], 1)
+                self.assertEqual(startup["prewarmStatuses"], {'Some("ready")': 2})
+                self.assertEqual(startup["durationSummariesNs"]["inclusiveDurationNs"],
+                                 {"count": 2, "total": 200_000_000, "min": 100_000_000, "max": 100_000_000})
+                self.assertEqual(startup["durationSummariesNs"]["preconnectPreparationOverlapNs"]["total"], 30_000_000)
+                self.assertEqual(startup["durationSummariesNs"]["preconnectExecutorOverlapNs"]["total"], 50_000_000)
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                kd4_turn_latency_audit.main(["--startup-log", str(source), "--tokens", "off"])
+            self.assertIn("startup timing: 2/2 valid captured profiles", stdout.getvalue())
+            self.assertIn("inclusiveDurationNs: mean=100.000ms", stdout.getvalue())
+            self.assertIn("must not be added or subtracted", stdout.getvalue())
+
+    def test_startup_log_excludes_invalid_unknown_and_conflicting_profiles(self):
+        changes = [
+            {"startup_timing_profile_valid": False},
+            {"startup_timing_schema_version": 2},
+            {"startup_timing_invalid_transition_count": 1},
+            {"startup_timing_clock_regression_count": 2},
+            {"startup_timing_saturation_count": 3},
+            {"startup_timing_duration_ns": None},
+            {"startup_timing_duration_ns": str(2**128 - 1)},
+            {"startup_preconnect_preparation_overlap_ns": 31_000_000},
+            {"startup_timing_duration_ns": True},
+        ]
+        events = [self.startup_event(startup_timing_correlation_id=str(i), **change)
+                  for i, change in enumerate(changes)]
+        events += [self.startup_event(), self.startup_event(startup_timing_duration_ns=99_000_000)]
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "stderr.jsonl"
+            source.write_text("\n".join(json.dumps(row) for row in events), encoding="utf-8")
+            report = kd4_turn_latency_audit.analyze_session_path(None, Path(temp), include_tokens=False, startup_log=source)
+        startup = report["startupTiming"]
+        self.assertFalse(startup["available"])
+        self.assertEqual(startup["excludedProfiles"], 10)
+        self.assertEqual(startup["conflictingProfiles"], 1)
+        self.assertEqual(startup["duplicateSnapshots"], 0)
+        self.assertTrue(all(value is None for value in startup["durationSummariesNs"].values()))
+        for row, reason in zip(startup["records"], [
+            "profile_invalid", "unsupported_schema", "runtime_diagnostics_nonzero",
+            "runtime_diagnostics_nonzero", "runtime_diagnostics_nonzero",
+            "missing_invalid_or_saturated_fields", "missing_invalid_or_saturated_fields",
+            "inconsistent_phase_durations", "missing_invalid_or_saturated_fields", "conflicting_snapshots",
+        ]):
+            self.assertIn(reason, row["exclusionReasons"])
+        self.assertEqual(startup["records"][3]["diagnostics"]["clockRegressionCount"], 2)
+        text = kd4_turn_latency_audit.render_report(report)
+        self.assertIn("startup durations unavailable", text)
+        self.assertIn("clockRegressionCount': 2", text)
+
+    def test_startup_log_missing_and_malformed_records_do_not_become_zero_durations(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.assertNotIn("startupTiming", kd4_turn_latency_audit.analyze_session_path(None, root, include_tokens=False))
+            source = root / "stderr.jsonl"
+            source.write_text('truncated JSON\n[]\n{"fields":{"message":"ordinary log"}}\n', encoding="utf-8")
+            report = kd4_turn_latency_audit.analyze_session_path(None, root, include_tokens=False, startup_log=source)
+        startup = kd4_turn_latency_audit.bounded_summary(report)["startupTiming"]
+        self.assertEqual(startup["parseErrorCount"], 2)
+        self.assertEqual(startup["profiles"], 0)
+        self.assertFalse(startup["available"])
+        self.assertIsNone(startup["durationSummariesNs"]["inclusiveDurationNs"])
+
+    def test_startup_log_bounded_records_preserve_full_coverage_and_valid_only_summaries(self):
+        events = [self.startup_event(startup_timing_correlation_id=str(i)) for i in range(12)]
+        events.append(self.startup_event(startup_timing_correlation_id="bad", startup_timing_profile_valid=False,
+                                         startup_timing_duration_ns=900_000_000))
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "stderr.jsonl"
+            source.write_text("\n".join(json.dumps(row) for row in events), encoding="utf-8")
+            full = kd4_turn_latency_audit.analyze_session_path(None, root, include_tokens=False, startup_log=source)
+        bounded = kd4_turn_latency_audit.bounded_summary(full)["startupTiming"]
+        self.assertEqual(len(bounded["records"]), 10)
+        self.assertEqual(bounded["omittedRecords"], 3)
+        self.assertEqual(bounded["profiles"], 13)
+        self.assertEqual(bounded["validProfiles"], 12)
+        self.assertEqual(bounded["excludedProfiles"], 1)
+        self.assertEqual(bounded["durationSummariesNs"]["inclusiveDurationNs"],
+                         {"count": 12, "total": 1_200_000_000, "min": 100_000_000, "max": 100_000_000})
+
+    def audit_commands(self, commands, *, timing=None, include_tokens=True):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "rollout.jsonl"
+            lines = [_meta(str(root)), _event({"type": "task_started", "turn_id": "behavior"})]
+            for index, (command, output) in enumerate(commands):
+                # Exercise literal decoding through the normal code-mode boundary.
+                lines.append(_response({
+                    "type": "custom_tool_call", "call_id": f"call-{index}", "name": "exec",
+                    "input": "await tools.exec_command({cmd: " + json.dumps(command) + "});",
+                }, "2026-08-17T00:00:01Z"))
+                lines.append(_response({
+                    "type": "custom_tool_call_output", "call_id": f"call-{index}", "output": output,
+                }, "2026-08-17T00:00:02Z"))
+            lines.append(_event({"type": "task_complete", "turn_id": "behavior", "timing": timing or _timing()}, "2026-08-17T00:00:03Z"))
+            source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            return kd4_turn_latency_audit.analyze_session_path(source, root, include_tokens=include_tokens)
+
+    def test_behavior_vector_uses_untruncated_counts_and_complete_provider_tokens(self):
+        timing = _timing()
+        timing["counters"].update({
+            "executedValidationCount": 3, "executedValidationDurationNs": 1_234_567,
+            "suppressedValidationOutputCount": 4, "modelRetryCount": 2,
+            "modelFallbackCount": 0, "saturationCount": 0,
+            "planningGenerationCount": 5, "planRevisionGenerationCount": 2,
+            "planningFixedPointIterationCount": 3, "approvalWaitCount": 2,
+            "permissionWaitCount": 0, "mcpElicitationWaitCount": 4,
+            "toolOutputCanonicalTokenCount": 2**32 + 100,
+            "toolOutputModelTokenCount": 2**32 + 50,
+            "toolOutputRecoveryCallCount": 3, "toolOutputRecoveryRetruncationCount": 0,
+        })
+        report = self.audit_commands([("cat src/client.ts", ""), ("rg Widget src/client.ts", "")] * 35, timing=timing)
+        self.assertEqual(len(report["sourceDiscovery"]["events"]), 64)
+        self.assertEqual(report["sourceDiscovery"]["omittedEvents"], 6)
+        vector = report["behaviorMetrics"]
+        self.assertEqual(vector["behaviorSchemaVersion"], 2)
+        self.assertEqual(vector["metrics"], {
+            "discoveryEvents": 70, "searchEvents": 35, "readEvents": 35,
+            "broadSearchEvents": 0, "repeatedSearchEvents": 34,
+            "executedValidationCount": 3, "modelRetryCount": 2, "modelFallbackCount": 0,
+            "executedValidationDurationNs": 1_234_567, "suppressedValidationOutputCount": 4,
+            "noProgressDirectiveCount": 1, "provenLoopActivationCount": 1,
+            "planningGenerationCount": 5, "planRevisionGenerationCount": 2,
+            "planningFixedPointIterationCount": 3, "approvalWaitCount": 2,
+            "permissionWaitCount": 0, "userInputWaitCount": 1, "mcpElicitationWaitCount": 4,
+            "toolOutputCanonicalTokenCount": 2**32 + 100,
+            "toolOutputModelTokenCount": 2**32 + 50,
+            "toolOutputRecoveryCallCount": 3, "toolOutputRecoveryRetruncationCount": 0,
+            "totalTokens": 235,
+        })
+        self.assertEqual(vector["unavailableReasons"], {})
+        self.assertEqual(kd4_turn_latency_audit.bounded_summary(report)["behaviorMetrics"], {
+            key: value for key, value in vector.items() if key != "measurementNote"
+        })
+        self.assertNotIn("client.ts", json.dumps(vector))
+        bounded = kd4_turn_latency_audit.bounded_summary(report)
+        captured = report["runnerDiagnostics"]["capturedRequests"]
+        self.assertIn("measurementNote", captured)
+        self.assertEqual(
+            bounded["runnerDiagnostics"]["capturedRequests"],
+            {key: value for key, value in captured.items() if key != "measurementNote"},
+        )
+
+    def test_behavior_counters_sum_unique_turns_and_reject_unanchored_or_pending_work(self):
+        for mode in ("complete", "unanchored", "unpaired", "late_output"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                source = root / "rollout.jsonl"
+                lines = [_meta(str(root))]
+                for turn, count, duration in (("first", 2, 100), ("resumed", 3, 275)):
+                    if mode != "unanchored":
+                        lines.append(_event({"type": "task_started", "turn_id": turn}))
+                    if mode in ("unpaired", "late_output"):
+                        lines.append(_response({"type": "function_call", "name": "exec_command", "call_id": turn, "arguments": {"cmd": "rg needle src"}}, "2026-08-17T00:00:01Z"))
+                    timing = _timing()
+                    timing["counters"].update({"executedValidationCount": count, "executedValidationDurationNs": duration, "saturationCount": 0})
+                    terminal = _event({"type": "task_complete", "turn_id": turn, "timing": timing}, "2026-08-17T00:00:02Z")
+                    lines.extend([terminal, terminal])
+                    if mode == "late_output":
+                        lines.append(_response({"type": "function_call_output", "call_id": turn, "output": ""}, "2026-08-17T00:00:03Z"))
+                source.write_text("\n".join(lines), encoding="utf-8")
+                report = kd4_turn_latency_audit.analyze_session_path(source, root, include_tokens=False)
+                metrics = report["behaviorMetrics"]["metrics"]
+                self.assertEqual(report["coverage"]["duplicateTimedTerminalEvents"], 2)
+                if mode == "complete":
+                    self.assertEqual(metrics["executedValidationCount"], 5)
+                    self.assertEqual(metrics["executedValidationDurationNs"], 375)
+                    self.assertEqual(metrics["provenLoopActivationCount"], 2)
+                    self.assertEqual(metrics["searchEvents"], 0)
+                    self.assertEqual(report["coverage"]["terminalTurnsWithUnresolvedToolCalls"], 0)
+                else:
+                    self.assertTrue(all(value is None for value in metrics.values()))
+                    self.assertEqual(report["behaviorMetrics"]["unavailableReasons"]["executedValidationCount"], "incomplete_timing_coverage")
+                    if mode in ("unpaired", "late_output"):
+                        # Output after terminal publication cannot restore
+                        # complete measurements at the terminal boundary.
+                        self.assertEqual(report["coverage"]["terminalTurnsWithUnresolvedToolCalls"], 2)
+                    if mode == "unanchored":
+                        self.assertEqual(report["coverage"]["terminalTurnsWithoutStart"], 2)
+                        self.assertEqual(kd4_turn_latency_audit.bounded_summary(report)["coverage"]["terminalTurnsWithoutStart"], 2)
+
+    def test_behavior_counter_maxima_are_unavailable_even_without_saturation_flag(self):
+        for key, maximum in (
+            ("provenLoopActivationCount", 2**32 - 1),
+            ("executedValidationDurationNs", 2**64 - 1),
+            ("toolOutputCanonicalTokenCount", 2**64 - 1),
+            ("toolOutputModelTokenCount", 2**64 - 1),
+            ("toolOutputRecoveryCallCount", 2**32 - 1),
+            ("toolOutputRecoveryRetruncationCount", 2**32 - 1),
+        ):
+            for value in (0, maximum - 1, maximum):
+                with self.subTest(key=key, value=value):
+                    timing = _timing()
+                    timing["counters"].update({key: value, "saturationCount": 0})
+                    vector = self.audit_commands([], timing=timing, include_tokens=False)["behaviorMetrics"]
+                    if value == maximum:
+                        self.assertIsNone(vector["metrics"][key])
+                        self.assertEqual(vector["unavailableReasons"][key], "saturated_counters")
+                    else:
+                        self.assertEqual(vector["metrics"][key], value)
+
+    def test_output_metrics_require_each_runtime_counter_and_complete_timing(self):
+        expected = {
+            "toolOutputCanonicalTokenCount": 1000, "toolOutputModelTokenCount": 200,
+            "toolOutputRecoveryCallCount": 2, "toolOutputRecoveryRetruncationCount": 1,
+        }
+        for key in expected:
+            for invalid in (None, -1, True, "2"):
+                with self.subTest(key=key, invalid=invalid):
+                    timing = _timing()
+                    timing["counters"].update(expected | {"saturationCount": 0})
+                    if invalid is None:
+                        del timing["counters"][key]
+                    else:
+                        timing["counters"][key] = invalid
+                    vector = self.audit_commands([], timing=timing)["behaviorMetrics"]
+                    self.assertIsNone(vector["metrics"][key])
+                    self.assertEqual(vector["unavailableReasons"][key], "counter_unavailable")
+                    for other, value in expected.items():
+                        if other != key:
+                            self.assertEqual(vector["metrics"][other], value)
+                    self.assertNotIn("toolOutputRecursiveSpillCount", vector["metrics"])
+        timing = _timing(valid=False)
+        timing["counters"].update(expected | {"saturationCount": 0})
+        vector = self.audit_commands([], timing=timing)["behaviorMetrics"]
+        for key in expected:
+            self.assertIsNone(vector["metrics"][key])
+            self.assertEqual(vector["unavailableReasons"][key], "incomplete_timing_coverage")
+
+    def test_behavior_missing_saturated_partial_and_disabled_measurements_are_unavailable(self):
+        for mode, reason in [("missing", "counter_unavailable"), ("saturated", "saturated_counters"), ("invalid", "incomplete_timing_coverage")]:
+            with self.subTest(mode=mode):
+                timing = _timing(valid=mode != "invalid")
+                if mode != "missing":
+                    timing["counters"].update({"executedValidationCount": 4294967295, "saturationCount": 1})
+                vector = self.audit_commands([], timing=timing, include_tokens=False)["behaviorMetrics"]
+                self.assertIsNone(vector["metrics"]["executedValidationCount"])
+                self.assertEqual(vector["unavailableReasons"]["executedValidationCount"], reason)
+                self.assertIsNone(vector["metrics"]["totalTokens"])
+                self.assertEqual(vector["unavailableReasons"]["totalTokens"], "token_analysis_disabled")
+        timing = _timing()
+        del timing["modelRequests"][0]["tokenUsage"]
+        vector = self.audit_commands([], timing=timing)["behaviorMetrics"]
+        self.assertIsNone(vector["metrics"]["totalTokens"])
+        self.assertEqual(vector["unavailableReasons"]["totalTokens"], "incomplete_token_coverage")
+        vector = kd4_turn_latency_audit.analyze_session_path(None, Path.cwd())["behaviorMetrics"]
+        self.assertTrue(all(value is None for value in vector["metrics"].values()))
+
+    def test_discovery_relative_paths_and_redacted_queries_preserve_search_identity(self):
+        commands = [
+            ("cat client.rs", ""), ("head src/client.tsx", ""),
+            ("tail ./package/worker.py", ""), ("sed -n '1,5p' lib/worker.js", ""),
+            ('rg "first private phrase"', ""), ('rg "second private phrase"', ""),
+            ('rg "second private phrase"', ""), ('rg "second private phrase"', ""),
+            ("rg Widget", ""), ("rg Widget --glob '*.rs'", ""),
+        ]
+        report = self.audit_commands(commands)
+        discovery = report["sourceDiscovery"]
+        self.assertEqual(discovery["readCount"], 4)
+        self.assertEqual([event["requestedPaths"] for event in discovery["events"][:4]], [
+            ["client.rs"], ["src/client.tsx"], ["package/worker.py"], ["lib/worker.js"],
+        ])
+        self.assertEqual(discovery["repeatedSearchCount"], 2)
+        self.assertEqual(discovery["repeatedSearchSignatureCount"], 1)
+        self.assertEqual([signal["ordinal"] for signal in discovery["candidateSignals"] if signal["code"] == "repeated_discovery"], [7, 8])
+        self.assertNotIn("first private phrase", json.dumps(report))
+        self.assertNotIn("second private phrase", json.dumps(report))
+
+    def test_structured_tool_outcome_overrides_output_text_without_timing_boundaries(self):
+        for outcome, output, failures in [
+            ("success", "matched: Traceback (most recent call last)\nExit code: 9", 0),
+            ("no_match", "Exit code: 1", 0),
+            ("failure", "", 1),
+        ]:
+            with self.subTest(outcome=outcome):
+                timing = _timing()
+                timing["toolCalls"] = [{"callId": "call-0", "toolName": "exec", "outcome": outcome}]
+                report = self.audit_commands([("rg Traceback client.rs", output)], timing=timing)
+                self.assertEqual(report["commandOrchestration"]["failedToolCalls"], failures)
+
     def test_overlapping_children_use_elapsed_union_and_missing_bounds_are_uncertain(
         self,
     ):
@@ -300,9 +629,12 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         tokens = kd4_turn_latency_audit._token_report([])
 
         self.assertFalse(tokens["complete"])
-        self.assertEqual(tokens["inputTokens"], 0)
-        self.assertEqual(tokens["cachedInputTokens"], 0)
-        self.assertEqual(tokens["outputTokens"], 0)
+        self.assertIsNone(tokens["inputTokens"])
+        self.assertIsNone(tokens["cachedInputTokens"])
+        self.assertIsNone(tokens["outputTokens"])
+        self.assertEqual(tokens["observedTotals"]["inputTokens"], 0)
+        self.assertEqual(tokens["observedTotals"]["cachedInputTokens"], 0)
+        self.assertEqual(tokens["observedTotals"]["outputTokens"], 0)
         self.assertIsNone(tokens["billableTokens"])
 
     def test_token_report_marks_internal_provider_retries_as_partial(self) -> None:
@@ -843,7 +1175,8 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
             115,
         )
         self.assertEqual(report["populations"]["all"]["modelShare"], 2 / 3)
-        self.assertEqual(report["schemaVersion"], 18)
+        self.assertEqual(report["populations"]["repository_root"], {"turns": 1, "sameAs": "all"})
+        self.assertEqual(report["schemaVersion"], 20)
         breakdown = report["latencyBreakdown"]
         orchestration_breakdown = breakdown["orchestration"]
         self.assertEqual(orchestration_breakdown["exclusiveTotalNs"], 100_000_000)
@@ -908,6 +1241,7 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertNotIn("measurementContract", summary["firstUsefulActionAnalysis"])
         self.assertNotIn("sourceSnapshots", summary["firstUsefulActionAnalysis"])
         rendered = kd4_turn_latency_audit.render_report(report)
+        self.assertIn("repository_root: 1 turns; same measurements as all", rendered)
         self.assertIn("boundary=2026-08-17", rendered)
         self.assertIn("orchestration breakdown (overlapping diagnostics", rendered)
         self.assertIn("model inference breakdown (overlapping diagnostics", rendered)
@@ -1015,7 +1349,12 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertEqual(discovery["events"][1]["resultPaths"], ["scripts/widget.py"])
         signal_counts = discovery["candidateSignalCounts"]
         self.assertEqual(signal_counts["broad_search_without_path_scope"], 2)
-        self.assertEqual(signal_counts["repeated_discovery"], 2)
+        self.assertEqual(signal_counts["repeated_discovery"], 1)
+        self.assertEqual(
+            [signal["ordinal"] for signal in discovery["candidateSignals"]
+             if signal["code"] == "repeated_discovery"],
+            [3],
+        )
         self.assertEqual(signal_counts["broad_source_map_before_owner_slice"], 1)
         self.assertEqual(signal_counts["ownership_evidence_late"], 1)
         self.assertEqual(signal_counts["callers_evidence_late"], 1)

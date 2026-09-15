@@ -62,7 +62,8 @@ async fn large_hook_output_spills_to_file() -> Result<()> {
         .maybe_spill_text(ThreadId::new(), text.clone())
         .await;
 
-    assert!(output.contains("tokens truncated"));
+    assert!(output.contains("[omitted before retained middle]"));
+    assert!(output.contains("[omitted after retained middle]"));
     assert!(approx_token_count(&output) <= HOOK_OUTPUT_TOKEN_LIMIT);
     let path = output
         .lines()

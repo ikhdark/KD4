@@ -177,12 +177,9 @@ async fn assert_failed_user_input_response_interrupts_turn(
     failed_response: FailedUserInputClientResponse,
 ) -> Result<()> {
     let codex_home = tempfile::TempDir::new()?;
-    let responses = vec![
-        create_request_user_input_sse_response_with_auto_resolution(
-            "call1", /*auto_resolution_ms*/ 60_000,
-        )?,
-        create_final_assistant_message_sse_response("must not be requested")?,
-    ];
+    let responses = vec![create_request_user_input_sse_response_with_auto_resolution(
+        "call1", /*auto_resolution_ms*/ 60_000,
+    )?];
     let server = create_mock_responses_server_sequence(responses).await;
     create_config_toml(codex_home.path(), &server.uri())?;
 

@@ -1,6 +1,6 @@
 ## `apply_patch`
 
-Use `apply_patch` to send one file-oriented patch:
+Use `apply_patch` to send one patch:
 
 ```text
 *** Begin Patch
@@ -8,7 +8,7 @@ Use `apply_patch` to send one file-oriented patch:
 *** End Patch
 ```
 
-Every operation requires one header:
+Operation headers:
 
 - `*** Add File: <path>`: create a file; prefix every content line with `+`.
 - `*** Delete File: <path>`: delete a file; no body follows.
@@ -69,11 +69,13 @@ Example combining operations:
 
 Important rules:
 
-- Use an Add, Delete, or Update header for every operation.
+- Reread the entire target region without truncation immediately before patching, reconcile changes, and keep each patch to one coherent contract.
 - Paths must be relative; never use absolute paths.
 - Use only this grammar. Do not include unified-diff headers such as `diff --git`, `---`, or `+++`.
-- Success proves only that the patch matched and applied, not that the result is correct or unchanged afterward.
+- Updates preserve whether a nonempty file ends with a newline. New lines use the file's first observed line ending; untouched lines retain their existing endings. Add operations use LF and terminate nonempty content with a newline.
+- A hunk containing only additions appends at EOF unless its `@@` header names a context line, in which case it inserts immediately after that line.
+- Success confirms application, not correctness or unchanged contents.
 - After stale context, a concurrent edit, a context mismatch, or a failure that may have modified files, re-read only the affected current sections before retrying. For errors known to occur before file mutation, correct the error without re-reading unchanged contents. Do not retry against stale context.
 - Preserve an implementation that already satisfies the request even when it differs from an earlier plan.
 
-Pass the complete patch as the tool's single multiline argument, preserving actual line breaks as in the example above. Use the argument format exposed by the tool interface.
+Pass the complete patch as the tool's single multiline argument, preserving actual line breaks. Follow the tool interface's argument format.

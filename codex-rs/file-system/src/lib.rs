@@ -134,6 +134,7 @@ pub struct WalkError {
 pub struct WalkOutcome {
     pub entries: Vec<WalkEntry>,
     pub errors: Vec<WalkError>,
+    /// Whether a traversal budget prevented inspecting all eligible descendants.
     pub truncated: bool,
 }
 
@@ -592,7 +593,7 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
                 kind,
             });
 
-            if kind == WalkEntryKind::Directory && depth < options.max_depth {
+            if kind == WalkEntryKind::Directory {
                 if options.prune_hidden_directories && entry.file_name.starts_with('.') {
                     continue;
                 }
@@ -617,7 +618,7 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
                 if !visited_directories.insert(directory_identity) {
                     continue;
                 }
-                if directory_count == options.max_directories {
+                if depth == options.max_depth || directory_count == options.max_directories {
                     outcome.truncated = true;
                 } else {
                     directory_count += 1;

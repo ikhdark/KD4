@@ -21,11 +21,11 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
                 BTreeMap::from([
                     (
                         "start".to_string(),
-                        JsonSchema::integer(Some("Zero-based start byte.".to_string())),
+                        bounded_integer(0, u64::MAX, "Zero-based start byte.".to_string()),
                     ),
                     (
                         "end".to_string(),
-                        JsonSchema::integer(Some("Exclusive end byte.".to_string())),
+                        bounded_integer(0, u64::MAX, "Exclusive end byte.".to_string()),
                     ),
                 ]),
                 vec!["start", "end"],
@@ -35,11 +35,11 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
                 BTreeMap::from([
                     (
                         "start".to_string(),
-                        JsonSchema::integer(Some("One-based first line.".to_string())),
+                        bounded_integer(1, u64::MAX, "One-based first line.".to_string()),
                     ),
                     (
                         "end".to_string(),
-                        JsonSchema::integer(Some("Inclusive last line.".to_string())),
+                        bounded_integer(1, u64::MAX, "Inclusive last line.".to_string()),
                     ),
                 ]),
                 vec!["start", "end"],
@@ -110,14 +110,8 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
     let artifact_id = JsonSchema::string(Some(
         "Opaque UUID from the original tool projection.".to_string(),
     ));
-    let max_bytes = bounded_integer(
-        1,
-        READ_TOOL_OUTPUT_MAX_BYTES as u64,
-        "Legacy compatibility field; validated but never used to clip a selected value."
-            .to_string(),
-    );
     let selectors = bounded_array(
-        selector_schema,
+        selector_schema.clone(),
         1,
         READ_TOOL_OUTPUT_MAX_SELECTORS as u64,
         "Preferred selector list; exact duplicates and overlapping or adjacent same-kind ranges are normalized into stable canonical source order.".to_string(),
@@ -152,10 +146,7 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
         "Up to 16 legacy line ranges normalized into selectors.".to_string(),
     );
     let input_variant = |variant_properties: Vec<(String, JsonSchema)>, required: Vec<&str>| {
-        let mut properties = BTreeMap::from([
-            ("artifact_id".to_string(), artifact_id.clone()),
-            ("max_bytes".to_string(), max_bytes.clone()),
-        ]);
+        let mut properties = BTreeMap::from([("artifact_id".to_string(), artifact_id.clone())]);
         properties.extend(variant_properties);
         JsonSchema::object(
             properties,
@@ -166,8 +157,7 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: READ_TOOL_OUTPUT_TOOL_NAME.to_string(),
-        description: "Search or select one validated immutable tool-output snapshot without rerunning it. Batch independent selectors instead of rereading tiny fragments. Searches return exact hydrated_ranges in the same call. Values are never clipped; overflow returns exact ranges and deterministic child_selectors. complete means every selector is present. After overflow, retry only the returned continuation or child_selectors. Recovery reopens and validates the retained artifact without recursive spills or child artifacts."
-            .to_string(),
+        description: "Search or select one validated immutable tool-output snapshot without rerunning it. Batch independent selectors instead of rereading tiny fragments.\nSearches return exact hydrated_ranges in results[].value in the same call. Values are never clipped; overflow returns exact ranges and deterministic child_selectors.\ncomplete means every selector is present. After overflow, retry only the returned continuation or child_selectors. Check continuation_stop for the reason recovery stopped and whether its selector is resumable.\nRecovery reopens and validates the retained artifact without recursive spills or child artifacts.".to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::one_of(
@@ -193,8 +183,153 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
                     .to_string(),
             ),
         ),
-        output_schema: None,
+        output_schema: Some(read_tool_output_output_schema(selector_schema)),
     })
+}
+
+fn read_tool_output_output_schema(mut selector_schema: JsonSchema) -> serde_json::Value {
+    // Invalid selectors are echoed in error results, so output coordinates must
+    // describe the parsed unsigned values without imposing input validity bounds.
+    for variant in selector_schema.one_of.iter_mut().flatten() {
+        for property in variant
+            .properties
+            .iter_mut()
+            .flat_map(|properties| properties.values_mut())
+        {
+            if property.minimum.is_some() {
+                property.minimum = Some(Number::from(0));
+                property.maximum = None;
+            }
+        }
+    }
+    let mut schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "artifact_id": {"type": "string"},
+            "canonical_sha256": {"type": "string"},
+            "canonical_bytes": {"type": "integer", "minimum": 0},
+            "retained_bytes": {"type": "integer", "minimum": 0},
+            "complete": {"type": "boolean"},
+            "unavailable_ranges": {"type": "array", "items": {"$ref": "#/$defs/range"}},
+            "results": {"type": "array", "items": {"$ref": "#/$defs/result"}},
+            "continuation_stop": {
+                "type": "object",
+                "properties": {
+                    "version": {"type": "integer", "enum": [1]},
+                    "reason": {"type": "string", "enum": [
+                        "budget", "cancelled", "identity_drift", "incomplete_owner_result",
+                        "invalid_selector", "selector_not_found", "page_read_error", "repeated_selector"
+                    ]},
+                    "selector": {"anyOf": [{"$ref": "#/$defs/selector"}, {"type": "null"}]},
+                    "resumable": {"type": "boolean"},
+                    "message": {"type": "string"}
+                },
+                "required": ["version", "reason", "selector", "resumable"],
+                "additionalProperties": false
+            }
+        },
+        "required": ["artifact_id", "canonical_sha256", "canonical_bytes", "retained_bytes", "complete", "results"],
+        "additionalProperties": false,
+        "$defs": {
+            "selector": selector_schema,
+            "range": {
+                "type": "object",
+                "properties": {"start": {"type": "integer", "minimum": 0}, "end": {"type": "integer", "minimum": 0}},
+                "required": ["start", "end"],
+                "additionalProperties": false
+            },
+            "result": {
+                "type": "object",
+                "properties": {
+                    "selector": {"$ref": "#/$defs/selector"},
+                    "status": {"type": "string", "enum": ["ok", "selector_too_large", "aggregate_omitted", "not_found", "invalid"]},
+                    "complete": {"type": "boolean"},
+                    "exact_bytes": {"type": "integer", "minimum": 0},
+                    "canonical_range": {"$ref": "#/$defs/range"},
+                    "text": {"type": "string"},
+                    "value": {"description": "Exact selected JSON value. Search selectors return the search_result shape."},
+                    "data_base64": {"type": "string"},
+                    "subdivision_plan": {
+                        "type": "object",
+                        "properties": {
+                            "range": {"$ref": "#/$defs/range"},
+                            "chunk_bytes": {"type": "integer", "minimum": 0},
+                            "chunk_count": {"type": "integer", "minimum": 0},
+                            "selector_kind": {"type": "string"}
+                        },
+                        "required": ["range", "chunk_bytes", "chunk_count", "selector_kind"],
+                        "additionalProperties": false
+                    },
+                    "child_selectors": {"type": "array", "items": {"$ref": "#/$defs/selector"}},
+                    "continuation": {"$ref": "#/$defs/selector"},
+                    "message": {"type": "string"}
+                },
+                "required": ["selector", "status", "complete"],
+                "additionalProperties": false
+            },
+            "search_result": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "start_byte": {"type": "integer", "minimum": 0},
+                    "coverage_complete": {"type": "boolean"},
+                    "total_matches": {"type": "integer", "minimum": 0},
+                    "matches_returned": {"type": "integer", "minimum": 0},
+                    "remaining_match_count": {"type": "integer", "minimum": 0},
+                    "matches": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "line": {"type": "integer", "minimum": 1},
+                                "end_line": {"type": "integer", "minimum": 1},
+                                "start_byte": {"type": "integer", "minimum": 0},
+                                "end_byte": {"type": "integer", "minimum": 0}
+                            },
+                            "required": ["line", "end_line", "start_byte", "end_byte"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "hydrated_ranges": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "selector": {"$ref": "#/$defs/selector"},
+                                "canonical_range": {"$ref": "#/$defs/range"},
+                                "exact_bytes": {"type": "integer", "minimum": 0},
+                                "text": {"type": "string"},
+                                "data_base64": {"type": "string"}
+                            },
+                            "required": ["selector", "canonical_range", "exact_bytes"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["query", "start_byte", "coverage_complete", "total_matches", "matches_returned", "remaining_match_count", "matches", "hydrated_ranges"],
+                "additionalProperties": false
+            }
+        }
+    });
+    let mut exact_result = schema["$defs"]["result"].clone();
+    let mut search_result = exact_result.clone();
+    let (search_selectors, exact_selectors): (Vec<_>, Vec<_>) = selector_schema
+        .one_of
+        .unwrap_or_default()
+        .into_iter()
+        .partition(|variant| {
+            variant.properties.as_ref().is_some_and(|properties| {
+                properties
+                    .get("kind")
+                    .and_then(|kind| kind.enum_values.as_ref())
+                    == Some(&vec![serde_json::json!("search")])
+            })
+        });
+    exact_result["properties"]["selector"] = serde_json::json!({"oneOf": exact_selectors});
+    search_result["properties"]["selector"] = serde_json::json!({"oneOf": search_selectors});
+    search_result["properties"]["value"] = serde_json::json!({"$ref": "#/$defs/search_result"});
+    schema["$defs"]["result"] = serde_json::json!({"oneOf": [exact_result, search_result]});
+    schema
 }
 
 fn selector_variant(
@@ -214,7 +349,7 @@ fn selector_variant(
 fn bounded_integer(minimum: u64, maximum: u64, description: String) -> JsonSchema {
     JsonSchema {
         minimum: Some(Number::from(minimum)),
-        maximum: Some(Number::from(maximum)),
+        maximum: Some(Number::from(maximum.min((1_u64 << 53) - 1))),
         ..JsonSchema::integer(Some(description))
     }
 }
@@ -230,6 +365,32 @@ fn bounded_array(items: JsonSchema, minimum: u64, maximum: u64, description: Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_range_selectors_enforce_coordinate_bounds() {
+        let tool = serde_json::to_value(create_read_tool_output_tool()).expect("tool spec");
+        let validator = jsonschema::validator_for(&tool["parameters"]).expect("artifact schema");
+        for (kind, minimum) in [("bytes", 0), ("lines", 1)] {
+            for field in ["start", "end"] {
+                for value in [minimum, 9_007_199_254_740_991_i64] {
+                    let mut selector =
+                        serde_json::json!({"kind": kind, "start": minimum, "end": minimum});
+                    selector[field] = serde_json::json!(value);
+                    assert!(validator.is_valid(
+                        &serde_json::json!({"artifact_id": "artifact", "selectors": [selector]})
+                    ));
+                }
+                for value in [minimum - 1, 9_007_199_254_740_992_i64] {
+                    let mut selector =
+                        serde_json::json!({"kind": kind, "start": minimum, "end": minimum});
+                    selector[field] = serde_json::json!(value);
+                    assert!(!validator.is_valid(
+                        &serde_json::json!({"artifact_id": "artifact", "selectors": [selector]})
+                    ));
+                }
+            }
+        }
+    }
 
     #[test]
     fn artifact_recovery_tool_exposes_search_and_exact_select_operations() {
@@ -261,6 +422,27 @@ mod tests {
         assert!(description.contains("instead of rereading tiny fragments"));
         assert!(description.contains("retry only the returned continuation or child_selectors"));
         assert!(description.contains("reopens and validates the retained artifact"));
+        let ToolSpec::Function(spec) = create_read_tool_output_tool() else {
+            panic!("recovery uses a function spec");
+        };
+        let declaration = codex_code_mode::render_json_schema_to_typescript(
+            spec.output_schema.as_ref().expect("recovery output schema"),
+        );
+        for field in [
+            "complete: boolean",
+            "hydrated_ranges:",
+            "child_selectors?",
+            "continuation_stop?",
+        ] {
+            assert!(
+                declaration.contains(field),
+                "missing {field} in {declaration}"
+            );
+        }
+        assert!(
+            !declaration.contains("schema projection incomplete"),
+            "{declaration}"
+        );
     }
 
     #[test]
@@ -289,5 +471,19 @@ mod tests {
         assert!(branches[2]["properties"].get("selectors").is_none());
         assert!(branches[2]["properties"].get("ranges").is_none());
         assert_eq!(branches[2]["properties"]["start_line"]["minimum"], 1);
+        assert!(
+            branches
+                .iter()
+                .all(|branch| branch["properties"].get("max_bytes").is_none())
+        );
+        let validator = jsonschema::validator_for(&tool["parameters"]).expect("artifact schema");
+        let args = serde_json::json!({"artifact_id": "artifact", "start_line": 1, "end_line": 10});
+        assert!(validator.is_valid(&args));
+        let mut obsolete_budget = args.clone();
+        obsolete_budget["max_bytes"] = serde_json::json!(100);
+        assert!(!validator.is_valid(&obsolete_budget));
+        let mut unsafe_number = args;
+        unsafe_number["start_line"] = serde_json::json!(9_007_199_254_740_992_u64);
+        assert!(!validator.is_valid(&unsafe_number));
     }
 }

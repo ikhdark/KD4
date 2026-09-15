@@ -6,7 +6,6 @@ mod wait_handler;
 pub(crate) mod wait_spec;
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -94,7 +93,6 @@ pub(crate) struct CodeModeService {
 #[derive(Default)]
 struct CodeModePacketAdmission {
     cells: HashMap<String, CodeModePacketMetrics>,
-    advised_turns: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -105,6 +103,7 @@ struct CodeModePacketMetrics {
     result_bytes: usize,
     post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
     nested_results: Vec<CodeModeNestedResultEvidence>,
+    omitted_nested_result_count: usize,
     first_required_terminal: Option<CodeModeNestedTerminal>,
 }
 
@@ -134,8 +133,8 @@ struct CodeModePacketReceipt {
     result_bytes: usize,
     post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
     nested_results: Vec<CodeModeNestedResultEvidence>,
+    omitted_nested_result_count: usize,
     first_required_terminal: Option<CodeModeNestedTerminal>,
-    advisory: Option<&'static str>,
 }
 
 struct BoundedJsonWriter {
@@ -198,13 +197,11 @@ fn bounded_serialized_json(value: &JsonValue) -> (String, bool, usize) {
     writer.finish()
 }
 
-const TINY_PACKET_RESULT_BYTES: usize = 1_024;
 const MAX_RETAINED_NESTED_RESULTS: usize = 8;
 const MAX_RETAINED_NESTED_RESULT_BYTES: usize = 4_096;
 const MAX_FAILED_CELL_ERROR_BYTES: usize = 4_096;
 const FAILED_CELL_ERROR_TRUNCATION_MARKER: &str = "\n… [truncated]";
 const APPLY_PATCH_ENVELOPE_MARKER: &str = "*** Begin Patch";
-const TINY_PACKET_ADVISORY: &str = "Low-density packet: when more evidence is needed, batch only necessary independent reads with known inputs in one exec using Promise.allSettled; print needed evidence with text(...). Reuse unchanged evidence. Stop when the task is answered.";
 
 impl CodeModeService {
     pub(crate) fn new(session_provider: Arc<dyn CodeModeSessionProvider>) -> Self {
@@ -364,6 +361,10 @@ impl CodeModeService {
             .post_tool_use_feedback
             .extend(post_tool_use_feedback);
         if let Some(nested_result) = nested_result {
+            if metrics.nested_results.len() == MAX_RETAINED_NESTED_RESULTS {
+                metrics.omitted_nested_result_count =
+                    metrics.omitted_nested_result_count.saturating_add(1);
+            }
             if metrics.nested_results.len() < MAX_RETAINED_NESTED_RESULTS {
                 metrics.nested_results.push(nested_result);
             } else if let Some((latest_index, latest)) = metrics
@@ -413,7 +414,7 @@ impl CodeModeService {
         );
     }
 
-    fn finish_packet(&self, cell_id: &str, turn_id: &str) -> CodeModePacketReceipt {
+    fn finish_packet(&self, cell_id: &str) -> CodeModePacketReceipt {
         let mut admission = self
             .packet_admission
             .lock()
@@ -433,31 +434,15 @@ impl CodeModeService {
         metrics
             .nested_results
             .sort_unstable_by_key(|result| result.ordinal);
-        let tiny_read_only_packet = metrics.nested_call_count == 1
-            && metrics.batchable_observation_count == 1
-            && metrics.result_bytes <= TINY_PACKET_RESULT_BYTES;
-        // The guidance is unchanged across packets. Keep it once in the turn's
-        // history even when a larger packet separates two small reads.
-        let advisory = (tiny_read_only_packet
-            && admission.advised_turns.insert(turn_id.to_string()))
-        .then_some(TINY_PACKET_ADVISORY);
         CodeModePacketReceipt {
             nested_call_count: metrics.nested_call_count,
             batchable_observation_count: metrics.batchable_observation_count,
             result_bytes: metrics.result_bytes,
             post_tool_use_feedback: metrics.post_tool_use_feedback,
             nested_results: metrics.nested_results,
+            omitted_nested_result_count: metrics.omitted_nested_result_count,
             first_required_terminal: metrics.first_required_terminal,
-            advisory,
         }
-    }
-
-    pub(crate) fn finish_turn(&self, turn_id: &str) {
-        self.packet_admission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .advised_turns
-            .remove(turn_id);
     }
 
     pub(crate) fn record_owner_drained_continuation(
@@ -551,7 +536,7 @@ pub(super) fn handle_runtime_response(
         .session
         .services
         .code_mode_service
-        .finish_packet(cell_id, exec.turn.sub_id.as_str());
+        .finish_packet(cell_id);
     tracing::info!(
         target: "codex.code_mode.packet",
         cell_id,
@@ -560,29 +545,33 @@ pub(super) fn handle_runtime_response(
         result_bytes = packet.result_bytes,
         post_tool_use_feedback_count = packet.post_tool_use_feedback.len(),
         retained_nested_result_count = packet.nested_results.len(),
-        low_density_advisory = packet.advisory.is_some(),
+        omitted_nested_result_count = packet.omitted_nested_result_count,
         "code-mode packet admission receipt"
     );
+    let mut post_tool_use_feedback = packet.post_tool_use_feedback;
     let nested_results = if response_needs_retained_nested_results(&response) {
+        if packet.omitted_nested_result_count > 0 {
+            post_tool_use_feedback.push(FunctionCallOutputContentItem::InputText {
+                text: format!(
+                    "{} additional nested tool results were omitted from this fallback output; it retains at most {MAX_RETAINED_NESTED_RESULTS} results. Use text(...) to include the results needed from a script.",
+                    packet.omitted_nested_result_count,
+                ),
+            });
+        }
         packet.nested_results
     } else {
         Vec::new()
     };
-    let mut output = format_runtime_response(
+    let output = format_runtime_response(
         response,
         max_output_tokens,
         hard_limit,
         original_image_detail_supported,
         started_at,
-        packet.post_tool_use_feedback,
+        post_tool_use_feedback,
         nested_results,
         packet.first_required_terminal,
     );
-    if let Some(advisory) = packet.advisory {
-        output.body.push(FunctionCallOutputContentItem::InputText {
-            text: advisory.to_string(),
-        });
-    }
     Ok(output)
 }
 
@@ -717,8 +706,8 @@ fn runtime_response_cell_id(response: &RuntimeResponse) -> &str {
 fn response_needs_retained_nested_results(response: &RuntimeResponse) -> bool {
     match response {
         RuntimeResponse::Yielded { content_items, .. }
-        | RuntimeResponse::ExplicitYield { content_items, .. }
-        | RuntimeResponse::Terminated { content_items, .. } => content_items.is_empty(),
+        | RuntimeResponse::ExplicitYield { content_items, .. } => content_items.is_empty(),
+        RuntimeResponse::Terminated { .. } => true,
         RuntimeResponse::Result {
             content_items,
             error_text,
@@ -1082,7 +1071,8 @@ async fn call_nested_tool(
         Ok(result) => result,
         Err(error) => {
             let message = error.to_string();
-            let terminal_cause = required_tool_error_terminal_cause(&error);
+            let terminal_cause = required_tool_error_terminal_cause(&error)
+                .or(Some(RequiredToolTerminalCause::Failure));
             tool_runtime.record_code_mode_failure(
                 cell_id.as_str(),
                 &tool_name,
@@ -1665,7 +1655,11 @@ mod tests {
         Arc<crate::session::turn_context::TurnContext>,
         crate::tools::parallel::ToolCallRuntime,
     ) {
-        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+        turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
+        turn.approval_policy
+            .set(codex_protocol::protocol::AskForApproval::Never)
+            .unwrap();
         let session = Arc::new(session);
         let turn = Arc::new(turn);
         let step_context = crate::session::step_context::StepContext::for_test(Arc::clone(&turn));
@@ -1729,7 +1723,7 @@ mod tests {
         let packet = session
             .services
             .code_mode_service
-            .finish_packet(cell_id.as_str(), turn.sub_id.as_str());
+            .finish_packet(cell_id.as_str());
         assert_eq!(packet.nested_call_count, 1);
         let terminal = packet
             .first_required_terminal
@@ -1745,6 +1739,7 @@ mod tests {
         let shell: Arc<dyn crate::tools::registry::CoreToolRuntime> =
             Arc::new(crate::tools::handlers::ShellCommandHandler::new(
                 crate::tools::handlers::ShellCommandHandlerOptions {
+                    foreign_environment: false,
                     allow_login_shell: false,
                     allow_escalated_sandbox_permissions: false,
                     exec_permission_approvals_enabled: false,
@@ -1766,14 +1761,14 @@ mod tests {
                 runtime_tool_call_id: "print-marker".to_string(),
                 tool_name: ToolName::plain("shell_command"),
                 tool_kind: CodeModeToolKind::Function,
-                input: Some(json!({ "command": "echo '*** Begin Patch'", "login": false })),
+                input: Some(json!({ "command": "echo '*** Begin Patch'" })),
             },
             tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("printing patch-shaped data must reach ordinary shell dispatch");
         assert!(result.to_string().contains("*** Begin Patch"));
-        let packet = service.finish_packet(cell_id.as_str(), turn.sub_id.as_str());
+        let packet = service.finish_packet(cell_id.as_str());
         assert_eq!(packet.nested_call_count, 1);
         assert!(packet.first_required_terminal.is_none());
         service.finish_cell_dispatch(&cell_id);
@@ -1812,79 +1807,23 @@ mod tests {
     }
 
     #[test]
-    fn first_tiny_read_only_packet_produces_one_runtime_advisory() {
+    fn packet_metrics_are_drained_between_responses() {
         let service = test_service();
         let cell = CellId::new("cell".to_string());
-
         service.record_packet_call(&cell, true, 128, Vec::new());
-        let advisory = service
-            .finish_packet("cell", "turn")
-            .advisory
-            .expect("first tiny packet should include an advisory");
-        assert!(
-            advisory
-                .contains("batch only necessary independent reads with known inputs in one exec")
-        );
-        assert!(
-            !advisory.contains("notify"),
-            "the advisory must not steer the model into notify-driven yields"
-        );
-        assert!(advisory.contains("Promise.allSettled"));
-        assert!(advisory.contains("print needed evidence with text(...)"));
-        assert!(advisory.contains("Reuse unchanged evidence"));
-        assert!(advisory.contains("Stop when the task is answered"));
-        service.record_packet_call(&cell, true, 128, Vec::new());
-        assert!(service.finish_packet("cell", "turn").advisory.is_none());
-        service.record_packet_call(&cell, true, 128, Vec::new());
-        assert!(service.finish_packet("cell", "turn").advisory.is_none());
-
+        let first = service.finish_packet("cell");
+        assert_eq!(first.nested_call_count, 1);
+        assert_eq!(first.batchable_observation_count, 1);
+        assert_eq!(first.result_bytes, 128);
+        let drained = service.finish_packet("cell");
+        assert_eq!(drained.nested_call_count, 0);
+        assert_eq!(drained.result_bytes, 0);
         for _ in 0..6 {
             service.record_packet_call(&cell, true, 128, Vec::new());
         }
-        let batched = service.finish_packet("cell", "turn");
+        let batched = service.finish_packet("cell");
         assert_eq!(batched.nested_call_count, 6);
-        assert!(batched.advisory.is_none());
-        service.record_packet_call(&cell, true, 128, Vec::new());
-        assert!(service.finish_packet("cell", "turn").advisory.is_none());
-        service.record_packet_call(&cell, true, 128, Vec::new());
-        assert_eq!(
-            service.finish_packet("cell", "next-turn").advisory,
-            Some(advisory)
-        );
-    }
-
-    #[test]
-    fn turn_completion_releases_tiny_packet_admission_state() {
-        let service = test_service();
-        let cell = CellId::new("cell".to_string());
-        service.record_packet_call(&cell, true, 128, Vec::new());
-        service.finish_packet("cell", "finished-turn");
-        assert!(
-            service
-                .packet_admission
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .advised_turns
-                .contains("finished-turn")
-        );
-
-        service.finish_turn("finished-turn");
-
-        assert!(
-            !service
-                .packet_admission
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .advised_turns
-                .contains("finished-turn")
-        );
-        service.record_packet_call(&cell, true, 128, Vec::new());
-        assert!(
-            service
-                .finish_packet("cell", "finished-turn")
-                .advisory
-                .is_some()
-        );
+        assert_eq!(batched.result_bytes, 768);
     }
 
     #[test]
@@ -1898,13 +1837,13 @@ mod tests {
         service.record_packet_call(&cell, false, 32, feedback.clone());
         assert_eq!(
             service
-                .finish_packet("feedback-cell", "turn")
+                .finish_packet("feedback-cell")
                 .post_tool_use_feedback,
             feedback
         );
         assert!(
             service
-                .finish_packet("feedback-cell", "turn")
+                .finish_packet("feedback-cell")
                 .post_tool_use_feedback
                 .is_empty()
         );
@@ -1944,7 +1883,7 @@ mod tests {
         );
 
         let terminal = service
-            .finish_packet("terminal-cell", "turn")
+            .finish_packet("terminal-cell")
             .first_required_terminal
             .expect("the first registered terminal nested call must be retained");
         assert_eq!(terminal.ordinal, first);
@@ -2210,7 +2149,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated_text_output_starts_with_warning() {
+    fn small_truncated_text_output_respects_the_complete_token_budget() {
         let items = vec![FunctionCallOutputContentItem::InputText {
             text: "0123456789012345678901234567890123456789".to_string(),
         }];
@@ -2220,12 +2159,7 @@ mod tests {
         assert_eq!(
             truncated_items,
             vec![FunctionCallOutputContentItem::InputText {
-                text: concat!(
-                    "Warning: truncated output (original token count: 10)\n",
-                    "Total output lines: 1\n\n",
-                    "…10 tokens truncated…"
-                )
-                .to_string(),
+                text: "01234567…23456789".to_string(),
             }]
         );
     }
@@ -2357,7 +2291,7 @@ mod tests {
         let projected =
             codex_protocol::models::function_call_output_content_items_to_text(&output.body)
                 .expect("projected code-mode text");
-        assert!(projected.contains("Warning: truncated output"));
+        assert!(projected.contains('…'));
         assert!(!projected.contains(sentinel));
 
         let canonical = output
@@ -2387,8 +2321,8 @@ mod tests {
         let [FunctionCallOutputContentItem::InputText { text }] = truncated.as_slice() else {
             panic!("expected one truncated text item");
         };
-        assert!(text.starts_with("Warning: truncated output"));
-        assert!(text.contains("tokens truncated"));
+        assert!(codex_utils_string::approx_token_count(text) <= 5);
+        assert!(!text.is_empty());
         assert!(!text.contains(&"x".repeat(100)));
     }
 
@@ -2452,8 +2386,8 @@ mod tests {
         assert!(capped_text.starts_with("Warning: truncated output"));
         let capped_tokens = codex_utils_string::approx_token_count(capped_text);
         assert!(
-            capped_tokens <= codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL + 64,
-            "the truncation body should honor the hard limit with only bounded warning metadata; got {capped_tokens} tokens"
+            capped_tokens <= codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
+            "the complete output must honor the hard limit; got {capped_tokens} tokens"
         );
     }
 

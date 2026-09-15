@@ -56,18 +56,39 @@ fn exec_command_boundary_normalizes_unambiguous_legacy_forms() {
 }
 
 #[test]
-fn exec_command_boundary_accepts_legacy_shell_timeouts_without_changing_yield() {
-    let decoded: ExecCommandArgs = parse_arguments(
-        &serde_json::json!({
-            "cmd": "long-running",
-            "timeout_ms": 60_000,
-            "stall_timeout_ms": 5_000
-        })
-        .to_string(),
-    )
-    .expect("legacy shell timeout fields should remain compatible");
+fn exec_command_boundary_uses_validation_wait_unless_explicitly_overridden() {
+    for (command, expected) in [
+        ("rg --files", 2_000),
+        ("cargo nextest run -p codex-core", 30_000),
+        ("just core-test-fast core_lib -E test(parser)", 30_000),
+        ("just core-gate tool-output-recovery", 30_000),
+        ("uv run pytest -q", 30_000),
+    ] {
+        let decoded: ExecCommandArgs =
+            parse_arguments(&serde_json::json!({"cmd": command}).to_string()).unwrap();
+        assert_eq!(decoded.yield_time_ms, expected, "{command}");
+        let explicit: ExecCommandArgs =
+            parse_arguments(&serde_json::json!({"cmd": command, "yield_time_ms": 500}).to_string())
+                .unwrap();
+        assert_eq!(explicit.yield_time_ms, 500, "{command}");
+    }
+}
 
-    assert_eq!(decoded.yield_time_ms, default_exec_yield_time_ms());
+#[test]
+fn exec_command_boundary_rejects_unsupported_deadlines() {
+    for field in ["timeout_ms", "stall_timeout_ms"] {
+        for value in [0, 60_000] {
+            let mut arguments = serde_json::json!({"cmd": "long-running"});
+            arguments[field] = serde_json::json!(value);
+            let error = validate_exec_command_arguments(&arguments.to_string())
+                .expect_err("deadlines must not be silently ignored");
+            assert!(
+                error.contains(&format!("does not support `{field}`")),
+                "{error}"
+            );
+            assert!(error.contains("not a process deadline"), "{error}");
+        }
+    }
 }
 
 #[test]
@@ -410,6 +431,7 @@ fn terminal_powershell_failure_keeps_recovery_advisory_out_of_raw_output() {
         process_id: None,
         exit_code: Some(1),
         process_exited: true,
+        search_no_match: false,
         original_token_count: None,
         hook_command: Some("broken command".to_string()),
         raw_output_artifact: None,
@@ -555,8 +577,10 @@ fn test_get_command_uses_default_shell_when_unspecified() -> anyhow::Result<()> 
     .map_err(anyhow::Error::msg)?;
     let command = resolved.command;
 
-    assert_eq!(command.len(), 3);
-    assert_eq!(command[2], "echo hello");
+    assert_eq!(
+        command,
+        default_user_shell().derive_exec_args("echo hello", true)?,
+    );
     Ok(())
 }
 
@@ -643,13 +667,128 @@ async fn repeated_rg_miss_uses_workspace_identity_across_epoch_advance() {
 
     assert_eq!(launches.process_launches, 1);
     assert_eq!(first.code_mode_result(&payload)["exit_code"], 1);
-    let second_error = match second {
-        Ok(_) => panic!("the equivalent negative search should be suppressed"),
-        Err(error) => error,
-    };
-    let message = second_error.to_string();
-    assert!(message.contains("equivalent search already produced a negative result"));
-    assert!(message.contains("execution was suppressed"));
+    assert_eq!(
+        first.outcome_for_logging(),
+        codex_tools::ToolOutputOutcome::Success
+    );
+    assert_eq!(
+        first.sampling_request_signal().unwrap()["outcome"],
+        serde_json::Value::Null
+    );
+    let second = second.expect("a cached search miss is successful negative evidence");
+    assert_eq!(
+        second.outcome_for_logging(),
+        codex_tools::ToolOutputOutcome::Success
+    );
+    let canonical = second
+        .canonical_result(&payload)
+        .expect("canonical cached miss");
+    for message in [
+        second.log_preview(),
+        second.code_mode_result(&payload).to_string(),
+        String::from_utf8(canonical.bytes).expect("canonical text"),
+    ] {
+        assert!(message.contains("equivalent search already produced a negative result"));
+        assert!(message.contains("execution was suppressed"));
+    }
+}
+
+#[tokio::test]
+async fn command_handlers_normalize_status_and_distinguish_search_misses_from_errors() {
+    let repository = tempfile::tempdir().expect("command outcome fixture");
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repository.path())
+            .status()
+            .expect("git init")
+            .success()
+    );
+    std::fs::write(repository.path().join("fixture.txt"), "present\n").unwrap();
+    for tool in ["exec_command", "shell_command"] {
+        let (session, mut turn) = make_session_and_context().await;
+        turn.permission_profile = PermissionProfile::Disabled;
+        *turn.validation_authorization.write().await =
+            crate::validation_admission::ValidationAuthorization::enabled();
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        for (program, args, validation, expected_success, expected_output) in [
+            (
+                "git",
+                vec!["status", "--porcelain"],
+                false,
+                true,
+                "?? fixture.txt",
+            ),
+            ("rg", vec!["missing-needle", "fixture.txt"], false, true, ""),
+            (
+                "rg",
+                vec!["[", "fixture.txt"],
+                false,
+                false,
+                "regex parse error",
+            ),
+            ("rg", vec!["missing-needle", "fixture.txt"], true, false, ""),
+        ] {
+            let mut arguments = serde_json::json!({
+                "kind": "argv", "program": program, "args": args,
+                "workdir": repository.path(),
+            });
+            if validation {
+                arguments["validation"] = serde_json::json!({
+                    "covered_paths": [repository.path().join("fixture.txt")],
+                });
+            }
+            let payload = ToolPayload::Function {
+                arguments: arguments.to_string(),
+            };
+            let invocation = ToolInvocation {
+                session: Arc::clone(&session),
+                step_context: StepContext::for_test(Arc::clone(&turn)),
+                cancellation_token: tokio_util::sync::CancellationToken::new(),
+                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                call_id: format!("{tool}-{program}-{}-{validation}", args[0]),
+                tool_name: codex_tools::ToolName::plain(tool),
+                source: ToolCallSource::Direct,
+                payload: payload.clone(),
+            };
+            let output = if tool == "exec_command" {
+                ExecCommandHandler::default().handle(invocation).await
+            } else {
+                crate::tools::handlers::ShellCommandHandler::default()
+                    .handle(invocation)
+                    .await
+            }
+            .expect("execute through the production handler");
+            assert_eq!(
+                output.success_for_logging(),
+                expected_success,
+                "{tool}: {args:?}"
+            );
+            let signal = output
+                .sampling_request_signal()
+                .expect("completed command evidence");
+            assert_eq!(
+                signal["outcome"] == "failure",
+                !expected_success,
+                "{tool}: {args:?}"
+            );
+            let canonical = output
+                .canonical_result(&payload)
+                .expect("canonical command output");
+            let text = String::from_utf8_lossy(&canonical.bytes);
+            if program == "rg" && args[0] == "missing-needle" {
+                assert!(
+                    text.is_empty(),
+                    "search miss must have no matched lines: {text}"
+                );
+            } else {
+                assert!(text.contains(expected_output), "{tool}: {text}");
+            }
+            assert!(!output.log_preview().contains("read_only_repair"));
+            assert!(output.code_mode_result(&payload).get("repair").is_none());
+        }
+    }
 }
 
 #[tokio::test]
@@ -882,8 +1021,23 @@ async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_la
     assert!(!canonical_text(first.as_ref()).contains("known-delta cache hit"));
     assert!(!canonical_text(second.as_ref()).contains("known-delta cache hit"));
     assert!(canonical_text(third.as_ref()).contains("known-delta cache hit"));
+    assert!(canonical_text(third.as_ref()).contains("command_was_executed=false"));
+    assert!(canonical_text(third.as_ref()).contains("shadow_validations=1"));
+    assert!(canonical_text(third.as_ref()).contains("not a fresh execution or exit status"));
     let third_code_mode = third.code_mode_result(&payload);
     assert_eq!(third_code_mode["exit_code"], 0);
+    let fresh_token_count = first.code_mode_result(&payload)["original_token_count"]
+        .as_u64()
+        .expect("fresh output has a token estimate");
+    assert!(fresh_token_count > 0);
+    assert_eq!(third_code_mode["original_token_count"], fresh_token_count);
+    assert_eq!(third_code_mode["original_token_count_is_approximate"], true);
+    let essential = third
+        .projection_metadata()
+        .expect("cache projection")
+        .essential_inline;
+    assert_eq!(essential["original_token_count"], fresh_token_count);
+    assert_eq!(essential["original_token_count_is_approximate"], true);
     assert!(third_code_mode.get("session_id").is_none());
     let second_artifact_id = second.code_mode_result(&payload)["raw_output_artifact_id"]
         .as_str()
@@ -1171,6 +1325,7 @@ async fn registered_exec_minimal_and_explicit_defaults_preserve_process_and_perm
             .shell_environment_policy
             .set
             .insert("KD4_ARGUMENT_PROOF".into(), "configured value".into());
+        turn.approval_policy = config.permissions.approval_policy.clone();
         turn.config = Arc::new(config);
         let session = Arc::new(session);
         let turn = Arc::new(turn);
@@ -1328,6 +1483,51 @@ async fn mutating_preflight_rejection_does_not_reserve_process_id() {
         .unified_exec_manager
         .release_process_id(process_id)
         .await;
+}
+
+#[tokio::test]
+async fn unsupported_deadlines_reject_before_execution() {
+    let temp = tempfile::tempdir().expect("deadline rejection directory");
+    let marker = temp.path().join("must-not-exist");
+    let marker_literal = serde_json::to_string(&marker.to_string_lossy()).unwrap();
+    for field in ["timeout_ms", "stall_timeout_ms"] {
+        let mut arguments = serde_json::json!({
+            "program": "python",
+            "args": ["-c", format!("open({marker_literal}, 'w').write('started')")],
+        });
+        arguments[field] = serde_json::json!(60_000);
+        let invocation = invocation_for_payload_without_sandbox(
+            "exec_command",
+            "unsupported-deadline",
+            ToolPayload::Function {
+                arguments: arguments.to_string(),
+            },
+        )
+        .await;
+        let session = Arc::clone(&invocation.session);
+        let error = match ExecCommandHandler::default().handle(invocation).await {
+            Ok(_) => panic!("unsupported deadline must prevent execution"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("does not support `{field}`")),
+            "{error}"
+        );
+        assert!(!marker.exists(), "rejected commands must not run");
+        let process_id = session
+            .services
+            .unified_exec_manager
+            .allocate_process_id()
+            .await;
+        assert_eq!(process_id, 1000);
+        session
+            .services
+            .unified_exec_manager
+            .release_process_id(process_id)
+            .await;
+    }
 }
 
 #[tokio::test]
@@ -1806,7 +2006,7 @@ fn test_get_command_respects_explicit_powershell_shell() -> anyhow::Result<()> {
     .map_err(anyhow::Error::msg)?;
     let command = resolved.command;
 
-    assert_eq!(command[2], "echo hello");
+    assert_eq!(command.last().map(String::as_str), Some("echo hello"));
     assert_eq!(resolved.shell_type, ShellType::PowerShell);
     Ok(())
 }
@@ -1828,7 +2028,7 @@ fn test_get_command_respects_explicit_cmd_shell() -> anyhow::Result<()> {
     .map_err(anyhow::Error::msg)?;
     let command = resolved.command;
 
-    assert_eq!(command[2], "echo hello");
+    assert_eq!(command.last().map(String::as_str), Some("echo hello"));
     Ok(())
 }
 
@@ -1916,7 +2116,7 @@ async fn exec_command_hook_preserves_and_rewrites_direct_argv_structurally() {
         "kind": "argv",
         "program": "rg",
         "args": ["--files"],
-        "timeout_ms": 1234
+        "yield_time_ms": 1234
     })
     .to_string();
     let invocation = invocation_for_payload(
@@ -2060,6 +2260,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_s
         process_id: None,
         exit_code: Some(0),
         process_exited: true,
+        search_no_match: false,
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
         raw_output_artifact: None,
@@ -2095,6 +2296,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_interactive_completi
         process_id: None,
         exit_code: Some(0),
         process_exited: true,
+        search_no_match: false,
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
         raw_output_artifact: None,
@@ -2131,6 +2333,7 @@ async fn exec_command_post_tool_use_payload_skips_running_sessions() {
         process_id: Some(45),
         exit_code: None,
         process_exited: false,
+        search_no_match: false,
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
         raw_output_artifact: None,
@@ -2162,6 +2365,7 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
         process_id: None,
         exit_code: Some(0),
         process_exited: true,
+        search_no_match: false,
         original_token_count: None,
         hook_command: Some("sleep 1; echo finished".to_string()),
         raw_output_artifact: None,
@@ -2228,6 +2432,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         process_id: None,
         exit_code: Some(0),
         process_exited: true,
+        search_no_match: false,
         original_token_count: None,
         hook_command: Some("sleep 2; echo alpha".to_string()),
         raw_output_artifact: None,
@@ -2245,6 +2450,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         process_id: None,
         exit_code: Some(0),
         process_exited: true,
+        search_no_match: false,
         original_token_count: None,
         hook_command: Some("sleep 1; echo beta".to_string()),
         raw_output_artifact: None,

@@ -473,3 +473,42 @@ fn sandbox_preferences_and_disabled_backend_have_distinct_results() {
         );
     }
 }
+
+#[test]
+fn restricted_token_accepts_native_writable_roots_without_legacy_cwd() {
+    let temp = TempDir::new().expect("tempdir");
+    let cwd = AbsolutePathBuf::from_absolute_path(temp.path().join("read-only-cwd"))
+        .expect("absolute cwd");
+    let writable = AbsolutePathBuf::from_absolute_path(temp.path().join("writable"))
+        .expect("absolute writable root");
+    std::fs::create_dir_all(cwd.as_path()).expect("create cwd");
+    std::fs::create_dir_all(writable.as_path()).expect("create writable root");
+    let file_system = FileSystemSandboxPolicy::restricted(vec![
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::Root,
+            },
+            access: FileSystemAccessMode::Read,
+        },
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Path {
+                path: writable.clone(),
+            },
+            access: FileSystemAccessMode::Write,
+        },
+    ]);
+    let permissions =
+        PermissionProfile::from_runtime_permissions(&file_system, NetworkSandboxPolicy::Restricted);
+    assert!(!file_system.can_write_path_with_cwd(cwd.as_path(), cwd.as_path()));
+    assert!(file_system.can_write_path_with_cwd(writable.as_path(), cwd.as_path()));
+    assert_eq!(
+        crate::resolve_windows_restricted_token_filesystem_overrides(
+            SandboxType::WindowsRestrictedToken,
+            &permissions,
+            &cwd,
+            WindowsSandboxLevel::RestrictedToken,
+        ),
+        Ok(None),
+        "native permission roots need no legacy write-root overrides",
+    );
+}

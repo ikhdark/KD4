@@ -120,14 +120,53 @@ fn region_restricted_status_skips_every_outer_response_retry() {
     }
 }
 
-#[test]
-fn server_requested_retry_delay_is_bounded() {
+#[tokio::test]
+async fn server_requested_retry_delay_above_local_backoff_cap_is_preserved() {
+    let (session, turn_context, events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let mut client_session = session.services.model_client.new_session();
+    let mut retry_state = ResponsesStreamRetryState::default();
+    let cancellation_token = CancellationToken::new();
     let err = CodexErr::Stream("retry later".to_string(), Some(Duration::from_secs(60)));
 
-    assert_eq!(
-        response_stream_retry_delay(&err, 1),
-        MAX_RESPONSE_STREAM_RETRY_DELAY
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let retry = handle_retryable_response_stream_error(
+        &mut retry_state,
+        5,
+        err,
+        &mut client_session,
+        &session,
+        &turn_context,
+        ResponsesStreamRequest::Sampling,
+        &cancellation_token,
     );
+    tokio::pin!(retry);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(59), retry.as_mut())
+            .await
+            .is_err(),
+        "the request loop must not retry before the server's delay"
+    );
+    retry.await.expect("retry after the requested delay");
+    assert!((Duration::from_secs(60)..=Duration::from_millis(60_001)).contains(&started.elapsed()));
+    let emitted = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+    assert!(emitted.iter().any(|event| matches!(&event.msg,
+        EventMsg::StreamError(error)
+            if error.message == "Reconnecting... 1/5 (next retry in 60.0s)")));
+}
+
+#[test]
+fn local_retry_backoff_remains_bounded() {
+    let err = CodexErr::Stream("retry later".to_string(), None);
+    let first = response_stream_retry_delay(&err, 1);
+    let second = response_stream_retry_delay(&err, 2);
+    assert!(first > Duration::ZERO);
+    assert!(second > first, "early retries must back off despite jitter");
+    assert!(second < MAX_RESPONSE_STREAM_RETRY_DELAY);
+    let saturated = response_stream_retry_delay(&err, 10);
+    assert!(saturated >= MAX_RESPONSE_STREAM_RETRY_DELAY.mul_f64(0.9));
+    assert!(saturated <= MAX_RESPONSE_STREAM_RETRY_DELAY);
 }
 
 #[test]
@@ -227,4 +266,98 @@ fn connection_retry_delay_backs_off_and_is_bounded() {
         delay = next_connection_retry_delay(delay);
     }
     assert_eq!(delay, MAX_CONNECTION_RETRY_DELAY);
+}
+
+#[tokio::test]
+async fn connection_recovery_reaches_https_fallback_without_exhausting_network_waits() {
+    let home = tempfile::tempdir().unwrap();
+    let (session, turn_context, events) =
+        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+            codex_login::CodexAuth::from_api_key("test key"),
+            Vec::new(),
+            home.path(),
+            |config| config.model_provider.supports_websockets = true,
+        )
+        .await;
+    let mut client_session = session.services.model_client.new_session();
+    let mut retry_state = ResponsesStreamRetryState::default();
+    let cancellation_token = CancellationToken::new();
+    assert!(session.services.model_client.responses_websocket_enabled());
+    tokio::time::pause();
+
+    for expected_delay in [Duration::from_secs(5), Duration::from_secs(10)] {
+        let started = tokio::time::Instant::now();
+        handle_retryable_response_stream_error(
+            &mut retry_state,
+            2,
+            connection_failed(),
+            &mut client_session,
+            &session,
+            &turn_context,
+            ResponsesStreamRequest::Sampling,
+            &cancellation_token,
+        )
+        .await
+        .unwrap();
+        assert!(
+            (expected_delay..=expected_delay + Duration::from_millis(1))
+                .contains(&started.elapsed())
+        );
+        assert_eq!(retry_state.retries, 0);
+        assert!(session.services.model_client.responses_websocket_enabled());
+    }
+
+    let started = tokio::time::Instant::now();
+    handle_retryable_response_stream_error(
+        &mut retry_state,
+        2,
+        connection_failed(),
+        &mut client_session,
+        &session,
+        &turn_context,
+        ResponsesStreamRequest::Sampling,
+        &cancellation_token,
+    )
+    .await
+    .unwrap();
+    assert_eq!(started.elapsed(), Duration::ZERO);
+    assert!(!session.services.model_client.responses_websocket_enabled());
+    assert_eq!(retry_state.retries, 2);
+    assert_eq!(retry_state.connection_retries, 2);
+    let emitted = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+    assert!(emitted.iter().any(|event| matches!(&event.msg,
+        EventMsg::Warning(warning) if warning.message.contains("Falling back from WebSockets to HTTPS"))));
+    assert!(emitted.iter().any(|event| matches!(&event.msg,
+        EventMsg::StreamError(error) if error.message.contains("attempt 2, next retry in 10s"))));
+
+    // A real network outage still waits after the transport fallback.
+    let started = tokio::time::Instant::now();
+    handle_retryable_response_stream_error(
+        &mut retry_state,
+        2,
+        connection_failed(),
+        &mut client_session,
+        &session,
+        &turn_context,
+        ResponsesStreamRequest::Sampling,
+        &cancellation_token,
+    )
+    .await
+    .unwrap();
+    assert!((Duration::from_secs(20)..=Duration::from_millis(20_001)).contains(&started.elapsed()));
+    assert_eq!(retry_state.retries, 2);
+    assert_eq!(retry_state.connection_retries, 3);
+
+    let result = handle_retryable_response_stream_error(
+        &mut retry_state,
+        2,
+        CodexErr::RequestTimeout,
+        &mut client_session,
+        &session,
+        &turn_context,
+        ResponsesStreamRequest::Sampling,
+        &cancellation_token,
+    )
+    .await;
+    assert!(matches!(result, Err(CodexErr::RequestTimeout)));
 }

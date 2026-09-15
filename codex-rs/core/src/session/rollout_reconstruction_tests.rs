@@ -1,4 +1,5 @@
 use super::*;
+use codex_rollout::RolloutRecorder;
 
 use super::tests::build_world_state_from_turn_context;
 use super::tests::make_session_and_context;
@@ -122,6 +123,7 @@ async fn reconstruct_history_ignores_tool_manifest_records() {
 
     let super::rollout_reconstruction::RolloutReconstruction {
         history,
+        plan: _,
         previous_turn_settings: _,
         reference_context_item: _,
         world_state_baseline: _,
@@ -189,11 +191,298 @@ async fn resume_rollout(session: &Session, rollout_items: Vec<RolloutItem>) {
         .await;
 }
 
+fn checklist(step: &str) -> codex_protocol::plan_tool::UpdatePlanArgs {
+    codex_protocol::plan_tool::UpdatePlanArgs {
+        explanation: None,
+        plan: vec![codex_protocol::plan_tool::PlanItemArg {
+            step: step.to_string(),
+            status: codex_protocol::plan_tool::StepStatus::InProgress,
+        }],
+    }
+}
+
+#[tokio::test]
+async fn nested_plan_handler_persists_checklist_for_resume() {
+    use crate::tools::context::ToolInvocation;
+    use crate::tools::context::ToolPayload;
+    use crate::tools::handlers::PlanHandler;
+    use crate::tools::router::ToolCallSource;
+    use codex_tools::ToolExecutor;
+
+    let (mut session, turn) = make_session_and_context().await;
+    let rollout_path = super::tests::attach_thread_persistence(&mut session).await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let expected = checklist("Implement the verified fix");
+    let payload = ToolPayload::Function {
+        arguments: serde_json::to_string(&expected).unwrap(),
+    };
+    let output = PlanHandler
+        .handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: crate::session::step_context::StepContext::for_test(Arc::clone(&turn)),
+            cancellation_token: Default::default(),
+            tracker: Arc::new(tokio::sync::Mutex::new(
+                crate::turn_diff_tracker::TurnDiffTracker::new(),
+            )),
+            call_id: "nested-plan".to_string(),
+            tool_name: codex_tools::ToolName::plain("update_plan"),
+            source: ToolCallSource::CodeMode {
+                cell_id: "plan-cell".to_string(),
+                parent_call_id: Some("plan-exec".to_string()),
+                runtime_tool_call_id: "1".to_string(),
+            },
+            payload: payload.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(output.code_mode_result(&payload)["effect"], "initial");
+    session.flush_rollout().await.unwrap();
+    let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
+        .await
+        .unwrap()
+    else {
+        panic!("expected persisted rollout history");
+    };
+    assert!(resumed.history.iter().any(
+        |item| matches!(item, RolloutItem::EventMsg(EventMsg::PlanUpdate(plan)) if plan == &expected)
+    ));
+    let (restored, restored_turn) = make_session_and_context().await;
+    restored
+        .apply_rollout_reconstruction(&restored_turn, &resumed.history, false)
+        .await;
+    assert_eq!(
+        restored.services.plan_store.current_for_test().await,
+        Some(expected.clone())
+    );
+    assert_eq!(
+        restored.services.plan_store.update(expected).await.effect,
+        crate::plan_store::PlanUpdateEffect::NoOp
+    );
+}
+
+#[tokio::test]
+async fn plan_reconstruction_survives_compaction_and_respects_rollback() {
+    let (session, turn) = make_session_and_context().await;
+    let first = checklist("inspect");
+    let second = checklist("implement");
+    let mut first_context = accepted_context(turn.to_turn_context_item());
+    first_context.turn_id = Some("first".to_string());
+    let mut second_context = first_context.clone();
+    second_context.turn_id = Some("second".to_string());
+    let mut rollout = completed_user_turn_rollout(
+        first_context,
+        vec![RolloutItem::EventMsg(EventMsg::PlanUpdate(first.clone()))],
+    );
+    let window_id = Uuid::now_v7().to_string();
+    rollout.extend(completed_user_turn_rollout(
+        second_context.clone(),
+        vec![
+            RolloutItem::Compacted(CompactedItem {
+                message: String::new(),
+                replacement_history: Some(Vec::new()),
+                window_number: Some(1),
+                first_window_id: Some(window_id.clone()),
+                previous_window_id: None,
+                window_id: Some(window_id),
+            }),
+            RolloutItem::TurnContext(second_context),
+        ],
+    ));
+    // A replacement checkpoint cannot hide an older committed checklist.
+    session
+        .apply_rollout_reconstruction(&turn, &rollout, false)
+        .await;
+    assert_eq!(
+        session.services.plan_store.current_for_test().await,
+        Some(first.clone())
+    );
+
+    let mut third_context = accepted_context(turn.to_turn_context_item());
+    third_context.turn_id = Some("third".to_string());
+    rollout.extend(completed_user_turn_rollout(
+        third_context,
+        vec![RolloutItem::EventMsg(EventMsg::PlanUpdate(second.clone()))],
+    ));
+    session
+        .apply_rollout_reconstruction(&turn, &rollout, false)
+        .await;
+    assert_eq!(
+        session.services.plan_store.current_for_test().await,
+        Some(second)
+    );
+
+    rollout.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+        codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+    )));
+    session
+        .apply_rollout_reconstruction(&turn, &rollout, false)
+        .await;
+    assert_eq!(
+        session.services.plan_store.current_for_test().await,
+        Some(first)
+    );
+
+    rollout.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+        codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 2 },
+    )));
+    session
+        .apply_rollout_reconstruction(&turn, &rollout, false)
+        .await;
+    assert_eq!(session.services.plan_store.current_for_test().await, None);
+}
+
+#[tokio::test]
+async fn plan_reconstruction_orders_events_and_tool_outputs_across_compaction_and_rollback() {
+    for newer_is_event in [false, true] {
+        for compacted in [false, true] {
+            for rollback_turns in 0..=2 {
+                let (session, turn) = make_session_and_context().await;
+                let earlier = checklist("inspect");
+                let latest = checklist("implement");
+                let mut rollout = Vec::new();
+                for (turn_id, plan, is_event) in [
+                    ("earlier", &earlier, !newer_is_event),
+                    ("latest", &latest, newer_is_event),
+                ] {
+                    let mut context = accepted_context(turn.to_turn_context_item());
+                    context.turn_id = Some(turn_id.to_string());
+                    let mut records = if is_event {
+                        vec![RolloutItem::EventMsg(EventMsg::PlanUpdate(plan.clone()))]
+                    } else {
+                        vec![
+                            RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+                                id: None,
+                                name: "update_plan".to_string(),
+                                namespace: None,
+                                arguments: serde_json::to_string(plan).unwrap(),
+                                call_id: turn_id.to_string(),
+                                internal_chat_message_metadata_passthrough: None,
+                            }),
+                            RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+                                id: None,
+                                call_id: turn_id.to_string(),
+                                output: FunctionCallOutputPayload::from_text(
+                                    json!({"current_plan": plan}).to_string(),
+                                ),
+                                internal_chat_message_metadata_passthrough: None,
+                            }),
+                        ]
+                    };
+                    if compacted && turn_id == "latest" {
+                        let window_id = Uuid::now_v7().to_string();
+                        records.push(RolloutItem::Compacted(CompactedItem {
+                            message: String::new(),
+                            replacement_history: Some(Vec::new()),
+                            window_number: Some(1),
+                            first_window_id: Some(window_id.clone()),
+                            previous_window_id: None,
+                            window_id: Some(window_id),
+                        }));
+                        records.push(RolloutItem::TurnContext(context.clone()));
+                    }
+                    rollout.extend(completed_user_turn_rollout(context, records));
+                }
+                if rollback_turns > 0 {
+                    rollout.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+                        codex_protocol::protocol::ThreadRolledBackEvent {
+                            num_turns: rollback_turns,
+                        },
+                    )));
+                }
+                session
+                    .apply_rollout_reconstruction(&turn, &rollout, false)
+                    .await;
+                let expected = match rollback_turns {
+                    0 => Some(latest),
+                    1 => Some(earlier),
+                    _ => None,
+                };
+                assert_eq!(
+                    session.services.plan_store.current_for_test().await,
+                    expected,
+                    "newer_is_event={newer_is_event}, compacted={compacted}, rollback_turns={rollback_turns}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn plan_reconstruction_preserves_rollback_for_eventless_legacy_history() {
+    let (session, turn) = make_session_and_context().await;
+    let earlier = checklist("inspect");
+    let latest = checklist("implement");
+    let mut rollout = Vec::new();
+    for (call_id, plan) in [("earlier", &earlier), ("latest", &latest)] {
+        rollout.extend([
+            RolloutItem::ResponseItem(user_message(call_id)),
+            RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+                id: None,
+                name: "update_plan".to_string(),
+                namespace: None,
+                arguments: serde_json::to_string(plan).unwrap(),
+                call_id: call_id.to_string(),
+                internal_chat_message_metadata_passthrough: None,
+            }),
+            RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: call_id.to_string(),
+                output: FunctionCallOutputPayload::from_text(
+                    json!({"current_plan": plan}).to_string(),
+                ),
+                internal_chat_message_metadata_passthrough: None,
+            }),
+        ]);
+    }
+    session
+        .apply_rollout_reconstruction(&turn, &rollout, false)
+        .await;
+    assert_eq!(
+        session.services.plan_store.current_for_test().await,
+        Some(latest)
+    );
+    rollout.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+        codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+    )));
+    session
+        .apply_rollout_reconstruction(&turn, &rollout, false)
+        .await;
+    assert_eq!(
+        session.services.plan_store.current_for_test().await,
+        Some(earlier)
+    );
+    rollout.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+        codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+    )));
+    session
+        .apply_rollout_reconstruction(&turn, &rollout, false)
+        .await;
+    assert_eq!(session.services.plan_store.current_for_test().await, None);
+}
+
 #[tokio::test]
 async fn durability_regression_resume_invalidates_unified_exec_session() {
     let (session, _turn_context) = make_session_and_context().await;
-    let original_output =
-        "Chunk ID: 123\nProcess running with session ID 1000\nLive output\n".to_string();
+    let original_output = crate::tools::context::ExecCommandToolOutput {
+        validation: None,
+        event_call_id: "exec-call".to_string(),
+        chunk_id: "123".to_string(),
+        wall_time: std::time::Duration::from_millis(10),
+        raw_output: b"Live output\n".to_vec(),
+        truncation_policy: codex_utils_output_truncation::TruncationPolicy::Tokens(1_000),
+        max_output_tokens: Some(1_000),
+        process_id: Some(1000),
+        exit_code: None,
+        process_exited: false,
+        search_no_match: false,
+        original_token_count: None,
+        hook_command: None,
+        raw_output_artifact: None,
+        raw_output_reduction_notice: None,
+        repair_notice: None,
+    }
+    .response_text();
     let rollout_items = vec![
         RolloutItem::ResponseItem(ResponseItem::FunctionCall {
             id: None,
@@ -221,7 +510,8 @@ async fn durability_regression_resume_invalidates_unified_exec_session() {
             id: None,
             call_id: "write-call".to_string(),
             output: FunctionCallOutputPayload::from_text(
-                "Process running with session ID 1000\nMore output\n".to_string(),
+                "Process running with session ID 1000; wall time: 0.0100 seconds\nMore output\n"
+                    .to_string(),
             ),
             internal_chat_message_metadata_passthrough: None,
         }),
@@ -488,6 +778,13 @@ async fn record_initial_history_resumed_hydrates_previous_turn_settings_from_lif
     previous_context_item.turn_id = None;
 
     let rollout_items = vec![
+        RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                model_provider: Some(turn_context.config.model_provider_id.clone()),
+                ..SessionMeta::default()
+            },
+            git: None,
+        }),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: turn_id.clone(),
@@ -543,6 +840,7 @@ async fn record_initial_history_resumed_hydrates_previous_turn_settings_from_lif
 async fn reconstruct_history_rollback_keeps_history_and_metadata_in_sync_for_completed_turns() {
     let (session, turn_context) = make_session_and_context().await;
     let first_context_item = accepted_context(turn_context.to_turn_context_item());
+    let expected_comp_hash = first_context_item.comp_hash.clone();
     let first_turn_id = first_context_item
         .turn_id
         .clone()
@@ -651,7 +949,7 @@ async fn reconstruct_history_rollback_keeps_history_and_metadata_in_sync_for_com
         reconstructed.previous_turn_settings,
         Some(PreviousTurnSettings {
             model: turn_context.model_info.slug.clone(),
-            comp_hash: None,
+            comp_hash: expected_comp_hash,
         })
     );
     assert_eq!(
@@ -671,6 +969,7 @@ async fn reconstruct_history_rollback_keeps_history_and_metadata_in_sync_for_com
 async fn reconstruct_history_rollback_keeps_history_and_metadata_in_sync_for_incomplete_turn() {
     let (session, turn_context) = make_session_and_context().await;
     let first_context_item = accepted_context(turn_context.to_turn_context_item());
+    let expected_comp_hash = first_context_item.comp_hash.clone();
     let first_turn_id = first_context_item
         .turn_id
         .clone()
@@ -752,7 +1051,7 @@ async fn reconstruct_history_rollback_keeps_history_and_metadata_in_sync_for_inc
         reconstructed.previous_turn_settings,
         Some(PreviousTurnSettings {
             model: turn_context.model_info.slug.clone(),
-            comp_hash: None,
+            comp_hash: expected_comp_hash,
         })
     );
     assert_eq!(
@@ -767,6 +1066,7 @@ async fn reconstruct_history_rollback_keeps_history_and_metadata_in_sync_for_inc
 async fn reconstruct_history_rollback_discards_checkpoint_without_truncating_surviving_history() {
     let (session, turn_context) = make_session_and_context().await;
     let surviving_context_item = accepted_context(turn_context.to_turn_context_item());
+    let expected_comp_hash = surviving_context_item.comp_hash.clone();
     let mut rolled_back_context_item = surviving_context_item.clone();
     rolled_back_context_item.turn_id = Some("rolled-back-compaction-turn".to_string());
     rolled_back_context_item.model = "rolled-back-model".to_string();
@@ -835,7 +1135,7 @@ async fn reconstruct_history_rollback_discards_checkpoint_without_truncating_sur
         reconstructed.previous_turn_settings,
         Some(PreviousTurnSettings {
             model: turn_context.model_info.slug.clone(),
-            comp_hash: None,
+            comp_hash: expected_comp_hash,
         })
     );
     assert_eq!(
@@ -855,6 +1155,7 @@ async fn reconstruct_history_rollback_discards_checkpoint_without_truncating_sur
 async fn reconstruct_history_rollback_skips_non_user_turns_for_history_and_metadata() {
     let (session, turn_context) = make_session_and_context().await;
     let first_context_item = accepted_context(turn_context.to_turn_context_item());
+    let expected_comp_hash = first_context_item.comp_hash.clone();
     let first_turn_id = first_context_item
         .turn_id
         .clone()
@@ -974,7 +1275,7 @@ async fn reconstruct_history_rollback_skips_non_user_turns_for_history_and_metad
         reconstructed.previous_turn_settings,
         Some(PreviousTurnSettings {
             model: turn_context.model_info.slug.clone(),
-            comp_hash: None,
+            comp_hash: expected_comp_hash,
         })
     );
     assert_eq!(
@@ -989,6 +1290,7 @@ async fn reconstruct_history_rollback_skips_non_user_turns_for_history_and_metad
 async fn reconstruct_history_rollback_counts_inter_agent_assistant_turns() {
     let (session, turn_context) = make_session_and_context().await;
     let first_context_item = accepted_context(turn_context.to_turn_context_item());
+    let expected_comp_hash = first_context_item.comp_hash.clone();
     let first_turn_id = first_context_item
         .turn_id
         .clone()
@@ -1080,7 +1382,7 @@ async fn reconstruct_history_rollback_counts_inter_agent_assistant_turns() {
         reconstructed.previous_turn_settings,
         Some(PreviousTurnSettings {
             model: turn_context.model_info.slug.clone(),
-            comp_hash: None,
+            comp_hash: expected_comp_hash,
         })
     );
     assert_eq!(
@@ -1233,6 +1535,7 @@ async fn record_initial_history_resumed_rollback_skips_only_user_turns() {
 async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_compaction_metadata() {
     let (session, turn_context) = make_session_and_context().await;
     let previous_context_item = accepted_context(turn_context.to_turn_context_item());
+    let expected_comp_hash = previous_context_item.comp_hash.clone();
     let previous_turn_id = previous_context_item
         .turn_id
         .clone()
@@ -1320,7 +1623,7 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
         session.previous_turn_settings().await,
         Some(PreviousTurnSettings {
             model: turn_context.model_info.slug.clone(),
-            comp_hash: None,
+            comp_hash: expected_comp_hash,
         })
     );
     assert_eq!(
@@ -1636,7 +1939,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_does_
         .await;
 
     assert_eq!(
-        reconstructed.history,
+        core_test_support::responses::strip_response_item_ids(&reconstructed.history),
         vec![
             user_message("before compact"),
             user_message("legacy summary"),
@@ -1736,6 +2039,13 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
         .clone()
         .expect("turn context should have turn_id");
     let rollout_items = vec![
+        RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                model_provider: Some(turn_context.config.model_provider_id.clone()),
+                ..SessionMeta::default()
+            },
+            git: None,
+        }),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: previous_turn_id.clone(),
@@ -1855,6 +2165,13 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
     let aborted_turn_id = "aborted-turn-without-id".to_string();
 
     let rollout_items = vec![
+        RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                model_provider: Some(turn_context.config.model_provider_id.clone()),
+                ..SessionMeta::default()
+            },
+            git: None,
+        }),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: previous_turn_id.clone(),
@@ -1978,6 +2295,13 @@ async fn record_initial_history_resumed_unmatched_abort_preserves_active_turn_fo
     });
 
     let rollout_items = vec![
+        RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                model_provider: Some(turn_context.config.model_provider_id.clone()),
+                ..SessionMeta::default()
+            },
+            git: None,
+        }),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: previous_turn_id.clone(),
@@ -2109,6 +2433,13 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
     let incomplete_turn_id = "trailing-incomplete-turn".to_string();
 
     let rollout_items = vec![
+        RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                model_provider: Some(turn_context.config.model_provider_id.clone()),
+                ..SessionMeta::default()
+            },
+            git: None,
+        }),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: previous_turn_id.clone(),
@@ -2192,6 +2523,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
 async fn record_initial_history_resumed_trailing_incomplete_turn_preserves_turn_context_item() {
     let (session, turn_context) = make_session_and_context().await;
     let current_context_item = accepted_context(turn_context.to_turn_context_item());
+    let expected_comp_hash = current_context_item.comp_hash.clone();
     let current_turn_id = current_context_item
         .turn_id
         .clone()
@@ -2232,7 +2564,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_preserves_turn_
         session.previous_turn_settings().await,
         Some(PreviousTurnSettings {
             model: turn_context.model_info.slug.clone(),
-            comp_hash: None,
+            comp_hash: expected_comp_hash,
         })
     );
     assert_eq!(
@@ -2277,6 +2609,13 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
     let replacing_turn_id = "replacing-turn".to_string();
 
     let rollout_items = vec![
+        RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                model_provider: Some(turn_context.config.model_provider_id.clone()),
+                ..SessionMeta::default()
+            },
+            git: None,
+        }),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: previous_turn_id.clone(),

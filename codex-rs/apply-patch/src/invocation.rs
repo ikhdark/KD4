@@ -723,6 +723,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_verification_rejects_ambiguous_update_before_any_writes() {
+        let tmp = tempdir().unwrap();
+        let cwd = PathUri::from_host_native_path(tmp.path()).unwrap();
+        let original = "old\nold\n";
+        fs::write(tmp.path().join("a.txt"), original).unwrap();
+        let patch = "*** Begin Patch\n*** Add File: untouched.txt\n+x\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch";
+        let result = maybe_parse_apply_patch_verified(
+            &strs_to_strings(&["apply_patch", patch]),
+            &cwd,
+            LOCAL_FS.as_ref(),
+            None,
+        )
+        .await;
+        let MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ComputeReplacements(
+            message,
+        )) = result
+        else {
+            panic!("{result:?}")
+        };
+        assert!(
+            message.contains("Ambiguous exact match at lines 1 and 2"),
+            "{message}"
+        );
+        assert!(message.contains("add more context"), "{message}");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+            original
+        );
+        assert!(!tmp.path().join("untouched.txt").exists());
+    }
+
+    #[tokio::test]
     async fn test_verification_reports_structured_mismatch_without_writes() {
         let tmp = tempdir().unwrap();
         let cwd = PathUri::from_host_native_path(tmp.path()).unwrap();

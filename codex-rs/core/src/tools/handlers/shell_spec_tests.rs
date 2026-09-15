@@ -14,7 +14,7 @@ fn shell_command_guidance_description() -> String {
     format!(
         "\n\n{}\n\n{}",
         rg_search_admission_guidance(),
-        windows_shell_guidance()
+        filesystem_safety_guidance()
     )
 }
 
@@ -36,8 +36,21 @@ fn token_efficiency_command_tools_recommend_narrow_rg_without_rejection() {
                 .expect("command tool description")
                 .to_string();
         assert!(description.contains("Start repository `rg` searches in a likely owning path"));
-        assert!(description.contains("genuinely requires a repository-wide inventory"));
+        assert!(description.contains(
+            "Expand after a miss or when the request requires a repository-wide inventory."
+        ));
         assert!(!description.contains("is rejected"));
+        assert!(description.contains(
+            "Before editing, read the complete enclosing function, type, or configuration unit"
+        ));
+        assert!(
+            description.contains(
+                "apply when executing in a Windows environment, regardless of the host OS"
+            )
+        );
+        assert!(description.contains(
+            "resolve recursive delete or move targets inside the intended directory first"
+        ));
     }
 }
 
@@ -101,10 +114,7 @@ fn command_tools_allow_batched_inspection_and_optional_validation_metadata() {
         let script_description = tool["parameters"]["properties"][script_field]["description"]
             .as_str()
             .expect("script description");
-        assert!(
-            script_description
-                .contains("Read-only inspection may be batched in a single script call.")
-        );
+        assert!(!script_description.contains("Issue independent read-only commands"));
         assert!(script_description.contains("you may use `kind: \"argv\"`"));
         assert_eq!(
             tool["parameters"]["properties"]["validation"]["description"],
@@ -128,7 +138,7 @@ fn exec_command_tool_matches_expected_spec() {
     });
 
     let description = format!(
-        "Runs a command, returning output or a session ID for ongoing interaction. For commands needing no shell interpretation, you may use program and args (kind: argv). Read-only inspection may be batched in a single script call. Use kind: powershell_script with script_body for PowerShell semantics. Keep pipelines, redirections, and shell expansion in script form.{}",
+        "Runs a command, returning output or a session ID for ongoing interaction. For commands needing no shell interpretation, you may use program and args (kind: argv). Use kind: powershell_script with script_body for PowerShell semantics. Keep pipelines, redirections, and shell expansion in script form.{}",
         exec_command_guidance_description()
     );
 
@@ -136,7 +146,7 @@ fn exec_command_tool_matches_expected_spec() {
         (
             "cmd".to_string(),
             JsonSchema::string(Some(
-                "Shell script to execute. Read-only inspection may be batched in a single script call. For a standalone native executable with known arguments, you may use `kind: \"argv\"` with `program` and `args`. Keep pipelines, redirection, shell expansion, compound statements, builtins, and `.cmd`/`.bat` semantics in script form. Arbitrary command strings remain shell scripts and must not be heuristically split. For complex PowerShell, prefer `kind: \"powershell_script\"`. Keep read-only PowerShell to direct cmdlet pipelines when possible; variables, loops, or script blocks may require the repository mutation lane."
+                "Shell script to execute in the user's default shell. For a standalone native executable with known arguments, you may use `kind: \"argv\"` with `program` and `args`. Keep pipelines, redirection, shell expansion, compound statements, and builtins in script form. On Windows, also keep `.cmd`/`.bat` calls in script form; for complex PowerShell, prefer `kind: \"powershell_script\"`."
                     .to_string(),
             )),
         ),
@@ -166,7 +176,7 @@ fn exec_command_tool_matches_expected_spec() {
         (
             "script_body".to_string(),
             JsonSchema::string(Some(
-                "Plain PowerShell script for `kind: \"powershell_script\"`; Codex encodes it at runtime. Read-only PowerShell that uses variables, loops, or script blocks may require the repository mutation lane."
+                "Plain PowerShell script for `kind: \"powershell_script\"`; Codex encodes it at runtime."
                     .to_string(),
             )),
         ),
@@ -193,7 +203,7 @@ fn exec_command_tool_matches_expected_spec() {
         (
             "yield_time_ms".to_string(),
             bounded_integer(
-                "Wait before yielding output. Defaults to 2000 ms; effective range is 250-30000 ms.".to_string(),
+                "Wait before yielding output. Defaults to 30000 ms for recognized validation commands and 2000 ms otherwise; explicit values use 250-30000 ms. Windows initial waits are floored to 2000 ms.".to_string(),
                 crate::unified_exec::MIN_YIELD_TIME_MS,
                 crate::unified_exec::MAX_YIELD_TIME_MS,
             ),
@@ -220,7 +230,7 @@ fn exec_command_tool_matches_expected_spec() {
     properties.insert(
         "force_fresh".to_string(),
         JsonSchema::boolean(Some(
-            "Execute without reusing prior immutable evidence.".to_string(),
+            "Force execution instead of reusing equivalent evidence. By default, unchanged file reads, searches, and deterministic failures may reuse a prior result; reused results are labeled. Set true when external state changed or a fresh observation is required.".to_string(),
         )),
     );
     assert_eq!(
@@ -230,7 +240,7 @@ fn exec_command_tool_matches_expected_spec() {
             description,
             strict: false,
             defer_loading: None,
-            parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
+            parameters: command_parameters_schema(properties, "cmd"),
             output_schema: Some(unified_exec_output_schema()),
         })
     );
@@ -315,7 +325,7 @@ fn write_stdin_tool_matches_expected_spec() {
         (
             "yield_time_ms".to_string(),
             bounded_integer(
-                "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms; empty polls wait for output or completion for at least 60000 ms even when a shorter yield is requested. A wait deadline does not terminate the process.".to_string(),
+                "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms. Empty polls default to 60000 ms; explicit shorter waits are honored down to 250 ms. A wait deadline does not terminate the process.".to_string(),
                 crate::unified_exec::MIN_YIELD_TIME_MS,
                 crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
             ),
@@ -394,24 +404,14 @@ fn shell_command_tool_matches_expected_spec() {
         exec_permission_approvals_enabled: false,
     });
 
-    let description = r#"Runs a Powershell command (Windows) and returns its output.
-
-Examples of valid command strings:
-
-- ls -a (show hidden): "Get-ChildItem -Force"
-- recursive find by name: "Get-ChildItem -Recurse -Filter *.py"
-- recursive grep: "Get-ChildItem -Path C:\\myrepo -Recurse | Select-String -Pattern 'TODO' -CaseSensitive"
-- ps aux | grep python: "Get-Process | Where-Object { $_.ProcessName -like '*python*' }"
-- setting an env var: "$env:FOO='bar'; echo $env:FOO"
-- running an inline Python script: "@'\\nprint('Hello, world!')\\n'@ | python -""#
-            .to_string()
-            + &shell_command_guidance_description();
+    let description = "Runs a command in the user's default shell and returns its output. Use syntax supported by that shell. For commands needing no shell interpretation, you may use program and args (kind: argv). Use kind: powershell_script with script_body for PowerShell semantics.".to_string()
+        + &shell_command_guidance_description();
 
     let mut properties = BTreeMap::from([
         (
             "command".to_string(),
             JsonSchema::string(Some(
-                "Shell script to execute. Read-only inspection may be batched in a single script call. For a standalone native executable with known arguments, you may use `kind: \"argv\"` with `program` and `args`. Keep pipelines, redirection, shell expansion, compound statements, builtins, and `.cmd`/`.bat` semantics in script form. Arbitrary command strings remain shell scripts and must not be heuristically split. For complex PowerShell, prefer `kind: \"powershell_script\"`. Keep read-only PowerShell to direct cmdlet pipelines when possible; variables, loops, or script blocks may require the repository mutation lane."
+                "Shell script to execute in the user's default shell. For a standalone native executable with known arguments, you may use `kind: \"argv\"` with `program` and `args`. Keep pipelines, redirection, shell expansion, compound statements, and builtins in script form. On Windows, also keep `.cmd`/`.bat` calls in script form; for complex PowerShell, prefer `kind: \"powershell_script\"`."
                     .to_string(),
             )),
         ),
@@ -441,7 +441,7 @@ Examples of valid command strings:
         (
             "script_body".to_string(),
             JsonSchema::string(Some(
-                "Plain PowerShell script for `kind: \"powershell_script\"`; Codex encodes it at runtime. Read-only PowerShell that uses variables, loops, or script blocks may require the repository mutation lane."
+                "Plain PowerShell script for `kind: \"powershell_script\"`; Codex encodes it at runtime."
                     .to_string(),
             )),
         ),
@@ -484,7 +484,7 @@ Examples of valid command strings:
     properties.insert(
         "force_fresh".to_string(),
         JsonSchema::boolean(Some(
-            "Execute without reusing prior immutable evidence.".to_string(),
+            "Force execution instead of reusing equivalent evidence. By default, unchanged file reads, searches, and deterministic failures may reuse a prior result; reused results are labeled. Set true when external state changed or a fresh observation is required.".to_string(),
         )),
     );
 
@@ -495,7 +495,7 @@ Examples of valid command strings:
             description,
             strict: false,
             defer_loading: None,
-            parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
+            parameters: command_parameters_schema(properties, "command"),
             output_schema: None,
         })
     );
@@ -563,6 +563,9 @@ fn command_tools_accept_legacy_untagged_and_canonical_kind_forms() {
         }
 
         let rejected = [
+            json!({}),
+            json!({"kind": "script"}),
+            json!({"args": ["status"]}),
             json!({"kind": "argv", "program": "git", "unknown": true}),
             json!({"kind": "argv", "program": "git", "workdir": 42}),
             json!({
@@ -631,4 +634,62 @@ fn integer_arguments_expose_destination_types_and_runtime_bounds() {
         write["parameters"]["properties"]["yield_time_ms"]["maximum"],
         crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS
     );
+}
+
+#[test]
+fn command_schema_rejects_numbers_javascript_cannot_represent_exactly() {
+    let tool = serde_json::to_value(create_exec_command_tool(CommandToolOptions {
+        allow_login_shell: true,
+        exec_permission_approvals_enabled: false,
+    }))
+    .expect("serialize command tool");
+    let validator = jsonschema::validator_for(&tool["parameters"]).expect("command schema");
+    assert!(
+        validator
+            .is_valid(&json!({"cmd": "echo ok", "max_output_tokens": 9_007_199_254_740_991_u64}))
+    );
+    assert!(
+        !validator
+            .is_valid(&json!({"cmd": "echo ok", "max_output_tokens": 9_007_199_254_740_992_u64}))
+    );
+}
+
+#[test]
+fn command_output_schemas_require_integral_counters_but_allow_fractional_time() {
+    for tool in [
+        create_exec_command_tool(CommandToolOptions {
+            allow_login_shell: true,
+            exec_permission_approvals_enabled: false,
+        }),
+        create_write_stdin_tool(),
+    ] {
+        let ToolSpec::Function(tool) = tool else {
+            panic!("expected command function tool");
+        };
+        let schema = tool.output_schema.expect("command output schema");
+        let validator = jsonschema::validator_for(&schema).expect("valid output schema");
+        let output = json!({
+            "wall_time_seconds": 0.125,
+            "output": "done",
+            "exit_code": -1,
+            "session_id": 42,
+            "original_token_count": 100,
+            "raw_output_artifact_bytes": 400
+        });
+        assert!(validator.is_valid(&output));
+        for field in [
+            "exit_code",
+            "session_id",
+            "original_token_count",
+            "raw_output_artifact_bytes",
+        ] {
+            let mut invalid_output = output.clone();
+            invalid_output[field] = json!(1.5);
+            assert!(
+                !validator.is_valid(&invalid_output),
+                "{} must reject fractional {field}",
+                tool.name
+            );
+        }
+    }
 }

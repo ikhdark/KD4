@@ -23,17 +23,16 @@ impl McpServerContributor<Config> for HostedPluginRuntimeExtension {
         Box::pin(async move {
             let config = context.config();
             let name = CODEX_APPS_MCP_SERVER_NAME.to_string();
-            if !config.features.enabled(codex_features::Feature::Apps) {
-                return vec![McpServerContribution::Remove { name }];
-            }
-
+            let mut server = hosted_plugin_runtime_mcp_server_config(
+                &config.chatgpt_base_url,
+                config.apps_mcp_product_sku.as_deref(),
+                context.originator(),
+            );
+            // Retain the endpoint identity for cached installed apps even when calls are disabled.
+            server.enabled = config.features.enabled(codex_features::Feature::Apps);
             vec![McpServerContribution::Set {
                 name,
-                config: Box::new(hosted_plugin_runtime_mcp_server_config(
-                    &config.chatgpt_base_url,
-                    config.apps_mcp_product_sku.as_deref(),
-                    context.originator(),
-                )),
+                config: Box::new(server),
             }]
         })
     }

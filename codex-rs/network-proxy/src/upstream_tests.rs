@@ -177,14 +177,10 @@ async fn mitm_upstream_client_trusts_startup_custom_ca() {
                 let client = UpstreamClient::direct_with_allow_local_binding(
                     /*allow_local_binding*/ true, roots,
                 );
-                let mut request = Request::builder()
+                let request = Request::builder()
                     .uri(format!("https://localhost:{}/", address.port()))
                     .body(Body::empty())
                     .unwrap();
-                // Direct configuration must override stale routing metadata.
-                request
-                    .extensions_mut()
-                    .insert(ProxyAddress::try_from("http://127.0.0.1:1").unwrap());
                 let result = client.serve(request).await;
                 if trusted {
                     assert_eq!(result.unwrap().status(), StatusCode::OK);

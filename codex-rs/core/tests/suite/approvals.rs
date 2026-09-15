@@ -620,7 +620,9 @@ fn parse_result(item: &Value) -> CommandResult {
         .expect("shell output payload");
     match serde_json::from_str::<Value>(output_str) {
         Ok(parsed) => {
-            let exit_code = parsed["metadata"]["exit_code"].as_i64();
+            let exit_code = parsed["metadata"]["exit_code"]
+                .as_i64()
+                .or_else(|| parsed["exit_code"].as_i64());
             let stdout = parsed["output"].as_str().unwrap_or_default().to_string();
             CommandResult { exit_code, stdout }
         }
@@ -1793,7 +1795,6 @@ async fn run_scenario(scenario: &ScenarioSpec) -> Result<()> {
     } else if let Some(command_end) = auto_command_end
         .as_ref()
         .and_then(|completion| completion.command_end.as_ref())
-        .filter(|command_end| command_end.exit_code != 0)
     {
         CommandResult {
             exit_code: Some(i64::from(command_end.exit_code)),

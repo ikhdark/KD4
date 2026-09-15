@@ -14,6 +14,248 @@ from scripts.generated_output_lock import source_map_lock  # noqa: E402
 
 
 class SourceOwnersTest(unittest.TestCase):
+    def test_validation_cli_returns_only_the_most_specific_declared_routes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / "src/tools").mkdir(parents=True)
+            (root / "unvalidated").mkdir()
+            manifest_path = root / "source_owners.toml"
+            manifest_path.write_text(
+                """schema_version = 2
+[[owners]]
+id = "broad"
+roots = ["src"]
+[[owners.validation]]
+id = "broad-tests"
+cwd = "."
+argv = ["just", "core-gate", "broad"]
+[[owners]]
+id = "specific"
+roots = ["src/tools"]
+[[owners.validation]]
+id = "tools-tests"
+cwd = "src"
+argv = ["just", "core-test-fast", "core_lib", "-E", "test(tools)"]
+role = "focused_tests"
+[[owners]]
+id = "shared"
+roots = ["src/tools"]
+[[owners.validation]]
+id = "shared-contract"
+cwd = "."
+argv = ["just", "core-gate", "shared"]
+role = "generated_contract_check"
+[[owners]]
+id = "unvalidated"
+roots = ["unvalidated"]
+""",
+                encoding="utf-8",
+            )
+
+            def query(paths: list[str], status: int) -> dict:
+                argv = [
+                    "source_owners.py",
+                    "validation",
+                    "--manifest",
+                    str(manifest_path),
+                ]
+                for path in paths:
+                    argv.extend(["--path", path])
+                with (
+                    mock.patch.object(sys, "argv", argv),
+                    mock.patch("builtins.print") as emit,
+                ):
+                    self.assertEqual(source_owners.main(), status)
+                return json.loads(emit.call_args.args[0])
+
+            expected = [
+                {
+                    "owner": "shared",
+                    "id": "shared-contract",
+                    "cwd": ".",
+                    "argv": ["just", "core-gate", "shared"],
+                    "role": "generated_contract_check",
+                },
+                {
+                    "owner": "specific",
+                    "id": "tools-tests",
+                    "cwd": "src",
+                    "argv": ["just", "core-test-fast", "core_lib", "-E", "test(tools)"],
+                    "role": "focused_tests",
+                },
+            ]
+            result = query(["src/tools/new.rs", str(root / "src/tools/second.rs")], 0)
+            self.assertEqual(result["status"], "declared")
+            self.assertEqual(result["validation"], expected)
+            self.assertEqual(result["repository_root"], str(root))
+            self.assertEqual(result["unowned_paths"], [])
+            self.assertEqual(result["owners_without_validation"], [])
+
+            partial = query(["src/tools/new.rs", "unknown.rs", "unvalidated/new.rs"], 1)
+            self.assertEqual(partial["status"], "partial")
+            self.assertEqual(partial["validation"], expected)
+            self.assertEqual(partial["unowned_paths"], ["unknown.rs"])
+            self.assertEqual(partial["owners_without_validation"], ["unvalidated"])
+            self.assertEqual(query(["unknown.rs"], 1)["validation"], [])
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "source_owners.py",
+                        "validation",
+                        "--manifest",
+                        str(manifest_path),
+                        "--path",
+                        "../outside.rs",
+                    ],
+                ),
+                mock.patch("builtins.print") as emit,
+            ):
+                self.assertEqual(source_owners.main(), 1)
+                self.assertIn("outside the repository", str(emit.call_args.args[0]))
+
+    def test_validation_cli_requires_a_scope(self) -> None:
+        with (
+            mock.patch.object(sys, "argv", ["source_owners.py", "validation"]),
+            mock.patch.object(sys, "stderr"),
+            self.assertRaises(SystemExit) as error,
+        ):
+            source_owners.main()
+        self.assertEqual(error.exception.code, 2)
+
+    def test_slice_identity_tracks_selected_routing_and_new_incoming_edges(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "selected.rs").write_text("fn selected() {}", encoding="utf-8")
+            (root / "unrelated.rs").write_text("fn unrelated() {}", encoding="utf-8")
+            selected = {
+                "id": "selected",
+                "primary_entries": [{"path": "selected.rs", "symbol": "selected"}],
+            }
+            unrelated = {
+                "id": "unrelated",
+                "primary_entries": [{"path": "unrelated.rs", "symbol": "unrelated"}],
+            }
+            manifest = {"owners": [selected, unrelated]}
+
+            def snapshot(digest: str) -> str:
+                return source_owners.architecture_slice(
+                    manifest, digest, root, ["selected"]
+                )["snapshot"]
+
+            original = snapshot("original")
+            unrelated["roots"] = ["new-unrelated-root"]
+            self.assertEqual(original, snapshot("unrelated-routing-edit"))
+            selected["roots"] = ["new-selected-root"]
+            rerouted = snapshot("selected-routing-edit")
+            self.assertNotEqual(original, rerouted)
+            unrelated["relationships"] = [
+                {
+                    "category": "callers_consumers",
+                    "kind": "calls",
+                    "target": "owner:selected",
+                    "confidence": "declared",
+                    "evidence": [{"path": "unrelated.rs", "symbol": "unrelated"}],
+                }
+            ]
+            with_incoming = snapshot("new-incoming-edge")
+            self.assertNotEqual(rerouted, with_incoming)
+            (root / "unrelated.rs").write_text(
+                "fn unrelated() { selected(); }", encoding="utf-8"
+            )
+            self.assertNotEqual(with_incoming, snapshot("new-incoming-edge"))
+            graph = json.loads(
+                source_owners.expected_architecture_index(
+                    manifest, "new-incoming-edge", root
+                )
+            )
+            indexed = source_owners.architecture_slice(
+                manifest, "new-incoming-edge", root, ["selected"], graph=graph
+            )
+            self.assertEqual(snapshot("new-incoming-edge"), indexed["snapshot"])
+
+    def test_warm_query_reads_only_selected_and_incoming_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("selected", "incoming", "unrelated"):
+                (root / f"{name}.rs").write_text(f"fn {name}() {{}}\n")
+            manifest_path = root / "source_owners.toml"
+            manifest_path.write_text("""schema_version = 2
+[[owners]]
+id = "selected"
+roots = ["selected.rs"]
+primary_entries = [{ path = "selected.rs", symbol = "selected" }]
+[[owners]]
+id = "incoming"
+roots = ["incoming.rs"]
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "calls"
+target = "owner:selected"
+confidence = "compiler_resolved"
+evidence = [{ path = "incoming.rs", symbol = "incoming" }]
+[[owners]]
+id = "unrelated"
+roots = ["unrelated.rs"]
+primary_entries = [{ path = "unrelated.rs", symbol = "unrelated" }]
+""")
+            manifest, digest = source_owners.load_and_validate(manifest_path, root)
+            index_path = root / "architecture_index.json"
+            index_path.write_text(
+                source_owners.expected_architecture_index(manifest, digest, root)
+            )
+            argv = [
+                "source_owners.py",
+                "query",
+                "--manifest",
+                str(manifest_path),
+                "--architecture-index",
+                str(index_path),
+                "--owner",
+                "selected",
+                "--max-relationships",
+                "1",
+            ]
+            original_read_bytes = Path.read_bytes
+            original_read_text = Path.read_text
+            reads = set()
+
+            def read_bytes(path, *args, **kwargs):
+                reads.add(path.name)
+                return original_read_bytes(path, *args, **kwargs)
+
+            def read_text(path, *args, **kwargs):
+                reads.add(path.name)
+                return original_read_text(path, *args, **kwargs)
+
+            def query():
+                reads.clear()
+                with (
+                    mock.patch.object(sys, "argv", argv),
+                    mock.patch.object(Path, "read_bytes", read_bytes),
+                    mock.patch.object(Path, "read_text", read_text),
+                    mock.patch("builtins.print") as emit,
+                ):
+                    self.assertEqual(source_owners.main(), 0)
+                self.assertEqual(
+                    reads & {"selected.rs", "incoming.rs", "unrelated.rs"},
+                    {"selected.rs", "incoming.rs"},
+                )
+                result = json.loads(emit.call_args.args[0])
+                self.assertEqual(result["relationships"][0]["source"], "owner:incoming")
+                return result["repository_revision"]
+
+            first = query()
+            (root / "unrelated.rs").write_text("unrelated declaration was deleted")
+            self.assertEqual(first, query())
+            (root / "incoming.rs").write_text("fn incoming() { changed(); }\n")
+            self.assertNotEqual(first, query())
+
     def test_slice_scopes_freshness_and_reports_warm_reads(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -75,7 +317,7 @@ class SourceOwnersTest(unittest.TestCase):
                 self.assertEqual(
                     result["metrics"]["bytes_read"], sum(size for _, size in reads)
                 )
-                self.assertTrue(result["snapshot"].startswith("slice-v3:selected:"))
+                self.assertTrue(result["snapshot"].startswith("slice-v4:selected:"))
                 return result["snapshot"]
 
             cold = capture()
@@ -88,7 +330,9 @@ class SourceOwnersTest(unittest.TestCase):
             (root / "selected.rs").write_bytes(b"changed implementation")
             selected = capture()
             self.assertNotEqual(incoming, selected)
-            self.assertNotEqual(selected, capture("changed manifest"))
+            self.assertEqual(selected, capture("unrelated manifest digest"))
+            manifest["owners"][0]["primary_entries"][0]["symbol"] = "renamed_selected"
+            self.assertNotEqual(selected, capture("changed selected owner"))
             index = root / "architecture_index.json"
             index.write_text(
                 source_owners.expected_architecture_index(manifest, "manifest", root),
@@ -118,6 +362,7 @@ class SourceOwnersTest(unittest.TestCase):
         with (
             mock.patch.object(sys, "argv", argv),
             mock.patch("builtins.print") as emit,
+            mock.patch.object(source_owners, "MAX_SLICE_RELATIONSHIPS", 17),
             mock.patch.object(
                 Path,
                 "read_text",
@@ -130,8 +375,228 @@ class SourceOwnersTest(unittest.TestCase):
         owner_ids = {owner["id"] for owner in catalog["owners"]}
         self.assertIn("source-owner-index", owner_ids)
         self.assertIn("code-mode-protocol-contracts", owner_ids)
+        catalog_by_id = {owner["id"]: owner for owner in catalog["owners"]}
+        self.assertEqual(
+            catalog_by_id["source-owner-index"]["roots"],
+            ["scripts/source_owners.py", "source_owners.toml"],
+        )
         self.assertIn("source_owners.py slice --owner <owner-id>", catalog["next"])
+        self.assertTrue(catalog["next"].endswith("--max-relationships 17"))
         self.assertLess(len(emit.call_args.args[0]), 10_000)
+
+    def test_slice_resolves_known_path_through_the_cli(self) -> None:
+        argv = [
+            "source_owners.py",
+            "slice",
+            "--path",
+            "scripts/source_owners.py",
+            "--focus",
+            "owner routing",
+        ]
+        with mock.patch.object(sys, "argv", argv), mock.patch("builtins.print") as emit:
+            self.assertEqual(source_owners.main(), 0)
+        result = json.loads(emit.call_args.args[0])
+        self.assertTrue(
+            result["snapshot"].startswith("slice-v4:source-owner-index:routing:")
+        )
+
+    def test_tool_history_path_resolves_to_recovery_flow_through_the_cli(self) -> None:
+        argv = [
+            "source_owners.py",
+            "slice",
+            "--path",
+            "codex-rs/core/src/tool_history.rs",
+            "--focus",
+            "compaction artifact recovery",
+        ]
+        with mock.patch.object(sys, "argv", argv), mock.patch("builtins.print") as emit:
+            self.assertEqual(source_owners.main(), 0)
+        result = json.loads(emit.call_args.args[0])
+        self.assertTrue(
+            result["snapshot"].startswith("slice-v4:tool-output-recovery:routing:")
+        )
+        self.assertEqual(result["control_and_data_flow"]["status"], "established")
+        self.assertTrue(
+            any(
+                "artifact_pin_payload_for_items" in relationship["evidence"]
+                for relationship in result["control_and_data_flow"]["relationships"]
+            )
+        )
+        self.assertIn(
+            "test(tool_history::tests)",
+            result["tests_and_contracts"]["focused_validation"][0]["argv"][-1],
+        )
+
+    def test_path_routing_preserves_specificity_ties_and_directory_boundaries(
+        self,
+    ) -> None:
+        manifest = {
+            "owners": [
+                {"id": "broad", "roots": ["src"]},
+                {"id": "specific", "roots": ["src/tools"]},
+                {"id": "shared", "roots": ["src/tools"]},
+            ]
+        }
+        root = REPO_ROOT.resolve()
+        self.assertEqual(
+            source_owners.owners_for_paths(manifest, root, ["src/tools/new.rs"]),
+            ["shared", "specific"],
+        )
+        self.assertEqual(
+            source_owners.owners_for_paths(manifest, root, ["src/tools_extra.rs"]),
+            ["broad"],
+        )
+        with self.assertRaisesRegex(ValueError, "outside the repository"):
+            source_owners.owners_for_paths(manifest, root, ["../outside.rs"])
+        with self.assertRaisesRegex(ValueError, "no source owner"):
+            source_owners.owners_for_paths(manifest, root, ["unowned/new.rs"])
+
+    def test_path_routing_resolves_shared_owner_roots_once_per_request(self) -> None:
+        manifest = {
+            "owners": [
+                {"id": "broad", "roots": ["src"]},
+                {"id": "specific", "roots": ["src/tools"]},
+                {"id": "shared", "roots": ["src/tools"]},
+            ]
+        }
+        root = REPO_ROOT.resolve()
+        resolve = Path.resolve
+        probes: list[Path] = []
+
+        def observe(path: Path, *args, **kwargs) -> Path:
+            probes.append(path)
+            return resolve(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "resolve", observe):
+            self.assertEqual(
+                source_owners.owners_for_paths(
+                    manifest,
+                    root,
+                    ["src/tools/first.rs", "src/tools/second.rs", "src/third.rs"],
+                ),
+                ["broad", "shared", "specific"],
+            )
+        self.assertEqual(probes.count(root / "src"), 1)
+        self.assertEqual(probes.count(root / "src/tools"), 1)
+
+    def test_cli_unowned_paths_preserve_scoped_results_and_expose_index_fallback(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / "owned.rs").write_text("fn entry() {}\n", encoding="utf-8")
+            (root / "unowned").mkdir()
+            (root / "unowned/new.rs").write_text("fn other() {}\n", encoding="utf-8")
+            manifest_path = root / "source_owners.toml"
+            manifest_path.write_text(
+                'schema_version = 2\n[[owners]]\nid = "alpha"\nroots = ["owned.rs"]\n'
+                'primary_entries = [{ path = "owned.rs", symbol = "entry" }]\n',
+                encoding="utf-8",
+            )
+            manifest, digest = source_owners.load_and_validate(manifest_path, root)
+            index_path = root / "architecture_index.json"
+            index_text = source_owners.expected_architecture_index(
+                manifest, digest, root
+            )
+            stale_index_text = source_owners.expected_architecture_index(
+                manifest, "stale", root
+            )
+
+            for index_kind, index_content in (
+                ("missing", None),
+                ("invalid", "{"),
+                ("stale", stale_index_text),
+                ("current", index_text),
+            ):
+                if index_content is not None:
+                    index_path.write_text(index_content, encoding="utf-8")
+                for command in ("query", "slice"):
+                    for mixed in (False, True):
+                        with self.subTest(
+                            index=index_kind, command=command, mixed=mixed
+                        ):
+                            argv = [
+                                "source_owners.py",
+                                command,
+                                "--manifest",
+                                str(manifest_path),
+                                "--architecture-index",
+                                str(index_path),
+                                "--path",
+                                "unowned/new.rs",
+                            ]
+                            if mixed:
+                                argv.extend(["--path", "owned.rs"])
+                            with (
+                                mock.patch.object(sys, "argv", argv),
+                                mock.patch("builtins.print") as emit,
+                            ):
+                                self.assertEqual(source_owners.main(), 0)
+                            result = json.loads(emit.call_args.args[0])
+                            self.assertEqual(
+                                result["index_status"],
+                                "reused" if index_kind == "current" else "fallback",
+                            )
+                            self.assertEqual(
+                                "index_hint" in result, index_kind != "current"
+                            )
+                            self.assertEqual(
+                                result["unowned_paths"], ["unowned/new.rs"]
+                            )
+                            self.assertEqual(
+                                result["fallback_searches"],
+                                [
+                                    {
+                                        "cwd": str(root),
+                                        "argv": ["rg", "--files", "--", "unowned"],
+                                    }
+                                ],
+                            )
+                            self.assertIn(
+                                "No declared owner for unowned/new.rs; inspect its directory before mutation.",
+                                result["material_unknowns"],
+                            )
+                            if command == "query":
+                                self.assertEqual(result["status"], "partial")
+                                self.assertEqual(
+                                    [owner["id"] for owner in result["owners"]],
+                                    ["alpha"] if mixed else [],
+                                )
+                                self.assertEqual(result["relationships"], [])
+                            else:
+                                entries = result["registration_and_entrypoints"]
+                                self.assertEqual(
+                                    entries["status"], "partial" if mixed else "unknown"
+                                )
+                                self.assertEqual(
+                                    [
+                                        entry["target"]
+                                        for entry in entries["relationships"]
+                                    ],
+                                    ["path:owned.rs::entry"] if mixed else [],
+                                )
+                                self.assertEqual(
+                                    result["tests_and_contracts"]["focused_validation"],
+                                    [],
+                                )
+                                self.assertEqual(
+                                    result["metrics"]["files_read"], 2 if mixed else 1
+                                )
+
+            argv = [
+                "source_owners.py",
+                "slice",
+                "--manifest",
+                str(manifest_path),
+                "--path",
+                "../outside.rs",
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch("builtins.print") as emit,
+            ):
+                self.assertEqual(source_owners.main(), 1)
+                self.assertIn("outside the repository", str(emit.call_args.args[0]))
 
     def test_retired_task_continuity_workflow_has_no_source_owner(self) -> None:
         manifest, _ = source_owners.load_and_validate(
@@ -265,7 +730,7 @@ role = "focused_tests"
                         + "\n".join(
                             f'[[owners]]\nid = "{name}"\nroots = ["shared.rs"]\n'
                             'primary_entries = [{ path = "shared.rs", symbol = "main", '
-                            f'ambiguous = {str(ambiguous).lower()} }}]\n'
+                            f"ambiguous = {str(ambiguous).lower()} }}]\n"
                             for name, ambiguous in (("alpha", alpha), ("beta", beta))
                         ),
                         encoding="utf-8",
@@ -275,7 +740,9 @@ role = "focused_tests"
                             manifest_path, root
                         )
                         index = json.loads(
-                            source_owners.expected_architecture_index(manifest, digest, root)
+                            source_owners.expected_architecture_index(
+                                manifest, digest, root
+                            )
                         )
                         self.assertEqual(len(index["owners"]), 2)
                         self.assertTrue(
@@ -311,6 +778,53 @@ symbol = "removed_symbol"
 
             with self.assertRaisesRegex(ValueError, "stale symbol evidence"):
                 source_owners.load_and_validate(manifest_path, root)
+
+    def test_primary_entry_requires_a_declaration_or_reexport(self) -> None:
+        cases = [
+            ("rs", "// fn entry() {}\nfn other() {}", False),
+            ("rs", "/* outer /* nested */ fn entry() {} */", False),
+            ("rs", 'const DOC: &str = "fn entry() {}";', False),
+            ("rs", 'const DOC: &str = r##"fn entry() {}"##;', False),
+            ("rs", "fn test_entry() { entry(); }", False),
+            ("rs", "pub use other::entry as renamed;", False),
+            ("rs", "pub async fn entry() {}", True),
+            ("rs", "pub struct entry;", True),
+            ("rs", "pub use other::entry;", True),
+            ("rs", "pub use other::{first, entry};", True),
+            ("rs", "pub use other::original as entry;", True),
+            ("py", "# def entry(): pass\ndef other(): pass", False),
+            ("py", '"""def entry(): pass"""', False),
+            ("py", "def test_entry():\n    entry()", False),
+            ("py", "async def entry(): pass", True),
+            ("py", "class entry: pass", True),
+            ("py", "from other import original as entry", True),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "source_owners.toml"
+            for suffix, contents, valid in cases:
+                with self.subTest(suffix=suffix, contents=contents):
+                    path = f"source.{suffix}"
+                    (root / path).write_text(contents, encoding="utf-8")
+                    manifest_path.write_text(
+                        'schema_version = 2\n[[owners]]\nid = "alpha"\n'
+                        f'roots = ["{path}"]\n'
+                        f'primary_entries = [{{ path = "{path}", symbol = "entry" }}]\n',
+                        encoding="utf-8",
+                    )
+                    if valid:
+                        manifest, _ = source_owners.load_and_validate(
+                            manifest_path, root
+                        )
+                        self.assertEqual(
+                            manifest["owners"][0]["primary_entries"],
+                            [{"path": path, "symbol": "entry"}],
+                        )
+                    else:
+                        with self.assertRaisesRegex(
+                            ValueError, "stale symbol evidence"
+                        ):
+                            source_owners.load_and_validate(manifest_path, root)
 
     def test_targeted_validation_checks_only_the_returned_relationship_closure(
         self,
@@ -566,17 +1080,28 @@ primary_entries = [{ path = "source.rs", symbol = "locate" }]
             ]
             with (
                 mock.patch.object(sys, "argv", argv),
-                mock.patch.object(
-                    source_owners,
-                    "load_and_validate",
-                    side_effect=AssertionError("warm lookup reparsed the manifest"),
-                ),
                 mock.patch("builtins.print") as print_output,
             ):
                 self.assertEqual(source_owners.main(), 0)
                 argv[1] = "slice"
                 self.assertEqual(source_owners.main(), 0)
-            self.assertTrue(print_output.called)
+            result = json.loads(print_output.call_args.args[0])
+            self.assertEqual(
+                result["registration_and_entrypoints"]["relationships"][0]["target"],
+                "path:source.rs::locate",
+            )
+            source.write_text("fn renamed() {}\n", encoding="utf-8")
+            for command in ("query", "slice"):
+                argv[1] = command
+                with (
+                    self.subTest(command=command),
+                    mock.patch.object(sys, "argv", argv),
+                    mock.patch("builtins.print") as diagnostic,
+                ):
+                    self.assertEqual(source_owners.main(), 1)
+                    self.assertIn(
+                        "stale symbol evidence", str(diagnostic.call_args.args[0])
+                    )
 
     def test_slice_snapshot_revalidates_content_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -784,17 +1309,20 @@ evidence = [{ path = "src/lib.rs", symbol = "locate" }]
             )
             manifest, digest = source_owners.load_and_validate(manifest_path, root)
 
-            with mock.patch.object(
-                source_owners, "repository_revision", return_value="revision-1"
-            ):
-                bounded = source_owners.query_graph(
-                    manifest, digest, root, ["alpha"], max_relationships=1
-                )
-                result = source_owners.query_graph(
-                    manifest, digest, root, ["alpha"], max_relationships=2
-                )
-
-            self.assertEqual(result["repository_revision"], "revision-1")
+            bounded = source_owners.query_graph(
+                manifest, digest, root, ["alpha"], max_relationships=1
+            )
+            result = source_owners.query_graph(
+                manifest, digest, root, ["alpha"], max_relationships=2
+            )
+            self.assertEqual(
+                result["repository_revision"], bounded["repository_revision"]
+            )
+            (root / "src" / "lib.rs").write_text("fn locate() { changed(); }\n")
+            changed = source_owners.query_graph(manifest, digest, root, ["alpha"])
+            self.assertNotEqual(
+                result["repository_revision"], changed["repository_revision"]
+            )
             self.assertEqual(bounded["status"], "partial")
             self.assertEqual(bounded["omitted"]["relationships"], 1)
             self.assertTrue(
@@ -892,6 +1420,7 @@ role = "focused_tests"
             )
 
             self.assertEqual(slice_["material_unknowns"], [])
+            self.assertIsNone(slice_["metrics"]["late_relationship_discoveries"])
             self.assertFalse(slice_["truncated"])
             self.assertEqual(slice_["omitted_relationships"], 0)
             self.assertEqual(
@@ -899,8 +1428,9 @@ role = "focused_tests"
             )
             self.assertEqual(
                 slice_["control_and_data_flow"]["relationships"][0]["provenance"],
-                "exact",
+                "declared",
             )
+            self.assertIsNone(slice_["metrics"]["late_relationship_discoveries"])
             first_snapshot = slice_["snapshot"]
             (root / "src" / "lib.rs").write_text(
                 'fn locate() { println!("changed"); }\n', encoding="utf-8"
@@ -1005,6 +1535,20 @@ tests = ["src/lib.rs"]
                         len(bounded["registration_and_entrypoints"]["relationships"]),
                         entry_count,
                     )
+                    for facet in source_owners.ARCHITECTURE_FACETS:
+                        omitted = len(slice_[facet]["relationships"]) - len(
+                            bounded[facet]["relationships"]
+                        )
+                        self.assertEqual(
+                            bounded[facet].get("omitted_relationships", 0), omitted
+                        )
+                        if omitted:
+                            self.assertEqual(
+                                bounded[facet]["status"],
+                                "partial"
+                                if bounded[facet]["relationships"]
+                                else "unknown",
+                            )
                     self.assertEqual(
                         len(bounded["tests_and_contracts"]["relationships"]), test_count
                     )
@@ -1017,6 +1561,114 @@ tests = ["src/lib.rs"]
                     )
                     self.assertEqual(bounded["omitted_relationships"], 6 - cap)
                     self.assertEqual(bounded["truncated"], cap < 6)
+                    self.assertEqual(
+                        bounded["invariants"]["status"],
+                        "established" if invariant_count else "unknown",
+                    )
+                    self.assertEqual(
+                        bounded["control_and_data_flow"]["status"],
+                        "established" if control_count == 2 else "partial",
+                    )
+
+    def test_slice_missing_owner_declarations_are_partial_or_unknown(self) -> None:
+        manifest = {
+            "owners": [
+                {"id": "alpha", "primary_entries": [{"path": "a.rs", "symbol": "a"}]},
+                {"id": "beta"},
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            result = source_owners.architecture_slice(
+                manifest, "digest", Path(directory), ["alpha", "beta"]
+            )
+        self.assertEqual(result["registration_and_entrypoints"]["status"], "partial")
+        self.assertEqual(result["control_and_data_flow"]["status"], "unknown")
+        self.assertIn(
+            "registration_and_entrypoints: missing declarations for beta",
+            result["material_unknowns"],
+        )
+        self.assertEqual(result["control_and_data_flow"]["relationships"], [])
+
+    def test_slice_behavior_relevance_outranks_kind_and_uses_spare_budget(self) -> None:
+        def edge(category: str, kind: str, name: str) -> dict:
+            return {
+                "category": category,
+                "kind": kind,
+                "target": f"path:{name}.rs",
+                "confidence": "declared",
+                "evidence": [{"path": f"{name}.rs"}],
+            }
+
+        manifest = {
+            "owners": [
+                {
+                    "id": "alpha",
+                    "relationships": [
+                        edge("control_flow", "calls", "irrelevant"),
+                        edge("control_flow", "emits", "cancellation"),
+                        edge("callers_consumers", "consumed_by", "cancellation_one"),
+                        edge("callers_consumers", "consumed_by", "cancellation_two"),
+                        edge("callers_consumers", "consumed_by", "cancellation_three"),
+                        {
+                            **edge("tests_contracts", "validated_by", "z"),
+                            "evidence": [{"path": "z.rs", "symbol": "effect"}],
+                        },
+                        {
+                            **edge("tests_contracts", "validated_by", "a"),
+                            "evidence": [{"path": "a.rs", "symbol": "effect"}],
+                        },
+                    ],
+                    "invariants": [
+                        {
+                            "id": name,
+                            "kind": "semantic",
+                            "statement": statement,
+                            "evidence": [{"path": f"{name}.rs"}],
+                            "tests": [f"{name}.rs"],
+                        }
+                        for name, statement in (
+                            ("a", "Unrelated behavior stays stable."),
+                            ("z", "Cancellation prevents updates."),
+                        )
+                    ],
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            result = source_owners.architecture_slice(
+                manifest,
+                "digest",
+                Path(directory),
+                ["alpha"],
+                max_relationships=6,
+                focus="cancellation",
+            )
+        self.assertEqual(
+            [
+                edge["target"]
+                for edge in result["control_and_data_flow"]["relationships"]
+            ],
+            ["path:cancellation.rs"],
+        )
+        self.assertEqual(
+            [
+                edge["target"]
+                for edge in result["callers_and_consumers"]["relationships"]
+            ],
+            [
+                "path:cancellation_one.rs",
+                "path:cancellation_three.rs",
+                "path:cancellation_two.rs",
+            ],
+        )
+        self.assertEqual(
+            result["invariants"]["relationships"][0]["target"], "contract:z"
+        )
+        self.assertEqual(
+            result["tests_and_contracts"]["representative_scenario"]["target"],
+            "path:z.rs",
+        )
+        self.assertEqual(result["omitted_relationships"], 3)
 
     def test_architecture_slice_ranks_focus_before_relationship_cap(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1269,6 +1921,58 @@ tests = ["src/lib.rs"]
                         ),
                         f"{facet} did not contain {needle!r}",
                     )
+
+    def test_exact_runtime_paths_route_to_behavioral_tests(self) -> None:
+        cases = [
+            (
+                "codex-rs/core/src/session/turn.rs",
+                "turn-orchestration",
+                "test(session::turn::tests)",
+                "mid_turn_compaction_failure_preserves_completed_message",
+            ),
+            (
+                "codex-rs/utils/output-truncation/src/lib.rs",
+                "output-truncation",
+                "test(truncate_tests)",
+                "formatted_token_policies_bound_dense_output_including_metadata",
+            ),
+        ]
+        for path, owner, test_filter, scenario in cases:
+            with self.subTest(path=path):
+                with (
+                    mock.patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "source_owners.py",
+                            "slice",
+                            "--path",
+                            path,
+                            "--focus",
+                            "compaction failure and output token budgets",
+                        ],
+                    ),
+                    mock.patch("builtins.print") as emit,
+                ):
+                    self.assertEqual(source_owners.main(), 0)
+                result = json.loads(emit.call_args.args[0])
+                self.assertEqual(
+                    {
+                        entry["source"]
+                        for entry in result["registration_and_entrypoints"][
+                            "relationships"
+                        ]
+                        if entry["kind"] == "entrypoint"
+                    },
+                    {f"owner:{owner}"},
+                )
+                self.assertEqual(result["material_unknowns"], [])
+                self.assertEqual(
+                    result["control_and_data_flow"]["status"], "established"
+                )
+                tests = result["tests_and_contracts"]
+                self.assertIn(scenario, tests["representative_scenario"]["evidence"])
+                self.assertIn(test_filter, tests["focused_validation"][0]["argv"])
 
     def test_runtime_features_and_kd4_capabilities_have_distinct_owners(self) -> None:
         manifest, _ = source_owners.load_and_validate(

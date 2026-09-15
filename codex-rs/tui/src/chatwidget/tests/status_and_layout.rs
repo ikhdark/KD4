@@ -2469,6 +2469,7 @@ async fn status_line_context_used_renders_labeled_percent() {
     chat.thread_id = Some(ThreadId::new());
     chat.config.tui_status_line = Some(vec!["context-used".to_string()]);
 
+    handle_token_count(&mut chat, Some(make_token_info(0, 200_000)));
     chat.refresh_status_line();
 
     assert_eq!(status_line_text(&chat), Some("Context 0% used".to_string()));
@@ -2484,6 +2485,7 @@ async fn status_line_context_remaining_renders_labeled_percent() {
     chat.thread_id = Some(ThreadId::new());
     chat.config.tui_status_line = Some(vec!["context-remaining".to_string()]);
 
+    handle_token_count(&mut chat, Some(make_token_info(0, 200_000)));
     chat.refresh_status_line();
 
     assert_eq!(
@@ -2502,6 +2504,7 @@ async fn status_line_legacy_context_usage_renders_context_used_percent() {
     chat.thread_id = Some(ThreadId::new());
     chat.config.tui_status_line = Some(vec!["context-usage".to_string()]);
 
+    handle_token_count(&mut chat, Some(make_token_info(0, 200_000)));
     chat.refresh_status_line();
 
     assert_eq!(status_line_text(&chat), Some("Context 0% used".to_string()));
@@ -2873,6 +2876,7 @@ async fn status_line_model_with_reasoning_includes_fast_for_fast_capable_models(
     set_chatgpt_auth(&mut chat);
     set_fast_mode_test_catalog(&mut chat);
     assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
+    handle_token_count(&mut chat, Some(make_token_info(0, 200_000)));
     chat.refresh_status_line();
     let test_cwd = test_path_display("/tmp/project");
 
@@ -3038,6 +3042,7 @@ async fn status_line_model_with_reasoning_fast_footer_snapshot() {
     set_chatgpt_auth(&mut chat);
     set_fast_mode_test_catalog(&mut chat);
     assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
+    handle_token_count(&mut chat, Some(make_token_info(0, 200_000)));
     chat.refresh_status_line();
 
     let width = 80;
@@ -3072,6 +3077,7 @@ async fn status_line_model_with_reasoning_context_remaining_footer_snapshot() {
     set_chatgpt_auth(&mut chat);
     set_fast_mode_test_catalog(&mut chat);
     assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
+    handle_token_count(&mut chat, Some(make_token_info(0, 200_000)));
     chat.refresh_status_line();
 
     let width = 80;
@@ -4537,8 +4543,7 @@ fn notification_preview_preserves_unicode_and_whitespace_at_limit() {
         "\n\t ".to_string(),
     ] {
         let normalized = response.split_whitespace().collect::<Vec<_>>().join(" ");
-        let expected = (!normalized.is_empty())
-            .then(|| truncate_text(&normalized, 200));
+        let expected = (!normalized.is_empty()).then(|| truncate_text(&normalized, 200));
         assert_eq!(Notification::agent_turn_preview(&response), expected);
     }
 }

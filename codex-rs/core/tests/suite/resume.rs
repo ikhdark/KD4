@@ -65,7 +65,16 @@ async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .disable(codex_features::Feature::CodeMode)
+            .expect("disable Code Mode for the resume fixture model");
+        config
+            .features
+            .disable(codex_features::Feature::CodeModeOnly)
+            .expect("disable Code Mode only mode");
+    });
     let initial = builder.build(&server).await?;
     let codex = Arc::clone(&initial.codex);
     let home = initial.home.clone();
@@ -159,6 +168,14 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
         config.show_raw_agent_reasoning = true;
+        config
+            .features
+            .disable(codex_features::Feature::CodeMode)
+            .expect("disable Code Mode for the resume fixture model");
+        config
+            .features
+            .disable(codex_features::Feature::CodeModeOnly)
+            .expect("disable Code Mode only mode");
     });
     let initial = builder.build(&server).await?;
     let codex = Arc::clone(&initial.codex);

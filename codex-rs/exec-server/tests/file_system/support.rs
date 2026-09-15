@@ -99,8 +99,16 @@ pub(crate) fn workspace_write_sandbox(
 }
 
 fn sandbox_context(entries: Vec<FileSystemSandboxEntry>) -> FileSystemSandboxContext {
-    FileSystemSandboxContext::from_permission_profile(PermissionProfile::from_runtime_permissions(
-        &FileSystemSandboxPolicy::restricted(entries),
-        NetworkSandboxPolicy::Restricted,
-    ))
+    let context = FileSystemSandboxContext::from_permission_profile(
+        PermissionProfile::from_runtime_permissions(
+            &FileSystemSandboxPolicy::restricted(entries),
+            NetworkSandboxPolicy::Restricted,
+        ),
+    );
+    #[cfg(windows)]
+    let context = FileSystemSandboxContext {
+        windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Elevated,
+        ..context
+    };
+    context
 }

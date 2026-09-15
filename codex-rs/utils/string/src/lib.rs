@@ -79,7 +79,6 @@ fn parse_markdown_hash_location_point(point: &str) -> Option<(&str, Option<&str>
 }
 
 #[cfg(test)]
-#[allow(warnings, clippy::all)]
 mod tests {
     use super::normalize_markdown_hash_location_suffix;
     use super::sanitize_metric_tag_value;

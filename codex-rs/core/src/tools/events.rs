@@ -548,7 +548,9 @@ impl ToolEmitter {
                 (event, result)
             }
             Err(ToolError::Codex(err)) => {
-                let message = format!("execution error: {err:?}");
+                let message = format!("execution error: {err}");
+                let message =
+                    truncate_middle_with_token_budget(&message, REJECTION_OUTPUT_MAX_TOKENS).0;
                 let event = ToolEventStage::Failure(ToolEventFailure::Message(message.clone()));
                 let result = Err(FunctionCallError::RespondToModel(message));
                 (event, result)
@@ -672,16 +674,12 @@ async fn emit_exec_stage(
                 mutation,
                 crate::turn_diff_tracker::CommandMutation::Uncertain
             ) {
-                let baseline = match native_cwd.as_ref() {
-                    Some(cwd) => {
-                        ctx.session
-                            .services
-                            .git_workspace
-                            .workspace_evidence_identity(cwd.as_path())
-                            .await
-                    }
-                    None => None,
-                };
+                let baseline = ctx
+                    .session
+                    .services
+                    .git_workspace
+                    .workspace_evidence_for_uri(ctx.turn, exec_input.cwd, exec_input.environment_id)
+                    .await;
                 ctx.session
                     .services
                     .command_execution
@@ -920,16 +918,12 @@ async fn emit_exec_end(
         mutation = if exec_result.status == ExecCommandStatus::Declined {
             crate::turn_diff_tracker::CommandMutation::ReadOnly
         } else {
-            let current = match native_cwd.as_ref() {
-                Some(cwd) => {
-                    ctx.session
-                        .services
-                        .git_workspace
-                        .workspace_evidence_identity(cwd.as_path())
-                        .await
-                }
-                None => None,
-            };
+            let current = ctx
+                .session
+                .services
+                .git_workspace
+                .workspace_evidence_for_uri(ctx.turn, exec_input.cwd, exec_input.environment_id)
+                .await;
             let workspace_changed =
                 observed_workspace_identity_changed(baseline.as_ref(), current.as_ref());
             observed_workspace_identity = current;
@@ -961,16 +955,11 @@ async fn emit_exec_end(
             workspace_identity_required,
             observed_workspace_identity.as_ref(),
         ) {
-        match native_cwd.as_ref() {
-            Some(cwd) => {
-                ctx.session
-                    .services
-                    .git_workspace
-                    .workspace_evidence_identity(cwd.as_path())
-                    .await
-            }
-            None => None,
-        }
+        ctx.session
+            .services
+            .git_workspace
+            .workspace_evidence_for_uri(ctx.turn, exec_input.cwd, exec_input.environment_id)
+            .await
     } else {
         observed_workspace_identity
     };
@@ -1151,7 +1140,12 @@ async fn emit_patch_end(
         let current_workspace_identity = if affected_paths.is_some() && !mutation_deferred {
             match evidence_cwd.as_ref() {
                 Some(cwd) => {
-                    crate::git_workspace::capture_workspace_evidence_identity(cwd.as_path()).await
+                    ctx.session
+                        .services
+                        .git_workspace
+                        .workspace_evidence_for_turn(ctx.turn, cwd.as_path())
+                        .await
+                        .identity
                 }
                 None => None,
             }
@@ -1695,6 +1689,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_execution_error_is_readable_and_bounded_for_model_and_event() {
+        let (session, turn, rx_event) =
+            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+        let message = format!(
+            "failure-head\n{}\nfailure-tail",
+            "diagnostic detail\n".repeat(2_000)
+        );
+        let error = ToolEmitter::ApplyPatch {
+            changes: HashMap::new(),
+            auto_approved: false,
+            environment_id: None,
+        }
+        .finish(
+            ToolEventCtx::new(session.as_ref(), turn.as_ref(), "call-id", None),
+            Err(ToolError::Codex(CodexErr::InvalidRequest(message.clone()))),
+            None,
+        )
+        .await
+        .expect_err("execution failure should be returned to the model");
+        let FunctionCallError::RespondToModel(text) = error else {
+            panic!("expected a model-visible execution error");
+        };
+        assert!(text.starts_with("execution error: failure-head\n"));
+        assert!(text.ends_with("failure-tail"));
+        assert!(text.len() < message.len());
+        assert!(!text.contains("InvalidRequest("));
+        assert!(!text.contains("\\n"));
+        let completed = rx_event.recv().await.expect("item completed event");
+        assert!(matches!(
+            completed.msg,
+            EventMsg::ItemCompleted(event)
+                if matches!(
+                    &event.item,
+                    TurnItem::FileChange(FileChangeItem {
+                        status: Some(PatchApplyStatus::Failed),
+                        stderr: Some(stderr),
+                        ..
+                    }) if stderr == &text
+                )
+        ));
+    }
+
+    #[tokio::test]
     async fn operational_apply_patch_rejection_is_reported_as_failed() {
         let (session, turn, rx_event) =
             make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
@@ -1829,7 +1866,8 @@ mod tests {
         let FunctionCallError::RespondToModel(model_text) = error else {
             panic!("expected model-visible command failure");
         };
-        assert!(model_text.contains("failure-focused lines, final status lines, tail"));
+        assert!(model_text.contains("error[E0599]: no method named `repair_bug` found"));
+        assert!(model_text.contains("build log 899"));
 
         let completed = rx_event.recv().await.expect("item completed event");
         let EventMsg::ItemCompleted(event) = completed.msg else {

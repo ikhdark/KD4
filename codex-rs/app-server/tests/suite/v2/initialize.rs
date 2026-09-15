@@ -236,7 +236,7 @@ async fn initialize_response_includes_local_runtime_metadata() -> Result<()> {
     let receipt_path = codex_home
         .path()
         .join("runtime/desktop-app-server-runtime.json");
-    fs_wait::wait_for_path_exists(&receipt_path, Duration::from_secs(5)).await?;
+    fs_wait::wait_for_path_exists(&receipt_path, DEFAULT_READ_TIMEOUT).await?;
     let receipt: Value = serde_json::from_slice(&std::fs::read(receipt_path)?)?;
     assert_eq!(receipt["schemaVersion"], 1);
     assert_eq!(receipt["clientName"], "codex_desktop");

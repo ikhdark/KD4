@@ -918,7 +918,7 @@ async fn pending_turn_router_reuses_session_cache_until_planning_changes() -> Re
         .await;
     let first = built_tools_for_pending_turn(
         session.as_ref(),
-        first_step.as_ref(),
+        &first_step,
         &[],
         planning_generation,
         &CancellationToken::new(),
@@ -929,7 +929,7 @@ async fn pending_turn_router_reuses_session_cache_until_planning_changes() -> Re
         .await;
     let second = built_tools_for_pending_turn(
         session.as_ref(),
-        second_step.as_ref(),
+        &second_step,
         &[],
         planning_generation,
         &CancellationToken::new(),
@@ -946,7 +946,7 @@ async fn pending_turn_router_reuses_session_cache_until_planning_changes() -> Re
     let changed_step = session.capture_step_context(turn_context).await;
     let changed = built_tools_for_pending_turn(
         session.as_ref(),
-        changed_step.as_ref(),
+        &changed_step,
         &[],
         changed_generation,
         &CancellationToken::new(),
@@ -1006,7 +1006,7 @@ async fn built_tools_uses_the_revision_tagged_on_the_step_mcp_snapshot() -> Resu
 
     let router = built_tools(
         session.as_ref(),
-        step_context.as_ref(),
+        &step_context,
         &[],
         &CancellationToken::new(),
     )
@@ -1212,6 +1212,7 @@ async fn kd4_latency_continuation_prefetch_skips_non_workspace_eager_read() {
         &turn_diff_tracker,
         Arc::clone(&git_workspace),
         turn_context.config.cwd.clone(),
+        turn_context.environments.clone(),
     )
     .await;
 
@@ -1248,6 +1249,7 @@ async fn continuation_prefetch_skips_non_workspace_code_mode_exec() {
         &turn_diff_tracker,
         Arc::clone(&git_workspace),
         turn_context.config.cwd.clone(),
+        turn_context.environments.clone(),
     )
     .await;
 
@@ -1282,6 +1284,7 @@ async fn kd4_latency_continuation_prefetch_preserves_workspace_evidence_read() {
         &turn_diff_tracker,
         Arc::clone(&git_workspace),
         turn_context.config.cwd.clone(),
+        turn_context.environments.clone(),
     )
     .await
     .expect("workspace evidence should start a continuation prefetch");
@@ -1946,8 +1949,6 @@ fn logical_generation_budget_allows_thirty_two_regular_and_one_terminal_generati
         budget.admit(/*terminal_requested*/ false),
         LogicalGenerationAdmission::Terminal { forced: true }
     );
-    assert!(LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE.contains("final tool-free"));
-    assert!(LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE.contains("forced terminal"));
     assert_eq!(
         budget.admit(/*terminal_requested*/ false),
         LogicalGenerationAdmission::Exhausted
@@ -1955,25 +1956,15 @@ fn logical_generation_budget_allows_thirty_two_regular_and_one_terminal_generati
 }
 
 #[tokio::test]
-async fn forced_terminal_budget_boundary_is_visible_in_history_and_events() {
+async fn forced_terminal_budget_boundary_warns_without_changing_history() {
     let (session, turn_context, events) =
         crate::session::tests::make_session_and_context_with_rx().await;
 
+    let history_before = session.clone_history().await;
     record_forced_terminal_budget_boundary(session.as_ref(), turn_context.as_ref()).await;
 
     let history = session.clone_history().await;
-    assert!(history.raw_items().iter().any(|item| {
-        matches!(
-            item,
-            ResponseItem::Message { role, content, .. }
-                if role == "developer"
-                    && content.iter().any(|item| matches!(
-                        item,
-                        ContentItem::InputText { text }
-                            if text == LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE
-                    ))
-        )
-    }));
+    assert_eq!(history.raw_items(), history_before.raw_items());
     let warning = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let event = events
@@ -1989,7 +1980,7 @@ async fn forced_terminal_budget_boundary_is_visible_in_history_and_events() {
     .expect("forced-terminal boundary emits a warning");
     assert_eq!(
         warning.message,
-        LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE
+        "This turn reached its limit of 32 regular model generations. The assistant will now summarize completed work and report anything unfinished. Send another message to continue the remaining work."
     );
 }
 
@@ -2018,6 +2009,39 @@ fn completion_pending_input_stays_in_the_sampling_loop_when_capacity_remains() {
     );
 }
 
+#[tokio::test]
+async fn enforced_convergence_warns_once_and_advisories_do_not_warn() {
+    let (session, turn_context, events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let mut decision = SamplingConvergenceDecision {
+        continuation: ContinuationDisposition::TerminalCompletionRequired,
+        directive: Some("Report the remaining work.".to_string()),
+        proven_loop_activated: true,
+        authoritative_wait: None,
+    };
+    record_convergence_decision(&session, &turn_context, Some(&mut decision)).await;
+    record_convergence_decision(&session, &turn_context, Some(&mut decision)).await;
+    let mut advisory = SamplingConvergenceDecision {
+        continuation: ContinuationDisposition::ModelRequired,
+        directive: Some("Try a different method.".to_string()),
+        proven_loop_activated: false,
+        authoritative_wait: None,
+    };
+    record_convergence_decision(&session, &turn_context, Some(&mut advisory)).await;
+    let mut warnings = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let EventMsg::Warning(warning) = event.msg {
+            warnings.push(warning.message);
+        }
+    }
+    assert_eq!(
+        warnings,
+        vec![
+            "This turn's tools were stopped after a repeated action/result cycle without state progress. The assistant will summarize the available evidence and report anything unfinished."
+        ]
+    );
+}
+
 #[test]
 fn logical_generation_budget_terminal_attempt_is_exactly_once() {
     let mut budget = LogicalGenerationBudget::default();
@@ -2029,6 +2053,29 @@ fn logical_generation_budget_terminal_attempt_is_exactly_once() {
         budget.admit(/*terminal_requested*/ true),
         LogicalGenerationAdmission::Exhausted
     );
+}
+
+#[test]
+fn logical_generation_budget_new_user_input_reopens_terminal_without_resetting_regular_limit() {
+    let mut budget = LogicalGenerationBudget::default();
+    for _ in 0..3 {
+        assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
+    }
+    assert_eq!(
+        budget.admit(true),
+        LogicalGenerationAdmission::Terminal { forced: false }
+    );
+    assert!(!budget.can_admit(true));
+    budget.accepted_user_input();
+    assert!(budget.can_admit(true));
+    for _ in 3..MAX_REGULAR_LOGICAL_GENERATIONS {
+        assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
+    }
+    assert_eq!(
+        budget.admit(false),
+        LogicalGenerationAdmission::Terminal { forced: true }
+    );
+    assert_eq!(budget.admit(false), LogicalGenerationAdmission::Exhausted);
 }
 
 #[test]
@@ -2208,7 +2255,10 @@ async fn generation_budget_exhaustion_emits_one_status_affecting_error() {
     let EventMsg::Error(error) = event.msg else {
         panic!("expected generation budget error event");
     };
-    assert_eq!(error.message, LOGICAL_GENERATION_BUDGET_EXHAUSTED_MESSAGE);
+    assert_eq!(
+        error.message,
+        "This turn reached its generation budget (up to 32 regular model generations and one final summary) before all requested work completed. Send another message to continue the remaining work."
+    );
     assert!(error.affects_turn_status());
     assert_eq!(
         turn_context.terminal_error.lock().await.as_ref(),
@@ -2229,14 +2279,14 @@ async fn planning_failure_records_initial_input_and_emits_status_affecting_error
         client_id: Some("planning-failure-input".to_string()),
     }];
 
-    finish_pending_turn_planning_failure(
-        &session,
-        &turn_context,
-        &input,
-        planning_failure("injected test failure"),
-    )
-    .await
-    .expect("planning failure is surfaced as a terminal turn result");
+    let failure = planning_failure("injected test failure");
+    assert!(
+        !failure.is_retryable(),
+        "local planning errors must not retry the transport"
+    );
+    finish_pending_turn_planning_failure(&session, &turn_context, &input, failure)
+        .await
+        .expect("planning failure is surfaced as a terminal turn result");
 
     let error = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -2252,6 +2302,7 @@ async fn planning_failure_records_initial_input_and_emits_status_affecting_error
     .await
     .expect("planning failure emits an error event");
     assert!(error.message.contains("pending-turn planning failure"));
+    assert_eq!(error.codex_error_info, Some(CodexErrorInfo::Other));
     assert!(error.affects_turn_status());
     assert_eq!(
         turn_context.terminal_error.lock().await.as_ref(),
@@ -2949,15 +3000,22 @@ fn streamed_item_with_empty_id_gets_a_generated_id() -> Result<()> {
 
 async fn streamed_item_with_empty_id_gets_a_generated_id_impl() -> Result<()> {
     core_test_support::skip_if_no_network!(Ok(()));
+    for provider_id in ["", "msg_sctx_provider", "ordinary-provider-id"] {
+        assert_streamed_item_id(provider_id).await?;
+    }
+    Ok(())
+}
+
+async fn assert_streamed_item_id(provider_id: &str) -> Result<()> {
     let server = responses::start_mock_server().await;
     let test = test_codex().build(&server).await?;
     let response_mock = responses::mount_sse_once(
         &server,
         responses::sse(vec![
             responses::ev_response_created("response-1"),
-            responses::ev_message_item_added("", ""),
+            responses::ev_message_item_added(provider_id, ""),
             responses::ev_output_text_delta("streamed"),
-            responses::ev_assistant_message("", "streamed"),
+            responses::ev_assistant_message(provider_id, "streamed"),
             responses::ev_completed("response-1"),
         ]),
     )
@@ -2993,7 +3051,11 @@ async fn streamed_item_with_empty_id_gets_a_generated_id_impl() -> Result<()> {
     })
     .await;
 
-    assert!(started_id.starts_with("msg_"));
+    match provider_id {
+        "" => assert!(started_id.starts_with("msg_")),
+        "msg_sctx_provider" => assert_eq!(started_id, "msg_msg_sctx_provider"),
+        id => assert_eq!(started_id, id),
+    }
     assert_eq!(started_id, completed_id);
     response_mock.single_request();
     Ok(())
@@ -3007,10 +3069,345 @@ fn non_openai_model_provider(server: &wiremock::MockServer) -> ModelProviderInfo
     provider
 }
 
+#[test]
+fn generation_budget_survives_reentry_and_terminal_directive_is_request_local() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "generation_budget_survives_reentry_and_terminal_directive_is_request_local",
+        generation_budget_survives_reentry_and_terminal_directive_is_request_local_impl,
+    )
+}
+
+async fn generation_budget_survives_reentry_and_terminal_directive_is_request_local_impl()
+-> Result<()> {
+    core_test_support::skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let mut sequence = (0..30)
+        .map(|i| {
+            let id = format!("regular-{i}");
+            responses::sse(vec![
+                responses::ev_response_created(&id),
+                responses::ev_function_call(&id, "unknown_test_tool", "{}"),
+                responses::ev_completed(&id),
+            ])
+        })
+        .collect::<Vec<_>>();
+    sequence.push(responses::sse(vec![
+        responses::ev_assistant_message("reentry", "ready for reentry"),
+        responses::ev_completed("reentry"),
+    ]));
+    sequence.push(responses::sse(vec![
+        responses::ev_function_call("after-reentry", "unknown_test_tool", "{}"),
+        responses::ev_completed("after-reentry"),
+    ]));
+    for id in ["terminal", "next-turn"] {
+        sequence.push(responses::sse(vec![
+            responses::ev_assistant_message(id, id),
+            responses::ev_completed(id),
+        ]));
+    }
+    let requests = responses::mount_sse_sequence(&server, sequence).await;
+    let mut builder = test_codex()
+        .with_pre_build_hook(|home| {
+            let ready =
+                serde_json::to_string(&home.join("reentry.ready").to_string_lossy()).unwrap();
+            let release =
+                serde_json::to_string(&home.join("reentry.release").to_string_lossy()).unwrap();
+            let script_path = home.join("reentry_hook.py");
+            fs::write(
+                &script_path,
+                format!(
+                    r#"import json, sys, time
+from pathlib import Path
+json.load(sys.stdin)
+ready, release = Path({ready}), Path({release})
+if not ready.exists():
+    ready.write_text("ready")
+    deadline = time.monotonic() + 20
+    while not release.exists():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("reentry input was never queued")
+        time.sleep(0.01)
+    print(json.dumps({{"continue": False, "stopReason": "reenter queued input"}}))
+else:
+    print("{{}}")
+"#
+                ),
+            )
+            .unwrap();
+            fs::write(
+                home.join("hooks.json"),
+                serde_json::json!({
+                    "hooks": {"Stop": [{"hooks": [{
+                        "type": "command",
+                        "command": format!("python3 \"{}\"", script_path.display()),
+                        "commandWindows": format!("python \"{}\"", script_path.display()),
+                    }]}]}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        })
+        .with_config(|config| {
+            trust_discovered_hooks(config);
+            config.model_auto_compact_token_limit = Some(i64::MAX);
+            // Exercise the hard task budget without an earlier convergence
+            // decision terminating this intentionally repetitive fixture.
+            config
+                .features
+                .disable(Feature::Kd4Runtime)
+                .expect("disable the separate convergence policy");
+        });
+    let test = builder.build(&server).await?;
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "keep working".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !test.codex_home_path().join("reentry.ready").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    assert_eq!(
+        requests.requests().len(),
+        31,
+        "reentry follows 31 generations"
+    );
+    // Queue input while Stop holds the first run_turn at its completion boundary.
+    // The hook ends that invocation, so RegularTask must drain and reenter it.
+    test.codex
+        .steer_input(
+            vec![UserInput::Text {
+                text: "queued reentry input".to_string(),
+                text_elements: Vec::new(),
+            }],
+            Default::default(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("steer input is accepted by the active regular task");
+    fs::write(test.codex_home_path().join("reentry.release"), "release")?;
+    let last_message = core_test_support::wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnComplete(event) => Some(event.last_agent_message.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(last_message.as_deref(), Some("terminal"));
+    assert_eq!(
+        requests.requests().len(),
+        33,
+        "one task admits 32 regular requests and one terminal request across reentry"
+    );
+    assert!(requests.requests()[31].body_contains_text("queued reentry input"));
+
+    test.submit_turn("start a fresh turn").await?;
+    let sent = requests.requests();
+    assert_eq!(
+        sent.len(),
+        34,
+        "the terminal request cannot trigger another generation"
+    );
+    for (index, request) in sent.iter().enumerate() {
+        let terminal = index == 32;
+        assert_eq!(
+            request.body_contains_text(LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE),
+            terminal,
+            "the terminal instruction must not persist in history or leak into a fresh turn"
+        );
+        assert_eq!(
+            request.body_json()["tools"]
+                .as_array()
+                .expect("tools array")
+                .is_empty(),
+            terminal
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn mid_turn_compaction_failure_preserves_completed_message() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "mid_turn_compaction_failure_preserves_completed_message",
+        mid_turn_compaction_failure_preserves_completed_message_impl,
+    )
+}
+
+async fn mid_turn_compaction_failure_preserves_completed_message_impl() -> Result<()> {
+    core_test_support::skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let requests = responses::mount_response_sequence(
+        &server,
+        vec![
+            responses::sse_response(responses::sse(vec![
+                responses::ev_response_created("before-compaction"),
+                responses::ev_assistant_message("completed-work", "The first result is ready."),
+                responses::ev_function_call("continue-work", "unknown_test_tool", "{}"),
+                responses::ev_completed_with_tokens("before-compaction", 95_001),
+            ])),
+            ResponseTemplate::new(400)
+                .set_body_json(serde_json::json!({"detail": "permanent compaction failure"})),
+        ],
+    )
+    .await;
+    let provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = provider;
+        config.model_provider.request_max_retries = Some(0);
+        config.model_provider.stream_max_retries = Some(0);
+        config.compact_prompt = Some(codex_prompts::SUMMARIZATION_PROMPT.to_string());
+        config.model_context_window = Some(100_000);
+        config.model_auto_compact_token_limit = Some(90_000);
+    });
+    let test = builder.build(&server).await?;
+    let completion = test
+        .submit_turn_and_capture_completion("Produce a result, then continue working.")
+        .await?;
+    assert!(
+        completion.error.is_some(),
+        "compaction failure must remain visible"
+    );
+    assert_eq!(
+        completion.last_agent_message.as_deref(),
+        Some("The first result is ready.")
+    );
+    let requests = requests.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "failure must not dispatch another generation"
+    );
+    assert!(
+        requests[1]
+            .function_call_output_text("continue-work")
+            .is_some(),
+        "compaction follows the completed tool result"
+    );
+    Ok(())
+}
+
+#[test]
+fn deterministic_protocol_completion_does_not_count_a_cancelled_generation() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "deterministic_protocol_completion_does_not_count_a_cancelled_generation",
+        deterministic_protocol_completion_does_not_count_a_cancelled_generation_impl,
+    )
+}
+
+async fn deterministic_protocol_completion_does_not_count_a_cancelled_generation_impl() -> Result<()>
+{
+    core_test_support::skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let mut completed = responses::ev_completed("protocol-only");
+    completed["response"]["end_turn"] = serde_json::json!(false);
+    let request = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("protocol-only"),
+            responses::ev_assistant_message("answer", "Finished."),
+            completed,
+        ]),
+    )
+    .await;
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::Kd4Runtime)
+            .expect("enable KD4 runtime");
+    });
+    let test = builder.build(&server).await?;
+    let completion = test
+        .submit_turn_and_capture_completion("Return the answer.")
+        .await?;
+    assert!(completion.error.is_none(), "{completion:?}");
+    assert_eq!(completion.last_agent_message.as_deref(), Some("Finished."));
+    let timing = completion.timing.expect("completed turn timing");
+    assert_eq!(timing.counters.residual_deterministic_generation_count, 0);
+    request.single_request();
+    Ok(())
+}
+
 fn complete_compaction_summary(state: &str) -> String {
     format!(
         "## Goal\nresume the pending turn\n\n## Current state\n{state}\n\n## Completed work\nseed turn completed\n\n## Unresolved work\npending input remains\n\n## Evidence\nmock compaction response\n\n## Next action\nsample the pending input"
     )
+}
+
+#[test]
+fn compaction_that_remains_over_limit_is_not_a_retryable_stream_error() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "compaction_that_remains_over_limit_is_not_a_retryable_stream_error",
+        compaction_that_remains_over_limit_is_not_a_retryable_stream_error_impl,
+    )
+}
+
+async fn compaction_that_remains_over_limit_is_not_a_retryable_stream_error_impl() -> Result<()> {
+    core_test_support::skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let requests = responses::mount_sse_sequence(
+        &server,
+        vec![responses::sse(vec![
+            responses::ev_response_created("compaction"),
+            responses::ev_assistant_message(
+                "summary",
+                &complete_compaction_summary("work remains"),
+            ),
+            responses::ev_completed("compaction"),
+        ])],
+    )
+    .await;
+    let home = tempfile::tempdir()?;
+    let provider = non_openai_model_provider(&server);
+    let (session, turn_context, _) =
+        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+            CodexAuth::from_api_key("test key"),
+            Vec::new(),
+            home.path(),
+            move |config| {
+                config.model_provider = provider;
+                config.model_provider.stream_max_retries = Some(0);
+                config.model_auto_compact_token_limit = Some(1);
+                config.model_auto_compact_token_limit_scope =
+                    codex_protocol::config_types::AutoCompactTokenLimitScope::Total;
+            },
+        )
+        .await;
+    let step = session
+        .capture_step_context(Arc::clone(&turn_context))
+        .await;
+    let mut client = session.services.model_client.new_session();
+    let error = run_auto_compact(
+        &session,
+        step,
+        None,
+        &mut client,
+        None,
+        InitialContextInjection::DoNotInject,
+        CompactionReason::ContextLimit,
+        CompactionPhase::MidTurn,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect_err("the preserved context cannot fit in a single token");
+    assert!(
+        error
+            .to_string()
+            .contains("Compaction did not bring the context below")
+    );
+    assert!(!error.is_retryable());
+    assert_eq!(error.to_codex_protocol_error(), CodexErrorInfo::Other);
+    assert_eq!(requests.requests().len(), 1);
+    Ok(())
 }
 
 fn write_one_shot_stop_hook(home: &Path) -> Result<()> {
@@ -6061,15 +6458,119 @@ fn pending_turn_mechanism_retries_remain_bounded_without_fixed_point_state() {
     assert!(advance_pending_turn_plan_iteration(&mut iterations).is_err());
 }
 
-#[test]
-fn pending_turn_stale_builds_consume_iteration_budget() {
+#[tokio::test]
+async fn pending_turn_exhausted_budget_stops_before_history_or_snapshot_work() {
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let mut client = session.services.model_client.new_session();
+    let mut iterations = MAX_PENDING_TURN_PLAN_ITERATIONS;
+    let mut completed_effect = None;
+    // Any history inspection or step capture would wait on this state owner.
+    let state = session.state.lock().await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        stabilize_pending_turn_plan(
+            &session,
+            &turn_context,
+            &[],
+            &mut client,
+            &mut iterations,
+            &mut completed_effect,
+            &CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("exhausted planning must stop before waiting for session state");
+    drop(state);
+
+    assert!(
+        matches!(result, Err(CodexErr::Fatal(message)) if message.contains("did not stabilize after 8 iterations"))
+    );
+    assert_eq!(completed_effect, None);
+    assert_eq!(
+        turn_context
+            .turn_timing_state
+            .complete_snapshot()
+            .profile
+            .counters
+            .planning_failure_count,
+        1
+    );
+    assert!(session.clone_history().await.raw_items().is_empty());
+}
+
+#[tokio::test]
+async fn pending_turn_missing_inventory_records_a_planning_failure() {
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let mut client = session.services.model_client.new_session();
     let mut iterations = 0;
+    let mut completed_effect = Some((
+        "installed-probe".to_string(),
+        Some(HashSet::from(["absent-inventory-key".to_string()])),
+    ));
+    let result = stabilize_pending_turn_plan(
+        &session,
+        &turn_context,
+        &[],
+        &mut client,
+        &mut iterations,
+        &mut completed_effect,
+        &CancellationToken::new(),
+    )
+    .await;
 
-    for _ in 0..MAX_PENDING_TURN_PLAN_ITERATIONS {
-        charge_pending_turn_plan_build((), &mut iterations).expect("within retry bound");
-    }
+    assert!(matches!(
+        result,
+        Err(CodexErr::Fatal(message)) if message.contains("installed-probe")
+            && message.contains("missing its expected model-visible state")
+    ));
+    assert_eq!(
+        turn_context
+            .turn_timing_state
+            .complete_snapshot()
+            .profile
+            .counters
+            .planning_failure_count,
+        1
+    );
+    assert!(session.clone_history().await.raw_items().is_empty());
+}
 
-    assert!(charge_pending_turn_plan_build((), &mut iterations).is_err());
+#[tokio::test]
+async fn pending_turn_cancelled_before_planning_does_not_charge_budget() {
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let mut client = session.services.model_client.new_session();
+    let mut iterations = 0;
+    let mut completed_effect = None;
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let state = session.state.lock().await;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        stabilize_pending_turn_plan(
+            &session,
+            &turn_context,
+            &[],
+            &mut client,
+            &mut iterations,
+            &mut completed_effect,
+            &cancellation,
+        ),
+    )
+    .await
+    .expect("cancelled planning must not wait for session state");
+    drop(state);
+
+    assert!(matches!(result, Err(CodexErr::TurnAborted)));
+    assert_eq!(iterations, 0);
+    assert_eq!(completed_effect, None);
+    assert!(session.clone_history().await.raw_items().is_empty());
 }
 
 #[test]

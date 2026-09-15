@@ -513,6 +513,7 @@ async fn turn_start_keeps_identical_input_in_distinct_conversations_independent(
     for _ in 0..3 {
         let id = mcp
             .send_thread_start_request_with_auto_env(ThreadStartParams {
+                approval_policy: Some(codex_app_server_protocol::AskForApproval::OnRequest),
                 model: Some("mock-model".to_string()),
                 ..Default::default()
             })
@@ -745,24 +746,20 @@ async fn turn_start_emits_thread_scoped_warning_notification_for_trimmed_skills(
         .to_string();
     // Keep the metadata budget small enough to trim the test skills without triggering
     // pre-sampling compaction, which is outside this notification contract.
-    entry["context_window"] = serde_json::Value::from(15_000);
+    entry["context_window"] = serde_json::Value::from(64_000);
     std::fs::write(&cache_path, serde_json::to_string_pretty(&cache)?)?;
     let config_path = codex_home.path().join("config.toml");
     let config = std::fs::read_to_string(&config_path)?;
     std::fs::write(
         &config_path,
-        format!("model_context_window = 15000\n{config}"),
+        format!("model_context_window = 64000\n{config}"),
     )?;
-    write_test_skill(codex_home.path(), "alpha-skill")?;
-    write_test_skill(codex_home.path(), "beta-skill")?;
-    write_test_skill(codex_home.path(), "gamma-skill")?;
-    write_test_skill(codex_home.path(), "delta-skill")?;
-    write_test_skill(codex_home.path(), "epsilon-skill")?;
-    write_test_skill(codex_home.path(), "zeta-skill")?;
-    write_test_skill(codex_home.path(), "eta-skill")?;
-    write_test_skill(codex_home.path(), "theta-skill")?;
-    write_test_skill(codex_home.path(), "iota-skill")?;
-    write_test_skill(codex_home.path(), "kappa-skill")?;
+    // Each catalog description is capped at 240 characters before budgeting.
+    // Thirty-two entries exceed the 1,280-token budget while their names and
+    // locators still fit, exercising shortening without omitting any skills.
+    for index in 0..32 {
+        write_test_skill(codex_home.path(), &format!("test-skill-{index:02}"))?;
+    }
 
     let isolated_home = codex_home.path().to_string_lossy();
     let mut mcp = TestAppServer::builder()
@@ -1049,6 +1046,7 @@ async fn turn_start_tracks_thread_originator_in_analytics() -> Result<()> {
     mount_analytics_capture(&server, codex_home.path()).await?;
 
     let mut mcp = TestAppServer::builder()
+        .with_args(&["-c", "analytics.enabled=true"])
         .with_codex_home(codex_home.path())
         .without_managed_config()
         .build()
@@ -1186,6 +1184,7 @@ async fn turn_profile_tracks_blocking_tool_and_follow_up_sampling() -> Result<()
 
     let thread_req = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
+            approval_policy: Some(codex_app_server_protocol::AskForApproval::OnRequest),
             model: Some("mock-model".to_string()),
             ..Default::default()
         })
@@ -1430,6 +1429,16 @@ async fn turn_start_rejects_invalid_permission_selection_before_starting_turn() 
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
+        .with_env_overrides(&[(
+            "CODEX_APP_SERVER_MANAGED_CONFIG_PATH",
+            Some(
+                codex_home
+                    .path()
+                    .join("managed_config.toml")
+                    .to_string_lossy()
+                    .as_ref(),
+            ),
+        )])
         .build()
         .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
@@ -2018,6 +2027,7 @@ async fn turn_start_change_personality_mid_thread_v2() -> Result<()> {
     let thread_req = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("exp-codex-personality".to_string()),
+            personality: Some(Personality::None),
             ..Default::default()
         })
         .await?;
@@ -2337,19 +2347,16 @@ async fn turn_start_exec_approval_decline_v2() -> Result<()> {
     let tmp = TempDir::new()?;
     let codex_home = tmp.path().to_path_buf();
 
-    let responses = vec![
-        create_shell_command_sse_response(
-            vec![
-                "python3".to_string(),
-                "-c".to_string(),
-                "print(42)".to_string(),
-            ],
-            /*workdir*/ None,
-            Some(5000),
-            "call-decline",
-        )?,
-        create_final_assistant_message_sse_response("done")?,
-    ];
+    let responses = vec![create_shell_command_sse_response(
+        vec![
+            "python3".to_string(),
+            "-c".to_string(),
+            "print(42)".to_string(),
+        ],
+        /*workdir*/ None,
+        Some(5000),
+        "call-decline",
+    )?];
     let server = create_mock_responses_server_sequence(responses).await;
     create_config_toml(
         codex_home.as_path(),
@@ -2496,7 +2503,6 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
             Some(5000),
             "call-first",
         )?,
-        create_final_assistant_message_sse_response("done first")?,
         create_shell_command_sse_response(
             vec!["echo".to_string(), "second".to_string(), "turn".to_string()],
             /*workdir*/ None,
@@ -2551,7 +2557,7 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
             approval_policy: Some(codex_app_server_protocol::AskForApproval::Never),
             approvals_reviewer: None,
             sandbox_policy: Some(codex_app_server_protocol::SandboxPolicy::WorkspaceWrite {
-                writable_roots: vec![first_cwd.try_into()?],
+                writable_roots: vec![first_cwd.clone().try_into()?],
                 network_access: false,
                 exclude_tmpdir_env_var: true,
                 exclude_slash_tmp: true,
@@ -2572,6 +2578,29 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
         mcp.read_stream_until_response_message(RequestId::Integer(first_turn)),
     )
     .await??;
+    let rejected_command = timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let notification = mcp
+                .read_stream_until_notification_message("item/completed")
+                .await?;
+            let completed: ItemCompletedNotification =
+                serde_json::from_value(notification.params.expect("item/completed params"))?;
+            if let ThreadItem::CommandExecution {
+                cwd,
+                status,
+                exit_code,
+                ..
+            } = completed.item
+            {
+                assert_eq!(cwd.as_str(), first_cwd.to_string_lossy().as_ref());
+                assert_eq!(status, CommandExecutionStatus::Declined);
+                assert_eq!(exit_code, Some(-1));
+                return Ok::<_, anyhow::Error>(());
+            }
+        }
+    })
+    .await?;
+    rejected_command?;
     timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/completed"),
@@ -2579,7 +2608,7 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
     .await??;
     mcp.clear_message_buffer();
 
-    // second turn with workspace-write and second_cwd, ensure exec begins in second_cwd
+    // Switching to full access admits execution in the second cwd.
     let second_turn = mcp
         .send_turn_start_request(TurnStartParams {
             environments: None,
@@ -3847,12 +3876,15 @@ async fn turn_start_file_change_approval_accept_for_session_persists_v2() -> Res
         create_final_assistant_message_sse_response("patch 2 applied")?,
     ];
     let server = create_mock_responses_server_sequence(responses).await;
-    create_config_toml(
+    create_config_toml_with_sandbox(
         &codex_home,
         &server.uri(),
         "untrusted",
         &BTreeMap::default(),
+        "danger-full-access",
     )?;
+
+    let model_slug = write_apply_patch_models_cache(&codex_home)?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(&codex_home)
@@ -3862,7 +3894,7 @@ async fn turn_start_file_change_approval_accept_for_session_persists_v2() -> Res
 
     let start_req = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
-            model: Some("mock-model".to_string()),
+            model: Some(model_slug.clone()),
             cwd: Some(workspace.to_string_lossy().into_owned()),
             ..Default::default()
         })
@@ -4018,17 +4050,17 @@ async fn turn_start_file_change_approval_decline_v2() -> Result<()> {
 +new line
 *** End Patch
 "#;
-    let responses = vec![
-        create_apply_patch_sse_response(patch, "patch-call")?,
-        create_final_assistant_message_sse_response("patch declined")?,
-    ];
+    let responses = vec![create_apply_patch_sse_response(patch, "patch-call")?];
     let server = create_mock_responses_server_sequence(responses).await;
-    create_config_toml(
+    create_config_toml_with_sandbox(
         &codex_home,
         &server.uri(),
         "untrusted",
         &BTreeMap::default(),
+        "danger-full-access",
     )?;
+
+    let model_slug = write_apply_patch_models_cache(&codex_home)?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(&codex_home)
@@ -4038,7 +4070,7 @@ async fn turn_start_file_change_approval_decline_v2() -> Result<()> {
 
     let start_req = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
-            model: Some("mock-model".to_string()),
+            model: Some(model_slug.clone()),
             cwd: Some(workspace.to_string_lossy().into_owned()),
             ..Default::default()
         })

@@ -12,6 +12,7 @@ use crate::tools::command_execution::CompletionApplyResult;
 use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::command_output_artifact::replace_raw_output_artifact;
 use crate::tools::context::ExecCommandToolOutput;
+use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
@@ -399,10 +400,11 @@ impl ExecCommandHandler {
         let validation_invocations = preflight.validation_invocations;
         let command_invocation = preflight.invocation;
         let repair_notice = preflight.repair_notice;
-        if repaired {
+        let invocation_changed = command_invocation != original_invocation;
+        if invocation_changed {
             args.replace_command_invocation(&command_invocation);
         }
-        let resolved_command = if repair_notice.is_some() {
+        let resolved_command = if invocation_changed {
             get_command_async(
                 &args,
                 Arc::clone(&shell),
@@ -700,12 +702,22 @@ impl ExecCommandHandler {
             .is_some_and(crate::tools::known_delta_store::PreparedKnownDelta::is_hit);
         let validation_attempt = validation_launch.is_some();
         if !known_delta_hit && !validation_attempt {
-            session
+            if let Err(blocked) = session
                 .services
                 .command_execution
                 .begin_attempt_with_freshness(&attempt_key, repaired, force_fresh)
                 .await
-                .map_err(|blocked| FunctionCallError::RespondToModel(blocked.render_for_model()))?;
+            {
+                if blocked.is_search_miss() {
+                    return Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                        blocked.render_for_model(),
+                        Some(true),
+                    )));
+                }
+                return Err(FunctionCallError::RespondToModel(
+                    blocked.render_for_model(),
+                ));
+            }
         }
         let interception_started_at = std::time::Instant::now();
         let intercepted = intercept_apply_patch(
@@ -757,6 +769,7 @@ impl ExecCommandHandler {
                         process_id: None,
                         exit_code: Some(0),
                         process_exited: true,
+                        search_no_match: false,
                         original_token_count: None,
                         hook_command: Some(hook_command),
                         raw_output_artifact: Some(raw_output_artifact),
@@ -959,6 +972,7 @@ impl ExecCommandHandler {
                     process_id: None,
                     exit_code: Some(output.exit_code),
                     process_exited: true,
+                    search_no_match: false,
                     original_token_count: Some(original_token_count),
                     hook_command: Some(hook_command),
                     raw_output_artifact: Some(finalized_artifact),
@@ -1149,6 +1163,6 @@ fn exec_command_error_output(
     error: &UnifiedExecError,
     repair: &str,
 ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
-    let message = format!("exec_command failed for `{command_for_display}`: {error:?}{repair}");
+    let message = format!("exec_command failed for `{command_for_display}`: {error}{repair}");
     Err(FunctionCallError::RespondToModel(message))
 }

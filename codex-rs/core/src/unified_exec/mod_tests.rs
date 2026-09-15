@@ -296,6 +296,7 @@ async fn write_stdin_yield_deadlines_include_reaction_and_cap_background_wait() 
         ProcessEntry {
             process: Arc::clone(&process),
             command_execution_id: Default::default(),
+            search_exit_one_is_no_match: false,
             parent_tool_execution_id: Default::default(),
             call_id: "write-stdin-deadline".to_string(),
             process_id,
@@ -324,6 +325,21 @@ async fn write_stdin_yield_deadlines_include_reaction_and_cap_background_wait() 
     );
     assert_eq!(output.wall_time, Duration::from_millis(MIN_YIELD_TIME_MS));
     assert_eq!(output.process_id, Some(process_id));
+
+    let started_at = Instant::now();
+    let output = write_stdin(&session, process_id, "", /*yield_time_ms*/ 0).await?;
+    assert_eq!(
+        Instant::now().saturating_duration_since(started_at),
+        Duration::from_millis(MIN_EMPTY_YIELD_TIME_MS)
+    );
+    assert_eq!(
+        output.wall_time,
+        Duration::from_millis(MIN_EMPTY_YIELD_TIME_MS)
+    );
+    assert!(output.raw_output.is_empty());
+    assert_eq!(output.process_id, Some(process_id));
+    assert_eq!(output.exit_code, None);
+    assert!(!output.process_exited);
 
     let started_at = Instant::now();
     let output = write_stdin(&session, process_id, "", /*yield_time_ms*/ 120_000).await?;
@@ -643,6 +659,37 @@ async fn multi_unified_exec_sessions() -> anyhow::Result<()> {
 
 #[cfg(windows)]
 #[tokio::test]
+async fn unified_exec_silent_command_finishes_within_requested_initial_yield() -> anyhow::Result<()>
+{
+    let (session, mut turn) = test_session_and_turn().await;
+    Arc::get_mut(&mut turn)
+        .expect("turn is uniquely owned")
+        .approval_policy
+        .set(codex_protocol::protocol::AskForApproval::Never)?;
+    let result = exec_command_with_tty(
+        &session,
+        &turn,
+        "Start-Sleep -Milliseconds 750; Write-Output 'silent-command-complete'",
+        10_000,
+        None,
+        false,
+    )
+    .await?;
+    assert_eq!(result.exit_code, Some(0));
+    assert!(
+        result.process_id.is_none(),
+        "finished command must not require polling"
+    );
+    assert_eq!(
+        result.truncated_output(TEST_MAX_OUTPUT_TOKENS).trim(),
+        "silent-command-complete"
+    );
+    assert!(session.list_background_terminals().await.is_empty());
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_exec_timeouts() -> anyhow::Result<()> {
     const TEST_VAR_VALUE: &str = "unified_exec_var_123";
 
@@ -651,7 +698,7 @@ async fn unified_exec_timeouts() -> anyhow::Result<()> {
     let open_shell = exec_command(
         &session,
         &turn,
-        "powershell.exe -NoExit",
+        r#"powershell.exe -NoLogo -NoProfile -NoExit -Command "Remove-Module PSReadLine -ErrorAction SilentlyContinue""#,
         /*yield_time_ms*/ 2_500,
         /*workdir*/ None,
     )
@@ -663,7 +710,7 @@ async fn unified_exec_timeouts() -> anyhow::Result<()> {
     write_stdin(
         &session,
         process_id,
-        format!("$env:CODEX_INTERACTIVE_SHELL_VAR = '{TEST_VAR_VALUE}'\n").as_str(),
+        format!("$env:CODEX_INTERACTIVE_SHELL_VAR = '{TEST_VAR_VALUE}'\r\n").as_str(),
         /*yield_time_ms*/ 2_500,
     )
     .await?;
@@ -671,7 +718,7 @@ async fn unified_exec_timeouts() -> anyhow::Result<()> {
     let out_2 = write_stdin(
         &session,
         process_id,
-        "Start-Sleep -Seconds 5; Write-Output $env:CODEX_INTERACTIVE_SHELL_VAR\n",
+        "Start-Sleep -Seconds 5; Write-Output $env:CODEX_INTERACTIVE_SHELL_VAR\r\n",
         /*yield_time_ms*/ 10,
     )
     .await?;
@@ -886,6 +933,7 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
         ProcessEntry {
             process,
             command_execution_id: Default::default(),
+            search_exit_one_is_no_match: false,
             parent_tool_execution_id: Default::default(),
             call_id: "call".to_string(),
             process_id,
@@ -960,6 +1008,7 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
         ProcessEntry {
             process: Arc::clone(&process),
             command_execution_id: Default::default(),
+            search_exit_one_is_no_match: false,
             parent_tool_execution_id: Default::default(),
             call_id: "call".to_string(),
             process_id,

@@ -798,4 +798,4 @@ contains = "crate::validation_admission::ValidationAuthorization::default()"
 [[features.evidence]]
 kind = "test"
 path = "codex-rs/core/src/validation_admission.rs"
-contains = "production_turn_keeps_validation_authorization_inactive"
+contains = "production_turn_keeps_validation_classification_without_enforcement"

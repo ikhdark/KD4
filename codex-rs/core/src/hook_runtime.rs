@@ -536,6 +536,17 @@ pub(crate) async fn run_legacy_after_agent_hook(
             error = %error,
             "after_agent hook failed; {action}"
         );
+        if !should_abort {
+            sess.send_event(
+                turn_context,
+                EventMsg::Warning(WarningEvent {
+                    message: format!(
+                        "after_agent hook '{hook_name}' failed; continuing turn completion: {error}"
+                    ),
+                }),
+            )
+            .await;
+        }
         if should_abort && abort_message.is_none() {
             abort_message = Some(format!(
                 "after_agent hook '{hook_name}' failed and aborted turn completion: {error}"
@@ -671,9 +682,9 @@ pub(crate) async fn emit_hook_stop_reason(
     hook_name: &str,
     stop_reason: Option<&str>,
 ) {
-    let Some(stop_reason) = stop_reason.filter(|reason| !reason.trim().is_empty()) else {
-        return;
-    };
+    let stop_reason = stop_reason
+        .filter(|reason| !reason.trim().is_empty())
+        .unwrap_or("no reason was provided by the hook");
     sess.send_event(
         turn_context,
         EventMsg::Warning(WarningEvent {
@@ -708,9 +719,9 @@ async fn record_session_start_additional_contexts(
     if developer_messages.is_empty() {
         return;
     }
-    let history = sess.clone_history().await;
-    let developer_messages =
-        dedupe_existing_developer_contexts(history.raw_items(), developer_messages);
+    let developer_messages = sess
+        .dedupe_existing_developer_contexts(developer_messages)
+        .await;
     if developer_messages.is_empty() {
         return;
     }
@@ -718,13 +729,21 @@ async fn record_session_start_additional_contexts(
         .await;
 }
 
-fn dedupe_existing_developer_contexts(
+pub(crate) fn dedupe_existing_developer_contexts(
     existing: &[ResponseItem],
     candidates: Vec<ResponseItem>,
 ) -> Vec<ResponseItem> {
     let existing_text = existing
         .iter()
-        .filter_map(single_developer_input_text)
+        .filter_map(|item| match item {
+            ResponseItem::Message { role, content, .. } if role == "developer" => Some(content),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|item| match item {
+            codex_protocol::models::ContentItem::InputText { text } => Some(text.as_str()),
+            _ => None,
+        })
         .collect::<HashSet<_>>();
     candidates
         .into_iter()
@@ -913,6 +932,68 @@ mod tests {
     use super::hook_run_metric_tags;
     use super::prepare_additional_context_items;
     use crate::session::tests::make_session_and_context;
+
+    #[tokio::test]
+    async fn legacy_after_agent_failure_warns_and_allows_completion() {
+        let (session, turn, rx) = crate::session::tests::make_session_and_context_with_rx().await;
+        let temp = tempfile::tempdir().expect("temporary directory");
+        session
+            .services
+            .hooks
+            .store(std::sync::Arc::new(codex_hooks::Hooks::new(
+                codex_hooks::HooksConfig {
+                    legacy_notify_argv: Some(vec![
+                        temp.path()
+                            .join("missing-hook-executable")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ]),
+                    ..Default::default()
+                },
+            )));
+        let outcome =
+            super::run_legacy_after_agent_hook(&session, &turn, &[], Some("done".to_string()))
+                .await;
+        assert!(
+            !outcome.aborted,
+            "notification failure must allow completion"
+        );
+        let event = rx.try_recv().expect("hook failure warning");
+        let codex_protocol::protocol::EventMsg::Warning(warning) = event.msg else {
+            panic!("expected hook failure warning");
+        };
+        assert!(
+            warning.message.starts_with(
+                "after_agent hook 'legacy_notify' failed; continuing turn completion: "
+            )
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "failed notification must emit one warning"
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_stop_without_a_reason_still_emits_a_warning() {
+        let (session, turn, rx) = crate::session::tests::make_session_and_context_with_rx().await;
+        for reason in [None, Some("   "), Some("requested stop")] {
+            super::emit_hook_stop_reason(&session, &turn, "Stop", reason).await;
+            let event = rx.try_recv().expect("stop warning");
+            let codex_protocol::protocol::EventMsg::Warning(warning) = event.msg else {
+                panic!("expected stop warning");
+            };
+            let expected_reason = if reason == Some("requested stop") {
+                "requested stop"
+            } else {
+                "no reason was provided by the hook"
+            };
+            assert_eq!(
+                warning.message,
+                format!("Stop hook stopped the operation: {expected_reason}")
+            );
+            assert!(rx.try_recv().is_err(), "exactly one warning per stop");
+        }
+    }
     use codex_protocol::models::ContentItem;
     use codex_protocol::protocol::HookCompletedEvent;
     use codex_protocol::protocol::HookEventName;
@@ -1017,6 +1098,15 @@ mod tests {
     #[test]
     fn additional_context_messages_share_one_hard_budget() {
         let messages = additional_context_messages(vec!["a".repeat(30_000), "b".repeat(30_000)]);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            super::single_developer_input_text(&messages[0]),
+            Some("a".repeat(30_000).as_str())
+        );
+        let second = super::single_developer_input_text(&messages[1]).expect("second context");
+        assert!(second.starts_with('b'));
+        assert!(second.ends_with('b'));
+        assert!(second.contains("[... context truncated ...]"));
         let rendered_bytes = messages
             .iter()
             .map(|message| match message {
@@ -1030,7 +1120,69 @@ mod tests {
                 _ => 0,
             })
             .sum::<usize>();
-        assert!(rendered_bytes <= 40_000);
+        assert_eq!(
+            rendered_bytes,
+            codex_context_fragments::ModelContextBudget::default().remaining_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_context_dedupes_all_parts_of_resumed_developer_messages() {
+        let (session, turn) = make_session_and_context().await;
+        let session = std::sync::Arc::new(session);
+        let turn = std::sync::Arc::new(turn);
+        let existing = codex_protocol::models::ResponseItem::Message {
+            id: None,
+            role: "developer".to_string(),
+            content: vec![
+                ContentItem::InputText {
+                    text: "first context".to_string(),
+                },
+                ContentItem::InputText {
+                    text: "second context".to_string(),
+                },
+            ],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        session
+            .record_conversation_items(&turn, &[existing.clone()])
+            .await;
+        super::record_session_start_additional_contexts(
+            &session,
+            &turn,
+            vec!["second context".to_string(), "new context".to_string()],
+        )
+        .await;
+        let history = session.clone_history().await;
+        let developer_contents = history
+            .raw_items()
+            .iter()
+            .map(|item| match item {
+                codex_protocol::models::ResponseItem::Message { role, content, .. }
+                    if role == "developer" =>
+                {
+                    content.clone()
+                }
+                other => panic!("expected developer context, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            developer_contents,
+            vec![
+                vec![
+                    ContentItem::InputText {
+                        text: "first context".to_string(),
+                    },
+                    ContentItem::InputText {
+                        text: "second context".to_string(),
+                    },
+                ],
+                vec![ContentItem::InputText {
+                    text: "new context".to_string(),
+                }],
+            ]
+        );
     }
 
     #[tokio::test]

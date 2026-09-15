@@ -80,7 +80,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 const SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY: &str = "Codex rebuilt its local database.";
 const STARTUP_WARNING_TARGET: &str = "codex_app_server::startup_warning";
-const DEFAULT_STDERR_LOG_FILTER: &str = "error,codex_app_server::startup_warning=warn";
+const DEFAULT_STDERR_LOG_FILTER: &str = "warn";
 
 fn default_stderr_log_filter() -> EnvFilter {
     EnvFilter::new(DEFAULT_STDERR_LOG_FILTER)
@@ -1451,7 +1451,7 @@ mod tests {
     }
 
     #[test]
-    fn logging_contract_startup_warning_is_warn_and_default_visible() {
+    fn logging_contract_warnings_are_default_visible_without_info_noise() {
         let capture = EventCapture::default();
         let captured = Arc::clone(&capture.0);
         let subscriber =
@@ -1466,11 +1466,17 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             emit_startup_warning(&warning);
             warn!(target: "codex_app_server::unrelated", "unrelated warning");
+            warn!(target: "codex_core_skills::loader", "invalid skill dependency");
+            tracing::info!(target: "codex_app_server", "routine event");
         });
 
         assert_eq!(
             *captured.lock().expect("capture lock"),
-            vec![(STARTUP_WARNING_TARGET.to_string(), Level::WARN)]
+            vec![
+                (STARTUP_WARNING_TARGET.to_string(), Level::WARN),
+                ("codex_app_server::unrelated".to_string(), Level::WARN),
+                ("codex_core_skills::loader".to_string(), Level::WARN),
+            ]
         );
     }
 

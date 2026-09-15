@@ -10,6 +10,7 @@ use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCRequest;
 use std::io::BufRead;
 use std::io::ErrorKind;
+use std::io::Read;
 use std::io::Result as IoResult;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -23,6 +24,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
+
+// Bound allocation before JSON parsing and request-queue admission can run.
+const MAX_STDIN_LINE_BYTES: usize = 32 * 1024 * 1024;
 
 pub async fn start_stdio_connection(
     transport_event_tx: mpsc::Sender<TransportEvent>,
@@ -203,27 +207,50 @@ fn spawn_stdin_line_reader() -> IoResult<mpsc::Receiver<IoResult<String>>> {
         .name("codex-app-server-stdin".to_string())
         .spawn(move || {
             let stdin = std::io::stdin();
-            let mut stdin = stdin.lock();
-            loop {
-                let mut line = String::new();
-                match stdin.read_line(&mut line) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        while matches!(line.as_bytes().last(), Some(b'\n' | b'\r')) {
-                            line.pop();
-                        }
-                        if line_tx.blocking_send(Ok(line)).is_err() {
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        let _ = line_tx.blocking_send(Err(err));
-                        break;
-                    }
-                }
-            }
+            read_stdin_lines(stdin.lock(), line_tx, MAX_STDIN_LINE_BYTES);
         })?;
     Ok(line_rx)
+}
+
+fn read_stdin_lines(
+    mut stdin: impl BufRead,
+    line_tx: mpsc::Sender<IoResult<String>>,
+    max_line_bytes: usize,
+) {
+    loop {
+        let mut bytes = Vec::new();
+        // Read at most one byte beyond the cap, even if the peer never sends a newline.
+        match stdin
+            .by_ref()
+            .take(max_line_bytes as u64 + 1)
+            .read_until(b'\n', &mut bytes)
+        {
+            Ok(0) => break,
+            Ok(length) if length > max_line_bytes => {
+                let _ = line_tx.blocking_send(Err(std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("stdin message exceeds the {max_line_bytes}-byte line limit"),
+                )));
+                break;
+            }
+            Ok(_) => {
+                while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+                    bytes.pop();
+                }
+                let line = String::from_utf8(bytes)
+                    .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error));
+                // Invalid UTF-8 is a malformed frame. Its newline was consumed, so the
+                // next frame can still be handled without corrupting valid input.
+                if line_tx.blocking_send(line).is_err() {
+                    break;
+                }
+            }
+            Err(error) => {
+                let _ = line_tx.blocking_send(Err(error));
+                break;
+            }
+        }
+    }
 }
 
 async fn start_stdio_connection_with_io<W>(
@@ -285,7 +312,9 @@ where
                 }
                 Some(Err(err)) => {
                     error!("Failed reading stdin: {err}");
-                    break;
+                    if err.kind() != ErrorKind::InvalidData {
+                        break;
+                    }
                 }
                 None => break,
             }
@@ -394,6 +423,80 @@ mod tests {
     use super::*;
     use crate::outgoing_message::OutgoingMessage;
     use crate::outgoing_message::OutgoingResponse;
+
+    #[tokio::test]
+    async fn stdio_invalid_utf8_does_not_drop_the_next_request() {
+        let (events_tx, mut events_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (lines_tx, lines_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (initialize_tx, _) = oneshot::channel();
+        let mut handles = Vec::new();
+        start_stdio_connection_with_io(
+            events_tx,
+            &mut handles,
+            initialize_tx,
+            lines_rx,
+            tokio::io::sink(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(TransportEvent::ConnectionOpened { .. })
+        ));
+        let producer = std::thread::spawn(move || {
+            read_stdin_lines(
+                std::io::Cursor::new(b"\xff\n{\"id\":7,\"method\":\"config/read\"}\n"),
+                lines_tx,
+                MAX_STDIN_LINE_BYTES,
+            );
+        });
+        let event = timeout(Duration::from_secs(2), events_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let TransportEvent::IncomingMessage {
+            message: JSONRPCMessage::Request(request),
+            ..
+        } = event
+        else {
+            panic!("expected request after invalid UTF-8");
+        };
+        assert_eq!(request.id, RequestId::Integer(7));
+        assert_eq!(request.method, "config/read");
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(TransportEvent::ConnectionClosed { .. })
+        ));
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        producer.join().unwrap();
+        assert!(events_rx.recv().await.is_none());
+    }
+
+    #[test]
+    fn stdin_line_limit_bounds_reads_even_without_a_newline() {
+        for input in [
+            b"123456789\nnext\n".as_slice(),
+            b"123456789abcdef".as_slice(),
+        ] {
+            let (tx, mut rx) = mpsc::channel(2);
+            let mut input = std::io::Cursor::new(input);
+            read_stdin_lines(&mut input, tx, 8);
+            let error = rx.blocking_recv().unwrap().unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidInput);
+            assert_eq!(
+                error.to_string(),
+                "stdin message exceeds the 8-byte line limit"
+            );
+            assert_eq!(input.position(), 9);
+            assert!(rx.blocking_recv().is_none());
+        }
+        let (tx, mut rx) = mpsc::channel(2);
+        read_stdin_lines(std::io::Cursor::new(b"1234567\n"), tx, 8);
+        assert_eq!(rx.blocking_recv().unwrap().unwrap(), "1234567");
+        assert!(rx.blocking_recv().is_none());
+    }
 
     #[tokio::test]
     async fn stdio_forwards_messages_after_initialize_name_handoff() {

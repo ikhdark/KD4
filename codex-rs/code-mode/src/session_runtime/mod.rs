@@ -194,12 +194,14 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         request: CreateCellRequest,
         initial_observe_mode: ObserveMode,
     ) -> Result<RuntimeEventFuture, Error> {
-        let cell_permit = tokio::select! {
-            _ = self.inner.shutdown_token.cancelled() => return Err(Error::ShuttingDown),
-            permit = Arc::clone(&self.inner.active_cell_permits).acquire_owned() => {
-                permit.map_err(|_| Error::ShuttingDown)?
-            }
-        };
+        // Yielded cells retain their permits until they finish. Waiting here can
+        // prevent the caller from ever issuing the wait/terminate that frees one.
+        let cell_permit = Arc::clone(&self.inner.active_cell_permits)
+            .try_acquire_owned()
+            .map_err(|error| match error {
+                tokio::sync::TryAcquireError::Closed => Error::ShuttingDown,
+                tokio::sync::TryAcquireError::NoPermits => Error::ActiveCellLimit,
+            })?;
         let stored_values = self.inner.stored_values.lock().await.clone();
         let host = Arc::new(RuntimeCellHost {
             cell_id: cell_id.clone(),
@@ -215,15 +217,18 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
             return Err(Error::DuplicateCell(cell_id));
         }
         let cell_state = Arc::new(CellState::new(self.inner.shutdown_token.child_token()));
-        let (handle, initial_event, task) = CellActor::prepare(
-            request,
-            stored_values,
-            host,
-            initial_observe_mode,
-            cell_state,
-            self.inner.task_failure_handler.clone(),
-        )
-        .map_err(Error::Runtime)?;
+        let (handle, initial_event, task) = tokio::select! {
+            biased;
+            _ = self.inner.shutdown_token.cancelled() => return Err(Error::ShuttingDown),
+            prepared = CellActor::prepare(
+                request,
+                stored_values,
+                host,
+                initial_observe_mode,
+                cell_state,
+                self.inner.task_failure_handler.clone(),
+            ) => prepared.map_err(Error::Runtime)?,
+        };
         cells.insert(cell_id.clone(), handle);
         let task = self.inner.cell_tasks.spawn(task);
         if let Some(task_failure_handler) = self.inner.task_failure_handler.clone() {

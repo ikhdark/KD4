@@ -1509,7 +1509,7 @@ enabled = false
 [plugins."demo-plugin@codex-curated"]
 enabled = true
 
-[hooks.state."demo-plugin@codex-curated:hooks/hooks.json:pre_tool_use:0:0"]
+[hooks.state."demo-plugin@codex-curated:hooks/hooks.json:pre_tool_use:v2:sha256:d7ac3f3a359b8e90d5aa9a269ee73016c57fe28c03d1a97af3c2b12a3a1b6d2f:0"]
 enabled = false
 "#,
     )?;
@@ -1617,15 +1617,15 @@ enabled = false
         response.plugin.hooks,
         vec![
             codex_app_server_protocol::PluginHookSummary {
-                key: "demo-plugin@codex-curated:hooks/hooks.json:pre_tool_use:0:0".to_string(),
+                key: "demo-plugin@codex-curated:hooks/hooks.json:pre_tool_use:v2:sha256:d7ac3f3a359b8e90d5aa9a269ee73016c57fe28c03d1a97af3c2b12a3a1b6d2f:0".to_string(),
                 event_name: HookEventName::PreToolUse,
             },
             codex_app_server_protocol::PluginHookSummary {
-                key: "demo-plugin@codex-curated:hooks/hooks.json:pre_tool_use:0:1".to_string(),
+                key: "demo-plugin@codex-curated:hooks/hooks.json:pre_tool_use:v2:sha256:17aab124f133af0489e3092736c583186886e661459bf18b725bafbcc0ce4699:0".to_string(),
                 event_name: HookEventName::PreToolUse,
             },
             codex_app_server_protocol::PluginHookSummary {
-                key: "demo-plugin@codex-curated:hooks/hooks.json:session_start:0:0".to_string(),
+                key: "demo-plugin@codex-curated:hooks/hooks.json:session_start:v2:sha256:0d201067549d88fbd21b6deb419323b04709d653e715559951b72d5e2870553e:0".to_string(),
                 event_name: HookEventName::SessionStart,
             },
         ]

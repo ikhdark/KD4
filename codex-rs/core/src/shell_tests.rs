@@ -49,14 +49,79 @@ fn derive_exec_args() {
         test_powershell_shell
             .derive_exec_args("echo hello", /*use_login_shell*/ false)
             .expect("PowerShell args"),
-        vec!["pwsh.exe", "-NoProfile", "-Command", "echo hello"]
+        vec![
+            "pwsh.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "echo hello"
+        ]
     );
     assert_eq!(
         test_powershell_shell
             .derive_exec_args("echo hello", /*use_login_shell*/ true)
             .expect("PowerShell args"),
-        vec!["pwsh.exe", "-Command", "echo hello"]
+        vec!["pwsh.exe", "-NonInteractive", "-Command", "echo hello"]
     );
+    let cmd = Shell {
+        shell_type: ShellType::Cmd,
+        shell_path: "cmd.exe".into(),
+    };
+    assert_eq!(
+        cmd.derive_exec_args("echo hello", false).unwrap(),
+        vec!["cmd.exe", "/d", "/c", "echo hello"]
+    );
+}
+
+#[test]
+fn environment_shell_names_use_the_shared_vocabulary() {
+    for (name, expected) in [
+        ("pwsh", ShellType::PowerShell),
+        ("powershell", ShellType::PowerShell),
+        ("cmd", ShellType::Cmd),
+        ("bash", ShellType::Bash),
+        ("sh", ShellType::Sh),
+        ("zsh", ShellType::Zsh),
+    ] {
+        let shell = Shell::from_environment_shell_info(ShellInfo {
+            name: name.into(),
+            path: format!("/remote/{name}"),
+        })
+        .unwrap();
+        assert_eq!(shell.shell_type, expected);
+        assert_eq!(ShellType::from_name(shell.name()), Some(expected));
+    }
+    assert!(
+        Shell::from_environment_shell_info(ShellInfo {
+            name: "unknown".into(),
+            path: "/remote/pwsh".into()
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn powershell_prompt_fails_without_reading_stdin() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let shell = get_shell(ShellType::PowerShell, None).unwrap();
+    for login in [false, true] {
+        let args = shell
+            .derive_exec_args("$ErrorActionPreference = 'Stop'; Read-Host 'prompt'", login)
+            .unwrap();
+        let mut child = Command::new(&args[0])
+            .args(&args[1..])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // An interactive implementation would consume this and succeed.
+        let _ = child.stdin.take().unwrap().write_all(b"answer\n");
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("answer"));
+    }
 }
 
 #[test]

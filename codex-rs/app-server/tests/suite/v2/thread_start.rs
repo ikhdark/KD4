@@ -126,7 +126,7 @@ model = "gpt-5.4-mini"
     .await??;
     let response: ThreadStartResponse = to_response(response)?;
 
-    assert_eq!(response.model, "openai.gpt-5.5");
+    assert_eq!(response.model, "openai.gpt-6-astra");
     Ok(())
 }
 
@@ -293,7 +293,7 @@ async fn thread_start_provider_model_fallback_uses_bedrock_static_catalog() -> R
             supported_with_fallback.model,
             unsupported_without_fallback.model,
         ],
-        vec!["openai.gpt-5.5", "openai.gpt-5.4", "gpt-5.4-mini"]
+        vec!["openai.gpt-6-astra", "openai.gpt-5.4", "gpt-5.4-mini"]
     );
     Ok(())
 }
@@ -918,6 +918,7 @@ async fn thread_start_tracks_thread_initialized_analytics() -> Result<()> {
     mount_analytics_capture(&server, codex_home.path()).await?;
 
     let mut mcp = TestAppServer::builder()
+        .with_args(&["-c", "analytics.enabled=true"])
         .with_codex_home(codex_home.path())
         .without_managed_config()
         .build()
@@ -1306,7 +1307,10 @@ async fn thread_start_emits_mcp_server_startup_notifications() -> Result<()> {
     assert!(cancelled.is_empty());
     assert_eq!(failed.len(), 1);
     assert_eq!(failed[0].server, "optional_broken");
-    assert!(failed[0].error.contains("failed to start"));
+    assert_eq!(
+        failed[0].error,
+        "handshaking with MCP server failed: connection closed: initialize response"
+    );
 
     Ok(())
 }

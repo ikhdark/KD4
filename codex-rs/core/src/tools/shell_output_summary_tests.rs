@@ -1,9 +1,12 @@
 use super::*;
 
-fn options(command_text: Option<&str>, turn_cost_guard: bool) -> ShellOutputSummaryOptions<'_> {
+fn options(
+    command_text: Option<&str>,
+    applied_token_limit: Option<usize>,
+) -> ShellOutputSummaryOptions<'_> {
     ShellOutputSummaryOptions {
         enabled: true,
-        turn_cost_guard,
+        applied_token_limit,
         command_text,
     }
 }
@@ -12,9 +15,140 @@ fn options(command_text: Option<&str>, turn_cost_guard: bool) -> ShellOutputSumm
 fn small_output_is_unchanged() {
     let output = "ok\n";
 
-    let summary = summarize_shell_output_for_model(output, 0, false, options(None, false));
+    let summary = summarize_shell_output_for_model(output, 0, false, options(None, None));
 
     assert_eq!(summary, None);
+}
+
+#[test]
+fn ordinary_try_prose_does_not_displace_diagnostics() {
+    let mut lines = (0..900)
+        .map(|index| format!("ordinary line {index}"))
+        .collect::<Vec<_>>();
+    for index in 0..20 {
+        lines[50 + index * 10] = "try another example".to_string();
+    }
+    lines[400] = "warning: KEEP_REAL_DIAGNOSTIC".to_string();
+    let summary = summarize_shell_output_for_model(
+        &lines.join("\n"),
+        0,
+        false,
+        options(Some("cargo test"), None),
+    )
+    .expect("validation summary");
+    assert!(summary.contains("KEEP_REAL_DIAGNOSTIC"), "{summary}");
+    assert!(!summary.contains("try another example"), "{summary}");
+}
+
+#[test]
+fn exact_byte_limit_discloses_pending_lines_and_retention_counts() {
+    let mut lines = vec![String::new(); 700];
+    lines[0] = "x".repeat(SUMMARY_MAX_BYTES);
+    let probe =
+        summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, None)).unwrap();
+    let prefix_bytes = probe.find("    1: ").unwrap() + "    1: ".len();
+    lines[0] = "x".repeat(SUMMARY_MAX_BYTES - SUMMARY_FOOTER_BYTES - prefix_bytes);
+    let summary =
+        summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, None)).unwrap();
+    assert!(summary.ends_with("[summary capped]"), "{summary}");
+    assert!(summary.contains("- emitted_source_lines: 1\n"));
+    // A final empty line is not a source line according to str::lines().
+    assert!(summary.contains("- omitted_source_lines: 698\n"));
+    assert!(!summary.contains("[line truncated]"));
+    assert!(summary.len() <= SUMMARY_MAX_BYTES);
+}
+
+#[test]
+fn summary_reports_gap_sizes_and_source_line_counts() {
+    let output = (0..700)
+        .map(|index| format!("line {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let summary = summarize_shell_output_for_model(&output, 0, false, options(None, None)).unwrap();
+    assert!(summary.contains("... [612 lines omitted]"));
+    assert!(summary.contains("- emitted_source_lines: 88\n"));
+    assert!(summary.ends_with("- omitted_source_lines: 612"));
+    assert!(!summary.contains("[summary capped]"));
+}
+
+#[test]
+fn source_prose_about_passed_does_not_displace_test_status() {
+    let mut lines = vec!["ordinary output".to_string(); 700];
+    lines[200] = "test result: ok. 3 passed; 0 failed".to_string();
+    for line in &mut lines[300..320] {
+        *line = "let message = \"passed\"; // source text".to_string();
+    }
+    let summary = summarize_shell_output_for_model(
+        &lines.join("\n"),
+        0,
+        false,
+        options(Some("cargo test"), None),
+    )
+    .unwrap();
+    assert!(summary.contains("test result: ok. 3 passed; 0 failed"));
+    assert!(!summary.contains("// source text"));
+}
+
+#[test]
+fn incidental_words_do_not_displace_validation_status_or_warnings() {
+    let mut lines = (0..700)
+        .map(|index| format!("ordinary line {index}"))
+        .collect::<Vec<_>>();
+    for index in 0..12 {
+        lines[50 + index * 8] = format!("warnings: 0 (batch {index})");
+        lines[300 + index * 8] =
+            format!("bypassed, surpassed, passed-through, not_passed, forewarning (batch {index})");
+    }
+    lines[200] = "warning[E001]: KEEP_ADVISORY".to_string();
+    lines[250] = "Tests PASSED; KEEP_STATUS".to_string();
+    let summary = summarize_shell_output_for_model(
+        &lines.join("\n"),
+        0,
+        false,
+        options(Some("cargo test"), None),
+    )
+    .expect("large validation summary");
+
+    assert!(summary.contains("KEEP_ADVISORY"), "{summary}");
+    assert!(summary.contains("KEEP_STATUS"), "{summary}");
+    assert!(!summary.contains("warnings: 0"), "{summary}");
+    assert!(!summary.contains("passed-through"), "{summary}");
+}
+
+#[test]
+fn selected_errors_do_not_spend_the_final_status_quota() {
+    let mut lines = (0..900)
+        .map(|index| format!("ordinary line {index}"))
+        .collect::<Vec<_>>();
+    for index in 0..8 {
+        lines[50 + index * 10] = format!("suite {index} passed; KEEP_STATUS_{index}");
+        lines[300 + index * 10] = format!("compiler error: KEEP_ERROR_{index}");
+    }
+    // Exercise the normal exec-output projection boundary, not only selection helpers.
+    let output = codex_protocol::exec_output::ExecToolCallOutput {
+        exit_code: 1,
+        stdout: codex_protocol::exec_output::StreamOutput::new(lines.join("\n")),
+        stderr: codex_protocol::exec_output::StreamOutput::new(String::new()),
+        aggregated_output: codex_protocol::exec_output::StreamOutput::new(lines.join("\n")),
+        duration: std::time::Duration::ZERO,
+        timed_out: false,
+    };
+    let summary = crate::tools::format_exec_output_for_model(
+        &output,
+        codex_utils_output_truncation::TruncationPolicy::Tokens(10_000),
+    );
+    assert!(summary.contains("Shell output summary:"), "{summary}");
+
+    for index in 0..8 {
+        assert!(
+            summary.contains(&format!("KEEP_STATUS_{index}")),
+            "{summary}"
+        );
+        assert!(
+            summary.contains(&format!("KEEP_ERROR_{index}")),
+            "{summary}"
+        );
+    }
 }
 
 #[test]
@@ -26,8 +160,7 @@ fn large_success_output_keeps_head_tail_and_warning_lines() {
     lines[200] = "warning: useful warning".to_string();
     let output = lines.join("\n");
 
-    let summary =
-        summarize_shell_output_for_model(&output, 0, false, options(None, false)).unwrap();
+    let summary = summarize_shell_output_for_model(&output, 0, false, options(None, None)).unwrap();
 
     assert!(summary.contains("Shell output summary:"));
     assert!(summary.contains("line 0"));
@@ -47,8 +180,7 @@ fn large_success_output_preserves_source_order() {
     lines[699] = "UNIQUE_TAIL".to_string();
     let output = lines.join("\n");
 
-    let summary =
-        summarize_shell_output_for_model(&output, 0, false, options(None, false)).unwrap();
+    let summary = summarize_shell_output_for_model(&output, 0, false, options(None, None)).unwrap();
     let head = summary.find("UNIQUE_HEAD").unwrap();
     let middle = summary.find("UNIQUE_MIDDLE").unwrap();
     let tail = summary.find("UNIQUE_TAIL").unwrap();
@@ -67,8 +199,7 @@ fn failed_output_keeps_exact_error_lines() {
     lines[177] = "expected `usize`, actual `String`".to_string();
     let output = lines.join("\n");
 
-    let summary =
-        summarize_shell_output_for_model(&output, 1, false, options(None, false)).unwrap();
+    let summary = summarize_shell_output_for_model(&output, 1, false, options(None, None)).unwrap();
 
     assert!(summary.contains("error[E0425]: cannot find value `needle` in this scope"));
     assert!(summary.contains("--> src/main.rs:10:5"));
@@ -92,7 +223,7 @@ fn critical_error_survives_earlier_warning_flood() {
         &output,
         1,
         false,
-        options(Some("cargo test -p codex-core"), false),
+        options(Some("cargo test -p codex-core"), None),
     )
     .unwrap();
 
@@ -114,8 +245,7 @@ fn benign_keywords_do_not_hide_the_first_real_error() {
     lines[500] = "error: REAL_ERROR_SENTINEL".to_string();
     let output = lines.join("\n");
 
-    let summary =
-        summarize_shell_output_for_model(&output, 1, false, options(None, false)).unwrap();
+    let summary = summarize_shell_output_for_model(&output, 1, false, options(None, None)).unwrap();
 
     assert!(summary.contains("error: REAL_ERROR_SENTINEL"));
     assert!(summary.contains("ordinary line 499"));
@@ -133,8 +263,7 @@ fn over_truncation_failure_focus_keeps_late_root_cause_after_early_error_flood()
     lines[610] = "fatal: ROOT_CAUSE_SENTINEL".to_string();
     let output = lines.join("\n");
 
-    let summary =
-        summarize_shell_output_for_model(&output, 1, false, options(None, false)).unwrap();
+    let summary = summarize_shell_output_for_model(&output, 1, false, options(None, None)).unwrap();
 
     assert!(summary.contains("ROOT_CAUSE_SENTINEL"));
     assert!(summary.contains("ordinary line 609"));
@@ -157,7 +286,7 @@ fn validation_output_keeps_failure_status_and_tail() {
         &output,
         101,
         false,
-        options(Some("cargo test -p codex-core"), false),
+        options(Some("cargo test -p codex-core"), None),
     )
     .unwrap();
 
@@ -183,7 +312,7 @@ fn validation_output_keeps_the_authoritative_final_status() {
         &output,
         0,
         false,
-        options(Some("cargo test -p codex-core"), false),
+        options(Some("cargo test -p codex-core"), None),
     )
     .unwrap();
 
@@ -192,18 +321,71 @@ fn validation_output_keeps_the_authoritative_final_status() {
 }
 
 #[test]
-fn turn_cost_guard_uses_earlier_threshold_without_blocking_semantics() {
+fn nextest_failures_and_summary_survive_a_passing_test_flood() {
+    let mut lines = (0..900)
+        .map(|index| format!("PASS [0.001s] crate test_{index}"))
+        .collect::<Vec<_>>();
+    lines[450] = "FAIL [0.003s] codex_core parser::tests::keeps_error".to_string();
+    lines[451] = "TRY 2 FAIL [0.003s] codex_core parser::tests::retry_error".to_string();
+    lines[500] = "Summary [1.234s] 900 tests run: 898 passed, 2 failed".to_string();
+    let output = lines.join("\n");
+    let summary = summarize_shell_output_for_model(
+        &output,
+        100,
+        false,
+        options(Some("just core-gate parser"), Some(2_000)),
+    )
+    .unwrap();
+    assert!(summary.contains("parser::tests::keeps_error"));
+    assert!(summary.contains("parser::tests::retry_error"));
+    assert!(summary.contains("900 tests run: 898 passed, 2 failed"));
+}
+
+#[test]
+fn passing_validation_retains_status_with_a_short_tail() {
+    let mut lines = (0..700)
+        .map(|index| format!("PASS [0.001s] crate test_{index}"))
+        .collect::<Vec<_>>();
+    lines[699] = "Summary [1.234s] 699 tests run: 699 passed".to_string();
+    let summary = summarize_shell_output_for_model(
+        &lines.join("\n"),
+        0,
+        false,
+        options(Some("just core-test-fast core_lib"), None),
+    )
+    .unwrap();
+    assert!(summary.contains("699 tests run: 699 passed"));
+    assert!(summary.contains("test_698"));
+    assert!(!summary.contains("test_600"));
+    let retained_tests = summary
+        .lines()
+        .filter_map(|line| line.split_once(": ").map(|(_, text)| text))
+        .filter(|line| line.starts_with("PASS [0.001s]"))
+        .collect::<Vec<_>>();
+    let tail_start = lines.len() - VALIDATION_SUCCESS_TAIL_LINES;
+    assert_eq!(
+        retained_tests,
+        lines[tail_start..lines.len() - 1]
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        "successful validation must retain exactly the configured tail"
+    );
+}
+
+#[test]
+fn applied_budget_summarizes_output_below_the_default_threshold() {
     let output = (0..200)
         .map(|index| format!("guard line {index}"))
         .collect::<Vec<_>>()
         .join("\n");
 
     assert_eq!(
-        summarize_shell_output_for_model(&output, 0, false, options(None, false)),
+        summarize_shell_output_for_model(&output, 0, false, options(None, None)),
         None
     );
     assert!(
-        summarize_shell_output_for_model(&output, 0, false, options(None, true))
+        summarize_shell_output_for_model(&output, 0, false, options(None, Some(400)))
             .unwrap()
             .contains("guard line 199")
     );
@@ -214,7 +396,7 @@ fn disabled_summarizer_returns_unchanged_signal() {
     let output = "line\n".repeat(400);
     let options = ShellOutputSummaryOptions {
         enabled: false,
-        turn_cost_guard: true,
+        applied_token_limit: Some(400),
         command_text: Some("cargo test"),
     };
 
@@ -228,8 +410,7 @@ fn disabled_summarizer_returns_unchanged_signal() {
 fn oversized_single_line_retains_bounded_head_and_tail() {
     let output = format!("HEAD{}TAIL", "x".repeat(DEFAULT_SUMMARY_AFTER_BYTES + 1024));
 
-    let summary =
-        summarize_shell_output_for_model(&output, 0, false, options(None, false)).unwrap();
+    let summary = summarize_shell_output_for_model(&output, 0, false, options(None, None)).unwrap();
 
     assert!(summary.contains("HEAD"));
     assert!(summary.contains("TAIL"));
@@ -240,4 +421,33 @@ fn oversized_single_line_retains_bounded_head_and_tail() {
 #[test]
 fn tiny_single_line_budget_stops_before_split_utf8_character() {
     assert_eq!(summarize_oversized_line("a😀z", 4), "a");
+}
+
+#[test]
+fn validation_summary_keeps_typescript_and_npm_errors_outside_tail() {
+    for (command, diagnostic) in [
+        (
+            "npx tsc --noEmit",
+            "src/app.ts(10,5): error TS2322: Type 'string' is not assignable to type 'number'.",
+        ),
+        ("npm run build", "npm ERR! code ELIFECYCLE"),
+    ] {
+        let mut lines = (0..700)
+            .map(|index| format!("ordinary line {index}"))
+            .collect::<Vec<_>>();
+        lines[200] = diagnostic.to_string();
+        let summary = summarize_shell_output_for_model(
+            &lines.join("\n"),
+            1,
+            false,
+            options(Some(command), None),
+        )
+        .expect("large validation summary");
+        assert!(summary.contains(diagnostic), "{summary}");
+        assert!(
+            !summary.contains("ordinary line 0\n"),
+            "validation omits routine head"
+        );
+        assert!(summary.contains("ordinary line 699"));
+    }
 }

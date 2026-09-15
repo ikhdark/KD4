@@ -48,6 +48,92 @@ use std::sync::atomic::Ordering;
 const EXEC_FORMAT_MAX_BYTES: usize = 10_000;
 const EXEC_FORMAT_MAX_TOKENS: usize = 2_500;
 
+#[test]
+fn prepared_prompt_index_uses_materialized_items_and_respects_truncation() {
+    let first = agent_message("first");
+    let second = agent_message("second");
+    let third = agent_message("third");
+    let items = PreparedPromptItems::from_shared(vec![first.clone()].into())
+        .appended(vec![second.clone(), third].into())
+        .truncated(2);
+    assert_eq!(items.get(0), Some(&first));
+    assert_eq!(items.get(1), Some(&second));
+    assert_eq!(items.get(2), None);
+    let shared = items.shared();
+    assert!(std::ptr::eq(items.get(0).unwrap(), &shared[0]));
+    assert!(std::ptr::eq(items.get(1).unwrap(), &shared[1]));
+    assert_eq!(items.get(2), None);
+}
+
+#[test]
+fn prepared_prompt_index_walks_deep_unmaterialized_chains() {
+    let first = agent_message("first");
+    let mut versions = vec![PreparedPromptItems::from_shared(vec![first.clone()].into())];
+    for _ in 0..4096 {
+        let last = versions.last().unwrap();
+        versions.push(
+            last.appended(vec![agent_message("tail")].into())
+                .truncated(1),
+        );
+    }
+    let last = versions.last().unwrap().clone();
+    for _ in 0..3 {
+        assert_eq!(last.get(0), Some(&first));
+        assert_eq!(last.get(1), None);
+        assert!(versions[1..].iter().all(|items| !items.is_materialized()));
+    }
+    let head = Arc::downgrade(&last.0);
+    // Release the other owners first, as replacing a prepared history does.
+    drop(versions);
+    drop(last);
+    assert!(head.upgrade().is_none());
+}
+
+#[test]
+fn prepared_prompt_index_preserves_compacted_search_tail_during_runtime_append() {
+    let search = ResponseItem::ToolSearchOutput {
+        id: None,
+        call_id: Some("server-search".to_string()),
+        status: "completed".to_string(),
+        execution: "server".to_string(),
+        tools: vec![serde_json::json!({
+            "type": "function", "name": "read_resource", "description": "full definition"
+        })],
+        omitted_result_count: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut history = create_history_with_items(vec![search.clone()]);
+    let first = history
+        .clone()
+        .prepare_for_prompt(&default_input_modalities());
+    let original = first.compacted_tool_search_outputs(compact_acknowledged_tool_search_outputs);
+    assert_eq!(original[0].as_ref(), &[search.clone()]);
+
+    let mut compacted_search = search;
+    if let ResponseItem::ToolSearchOutput { tools, .. } = &mut compacted_search {
+        *tools = vec![serde_json::json!({"type": "function", "name": "read_resource"})];
+    }
+    let mut expected = vec![compacted_search];
+    for text in ["first append", "second append"] {
+        let reasoning = reasoning_msg(text);
+        history.record_items([&reasoning], TruncationPolicy::Tokens(10_000));
+        expected.push(reasoning);
+        let prepared = history
+            .clone()
+            .prepare_for_prompt(&default_input_modalities());
+        let projections = prepared.compacted_tool_search_outputs(|_| {
+            panic!("safe append must advance the existing compaction cache")
+        });
+        for projection in projections {
+            assert_eq!(projection.as_ref(), expected.as_slice());
+        }
+    }
+    let ResponseItem::ToolSearchOutput { tools, .. } = &original[0][0] else {
+        panic!("the original projection retains its search result");
+    };
+    assert_eq!(tools[0]["description"], "full definition");
+}
+
 fn assistant_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
         id: None,
@@ -276,6 +362,26 @@ fn reference_context_presence_can_be_checked_without_materializing_the_item() {
 
     history.set_reference_context_item(None);
     assert!(!history.has_reference_context_item());
+}
+
+#[test]
+fn replacing_history_invalidates_the_realized_context_baseline() {
+    let mut history = create_history_with_items(vec![user_input_text_msg("old request")]);
+    history.set_reference_context_item(Some(reference_context_item()));
+    let previous = history.clone();
+
+    history.replace(vec![user_input_text_msg("compacted request")]);
+
+    assert_eq!(history.reference_context_item(), None);
+    assert!(!history.has_reference_context_item());
+    assert_eq!(
+        previous.reference_context_item(),
+        Some(reference_context_item())
+    );
+    assert_eq!(
+        history.raw_items(),
+        &[user_input_text_msg("compacted request")]
+    );
 }
 
 #[test]
@@ -1037,9 +1143,11 @@ fn pending_user_boundary_estimate_uses_sampling_projection() {
         "<task_model_guidance>\n{}\n</task_model_guidance>",
         "stable guidance ".repeat(400)
     );
+    let mut guidance = user_input_text_msg(&repeated_guidance);
+    crate::stable_context::mark_trusted_stable_context_item(&mut guidance);
     let history = create_history_with_items(vec![
-        user_input_text_msg(&repeated_guidance),
-        user_input_text_msg(&repeated_guidance),
+        guidance.clone(),
+        guidance,
         user_input_text_msg("current instruction"),
     ]);
     let base_instructions = BaseInstructions {
@@ -1081,8 +1189,9 @@ fn total_token_usage_recomputes_initial_projected_history_before_any_model_respo
 #[test]
 fn total_token_usage_refreshes_from_server_after_next_model_response() {
     let boundary = user_input_text_msg("new instruction");
+    let earlier_reasoning = reasoning_with_encrypted_content(/*len*/ 2_000);
     let mut history = create_history_with_items(vec![
-        reasoning_with_encrypted_content(/*len*/ 2_000),
+        earlier_reasoning.clone(),
         assistant_msg("old response"),
         boundary,
     ]);
@@ -1109,7 +1218,11 @@ fn total_token_usage_refreshes_from_server_after_next_model_response() {
     for server_reasoning_included in [false, true] {
         assert_eq!(
             history.get_total_token_usage(server_reasoning_included, &base_instructions),
-            222
+            222 + if server_reasoning_included {
+                0
+            } else {
+                estimate_item_token_count(&earlier_reasoning)
+            }
         );
     }
 }
@@ -1344,7 +1457,7 @@ fn for_prompt_preserves_image_generation_calls_when_images_are_supported() {
 }
 
 #[test]
-fn for_prompt_clears_image_generation_result_when_images_are_unsupported() {
+fn for_prompt_discloses_omitted_image_generation_result() {
     let history = create_history_with_items(vec![
         ResponseItem::Message {
             id: None,
@@ -1365,7 +1478,7 @@ fn for_prompt_clears_image_generation_result_when_images_are_unsupported() {
     ]);
 
     assert_eq!(
-        history.for_prompt(&[InputModality::Text]),
+        history.clone().for_prompt(&[InputModality::Text]),
         vec![
             ResponseItem::Message {
                 id: None,
@@ -1383,7 +1496,29 @@ fn for_prompt_clears_image_generation_result_when_images_are_unsupported() {
                 result: String::new(),
                 internal_chat_message_metadata_passthrough: None,
             },
+            developer_msg("Generated image content omitted because you do not support image input"),
         ]
+    );
+    let projected = history.clone().for_prompt(&[InputModality::Text]);
+    let mut normalized_again = projected.clone();
+    normalize::strip_images_when_unsupported(&[InputModality::Text], &mut normalized_again);
+    assert_eq!(
+        normalized_again, projected,
+        "omission receipts must not accumulate"
+    );
+    assert!(matches!(
+        &history.raw_items()[1],
+        ResponseItem::ImageGenerationCall { result, .. } if result == "Zm9v"
+    ));
+
+    let mut empty_generation = history.raw_items()[1].clone();
+    if let ResponseItem::ImageGenerationCall { result, .. } = &mut empty_generation {
+        result.clear();
+    }
+    let empty_history = create_history_with_items(vec![empty_generation.clone()]);
+    assert_eq!(
+        empty_history.for_prompt(&[InputModality::Text]),
+        vec![empty_generation]
     );
 }
 
@@ -1761,11 +1896,9 @@ fn drop_last_n_user_turns_trims_context_updates_above_rolled_back_turn() {
             developer_msg("Generated images are saved to /tmp as /tmp/image-1.png by default."),
         ]
     );
-    assert_eq!(
-        serde_json::to_value(history.reference_context_item())
-            .expect("serialize retained reference context item"),
-        serde_json::to_value(Some(reference_context_item))
-            .expect("serialize expected reference context item")
+    assert!(
+        history.reference_context_item().is_none(),
+        "rollback invalidates the realized context baseline until surviving history is replayed"
     );
 }
 
@@ -1935,7 +2068,7 @@ fn record_items_respects_custom_token_limit() {
     );
 }
 
-fn assert_truncated_message_matches(message: &str, line: &str, expected_removed: usize) {
+fn assert_truncated_message_matches(message: &str, line: &str, original: &str) {
     let pattern = truncated_message_pattern(line);
     let regex = Regex::new(&pattern).unwrap_or_else(|err| {
         panic!("failed to compile regex {pattern}: {err}");
@@ -1958,12 +2091,19 @@ fn assert_truncated_message_matches(message: &str, line: &str, expected_removed:
         .as_str()
         .parse()
         .unwrap_or_else(|err| panic!("invalid removed tokens: {err}"));
+    let tail = captures.name("tail").expect("retained tail").as_str();
+    assert!(original.starts_with(body));
+    assert!(original.ends_with(tail));
+    // The marker describes omitted source bytes at four bytes per token.
+    let expected_removed = (original.len() - body.len() - tail.len()).div_ceil(4);
     assert_eq!(removed, expected_removed, "mismatched removed token count");
 }
 
 fn truncated_message_pattern(line: &str) -> String {
     let escaped_line = regex_lite::escape(line);
-    format!(r"(?s)^(?P<body>{escaped_line}.*?)(?:\r?)?…(?P<removed>\d+) tokens truncated…(?:.*)?$")
+    format!(
+        r"(?s)^(?P<body>{escaped_line}.*?)(?:\r?)?…(?P<removed>\d+) tokens truncated…(?P<tail>.*)$"
+    )
 }
 
 #[test]
@@ -1973,7 +2113,7 @@ fn format_exec_output_truncates_large_error() {
 
     let truncated = truncate_exec_output(&large_error);
 
-    assert_truncated_message_matches(&truncated, line, /*expected_removed*/ 36_338);
+    assert_truncated_message_matches(&truncated, line, &large_error);
     assert_ne!(truncated, large_error);
 }
 
@@ -1982,7 +2122,7 @@ fn format_exec_output_marks_byte_truncation_without_omitted_lines() {
     let long_line = "a".repeat(EXEC_FORMAT_MAX_BYTES + 10000);
     let truncated = truncate_exec_output(&long_line);
     assert_ne!(truncated, long_line);
-    assert_truncated_message_matches(&truncated, "a", /*expected_removed*/ 2_508);
+    assert_truncated_message_matches(&truncated, "a", &long_line);
     assert!(
         !truncated.contains("omitted"),
         "line omission marker should not appear when no lines were dropped: {truncated}"
@@ -2004,7 +2144,7 @@ fn format_exec_output_reports_omitted_lines_and_keeps_head_and_tail() {
         .collect();
 
     let truncated = truncate_exec_output(&content);
-    assert_truncated_message_matches(&truncated, "line-0-", /*expected_removed*/ 34_923);
+    assert_truncated_message_matches(&truncated, "line-0-", &content);
     assert!(
         truncated.contains("line-0-"),
         "expected head line to remain: {truncated}"
@@ -2027,7 +2167,7 @@ fn format_exec_output_prefers_line_marker_when_both_limits_exceeded() {
 
     let truncated = truncate_exec_output(&content);
 
-    assert_truncated_message_matches(&truncated, "line-0-", /*expected_removed*/ 17_495);
+    assert_truncated_message_matches(&truncated, "line-0-", &content);
 }
 
 #[cfg(not(debug_assertions))]
@@ -2527,7 +2667,7 @@ fn sampling_tool_projection_reuses_shared_input_and_preserves_fail_open_context(
                 };
                 assert_eq!(
                     serde_json::from_str::<serde_json::Value>(arguments).unwrap(),
-                    serde_json::json!({"cmd": "cat source.rs", "force_fresh": true})
+                    serde_json::json!({"cmd": "cat source.rs"})
                 );
                 let ResponseItem::FunctionCallOutput { output, .. } = &projected[call_index + 1]
                 else {
@@ -2538,7 +2678,12 @@ fn sampling_tool_projection_reuses_shared_input_and_preserves_fail_open_context(
                         .unwrap(),
                     serde_json::json!({
                         "call_id": "read-source", "rerun": {"force_fresh": true},
-                        "reason": "no workspace observation was recorded for this tool result; rerun the tool before relying on it",
+                        "reason": "no workspace observation is available for this tool result; it may be unrecorded or evicted; rerun the tool before relying on it",
+                        "reason_code": "missing_observation",
+                        "valid_for_current_workspace": false,
+                        "observed_revision": null,
+                        "current_revision": null,
+                        "if_rerun_unavailable": "Report the affected claim as unverified; this result does not validate the current workspace.",
                         "stale_workspace_evidence": true,
                     })
                 );
@@ -2752,13 +2897,19 @@ fn prepared_prompt_cache_extends_complete_tool_result_tail_without_rebuilding_pr
 }
 
 #[test]
-fn tool_history_mutation_advances_projection_revision_once() {
+fn tool_history_mutation_preserves_canonical_projection_revision() {
     let mut history = ContextManager::new();
     let initial_revision = history.projection_revision;
 
-    history.set_tool_history_state(ToolHistoryState::default());
+    let mut state = ToolHistoryState::default();
+    state.register_non_workspace_code_mode_call("new-call".to_string());
+    history.set_tool_history_state(state);
 
-    assert_eq!(history.projection_revision, initial_revision + 1);
+    assert_eq!(history.projection_revision, initial_revision);
+    assert_eq!(
+        serde_json::to_value(history.tool_history_state()).unwrap()["non_workspace_code_mode_calls"],
+        serde_json::json!(["new-call"])
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2812,10 +2963,7 @@ async fn tool_history_registration_does_not_wait_for_snapshot_cache_locks() {
         persisted_state["non_workspace_code_mode_calls"],
         serde_json::json!(["independent-tool-call"])
     );
-    assert_eq!(
-        current.projection_revision,
-        snapshot.projection_revision + 1
-    );
+    assert_eq!(current.projection_revision, snapshot.projection_revision);
     assert_eq!(
         current
             .prepare_for_prompt(&default_input_modalities())
@@ -2934,7 +3082,7 @@ fn tool_history_candidate_lifecycle_preserves_prepared_base_and_refreshes_projec
         artifact_sha256: crate::tool_history::sha256(b"canonical artifact"),
         original_output_sha256: crate::tool_history::sha256(bounded_output.as_bytes()),
         original_tokens: 24_000,
-        preserved_non_text_tokens: 0,
+        preserved_non_text_tokens: Some(0),
         bounded_model_output: bounded_output,
         complete: true,
         projection_eligible: true,

@@ -202,7 +202,7 @@ mod tests {
         assert_eq!(warning.thread_id, Some(thread_id.to_string()));
         assert_eq!(
             warning.message,
-            "Selected capability root `missing-skills` references unavailable environment `unavailable-executor`."
+            "executor skills unavailable: Selected capability root `missing-skills` references unavailable environment `unavailable-executor`."
         );
         assert!(
             outgoing_rx.try_recv().is_err(),

@@ -395,21 +395,6 @@ async fn exec_resume_last_respects_cwd_filter_and_all_flag() -> anyhow::Result<(
     let test = test_codex_exec();
     let server = MockServer::start().await;
     let _response_mock = mount_exec_responses(&server, /*count*/ 6).await;
-    // This peer implements HTTP Responses/SSE, so register that capability via
-    // the same provider configuration read by every normal CLI invocation.
-    std::fs::write(
-        test.home_path().join("config.toml"),
-        format!(
-            "model_provider = \"resume_fixture\"\n\
-             [model_providers.resume_fixture]\n\
-             name = \"Resume HTTP fixture\"\n\
-             base_url = {}\n\
-             wire_api = \"responses\"\n\
-             requires_openai_auth = true\n\
-             supports_websockets = false\n",
-            serde_json::to_string(&format!("{}/v1", server.uri()))?,
-        ),
-    )?;
 
     let dir_a = TempDir::new()?;
     let dir_b = TempDir::new()?;
@@ -538,13 +523,9 @@ async fn exec_resume_accepts_global_flags_after_subcommand() -> anyhow::Result<(
         .success();
 
     // Resume while passing global flags after the subcommand to ensure clap accepts them.
-    let base = format!("{}/v1", server.uri());
-    let base_config = format!("openai_base_url={}", serde_json::to_string(&base)?);
-    test.cmd()
+    test.cmd_with_server(&server)
         .arg("resume")
         .arg("--last")
-        .arg("--config")
-        .arg(base_config)
         .arg("--json")
         .arg("--model")
         .arg("gpt-5.2-codex")
@@ -566,20 +547,6 @@ async fn exec_resume_includes_output_schema_in_request() -> anyhow::Result<()> {
     let test = test_codex_exec();
     let server = MockServer::start().await;
     let response_mock = mount_exec_responses(&server, /*count*/ 2).await;
-    // Both CLI invocations use this HTTP Responses/SSE fixture.
-    std::fs::write(
-        test.home_path().join("config.toml"),
-        format!(
-            "model_provider = \"schema_fixture\"\n\
-             [model_providers.schema_fixture]\n\
-             name = \"Schema HTTP fixture\"\n\
-             base_url = {}\n\
-             wire_api = \"responses\"\n\
-             requires_openai_auth = true\n\
-             supports_websockets = false\n",
-            serde_json::to_string(&format!("{}/v1", server.uri()))?,
-        ),
-    )?;
 
     let schema_contents = serde_json::json!({
         "type": "object",

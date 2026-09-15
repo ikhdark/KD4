@@ -141,9 +141,8 @@ pub(crate) async fn handle_mcp_tool_call(
 ) -> HandledMcpToolCall {
     let turn_context = &step_context.turn;
     let manager = step_context.mcp.manager();
-    let live_tool_info = tool_info.clone();
-    let sampled_server = live_tool_info.server_name.clone();
-    let sampled_tool_name = live_tool_info.tool.name.to_string();
+    let sampled_server = tool_info.server_name.clone();
+    let sampled_tool_name = tool_info.tool.name.to_string();
     // Parse the `arguments` as JSON. An empty string is OK, but invalid JSON
     // is not.
     let arguments_value = match parse_mcp_tool_arguments_before_execution(&arguments) {
@@ -164,7 +163,8 @@ pub(crate) async fn handle_mcp_tool_call(
                 .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
         };
     }
-    if !tool_is_model_visible(&live_tool_info) {
+    let live_tool_info = manager.tool_info(&sampled_server, &sampled_tool_name).await;
+    if !live_tool_info.as_ref().is_some_and(tool_is_model_visible) {
         let invocation = McpInvocation {
             server: sampled_server.clone(),
             tool: sampled_tool_name.clone(),
@@ -200,6 +200,7 @@ pub(crate) async fn handle_mcp_tool_call(
         };
     }
 
+    let live_tool_info = live_tool_info.expect("model-visible tool was checked above");
     let server = live_tool_info.server_name.clone();
     let tool_name = live_tool_info.tool.name.to_string();
     let hook_tool_name = live_mcp_hook_tool_name(&live_tool_info);

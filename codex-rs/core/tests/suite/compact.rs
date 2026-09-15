@@ -3456,6 +3456,15 @@ async fn manual_compact_non_retryable_failure_is_not_retried() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_compact_rejects_invalid_summary_without_committing_output() {
+    assert_manual_compact_corrective_retry(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_compact_corrects_invalid_summary_before_committing_output() {
+    assert_manual_compact_corrective_retry(true).await;
+}
+
+async fn assert_manual_compact_corrective_retry(retry_succeeds: bool) {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
@@ -3468,12 +3477,24 @@ async fn manual_compact_rejects_invalid_summary_without_committing_output() {
         ev_assistant_message("m2", rejected_summary),
         ev_completed("r2"),
     ]);
+    let corrected_summary = "## Goal\nPreserve the active task\n\n## Current state\nReady to continue\n\n## Completed work\nFirst turn answered\n\n## Unresolved work\nHandle the follow-up\n\n## Evidence\nFirst reply received\n\n## Next action\nContinue the task";
+    let retry_turn = if retry_succeeds {
+        sse(vec![
+            ev_assistant_message("m-retry", corrected_summary),
+            ev_completed("r-retry"),
+        ])
+    } else {
+        compact_turn.clone()
+    };
     let followup_turn = sse(vec![
         ev_assistant_message("m3", "FOLLOWUP_REPLY"),
         ev_completed("r3"),
     ]);
-    let request_log =
-        mount_sse_sequence(&server, vec![user_turn, compact_turn, followup_turn]).await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![user_turn, compact_turn, retry_turn, followup_turn],
+    )
+    .await;
 
     let model_provider = non_openai_model_provider(&server);
     let test = test_codex()
@@ -3508,20 +3529,19 @@ async fn manual_compact_rejects_invalid_summary_without_committing_output() {
     wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
     codex.submit(Op::Compact).await.expect("trigger compact");
-    let error = wait_for_event(codex, |event| matches!(event, EventMsg::Error(_))).await;
-    let EventMsg::Error(error) = error else {
-        unreachable!("predicate only accepts error events");
-    };
-    assert!(error.message.contains("compaction handoff is incomplete"));
+    if !retry_succeeds {
+        let error = wait_for_event(codex, |event| matches!(event, EventMsg::Error(_))).await;
+        let EventMsg::Error(error) = error else {
+            unreachable!("predicate only accepts error events");
+        };
+        assert!(error.message.contains("compaction handoff is incomplete"));
+    }
     let completion =
         wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
     let EventMsg::TurnComplete(completion) = completion else {
         unreachable!("predicate only accepts turn-complete events");
     };
-    assert!(
-        completion.error.is_some(),
-        "standalone compact failure must be terminally unsuccessful"
-    );
+    assert_eq!(completion.error.is_none(), retry_succeeds);
 
     codex
         .submit(Op::UserInput {
@@ -3540,10 +3560,27 @@ async fn manual_compact_rejects_invalid_summary_without_committing_output() {
     codex.flush_rollout().await.expect("flush rollout");
 
     let requests = request_log.requests();
-    assert_eq!(requests.len(), 3);
-    let followup_body = requests[2].body_json().to_string();
-    assert!(body_contains_text(&followup_body, "first turn"));
-    assert!(body_contains_text(&followup_body, FIRST_REPLY));
+    assert_eq!(
+        requests.len(),
+        4,
+        "malformed handoffs get exactly one corrective retry"
+    );
+    let corrective_body = requests[2].body_json().to_string();
+    assert!(body_contains_text(
+        &corrective_body,
+        "The previous compaction handoff was rejected"
+    ));
+    assert!(body_contains_text(
+        &corrective_body,
+        "missing non-empty sections"
+    ));
+    let followup_body = requests[3].body_json().to_string();
+    if retry_succeeds {
+        assert!(body_contains_text(&followup_body, corrected_summary));
+    } else {
+        assert!(body_contains_text(&followup_body, "first turn"));
+        assert!(body_contains_text(&followup_body, FIRST_REPLY));
+    }
     assert!(body_contains_text(&followup_body, "after rejected compact"));
     assert!(
         !body_contains_text(&followup_body, rejected_summary),
@@ -3555,12 +3592,15 @@ async fn manual_compact_rejects_invalid_summary_without_committing_output() {
         !body_contains_text(&rollout, rejected_summary),
         "rejected compaction output must not be persisted"
     );
-    assert!(
-        rollout
-            .lines()
-            .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
-            .all(|line| !matches!(line.item, RolloutItem::Compacted(_))),
-        "failed compaction must not persist a compacted checkpoint"
+    let compacted_count = rollout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
+        .filter(|line| matches!(line.item, RolloutItem::Compacted(_)))
+        .count();
+    assert_eq!(
+        compacted_count,
+        usize::from(retry_succeeds),
+        "only a corrected handoff may persist a compacted checkpoint"
     );
 }
 
@@ -4197,7 +4237,7 @@ async fn auto_compact_body_after_prefix_ignores_prefix_until_body_hits_limit() {
         .with_config(move |config| {
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
-            config.model_context_window = Some(1_000);
+            config.model_context_window = Some(200_000);
             config.model_auto_compact_token_limit = Some(100);
             config.model_auto_compact_token_limit_scope =
                 AutoCompactTokenLimitScope::BodyAfterPrefix;
@@ -4210,10 +4250,17 @@ async fn auto_compact_body_after_prefix_ignores_prefix_until_body_hits_limit() {
         test.submit_turn(user).await.expect("submit turn");
     }
 
+    // A completed response needs no further sampling. Compact at the next
+    // request boundary after the second response raises body usage above 100.
+    assert_eq!(request_log.requests().len(), 2);
+    test.submit_turn("PREFIX_FREE_THREE")
+        .await
+        .expect("submit turn after body growth");
+
     assert_eq!(
         request_log.requests().len(),
         4,
-        "body growth on the second turn should compact immediately, while the initial prefix alone should not"
+        "body growth should compact before the next sample, while the initial prefix alone should not"
     );
     let requests = request_log.requests();
     let compact_body = requests[2].body_json().to_string();

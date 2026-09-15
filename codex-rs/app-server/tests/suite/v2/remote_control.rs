@@ -93,6 +93,16 @@ async fn managed_requirements_reject_all_remote_control_rpcs() -> Result<()> {
     )?;
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
+        .with_env_overrides(&[(
+            "CODEX_APP_SERVER_MANAGED_CONFIG_PATH",
+            Some(
+                codex_home
+                    .path()
+                    .join("managed_config.toml")
+                    .to_string_lossy()
+                    .as_ref(),
+            ),
+        )])
         .without_auto_env()
         .build()
         .await?;
@@ -155,6 +165,16 @@ async fn managed_requirements_allow_remote_control_true_does_not_enable_or_block
     )?;
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
+        .with_env_overrides(&[(
+            "CODEX_APP_SERVER_MANAGED_CONFIG_PATH",
+            Some(
+                codex_home
+                    .path()
+                    .join("managed_config.toml")
+                    .to_string_lossy()
+                    .as_ref(),
+            ),
+        )])
         .without_auto_env()
         .build()
         .await?;
@@ -244,6 +264,17 @@ async fn listen_off_honors_persisted_remote_control_enable_with_residency_before
 
     let _app_server = TestAppServer::builder()
         .with_codex_home(codex_home.path())
+        .with_env_overrides(&[(
+            "CODEX_APP_SERVER_MANAGED_CONFIG_PATH",
+            Some(
+                codex_home
+                    .path()
+                    .join("managed_config.toml")
+                    .to_string_lossy()
+                    .as_ref(),
+            ),
+        )])
+        .with_env_overrides(&[("CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG", None)])
         .without_auto_env()
         .with_args(&["--listen", "off"])
         .build()
@@ -295,6 +326,16 @@ async fn listen_off_ignores_persisted_enable_when_disabled_by_requirements() -> 
 
     let mut app_server = TestAppServer::builder()
         .with_codex_home(codex_home.path())
+        .with_env_overrides(&[(
+            "CODEX_APP_SERVER_MANAGED_CONFIG_PATH",
+            Some(
+                codex_home
+                    .path()
+                    .join("managed_config.toml")
+                    .to_string_lossy()
+                    .as_ref(),
+            ),
+        )])
         .without_auto_env()
         .with_args(&["--listen", "off"])
         .build()
@@ -680,7 +721,13 @@ async fn remote_control_pairing_start_propagates_backend_failure() -> Result<()>
             .contains("remote control pairing failed")
     );
     assert!(error.error.message.contains("HTTP 500"));
-    assert!(error.error.message.contains("pairing backend failure"));
+    assert!(
+        error
+            .error
+            .message
+            .contains("<omitted non-JSON response body>")
+    );
+    assert!(!error.error.message.contains("pairing backend failure"));
     Ok(())
 }
 
@@ -726,7 +773,13 @@ async fn remote_control_client_management_propagates_backend_errors() -> Result<
         .await??;
         assert_eq!(error.error.code, code);
         assert!(error.error.message.contains(&format!("HTTP {status}")));
-        assert!(error.error.message.contains("client backend failure"));
+        assert!(
+            error
+                .error
+                .message
+                .contains("<omitted non-JSON response body>")
+        );
+        assert!(!error.error.message.contains("client backend failure"));
     }
     timeout(DEFAULT_TIMEOUT, server_task).await???;
     Ok(())

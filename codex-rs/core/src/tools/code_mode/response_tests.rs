@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use crate::tools::context::{FunctionToolOutput, ToolInvocation, ToolPayload};
+use crate::tools::context::FunctionToolOutput;
+use crate::tools::context::ToolInvocation;
+use crate::tools::context::ToolPayload;
 use codex_code_mode::CellId;
 use codex_code_mode::FunctionCallOutputContentItem as RuntimeContentItem;
 use codex_code_mode::RuntimeResponse;
@@ -13,16 +15,18 @@ use codex_tools::ToolOutputOutcome;
 
 // Controlled nested results cross the real JS runtime, broker and tool router.
 // Tests below never manufacture packet entries or required-terminal metadata.
-struct PacketTestTool;
+struct PacketTestTool {
+    name: &'static str,
+}
 
 impl ToolExecutor<ToolInvocation> for PacketTestTool {
     fn tool_name(&self) -> codex_tools::ToolName {
-        codex_tools::ToolName::plain("read_tool_output")
+        codex_tools::ToolName::plain(self.name)
     }
 
     fn spec(&self) -> codex_tools::ToolSpec {
         codex_tools::ToolSpec::Function(codex_tools::ResponsesApiTool {
-            name: "read_tool_output".to_string(),
+            name: self.name.to_string(),
             description: "Controlled packet regression result.".to_string(),
             strict: false,
             defer_loading: None,
@@ -37,7 +41,26 @@ impl ToolExecutor<ToolInvocation> for PacketTestTool {
                 panic!("nested function dispatch must preserve its payload kind");
             };
             let args: serde_json::Value = serde_json::from_str(&arguments).unwrap();
-            if let Some(error) = args["error"].as_str() {
+            if let Some(status) = args["terminal_status"].as_u64() {
+                return Ok(crate::tools::context::boxed_tool_output(
+                    FunctionToolOutput::from_text(
+                        format!("request failed with status {status}"),
+                        Some(false),
+                    )
+                    .with_sampling_request_signal(serde_json::json!({"retryable": false})),
+                ));
+            }
+
+            if let Some(error) = args["error"]
+                .as_str()
+                .or_else(|| match args["cmd"].as_str() {
+                    Some("Remove-Item output.txt") => Some("write rejected"),
+                    Some("git log -1") => Some("history unavailable"),
+                    Some("Get-Content missing.txt") => Some("file missing"),
+                    Some("git status --short") => Some("status unavailable"),
+                    _ => None,
+                })
+            {
                 return Err(crate::FunctionCallError::RespondToModel(error.to_string()));
             }
             let output = FunctionToolOutput::from_text("READ_RESULT_42".to_string(), Some(true));
@@ -67,13 +90,18 @@ struct PacketRuntime {
 
 impl PacketRuntime {
     async fn new() -> Self {
+        Self::with_nested_tool("read_tool_output").await
+    }
+
+    async fn with_nested_tool(name: &'static str) -> Self {
         let (mut session, mut turn) = crate::session::tests::make_session_and_context().await;
         session.services.code_mode_service = super::CodeModeService::new(Arc::new(
             codex_code_mode::InProcessCodeModeSessionProvider,
         ));
         turn.model_info.tool_mode = Some(codex_protocol::openai_models::ToolMode::CodeMode);
         let session = Arc::new(session);
-        let nested: Arc<dyn crate::tools::registry::CoreToolRuntime> = Arc::new(PacketTestTool);
+        let nested: Arc<dyn crate::tools::registry::CoreToolRuntime> =
+            Arc::new(PacketTestTool { name });
         let execute = super::execute_handler::CodeModeExecuteHandler::new(
             super::execute_spec::create_code_mode_tool(false, false, &[], &[]),
             vec![nested.spec()],
@@ -205,6 +233,101 @@ fn packet_output_text(output: &dyn ToolOutput) -> String {
 }
 
 #[tokio::test]
+async fn nested_failures_preserve_only_observed_workspace_dependencies() {
+    use crate::tool_history::SourceDependencyV1;
+    use std::collections::BTreeSet;
+
+    for (input, added_dependency, unscoped) in [
+        (serde_json::json!(42), None, false),
+        (
+            serde_json::json!({"cmd": "Remove-Item output.txt"}),
+            None,
+            false,
+        ),
+        (serde_json::json!({"cmd": "git log -1"}), None, false),
+        (
+            serde_json::json!({"cmd": "Get-Content missing.txt"}),
+            Some("missing.txt"),
+            false,
+        ),
+        (serde_json::json!({"cmd": "git status --short"}), None, true),
+    ] {
+        let runtime = PacketRuntime::with_nested_tool("exec_command").await;
+        let output = runtime
+            .exec(&format!(
+                "await tools.exec_command({{cmd: 'Get-Content source.txt'}}); try {{ await tools.exec_command({input}); }} catch {{}}"
+            ))
+            .await;
+        assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
+        let visible = packet_output_text(output.as_ref());
+        assert!(visible.contains("READ_RESULT_42"), "{visible}");
+        let expected_error = match input["cmd"].as_str() {
+            Some("Remove-Item output.txt") => "write rejected",
+            Some("git log -1") => "history unavailable",
+            Some("Get-Content missing.txt") => "file missing",
+            Some("git status --short") => "status unavailable",
+            _ => "expects a JSON object for arguments",
+        };
+        assert!(visible.contains(expected_error), "{visible}");
+
+        let cell_id = output
+            .deterministic_continuation_owner_key()
+            .expect("completed cell retains its dependency owner");
+        let mut expected = BTreeSet::from([SourceDependencyV1::new(
+            &runtime.step.turn.config.cwd.join("source.txt"),
+            false,
+        )]);
+        if let Some(path) = added_dependency {
+            expected.insert(SourceDependencyV1::new(
+                &runtime.step.turn.config.cwd.join(path),
+                false,
+            ));
+        }
+        if unscoped {
+            expected.clear();
+        }
+        assert_eq!(
+            runtime.signals.code_mode_source_dependencies(&cell_id),
+            Some(expected),
+            "failed nested input: {input}"
+        );
+        runtime.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn exec_reports_omitted_nested_fallback_results() {
+    let runtime = PacketRuntime::new().await;
+    for (count, omitted) in [(20, 12), (8, 0)] {
+        let source = format!(
+            "await Promise.all(Array.from({{length: {count}}}, () => tools.read_tool_output({{}})));"
+        );
+        let output = runtime.exec(&source).await;
+        assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Success);
+        let visible = packet_output_text(output.as_ref());
+        assert_eq!(visible.matches("READ_RESULT_42").count(), 8, "{visible}");
+        if omitted > 0 {
+            assert!(
+                visible.contains(&format!(
+                    "{omitted} additional nested tool results were omitted"
+                )),
+                "{visible}"
+            );
+        } else {
+            assert!(!visible.contains("results were omitted"), "{visible}");
+        }
+    }
+    let output = runtime
+        .exec("await Promise.all(Array.from({length: 20}, () => tools.read_tool_output({}))); text('explicit result');")
+        .await;
+    let visible = packet_output_text(output.as_ref());
+    assert!(visible.contains("explicit result"), "{visible}");
+    assert!(!visible.contains("results were omitted"), "{visible}");
+    assert!(!visible.contains("READ_RESULT_42"), "{visible}");
+    runtime.finish().await;
+}
+
+#[tokio::test]
 async fn exec_caught_nested_error_is_budgeted_and_fully_recoverable() {
     let runtime = PacketRuntime::new().await;
     let diagnostic = format!("REQUIRED_ROOT_CAUSE {} CANONICAL_TAIL", "é".repeat(40_000));
@@ -333,14 +456,14 @@ async fn cancelled_wait_retires_packet_created_by_real_nested_dispatch() {
 }
 
 #[tokio::test]
-async fn exec_advisory_is_actionable_and_emitted_once_across_real_packets() {
+async fn small_read_results_do_not_inject_batching_instructions() {
     let runtime = PacketRuntime::new().await;
     let output = runtime.exec("await tools.read_tool_output({});").await;
     let first = packet_output_text(output.as_ref());
     assert!(first.contains("READ_RESULT_42"));
-    assert!(first.contains("batch only necessary independent reads with known inputs"));
-    assert!(first.contains("Reuse unchanged evidence. Stop when the task is answered."));
-    assert_eq!(first.matches("Low-density packet:").count(), 1);
+    assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Success);
+    assert!(!first.contains("Low-density packet:"));
+    assert!(!first.contains("batch only necessary independent reads"));
     for source in [
         "await tools.read_tool_output({});",
         "await tools.read_tool_output({}); await tools.read_tool_output({});",
@@ -396,18 +519,31 @@ async fn exec_mixed_output_keeps_the_actual_exception_after_a_printed_error_log(
 
 #[tokio::test]
 async fn nested_status_codes_remain_distinct_in_the_continuation_consumer() {
-    use crate::session::reasoning_governor::{
-        SamplingReasoningGovernor, SamplingRequestSettledState,
-    };
+    use crate::session::reasoning_governor::SamplingReasoningGovernor;
+    use crate::session::reasoning_governor::SamplingRequestSettledState;
     let mut fingerprints = Vec::new();
     for status in [403, 404, 403] {
         let runtime = PacketRuntime::new().await;
-        let output = runtime
-            .exec(&format!(
-                "try {{ await tools.read_tool_output({}); }} catch {{}}",
-                serde_json::json!({"error": format!("request failed with status {status}")}),
-            ))
-            .await;
+        let source = format!(
+            "try {{ await tools.read_tool_output({}); }} catch {{}}",
+            serde_json::json!({"terminal_status": status}),
+        );
+        let payload = ToolPayload::Custom {
+            input: source.clone(),
+        };
+        let registration = runtime.signals.register_deterministic_tool_call(
+            &codex_tools::ToolName::plain("exec"),
+            &payload,
+            "packet-exec",
+        );
+        let output = runtime.exec(&source).await;
+        runtime.signals.record_response_result(
+            registration.ordinal,
+            output.outcome_context(),
+            output.sampling_request_signal(),
+            &output.to_response_item("packet-exec", &payload),
+            false,
+        );
         assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
         let governor = SamplingReasoningGovernor::new(None);
         let request = governor.continuation_generation_request(
@@ -569,7 +705,7 @@ fn runtime_response_paths_preserve_status_success_and_output_limits() {
         assert!(output.body.iter().any(|item| matches!(
             item,
             FunctionCallOutputContentItem::InputText { text }
-                if text.contains("Warning: truncated output")
+                if text.contains('…')
         )));
     }
 }
@@ -755,6 +891,55 @@ fn successful_script_output_suppresses_duplicate_retained_result_projection() {
 }
 
 #[tokio::test]
+async fn terminated_packet_keeps_nested_results_and_omission_notice_after_printed_output() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let exec = super::ExecContext {
+        session: Arc::new(session),
+        turn: Arc::new(turn),
+    };
+    for count in [1, 10] {
+        let cell = CellId::new(format!("terminated-{count}"));
+        let service = &exec.session.services.code_mode_service;
+        service.record_cell_parent_call_id(&cell, "outer-exec");
+        for _ in 0..count {
+            let ordinal = service.begin_packet_call(&cell).unwrap();
+            service.complete_packet_call(
+                &cell,
+                ordinal,
+                false,
+                0,
+                Vec::new(),
+                Some(nested_result_evidence("RETAINED_BEFORE_TERMINATION")),
+                None,
+            );
+        }
+        let output = super::handle_runtime_response(
+            &exec,
+            RuntimeResponse::Terminated {
+                cell_id: cell,
+                content_items: vec![RuntimeContentItem::InputText {
+                    text: "progress log".to_string(),
+                }],
+            },
+            Some(10_000),
+            Instant::now(),
+        )
+        .unwrap();
+        let visible = output.into_text();
+        assert!(visible.contains("Script terminated"));
+        assert!(visible.contains("progress log"));
+        assert_eq!(
+            visible.matches("RETAINED_BEFORE_TERMINATION").count(),
+            count.min(8)
+        );
+        assert_eq!(
+            visible.contains("2 additional nested tool results were omitted"),
+            count == 10
+        );
+    }
+}
+
+#[tokio::test]
 async fn packet_composition_budgets_required_diagnostics_and_preserves_canonical_failure() {
     use crate::tools::context::RequiredToolTerminalCause;
     use crate::tools::context::ToolPayload;
@@ -821,7 +1006,7 @@ async fn packet_composition_budgets_required_diagnostics_and_preserves_canonical
     );
     assert!(
         service
-            .finish_packet(cell.as_str(), &exec.turn.sub_id)
+            .finish_packet(cell.as_str())
             .first_required_terminal
             .is_none()
     );

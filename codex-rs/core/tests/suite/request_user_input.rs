@@ -276,6 +276,13 @@ async fn request_user_input_round_trip_for_mode(
     assert_eq!(request.questions.len(), 1);
     assert_eq!(request.auto_resolution_ms, auto_resolution_ms);
     assert_eq!(request.questions[0].is_other, true);
+    assert_eq!(
+        serde_json::to_value(&request.questions[0].options)?,
+        json!([
+            { "label": "Yes (Recommended)", "description": "Continue the current plan." },
+            { "label": "No", "description": "Stop and revisit the approach." }
+        ])
+    );
     assert!(
         timeout(Duration::from_millis(200), async {
             loop {

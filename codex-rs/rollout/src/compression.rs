@@ -12,7 +12,7 @@ use std::time::Duration;
 
 const COMPRESSED_SUFFIX: &str = ".zst";
 const COMPRESSED_READER_CHANNEL_CAPACITY: usize = 64;
-const MAX_NOT_FOUND_RETRIES: usize = 3;
+const MAX_OPEN_RETRIES: usize = 3;
 const OPEN_ROLLOUT_LINE_READER_RETRY_DELAY: Duration = Duration::from_millis(50);
 const TEMP_SUFFIX: &str = ".tmp";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -38,19 +38,25 @@ pub(crate) async fn file_modified_time(path: &Path) -> io::Result<Option<time::O
 
 /// Opens a rollout line reader that transparently handles plain `.jsonl` and `.jsonl.zst` files.
 ///
-/// If the requested path disappears during a representation transition, this briefly retries
-/// resolution so callers do not need to know which representation is on disk.
+/// Briefly retries missing files and Windows sharing violations during representation
+/// transitions so callers do not need to know which representation is on disk.
 pub async fn open_rollout_line_reader(path: &Path) -> io::Result<RolloutLineReader> {
-    for _ in 0..MAX_NOT_FOUND_RETRIES {
+    for _ in 0..MAX_OPEN_RETRIES {
         match reader::open_once(path).await {
             Ok(reader) => return Ok(reader),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            Err(err) if is_retryable_open_error(&err) => {
                 tokio::time::sleep(OPEN_ROLLOUT_LINE_READER_RETRY_DELAY).await;
             }
             Err(err) => return Err(err),
         }
     }
     reader::open_once(path).await
+}
+
+fn is_retryable_open_error(error: &io::Error) -> bool {
+    // ERROR_SHARING_VIOLATION can occur while another handle replaces a rollout.
+    // Do not retry ordinary access-denied errors such as a persistent ACL failure.
+    error.kind() == io::ErrorKind::NotFound || (cfg!(windows) && error.raw_os_error() == Some(32))
 }
 
 /// Returns the compressed `.jsonl.zst` path for a rollout path.
@@ -186,7 +192,11 @@ fn materialize_rollout_for_append_locked(path: &Path) -> io::Result<PathBuf> {
         match std::fs::remove_file(compressed_path.as_path()) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err),
+            Err(err) => tracing::warn!(
+                path = %compressed_path.display(),
+                error = %err,
+                "rollout materialized but compressed source cleanup failed"
+            ),
         }
         Ok(())
     })();
@@ -197,6 +207,7 @@ fn materialize_rollout_for_append_locked(path: &Path) -> io::Result<PathBuf> {
             return Ok(plain_path);
         }
         metrics::materialize("failed");
+        tracing::warn!(path = %plain_path.display(), error = %err, "rollout materialization failed");
         return Err(err);
     }
     metrics::materialize("decompressed");

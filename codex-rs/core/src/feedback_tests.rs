@@ -126,17 +126,14 @@ fn emit_feedback_request_tags_records_sentry_feedback_fields() {
     );
 
     let tags = tags.lock().unwrap().clone();
-    assert_eq!(
-        tags.get("endpoint").map(String::as_str),
-        Some("\"/responses\"")
-    );
+    assert_eq!(tags.get("endpoint").map(String::as_str), Some("/responses"));
     assert_eq!(
         tags.get("auth_header_attached").map(String::as_str),
         Some("true")
     );
     assert_eq!(
         tags.get("auth_header_name").map(String::as_str),
-        Some("\"authorization\"")
+        Some("authorization")
     );
     assert_eq!(
         tags.get("auth_env_openai_api_key_present")
@@ -155,12 +152,12 @@ fn emit_feedback_request_tags_records_sentry_feedback_fields() {
     );
     assert_eq!(
         tags.get("auth_env_provider_key_name").map(String::as_str),
-        Some("\"configured\"")
+        Some("configured")
     );
     assert_eq!(
         tags.get("auth_env_provider_key_present")
             .map(String::as_str),
-        Some("\"true\"")
+        Some("true")
     );
     assert_eq!(
         tags.get("auth_env_refresh_token_url_override_present")
@@ -169,21 +166,21 @@ fn emit_feedback_request_tags_records_sentry_feedback_fields() {
     );
     assert_eq!(
         tags.get("auth_request_id").map(String::as_str),
-        Some("\"req-123\"")
+        Some("req-123")
     );
     assert_eq!(
         tags.get("auth_error_code").map(String::as_str),
-        Some("\"token_expired\"")
+        Some("token_expired")
     );
     assert_eq!(
         tags.get("auth_recovery_followup_success")
             .map(String::as_str),
-        Some("\"true\"")
+        Some("true")
     );
     assert_eq!(
         tags.get("auth_recovery_followup_status")
             .map(String::as_str),
-        Some("\"200\"")
+        Some("200")
     );
     assert_eq!(*event_count.lock().unwrap(), 1);
 }
@@ -212,19 +209,19 @@ fn emit_feedback_auth_recovery_tags_preserves_401_specific_fields() {
     let tags = tags.lock().unwrap().clone();
     assert_eq!(
         tags.get("auth_401_request_id").map(String::as_str),
-        Some("\"req-401\"")
+        Some("req-401")
     );
     assert_eq!(
         tags.get("auth_401_cf_ray").map(String::as_str),
-        Some("\"ray-401\"")
+        Some("ray-401")
     );
     assert_eq!(
         tags.get("auth_401_error").map(String::as_str),
-        Some("\"missing_authorization_header\"")
+        Some("missing_authorization_header")
     );
     assert_eq!(
         tags.get("auth_401_error_code").map(String::as_str),
-        Some("\"token_expired\"")
+        Some("token_expired")
     );
     assert_eq!(*event_count.lock().unwrap(), 1);
 }
@@ -262,16 +259,13 @@ fn emit_feedback_auth_recovery_tags_clears_stale_401_fields() {
     let tags = tags.lock().unwrap().clone();
     assert_eq!(
         tags.get("auth_401_request_id").map(String::as_str),
-        Some("\"req-401-b\"")
+        Some("req-401-b")
     );
-    assert_eq!(
-        tags.get("auth_401_cf_ray").map(String::as_str),
-        Some("\"\"")
-    );
-    assert_eq!(tags.get("auth_401_error").map(String::as_str), Some("\"\""));
+    assert_eq!(tags.get("auth_401_cf_ray").map(String::as_str), Some(""));
+    assert_eq!(tags.get("auth_401_error").map(String::as_str), Some(""));
     assert_eq!(
         tags.get("auth_401_error_code").map(String::as_str),
-        Some("\"\"")
+        Some("")
     );
     assert_eq!(*event_count.lock().unwrap(), 2);
 }
@@ -307,24 +301,21 @@ fn emit_feedback_request_tags_preserves_latest_auth_fields_after_unauthorized() 
     let tags = tags.lock().unwrap().clone();
     assert_eq!(
         tags.get("auth_request_id").map(String::as_str),
-        Some("\"req-123\"")
+        Some("req-123")
     );
-    assert_eq!(
-        tags.get("auth_cf_ray").map(String::as_str),
-        Some("\"ray-123\"")
-    );
+    assert_eq!(tags.get("auth_cf_ray").map(String::as_str), Some("ray-123"));
     assert_eq!(
         tags.get("auth_error").map(String::as_str),
-        Some("\"missing_authorization_header\"")
+        Some("missing_authorization_header")
     );
     assert_eq!(
         tags.get("auth_error_code").map(String::as_str),
-        Some("\"token_expired\"")
+        Some("token_expired")
     );
     assert_eq!(
         tags.get("auth_recovery_followup_success")
             .map(String::as_str),
-        Some("\"false\"")
+        Some("false")
     );
     assert_eq!(*event_count.lock().unwrap(), 1);
 }
@@ -386,21 +377,12 @@ fn emit_feedback_request_tags_preserves_auth_env_fields_for_legacy_emitters() {
     });
 
     let tags = tags.lock().unwrap().clone();
-    assert_eq!(
-        tags.get("auth_header_name").map(String::as_str),
-        Some("\"\"")
-    );
-    assert_eq!(tags.get("auth_mode").map(String::as_str), Some("\"\""));
-    assert_eq!(
-        tags.get("auth_request_id").map(String::as_str),
-        Some("\"\"")
-    );
-    assert_eq!(tags.get("auth_cf_ray").map(String::as_str), Some("\"\""));
-    assert_eq!(tags.get("auth_error").map(String::as_str), Some("\"\""));
-    assert_eq!(
-        tags.get("auth_error_code").map(String::as_str),
-        Some("\"\"")
-    );
+    assert_eq!(tags.get("auth_header_name").map(String::as_str), Some(""));
+    assert_eq!(tags.get("auth_mode").map(String::as_str), Some(""));
+    assert_eq!(tags.get("auth_request_id").map(String::as_str), Some(""));
+    assert_eq!(tags.get("auth_cf_ray").map(String::as_str), Some(""));
+    assert_eq!(tags.get("auth_error").map(String::as_str), Some(""));
+    assert_eq!(tags.get("auth_error_code").map(String::as_str), Some(""));
     assert_eq!(
         tags.get("auth_env_openai_api_key_present")
             .map(String::as_str),
@@ -418,12 +400,12 @@ fn emit_feedback_request_tags_preserves_auth_env_fields_for_legacy_emitters() {
     );
     assert_eq!(
         tags.get("auth_env_provider_key_name").map(String::as_str),
-        Some("\"configured\"")
+        Some("configured")
     );
     assert_eq!(
         tags.get("auth_env_provider_key_present")
             .map(String::as_str),
-        Some("\"true\"")
+        Some("true")
     );
     assert_eq!(
         tags.get("auth_env_refresh_token_url_override_present")
@@ -433,12 +415,12 @@ fn emit_feedback_request_tags_preserves_auth_env_fields_for_legacy_emitters() {
     assert_eq!(
         tags.get("auth_recovery_followup_success")
             .map(String::as_str),
-        Some("\"\"")
+        Some("")
     );
     assert_eq!(
         tags.get("auth_recovery_followup_status")
             .map(String::as_str),
-        Some("\"\"")
+        Some("")
     );
     assert_eq!(*event_count.lock().unwrap(), 2);
 }

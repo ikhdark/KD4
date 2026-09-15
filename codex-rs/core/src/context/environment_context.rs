@@ -192,9 +192,13 @@ fn dedupe_file_system_entries(entries: &mut Vec<FileSystemSandboxEntry>) {
 }
 
 fn push_text_element(rendered: &mut String, name: &str, value: &str) {
-    rendered.push_str(&format!("<{name}>"));
+    rendered.push('<');
+    rendered.push_str(name);
+    rendered.push('>');
     push_xml_escaped_text(rendered, value);
-    rendered.push_str(&format!("</{name}>"));
+    rendered.push_str("</");
+    rendered.push_str(name);
+    rendered.push('>');
 }
 
 pub(crate) fn push_xml_escaped_text(rendered: &mut String, value: &str) {
@@ -203,9 +207,18 @@ pub(crate) fn push_xml_escaped_text(rendered: &mut String, value: &str) {
             '&' => rendered.push_str("&amp;"),
             '<' => rendered.push_str("&lt;"),
             '>' => rendered.push_str("&gt;"),
-            '"' => rendered.push_str("&quot;"),
-            '\'' => rendered.push_str("&apos;"),
             _ => rendered.push(ch),
+        }
+    }
+}
+
+pub(crate) fn push_xml_escaped_attribute(rendered: &mut String, value: &str) {
+    for part in value.split_inclusive('"') {
+        if let Some(text) = part.strip_suffix('"') {
+            push_xml_escaped_text(rendered, text);
+            rendered.push_str("&quot;");
+        } else {
+            push_xml_escaped_text(rendered, part);
         }
     }
 }

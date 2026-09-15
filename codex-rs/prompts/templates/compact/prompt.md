@@ -18,11 +18,13 @@ task-relevant content for a required section; never leave a section empty.
 
 ## Goal
 
-Current goal and exact user constraints.
+Current goal and exact user constraints, including prohibitions and out-of-scope work.
 
 ## Current state
 
 The latest implementation and worktree state needed to resume safely.
+Name files already edited, partial changes, and any active ownership or handoffs.
+Preserve the remaining predicted change surface: owners, files, and affected contracts.
 
 ## Completed work
 
@@ -33,12 +35,17 @@ supporting evidence.
 
 Remaining steps, blockers, risks, ambiguities, or stale facts that must be
 re-established.
+Include pending consumer updates, regeneration commands, and validation obligations.
+Name preserved invariants that still need verification; retain applicable prohibitions.
+Preserve ruled-out causes with their observed evidence so they are not repeated.
 
 ## Evidence
 
 Preserve the available evidence identifier or command, scope, observed outcome,
 and any known later invalidation. Mark unknown freshness explicitly; do not
 invent identifiers or gather new evidence.
+Keep supplied provenance labels such as direct_file_read, cached_observation,
+and test_result attached to the claims they support.
 
 ## Next action
 

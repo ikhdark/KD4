@@ -55,6 +55,7 @@ codex *args:
     cargo run --bin codex -- {args}
 
 # Prefer the already-built debug binary (may be stale); fall back to `cargo run`.
+[windows]
 codex-fast *args:
     just codex-stale-ok {args}
 
@@ -179,18 +180,22 @@ rust-dead-code-matrix *args:
 [windows]
 install:
     #!powershell.exe -File
-    $requiredPwshVersion = [version]"7.5.2"
+    $requiredPwshVersion = [version]"7.5"
     $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue
     if (-not $pwsh) {
-        Write-Error "PowerShell $requiredPwshVersion is required. Install that exact version before running setup."
+        Write-Error "PowerShell $requiredPwshVersion or newer is required. Install it before running setup."
         exit 2
     }
     $actualPwshVersion = & $pwsh.Source -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
-    if ([version]$actualPwshVersion -ne $requiredPwshVersion) {
-        Write-Error "PowerShell $requiredPwshVersion is required; found $actualPwshVersion."
+    if ([version]$actualPwshVersion -lt $requiredPwshVersion) {
+        Write-Error "PowerShell $requiredPwshVersion or newer is required; found $actualPwshVersion."
         exit 2
     }
     rustup show active-toolchain
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $rustfmtToolchain = & {{ python }} "{{ justfile_directory() }}\scripts\tool_versions.py"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    rustup toolchain install $rustfmtToolchain --profile minimal --component rustfmt
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     cargo fetch --locked
     exit $LASTEXITCODE
@@ -252,7 +257,7 @@ rust-perf-env *args:
 test *args:
     $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast @forwarded_args
 
-# Fast local test loop: stop at the first failure and skip flaky retries.
+# Fast local test loop: finish the selected tests without flaky retries.
 [windows]
 test-fast *args:
     $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run @forwarded_args
@@ -270,7 +275,7 @@ adaptive-reasoning-contract-check:
 core-test target *args:
     $forwarded_args = @($args | Select-Object -Skip 2); $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; python "{{ justfile_directory() }}\scripts\rust_test_runner.py" run-target "{{ target }}" --no-fail-fast @forwarded_args
 
-# Fast local loop for a named core target: stop at the first failure, no retries.
+# Fast local loop for a named core target: finish the selection, no retries.
 [windows]
 core-test-fast target *args:
     $forwarded_args = @($args | Select-Object -Skip 2); $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; python "{{ justfile_directory() }}\scripts\rust_test_runner.py" run-target "{{ target }}" @forwarded_args
@@ -320,7 +325,7 @@ test-compile *args:
 
 [windows]
 test-windows-sandbox-processes *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:CODEX_REQUIRE_WINDOWS_SANDBOX_PROCESS_TESTS = "1"; cargo nextest run --no-tests=fail -p codex-utils-pty -E 'test(terminate_kills_descendants_for_best_effort_pipe_and_atomic_conpty) | test(normal_exit_preserves_descendants_for_pipe_and_conpty) | test(conpty_delivers_input_to_foreground_children) | test(conpty_ctrl_c_interrupts_powershell_foreground_child) | test(required_process_test_prerequisites_report_unverified_coverage)' @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo nextest run --no-tests=fail -p codex-windows-sandbox -E 'test(legacy_capture_cancellation_terminates_descendants_without_timeout) | test(controlling_ipc_eof_terminates_process_tree) | test(process_wait_failure_is_not_treated_as_exit) | test(invalid_process_wait_is_not_treated_as_exit)' @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; just core-gate windows-sandbox-core-exec
+    $forwarded_args = @($args | Select-Object -Skip 1); $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:CODEX_REQUIRE_WINDOWS_SANDBOX_PROCESS_TESTS = "1"; cargo nextest run --profile local --no-tests=fail -p codex-utils-pty -E 'test(terminate_kills_descendants_for_best_effort_pipe_and_atomic_conpty) | test(normal_exit_preserves_descendants_for_pipe_and_conpty) | test(conpty_delivers_input_to_foreground_children) | test(conpty_ctrl_c_interrupts_powershell_foreground_child) | test(required_process_test_prerequisites_report_unverified_coverage)' @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo nextest run --profile local --no-tests=fail -p codex-windows-sandbox -E 'test(legacy_capture_cancellation_terminates_descendants_without_timeout) | test(controlling_ipc_eof_terminates_process_tree) | test(process_wait_failure_is_not_treated_as_exit) | test(invalid_process_wait_is_not_treated_as_exit)' @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; just core-gate windows-sandbox-core-exec
 
 # Full local test gate plus benchmark startup smoke.
 test-full-with-bench *args:
@@ -530,8 +535,8 @@ config-schema-regenerate owner:
 
 # Run focused app-server runtime validation without regenerating schemas.
 app-server-runtime-check:
-    cargo nextest run -p codex-app-server-protocol -E 'test(command_exec_response_round_trips_runtime_status) | test(process_notifications_round_trip)'
-    cargo nextest run -p codex-app-server -E 'test(suite::v2::command_exec::command_exec_non_streaming_respects_output_cap) | test(process_spawn_reports_buffered_output_cap_reached) | test(thread_status::tests::stale_active_running_thread_resume_clears_watch_status) | test(thread_status::tests::stale_active_repair_preserves_pending_approval_status)'
+    cargo nextest run --profile local -p codex-app-server-protocol -E 'test(command_exec_response_round_trips_runtime_status) | test(process_notifications_round_trip)'
+    cargo nextest run --profile local -p codex-app-server -E 'test(suite::v2::command_exec::command_exec_non_streaming_respects_output_cap) | test(process_spawn_reports_buffered_output_cap_reached) | test(thread_status::tests::stale_active_running_thread_resume_clears_watch_status) | test(thread_status::tests::stale_active_repair_preserves_pending_approval_status)'
     cargo check -p codex-app-server
 
 # Synchronize the tracked-path snapshot, then validate source-map inventories.
@@ -548,12 +553,19 @@ source-owners-check:
     {{ python }} "{{ justfile_directory() }}/scripts/source_owners.py" check
     {{ python }} "{{ justfile_directory() }}/scripts/test_source_owners.py"
 
+# Show the most specific owner's declared test/gate commands for a repository path.
+[script("python")]
+gate-for path:
+    import subprocess
+    import sys
+    raise SystemExit(subprocess.call([sys.executable, r"{{ justfile_directory() }}/scripts/source_owners.py", "validation", "--path", sys.argv[1]]))
+
 [windows]
 source-owners-slice owner *args:
     @$forwarded_args = @($args | Select-Object -Skip 2); {{ python }} "{{ justfile_directory() }}/scripts/source_owners.py" slice --owner "{{ owner }}" --max-relationships 32 @forwarded_args
 
 tui-large-widget-check:
-    cargo nextest run -p codex-tui -E 'test(footer_collapse_snapshots) | test(handle_paste_large_uses_placeholder_and_replaces_on_submit) | test(resume_picker)'
+    cargo nextest run --profile local -p codex-tui -E 'test(footer_collapse_snapshots) | test(handle_paste_large_uses_placeholder_and_replaces_on_submit) | test(resume_picker)'
     cargo check -p codex-tui
 
 deps-duplicates-check *args:
@@ -561,12 +573,19 @@ deps-duplicates-check *args:
 
 # Refresh the advisory database and audit the locked dependency graph.
 deps-audit:
+    just deps-advisories-check
     cargo audit
+
+# Enforce the shared advisory exceptions before either dependency-policy gate.
+[working-directory("..")]
+deps-advisories-check:
+    {{ python }} -m unittest scripts.test_build_tooling_policy.BuildToolingPolicyTest.test_advisory_ignores_match_between_audit_and_deny
 
 # Dependency policy gate for the dependency-cleanup surface: duplicate report
 # plus the offline cargo-deny checks. Advisories need network access, so they
 # stay in the separate `deps-audit` gate configured by .cargo/audit.toml.
 deps-policy-check *args:
+    just deps-advisories-check
     just _cargo-deny-installed
     just deps-duplicates-check {args}
     cargo deny check bans sources licenses
@@ -598,26 +617,26 @@ app-server-command-exec-check:
     cargo check -p codex-app-server
 
 _app-server-command-exec-tests:
-    cargo nextest run -p codex-app-server-protocol -E 'test(command_exec_response_round_trips_runtime_status)'
-    cargo nextest run -p codex-app-server -E 'test(suite::v2::command_exec::command_exec_non_streaming_respects_output_cap)'
+    cargo nextest run --profile local -p codex-app-server-protocol -E 'test(command_exec_response_round_trips_runtime_status)'
+    cargo nextest run --profile local -p codex-app-server -E 'test(suite::v2::command_exec::command_exec_non_streaming_respects_output_cap)'
 
 app-server-process-exec-check:
     just _app-server-process-exec-tests
     cargo check -p codex-app-server
 
 _app-server-process-exec-tests:
-    cargo nextest run -p codex-app-server-protocol -E 'test(process_notifications_round_trip)'
-    cargo nextest run -p codex-app-server -E 'test(process_spawn_reports_buffered_output_cap_reached)'
+    cargo nextest run --profile local -p codex-app-server-protocol -E 'test(process_notifications_round_trip)'
+    cargo nextest run --profile local -p codex-app-server -E 'test(process_spawn_reports_buffered_output_cap_reached)'
 
 app-server-thread-status-check:
     just _app-server-thread-status-tests
     cargo check -p codex-app-server
 
 _app-server-thread-status-tests:
-    cargo nextest run -p codex-app-server -E 'test(thread_status::tests::stale_active_running_thread_resume_clears_watch_status) | test(thread_status::tests::stale_active_repair_preserves_pending_approval_status)'
+    cargo nextest run --profile local -p codex-app-server -E 'test(thread_status::tests::stale_active_running_thread_resume_clears_watch_status) | test(thread_status::tests::stale_active_repair_preserves_pending_approval_status)'
 
 app-server-schema-protocol-check:
-    cargo nextest run -p codex-app-server-protocol -E 'test(typescript_schema_fixtures_match_generated) | test(json_schema_fixtures_match_generated)'
+    cargo nextest run --profile local -p codex-app-server-protocol -E 'test(typescript_schema_fixtures_match_generated) | test(json_schema_fixtures_match_generated)'
 
 # Check app-server schema fixtures without modifying generated output.
 [no-cd]
@@ -633,6 +652,10 @@ app-server-schema-regenerate owner experimental="":
 [no-cd]
 write-hooks-schema:
     cargo run --manifest-path "{{ justfile_directory() }}/codex-rs/Cargo.toml" -p codex-hooks --bin write_hooks_schema_fixtures
+
+# Compare generated hook schemas in a temporary directory with checked-in fixtures.
+hooks-schema-check:
+    cargo nextest run --profile local --no-tests=fail -p codex-hooks --lib -E 'test(=schema::tests::generated_hook_schemas_match_fixtures)'
 
 # Run the argument-comment Dylint checks across codex-rs.
 [no-cd]

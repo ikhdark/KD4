@@ -628,7 +628,12 @@ fn render_project_doc_to_budget(
     loop {
         let retained_bytes = read.retained_data.len();
         let omitted_bytes = read.original_bytes.saturating_sub(retained_bytes as u64);
-        let mut text = String::from_utf8_lossy(&read.retained_data).to_string();
+        let decoded = String::from_utf8_lossy(&read.retained_data);
+        let invalid_utf8 = matches!(decoded, std::borrow::Cow::Owned(_));
+        let mut text = decoded.into_owned();
+        if invalid_utf8 {
+            text.push_str("\n\n[Project documentation encoding notice: invalid UTF-8 bytes were replaced with U+FFFD; instructions may be incomplete.]");
+        }
         if omitted_bytes > 0 {
             if !text.is_empty() {
                 text.push_str("\n\n");

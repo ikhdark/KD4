@@ -1177,6 +1177,8 @@ pub(crate) fn build_guardian_review_session_config(
     let mut guardian_config = parent_config.clone();
     guardian_config.model = Some(active_model.to_string());
     guardian_config.model_reasoning_effort = reasoning_effort;
+    // Review effort is selected for the Guardian model, independently of the parent's task phases.
+    guardian_config.reasoning_phase_efforts = None;
     guardian_config.model_provider.request_max_retries = Some(1);
     guardian_config.model_provider.stream_max_retries = Some(1);
     guardian_config.include_skill_instructions = false;

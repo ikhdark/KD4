@@ -60,6 +60,8 @@ enum ContinuationStopReason {
     Cancelled,
     IdentityDrift,
     IncompleteOwnerResult,
+    InvalidSelector,
+    SelectorNotFound,
     PageReadError,
     RepeatedSelector,
 }
@@ -118,7 +120,16 @@ impl RecoveryContinuationState {
                 reason,
                 ContinuationStopReason::Budget | ContinuationStopReason::Cancelled
             ),
-            message: None,
+            message: Some(match reason {
+                ContinuationStopReason::Budget => "Recovery reached its output budget. Continue with the unconsumed selector in a new call.",
+                ContinuationStopReason::Cancelled => "Recovery was cancelled. Already recovered pages are retained; the unconsumed selector can be retried.",
+                ContinuationStopReason::IdentityDrift => "The artifact identity or continuation changed. Re-identify the artifact and start a new recovery; do not combine pages from different identities.",
+                ContinuationStopReason::IncompleteOwnerResult => "The artifact has unavailable ranges or returned an incomplete continuation result. Inspect the retained evidence and obtain the missing source before claiming complete recovery.",
+                ContinuationStopReason::InvalidSelector => "The selector is invalid. Correct it using the selector result message and the read_tool_output schema.",
+                ContinuationStopReason::SelectorNotFound => "The selector did not find the requested content. Inspect the artifact structure or revise the selector.",
+                ContinuationStopReason::RepeatedSelector => "The continuation repeated an already consumed selector. Stop this traversal and choose a different selector.",
+                ContinuationStopReason::PageReadError => "The continuation page could not be read.",
+            }.to_string()),
         });
     }
 
@@ -137,10 +148,13 @@ impl RecoveryContinuationState {
     }
 
     fn first_pending_selector(&self) -> Option<ToolOutputSelector> {
-        self.output
-            .results
-            .iter()
-            .find_map(|result| result.continuation.clone())
+        self.output.results.iter().find_map(|result| {
+            if selector_stop_reason(result.status).is_some() {
+                Some(result.selector.clone())
+            } else {
+                result.continuation.clone()
+            }
+        })
     }
 
     fn next_step(&self) -> ContinuationStep {
@@ -148,25 +162,12 @@ impl RecoveryContinuationState {
             return ContinuationStep::Stop(ContinuationStopReason::IncompleteOwnerResult);
         }
         for (result_index, result) in self.output.results.iter().enumerate() {
+            if let Some(reason) = selector_stop_reason(result.status) {
+                return ContinuationStep::Stop(reason);
+            }
             let Some(selector) = result.continuation.as_ref() else {
-                if !matches!(
-                    result.status,
-                    ToolOutputSelectorStatus::Ok
-                        | ToolOutputSelectorStatus::SelectorTooLarge
-                        | ToolOutputSelectorStatus::AggregateOmitted
-                ) {
-                    return ContinuationStep::Stop(ContinuationStopReason::IncompleteOwnerResult);
-                }
                 continue;
             };
-            if !matches!(
-                result.status,
-                ToolOutputSelectorStatus::Ok
-                    | ToolOutputSelectorStatus::SelectorTooLarge
-                    | ToolOutputSelectorStatus::AggregateOmitted
-            ) {
-                return ContinuationStep::Stop(ContinuationStopReason::IncompleteOwnerResult);
-            }
             if self.followed_selectors.contains(selector) {
                 return ContinuationStep::Stop(ContinuationStopReason::RepeatedSelector);
             }
@@ -198,36 +199,43 @@ impl RecoveryContinuationState {
         if !page.unavailable_ranges.is_empty()
             || page.results.len() != 1
             || &page.results[0].selector != selector
-            || !matches!(
-                page.results[0].status,
-                ToolOutputSelectorStatus::Ok
-                    | ToolOutputSelectorStatus::SelectorTooLarge
-                    | ToolOutputSelectorStatus::AggregateOmitted
-            )
         {
             return Err(ContinuationStopReason::IncompleteOwnerResult);
         }
+        if let Some(reason) = selector_stop_reason(page.results[0].status) {
+            return Err(reason);
+        }
 
-        let mut candidate = self.output.clone();
-        let predecessor = &mut candidate.results[result_index];
-        predecessor.continuation = next_owner_continuation(predecessor, selector);
+        let previous_length = self.output.results.len();
+        let previous_complete = self.output.complete;
+        let predecessor = &mut self.output.results[result_index];
+        let next_continuation = next_owner_continuation(predecessor, selector);
+        let previous_continuation =
+            std::mem::replace(&mut predecessor.continuation, next_continuation);
+        let predecessor_was_complete = predecessor.complete;
         if predecessor.status == ToolOutputSelectorStatus::Ok {
             predecessor.complete = predecessor.continuation.is_none();
         }
         // Keep already-drained pages in traversal order. Inserting every page
         // immediately after the owner reverses multi-page continuations.
-        candidate.results.extend(page.results);
-        candidate.complete = candidate.unavailable_ranges.is_empty()
-            && candidate.results.iter().all(|result| {
+        self.output.results.extend(page.results);
+        self.output.complete = self.output.unavailable_ranges.is_empty()
+            && self.output.results.iter().all(|result| {
                 result.status == ToolOutputSelectorStatus::Ok
                     && result.complete
                     && result.continuation.is_none()
             });
-        if !recovery_result_fits_token_ceiling(&candidate, self.token_ceiling) {
+        if !recovery_result_fits_token_ceiling(&self.output, self.token_ceiling) {
+            // Roll back only this page rather than copying every accumulated
+            // page for each budget check.
+            self.output.results.truncate(previous_length);
+            self.output.complete = previous_complete;
+            let predecessor = &mut self.output.results[result_index];
+            predecessor.continuation = previous_continuation;
+            predecessor.complete = predecessor_was_complete;
             return Err(ContinuationStopReason::Budget);
         }
 
-        self.output = candidate;
         self.followed_selectors.push(selector.clone());
         self.drained_continuation_pages = self.drained_continuation_pages.saturating_add(1);
         Ok(())
@@ -240,6 +248,16 @@ impl RecoveryContinuationState {
             drained_continuation_pages: self.drained_continuation_pages,
             continuation_stop: self.continuation_stop,
         }
+    }
+}
+
+fn selector_stop_reason(status: ToolOutputSelectorStatus) -> Option<ContinuationStopReason> {
+    match status {
+        ToolOutputSelectorStatus::Invalid => Some(ContinuationStopReason::InvalidSelector),
+        ToolOutputSelectorStatus::NotFound => Some(ContinuationStopReason::SelectorNotFound),
+        ToolOutputSelectorStatus::Ok
+        | ToolOutputSelectorStatus::SelectorTooLarge
+        | ToolOutputSelectorStatus::AggregateOmitted => None,
     }
 }
 
@@ -771,6 +789,136 @@ fn resolved_max_bytes(max_bytes: Option<usize>) -> Result<usize, FunctionCallErr
 mod tests {
     use super::*;
     use crate::tools::command_output_artifact::ByteSubdivisionPlan;
+
+    #[tokio::test]
+    async fn recovery_handler_output_schema_covers_exact_search_and_rejected_selectors() {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let session = std::sync::Arc::new(session);
+        let turn = std::sync::Arc::new(turn);
+        let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
+            &turn.config.codex_home,
+            &session.thread_id.to_string(),
+            &CanonicalToolResult::json(serde_json::json!({"present": "value"})),
+        )
+        .await;
+        let artifact_id = artifact
+            .artifact_id()
+            .expect("retained artifact")
+            .to_string();
+        let spec = ReadToolOutputHandler.spec();
+        let ToolSpec::Function(spec) = spec else {
+            panic!("recovery uses a function spec");
+        };
+        let validator =
+            jsonschema::validator_for(spec.output_schema.as_ref().expect("output schema"))
+                .expect("valid output schema");
+        for (selector, expected_status, expected_reason) in [
+            (
+                serde_json::json!({"kind": "json_pointer", "pointer": "invalid"}),
+                "invalid",
+                Some("invalid_selector"),
+            ),
+            (
+                serde_json::json!({"kind": "json_pointer", "pointer": "/present~2"}),
+                "invalid",
+                Some("invalid_selector"),
+            ),
+            (
+                serde_json::json!({"kind": "json_pointer", "pointer": "/present~"}),
+                "invalid",
+                Some("invalid_selector"),
+            ),
+            (
+                serde_json::json!({"kind": "json_pointer", "pointer": "/missing"}),
+                "not_found",
+                Some("selector_not_found"),
+            ),
+            (
+                serde_json::json!({"kind": "lines", "start": 0, "end": 0}),
+                "invalid",
+                Some("invalid_selector"),
+            ),
+            (
+                serde_json::json!({"kind": "json_pointer", "pointer": "/present"}),
+                "ok",
+                None,
+            ),
+            (
+                serde_json::json!({"kind": "search", "query": "present"}),
+                "ok",
+                None,
+            ),
+        ] {
+            let payload = ToolPayload::Function {
+                arguments: serde_json::json!({
+                    "artifact_id": artifact_id,
+                    "selectors": [selector],
+                })
+                .to_string(),
+            };
+            let result = ReadToolOutputHandler
+                .handle(ToolInvocation {
+                    session: std::sync::Arc::clone(&session),
+                    step_context: crate::session::step_context::StepContext::for_test(
+                        std::sync::Arc::clone(&turn),
+                    ),
+                    cancellation_token: Default::default(),
+                    tracker: std::sync::Arc::new(tokio::sync::Mutex::new(
+                        crate::turn_diff_tracker::TurnDiffTracker::new(),
+                    )),
+                    call_id: "selector-recovery".to_string(),
+                    tool_name: ToolName::plain("read_tool_output"),
+                    source: ToolCallSource::Direct,
+                    payload: payload.clone(),
+                })
+                .await
+                .expect("handler output")
+                .code_mode_result(&payload);
+            assert!(
+                validator.is_valid(&result),
+                "schema rejected handler result: {result}"
+            );
+            assert_eq!(
+                result["results"][0]["status"], expected_status,
+                "{selector}"
+            );
+            if let Some(reason) = expected_reason {
+                assert_eq!(result["continuation_stop"]["reason"], reason);
+                assert_eq!(result["continuation_stop"]["selector"], selector);
+                assert_eq!(result["continuation_stop"]["resumable"], false);
+                assert!(
+                    !result["continuation_stop"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(result["complete"], false);
+                let mut malformed = result.clone();
+                malformed["continuation_stop"]["reason"] = serde_json::json!("unknown");
+                assert!(!validator.is_valid(&malformed));
+            } else {
+                assert_eq!(result["complete"], true);
+                assert!(result.get("continuation_stop").is_none());
+                if selector["kind"] == "search" {
+                    assert_eq!(result["results"][0]["value"]["total_matches"], 1);
+                    assert_eq!(
+                        result["results"][0]["value"]["hydrated_ranges"][0]["text"],
+                        r#"{"present":"value"}"#
+                    );
+                    let mut malformed = result.clone();
+                    malformed["results"][0]["value"]["hydrated_ranges"] =
+                        serde_json::json!("missing ranges");
+                    assert!(!validator.is_valid(&malformed));
+                } else {
+                    assert_eq!(result["results"][0]["value"], "value");
+                }
+            }
+            let mut malformed = result;
+            malformed["complete"] = serde_json::json!("true");
+            assert!(!validator.is_valid(&malformed));
+        }
+    }
+
     use codex_tools::CanonicalByteRange;
 
     fn selector_result(status: ToolOutputSelectorStatus) -> ToolOutputSelectorResult {
@@ -865,6 +1013,7 @@ mod tests {
             None,
             "second page",
         )]);
+        let retained_text = initial.results[0].text.as_ref().unwrap().as_ptr();
         let mut state = RecoveryContinuationState::new(initial, false, usize::MAX);
 
         assert_eq!(
@@ -875,6 +1024,11 @@ mod tests {
             }
         );
         assert_eq!(state.accept_page(0, &second_selector, page, true), Ok(()));
+        assert_eq!(
+            state.output.results[0].text.as_ref().unwrap().as_ptr(),
+            retained_text,
+            "accepting a page must retain previously recovered text without copying it",
+        );
         assert_eq!(state.next_step(), ContinuationStep::Complete);
 
         let transaction = state.finish();
@@ -1283,7 +1437,12 @@ mod tests {
         assert_eq!(stop.reason, ContinuationStopReason::Budget);
         assert_eq!(stop.selector, Some(selector));
         assert!(stop.resumable);
-        assert_eq!(stop.message, None);
+        assert_eq!(
+            stop.message.as_deref(),
+            Some(
+                "Recovery reached its output budget. Continue with the unconsumed selector in a new call."
+            )
+        );
         assert_eq!(
             serde_json::to_value(stop).expect("serialize stop")["reason"],
             "budget"
@@ -1388,11 +1547,10 @@ mod tests {
             "start": 1,
             "end": 1,
         });
-        let selector_args = |count: usize, max_bytes: usize| {
+        let selector_args = |count: usize| {
             serde_json::json!({
                 "artifact_id": "artifact",
                 "selectors": vec![line_selector.clone(); count],
-                "max_bytes": max_bytes,
             })
         };
         let range_args = |count: usize| {
@@ -1414,15 +1572,10 @@ mod tests {
                 })
         };
         let cases = [
-            (selector_args(1, 1), true),
-            (
-                selector_args(READ_TOOL_OUTPUT_MAX_SELECTORS, READ_TOOL_OUTPUT_MAX_BYTES),
-                true,
-            ),
-            (selector_args(0, 1), false),
-            (selector_args(READ_TOOL_OUTPUT_MAX_SELECTORS + 1, 1), false),
-            (selector_args(1, 0), false),
-            (selector_args(1, READ_TOOL_OUTPUT_MAX_BYTES + 1), false),
+            (selector_args(1), true),
+            (selector_args(READ_TOOL_OUTPUT_MAX_SELECTORS), true),
+            (selector_args(0), false),
+            (selector_args(READ_TOOL_OUTPUT_MAX_SELECTORS + 1), false),
             (range_args(1), true),
             (range_args(READ_TOOL_OUTPUT_MAX_LEGACY_RANGES), true),
             (range_args(0), false),
@@ -1439,6 +1592,27 @@ mod tests {
                 runtime_accepts(&arguments),
                 expected,
                 "runtime verdict for {arguments}"
+            );
+        }
+
+        // Old callers may still supply max_bytes, but new calls must use the
+        // selector bounds advertised by the schema instead of a clipping knob.
+        for (max_bytes, runtime_expected) in [
+            (0, false),
+            (1, true),
+            (READ_TOOL_OUTPUT_MAX_BYTES, true),
+            (READ_TOOL_OUTPUT_MAX_BYTES + 1, false),
+        ] {
+            let mut arguments = selector_args(1);
+            arguments["max_bytes"] = serde_json::json!(max_bytes);
+            assert!(
+                !validator.is_valid(&arguments),
+                "legacy field is not advertised"
+            );
+            assert_eq!(
+                runtime_accepts(&arguments),
+                runtime_expected,
+                "legacy runtime verdict for {arguments}"
             );
         }
     }

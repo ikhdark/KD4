@@ -164,6 +164,11 @@ impl Drop for InFlightPermit {
 }
 
 fn parse_forward_config(upstream_url: String) -> Result<ForwardConfig> {
+    if !upstream_url.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    }) {
+        return Err(anyhow!("upstream URL must use http or https"));
+    }
     let upstream_uri = upstream_url
         .parse::<Uri>()
         .context("parsing --upstream-url")?;

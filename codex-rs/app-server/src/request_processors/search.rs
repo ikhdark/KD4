@@ -96,14 +96,9 @@ impl SearchRequestProcessor {
             flag: Arc::clone(&cancel_flag),
         };
 
-        let results = match query.as_str() {
-            "" => vec![],
-            _ => run_fuzzy_file_search(query, roots, cancel_flag.clone())
-                .await
-                .map_err(|err| internal_error(format!("fuzzy file search failed: {err}")))?,
-        };
-
-        Ok(FuzzyFileSearchResponse { files: results })
+        run_fuzzy_file_search(query, roots, cancel_flag.clone())
+            .await
+            .map_err(|err| internal_error(format!("fuzzy file search failed: {err}")))
     }
 
     pub(crate) async fn fuzzy_file_search_session_start_response(

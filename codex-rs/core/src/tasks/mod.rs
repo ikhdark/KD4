@@ -1168,9 +1168,6 @@ impl Session {
                 .await;
         }
 
-        self.services
-            .code_mode_service
-            .finish_turn(&turn_context.sub_id);
         // Accepted tool completions can still own context extraction and identity
         // preparation after the sampling worker stops. Let their ordered commits
         // finish before synthesizing outputs for calls that truly have none.
@@ -1393,9 +1390,6 @@ impl Session {
             .command_execution
             .finish_turn(&turn_context.sub_id)
             .await;
-        self.services
-            .code_mode_service
-            .finish_turn(&turn_context.sub_id);
         turn_context
             .turn_metadata_state
             .cancel_git_enrichment_task();

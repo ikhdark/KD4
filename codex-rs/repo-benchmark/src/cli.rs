@@ -3,7 +3,6 @@ use crate::prepare::Prepared;
 use crate::prepare::prepare;
 use crate::prepare::provenance::FileIdentity;
 use crate::prepare::provenance::hash_file;
-use crate::prepare::provenance::read_json;
 use crate::schedule::Mode;
 use anyhow::Context;
 use anyhow::Result;
@@ -113,7 +112,7 @@ fn verify_running_harness(frozen: &FileIdentity) -> Result<()> {
 }
 
 fn load_result_for_cli(path: &Path) -> Result<crate::runner::RunResult> {
-    let result: crate::runner::RunResult = read_json(path)?;
+    let result = crate::runner::RunResult::load(path)?;
     ensure!(
         hash_file(&result.prepared_manifest)? == result.prepared_manifest_sha256,
         "original prepared manifest changed"

@@ -12,7 +12,7 @@ use sha2::Sha256;
 
 use crate::shell::ShellType;
 
-use super::command_preflight::matches_ignore_ascii_case;
+use super::command_preflight::is_rg_program;
 use super::command_preflight::program_name;
 use super::command_preflight::rg_argv_commands;
 use super::command_preflight::rg_option_consumes_next;
@@ -58,11 +58,12 @@ pub(crate) fn classify_rg_search_with_repository(
     };
     let rg_commands = commands
         .iter()
-        .filter(|argv| {
-            argv.first()
-                .map(|program| program_name(program))
-                .is_some_and(|program| matches_ignore_ascii_case(program, &["rg", "rga"]))
-                && rg_invocation_searches(argv)
+        .filter_map(|argv| {
+            if !argv.first().is_some_and(|program| is_rg_program(program)) {
+                return None;
+            }
+            let roles = RgArgumentRoles::parse(argv);
+            roles.searches.then_some((argv, roles))
         })
         .collect::<Vec<_>>();
     if rg_commands.is_empty() {
@@ -75,9 +76,9 @@ pub(crate) fn classify_rg_search_with_repository(
     let mut explicit_input_files = Vec::new();
     let mut owner_scopes = Vec::new();
     let mut repository_wide = false;
-    for argv in &rg_commands {
-        let path_indices = rg_path_operand_indices(argv);
-        let query_identity = rg_query_identity(argv, &path_indices);
+    for (argv, roles) in &rg_commands {
+        let path_indices = &roles.path_indices;
+        let query_identity = rg_query_identity(argv, path_indices);
         let mut targets = if path_indices.is_empty() {
             vec![normalized_search_path(cwd)]
         } else {
@@ -103,7 +104,10 @@ pub(crate) fn classify_rg_search_with_repository(
             }
         }
         all_targets.extend(targets.iter().cloned());
-        explicit_input_files.extend(rg_input_file_paths(argv, cwd));
+        explicit_input_files.extend(roles.input_files.iter().map(|value| {
+            let path = Path::new(value);
+            normalized_search_path(&cwd.join(path))
+        }));
         search_identities.push(format!(
             "{}\u{1d}{query_identity}\u{1d}{}",
             program_name(&argv[0]),
@@ -142,7 +146,7 @@ pub(crate) fn classify_rg_search_with_repository(
             // classified target paths, so those searches remain retryable.
             can_record_miss: commands.len() == 1
                 && rg_commands.len() == 1
-                && !rg_commands.iter().any(|argv| rg_follows_links(argv)),
+                && !rg_commands.iter().any(|(_, roles)| roles.follows_links),
         },
     )))
 }
@@ -174,6 +178,13 @@ impl SearchSnapshotBudget {
 }
 
 pub(crate) async fn observe_rg_search_scope_state(search: &mut RgSearchNarrowing) {
+    observe_rg_search_scope_state_with(search, capture_search_scope_state).await;
+}
+
+async fn observe_rg_search_scope_state_with(
+    search: &mut RgSearchNarrowing,
+    mut capture: impl FnMut(&[PathBuf], &mut SearchSnapshotBudget) -> Option<String> + Send + 'static,
+) {
     if !search.can_record_miss {
         return;
     }
@@ -185,14 +196,21 @@ pub(crate) async fn observe_rg_search_scope_state(search: &mut RgSearchNarrowing
         deadline: Instant::now() + SEARCH_SNAPSHOT_TIMEOUT,
         cancellation,
     };
-    search.scope_state_identity = tokio::task::spawn_blocking(move || {
-        let first = capture_search_scope_state(&state_paths, &mut budget)?;
-        let second = capture_search_scope_state(&state_paths, &mut budget)?;
+    let observation = tokio::task::spawn_blocking(move || {
+        let first = capture(&state_paths, &mut budget)?;
+        // Each traversal must be able to inspect the same scope. Retain the
+        // shared deadline and cancellation so the optional cache stays bounded.
+        budget.remaining = SEARCH_SNAPSHOT_MAX_ENTRIES;
+        let second = capture(&state_paths, &mut budget)?;
         (first == second).then_some(first)
-    })
-    .await
-    .ok()
-    .flatten();
+    });
+    // Dropping the wait cannot interrupt a filesystem call already in progress.
+    // The drop guard cancels subsequent work, and late results are discarded.
+    search.scope_state_identity = tokio::time::timeout(SEARCH_SNAPSHOT_TIMEOUT, observation)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten();
 }
 
 fn search_state_paths(
@@ -225,51 +243,6 @@ fn search_state_paths(
     paths.sort_unstable();
     paths.dedup();
     paths
-}
-
-fn rg_input_file_paths(argv: &[String], cwd: &Path) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    let mut index = 1usize;
-    while let Some(argument) = argv.get(index) {
-        if argument == "--" {
-            break;
-        }
-        // Pattern files affect matches even when they are outside the searched
-        // paths, just as explicit ignore files do.
-        let value = if matches!(argument.as_str(), "--ignore-file" | "-f" | "--file") {
-            index = index.saturating_add(1);
-            argv.get(index).map(String::as_str)
-        } else if rg_option_consumes_next(argument) {
-            index = index.saturating_add(2);
-            continue;
-        } else {
-            argument
-                .strip_prefix("--ignore-file=")
-                .or_else(|| argument.strip_prefix("--file="))
-                .or_else(|| argument.strip_prefix("-f"))
-        };
-        if let Some(value) = value {
-            let path = Path::new(value);
-            let normalized_path = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                cwd.join(path)
-            };
-            paths.push(normalized_search_path(&normalized_path));
-        }
-        index = index.saturating_add(1);
-    }
-    paths
-}
-
-fn rg_follows_links(argv: &[String]) -> bool {
-    argv.iter().skip(1).any(|argument| {
-        argument == "--follow"
-            || argument == "-L"
-            || (argument.starts_with('-')
-                && !argument.starts_with("--")
-                && argument[1..].contains('L'))
-    })
 }
 
 fn capture_search_scope_state(
@@ -480,16 +453,6 @@ pub(crate) fn classify_rg_search_narrowing_without_native_scope(
     None
 }
 
-fn rg_invocation_searches(argv: &[String]) -> bool {
-    !argv.iter().skip(1).any(|arg| {
-        let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
-        matches!(
-            flag,
-            "-h" | "--help" | "-V" | "--version" | "--type-list" | "--pcre2-version" | "--generate"
-        )
-    })
-}
-
 fn rg_query_identity(argv: &[String], path_indices: &[usize]) -> String {
     argv.iter()
         .enumerate()
@@ -569,17 +532,17 @@ pub(crate) fn rg_search_path_operands(commands: &[Vec<String>]) -> Option<Vec<St
     let mut saw_search = false;
     let mut operands = Vec::new();
     for argv in commands {
-        let is_rg_search = argv
-            .first()
-            .map(|program| program_name(program))
-            .is_some_and(|program| matches_ignore_ascii_case(program, &["rg", "rga", "ripgrep"]))
-            && rg_invocation_searches(argv);
-        if !is_rg_search {
+        if !argv.first().is_some_and(|program| is_rg_program(program)) {
+            continue;
+        }
+        let roles = RgArgumentRoles::parse(argv);
+        if !roles.searches {
             continue;
         }
         saw_search = true;
         operands.extend(
-            rg_path_operand_indices(argv)
+            roles
+                .path_indices
                 .into_iter()
                 .filter_map(|index| argv.get(index).cloned()),
         );
@@ -587,38 +550,179 @@ pub(crate) fn rg_search_path_operands(commands: &[Vec<String>]) -> Option<Vec<St
     saw_search.then_some(operands)
 }
 
-fn rg_path_operand_indices(argv: &[String]) -> Vec<usize> {
-    let files_mode = argv.iter().skip(1).any(|arg| arg == "--files");
-    let explicit_pattern = argv.iter().skip(1).any(|arg| {
-        matches!(arg.as_str(), "-e" | "--regexp" | "-f" | "--file")
-            || (arg.starts_with("-e") && arg.len() > 2)
-            || arg.starts_with("--regexp=")
-            || (arg.starts_with("-f") && arg.len() > 2)
-            || arg.starts_with("--file=")
-    });
-    let mut positional = Vec::new();
-    let mut options_finished = false;
-    let mut index = 1usize;
-    while let Some(arg) = argv.get(index) {
-        if !options_finished && arg == "--" {
-            options_finished = true;
-            index += 1;
-            continue;
+struct RgArgumentRoles<'a> {
+    path_indices: Vec<usize>,
+    input_files: Vec<&'a str>,
+    searches: bool,
+    follows_links: bool,
+    files_mode: bool,
+    explicit_pattern: bool,
+}
+
+impl<'a> RgArgumentRoles<'a> {
+    fn option(&mut self, flag: &str, value: Option<&'a str>) {
+        match flag {
+            "--files" => self.files_mode = true,
+            "-e" | "--regexp" => self.explicit_pattern = true,
+            "-f" | "--file" | "--ignore-file" => {
+                self.explicit_pattern |= flag != "--ignore-file";
+                self.input_files.extend(value);
+            }
+            "-L" | "--follow" => self.follows_links = true,
+            "-h" | "--help" | "-V" | "--version" | "--type-list" | "--pcre2-version"
+            | "--generate" => self.searches = false,
+            _ => {}
         }
-        if !options_finished && rg_option_consumes_next(arg) {
-            index += 2;
-            continue;
-        }
-        if !options_finished && arg.starts_with('-') {
-            index += 1;
-            continue;
-        }
-        positional.push(index);
-        index += 1;
     }
-    if files_mode || explicit_pattern {
-        positional
-    } else {
-        positional.into_iter().skip(1).collect()
+
+    fn parse(argv: &'a [String]) -> Self {
+        let mut roles = Self {
+            path_indices: Vec::new(),
+            input_files: Vec::new(),
+            searches: true,
+            follows_links: false,
+            files_mode: false,
+            explicit_pattern: false,
+        };
+        let mut options_finished = false;
+        let mut index = 1;
+        while let Some(arg) = argv.get(index) {
+            if options_finished || !arg.starts_with('-') || arg == "-" {
+                roles.path_indices.push(index);
+            } else if arg == "--" {
+                options_finished = true;
+            } else if arg.starts_with("--") {
+                let (flag, mut value) = arg
+                    .split_once('=')
+                    .map_or((arg.as_str(), None), |(flag, value)| (flag, Some(value)));
+                if value.is_none() && rg_option_consumes_next(flag) {
+                    index += 1;
+                    value = argv.get(index).map(String::as_str);
+                }
+                roles.option(flag, value);
+            } else {
+                // A value-taking short option consumes the rest of its cluster
+                // or the next argument. Neither is another option.
+                for (offset, flag) in arg.char_indices().skip(1) {
+                    let flag_name = format!("-{flag}");
+                    if rg_option_consumes_next(&flag_name) {
+                        let remainder = &arg[offset + flag.len_utf8()..];
+                        let value = if remainder.is_empty() {
+                            index += 1;
+                            argv.get(index).map(String::as_str)
+                        } else {
+                            Some(remainder)
+                        };
+                        roles.option(&flag_name, value);
+                        break;
+                    }
+                    roles.option(&flag_name, None);
+                }
+            }
+            index += 1;
+        }
+        if !roles.files_mode && !roles.explicit_pattern && !roles.path_indices.is_empty() {
+            roles.path_indices.remove(0);
+        }
+        roles
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stable_scope_can_use_the_full_entry_budget_in_both_captures() {
+        let command = vec!["rg".to_string(), "needle".to_string(), "src".to_string()];
+        let mut search = classify_rg_search_narrowing(
+            &command,
+            None,
+            Path::new("workspace"),
+            Path::new("workspace"),
+        )
+        .unwrap()
+        .unwrap();
+
+        observe_rg_search_scope_state_with(&mut search, |_, budget| {
+            for _ in 0..SEARCH_SNAPSHOT_MAX_ENTRIES {
+                budget.check().ok()?;
+            }
+            Some("stable scope".to_string())
+        })
+        .await;
+
+        assert_eq!(search.scope_state_identity.as_deref(), Some("stable scope"));
+    }
+
+    #[tokio::test]
+    async fn changed_scope_is_not_reusable_between_captures() {
+        let command = vec!["rg".to_string(), "needle".to_string(), "src".to_string()];
+        let mut search = classify_rg_search_narrowing(
+            &command,
+            None,
+            Path::new("workspace"),
+            Path::new("workspace"),
+        )
+        .unwrap()
+        .unwrap();
+        let captures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_captures = std::sync::Arc::clone(&captures);
+        observe_rg_search_scope_state_with(&mut search, move |_, budget| {
+            budget.check().ok()?;
+            let capture_number = captures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(format!("scope revision {capture_number}"))
+        })
+        .await;
+
+        assert_eq!(
+            observed_captures.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert_eq!(search.scope_state_identity, None);
+    }
+
+    #[tokio::test]
+    async fn slow_scope_observation_releases_the_request_and_discards_late_evidence() {
+        let command = vec!["rg".to_string(), "needle".to_string(), "src".to_string()];
+        let mut search = classify_rg_search_narrowing(
+            &command,
+            None,
+            Path::new("workspace"),
+            Path::new("workspace"),
+        )
+        .unwrap()
+        .unwrap();
+        search.scope_state_identity = Some("previous evidence".to_string());
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (finished, done) = tokio::sync::oneshot::channel();
+        let mut started = Some(started);
+        let mut finished = Some(finished);
+        let observation = tokio::spawn(async move {
+            observe_rg_search_scope_state_with(&mut search, move |_, budget| {
+                if let Some(started) = started.take() {
+                    let _ = started.send(());
+                    blocked.recv().unwrap();
+                    let _ = finished
+                        .take()
+                        .unwrap()
+                        .send(budget.cancellation.is_cancelled());
+                }
+                Some("late evidence".to_string())
+            })
+            .await;
+            search
+        });
+        ready.await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), observation).await;
+        // Always release the worker before asserting, so a broken deadline does
+        // not hang Tokio runtime shutdown.
+        release.send(()).unwrap();
+        let search = result
+            .expect("optional observation must not wait on blocked I/O")
+            .unwrap();
+        assert_eq!(search.scope_state_identity, None);
+        assert!(done.await.unwrap(), "late worker must observe cancellation");
     }
 }

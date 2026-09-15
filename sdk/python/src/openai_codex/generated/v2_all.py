@@ -1583,7 +1583,30 @@ class FuzzyFileSearchSessionUpdatedNotification(BaseModel):
     )
     files: list[FuzzyFileSearchResult]
     query: str
+    scanned_file_count: Annotated[
+        int | None,
+        Field(
+            alias="scannedFileCount",
+            description="Number of indexed files and directories, including entries that did not match.",
+            ge=0,
+        ),
+    ] = 0
     session_id: Annotated[str, Field(alias="sessionId")]
+    total_match_count: Annotated[
+        int | None,
+        Field(
+            alias="totalMatchCount",
+            description="Matches found among scanned entries, before the result limit is applied. Zero when the query is empty and results are suppressed.",
+            ge=0,
+        ),
+    ] = 0
+    walk_complete: Annotated[
+        bool | None,
+        Field(
+            alias="walkComplete",
+            description="True only after scanning finishes without omitting paths. A completed notification with this still false indicates an incomplete traversal.",
+        ),
+    ] = False
 
 
 class GetAccountParams(BaseModel):

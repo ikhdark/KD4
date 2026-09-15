@@ -207,7 +207,12 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
                 };
                 match Pin::new(events).poll_next(cx) {
                     Poll::Ready(Some(Ok(event))) => Some(event),
-                    Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
+                    Poll::Ready(Some(Err(err))) => {
+                        tracing::error!(%err, "terminal input stream failed");
+                        *state = EventBrokerState::Start;
+                        return Poll::Ready(None);
+                    }
+                    Poll::Ready(None) => {
                         *state = EventBrokerState::Start;
                         return Poll::Ready(None);
                     }

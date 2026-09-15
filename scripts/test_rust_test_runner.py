@@ -41,6 +41,10 @@ MANIFEST_DATA: dict[str, Any] = {
             "package": "codex-rmcp-client",
             "bin": "test_stdio_server",
         },
+        "test_streamable_http_server": {
+            "package": "codex-rmcp-client",
+            "bin": "test_streamable_http_server",
+        },
         "codex-command-runner": {
             "package": "codex-windows-sandbox",
             "bin": "codex-command-runner",
@@ -115,6 +119,7 @@ METADATA_PACKAGES: list[dict[str, Any]] = [
         "targets": [
             {"name": "codex_rmcp_client", "kind": ["lib"]},
             {"name": "test_stdio_server", "kind": ["bin"]},
+            {"name": "test_streamable_http_server", "kind": ["bin"]},
         ],
     },
     {
@@ -212,21 +217,22 @@ class FakeExecutor:
         return args[args.index("--test") + 1] if "--test" in args else "--lib"
 
     def _artifact_output(self, args: list[str]) -> str:
-        binary = args[args.index("--bin") + 1]
+        binaries = [args[index + 1] for index, arg in enumerate(args) if arg == "--bin"]
         package = args[args.index("-p") + 1]
         package_id = next(
             entry["id"] for entry in METADATA_PACKAGES if entry["name"] == package
         )
-        executable = self.artifacts.get(binary)
-        if executable is None:
-            return json.dumps({"reason": "build-finished", "success": True})
-        return json.dumps(
-            {
-                "reason": "compiler-artifact",
-                "package_id": package_id,
-                "target": {"name": binary, "kind": ["bin"]},
-                "executable": str(executable),
-            }
+        return "\n".join(
+            json.dumps(
+                {
+                    "reason": "compiler-artifact",
+                    "package_id": package_id,
+                    "target": {"name": binary, "kind": ["bin"]},
+                    "executable": str(executable),
+                }
+            )
+            for binary in binaries
+            if (executable := self.artifacts.get(binary)) is not None
         )
 
     def commands(self, prefix: list[str]) -> list[list[str]]:
@@ -585,6 +591,102 @@ class TargetDirectoryPropagationTest(RunnerTestCase):
 
 
 class RunTargetTest(RunnerTestCase):
+    def test_same_package_helpers_share_a_build_and_export_every_artifact(self) -> None:
+        data = copy.deepcopy(MANIFEST_DATA)
+        names = ["test_stdio_server", "test_streamable_http_server"]
+        data["targets"]["core_shard"]["helpers"] = names
+        executor = FakeExecutor(
+            artifacts={name: self.helper_executable(name) for name in names}
+        )
+        runner, _ = self.runner(executor=executor, manifest=Manifest.from_data(data))
+        plan = runner.plan("core_shard")
+        runner.run_target("core_shard", [])
+        builds = executor.commands(["cargo", "build"])
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(plan["builds"], builds)
+        self.assertEqual(builds[0][builds[0].index("-p") + 1], "codex-rmcp-client")
+        self.assertEqual(
+            {
+                builds[0][index + 1]
+                for index, arg in enumerate(builds[0])
+                if arg == "--bin"
+            },
+            set(names),
+        )
+        self.assertEqual(len(executor.commands(["cargo", "nextest", "run"])), 1)
+        for name in names:
+            self.assertEqual(
+                executor.last_env()[f"CARGO_BIN_EXE_{name}"],
+                str(executor.artifacts[name].resolve()),
+            )
+
+    def test_grouped_helper_build_rejects_a_missing_second_artifact(self) -> None:
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["targets"]["core_shard"]["helpers"] = [
+            "test_stdio_server",
+            "test_streamable_http_server",
+        ]
+        executor = FakeExecutor(
+            artifacts={"test_stdio_server": self.helper_executable("test_stdio_server")}
+        )
+        runner, _ = self.runner(executor=executor, manifest=Manifest.from_data(data))
+        with self.assertRaisesRegex(
+            RunnerError, "codex-rmcp-client/test_streamable_http_server"
+        ):
+            runner.run_target("core_shard", [])
+        self.assertEqual(len(executor.commands(["cargo", "build"])), 1)
+        self.assertEqual(executor.commands(["cargo", "nextest", "run"]), [])
+
+    def test_unfiltered_core_lib_is_rejected_before_metadata_or_builds(self) -> None:
+        for arguments in [
+            [],
+            ["--no-fail-fast"],
+            ["--run-ignored", "all"],
+            ["--run-ignored", "all", "--", "--skip", "slow"],
+        ]:
+            with (
+                self.subTest(arguments=arguments),
+                mock.patch.object(rust_test_runner, "load_metadata") as metadata,
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+            ):
+                self.assertEqual(
+                    rust_test_runner.main(["run-target", "core_lib", *arguments]), 2
+                )
+                metadata.assert_not_called()
+                self.assertIn(
+                    "core_lib requires an explicit test filter", stderr.getvalue()
+                )
+
+    def test_core_lib_filter_and_explicit_all_reach_the_run(self) -> None:
+        for arguments in [
+            ["-E", "test(alpha)"],
+            ["tests::alpha"],
+            ["--all"],
+            ["--all", "--no-fail-fast"],
+        ]:
+            with (
+                self.subTest(arguments=arguments),
+                mock.patch.object(rust_test_runner, "load_metadata"),
+                mock.patch.object(rust_test_runner, "RustTestRunner") as runner,
+            ):
+                self.assertEqual(
+                    rust_test_runner.main(["run-target", "core_lib", *arguments]), 0
+                )
+                forwarded = [
+                    arg for arg in arguments if arg not in {"--all", "--no-fail-fast"}
+                ]
+                runner.return_value.run_target.assert_called_once_with(
+                    "core_lib", forwarded, allow_all="--all" in arguments
+                )
+
+    def test_direct_runner_also_rejects_unfiltered_core_lib(self) -> None:
+        runner, executor = self.runner()
+        with self.assertRaisesRegex(
+            RunnerError, "core_lib requires an explicit test filter"
+        ):
+            runner.run_target("core_lib", [])
+        self.assertEqual(executor.calls, [])
+
     def build_executor(self, **kwargs: Any) -> FakeExecutor:
         artifacts = {
             name: self.helper_executable(name)
@@ -601,6 +703,12 @@ class RunTargetTest(RunnerTestCase):
         run_commands = executor.commands(["cargo", "nextest", "run"])
         self.assertEqual(len(run_commands), 1)
         self.assertIn("--no-tests=fail", run_commands[0])
+        self.assertEqual(
+            run_commands[0][run_commands[0].index("--show-progress") + 1], "none"
+        )
+        self.assertEqual(
+            run_commands[0][run_commands[0].index("--success-output") + 1], "never"
+        )
 
     def test_local_run_can_preserve_no_fail_fast_behavior(self) -> None:
         runner, executor = self.runner(executor=self.build_executor())
@@ -657,8 +765,119 @@ class RunTargetTest(RunnerTestCase):
             runner.run_target("core_all", ["-p", "codex-tui"])
         self.assertEqual(executor.calls, [])
 
+    def test_failure_preserves_both_streams_and_recovers_large_output(self) -> None:
+        for large in (False, True):
+            with self.subTest(large=large):
+                stdout = (
+                    "stdout start\n"
+                    + ("output\n" * 2000 if large else "")
+                    + "stdout end\n"
+                )
+                stderr = (
+                    "stderr start\n"
+                    + ("errors\n" * 2000 if large else "")
+                    + "stderr end\n"
+                )
+                executor = self.build_executor(failing_runs={"all"})
+                original = executor.__call__
+
+                def execute(
+                    args: list[str],
+                    *,
+                    invoke: Any = original,
+                    streams: tuple[str, str] = (stdout, stderr),
+                    **kwargs: Any,
+                ) -> subprocess.CompletedProcess[str]:
+                    result = invoke(args, **kwargs)
+                    if args[:3] == ["cargo", "nextest", "run"]:
+                        result.stdout, result.stderr = streams
+                    return result
+
+                runner, _ = self.runner(executor=executor)
+                runner.executor = execute
+                with self.assertRaises(RunnerError) as raised:
+                    runner.run_target("core_all", [])
+                detail = str(raised.exception)
+                for marker in (
+                    "stdout start",
+                    "stdout end",
+                    "stderr start",
+                    "stderr end",
+                ):
+                    self.assertIn(marker, detail)
+                logs = list((runner.target_dir / "test-runner-logs").glob("*.log"))
+                if large:
+                    self.assertLess(len(detail), 10000)
+                    self.assertEqual(len(logs), 1)
+                    self.assertIn(str(logs[0]), detail)
+                    self.assertEqual(
+                        logs[0].read_text(encoding="utf-8"),
+                        f"stdout:\n{stdout}\nstderr:\n{stderr}",
+                    )
+                else:
+                    self.assertEqual(logs, [])
+
 
 class RunGateTest(RunnerTestCase):
+    def test_successful_gate_reports_counts_after_validating_completed_tests(self) -> None:
+        runner, executor = self.runner(executor=self.gate_executor(self.matching_listings()))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            runner.run_gates(["demo-gate"])
+        self.assertEqual(output.getvalue(), "gate core_lib: 1 passed\ngate core_all: 1 passed\n")
+        for command in executor.commands(["cargo", "nextest", "run"]):
+            self.assertEqual(command[command.index("--status-level") + 1], "pass")
+
+    def test_failed_gate_targets_finish_the_batch_and_report_every_failure(
+        self,
+    ) -> None:
+        for failed in ({"--lib"}, {"--lib", "all"}):
+            with self.subTest(failed=failed):
+                executor = self.gate_executor(self.matching_listings())
+                executor.failing_runs = failed
+                runner, _ = self.runner(executor=executor)
+                with self.assertRaises(RunnerError) as raised:
+                    runner.run_gate("demo-gate")
+                runs = executor.commands(["cargo", "nextest", "run"])
+                self.assertEqual(
+                    [executor._selector_for(run) for run in runs], ["--lib", "all"]
+                )
+                for selector in failed:
+                    self.assertIn(f"failed {selector}", str(raised.exception))
+                self.assertEqual(raised.exception.outcome, "failed")
+
+    def test_missing_completion_evidence_still_runs_later_targets(self) -> None:
+        executor = self.gate_executor(self.matching_listings())
+        original = executor._stdout
+        executor._stdout = lambda args: (
+            ""
+            if args[:3] == ["cargo", "nextest", "run"] and "--lib" in args
+            else original(args)
+        )
+        runner, _ = self.runner(executor=executor)
+        with self.assertRaisesRegex(RunnerError, "passed exactly once") as raised:
+            runner.run_gate("demo-gate")
+        self.assertEqual(len(executor.commands(["cargo", "nextest", "run"])), 2)
+        self.assertEqual(raised.exception.outcome, "not_executed")
+
+    def test_failed_execution_groups_are_collected_before_returning_failure(
+        self,
+    ) -> None:
+        for failing in ({"--lib"}, {"--lib", "all"}):
+            with self.subTest(failing=failing):
+                executor = self.gate_executor(self.matching_listings())
+                executor.failing_runs = failing
+                runner, _ = self.runner(executor=executor)
+                with self.assertRaises(RunnerError) as caught:
+                    runner.run_gates(["demo-gate"], quiet=True)
+                runs = executor.commands(["cargo", "nextest", "run"])
+                self.assertEqual(
+                    [executor._selector_for(command) for command in runs],
+                    ["--lib", "all"],
+                )
+                for selector in failing:
+                    self.assertIn(f"failed {selector}", str(caught.exception))
+
     def test_binary_gate_runs_the_named_binary(self) -> None:
         data = copy.deepcopy(MANIFEST_DATA)
         data["targets"]["cli"] = {"package": "codex-cli", "bin": "codex", "helpers": []}

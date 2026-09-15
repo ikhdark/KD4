@@ -1,7 +1,10 @@
 use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::plan_tool::PlanItemArg;
 use codex_protocol::plan_tool::UpdatePlanArgs;
+use serde::Deserialize;
+use serde::Serialize;
 use std::collections::HashSet;
 use tokio::sync::Mutex;
 
@@ -34,6 +37,31 @@ pub(crate) struct PlanStoreUpdate {
     pub(crate) effect: PlanUpdateEffect,
 }
 
+/// Persisted `update_plan` response shared by rendering and legacy history replay.
+/// The plan field is required; display metadata may be absent in older histories.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct PlanToolResponse {
+    pub(crate) current_plan: UpdatePlanArgs,
+    #[serde(default)]
+    pub(crate) message: String,
+    #[serde(default)]
+    pub(crate) effect: String,
+    #[serde(default)]
+    pub(crate) no_progress: bool,
+}
+
+pub(crate) fn plan_from_tool_output(output: &FunctionCallOutputPayload) -> Option<UpdatePlanArgs> {
+    if output.success == Some(false) {
+        return None;
+    }
+    let FunctionCallOutputBody::Text(text) = &output.body else {
+        return None;
+    };
+    serde_json::from_str::<PlanToolResponse>(text)
+        .ok()
+        .map(|response| response.current_plan)
+}
+
 /// Authoritative session-local TODO/checklist state.
 #[derive(Debug, Default)]
 pub(crate) struct PlanStore {
@@ -61,17 +89,15 @@ impl PlanStore {
             if !update_call_ids.contains(call_id.as_str()) {
                 return None;
             }
-            let FunctionCallOutputBody::Text(text) = &output.body else {
-                return None;
-            };
-            let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
-            serde_json::from_value(value.get("current_plan")?.clone()).ok()
+            plan_from_tool_output(output)
         });
-        let Some(restored) = restored else {
-            return false;
-        };
-        *self.current.lock().await = Some(restored);
-        true
+        let found = restored.is_some();
+        self.restore(restored).await;
+        found
+    }
+
+    pub(crate) async fn restore(&self, plan: Option<UpdatePlanArgs>) {
+        *self.current.lock().await = plan;
     }
 
     pub(crate) async fn update(&self, next: UpdatePlanArgs) -> PlanStoreUpdate {
@@ -200,5 +226,75 @@ mod tests {
 
         assert!(store.restore_from_history(&history).await);
         assert_eq!(store.update(expected).await.effect, PlanUpdateEffect::NoOp);
+    }
+
+    #[tokio::test]
+    async fn history_replay_ignores_invalid_unrelated_and_failed_plan_outputs() {
+        let earlier = plan("earlier", StepStatus::InProgress);
+        let expected = plan("accepted", StepStatus::Completed);
+        let rejected = plan("rejected", StepStatus::Pending);
+        for (name, output_text, success) in [
+            ("update_plan", "{\"current_plan\":".to_string(), None),
+            (
+                "update_plan",
+                "Plan update aborted by user".to_string(),
+                None,
+            ),
+            (
+                "update_plan",
+                r#"{"current_plan":{"plan":"invalid"}}"#.to_string(),
+                None,
+            ),
+            (
+                "another_tool",
+                serde_json::json!({"current_plan": rejected}).to_string(),
+                None,
+            ),
+            (
+                "update_plan",
+                serde_json::json!({"current_plan": rejected}).to_string(),
+                Some(false),
+            ),
+        ] {
+            let mut history = Vec::new();
+            for (call_id, tool_name, text, success) in [
+                (
+                    "earlier",
+                    "update_plan",
+                    serde_json::json!({"current_plan": earlier}).to_string(),
+                    Some(true),
+                ),
+                (
+                    "accepted",
+                    "update_plan",
+                    serde_json::json!({"current_plan": expected}).to_string(),
+                    None,
+                ),
+                ("rejected", name, output_text, success),
+            ] {
+                history.push(ResponseItem::FunctionCall {
+                    id: None,
+                    name: tool_name.to_string(),
+                    namespace: None,
+                    arguments: "{}".to_string(),
+                    call_id: call_id.to_string(),
+                    internal_chat_message_metadata_passthrough: None,
+                });
+                let mut output = FunctionCallOutputPayload::from_text(text);
+                output.success = success;
+                history.push(ResponseItem::FunctionCallOutput {
+                    id: None,
+                    call_id: call_id.to_string(),
+                    output,
+                    internal_chat_message_metadata_passthrough: None,
+                });
+            }
+            let store = PlanStore::default();
+            store.update(earlier.clone()).await;
+            store.restore(Some(rejected.clone())).await;
+            assert_eq!(store.current_for_test().await, Some(rejected.clone()));
+            assert!(store.restore_from_history(&history).await);
+            assert_eq!(store.current_for_test().await, Some(expected.clone()));
+        }
     }
 }

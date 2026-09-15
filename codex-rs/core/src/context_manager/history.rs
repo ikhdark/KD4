@@ -181,16 +181,22 @@ impl PreparedPromptItems {
         if index >= self.0.len {
             return None;
         }
-        match &self.0.source {
-            PreparedPromptItemsSource::Shared(items) => items.get(index),
-            PreparedPromptItemsSource::Appended { prefix, suffix } => {
-                if index < prefix.0.len {
-                    prefix.get(index)
-                } else {
-                    suffix.get(index - prefix.0.len)
-                }
+        let mut current = self;
+        loop {
+            if let Some(flattened) = current.0.flattened.get() {
+                return flattened.get(index);
             }
-            PreparedPromptItemsSource::Prefix { source } => source.get(index),
+            match &current.0.source {
+                PreparedPromptItemsSource::Shared(items) => return items.get(index),
+                PreparedPromptItemsSource::Appended { prefix, suffix } => {
+                    if index < prefix.0.len {
+                        current = prefix;
+                    } else {
+                        return suffix.get(index - prefix.0.len);
+                    }
+                }
+                PreparedPromptItemsSource::Prefix { source } => current = source,
+            }
         }
     }
 
@@ -1122,6 +1128,7 @@ impl ContextManager {
         self.history_version = self.history_version.saturating_add(1);
         self.invalidate_prepared_history();
         self.world_state_baseline = None;
+        self.realized_context_baseline = RealizedContextBaseline::Unknown;
     }
 
     /// Replace image content in the last turn if it originated from a tool output.

@@ -203,6 +203,64 @@ async fn shell_pipeline_validation_is_denied_before_execution() {
     assert_eq!(structured["command_was_executed"], false);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inactive_validation_enforcement_preserves_shell_failure_diagnostics() {
+    let python = which::which("python")
+        .or_else(|_| which::which("python3"))
+        .unwrap();
+    for (tagged, exit_code) in [(true, 7), (false, 7), (true, 0)] {
+        let (session, mut turn) = make_session_and_context().await;
+        turn.approval_policy =
+            crate::config::Constrained::allow_any(codex_protocol::protocol::AskForApproval::Never);
+        turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
+        let mut arguments = json!({
+            "kind": "argv", "program": python,
+            "args": ["-c", format!("import sys; print('ACTUAL_DIAGNOSTIC'); sys.exit({exit_code})")],
+        });
+        if tagged {
+            arguments["validation"] = json!({"covered_paths": ["src"]});
+        }
+        let payload = ToolPayload::Function {
+            arguments: arguments.to_string(),
+        };
+        let output = ShellCommandHandler::default()
+            .handle(ToolInvocation {
+                session: Arc::new(session),
+                step_context: StepContext::for_test(Arc::new(turn)),
+                cancellation_token: tokio_util::sync::CancellationToken::new(),
+                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                call_id: "passive-validation-diagnostics".to_string(),
+                tool_name: codex_tools::ToolName::plain("shell_command"),
+                source: ToolCallSource::Direct,
+                payload: payload.clone(),
+            })
+            .await
+            .expect("execute through the production shell handler");
+        assert!(
+            output
+                .code_mode_result(&payload)
+                .to_string()
+                .contains("ACTUAL_DIAGNOSTIC"),
+            "diagnostics must reach the model for tagged={tagged}, exit_code={exit_code}"
+        );
+        let metadata = output.projection_metadata().expect("shell output metadata");
+        assert_eq!(metadata.essential_inline["exit_code"], json!(exit_code));
+        let diagnostic = metadata.fragments.iter().find(|fragment| {
+            fragment.kind == codex_tools::ToolOutputProjectionFragmentKind::ValidationFailureOrFinalSummary
+        });
+        assert_eq!(diagnostic.is_some(), tagged && exit_code != 0);
+        if let Some(diagnostic) = diagnostic {
+            assert!(diagnostic.text.contains("ACTUAL_DIAGNOSTIC"));
+            assert!(
+                metadata
+                    .predetermined_ranges
+                    .iter()
+                    .any(|range| range.id == "validation:diagnostics")
+            );
+        }
+    }
+}
+
 #[test]
 fn shell_failure_sampling_signal_is_stable_and_distinguishes_outcomes() {
     let key = CommandAttemptKey::new(

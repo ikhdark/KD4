@@ -581,7 +581,7 @@ async fn enqueue_thread_event_uses_one_bounded_overflow_relay() -> Result<()> {
 
 #[tokio::test]
 async fn replay_thread_snapshot_restores_draft_and_queued_input() {
-    let mut app = make_test_app().await;
+    let (mut app, _events, _ops) = make_test_app_with_channels().await;
     let thread_id = ThreadId::new();
     let session = test_thread_session(thread_id, test_path_buf("/tmp/project"));
     app.thread_event_channels.insert(
@@ -1957,6 +1957,10 @@ async fn rejected_guardian_update_does_not_leak_into_other_feature_updates() -> 
         .cloud_config_bundle(cloud_config_bundle.clone())
         .build()
         .await?;
+    app.config
+        .features
+        .set_enabled(Feature::GuardianApproval, false)
+        .expect("disable Guardian baseline");
     app.cloud_config_bundle = cloud_config_bundle;
     let mut app_server = start_config_write_test_app_server(&app).await?;
     app.update_feature_flags(&mut app_server, vec![(Feature::GuardianApproval, true)])
@@ -1999,7 +2003,7 @@ async fn rejected_guardian_update_does_not_leak_into_other_feature_updates() -> 
     }
     assert!(history.contains("Failed to enable Approve for me"));
     assert!(!history.contains("Permissions updated to Approve for me"));
-    let persisted: toml::Value = toml::from_str(&std::fs::read_to_string(
+    let persisted: toml::Table = toml::from_str(&std::fs::read_to_string(
         codex_home.path().join("config.toml"),
     )?)?;
     assert_eq!(
@@ -3390,7 +3394,7 @@ async fn side_fork_config_is_ephemeral_and_appends_developer_guardrails() {
         developer_instructions
             .contains("Any MCP or external tool calls or outputs visible in the inherited")
     );
-    assert!(developer_instructions.contains("non-mutating inspection"));
+    assert!(developer_instructions.contains("Non-mutating inspection"));
     assert!(developer_instructions.contains("Do not modify files"));
     assert!(developer_instructions.contains("Do not request escalated permissions"));
     assert!(app.transcript_cells.is_empty());
@@ -6449,6 +6453,13 @@ async fn shutdown_first_exit_uses_app_server_shutdown_without_submitting_op() {
         thread_id,
         test_path_buf("/tmp/project"),
     ));
+    // Session setup requests its initial lists before the exit action begins.
+    while let Ok(op) = op_rx.try_recv() {
+        assert!(
+            matches!(op, Op::ListSkills { .. }),
+            "unexpected setup command: {op:?}"
+        );
+    }
     let listener = tokio::spawn(std::future::pending::<()>());
     let listener_abort = listener.abort_handle();
     app.thread_event_listener_tasks.insert(thread_id, listener);
@@ -6761,6 +6772,7 @@ async fn unavailable_side_parent_consumes_return_shortcut() {
             .handle_thread_session(test_thread_session(side_id, app.config.cwd.to_path_buf()));
         app.sync_side_thread_ui();
         while events.try_recv().is_ok() {}
+        while ops.try_recv().is_ok() {}
         let mut app_server =
             crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
                 .await
@@ -7023,6 +7035,10 @@ async fn clear_only_ui_reset_allows_active_skill_warning_to_render_again() {
 #[tokio::test]
 async fn backtrack_overlay_navigation_clamps_at_both_ends() -> Result<()> {
     let mut app = Box::pin(make_test_app()).await;
+    app.chat_widget.handle_thread_session(test_thread_session(
+        ThreadId::new(),
+        app.config.cwd.to_path_buf(),
+    ));
     app.transcript_cells = ["first", "second", "third"]
         .into_iter()
         .map(|message| {

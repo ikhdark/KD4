@@ -4,83 +4,41 @@ use codex_protocol::protocol::MULTI_AGENT_MODE_CLOSE_TAG;
 use codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG;
 
 const EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT: &str = "Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.";
-const ORCHESTRATOR_TEMPLATE: &str = include_str!("../../templates/agents/orchestrator.md");
-const ROOT_ORCHESTRATION_OPEN: &str = "<!-- runtime-root-orchestration:start -->";
-const ROOT_ORCHESTRATION_CLOSE: &str = "<!-- runtime-root-orchestration:end -->";
-
-fn extract_root_orchestration_text(template: &str) -> Option<&str> {
-    let (before_open, after_open) = template.split_once(ROOT_ORCHESTRATION_OPEN)?;
-    let (body, after_close) = after_open.split_once(ROOT_ORCHESTRATION_CLOSE)?;
-    if before_open.contains(ROOT_ORCHESTRATION_OPEN)
-        || before_open.contains(ROOT_ORCHESTRATION_CLOSE)
-        || body.contains(ROOT_ORCHESTRATION_OPEN)
-        || body.contains(ROOT_ORCHESTRATION_CLOSE)
-        || after_close.contains(ROOT_ORCHESTRATION_OPEN)
-        || after_close.contains(ROOT_ORCHESTRATION_CLOSE)
-    {
-        return None;
-    }
-    let body = body.trim();
-    (!body.is_empty()).then_some(body)
-}
-
-fn root_orchestration_text() -> &'static str {
-    extract_root_orchestration_text(ORCHESTRATOR_TEMPLATE).unwrap_or_else(|| {
-        tracing::error!(
-            "orchestrator template must contain exactly one ordered runtime root section"
-        );
-        ""
-    })
-}
+const ROOT_ORCHESTRATION_TEXT: &str = include_str!("../../templates/agents/root_orchestration.md");
 
 #[cfg(test)]
 mod tests {
     use super::EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT;
     use super::EffectiveMultiAgentMode;
     use super::MultiAgentModeInstructions;
-    use super::ROOT_ORCHESTRATION_CLOSE;
-    use super::ROOT_ORCHESTRATION_OPEN;
-    use super::extract_root_orchestration_text;
-    use super::root_orchestration_text;
     use crate::context::ContextualUserFragment;
     use codex_protocol::config_types::MultiAgentMode;
 
     #[test]
-    fn extracts_exactly_one_ordered_root_orchestration_section() {
-        let template = format!(
-            "preamble\n{ROOT_ORCHESTRATION_OPEN}\n runtime policy \n{ROOT_ORCHESTRATION_CLOSE}\nappendix"
+    fn root_orchestration_renders_only_the_bounded_runtime_policy() {
+        let fragment = super::RootOrchestrationInstructions;
+        let rendered = fragment.render();
+        assert_eq!(fragment.role(), "developer");
+        assert!(
+            rendered.starts_with(
+                "<root_orchestration_instructions>When several independent tool calls"
+            )
         );
-
-        assert_eq!(
-            extract_root_orchestration_text(&template),
-            Some("runtime policy")
+        assert!(rendered.contains("Do not run shared-state mutations concurrently."));
+        assert!(
+            rendered
+                .contains("Continue yielded commands through their existing wait or session path")
         );
-        assert!(!root_orchestration_text().is_empty());
-    }
-
-    #[test]
-    fn malformed_root_orchestration_markers_fail_closed() {
-        let cases = [
-            "no markers".to_string(),
-            format!("{ROOT_ORCHESTRATION_OPEN} body"),
-            format!("body {ROOT_ORCHESTRATION_CLOSE}"),
-            format!("{ROOT_ORCHESTRATION_CLOSE} body {ROOT_ORCHESTRATION_OPEN}"),
-            format!(
-                "{ROOT_ORCHESTRATION_OPEN} first {ROOT_ORCHESTRATION_OPEN} second {ROOT_ORCHESTRATION_CLOSE}"
-            ),
-            format!(
-                "{ROOT_ORCHESTRATION_OPEN} first {ROOT_ORCHESTRATION_CLOSE} second {ROOT_ORCHESTRATION_CLOSE}"
-            ),
-            format!("{ROOT_ORCHESTRATION_OPEN}   {ROOT_ORCHESTRATION_CLOSE}"),
-        ];
-
-        for template in cases {
-            assert_eq!(
-                extract_root_orchestration_text(&template),
-                None,
-                "{template}"
-            );
-        }
+        assert!(
+            rendered
+                .ends_with("scope clippy to changed packages.</root_orchestration_instructions>")
+        );
+        assert!(!rendered.contains("<!--"));
+        assert!(
+            rendered.len() <= 1_200,
+            "runtime policy grew to {} bytes",
+            rendered.len()
+        );
     }
 
     #[test]
@@ -140,7 +98,7 @@ impl ContextualUserFragment for RootOrchestrationInstructions {
     }
 
     fn body(&self) -> String {
-        root_orchestration_text().to_string()
+        ROOT_ORCHESTRATION_TEXT.trim().to_string()
     }
 }
 

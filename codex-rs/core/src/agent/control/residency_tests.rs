@@ -97,7 +97,7 @@ async fn residency_slot_reservation_unloads_oldest_idle_v2_agent() {
         .await
         .expect("first resident slot");
     let first =
-        spawn_v2_subagent(&control, &state, config.clone(), root.thread_id, "worker-1").await;
+        spawn_v2_subagent(&control, &state, config.clone(), root.thread_id, "worker_1").await;
     first_slot.commit(first.thread_id);
     mark_thread_completed(first.thread.as_ref()).await;
 
@@ -106,7 +106,7 @@ async fn residency_slot_reservation_unloads_oldest_idle_v2_agent() {
         .await
         .expect("second slot");
     let second =
-        spawn_v2_subagent(&control, &state, config.clone(), root.thread_id, "worker-2").await;
+        spawn_v2_subagent(&control, &state, config.clone(), root.thread_id, "worker_2").await;
     second_slot.commit(second.thread_id);
     mark_thread_completed(second.thread.as_ref()).await;
     assert!(
@@ -158,7 +158,7 @@ async fn residency_materialization_failure_preserves_running_agent_and_buffered_
         &state,
         config.clone(),
         root.thread_id,
-        "persistence-worker",
+        "persistence_worker",
     )
     .await;
     slot.commit(first.thread_id);
@@ -277,7 +277,7 @@ async fn late_residency_shutdown_keeps_claim_charged_until_slot_handoff() {
         &manager_state,
         config,
         root.thread_id,
-        "late-worker",
+        "late_worker",
     )
     .await;
     first_slot.commit(first.thread_id);
@@ -376,7 +376,7 @@ async fn registered_interrupted_v2_agent_reloads_after_residency_eviction() {
         .await
         .expect("first resident slot");
     let first =
-        spawn_v2_subagent(&control, &state, config.clone(), root.thread_id, "worker-1").await;
+        spawn_v2_subagent(&control, &state, config.clone(), root.thread_id, "worker_1").await;
     first_slot.commit(first.thread_id);
     mark_thread_interrupted(first.thread.as_ref()).await;
 
@@ -390,7 +390,7 @@ async fn registered_interrupted_v2_agent_reloads_after_residency_eviction() {
         Ok(_) => panic!("expected evicted thread to be missing"),
     }
     let second =
-        spawn_v2_subagent(&control, &state, config.clone(), root.thread_id, "worker-2").await;
+        spawn_v2_subagent(&control, &state, config.clone(), root.thread_id, "worker_2").await;
     second_slot.commit(second.thread_id);
     mark_thread_completed(second.thread.as_ref()).await;
 
@@ -696,7 +696,7 @@ async fn residency_cancellation_retains_cleanup_until_termination() {
         &manager_state,
         config.clone(),
         root.thread_id,
-        "late-worker",
+        "late_worker",
     )
     .await;
     first_slot.commit(first.thread_id);
@@ -707,10 +707,7 @@ async fn residency_cancellation_retains_cleanup_until_termination() {
     let state = Arc::clone(&manager_state);
     let reservation = tokio::spawn(async move { owner.reserve_slot(&state, 1, None).await });
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !matches!(
-            first.thread.agent_status().await,
-            crate::agent::AgentStatus::Shutdown
-        ) {
+        while !first.thread.codex.session.terminal_tasks.is_closed() {
             tokio::task::yield_now().await;
         }
     })
@@ -777,7 +774,7 @@ async fn residency_foreground_timeout_retains_cleanup_until_termination() {
         &manager_state,
         config.clone(),
         root.thread_id,
-        "late-worker",
+        "late_worker",
     )
     .await;
     first_slot.commit(first.thread_id);
@@ -839,7 +836,7 @@ async fn explicit_v2_resume_preserves_cold_identity_and_accounts_for_residency()
         .start_thread(config.clone())
         .await
         .expect("start root thread");
-    let control = manager.agent_control();
+    let control = root.thread.codex.session.services.agent_control.clone();
     let manager_state = control.upgrade().expect("thread manager should be live");
     let residency = Arc::clone(&control.v2_residency);
 
@@ -852,7 +849,7 @@ async fn explicit_v2_resume_preserves_cold_identity_and_accounts_for_residency()
         &manager_state,
         config.clone(),
         root.thread_id,
-        "late-worker",
+        "late_worker",
     )
     .await;
     first_slot.commit(first.thread_id);

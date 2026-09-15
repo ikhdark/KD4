@@ -926,7 +926,7 @@ BEGIN
 END
             "#,
         )
-        .execute(runtime.pool.as_ref())
+        .execute(runtime.thread_goals().pool.as_ref())
         .await
         .expect("test trigger should be created");
 

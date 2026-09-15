@@ -18,18 +18,6 @@ except ModuleNotFoundError:
     from generated_output_lock import GenerationLockError, generated_output_lock
 
 
-SCHEMA_INPUTS = (
-    "codex-rs/config/Cargo.toml",
-    "codex-rs/config/src",
-    "codex-rs/core/Cargo.toml",
-    "codex-rs/core/src/config/schema.rs",
-    "codex-rs/core/src/config/schema_tests.rs",
-    "codex-rs/core/src/bin/config_schema.rs",
-    "codex-rs/features/Cargo.toml",
-    "codex-rs/features/src",
-    "codex-rs/protocol/Cargo.toml",
-    "codex-rs/protocol/src",
-)
 GENERATED_OUTPUTS = ("codex-rs/core/config.schema.json",)
 
 
@@ -44,35 +32,6 @@ def run(args: Sequence[str], *, cwd: Path) -> int:
     except OSError as error:
         print(f"Could not run {args[0]}: {error}", file=sys.stderr)
         return 127 if isinstance(error, FileNotFoundError) else 1
-
-
-def schema_inputs_changed(root: Path, baseline: str = "HEAD") -> bool:
-    try:
-        completed = subprocess.run(
-            ["git", "diff", "--name-only", baseline, "--", *SCHEMA_INPUTS],
-            cwd=root,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-    except OSError as error:
-        print(
-            f"Could not compare config schema inputs with {baseline}: {error}",
-            file=sys.stderr,
-        )
-        return True
-    if completed.returncode != 0:
-        print(
-            "Could not inspect config schema input status.",
-            file=sys.stderr,
-        )
-        if completed.stderr:
-            print(completed.stderr, file=sys.stderr, end="")
-        return True
-    return bool(completed.stdout.strip())
 
 
 def hash_file(path: Path) -> str:
@@ -130,7 +89,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         choices=("check", "force"),
         required=True,
     )
-    parser.add_argument("--baseline", default="HEAD")
     parser.add_argument(
         "--owner",
         help="Required identity for the serialized force-regeneration lane.",

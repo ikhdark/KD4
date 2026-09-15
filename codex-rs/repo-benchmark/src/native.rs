@@ -196,7 +196,17 @@ fn execute(request: &NativeAttemptRequest, evidence: &mut NativeAttemptEvidence)
                 .scenario
                 .is_some_and(|scenario| scenario.cancel_first())
                 && turn_index == 0;
-            let terminal = process.finish_turn(&thread_id, &turn_id, cancel)?;
+            let mut checkpoint = || {
+                scripted
+                    .as_ref()
+                    .context("cancellation requires a scripted provider")?
+                    .cancellation_checkpoint(request, deadline)
+            };
+            let terminal = process.finish_turn(
+                &thread_id,
+                &turn_id,
+                if cancel { Some(&mut checkpoint) } else { None },
+            )?;
             evidence.tool_executions += terminal.tool_executions;
             if cancel {
                 if terminal.status != "interrupted" {
@@ -204,6 +214,11 @@ fn execute(request: &NativeAttemptRequest, evidence: &mut NativeAttemptEvidence)
                         "cancelled turn ended with {}, expected interrupted",
                         terminal.status
                     );
+                }
+                if let Some(provider) = &scripted {
+                    let stopped = provider.verify_cancelled(request, deadline)?;
+                    process.events.push(json!({"elapsedMs":started.elapsed().as_millis() as u64,"message":{"method":"repoBenchmark/cancellationStopped","params":stopped}}));
+                    provider.confirm_interrupted();
                 }
             } else {
                 if terminal.status != "completed" {

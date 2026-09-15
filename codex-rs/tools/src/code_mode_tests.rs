@@ -153,11 +153,8 @@ fn collect_code_mode_tool_definitions_disambiguates_flattened_name_collisions() 
             .map(|tool| (tool.name.as_str(), tool.tool_name.clone()))
             .collect::<Vec<_>>(),
         vec![
-            ("acme__lookup", ToolName::plain("acme__lookup")),
-            (
-                "acme__lookup__namespaced",
-                ToolName::namespaced("acme", "lookup")
-            ),
+            ("acme__lookup", ToolName::namespaced("acme", "lookup")),
+            ("acme__lookup__plain", ToolName::plain("acme__lookup")),
         ]
     );
     assert_eq!(

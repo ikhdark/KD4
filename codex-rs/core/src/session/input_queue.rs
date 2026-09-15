@@ -107,12 +107,18 @@ impl InputQueue {
         Option<InputQueueActivity>,
     ) {
         let activity_rx = self.activity_tx.subscribe();
+        let has_recovered_steer = self
+            .startup_recovery_items
+            .lock()
+            .await
+            .iter()
+            .any(TurnInput::is_steering_input);
         let has_pending_steer = if let Some(turn_state) = turn_state {
             turn_state.lock().await.pending_input.has_steering_input()
         } else {
             false
         };
-        let pending_activity = if has_pending_steer {
+        let pending_activity = if has_recovered_steer || has_pending_steer {
             Some(InputQueueActivity::Steer)
         } else if self.has_pending_mailbox_items().await {
             Some(InputQueueActivity::Mailbox)
@@ -228,19 +234,24 @@ impl InputQueue {
         if input.is_empty() {
             return;
         }
-        let activity = if input.iter().any(
-            |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
-        ) {
-            InputQueueActivity::Mailbox
-        } else {
-            InputQueueActivity::Steer
-        };
         let mut recovered = self.startup_recovery_items.lock().await;
         let mut restored = VecDeque::from(input);
         restored.append(&mut recovered);
         *recovered = restored;
+        let activity = if recovered.iter().any(TurnInput::is_steering_input) {
+            Some(InputQueueActivity::Steer)
+        } else if recovered
+            .iter()
+            .any(|item| matches!(item, TurnInput::InterAgentCommunication(_)))
+        {
+            Some(InputQueueActivity::Mailbox)
+        } else {
+            None
+        };
         drop(recovered);
-        self.activity_tx.send_replace(activity);
+        if let Some(activity) = activity {
+            self.activity_tx.send_replace(activity);
+        }
     }
 
     pub(crate) async fn turn_state_for_sub_id(
@@ -577,16 +588,15 @@ impl io::Write for ByteCounter {
 
 impl TurnInputQueue {
     fn has_steering_input(&self) -> bool {
-        self.items.iter().any(|input| {
-            matches!(
-                input,
-                TurnInput::UserInput { .. } | TurnInput::ResponseItem(_)
-            )
-        })
+        self.items.iter().any(TurnInput::is_steering_input)
     }
 }
 
 impl TurnInput {
+    fn is_steering_input(&self) -> bool {
+        matches!(self, Self::UserInput { .. } | Self::ResponseItem(_))
+    }
+
     fn requires_turn_continuation(&self) -> bool {
         !matches!(self, Self::InternalResponseItem(_))
     }
@@ -1107,6 +1117,71 @@ mod tests {
             .await;
 
         assert!(input_queue.has_pending_turn_start_work().await);
+    }
+
+    #[tokio::test]
+    async fn recovered_input_activity_preserves_steering_and_ignores_internal_context() {
+        let user = TurnInput::UserInput {
+            content: vec![UserInput::Text {
+                text: "change direction".to_string(),
+                text_elements: Vec::new(),
+            }],
+            client_id: None,
+        };
+        let mail = |trigger_turn| {
+            TurnInput::InterAgentCommunication(make_mail(
+                AgentPath::root(),
+                AgentPath::try_from("/root/worker").expect("agent path"),
+                "agent update",
+                trigger_turn,
+            ))
+        };
+        for (input, expected) in [
+            (vec![user.clone()], Some(InputQueueActivity::Steer)),
+            (
+                vec![mail(true), user.clone()],
+                Some(InputQueueActivity::Steer),
+            ),
+            (vec![mail(true)], Some(InputQueueActivity::Mailbox)),
+            (vec![mail(false)], Some(InputQueueActivity::Mailbox)),
+            (
+                vec![TurnInput::InternalResponseItem(ResponseItem::Other)],
+                None,
+            ),
+        ] {
+            let queue = InputQueue::new();
+            let (mut receiver, pending) = queue.subscribe_activity(None).await;
+            assert_eq!(pending, None);
+            queue.restore_transferred_startup_input(input.clone()).await;
+            assert_eq!(receiver.has_changed().unwrap(), expected.is_some());
+            if let Some(expected) = expected {
+                assert_eq!(*receiver.borrow_and_update(), expected);
+            }
+            let (_, pending) = queue.subscribe_activity(None).await;
+            assert_eq!(
+                pending, expected,
+                "late subscribers must see recovered work"
+            );
+            assert_eq!(queue.get_pending_input(&Mutex::new(None)).await, input);
+            let (_, pending) = queue.subscribe_activity(None).await;
+            assert_eq!(pending, None);
+        }
+
+        let queue = InputQueue::new();
+        queue
+            .restore_transferred_startup_input(vec![user.clone()])
+            .await;
+        let (mut receiver, _) = queue.subscribe_activity(None).await;
+        let later_mail = mail(true);
+        queue
+            .restore_transferred_startup_input(vec![later_mail.clone()])
+            .await;
+        assert!(receiver.has_changed().unwrap());
+        assert_eq!(*receiver.borrow_and_update(), InputQueueActivity::Steer);
+        assert_eq!(
+            queue.get_pending_input(&Mutex::new(None)).await,
+            vec![later_mail, user]
+        );
     }
 
     #[tokio::test]

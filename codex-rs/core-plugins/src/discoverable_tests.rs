@@ -915,9 +915,10 @@ plugins = true
     .await;
 
     assert_eq!(after_invalid_cache, Vec::new());
-    assert!(
-        !cache_path.exists(),
-        "invalid catalog cache should be removed"
+    assert_eq!(
+        std::fs::read_to_string(&cache_path).expect("cache snapshot remains available"),
+        "invalid json",
+        "readers must not delete a path that a concurrent publisher can replace"
     );
 }
 

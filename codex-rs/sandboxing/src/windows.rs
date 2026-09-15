@@ -15,8 +15,8 @@ use crate::compatibility_sandbox_policy_for_permission_profile;
 ///
 /// The elevated Windows backend consumes extra deny-read paths plus explicit
 /// read and write roots during setup/refresh. The unelevated restricted-token
-/// backend only consumes extra deny-write carveouts on top of the legacy
-/// `WorkspaceWrite` allow set. Read-root overrides are layered on top of the
+/// backend derives write roots from the permission profile and consumes extra
+/// deny-write carveouts that need preparation before launch. Read-root overrides are layered on top of the
 /// baseline helper roots that the elevated setup path needs to launch the
 /// sandboxed command; split policies that opt into platform defaults carry
 /// that explicitly with the override.
@@ -136,21 +136,9 @@ pub fn resolve_windows_restricted_token_filesystem_overrides(
     let legacy_writable_roots = legacy_projection.get_writable_roots_with_cwd(sandbox_policy_cwd);
     let split_writable_roots =
         file_system_sandbox_policy.get_writable_roots_with_cwd(sandbox_policy_cwd);
-    let legacy_root_paths: BTreeSet<PathBuf> = legacy_writable_roots
-        .iter()
-        .map(|root| normalize_windows_override_path(root.root.as_path()))
-        .collect::<std::result::Result<_, _>>()?;
-    let split_root_paths: BTreeSet<PathBuf> = split_writable_roots
-        .iter()
-        .map(|root| normalize_windows_override_path(root.root.as_path()))
-        .collect::<std::result::Result<_, _>>()?;
-
-    if legacy_root_paths != split_root_paths {
-        return Err(
-            "windows unelevated restricted-token sandbox cannot enforce split writable root sets directly; refusing to run unsandboxed"
-                .to_string(),
-        );
-    }
+    // The backend derives capability SIDs and write ACLs from this permission
+    // profile directly. The compatibility projection can add a writable cwd,
+    // so its root set must not constrain profiles that keep the cwd read-only.
 
     for writable_root in &split_writable_roots {
         for read_only_subpath in &writable_root.read_only_subpaths {
@@ -172,22 +160,17 @@ pub fn resolve_windows_restricted_token_filesystem_overrides(
     let mut additional_deny_write_paths = BTreeSet::new();
     for split_root in &split_writable_roots {
         let split_root_path = normalize_windows_override_path(split_root.root.as_path())?;
-        let Some(legacy_root) = legacy_writable_roots.iter().find(|candidate| {
+        let legacy_root = legacy_writable_roots.iter().find(|candidate| {
             normalize_windows_override_path(candidate.root.as_path())
                 .is_ok_and(|candidate_path| candidate_path == split_root_path)
-        }) else {
-            return Err(
-                "windows unelevated restricted-token sandbox cannot enforce split writable root sets directly; refusing to run unsandboxed"
-                    .to_string(),
-            );
-        };
+        });
 
         for read_only_subpath in &split_root.read_only_subpaths {
-            if !legacy_root
-                .read_only_subpaths
-                .iter()
-                .any(|candidate| candidate == read_only_subpath)
-            {
+            if !legacy_root.is_some_and(|root| {
+                root.read_only_subpaths
+                    .iter()
+                    .any(|candidate| candidate == read_only_subpath)
+            }) {
                 additional_deny_write_paths.insert(normalize_windows_override_path(
                     read_only_subpath.as_path(),
                 )?);

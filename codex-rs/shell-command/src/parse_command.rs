@@ -1319,6 +1319,21 @@ mod tests {
     }
 
     #[test]
+    fn full_search_paths_preserve_operands_and_successful_cd() {
+        let script = "cd home/memories && rg needle rollout_summaries";
+        assert!(matches!(
+            parse_shell_script_with_full_paths(script).as_slice(),
+            [ParsedCommand::Search { query: Some(query), path: Some(path), .. }]
+                if query == "needle"
+                    && PathBuf::from(path) == PathBuf::from("home/memories").join("rollout_summaries")
+        ));
+        assert!(matches!(
+            parse_shell_script("rg needle home/memories/rollout_summaries").as_slice(),
+            [ParsedCommand::Search { path: Some(path), .. }] if path == "rollout_summaries"
+        ));
+    }
+
+    #[test]
     fn untrusted_powershell_path_remains_visible() {
         let command = vec_str(&[
             "./workspace-local/pwsh.exe",
@@ -1655,7 +1670,11 @@ fn positional_operands<'a>(args: &'a [String], flags_with_vals: &[&str]) -> Vec<
     out
 }
 
-fn parse_grep_like(main_cmd: &[String], args: &[String]) -> ParsedCommand {
+fn parse_grep_like(
+    main_cmd: &[String],
+    args: &[String],
+    format_path: fn(&str) -> String,
+) -> ParsedCommand {
     let args_no_connector = trim_at_connector(args);
     let mut operands = Vec::new();
     let mut pattern: Option<String> = None;
@@ -1700,11 +1719,11 @@ fn parse_grep_like(main_cmd: &[String], args: &[String]) -> ParsedCommand {
         operands.push(arg);
     }
     // Do not shorten the query: grep patterns may legitimately contain slashes
-    // and should be preserved verbatim. Only paths should be shortened.
+    // and should be preserved verbatim. Only file operands use the path formatter.
     let has_pattern = pattern.is_some();
     let query = pattern.or_else(|| operands.first().cloned().map(String::from));
     let path_index = if has_pattern { 0 } else { 1 };
-    let path = operands.get(path_index).map(|s| short_display_path(s));
+    let path = operands.get(path_index).map(|s| format_path(s));
     ParsedCommand::Search {
         cmd: shlex_join(main_cmd),
         query,
@@ -1771,7 +1790,10 @@ fn is_pathish(s: &str) -> bool {
         || s.contains('\\')
 }
 
-fn parse_fd_query_and_path(tail: &[String]) -> (Option<String>, Option<String>) {
+fn parse_fd_query_and_path(
+    tail: &[String],
+    format_path: fn(&str) -> String,
+) -> (Option<String>, Option<String>) {
     let args_no_connector = trim_at_connector(tail);
     // fd has several flags that take values (e.g., -t/--type, -e/--extension).
     // Skip those values when extracting positional operands.
@@ -1794,23 +1816,26 @@ fn parse_fd_query_and_path(tail: &[String]) -> (Option<String>, Option<String>) 
     match non_flags.as_slice() {
         [one] => {
             if is_pathish(one) {
-                (None, Some(short_display_path(one)))
+                (None, Some(format_path(one)))
             } else {
                 (Some((*one).clone()), None)
             }
         }
-        [q, p, ..] => (Some((*q).clone()), Some(short_display_path(p))),
+        [q, p, ..] => (Some((*q).clone()), Some(format_path(p))),
         _ => (None, None),
     }
 }
 
-fn parse_find_query_and_path(tail: &[String]) -> (Option<String>, Option<String>) {
+fn parse_find_query_and_path(
+    tail: &[String],
+    format_path: fn(&str) -> String,
+) -> (Option<String>, Option<String>) {
     let args_no_connector = trim_at_connector(tail);
     // First positional argument (excluding common unary operators) is the root path
     let mut path: Option<String> = None;
     for a in &args_no_connector {
         if !a.starts_with('-') && *a != "!" && *a != "(" && *a != ")" {
-            path = Some(short_display_path(a));
+            path = Some(format_path(a));
             break;
         }
     }
@@ -1838,6 +1863,16 @@ fn parse_shell_lc_commands(original: &[String]) -> Option<Vec<ParsedCommand>> {
 
 /// Parses command metadata from a Bash-compatible shell script.
 pub fn parse_shell_script(script: &str) -> Vec<ParsedCommand> {
+    parse_shell_script_impl(script, false)
+}
+
+/// Parses command metadata without shortening file operands for display.
+/// Successful `cd ... &&` prefixes are included in read and search paths.
+pub fn parse_shell_script_with_full_paths(script: &str) -> Vec<ParsedCommand> {
+    parse_shell_script_impl(script, true)
+}
+
+fn parse_shell_script_impl(script: &str, preserve_paths: bool) -> Vec<ParsedCommand> {
     if let Some(tree) = try_parse_shell(script)
         && let Some((all_commands, operators)) =
             try_parse_word_only_commands_with_operators(&tree, script)
@@ -1890,7 +1925,14 @@ pub fn parse_shell_script(script: &str) -> Vec<ParsedCommand> {
                 }
                 continue;
             }
-            let parsed = summarize_main_tokens(&tokens);
+            let parsed = summarize_main_tokens_with_path_formatter(
+                &tokens,
+                if preserve_paths {
+                    str::to_owned
+                } else {
+                    short_display_path
+                },
+            );
             let parsed = match parsed {
                 ParsedCommand::Read { cmd, name, path } => {
                     if let Some(base) = &cwd {
@@ -1903,6 +1945,13 @@ pub fn parse_shell_script(script: &str) -> Vec<ParsedCommand> {
                     } else {
                         ParsedCommand::Read { cmd, name, path }
                     }
+                }
+                ParsedCommand::Search { cmd, query, path } if preserve_paths => {
+                    let path = path.map(|path| match &cwd {
+                        Some(base) => join_paths(base, &path),
+                        None => path,
+                    });
+                    ParsedCommand::Search { cmd, query, path }
                 }
                 other => other,
             };
@@ -2154,6 +2203,13 @@ fn drop_small_formatting_commands(
 }
 
 fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
+    summarize_main_tokens_with_path_formatter(main_cmd, short_display_path)
+}
+
+fn summarize_main_tokens_with_path_formatter(
+    main_cmd: &[String],
+    format_path: fn(&str) -> String,
+) -> ParsedCommand {
     match main_cmd.split_first() {
         Some((head, tail)) if matches!(head.as_str(), "ls" | "eza" | "exa") => {
             let flags_with_vals: &[&str] = match head.as_str() {
@@ -2176,8 +2232,7 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
                 ],
                 _ => &[],
             };
-            let path =
-                first_non_flag_operand(tail, flags_with_vals).map(|p| short_display_path(&p));
+            let path = first_non_flag_operand(tail, flags_with_vals).map(|p| format_path(&p));
             ParsedCommand::ListFiles {
                 cmd: shlex_join(main_cmd),
                 path,
@@ -2188,7 +2243,7 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
                 tail,
                 &["-L", "-P", "-I", "--charset", "--filelimit", "--sort"],
             )
-            .map(|p| short_display_path(&p));
+            .map(|p| format_path(&p));
             ParsedCommand::ListFiles {
                 cmd: shlex_join(main_cmd),
                 path,
@@ -2206,7 +2261,7 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
                     "--time-style",
                 ],
             )
-            .map(|p| short_display_path(&p));
+            .map(|p| format_path(&p));
             ParsedCommand::ListFiles {
                 cmd: shlex_join(main_cmd),
                 path,
@@ -2239,14 +2294,14 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
                 .filter(|p| !p.starts_with('-'))
                 .collect();
             if has_files_flag {
-                let path = non_flags.first().map(|s| short_display_path(s));
+                let path = non_flags.first().map(|s| format_path(s));
                 ParsedCommand::ListFiles {
                     cmd: shlex_join(main_cmd),
                     path,
                 }
             } else {
                 let query = non_flags.first().cloned().map(String::from);
-                let path = non_flags.get(1).map(|s| short_display_path(s));
+                let path = non_flags.get(1).map(|s| format_path(s));
                 ParsedCommand::Search {
                     cmd: shlex_join(main_cmd),
                     query,
@@ -2255,13 +2310,15 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
             }
         }
         Some((head, tail)) if head == "git" => match tail.split_first() {
-            Some((subcmd, sub_tail)) if subcmd == "grep" => parse_grep_like(main_cmd, sub_tail),
+            Some((subcmd, sub_tail)) if subcmd == "grep" => {
+                parse_grep_like(main_cmd, sub_tail, format_path)
+            }
             Some((subcmd, sub_tail)) if subcmd == "ls-files" => {
                 let path = first_non_flag_operand(
                     sub_tail,
                     &["--exclude", "--exclude-from", "--pathspec-from-file"],
                 )
-                .map(|p| short_display_path(&p));
+                .map(|p| format_path(&p));
                 ParsedCommand::ListFiles {
                     cmd: shlex_join(main_cmd),
                     path,
@@ -2272,7 +2329,7 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
             },
         },
         Some((head, tail)) if head == "fd" => {
-            let (query, path) = parse_fd_query_and_path(tail);
+            let (query, path) = parse_fd_query_and_path(tail, format_path);
             if query.is_some() {
                 ParsedCommand::Search {
                     cmd: shlex_join(main_cmd),
@@ -2288,7 +2345,7 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
         }
         Some((head, tail)) if head == "find" => {
             // Basic find support: capture path and common name filter
-            let (query, path) = parse_find_query_and_path(tail);
+            let (query, path) = parse_find_query_and_path(tail, format_path);
             if query.is_some() {
                 ParsedCommand::Search {
                     cmd: shlex_join(main_cmd),
@@ -2303,7 +2360,7 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
             }
         }
         Some((head, tail)) if matches!(head.as_str(), "grep" | "egrep" | "fgrep") => {
-            parse_grep_like(main_cmd, tail)
+            parse_grep_like(main_cmd, tail, format_path)
         }
         Some((head, tail)) if matches!(head.as_str(), "ag" | "ack" | "pt") => {
             let args_no_connector = trim_at_connector(tail);
@@ -2323,7 +2380,7 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
                 .filter(|p| !p.starts_with('-'))
                 .collect();
             let query = non_flags.first().cloned().map(String::from);
-            let path = non_flags.get(1).map(|s| short_display_path(s));
+            let path = non_flags.get(1).map(|s| format_path(s));
             ParsedCommand::Search {
                 cmd: shlex_join(main_cmd),
                 query,
@@ -2332,7 +2389,7 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
         }
         Some((head, tail)) if head == "cat" => {
             if let Some(path) = single_non_flag_operand(tail, &[]) {
-                let name = short_display_path(&path);
+                let name = format_path(&path);
                 ParsedCommand::Read {
                     cmd: shlex_join(main_cmd),
                     name,
@@ -2357,7 +2414,7 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
                     "--map-syntax",
                 ],
             ) {
-                let name = short_display_path(&path);
+                let name = format_path(&path);
                 ParsedCommand::Read {
                     cmd: shlex_join(main_cmd),
                     name,
@@ -2386,7 +2443,7 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
                     "--jump-target",
                 ],
             ) {
-                let name = short_display_path(&path);
+                let name = format_path(&path);
                 ParsedCommand::Read {
                     cmd: shlex_join(main_cmd),
                     name,
@@ -2400,7 +2457,7 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
         }
         Some((head, tail)) if head == "more" => {
             if let Some(path) = single_non_flag_operand(tail, &[]) {
-                let name = short_display_path(&path);
+                let name = format_path(&path);
                 ParsedCommand::Read {
                     cmd: shlex_join(main_cmd),
                     name,
@@ -2440,7 +2497,7 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
                 }
                 if let Some(p) = candidates.into_iter().find(|p| !p.starts_with('-')) {
                     let path = p.clone();
-                    let name = short_display_path(&path);
+                    let name = format_path(&path);
                     return ParsedCommand::Read {
                         cmd: shlex_join(main_cmd),
                         name,
@@ -2451,7 +2508,7 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
             if let [path] = tail
                 && !path.starts_with('-')
             {
-                let name = short_display_path(path);
+                let name = format_path(path);
                 return ParsedCommand::Read {
                     cmd: shlex_join(main_cmd),
                     name,
@@ -2494,7 +2551,7 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
                 }
                 if let Some(p) = candidates.into_iter().find(|p| !p.starts_with('-')) {
                     let path = p.clone();
-                    let name = short_display_path(&path);
+                    let name = format_path(&path);
                     return ParsedCommand::Read {
                         cmd: shlex_join(main_cmd),
                         name,
@@ -2505,7 +2562,7 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
             if let [path] = tail
                 && !path.starts_with('-')
             {
-                let name = short_display_path(path);
+                let name = format_path(path);
                 return ParsedCommand::Read {
                     cmd: shlex_join(main_cmd),
                     name,
@@ -2518,7 +2575,7 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
         }
         Some((head, tail)) if head == "awk" => {
             if let Some(path) = awk_data_file_operand(tail) {
-                let name = short_display_path(&path);
+                let name = format_path(&path);
                 ParsedCommand::Read {
                     cmd: shlex_join(main_cmd),
                     name,
@@ -2535,7 +2592,7 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
             let candidates = skip_flag_values(tail, &["-s", "-w", "-v", "-i", "-b"]);
             if let Some(p) = candidates.into_iter().find(|p| !p.starts_with('-')) {
                 let path = p.clone();
-                let name = short_display_path(&path);
+                let name = format_path(&path);
                 ParsedCommand::Read {
                     cmd: shlex_join(main_cmd),
                     name,
@@ -2549,7 +2606,7 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
         }
         Some((head, tail)) if head == "sed" => {
             if let Some(path) = sed_read_path(tail) {
-                let name = short_display_path(&path);
+                let name = format_path(&path);
                 ParsedCommand::Read {
                     cmd: shlex_join(main_cmd),
                     name,

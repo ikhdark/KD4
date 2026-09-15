@@ -976,6 +976,7 @@ async fn maybe_auto_review_mcp_request_user_input(
         Some(&review_cancel),
     )
     .await;
+    let interrupted = matches!(decision, ReviewDecision::Abort);
     let selected_label = match decision {
         ReviewDecision::ApprovedForSession => question
             .options
@@ -1001,7 +1002,7 @@ async fn maybe_auto_review_mcp_request_user_input(
                 answers: vec![selected_label],
             },
         )]),
-        interrupted: false,
+        interrupted,
     })
 }
 
@@ -1051,7 +1052,7 @@ where
         _ = cancel_token.cancelled() => {
             let empty = RequestUserInputResponse {
                 answers: HashMap::new(),
-                interrupted: false,
+                interrupted: true,
             };
             parent_session
                 .notify_user_input_response(sub_id, empty.clone())
@@ -1060,7 +1061,7 @@ where
         }
         response = fut => response.unwrap_or_else(|| RequestUserInputResponse {
             answers: HashMap::new(),
-            interrupted: false,
+            interrupted: true,
         }),
     }
 }

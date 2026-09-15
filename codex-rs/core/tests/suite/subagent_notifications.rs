@@ -1428,7 +1428,7 @@ async fn plaintext_multi_agent_v2_completion_without_receipt_sends_error_message
         ]),
     )
     .await;
-    let error = "Error while reading the server response: stream closed before response.completed";
+    let error = "Error while reading the server response: stream closed before response.completed (received 1 SSE events, 60 payload bytes)";
     let (status, expected_text) = match scenario {
         CompletionScenario::Completed => {
             ("Completed(Some(\"child done\"))".to_string(), "child done")

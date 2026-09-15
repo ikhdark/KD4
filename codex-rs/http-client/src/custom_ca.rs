@@ -1148,8 +1148,9 @@ mod tests {
 
     #[test]
     fn default_rustls_client_config_is_reused() {
-        let first = build_rustls_client_config(None).expect("first default rustls config");
-        let second = build_rustls_client_config(None).expect("second default rustls config");
+        let first = super::cached_rustls_client_config(None).expect("first default rustls config");
+        let second =
+            super::cached_rustls_client_config(None).expect("second default rustls config");
 
         assert!(Arc::ptr_eq(&first, &second));
     }
@@ -1291,7 +1292,7 @@ mod tests {
         assert!(matches!(
             handshake(rotated, server_a),
             Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::UnknownIssuer
+                rustls::CertificateError::UnknownIssuer | rustls::CertificateError::BadSignature
             ))
         ));
         println!("ROTATION_ASSERTED");

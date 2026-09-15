@@ -785,6 +785,8 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
             }
         }
 
+        // Settle requests queued while lossless event delivery was blocked.
+        drop(client_rx);
         drop(writer_rx);
         drop(processor_tx);
         outgoing_message_sender

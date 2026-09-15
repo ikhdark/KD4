@@ -93,6 +93,8 @@ async fn process_sse_with_metadata(
     let mut stream = stream.eventsource();
     let mut interpreter = ResponsesEventInterpreter::new(&metadata, turn_state);
     let mut poll_ordinal = 0_u64;
+    let mut received_events = 0_u64;
+    let mut received_payload_bytes = 0_usize;
 
     loop {
         let start = Instant::now();
@@ -130,9 +132,9 @@ async fn process_sse_with_metadata(
             }
             Ok(None) => {
                 let _ = tx_event
-                    .send(Err(ApiError::Stream(
-                        "stream closed before response.completed".into(),
-                    )))
+                    .send(Err(ApiError::Stream(format!(
+                        "stream closed before response.completed (received {received_events} SSE events, {received_payload_bytes} payload bytes)"
+                    ))))
                     .await;
                 if let Some(t) = telemetry.as_ref() {
                     t.on_sse_cleanup(
@@ -144,7 +146,10 @@ async fn process_sse_with_metadata(
             }
             Err(_) => {
                 let _ = tx_event
-                    .send(Err(ApiError::Stream("idle timeout waiting for SSE".into())))
+                    .send(Err(ApiError::Stream(format!(
+                        "idle timeout waiting for SSE after {}ms",
+                        idle_timeout.as_millis()
+                    ))))
                     .await;
                 if let Some(t) = telemetry.as_ref() {
                     t.on_sse_cleanup(SseCleanupOutcome::IdleTimeout, start.elapsed());
@@ -153,6 +158,8 @@ async fn process_sse_with_metadata(
             }
         };
 
+        received_events = received_events.saturating_add(1);
+        received_payload_bytes = received_payload_bytes.saturating_add(sse.data.len());
         trace!(event = %sse.event, payload_bytes = sse.data.len(), "SSE event");
 
         let events = match interpreter.process_payload(&sse.data) {
@@ -167,9 +174,11 @@ async fn process_sse_with_metadata(
                     t.on_sse_event(&sse.event, start.elapsed(), Some(&error));
                 }
                 debug!(event = %sse.event, payload_bytes = sse.data.len(), %error, "Failed to parse SSE event");
+                let event_name = sse.event.chars().take(128).collect::<String>();
                 let _ = tx_event
                     .send(Err(ApiError::Stream(format!(
-                        "failed to parse SSE event: {error}"
+                        "failed to parse SSE event {event_name:?} ({} payload bytes): {error}",
+                        sse.data.len()
                     ))))
                     .await;
                 if let Some(t) = telemetry.as_ref() {
@@ -262,16 +271,21 @@ mod tests {
         let reader = builder.build();
         let stream =
             ReaderStream::new(reader).map_err(|err| TransportError::Network(err.to_string()));
-        let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(16);
-        tokio::spawn(process_sse(
-            Box::pin(stream),
-            tx,
+        let mut response = spawn_response_stream(
+            StreamResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                bytes: Box::pin(stream),
+            },
             idle_timeout(),
             /*telemetry*/ None,
-        ));
+            /*turn_state*/ None,
+        );
 
+        assert_matches!(response.next().await, Some(Ok(ResponseEvent::RateLimits(snapshot)))
+            if snapshot.limit_id.as_deref() == Some("codex") && snapshot.primary.is_none() && snapshot.secondary.is_none());
         let mut events = Vec::new();
-        while let Some(ev) = rx.recv().await {
+        while let Some(ev) = response.next().await {
             events.push(ev);
         }
         events
@@ -423,6 +437,11 @@ mod tests {
                             || message.contains("failed to parse SSE event"),
                         "case {case}: {message}"
                     );
+                    if case == "malformed json" {
+                        assert!(message.contains("SSE event \"response.output_item.done\""));
+                        assert!(message.contains(&format!("({} payload bytes)", payload.len())));
+                        assert!(message.contains("EOF while parsing an object at line 1 column"));
+                    }
                 }
                 other => panic!("unexpected event for {case}: {other:?}"),
             }
@@ -477,10 +496,35 @@ mod tests {
 
         match &events[1] {
             Err(ApiError::Stream(msg)) => {
-                assert_eq!(msg, "stream closed before response.completed")
+                assert_eq!(
+                    msg,
+                    &format!(
+                        "stream closed before response.completed (received 1 SSE events, {} payload bytes)",
+                        item1.len()
+                    )
+                )
             }
             other => panic!("unexpected second event: {other:?}"),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_reports_duration_through_response_stream() {
+        let mut response = spawn_response_stream(
+            StreamResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                bytes: Box::pin(stream::pending()),
+            },
+            Duration::from_millis(1250),
+            None,
+            None,
+        );
+        assert_matches!(response.next().await, Some(Ok(ResponseEvent::RateLimits(snapshot)))
+            if snapshot.limit_id.as_deref() == Some("codex"));
+        let error = response.next().await.unwrap().unwrap_err();
+        assert_matches!(error, ApiError::Stream(message) if message == "idle timeout waiting for SSE after 1250ms");
+        assert!(response.next().await.is_none());
     }
 
     #[tokio::test]

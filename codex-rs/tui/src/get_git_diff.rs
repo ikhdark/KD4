@@ -924,7 +924,7 @@ mod tests {
                         "--relative",
                     ],
                 ),
-                /*exit_code*/ 1,
+                /*exit_code*/ 0,
                 "tracked\n",
             ),
             response(
@@ -1171,7 +1171,7 @@ mod tests {
                         "--relative",
                     ],
                 ),
-                /*exit_code*/ 1,
+                /*exit_code*/ 0,
                 "tracked\n",
             ),
             response(
@@ -1259,7 +1259,7 @@ mod tests {
                         "--relative",
                     ],
                 ),
-                /*exit_code*/ 1,
+                /*exit_code*/ 0,
                 "tracked\n",
             ),
             response(
@@ -1336,7 +1336,7 @@ mod tests {
                         "--relative",
                     ],
                 ),
-                /*exit_code*/ 1,
+                /*exit_code*/ 0,
                 "tracked\n",
             ),
             response(

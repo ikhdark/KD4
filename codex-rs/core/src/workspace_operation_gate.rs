@@ -50,7 +50,12 @@ mod tests {
             .is_err()
         );
         drop(first);
-        acquire_workspace_operation(temp.path()).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            acquire_workspace_operation(temp.path()),
+        )
+        .await
+        .expect("released workspace should become available");
     }
 
     #[tokio::test]

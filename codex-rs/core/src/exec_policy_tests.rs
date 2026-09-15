@@ -970,6 +970,41 @@ async fn execpolicy_prompt_takes_precedence_without_proposed_amendment() {
 }
 
 #[tokio::test]
+async fn execpolicy_reasons_preserve_unquotable_argument_boundaries() {
+    let display = r#"argv ["rm", "a b\0c", ""] (cannot be represented as a shell command)"#;
+    for (decision, expected) in [
+        (
+            "prompt",
+            ExecApprovalRequirement::NeedsApproval {
+                reason: Some(format!("`{display}` requires approval by policy")),
+                proposed_execpolicy_amendment: None,
+            },
+        ),
+        (
+            "forbidden",
+            ExecApprovalRequirement::Forbidden {
+                reason: format!("`{display}` rejected: policy forbids commands starting with `rm`"),
+            },
+        ),
+    ] {
+        assert_exec_approval_requirement_for_command(
+            ExecApprovalRequirementScenario {
+                policy_src: Some(format!(
+                    r#"prefix_rule(pattern=["rm"], decision="{decision}")"#
+                )),
+                command: vec!["rm".to_string(), "a b\0c".to_string(), String::new()],
+                approval_policy: AskForApproval::OnRequest,
+                permission_profile: PermissionProfile::Disabled,
+                sandbox_permissions: SandboxPermissions::UseDefault,
+                prefix_rule: None,
+            },
+            expected,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn absolute_path_exec_approval_requirement_matches_host_executable_rules() {
     let git_path = host_program_path("git");
     let git_path_literal = starlark_string(&git_path);
@@ -1986,6 +2021,103 @@ fn derive_requested_execpolicy_amendment_allows_non_exact_banned_prefix_rule_mat
         Some(ExecPolicyAmendment::new(prefix_rule.clone())),
         derive_requested_execpolicy_amendment_for_test(Some(&prefix_rule), &[])
     );
+}
+
+#[tokio::test]
+async fn broad_runtime_prefixes_offer_only_the_specific_command_for_approval() {
+    for prefix in [
+        vec!["deno"],
+        vec!["deno", "run"],
+        vec!["deno", "eval"],
+        vec!["bun"],
+        vec!["bun", "run"],
+        vec!["bun", "-e"],
+        vec!["bun", "--eval"],
+        vec!["uv"],
+        vec!["uv", "run"],
+        vec!["uv", "tool", "run"],
+        vec!["uvx"],
+        vec!["pipx"],
+        vec!["pipx", "run"],
+        vec!["julia"],
+        vec!["julia", "-e"],
+        vec!["Rscript"],
+        vec!["Rscript", "-e"],
+        vec!["go"],
+        vec!["go", "run"],
+        vec!["awk"],
+        vec!["gawk"],
+        vec!["mawk"],
+        vec!["tclsh"],
+        vec!["dotnet"],
+        vec!["dotnet", "run"],
+        vec!["dotnet", "exec"],
+        vec!["cmd"],
+        vec!["cmd", "/c"],
+        vec!["cmd", "/C"],
+        vec!["cmd.exe"],
+        vec!["cmd.exe", "/c"],
+        vec!["cmd.exe", "/C"],
+        vec!["cmd.exe", "/k"],
+        vec!["cmd.exe", "/D", "/C"],
+        vec!["CMD.EXE", "/q", "/s", "/c"],
+        vec!["cmd", "/d", "/v:ON", "/K"],
+        vec!["mshta.exe"],
+        vec!["rundll32.exe"],
+        vec!["regsvr32.exe"],
+        vec!["wscript.exe"],
+        vec!["cscript.exe"],
+        vec!["MSBuild.exe"],
+        vec!["InstallUtil.exe"],
+        vec!["wsl"],
+        vec!["wsl", "-e"],
+        vec!["wsl", "--exec"],
+        vec!["wsl.exe"],
+        vec!["wsl.exe", "-e"],
+        vec!["wsl.exe", "--exec"],
+        vec!["C:\\Tools\\DENO.EXE", "run"],
+        vec!["/opt/bin/bun", "--eval"],
+        vec!["C:\\Windows\\System32\\CMD.EXE", "/C"],
+        vec!["/opt/bin/python3", "-c"],
+        vec!["NODE.EXE", "-e"],
+    ] {
+        let prefix_rule = vec_str(&prefix);
+        let mut command = prefix_rule.clone();
+        command.push("fixture-script".to_string());
+        let policy = ExecPolicyManager::new(Arc::new(Policy::empty()));
+        let requirement = policy
+            .create_exec_approval_requirement_for_direct_argv(ExecApprovalRequest {
+                command: &command,
+                command_for_safety: None,
+                approval_policy: AskForApproval::UnlessTrusted,
+                permission_profile: PermissionProfile::read_only(),
+                windows_sandbox_level: WindowsSandboxLevel::Disabled,
+                sandbox_permissions: SandboxPermissions::UseDefault,
+                prefix_rule: Some(prefix_rule.clone()),
+            })
+            .await;
+        assert_eq!(
+            requirement,
+            ExecApprovalRequirement::NeedsApproval {
+                reason: None,
+                proposed_execpolicy_amendment: Some(ExecPolicyAmendment::new(command)),
+            },
+            "prefix: {prefix_rule:?}"
+        );
+    }
+    // Subcommands that identify a specific operation remain eligible.
+    for prefix in [
+        vec!["go", "build"],
+        vec!["dotnet", "build"],
+        vec!["cmd.exe", "/D", "/C", "echo fixture"],
+        vec!["cscript.exe", "fixture.vbs"],
+    ] {
+        let prefix = vec_str(&prefix);
+        assert_eq!(
+            derive_requested_execpolicy_amendment_for_test(Some(&prefix), &[]),
+            Some(ExecPolicyAmendment::new(prefix))
+        );
+    }
 }
 
 #[test]

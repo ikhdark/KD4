@@ -1,6 +1,7 @@
 use codex_protocol::config_types::Personality;
 use codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT;
 use codex_protocol::openai_models::ModelsResponse;
+use codex_utils_output_truncation::approx_token_count;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeSet;
 
@@ -30,6 +31,27 @@ struct PromptContract {
 
 const PROMPT_CONTRACTS: &[PromptContract] = &[
     PromptContract {
+        id: "requirement-fidelity-and-runtime-grounding",
+        scope: PromptScope::LocalPolicyAndFallback,
+        expectation: AnchorExpectation::All,
+        anchors: &[
+            "explicit constraints, prohibitions, and out-of-scope work until superseded",
+            "Delegated objectives and write scopes bound a worker's task",
+            "Read the complete enclosing function, type, or configuration unit before changing it",
+            "Current file content overrides summaries, plans, and stale reads",
+            "entrypoint through registration, dispatch, feature flags or config defaults to consumers",
+            "Partial wiring is forbidden.",
+            "Resolve contradictions by runtime reachability, ownership, and freshness.",
+            "Cargo commands sharing a target directory",
+            "do not evade denials",
+            "combine compatible behavior and verify it as one runtime path",
+            "Cancellation need not roll back effects.",
+            "without weakening required invariants or assertions",
+            "match every explicit requirement, prohibition, and preserved invariant to current evidence",
+            "Ending a turn or exhausting a budget does not prove completion.",
+        ],
+    },
+    PromptContract {
         id: "concise-progress-updates",
         scope: PromptScope::LocalPolicyAndFallback,
         expectation: AnchorExpectation::All,
@@ -46,7 +68,10 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
         id: "avoid-overengineering",
         scope: PromptScope::LocalPolicyAndFallback,
         expectation: AnchorExpectation::All,
-        anchors: &["Do not over-engineer implementations."],
+        anchors: &[
+            "Implement the smallest coherent change that fully satisfies the requested behavior.",
+            "avoid unrelated refactors, renames, file moves, dependencies, and redesigns.",
+        ],
     },
     PromptContract {
         id: "nearest-sufficient-completion",
@@ -124,8 +149,8 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
         scope: PromptScope::LocalPolicyAndFallback,
         expectation: AnchorExpectation::All,
         anchors: &[
-            "Batch independent calls when their tool contracts and execution resources permit concurrency",
-            "await Promise.allSettled and inspect every result and exit status",
+            "Batch independent calls using the available tool-native concurrency mechanism when their contracts and execution resources permit it",
+            "wait for every started call and inspect every result and exit status",
             "finish edits before checks that validate them",
             "Stop investigating when the available evidence is sufficient.",
         ],
@@ -139,11 +164,14 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "fresh content in context counts as read",
             "Retrieve missing or potentially changed instructions.",
             "Resolve conflicts by authority, scope, and explicit supersession.",
-            "Ask only when conflicting requirements remain unresolved.",
-            "Publish, deploy, contact third parties, delete data, or change external state only when authorized.",
+            "Ask when conflicting requirements or an essential missing fact cannot be resolved from available evidence.",
+            "When proceeding under a material assumption, state it",
+            "incorporate corrections before the next dependent action",
+            "a status question does not cancel ongoing work",
+            "Stage, commit, push, publish, deploy, install, restart, contact third parties, delete data, change external state, or rebuild or activate the installed application only when authorized.",
             "Do not request authorization already provided.",
             "autonomous within the requested scope",
-            "Ask questions when clarity is needed.",
+            "Ask only about material requirements that remain unresolved after examining available evidence.",
         ],
     },
     PromptContract {
@@ -161,21 +189,23 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
         scope: PromptScope::LocalPolicy,
         expectation: AnchorExpectation::All,
         anchors: &[
-            "Before editing, inspect implementation, contract, and validation.",
-            "Investigate callers, consumers",
+            "Before editing, identify the behavior's owner, intended observable change, preserved invariants, likely files, affected contracts, and focused validation.",
+            "Inspect affected callers, schemas",
             "duplicate or generated representations",
-            "compatibility when relevant to the change or inspected source",
+            "persistence/migrations, compatibility paths, and tests encoding old behavior",
             "Reuse evidence; resolve material uncertainty",
             "avoid checklist-only absence searches",
-            "Run all validation explicitly required by the user and repository instructions.",
-            "Do not run the full test suite unless explicitly requested.",
+            "Run all validation explicitly required by the user or applicable repository instructions",
+            "including a full suite only when either explicitly requires it.",
             "For every changed behavior, identify and run the existing test or tests that exercise that behavior.",
             "A test counts as validation only if at least one of its assertions would fail when the changed behavior is absent, produces the wrong result, or is not reached through the path the test is intended to exercise.",
             "If the existing tests would still pass under any of those failures, add or strengthen the smallest test necessary to make that failure observable.",
             "Every added or modified test must assert the intended result.",
-            "Change existing tests only when their current assertions cannot validate the requested behavior.",
-            "Leave unrelated tests untouched.",
+            "Repair weak tests covering the changed behavior or blocking its validation.",
+            "Report unrelated weaknesses encountered without starting a broader test audit.",
             "Validate every affected behavior after the final relevant implementation change.",
+            "Changes to dependency manifests, lockfiles, build configuration, or feature flags invalidate prior dependency setup and validation evidence for the affected scope.",
+            "Prefer the least costly check that proves the affected behavior.",
             "A result produced before a later change to that behavior or its exercised path does not validate the final state.",
             "Do not substitute compilation, formatting, linting, static analysis, code inspection, or unrelated passing tests for behavior validation.",
             "Run those only when required by the user, repository instructions, or the changed code's normal required validation.",
@@ -326,7 +356,7 @@ fn resolved_prompts_satisfy_named_contract_registry() {
 
 #[test]
 fn local_policy_models_use_one_canonical_prompt_within_size_limit() {
-    const PROMPT_CHAR_LIMIT: usize = 6_000;
+    const PROMPT_TOKEN_LIMIT: usize = 10_000;
     let response = crate::bundled_models_response().expect("bundled models.json should parse");
     let prompts = LOCAL_PROMPT_POLICY_SLUGS
         .iter()
@@ -343,7 +373,11 @@ fn local_policy_models_use_one_canonical_prompt_within_size_limit() {
 
     assert!(prompts.iter().all(|prompt| *prompt == prompts[0]));
     assert_eq!(prompts[0], BASE_INSTRUCTIONS_DEFAULT.trim());
-    assert!(prompts[0].chars().count() < PROMPT_CHAR_LIMIT);
+    let tokens = approx_token_count(prompts[0]);
+    assert!(
+        tokens <= PROMPT_TOKEN_LIMIT,
+        "default.md uses approximately {tokens} tokens; limit is {PROMPT_TOKEN_LIMIT}"
+    );
 }
 
 #[test]

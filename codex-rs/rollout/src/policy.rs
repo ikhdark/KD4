@@ -94,11 +94,21 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
                 || matches!(event.item, TurnItem::Plan(_) | TurnItem::Sleep(_))
         }
         EventMsg::TokenCount(_)
+        | EventMsg::PlanUpdate(_)
         | EventMsg::ThreadGoalUpdated(_)
         | EventMsg::ThreadRolledBack(_)
         | EventMsg::TurnAborted(_)
         | EventMsg::TurnStarted(_)
         | EventMsg::TurnComplete(_)
+        // These have no completed TurnItem equivalent. Preserve failures and
+        // host interventions in both history modes for replay and diagnosis.
+        | EventMsg::Error(_)
+        | EventMsg::Warning(_)
+        | EventMsg::StreamError(_)
+        | EventMsg::ModelReroute(_)
+        | EventMsg::ModelVerification(_)
+        | EventMsg::HookStarted(_)
+        | EventMsg::HookCompleted(_)
         | EventMsg::ReasoningPolicySummary(_)
         | EventMsg::ThreadSettingsApplied(_) => true,
 
@@ -118,8 +128,7 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::SubAgentActivity(_) => matches!(history_mode, ThreadHistoryMode::Legacy),
 
         // Transient, non-durable events.
-        EventMsg::Error(_)
-        | EventMsg::ReasoningPolicyUpdated(_)
+        EventMsg::ReasoningPolicyUpdated(_)
         | EventMsg::GuardianAssessment(_)
         | EventMsg::ExecCommandEnd(_)
         | EventMsg::ViewImageToolCall(_)
@@ -130,11 +139,8 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::CollabResumeEnd(_)
         | EventMsg::DynamicToolCallRequest(_)
         | EventMsg::DynamicToolCallResponse(_)
-        | EventMsg::Warning(_)
         | EventMsg::GuardianWarning(_)
         | EventMsg::SafetyBuffering(_)
-        | EventMsg::ModelReroute(_)
-        | EventMsg::ModelVerification(_)
         | EventMsg::TurnModerationMetadata(_)
         | EventMsg::AgentReasoningSectionBreak(_)
         | EventMsg::RawResponseItem(_)
@@ -149,19 +155,15 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::RequestUserInput(_)
         | EventMsg::ElicitationRequest(_)
         | EventMsg::ApplyPatchApprovalRequest(_)
-        | EventMsg::StreamError(_)
         | EventMsg::PatchApplyBegin(_)
         | EventMsg::PatchApplyUpdated(_)
         | EventMsg::TurnDiff(_)
         | EventMsg::McpStartupUpdate(_)
         | EventMsg::McpStartupComplete(_)
         | EventMsg::WebSearchBegin(_)
-        | EventMsg::PlanUpdate(_)
         | EventMsg::ShutdownComplete
         | EventMsg::DeprecationNotice(_)
         | EventMsg::ItemStarted(_)
-        | EventMsg::HookStarted(_)
-        | EventMsg::HookCompleted(_)
         | EventMsg::AgentMessageContentDelta(_)
         | EventMsg::PlanDelta(_)
         | EventMsg::ReasoningContentDelta(_)
@@ -177,6 +179,7 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
 
 #[cfg(test)]
 mod tests {
+    use super::persisted_rollout_items;
     use super::should_persist_event_msg;
     use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::protocol::EventMsg;
@@ -186,7 +189,106 @@ mod tests {
     use codex_protocol::protocol::ReasoningPolicySnapshot;
     use codex_protocol::protocol::ReasoningPolicySource;
     use codex_protocol::protocol::ReasoningPolicyTrigger;
+    use codex_protocol::protocol::RolloutItem;
     use codex_protocol::protocol::ThreadHistoryMode;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn live_append_preserves_failures_and_host_interventions_in_both_history_modes() {
+        let source = tempfile::tempdir().unwrap();
+        let hook_run = json!({
+            "id": "hook-1",
+            "event_name": "stop",
+            "handler_type": "command",
+            "execution_mode": "sync",
+            "scope": "turn",
+            "source_path": source.path().join("hooks.json"),
+            "display_order": 0,
+            "status": "running",
+            "status_message": null,
+            "started_at": 100,
+            "completed_at": null,
+            "duration_ms": null,
+            "entries": []
+        });
+        let mut completed = hook_run.clone();
+        completed["status"] = json!("blocked");
+        completed["completed_at"] = json!(125);
+        completed["duration_ms"] = json!(25);
+        completed["entries"] = json!([{"kind": "stop", "text": "validation required"}]);
+        let expected = vec![
+            json!({"type": "error", "message": "request failed", "codex_error_info": null}),
+            json!({"type": "warning", "message": "tools stopped after a repeated cycle"}),
+            json!({"type": "stream_error", "message": "Reconnecting... 1/4", "codex_error_info": {"response_stream_disconnected": {"http_status_code": 503}}, "additional_details": "connection reset before response completed"}),
+            json!({"type": "model_reroute", "from_model": "requested", "to_model": "served", "reason": "high_risk_cyber_activity"}),
+            json!({"type": "model_verification", "verifications": ["trusted_access_for_cyber"]}),
+            json!({"type": "hook_started", "turn_id": "turn-1", "run": hook_run}),
+            json!({"type": "hook_completed", "turn_id": "turn-1", "run": completed}),
+        ]
+        .into_iter()
+        .map(|value| RolloutItem::EventMsg(serde_json::from_value(value).unwrap()))
+        .collect::<Vec<_>>();
+        let mut live_items = expected.clone();
+        live_items.insert(
+            1,
+            RolloutItem::EventMsg(EventMsg::McpToolCallProgress(McpToolCallProgressEvent {
+                call_id: "call-1".to_string(),
+                message: "halfway".to_string(),
+            })),
+        );
+
+        for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+            let persisted = persisted_rollout_items(&live_items, history_mode);
+            // Compare the complete payloads: retaining only a count or final
+            // hook status would lose the reason a turn was interrupted.
+            assert_eq!(
+                serde_json::to_value(&persisted).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            let home = tempfile::tempdir().unwrap();
+            let config = crate::config::RolloutConfig {
+                codex_home: home.path().to_path_buf(),
+                sqlite_home: home.path().to_path_buf(),
+                cwd: home.path().to_path_buf(),
+                model_provider_id: "test-provider".to_string(),
+                generate_memories: false,
+            };
+            let thread_id = codex_protocol::ThreadId::new();
+            let recorder = crate::recorder::RolloutRecorder::new(
+                &config,
+                crate::recorder::RolloutRecorderParams::new(
+                    thread_id,
+                    None,
+                    None,
+                    codex_protocol::protocol::SessionSource::Exec,
+                    None,
+                    "durable-events-test".to_string(),
+                    codex_protocol::models::BaseInstructions::default(),
+                    Vec::new(),
+                )
+                .with_history_mode(history_mode),
+            )
+            .await
+            .unwrap();
+            recorder.record_canonical_items(&persisted).await.unwrap();
+            recorder.persist().await.unwrap();
+            recorder.shutdown().await.unwrap();
+            let (replayed, loaded_id, errors) =
+                crate::recorder::RolloutRecorder::load_rollout_items(recorder.rollout_path())
+                    .await
+                    .unwrap();
+            assert_eq!(loaded_id, Some(thread_id));
+            assert_eq!(errors, 0);
+            let events = replayed
+                .into_iter()
+                .filter(|item| matches!(item, RolloutItem::EventMsg(_)))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                serde_json::to_value(events).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+        }
+    }
 
     fn snapshot() -> ReasoningPolicySnapshot {
         ReasoningPolicySnapshot {
@@ -219,6 +321,17 @@ mod tests {
                 }),
                 history_mode
             ));
+        }
+    }
+
+    #[test]
+    fn committed_checklist_updates_are_durable_in_both_history_modes() {
+        let event = EventMsg::PlanUpdate(codex_protocol::plan_tool::UpdatePlanArgs {
+            explanation: None,
+            plan: Vec::new(),
+        });
+        for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+            assert!(should_persist_event_msg(&event, history_mode));
         }
     }
 

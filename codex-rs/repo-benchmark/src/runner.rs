@@ -1,6 +1,9 @@
 use crate::diagnostics::{DiagnosticResult, analyze};
 use crate::native::{NativeAttemptEvidence, NativeAttemptRequest, ScriptedScenario, run_attempt};
-use crate::prepare::provenance::{copy_tree, hash_file, hash_tree, reset_workspace, write_json};
+use crate::prepare::provenance::{
+    FileIdentity, copy_tree, hash_file, reset_workspace, source_tree_inventory, write_atomic_json,
+    write_json,
+};
 use crate::prepare::{Prepared, unique_id};
 use crate::schedule::{
     ATTEMPT_LIMIT_MS, ExecutionBudget, SCRIPTED_LIMIT_MS, ScheduledAttempt, Segment,
@@ -30,6 +33,8 @@ pub struct Attempt {
     pub diagnostics: Option<DiagnosticResult>,
     pub outside_execution_ms: BTreeMap<String, u64>,
     pub final_workspace_sha256: Option<String>,
+    #[serde(default)]
+    pub evidence_files: Vec<FileIdentity>,
     pub evidence_directory: PathBuf,
     pub rerun_command: String,
 }
@@ -50,6 +55,129 @@ pub struct RunResult {
     pub finished: bool,
 }
 
+impl RunResult {
+    pub fn verify_evidence(&self) -> Result<()> {
+        for attempt in &self.attempts {
+            verify_attempt_evidence(attempt)?;
+        }
+        Ok(())
+    }
+    /// An unfinished result is the frozen schedule plus individual durable
+    /// attempt checkpoints. Never rewrite all previous event traces per turn.
+    pub fn load(path: &Path) -> Result<Self> {
+        let mut result: Self = crate::prepare::provenance::read_json(path)?;
+        if !result.finished {
+            for attempt in &mut result.attempts {
+                // Analysis-only results retain the original evidence paths;
+                // never replay those checkpoints over their new diagnostics.
+                if attempt.evidence_directory.parent() != Some(result.directory.as_path()) {
+                    continue;
+                }
+                let checkpoint = attempt.evidence_directory.join("attempt.json");
+                if checkpoint.exists() {
+                    let saved: Attempt = crate::prepare::provenance::read_json(&checkpoint)?;
+                    ensure!(
+                        saved.scheduled == attempt.scheduled
+                            && saved.evidence_directory == attempt.evidence_directory,
+                        "attempt checkpoint differs from frozen schedule: {}",
+                        checkpoint.display()
+                    );
+                    *attempt = saved;
+                    if attempt.status == "running" {
+                        attempt.status = "incomplete".into();
+                        attempt.reason = Some("run stopped before final verification and diagnostics; inspect partial native evidence".into());
+                    }
+                } else if attempt.status == "not_started" && attempt.reason.is_none() {
+                    attempt.reason = Some("run stopped before an attempt checkpoint was saved; inspect any partial native evidence".into());
+                }
+            }
+            result.scripted_execution_ms = result.execution_ms(Segment::Scripted);
+            result.real_model_execution_ms = result.execution_ms(Segment::RealModel);
+        }
+        Ok(result)
+    }
+
+    fn execution_ms(&self, segment: Segment) -> u64 {
+        self.attempts
+            .iter()
+            .filter(|a| a.scheduled.segment == segment)
+            .filter_map(|a| a.native.as_ref())
+            .fold(0_u64, |total, native| {
+                total.saturating_add(native.elapsed_ms)
+            })
+    }
+}
+
+fn checkpoint(attempt: &Attempt) -> Result<()> {
+    fs::create_dir_all(&attempt.evidence_directory)?;
+    write_atomic_json(&attempt.evidence_directory.join("attempt.json"), attempt)
+}
+
+fn native_input_paths(native: &NativeAttemptEvidence) -> Vec<&Path> {
+    std::iter::once(native.evidence_path.as_path())
+        .chain(native.rollout_paths.iter().map(PathBuf::as_path))
+        .chain(native.stdout_paths.iter().map(PathBuf::as_path))
+        .chain(native.stderr_paths.iter().map(PathBuf::as_path))
+        .chain(native.provider_requests_path.iter().map(PathBuf::as_path))
+        .collect()
+}
+
+fn freeze_attempt_evidence(attempt: &mut Attempt) -> Result<()> {
+    let Some(native) = &attempt.native else {
+        return Ok(());
+    };
+    attempt.evidence_files = native_input_paths(native)
+        .into_iter()
+        .map(FileIdentity::record)
+        .collect::<Result<_>>()?;
+    Ok(())
+}
+
+fn verify_attempt_evidence(attempt: &Attempt) -> Result<()> {
+    let Some(native) = &attempt.native else {
+        return Ok(());
+    };
+    for path in native_input_paths(native) {
+        let resolved = fs::canonicalize(path)?;
+        ensure!(
+            attempt
+                .evidence_files
+                .iter()
+                .any(|file| file.path == resolved),
+            "attempt {} has no frozen identity for {}; raw evidence cannot be reanalyzed or imported",
+            attempt.scheduled.id,
+            path.display()
+        );
+    }
+    for file in &attempt.evidence_files {
+        file.verify()?;
+    }
+    let recorded: NativeAttemptEvidence =
+        serde_json::from_slice(&fs::read(&native.evidence_path)?)?;
+    ensure!(
+        serde_json::to_value(recorded)? == serde_json::to_value(native)?,
+        "native evidence differs from the embedded attempt {}",
+        attempt.scheduled.id
+    );
+    Ok(())
+}
+
+fn lock_workspace(prepared: &Prepared) -> Result<fs::File> {
+    ensure!(
+        prepared.workspace_lock == prepared.directory.join("workspace.lock"),
+        "prepared workspace lock path changed"
+    );
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&prepared.workspace_lock)?;
+    file.try_lock()
+        .context("prepared workspace is already in use by another benchmark run")?;
+    Ok(file)
+}
+
 pub fn execute(
     manifest: &Path,
     selected: Option<&str>,
@@ -57,6 +185,7 @@ pub fn execute(
 ) -> Result<PathBuf> {
     let manifest = fs::canonicalize(manifest)?;
     let prepared = Prepared::load(&manifest)?;
+    let _workspace_guard = lock_workspace(&prepared)?;
     prepared.verify()?;
     let id = unique_id();
     let directory = prepared.runs_directory.join(&id);
@@ -97,6 +226,7 @@ pub fn execute(
                 diagnostics: None,
                 outside_execution_ms: BTreeMap::new(),
                 final_workspace_sha256: None,
+                evidence_files: vec![],
             })
             .collect(),
         scripted_execution_ms: 0,
@@ -105,7 +235,7 @@ pub fn execute(
     };
     let result_path = directory.join("result.json");
     // Record every resolved attempt path before any native execution.
-    write_json(&result_path, &result)?;
+    write_atomic_json(&result_path, &result)?;
     let mut scripted_budget = ExecutionBudget::new(SCRIPTED_LIMIT_MS);
     let mut live_budget = ExecutionBudget::new(prepared.mode.live_limit_ms());
     let mut unrecoverable: Option<String> = None;
@@ -118,10 +248,12 @@ pub fn execute(
         };
         if let Some(reason) = &unrecoverable {
             attempt.reason = Some(format!("dependent setup unavailable: {reason}"));
+            checkpoint(attempt)?;
             continue;
         }
         if budget.remaining_ms() == 0 {
             attempt.reason = Some("segment_budget_exhausted before attempt started".into());
+            checkpoint(attempt)?;
             continue;
         }
         eprintln!(
@@ -142,6 +274,14 @@ pub fn execute(
             if error.downcast_ref::<ResetFailure>().is_some() {
                 unrecoverable = attempt.reason.clone();
             }
+            if attempt.evidence_files.is_empty() {
+                if let Err(freeze_error) = freeze_attempt_evidence(attempt) {
+                    attempt.reason = Some(format!(
+                        "{}; cannot freeze partial evidence: {freeze_error:#}",
+                        attempt.reason.as_deref().unwrap_or_default()
+                    ));
+                }
+            }
         }
         if let Some(native) = &attempt.native {
             budget.charge(native.elapsed_ms);
@@ -153,10 +293,10 @@ pub fn execute(
         }
         result.scripted_execution_ms = SCRIPTED_LIMIT_MS - scripted_budget.remaining_ms();
         result.real_model_execution_ms = prepared.mode.live_limit_ms() - live_budget.remaining_ms();
-        write_json(&result_path, &result)?;
+        checkpoint(attempt)?;
     }
     result.finished = true;
-    write_json(&result_path, &result)?;
+    write_atomic_json(&result_path, &result)?;
     crate::reports::write(&prepared, &result)?;
     Ok(result_path)
 }
@@ -216,12 +356,13 @@ fn execute_one(prepared: &Prepared, attempt: &mut Attempt, timeout_ms: u64) -> R
     };
     let fixture = &prepared.fixtures[fixture_key];
     let reset = Instant::now();
-    ensure!(
-        hash_tree(&fixture.snapshot)? == fixture.sha256,
-        "fixture changed before reset"
-    );
-    reset_workspace(&prepared.directory, &prepared.workspace, &fixture.snapshot)
-        .map_err(|e| ResetFailure(format!("cannot restore workspace: {e:#}")))?;
+    reset_workspace(
+        &prepared.directory,
+        &prepared.workspace,
+        &fixture.snapshot,
+        &fixture.sha256,
+    )
+    .map_err(|e| ResetFailure(format!("cannot restore workspace: {e:#}")))?;
     attempt
         .outside_execution_ms
         .insert("workspaceReset".into(), reset.elapsed().as_millis() as u64);
@@ -281,6 +422,8 @@ fn execute_one(prepared: &Prepared, attempt: &mut Attempt, timeout_ms: u64) -> R
     };
     attempt.started_unix_ms =
         Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64);
+    attempt.status = "running".into();
+    checkpoint(attempt)?;
     let native = run_attempt(&NativeAttemptRequest {
         attempt_id: attempt.scheduled.id.clone(),
         app_server: build.executables["codex-app-server"].path.clone(),
@@ -316,32 +459,29 @@ fn execute_one(prepared: &Prepared, attempt: &mut Attempt, timeout_ms: u64) -> R
         descriptor.verifier_path = protected.join("verify.py");
         let verified = verify_fixture_with_env(&descriptor, &prepared.environment.variables)?;
         if verified.status != VerificationStatus::Passed && attempt.status == "completed" {
-            attempt.status = if verified.status == VerificationStatus::Incorrect {
-                "incorrect"
-            } else {
-                "verification_unavailable"
+            attempt.status = match verified.status {
+                VerificationStatus::Incorrect => "incorrect",
+                VerificationStatus::ScopeViolation => "scope_violation",
+                _ => "verification_unavailable",
             }
             .into();
             attempt.reason = Some(verified.detail.clone());
         }
         attempt.verifier = Some(verified);
     }
-    attempt.final_workspace_sha256 = Some(hash_tree(&prepared.workspace)?);
-    preserve_final_changes(
+    attempt.final_workspace_sha256 = Some(preserve_final_changes(
         &fixture.snapshot,
         &prepared.workspace,
         &attempt.evidence_directory.join("final-changes"),
-    )?;
+    )?);
     attempt.outside_execution_ms.insert(
         "verificationAndFinalState".into(),
         verification.elapsed().as_millis() as u64,
     );
-    let native = attempt.native.as_ref().context("native evidence")?;
-    let mut raw = serde_json::to_value(native)?;
-    raw["verifier"] = serde_json::to_value(&attempt.verifier)?;
-    fs::write(&native.evidence_path, serde_json::to_vec_pretty(&raw)?)?;
+    freeze_attempt_evidence(attempt)?;
     // Persist verified underlying evidence before starting the fallible analyzer.
-    write_json(&attempt.evidence_directory.join("attempt.json"), attempt)?;
+    checkpoint(attempt)?;
+    let native = attempt.native.as_ref().context("native evidence")?;
     let analysis = Instant::now();
     attempt.diagnostics = Some(analyze(
         &prepared.environment.tools["python"].executable.path,
@@ -351,53 +491,47 @@ fn execute_one(prepared: &Prepared, attempt: &mut Attempt, timeout_ms: u64) -> R
         &attempt.evidence_directory,
         &prepared.workspace,
         live,
+        attempt.verifier.as_ref(),
     ));
     attempt
         .outside_execution_ms
         .insert("analysis".into(), analysis.elapsed().as_millis() as u64);
-    write_json(&attempt.evidence_directory.join("attempt.json"), attempt)?;
+    checkpoint(attempt)?;
     Ok(())
 }
 
-fn preserve_final_changes(snapshot: &Path, workspace: &Path, destination: &Path) -> Result<()> {
-    let mut paths = std::collections::BTreeSet::new();
-    for root in [snapshot, workspace] {
-        for entry in walkdir::WalkDir::new(root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|e| {
-                ![".git", "target", "node_modules", "__pycache__"]
-                    .contains(&e.file_name().to_string_lossy().as_ref())
-            })
-        {
-            let entry = entry?;
-            if entry.file_type().is_file() {
-                paths.insert(entry.path().strip_prefix(root)?.to_path_buf());
-            }
-        }
-    }
+/// The final source digest and preserved changes use the same inventory. Build
+/// products and installed dependencies are outside this source-state digest.
+fn preserve_final_changes(snapshot: &Path, workspace: &Path, destination: &Path) -> Result<String> {
+    let before = source_tree_inventory(snapshot)?;
+    let after = source_tree_inventory(workspace)?;
+    let paths = before
+        .files
+        .keys()
+        .chain(after.files.keys())
+        .collect::<std::collections::BTreeSet<_>>();
     fs::create_dir_all(destination)?;
     let mut changes = vec![];
     for relative in paths {
-        let before = snapshot.join(&relative);
-        let after = workspace.join(&relative);
-        let before_hash = before.is_file().then(|| hash_file(&before)).transpose()?;
-        let after_hash = after.is_file().then(|| hash_file(&after)).transpose()?;
+        let before_hash = before.files.get(relative);
+        let after_hash = after.files.get(relative);
         if before_hash == after_hash {
             continue;
         }
-        if after.is_file() {
-            let target = destination.join(&relative);
+        if after_hash.is_some() {
+            let target = destination.join(relative);
             fs::create_dir_all(target.parent().context("final change parent")?)?;
-            fs::copy(&after, target)?;
+            fs::copy(workspace.join(relative), target)?;
         }
         changes.push(json!({"path":relative,"beforeSha256":before_hash,"afterSha256":after_hash}));
     }
-    write_json(&destination.join("changes.json"), &changes)
+    write_json(&destination.join("changes.json"), &changes)?;
+    Ok(after.sha256)
 }
 
 pub fn analysis_only(result_path: &Path) -> Result<PathBuf> {
-    let mut result: RunResult = crate::prepare::provenance::read_json(result_path)?;
+    let mut result = RunResult::load(result_path)?;
+    result.verify_evidence()?;
     let prepared = Prepared::load(&result.prepared_manifest)?;
     ensure!(
         hash_file(&result.prepared_manifest)? == result.prepared_manifest_sha256,
@@ -423,11 +557,12 @@ pub fn analysis_only(result_path: &Path) -> Result<PathBuf> {
                 &output,
                 &prepared.workspace,
                 attempt.scheduled.segment == Segment::RealModel,
+                attempt.verifier.as_ref(),
             ));
         }
     }
     let output = result.directory.join("result.json");
-    write_json(&output, &result)?;
+    write_atomic_json(&output, &result)?;
     crate::reports::write(&prepared, &result)?;
     Ok(output)
 }

@@ -2349,6 +2349,13 @@ LIMIT 1
             ));
         }
         let mut transaction = self.pool.begin().await?;
+        // Reserve the writer before sampling the initial watermark. Upgrading a
+        // read snapshot after concurrent mailbox writes fails with SQLITE_BUSY_SNAPSHOT.
+        sqlx::query("UPDATE automatic_wake_cursors SET updated_at = updated_at WHERE root_session_id = ? AND consuming_agent_path = ?")
+            .bind(&root_session_id)
+            .bind(&consuming_agent_path)
+            .execute(&mut *transaction)
+            .await?;
         if let Some(row) = sqlx::query(
             "SELECT event_id FROM automatic_wake_cursors
              WHERE root_session_id = ? AND consuming_agent_path = ?",

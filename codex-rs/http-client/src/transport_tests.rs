@@ -36,7 +36,13 @@ async fn connection_failures_are_classified_without_exposing_request_urls() {
         .local_addr()
         .expect("server listener should have an address");
     drop(unavailable_server);
-    let transport = ReqwestTransport::from_http_client(HttpClient::new(test_reqwest_client()));
+    // Windows may retry a refused connection past the common two-second test deadline.
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("build connection-failure client");
+    let transport = ReqwestTransport::from_http_client(HttpClient::new(client));
     let request = Request::new(
         Method::POST,
         format!("http://{server_addr}/responses?token=url-secret"),

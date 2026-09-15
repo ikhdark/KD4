@@ -31,8 +31,8 @@ const ERROR_MESSAGE_UI_MAX_BYTES: usize = 2 * 1024;
 pub enum SandboxErr {
     /// Error from sandbox execution
     #[error(
-        "sandbox denied exec error, exit code: {}, stdout: {}, stderr: {}",
-        .output.exit_code, .output.stdout.text, .output.stderr.text
+        "sandbox denied exec error, exit code: {}, output: {}",
+        .output.exit_code, bounded_exec_output(.output)
     )]
     Denied {
         output: Box<ExecToolCallOutput>,
@@ -50,7 +50,7 @@ pub enum SandboxErr {
 
 #[derive(Error, Debug)]
 pub enum CodexErr {
-    #[error("turn aborted. Something went wrong? Hit `/feedback` to report the issue.")]
+    #[error("turn aborted")]
     TurnAborted,
 
     /// Returned by ResponsesClient when the SSE stream disconnects or errors out **after** the HTTP
@@ -90,7 +90,7 @@ pub enum CodexErr {
     Spawn,
     /// Returned by run_command_stream when the user pressed Ctrl-C (SIGINT). Session uses this to
     /// surface a polite FunctionCallOutput back to the model instead of crashing the CLI.
-    #[error("interrupted (Ctrl-C). Something went wrong? Hit `/feedback` to report the issue.")]
+    #[error("interrupted (Ctrl-C)")]
     Interrupted,
     /// Unexpected HTTP status code.
     #[error("{0}")]
@@ -102,7 +102,7 @@ pub enum CodexErr {
     #[error("{0}")]
     InvalidRequest(String),
     /// Invalid image.
-    #[error("Image poisoning")]
+    #[error("The provided image data is invalid. Remove or replace the image and try again.")]
     InvalidImageRequest(),
     #[error("{0}")]
     UsageLimitReached(UsageLimitReachedError),
@@ -589,32 +589,47 @@ impl std::fmt::Display for EnvVarError {
     }
 }
 
+fn bounded_exec_output(output: &ExecToolCallOutput) -> String {
+    let message = if !output.aggregated_output.text.trim().is_empty() {
+        output.aggregated_output.text.clone()
+    } else {
+        let stderr = output.stderr.text.trim();
+        let stdout = output.stdout.text.trim();
+        match (stderr.is_empty(), stdout.is_empty()) {
+            (false, false) => format!("{stderr}\n{stdout}"),
+            (false, true) => output.stderr.text.clone(),
+            (true, false) => output.stdout.text.clone(),
+            (true, true) => String::new(),
+        }
+    };
+    TruncationPolicy::Bytes(ERROR_MESSAGE_UI_MAX_BYTES).truncate_text(&message)
+}
+
 pub fn get_error_message_ui(e: &CodexErr) -> String {
     let message = match e {
         CodexErr::Sandbox(SandboxErr::Denied { output, .. }) => {
-            let aggregated = output.aggregated_output.text.trim();
-            if !aggregated.is_empty() {
-                output.aggregated_output.text.clone()
+            let text = bounded_exec_output(output);
+            if text.is_empty() {
+                format!(
+                    "command failed inside sandbox with exit code {}",
+                    output.exit_code
+                )
             } else {
-                let stderr = output.stderr.text.trim();
-                let stdout = output.stdout.text.trim();
-                match (stderr.is_empty(), stdout.is_empty()) {
-                    (false, false) => format!("{stderr}\n{stdout}"),
-                    (false, true) => output.stderr.text.clone(),
-                    (true, false) => output.stdout.text.clone(),
-                    (true, true) => format!(
-                        "command failed inside sandbox with exit code {}",
-                        output.exit_code
-                    ),
-                }
+                text
             }
         }
         // Timeouts are not sandbox errors from a UX perspective; present them plainly.
         CodexErr::Sandbox(SandboxErr::Timeout { output }) => {
-            format!(
+            let mut message = format!(
                 "error: command timed out after {} ms",
                 output.duration.as_millis()
-            )
+            );
+            let text = bounded_exec_output(output);
+            if !text.is_empty() {
+                message.push('\n');
+                message.push_str(&text);
+            }
+            message
         }
         _ => e.to_string(),
     };

@@ -2,6 +2,7 @@ use super::*;
 use crate::context::world_state::WorldStateSnapshot;
 use crate::context_manager::is_user_turn_boundary;
 use codex_protocol::models::ContentItem;
+use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::SessionContextWindow;
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -14,6 +15,7 @@ const UNIFIED_EXEC_SESSION_ID_PREFIX: &str = "Process running with session ID ";
 #[derive(Debug)]
 pub(super) struct RolloutReconstruction {
     pub(super) history: Vec<ResponseItem>,
+    pub(super) plan: Option<UpdatePlanArgs>,
     pub(super) previous_turn_settings: Option<PreviousTurnSettings>,
     pub(super) reference_context_item: Option<TurnContextItem>,
     pub(super) world_state_baseline: Option<WorldStateSnapshot>,
@@ -43,7 +45,10 @@ pub(super) fn append_unified_exec_resume_invalidation(history: &mut Vec<Response
             output.text_content().is_some_and(|output| {
                 output.lines().any(|line| {
                     line.strip_prefix(UNIFIED_EXEC_SESSION_ID_PREFIX)
-                        .is_some_and(|id| id.trim().parse::<u32>().is_ok())
+                        .is_some_and(|status| {
+                            let id = status.split_once(';').map_or(status, |(id, _)| id);
+                            id.trim().parse::<u32>().is_ok()
+                        })
                 })
             })
         }
@@ -107,6 +112,7 @@ enum TurnReferenceContextItem {
 #[derive(Debug, Default)]
 struct ActiveReplaySegment<'a> {
     turn_id: Option<String>,
+    plan: Option<UpdatePlanArgs>,
     counts_as_user_turn: bool,
     previous_turn_settings: Option<PreviousTurnSettings>,
     reference_context_item: TurnReferenceContextItem,
@@ -125,6 +131,7 @@ struct ReplacementCheckpoint<'a> {
 }
 
 struct FinalizedReplayState<'items, 'state> {
+    plan: &'state mut Option<UpdatePlanArgs>,
     base_replacement_history: &'state mut Option<&'items [ResponseItem]>,
     rollout_suffix: &'state mut &'items [RolloutItem],
     discarded_history_effect_indexes: &'state mut HashSet<usize>,
@@ -147,6 +154,7 @@ fn finalize_active_segment<'a>(
     state: FinalizedReplayState<'a, '_>,
 ) {
     let FinalizedReplayState {
+        plan,
         base_replacement_history,
         rollout_suffix,
         discarded_history_effect_indexes,
@@ -170,6 +178,9 @@ fn finalize_active_segment<'a>(
     }
 
     world_state_replay.extend(active_segment.world_state_replay);
+    if plan.is_none() {
+        *plan = active_segment.plan;
+    }
     *surviving_compaction_count =
         (*surviving_compaction_count).saturating_add(active_segment.compaction_count);
     *has_surviving_legacy_compaction_without_window_number |=
@@ -225,6 +236,21 @@ impl Session {
             _ => None,
         });
         let mut base_replacement_history: Option<&[ResponseItem]> = None;
+        let mut plan = None;
+        let update_plan_call_ids =
+            rollout_items
+                .iter()
+                .filter_map(|item| match item {
+                    RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+                        name, call_id, ..
+                    }) if name == "update_plan" => Some(call_id.as_str()),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
+        let has_plan_updates = rollout_items
+            .iter()
+            .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::PlanUpdate(_))))
+            || !update_plan_call_ids.is_empty();
         let mut previous_turn_settings = None;
         let mut reference_context_item = TurnReferenceContextItem::NeverSet;
         let mut world_state_replay = Vec::new();
@@ -258,6 +284,15 @@ impl Session {
 
         for (index, item) in rollout_items.iter().enumerate().rev() {
             match item {
+                RolloutItem::EventMsg(EventMsg::PlanUpdate(update)) => {
+                    let active_segment =
+                        active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                    // The newest committed update survives compaction, but belongs
+                    // to its turn so rollback can discard it with that turn.
+                    if active_segment.plan.is_none() {
+                        active_segment.plan = Some(update.clone());
+                    }
+                }
                 RolloutItem::Compacted(compacted) => {
                     let active_segment =
                         active_segment.get_or_insert_with(ActiveReplaySegment::default);
@@ -394,6 +429,7 @@ impl Session {
                         finalize_active_segment(
                             active_segment,
                             FinalizedReplayState {
+                                plan: &mut plan,
                                 base_replacement_history: &mut base_replacement_history,
                                 rollout_suffix: &mut rollout_suffix,
                                 discarded_history_effect_indexes:
@@ -415,6 +451,19 @@ impl Session {
                         active_segment.get_or_insert_with(ActiveReplaySegment::default);
                     active_segment.history_effect_indexes.push(index);
                     active_segment.counts_as_user_turn |= is_user_turn_boundary(response_item);
+                    // Events and legacy direct outputs share chronological and
+                    // rollback ordering; neither representation is always newer.
+                    // Eventless histories apply rollback during forward history
+                    // replay, so their plans must use the final-history fallback.
+                    if has_segmented_turn_boundaries
+                        && active_segment.plan.is_none()
+                        && let ResponseItem::FunctionCallOutput {
+                            call_id, output, ..
+                        } = response_item
+                        && update_plan_call_ids.contains(call_id.as_str())
+                    {
+                        active_segment.plan = crate::plan_store::plan_from_tool_output(output);
+                    }
                 }
                 RolloutItem::InterAgentCommunication(_) => {
                     let active_segment =
@@ -437,6 +486,7 @@ impl Session {
                 finalize_active_segment(
                     active_segment,
                     FinalizedReplayState {
+                        plan: &mut plan,
                         base_replacement_history: &mut base_replacement_history,
                         rollout_suffix: &mut rollout_suffix,
                         discarded_history_effect_indexes: &mut discarded_history_effect_indexes,
@@ -456,6 +506,7 @@ impl Session {
                 && previous_turn_settings.is_some()
                 && !matches!(reference_context_item, TurnReferenceContextItem::NeverSet)
                 && window.is_some()
+                && (plan.is_some() || !has_plan_updates)
             {
                 // At this point we have the eager resume metadata, the replacement-history base,
                 // and an explicit surviving window identity, so older rollout items cannot affect
@@ -468,6 +519,7 @@ impl Session {
             finalize_active_segment(
                 active_segment,
                 FinalizedReplayState {
+                    plan: &mut plan,
                     base_replacement_history: &mut base_replacement_history,
                     rollout_suffix: &mut rollout_suffix,
                     discarded_history_effect_indexes: &mut discarded_history_effect_indexes,
@@ -613,6 +665,7 @@ impl Session {
         });
         RolloutReconstruction {
             history: history.into_raw_items(),
+            plan,
             previous_turn_settings,
             reference_context_item,
             world_state_baseline,

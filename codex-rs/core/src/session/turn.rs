@@ -252,8 +252,9 @@ pub(crate) async fn prepare_sampling_prompt_for_client(
 ) -> PreparedPromptInput {
     let workspace_identity = if history.requires_workspace_evidence_validation() {
         git_workspace
-            .workspace_evidence_identity(turn_context.config.cwd.as_path())
+            .workspace_evidence_for_turn(turn_context, turn_context.config.cwd.as_path())
             .await
+            .identity
     } else {
         None
     };
@@ -301,6 +302,7 @@ async fn start_continuation_workspace_prefetch(
     turn_diff_tracker: &Arc<tokio::sync::Mutex<TurnDiffTracker>>,
     git_workspace: Arc<crate::git_workspace::GitWorkspaceCache>,
     cwd: codex_utils_absolute_path::AbsolutePathBuf,
+    environments: crate::environment_selection::TurnEnvironmentSnapshot,
 ) -> Option<(
     u64,
     AbortOnDropHandle<Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
@@ -311,8 +313,9 @@ async fn start_continuation_workspace_prefetch(
     let baseline_mutation_revision = turn_diff_tracker.lock().await.current_mutation_revision();
     let handle = AbortOnDropHandle::new(tokio::spawn(async move {
         git_workspace
-            .workspace_evidence_identity(cwd.as_path())
+            .workspace_evidence_for_environment(&environments, cwd.as_path(), cwd.as_path())
             .await
+            .identity
     }));
     Some((baseline_mutation_revision, handle))
 }
@@ -334,6 +337,7 @@ pub(crate) async fn run_turn(
     turn_extension_data: Arc<codex_extension_api::ExtensionData>,
     input: Vec<TurnInput>,
     prewarmed_client_session: Option<ModelClientSession>,
+    logical_generation_budget: &mut LogicalGenerationBudget,
     cancellation_token: CancellationToken,
 ) -> CodexResult<TurnTaskResult> {
     let mut mutating_finalizer_ran = false;
@@ -434,7 +438,6 @@ pub(crate) async fn run_turn(
     > = None;
     let mut has_started_generation = false;
     let mut logical_generation_ordinal = 0_u32;
-    let mut logical_generation_budget = LogicalGenerationBudget::default();
     let mut generation_budget_error_reported = false;
     let mut defer_pending_input = false;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
@@ -469,7 +472,7 @@ pub(crate) async fn run_turn(
         // submitted through the UI while the model was running. Though the UI
         // may support this, the model might not.
         let Some(pending_input) =
-            drain_pending_input_if_generation_available(&logical_generation_budget, async {
+            drain_pending_input_if_generation_available(logical_generation_budget, async {
                 if can_drain_pending_input {
                     sess.input_queue.get_pending_input(&sess.active_turn).await
                 } else {
@@ -494,6 +497,7 @@ pub(crate) async fn run_turn(
             prefetched_workspace_identity = None;
             mutating_finalizer_ran = false;
             reasoning_governor.accepted_user_input();
+            logical_generation_budget.accepted_user_input();
         }
         if recorded_input.should_stop {
             emit_status_affecting_turn_error(
@@ -622,7 +626,13 @@ pub(crate) async fn run_turn(
                 let history_snapshot_guard = turn_context
                     .turn_timing_state
                     .begin_local_phase(TurnLocalPhase::HistorySnapshot);
-                let history = sess.clone_history().await;
+                let mut history = sess.clone_history().await;
+                if budget_forced_terminal {
+                    history.record_items(
+                        std::slice::from_ref(&forced_terminal_budget_directive()),
+                        turn_context.model_info.truncation_policy.into(),
+                    );
+                }
                 drop(history_snapshot_guard);
                 let normalization_guard = turn_context
                     .turn_timing_state
@@ -655,6 +665,11 @@ pub(crate) async fn run_turn(
                 window_id,
                 CodexResponsesRequestKind::Turn,
             );
+            if generation_request.sampling.is_residual_deterministic() {
+                turn_context
+                    .turn_timing_state
+                    .record_residual_deterministic_generation();
+            }
             run_sampling_request(
                 Arc::clone(&sess),
                 Arc::clone(&step_context),
@@ -777,14 +792,6 @@ pub(crate) async fn run_turn(
                             && protocol_resample_completion_allowed(server_resample_eligible),
                     )
                 });
-                if next_generation_request
-                    .as_ref()
-                    .is_some_and(|request| request.sampling.is_residual_deterministic())
-                {
-                    turn_context
-                        .turn_timing_state
-                        .record_residual_deterministic_generation();
-                }
                 if terminal_completion_required {
                     next_generation_request = next_generation_request
                         .map(GenerationRequestDisposition::require_terminal_completion);
@@ -803,7 +810,7 @@ pub(crate) async fn run_turn(
                 }
                 if needs_follow_up
                     && generation_budget_blocks_follow_up(
-                        &logical_generation_budget,
+                        logical_generation_budget,
                         next_generation_request.as_ref(),
                     )
                 {
@@ -891,7 +898,10 @@ pub(crate) async fn run_turn(
                         let error = err.to_codex_protocol_error();
                         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
                             .await;
-                        return Ok(TurnTaskResult::default());
+                        last_agent_message =
+                            sampling_request_last_agent_message.or(last_agent_message);
+                        defer_pending_input |= has_pending_input;
+                        break 'sampling_loop;
                     }
                     can_drain_pending_input = !model_needs_follow_up;
                     reasoning_governor.host_retain();
@@ -937,7 +947,7 @@ pub(crate) async fn run_turn(
                         && admit_regular_follow_up(
                             sess.as_ref(),
                             turn_context.as_ref(),
-                            &logical_generation_budget,
+                            logical_generation_budget,
                             &mut generation_budget_error_reported,
                         )
                         .await
@@ -993,7 +1003,7 @@ pub(crate) async fn run_turn(
                         ));
                     }
                     match completion_pending_input_disposition(
-                        &logical_generation_budget,
+                        logical_generation_budget,
                         sess.input_queue.has_pending_input(&sess.active_turn).await,
                     ) {
                         CompletionPendingInputDisposition::Continue => {
@@ -1036,7 +1046,7 @@ pub(crate) async fn run_turn(
                     if !admit_regular_follow_up(
                         sess.as_ref(),
                         turn_context.as_ref(),
-                        &logical_generation_budget,
+                        logical_generation_budget,
                         &mut generation_budget_error_reported,
                     )
                     .await
@@ -1189,12 +1199,16 @@ enum LogicalGenerationAdmission {
 }
 
 #[derive(Default)]
-struct LogicalGenerationBudget {
+pub(crate) struct LogicalGenerationBudget {
     regular_generations: u32,
     terminal_generation_used: bool,
 }
 
 impl LogicalGenerationBudget {
+    fn accepted_user_input(&mut self) {
+        self.terminal_generation_used = false;
+    }
+
     fn is_exhausted(&self) -> bool {
         self.regular_generations >= MAX_REGULAR_LOGICAL_GENERATIONS && self.terminal_generation_used
     }
@@ -1260,11 +1274,19 @@ fn completion_pending_input_disposition(
     }
 }
 
-const LOGICAL_GENERATION_BUDGET_EXHAUSTED_MESSAGE: &str =
-    "The turn reached its logical generation limit before all requested work completed.";
 const LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE: &str = "The logical generation limit has been reached. This is the final tool-free synthesis request. Do not call tools. Summarize completed work and truthfully report any remaining work, failed validation, or blocker.";
 async fn record_forced_terminal_budget_boundary(sess: &Session, turn_context: &TurnContext) {
-    let directive_item = ResponseItem::Message {
+    sess.send_event(
+        turn_context,
+        EventMsg::Warning(WarningEvent {
+            message: format!("This turn reached its limit of {MAX_REGULAR_LOGICAL_GENERATIONS} regular model generations. The assistant will now summarize completed work and report anything unfinished. Send another message to continue the remaining work."),
+        }),
+    )
+    .await;
+}
+
+fn forced_terminal_budget_directive() -> ResponseItem {
+    ResponseItem::Message {
         id: None,
         role: "developer".to_string(),
         content: vec![ContentItem::InputText {
@@ -1272,16 +1294,7 @@ async fn record_forced_terminal_budget_boundary(sess: &Session, turn_context: &T
         }],
         phase: None,
         internal_chat_message_metadata_passthrough: None,
-    };
-    sess.record_conversation_items(turn_context, std::slice::from_ref(&directive_item))
-        .await;
-    sess.send_event(
-        turn_context,
-        EventMsg::Warning(WarningEvent {
-            message: LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE.to_string(),
-        }),
-    )
-    .await;
+    }
 }
 
 async fn emit_status_affecting_turn_error(
@@ -1313,7 +1326,7 @@ async fn report_logical_generation_budget_exhausted(
     emit_status_affecting_turn_error(
         sess,
         turn_context,
-        LOGICAL_GENERATION_BUDGET_EXHAUSTED_MESSAGE,
+        format!("This turn reached its generation budget (up to {MAX_REGULAR_LOGICAL_GENERATIONS} regular model generations and one final summary) before all requested work completed. Send another message to continue the remaining work."),
     )
     .await;
 }
@@ -1413,6 +1426,13 @@ async fn record_convergence_decision(
         turn_context
             .turn_timing_state
             .record_proven_loop_activation();
+        sess.send_event(
+            turn_context,
+            EventMsg::Warning(WarningEvent {
+                message: "This turn's tools were stopped after a repeated action/result cycle without state progress. The assistant will summarize the available evidence and report anything unfinished.".to_string(),
+            }),
+        )
+        .await;
     }
     let Some(directive) = directive else {
         return;
@@ -1743,7 +1763,7 @@ async fn build_pure_pending_turn_plan(
         let (first_router, prepared_context_update) = tokio::join!(
             built_tools_for_pending_turn(
                 sess.as_ref(),
-                step_context.as_ref(),
+                &step_context,
                 &[],
                 planning_generation,
                 cancellation_token
@@ -1944,7 +1964,7 @@ async fn build_pure_pending_turn_plan(
     let (first_router, prepared_context_update) = tokio::join!(
         built_tools_for_pending_turn(
             sess.as_ref(),
-            step_context.as_ref(),
+            &step_context,
             &skill_plan.invocations,
             planning_generation,
             cancellation_token,
@@ -1994,15 +2014,16 @@ async fn stabilize_pending_turn_plan(
     completed_mcp_effect: &mut Option<(String, Option<HashSet<String>>)>,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<PendingTurnPlan> {
-    if cancellation_token.is_cancelled() {
-        return Err(CodexErr::TurnAborted);
-    }
     let mut check_previous_model_compaction = true;
     let mut incoming_precompaction_completed = false;
     loop {
         if cancellation_token.is_cancelled() {
             return Err(CodexErr::TurnAborted);
         }
+        // Charge every attempt before maintenance or snapshot work, including
+        // retries caused by compaction and stale generations.
+        advance_pending_turn_plan_iteration(planning_iterations)
+            .map_err(|message| planning_failure_with_timing(turn_context, message))?;
 
         // Model-transition compaction is independent of pending input. Context-pressure
         // compaction waits for the absolute next-prompt projection built below.
@@ -2030,25 +2051,30 @@ async fn stabilize_pending_turn_plan(
         if let Some((effect_id, Some(expected_inventory_keys))) = completed_mcp_effect
             && !inventory_contains_expected(sess, expected_inventory_keys).await
         {
-            return Err(planning_failure(format!(
-                "completed inventory effect `{effect_id}` is missing its expected model-visible state"
-            )));
+            return Err(planning_failure_with_timing(
+                turn_context,
+                format!(
+                    "completed inventory effect `{effect_id}` is missing its expected model-visible state"
+                ),
+            ));
         }
 
         let planning_generation = sess.services.planning_generation();
+        if cancellation_token.is_cancelled() {
+            return Err(CodexErr::TurnAborted);
+        }
+        // Capturing a step can publish an MCP manager. Let that resource-owning
+        // operation finish; the pure build below checks cancellation again.
         let step_context = sess.capture_step_context(Arc::clone(turn_context)).await;
-        let plan_build = charge_pending_turn_plan_build(
-            build_pure_pending_turn_plan(
-                sess,
-                step_context,
-                input,
-                planning_generation,
-                cancellation_token,
-            )
-            .await?,
-            planning_iterations,
+        let plan_build = build_pure_pending_turn_plan(
+            sess,
+            step_context,
+            input,
+            planning_generation,
+            cancellation_token,
         )
-        .map_err(|message| planning_failure_with_timing(turn_context, message))?;
+        .or_cancel(cancellation_token)
+        .await??;
         let plan = match plan_build {
             PendingTurnPlanBuild::Stale => continue,
             PendingTurnPlanBuild::Ready(plan) => *plan,
@@ -2076,8 +2102,6 @@ async fn stabilize_pending_turn_plan(
         drop(compaction_timing_guard);
         if compaction_reason.is_some() {
             incoming_precompaction_completed = true;
-        }
-        if compaction_reason.is_some() {
             client_session.invalidate_incremental_history("compaction");
             turn_context
                 .turn_timing_state
@@ -2151,11 +2175,6 @@ fn advance_pending_turn_plan_iteration(iterations: &mut usize) -> Result<(), Str
         ));
     }
     Ok(())
-}
-
-fn charge_pending_turn_plan_build<T>(build: T, iterations: &mut usize) -> Result<T, String> {
-    advance_pending_turn_plan_iteration(iterations)?;
-    Ok(build)
 }
 
 fn mcp_dependency_effect_is_completed(
@@ -2254,10 +2273,7 @@ async fn commit_pending_turn_plan_effects(
 }
 
 fn planning_failure(message: impl Into<String>) -> CodexErr {
-    CodexErr::Stream(
-        format!("pending-turn planning failure: {}", message.into()),
-        None,
-    )
+    CodexErr::Fatal(format!("pending-turn planning failure: {}", message.into()))
 }
 
 fn planning_failure_with_timing(
@@ -2950,9 +2966,8 @@ async fn run_auto_compact(
             super::context_window::context_window_token_status(sess, budget_turn_context.as_ref())
                 .await;
         if token_status.token_limit_reached {
-            let error = CodexErr::Stream(
+            let error = CodexErr::Fatal(
                 "Compaction did not bring the context below its configured token limit. Stopped automatic continuation to prevent repeated compaction and usage drain; reduce context or start a new task.".to_string(),
-                None,
             );
             sess.send_event(
                 &budget_turn_context,
@@ -2980,12 +2995,12 @@ pub(super) fn collect_explicit_app_ids_from_skill_items(
     let skill_messages = skill_items
         .iter()
         .filter_map(|item| match item {
-            ResponseItem::Message { content, .. } => {
-                content.iter().find_map(|content_item| match content_item {
-                    ContentItem::InputText { text } => Some(text.clone()),
-                    _ => None,
-                })
-            }
+            ResponseItem::Message { content, .. } => Some(content),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|content_item| match content_item {
+            ContentItem::InputText { text } => Some(text.clone()),
             _ => None,
         })
         .collect::<Vec<String>>();
@@ -3595,7 +3610,7 @@ async fn run_sampling_request(
             turn_context.turn_timing_state.record_tool_router_rebuild();
             built_tools(
                 sess.as_ref(),
-                step_context.as_ref(),
+                &step_context,
                 selected_skill_invocations,
                 &cancellation_token,
             )
@@ -3604,7 +3619,7 @@ async fn run_sampling_request(
         None => {
             built_tools(
                 sess.as_ref(),
-                step_context.as_ref(),
+                &step_context,
                 selected_skill_invocations,
                 &cancellation_token,
             )
@@ -3912,7 +3927,7 @@ impl SessionPreparedRouterCache {
 
 async fn built_tools_for_pending_turn(
     sess: &Session,
-    step_context: &StepContext,
+    step_context: &Arc<StepContext>,
     selected_skill_invocations: &[SkillInvocation],
     planning_generation: u64,
     cancellation_token: &CancellationToken,
@@ -3990,7 +4005,7 @@ async fn built_tools_for_pending_turn(
 )]
 pub(crate) async fn built_tools(
     sess: &Session,
-    step_context: &StepContext,
+    step_context: &Arc<StepContext>,
     selected_skill_invocations: &[SkillInvocation],
     cancellation_token: &CancellationToken,
 ) -> CodexResult<Arc<ToolRouter>> {
@@ -4134,20 +4149,32 @@ pub(crate) async fn built_tools(
     );
     let mcp_tools = has_mcp_servers.then_some(mcp_tool_exposure.direct_tools);
     let deferred_mcp_tools = mcp_tool_exposure.deferred_tools;
-    let router = Arc::new(
+    // Index construction and concurrent cache-build waits can block. Keep them
+    // off runtime workers so cancellation and other turns can still progress.
+    let router_step = Arc::clone(step_context);
+    let search_cache = Arc::clone(&sess.services.tool_search_handler_cache);
+    let span = tracing::Span::current();
+    let router_build = AbortOnDropHandle::new(tokio::task::spawn_blocking(move || {
+        let _enter = span.enter();
         ToolRouter::try_from_context(
-            step_context,
+            router_step.as_ref(),
             ToolRouterParams {
                 mcp_tools,
                 deferred_mcp_tools,
                 tool_suggest_candidates,
                 extension_tool_executors,
-                dynamic_tools: turn_context.dynamic_tools.as_slice(),
+                dynamic_tools: router_step.turn.dynamic_tools.as_slice(),
                 exposure_identity,
             },
-            &sess.services.tool_search_handler_cache,
+            &search_cache,
         )
-        .map_err(CodexErr::InvalidRequest)?,
+    }));
+    let router = Arc::new(
+        router_build
+            .or_cancel(cancellation_token)
+            .await?
+            .map_err(|error| CodexErr::Fatal(format!("tool router build task failed: {error}")))?
+            .map_err(CodexErr::InvalidRequest)?,
     );
     step_context
         .turn
@@ -6031,6 +6058,7 @@ async fn try_run_sampling_request(
                         &turn_diff_tracker,
                         Arc::clone(&sess.services.git_workspace),
                         turn_context.config.cwd.clone(),
+                        turn_context.environments.clone(),
                     )
                     .await;
                 }

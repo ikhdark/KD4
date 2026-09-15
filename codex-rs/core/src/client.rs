@@ -1766,6 +1766,15 @@ const WEBSOCKET_HISTORY_HASH_DOMAIN: &[u8] = b"codex.websocket.history.v1";
 const WEBSOCKET_REQUEST_FINGERPRINT_DOMAIN: &[u8] = b"codex.websocket.request-properties.v1";
 const WEBSOCKET_SETUP_FINGERPRINT_DOMAIN: &[u8] = b"codex.websocket.setup.v1";
 
+fn normalized_websocket_history_item(item: &ResponseItem) -> std::borrow::Cow<'_, ResponseItem> {
+    if item.internal_chat_message_metadata_passthrough().is_none() {
+        return std::borrow::Cow::Borrowed(item);
+    }
+    let mut normalized = item.clone();
+    normalized.clear_internal_chat_message_metadata_passthrough();
+    std::borrow::Cow::Owned(normalized)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CanonicalPrefixHash {
     item_count: usize,
@@ -1791,8 +1800,7 @@ impl CanonicalPrefixHash {
 
     fn extend_items(&mut self, items: &[ResponseItem]) -> serde_json::Result<()> {
         for item in items {
-            let mut normalized = item.clone();
-            normalized.clear_internal_chat_message_metadata_passthrough();
+            let normalized = normalized_websocket_history_item(item);
             let serialized = serde_json::to_vec(&normalized)?;
             let mut hasher = Sha256::new();
             hasher.update(WEBSOCKET_HISTORY_HASH_DOMAIN);
@@ -1854,17 +1862,50 @@ pub(crate) enum StartupPrewarmClaim {
     Rejected,
 }
 
+// Input is compared through the normalized prefix chain. Delivery-only stream
+// options and client metadata do not affect previous_response_id reuse. Keep
+// this destructuring exhaustive so new fields require an explicit reuse decision.
+// Both equality and fingerprinting use this same ordered projection.
+fn responses_request_reuse_properties(
+    request: &ResponsesApiRequest,
+) -> impl serde::Serialize + PartialEq + '_ {
+    let ResponsesApiRequest {
+        model,
+        instructions,
+        input: _,
+        tools,
+        tool_choice,
+        parallel_tool_calls,
+        reasoning,
+        store,
+        stream,
+        stream_options: _,
+        include,
+        service_tier,
+        prompt_cache_key,
+        text,
+        client_metadata: _,
+    } = request;
+    (
+        model,
+        instructions,
+        tools,
+        tool_choice,
+        parallel_tool_calls,
+        reasoning,
+        store,
+        stream,
+        include,
+        service_tier,
+        prompt_cache_key,
+        text,
+    )
+}
+
 fn responses_request_properties_fingerprint(
     request: &ResponsesApiRequest,
 ) -> serde_json::Result<[u8; 32]> {
-    // Keep this aligned with `responses_request_properties_match`: input is
-    // compared through the normalized prefix chain, while delivery-only stream
-    // options and client metadata do not affect previous_response_id reuse.
-    let mut properties = request.clone();
-    properties.input = Arc::from([]);
-    properties.stream_options = None;
-    properties.client_metadata = None;
-    let serialized = serde_json::to_vec(&properties)?;
+    let serialized = serde_json::to_vec(&responses_request_reuse_properties(request))?;
     let mut hasher = Sha256::new();
     hasher.update(WEBSOCKET_REQUEST_FINGERPRINT_DOMAIN);
     hasher.update(WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION.to_be_bytes());
@@ -1903,60 +1944,11 @@ fn websocket_setup_fingerprint(
 
 // This is intentionally not a `PartialEq` implementation: request equality includes `input` and
 // `client_metadata`, while websocket reuse compares the input separately and ignores metadata.
-// Keep the destructuring exhaustive so new request fields require an explicit reuse decision.
 fn responses_request_properties_match(
     previous: &ResponsesApiRequest,
     current: &ResponsesApiRequest,
 ) -> bool {
-    let ResponsesApiRequest {
-        model: previous_model,
-        instructions: previous_instructions,
-        input: _,
-        tools: previous_tools,
-        tool_choice: previous_tool_choice,
-        parallel_tool_calls: previous_parallel_tool_calls,
-        reasoning: previous_reasoning,
-        store: previous_store,
-        stream: previous_stream,
-        stream_options: _,
-        include: previous_include,
-        service_tier: previous_service_tier,
-        prompt_cache_key: previous_prompt_cache_key,
-        text: previous_text,
-        client_metadata: _,
-    } = previous;
-    let ResponsesApiRequest {
-        model: current_model,
-        instructions: current_instructions,
-        input: _,
-        tools: current_tools,
-        tool_choice: current_tool_choice,
-        parallel_tool_calls: current_parallel_tool_calls,
-        reasoning: current_reasoning,
-        store: current_store,
-        stream: current_stream,
-        stream_options: _,
-        include: current_include,
-        service_tier: current_service_tier,
-        prompt_cache_key: current_prompt_cache_key,
-        text: current_text,
-        client_metadata: _,
-    } = current;
-
-    previous_model == current_model
-        && previous_instructions == current_instructions
-        && previous_tools == current_tools
-        && previous_tool_choice == current_tool_choice
-        && previous_parallel_tool_calls == current_parallel_tool_calls
-        && previous_reasoning == current_reasoning
-        && previous_store == current_store
-        && previous_stream == current_stream
-        // Stream options control delivery for this response, not the context
-        // referenced by `previous_response_id`.
-        && previous_include == current_include
-        && previous_service_tier == current_service_tier
-        && previous_prompt_cache_key == current_prompt_cache_key
-        && previous_text == current_text
+    responses_request_reuse_properties(previous) == responses_request_reuse_properties(current)
 }
 
 fn rebase_empty_startup_prewarm_stable_context(
@@ -3252,37 +3244,37 @@ impl ModelClientSession {
         .map(|items| (items, None))
     }
 
-    /// Correctness fallback for missing/unknown hash state. This retains the
-    /// prior full materialization and normalized comparison contract.
+    /// Correctness fallback for missing/unknown hash state. Compare the
+    /// normalized prefix without materializing copies of both histories.
     fn get_incremental_items_full_compare(
         previous_request: &ResponsesApiRequest,
         request: &ResponsesApiRequest,
         last_response: Option<&LastResponse>,
         allow_empty_delta: bool,
     ) -> Option<Vec<ResponseItem>> {
-        // To compare the inputs, we concatenate the previous request items with the response items,
-        // then compare that against the equivalent slice of request items, ignoring metadata. If
-        // they match, we can consider the remaining items the incremental request.
-        let mut previous_items = previous_request.input.to_vec();
-        if let Some(response) = last_response {
-            previous_items.extend_from_slice(&response.items_added);
-        }
-        previous_items
-            .iter_mut()
-            .for_each(ResponseItem::clear_internal_chat_message_metadata_passthrough);
-
+        let response_items =
+            last_response.map_or(&[][..], |response| response.items_added.as_slice());
+        let previous_len = previous_request
+            .input
+            .len()
+            .checked_add(response_items.len())?;
         let Some((request_items_to_compare, incremental_items)) =
-            request.input.split_at_checked(previous_items.len())
+            request.input.split_at_checked(previous_len)
         else {
             trace!("incremental request failed, incompatible request length");
             return None;
         };
-        let mut request_prefix = request_items_to_compare.to_vec();
-        request_prefix
-            .iter_mut()
-            .for_each(ResponseItem::clear_internal_chat_message_metadata_passthrough);
-
-        if previous_items.as_slice() != request_prefix {
+        if !previous_request
+            .input
+            .iter()
+            .chain(response_items)
+            .zip(request_items_to_compare)
+            .all(|(previous, current)| {
+                previous == current
+                    || normalized_websocket_history_item(previous)
+                        == normalized_websocket_history_item(current)
+            })
+        {
             trace!("incremental request failed, items didn't match");
             return None;
         }
@@ -4811,9 +4803,14 @@ where
                 }
                 event = api_stream.next() => event,
             };
-            let Some(event) = event else {
+            let Some(mut event) = event else {
                 break;
             };
+            if let Ok(ResponseEvent::OutputItemAdded(item) | ResponseEvent::OutputItemDone(item)) =
+                &mut event
+            {
+                crate::stable_context::normalize_provider_context_item_id(item);
+            }
             if let Ok(response_event) = &event
                 && let Some(attempt) = attempt.as_ref()
             {
@@ -4864,16 +4861,6 @@ where
                             &items_added,
                         )
                         .await;
-                    // Publish the completed response chain before exposing the
-                    // completion event. A caller may start the next request as
-                    // soon as it observes that event, so sending afterward can
-                    // race with `get_last_response()` and force a full replay.
-                    if let Some(sender) = tx_last_response.take() {
-                        let _ = sender.send(LastResponse {
-                            response_id: response_id.clone(),
-                            items_added: items_added.clone(),
-                        });
-                    }
                     // Request diagnostics run after dispatch so they stay off the
                     // request-preparation critical path. They must still be
                     // committed before completion becomes observable: turn
@@ -4904,6 +4891,14 @@ where
                             token_usage.as_ref().map(|usage| usage.cached_input_tokens),
                             &items_added,
                         );
+                    }
+                    // Move the completed history after diagnostics have consumed
+                    // it, but before completion is observable to the next request.
+                    if let Some(sender) = tx_last_response.take() {
+                        let _ = sender.send(LastResponse {
+                            response_id: response_id.clone(),
+                            items_added,
+                        });
                     }
                     let _ = tx_event
                         .send(Ok(ResponseEvent::Completed {

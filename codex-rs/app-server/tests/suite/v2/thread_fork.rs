@@ -707,6 +707,7 @@ async fn thread_fork_tracks_thread_initialized_analytics() -> Result<()> {
     )?;
 
     let mut mcp = TestAppServer::builder()
+        .with_args(&["-c", "analytics.enabled=true"])
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .without_managed_config()

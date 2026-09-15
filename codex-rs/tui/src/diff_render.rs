@@ -520,7 +520,13 @@ fn detect_lang_for_path(path: &Path) -> Option<String> {
 
 fn parsed_patch(change: &FileChange) -> Option<diffy::Patch<'_, str>> {
     match change {
-        FileChange::Update { unified_diff, .. } => diffy::Patch::from_str(unified_diff).ok(),
+        FileChange::Update { unified_diff, .. } => {
+            diffy::Patch::from_str(unified_diff).ok().filter(|patch| {
+                !patch.hunks().is_empty()
+                    || patch.original().is_some()
+                    || patch.modified().is_some()
+            })
+        }
         _ => None,
     }
 }

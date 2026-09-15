@@ -607,13 +607,17 @@ fn selected_skill_change_and_resolution_failure_replace_then_restore_catalog() {
 
 #[test]
 fn malformed_registered_fragment_fails_open() {
-    let malformed = "<skills_instructions>\nmissing close";
-    let items: Arc<[ResponseItem]> = vec![text_message("developer", malformed)].into();
-    let projection = project_stable_context(Arc::clone(&items), StableContextTarget::Sampling);
-
-    assert!(!projection.manifest.projection_enabled());
-    assert!(projection.manifest.fail_open());
-    assert_eq!(projection.items.as_ref(), items.as_ref());
+    for malformed in [
+        "<skills_instructions>\nmissing close",
+        "<turn_context_contribution index=\"invalid\">\ncontent\n</turn_context_contribution>",
+        "<turn_context_contribution index=\"0\">\nmissing close",
+    ] {
+        let items: Arc<[ResponseItem]> = vec![text_message("developer", malformed)].into();
+        let projection = project_stable_context(Arc::clone(&items), StableContextTarget::Sampling);
+        assert!(!projection.manifest.projection_enabled(), "{malformed}");
+        assert!(projection.manifest.fail_open(), "{malformed}");
+        assert_eq!(projection.items.as_ref(), items.as_ref());
+    }
 }
 
 #[test]

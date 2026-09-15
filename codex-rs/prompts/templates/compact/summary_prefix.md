@@ -9,5 +9,7 @@ solely because compaction occurred.
 
 Preserve the user’s constraints, unresolved issues, and distinctions between
 verified, unverified, planned, blocked, and uncertain work.
+User prohibitions and out-of-scope declarations remain binding until superseded
+by an applicable instruction; stale evidence alone does not retire them.
 
 Here is the handoff summary:

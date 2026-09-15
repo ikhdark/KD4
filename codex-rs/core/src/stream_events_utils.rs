@@ -594,7 +594,7 @@ pub(crate) async fn handle_output_item_done(
                 )
             {
                 return Err(CodexErr::Fatal(format!(
-                    "refusing tool call `{call_id}` because acceptance was sealed or the same call ID was already accepted in this model generation"
+                    "refusing tool call `{call_id}` because the same call ID was already accepted in this model generation"
                 )));
             }
             let accepted = ctx.turn_context.tool_call_acceptance.try_accept(|| {

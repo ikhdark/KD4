@@ -1679,8 +1679,27 @@
         "query": {
           "type": "string"
         },
+        "scannedFileCount": {
+          "default": 0,
+          "description": "Number of indexed files and directories, including entries that did not match.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
         "sessionId": {
           "type": "string"
+        },
+        "totalMatchCount": {
+          "default": 0,
+          "description": "Matches found among scanned entries, before the result limit is applied. Zero when the query is empty and results are suppressed.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "walkComplete": {
+          "default": false,
+          "description": "True only after scanning finishes without omitting paths. A completed notification with this still false indicates an incomplete traversal.",
+          "type": "boolean"
         }
       },
       "required": [

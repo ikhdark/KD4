@@ -61,17 +61,29 @@ pub fn backoff(base: Duration, retry_number: u64) -> Duration {
     if retry_number == 0 {
         return base;
     }
-    let exponent = u32::try_from(retry_number - 1).unwrap_or(u32::MAX);
-    let exp = 2u64.saturating_pow(exponent);
-    let millis = u64::try_from(base.as_millis()).unwrap_or(u64::MAX);
-    let raw = millis.saturating_mul(exp);
+    let raw = exponential_backoff_millis(base, retry_number);
     let jitter: f64 = rand::rng().random_range(0.9..1.1);
     Duration::from_millis((raw as f64 * jitter) as u64)
 }
 
-/// Computes exponential backoff and caps the result at `maximum`.
+/// Computes exponential backoff while retaining jitter at the `maximum`.
+/// Saturated delays are spread over 90-100% of the ceiling.
 pub fn capped_backoff(base: Duration, retry_number: u64, maximum: Duration) -> Duration {
-    backoff(base, retry_number).min(maximum)
+    if retry_number == 0 {
+        return base.min(maximum);
+    }
+    let raw = Duration::from_millis(exponential_backoff_millis(base, retry_number));
+    let bounded = raw.min(maximum);
+    let upper = if raw >= maximum { 1.0 } else { 1.1 };
+    let jitter: f64 = rand::rng().random_range(0.9..upper);
+    bounded.mul_f64(jitter).min(maximum)
+}
+
+fn exponential_backoff_millis(base: Duration, retry_number: u64) -> u64 {
+    let exponent = u32::try_from(retry_number.saturating_sub(1)).unwrap_or(u32::MAX);
+    let exp = 2u64.saturating_pow(exponent);
+    let millis = u64::try_from(base.as_millis()).unwrap_or(u64::MAX);
+    millis.saturating_mul(exp)
 }
 
 /// Runs an operation once and retries it up to `policy.max_retries` times.

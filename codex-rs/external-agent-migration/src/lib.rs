@@ -1229,7 +1229,10 @@ fn json_u64(value: &JsonValue) -> Option<u64> {
     value.as_u64().or_else(|| value.as_str()?.parse().ok())
 }
 
-#[expect(clippy::expect_used, reason = "A string serialized into an in-memory JSON buffer has no fallible values or writer")]
+#[expect(
+    clippy::expect_used,
+    reason = "A string serialized into an in-memory JSON buffer has no fallible values or writer"
+)]
 fn yaml_string(value: &str) -> String {
     // JSON quoted scalars are valid YAML and preserve line breaks and control characters.
     serde_json::to_string(value).expect("string serializes")
@@ -1484,7 +1487,7 @@ args = [
                 "legacy-sse": {"type": "sse", "url": "https://example.invalid/sse"},
                 "vault": {
                   "url": "https://example.invalid/vault",
-                  "headers": {"Authorization": "Bearer ${VAULT_TOKEN:-dev-token}"}
+                  "headers": {"Authorization": "Bearer ${VAULT_TOKEN}"}
                 }
               }
             }"#,

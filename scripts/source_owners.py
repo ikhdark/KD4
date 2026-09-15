@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import heapq
 import json
@@ -299,6 +300,70 @@ def _schema_errors(manifest: object) -> list[str]:
     return errors
 
 
+def _rust_declaration_source(source: str) -> str:
+    """Remove literals and comments before checking declaration sites.
+
+    This is lexical evidence, not compiler resolution. Rust block comments nest;
+    raw strings must be consumed before looking for comment markers inside them.
+    """
+    tokens = re.compile(
+        r'//[^\n]*|/\*|\b(?:br|cr|r)(?P<hashes>\#*)".*?"(?P=hashes)'
+        r'|"(?:\\.|[^"\\])*"|\'(?:\\(?:u\{[^}]*\}|x[0-9a-fA-F]{2}|.)|[^\'\\])\'',
+        re.DOTALL,
+    )
+    parts: list[str] = []
+    position = 0
+    while match := tokens.search(source, position):
+        parts.append(source[position : match.start()])
+        position = match.end()
+        if match.group() == "/*":
+            depth = 1
+            while depth:
+                marker = re.search(r"/\*|\*/", source[position:])
+                if marker is None:
+                    position = len(source)
+                    break
+                depth += 1 if marker.group() == "/*" else -1
+                position += marker.end()
+        parts.append(" ")
+    parts.append(source[position:])
+    return "".join(parts)
+
+
+def _has_primary_declaration(path: Path, source: str, symbol: str) -> bool:
+    """Primary entries identify declarations; relationship evidence may be uses."""
+    if not symbol.isidentifier() or path.suffix not in {".rs", ".py"}:
+        return symbol in source
+    if path.suffix == ".py":
+        try:
+            nodes = ast.walk(ast.parse(source))
+        except SyntaxError:
+            return False
+        for node in nodes:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node.name == symbol:
+                    return True
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                if any(
+                    (alias.asname or alias.name.split(".")[0]) == symbol
+                    for alias in node.names
+                ):
+                    return True
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                if node.id == symbol:
+                    return True
+        return False
+    code = _rust_declaration_source(source)
+    name = rf"(?:r\#)?{re.escape(symbol)}\b"
+    if re.search(rf"\b(?:fn|struct|enum|trait|type|const|static|mod)\s+{name}", code):
+        return True
+    # A public reexport is also an entry point, including grouped and aliased uses.
+    return any(
+        re.search(rf"\b{name}\s*(?:[,}}]|$)", declaration.group(1))
+        for declaration in re.finditer(r"\bpub\s+use\s+([^;]+);", code)
+    )
+
+
 def load_and_validate(
     manifest_path: Path,
     root: Path | None = None,
@@ -351,7 +416,9 @@ def load_and_validate(
     def path_is_dir(candidate: Path) -> bool:
         return observe_path(candidate)[1]
 
-    def validate_symbol(owner_id: str, label: str, evidence: dict) -> None:
+    def validate_symbol(
+        owner_id: str, label: str, evidence: dict, *, primary: bool = False
+    ) -> None:
         symbol = evidence.get("symbol")
         if not isinstance(symbol, str) or not symbol:
             return
@@ -370,7 +437,13 @@ def load_and_validate(
         except (OSError, UnicodeError) as error:
             errors.append(f"{owner_id}: unreadable symbol evidence {raw_path}: {error}")
             return
-        if symbol not in source_text[candidate]:
+        source = source_text[candidate]
+        present = (
+            _has_primary_declaration(candidate, source, symbol)
+            if primary
+            else symbol in source
+        )
+        if not present:
             errors.append(f"{owner_id}: stale symbol evidence {raw_path}::{symbol}")
 
     if manifest.get("schema_version") != SCHEMA_VERSION:
@@ -399,7 +472,9 @@ def load_and_validate(
             symbols.setdefault(identity, []).append((owner, entry))
         if validate_owner_paths:
             for index, entry in enumerate(owner.get("primary_entries", [])):
-                validate_symbol(owner_id, f"primary_entries[{index}]", entry)
+                validate_symbol(
+                    owner_id, f"primary_entries[{index}]", entry, primary=True
+                )
         for relationship_index, relationship in enumerate(
             owner.get("relationships", [])
         ):
@@ -711,12 +786,24 @@ def query_graph(
     root: Path,
     owner_ids: list[str] | None = None,
     max_relationships: int = MAX_QUERY_RELATIONSHIPS,
+    *,
+    graph: dict | None = None,
 ) -> dict:
     if not 1 <= max_relationships <= MAX_QUERY_RELATIONSHIPS:
         raise ValueError(
             f"max_relationships must be between 1 and {MAX_QUERY_RELATIONSHIPS}"
         )
-    return _query_graph(manifest, digest, root, owner_ids, max_relationships)
+    if graph is None:
+        graph = _query_graph(
+            manifest, digest, root, owner_ids, None, refresh_sources=False
+        )
+    else:
+        graph = _select_index_graph(graph, owner_ids, None)
+    # Freshness covers the selected declaration closure, including incoming
+    # edges and evidence omitted by the response budget, before truncation.
+    snapshot, _, _ = _slice_source_snapshot(root, graph, graph["owners"])
+    graph["repository_revision"] = f"manifest:{digest}:sources:{snapshot}"
+    return _select_index_graph(graph, None, max_relationships)
 
 
 def _query_graph(
@@ -729,7 +816,7 @@ def _query_graph(
     refresh_sources: bool = True,
 ) -> dict:
     owners_by_id = {owner["id"]: owner for owner in manifest["owners"]}
-    selected_ids = sorted(set(owner_ids or owners_by_id))
+    selected_ids = sorted(set(owners_by_id if owner_ids is None else owner_ids))
     unknown = sorted(set(selected_ids) - set(owners_by_id))
     if unknown:
         raise ValueError(f"unknown owner ids: {', '.join(unknown)}")
@@ -890,7 +977,7 @@ def _select_index_graph(
     max_relationships: int | None,
 ) -> dict:
     owners_by_id = {owner["id"]: owner for owner in index["owners"]}
-    selected_ids = sorted(set(owner_ids or owners_by_id))
+    selected_ids = sorted(set(owners_by_id if owner_ids is None else owner_ids))
     unknown = sorted(set(selected_ids) - set(owners_by_id))
     if unknown:
         raise ValueError(f"unknown owner ids: {', '.join(unknown)}")
@@ -964,7 +1051,14 @@ def _relationship_rank_key(
 ) -> tuple:
     searchable = " ".join(
         str(relationship.get(field, ""))
-        for field in ("kind", "source", "target", "evidence")
+        for field in (
+            "kind",
+            "source",
+            "target",
+            "evidence",
+            "statement",
+            "behavioral_contracts",
+        )
     )
     overlap = len(focus_tokens & _ranking_tokens(searchable))
     endpoints = {
@@ -982,9 +1076,9 @@ def _relationship_rank_key(
         "heuristic": 0,
     }.get(relationship.get("provenance", ""), 0)
     return (
+        -overlap,
         -kind_priority,
         -bool(relationship.get("behavioral_contracts")),
-        -overlap,
         -provenance_priority,
         -selected_endpoint_count,
         relationship.get("source", ""),
@@ -1032,18 +1126,32 @@ def _bounded_sorted(items: list[dict], key: object, limit: int | None) -> list[d
     return heapq.nsmallest(limit, items, key=key)
 
 
-def _round_robin_relationships(
-    relationships_by_facet: dict[str, list[dict]], limit: int
+def _budgeted_relationships(
+    relationships_by_facet: dict[str, list[dict]],
+    limit: int,
+    selected_ids: set[str],
+    focus_tokens: set[str],
 ) -> dict[str, list[dict]]:
+    """Protect one edge per facet, then spend spare capacity on task relevance."""
     retained: dict[str, list[dict]] = {facet: [] for facet in relationships_by_facet}
     retained_count = 0
-    for rank in range(max(map(len, relationships_by_facet.values()), default=0)):
-        if retained_count >= limit:
-            break
-        for facet, relationships in relationships_by_facet.items():
-            if rank < len(relationships) and retained_count < limit:
-                retained[facet].append(relationships[rank])
-                retained_count += 1
+    for facet, relationships in relationships_by_facet.items():
+        if relationships and retained_count < limit:
+            retained[facet].append(relationships[0])
+            retained_count += 1
+    remaining = [
+        (facet, relationship)
+        for facet, relationships in relationships_by_facet.items()
+        for relationship in relationships[1:]
+    ]
+    for facet, relationship in heapq.nsmallest(
+        limit - retained_count,
+        remaining,
+        key=lambda item: _relationship_rank_key(
+            item[0], item[1], selected_ids, focus_tokens
+        ),
+    ):
+        retained[facet].append(relationship)
     return retained
 
 
@@ -1059,7 +1167,9 @@ def _slice_source_snapshot(
         paths.update(entry["path"] for entry in owner.get("primary_entries", []))
         paths.update(owner.get("contracts", owner.get("configuration", [])))
         paths.update(owner.get("tests", []))
-        paths.update(owner.get("generated_mirrors", []))
+        paths.update(
+            owner.get("generated_mirrors", owner.get("generated_artifacts", []))
+        )
         for invariant in owner.get("invariants", []):
             paths.update(item["path"] for item in invariant["evidence"])
             paths.update(invariant.get("tests", []))
@@ -1120,10 +1230,24 @@ def architecture_slice(
             }
             for owner in graph["owners"]
         }
-    selected_ids = sorted(set(owner_ids or selected))
+    selected_ids = sorted(set(selected if owner_ids is None else owner_ids))
     selected_id_set = set(selected_ids)
     focus_tokens = _ranking_tokens(focus)
     selected_owners = [selected[owner_id] for owner_id in selected_ids]
+    # Retain every selected declaration and incoming/outgoing edge in the identity so
+    # new callers invalidate reuse without invalidating it for unrelated owners.
+    routing_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "owners": graph["owners"],
+                "relationships": graph["relationships"],
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
     source_snapshot, files_read, bytes_read = _slice_source_snapshot(
         root, graph, selected_owners
     )
@@ -1156,11 +1280,9 @@ def architecture_slice(
                 "evidence": ", ".join(
                     _evidence_location(item) for item in relationship["evidence"]
                 ),
-                "provenance": (
-                    "exact"
-                    if relationship["confidence"] == "compiler_resolved"
-                    else "declared"
-                ),
+                # Confidence is a manifest assertion, not a compiler receipt
+                # tied to this source state, target, and feature configuration.
+                "provenance": "declared",
                 **(
                     {"behavioral_contracts": scenario_contracts}
                     if scenario_contracts
@@ -1257,12 +1379,13 @@ def architecture_slice(
             max_relationships,
         )
         if relationships:
-            output[facet] = {"status": "established", "relationships": relationships}
+            output[facet] = {
+                "status": "partial" if uncovered else "established",
+                "relationships": relationships,
+            }
         else:
             output[facet] = {
-                "status": "not_applicable"
-                if reasons and not uncovered
-                else "established",
+                "status": "not_applicable" if reasons and not uncovered else "unknown",
                 "relationships": [],
                 **({"not_applicable_reason": "; ".join(reasons)} if reasons else {}),
             }
@@ -1270,17 +1393,28 @@ def architecture_slice(
     relationship_total = sum(facet_relationship_totals.values())
     omitted_relationships = graph["omitted"]["relationships"]
     if relationship_total > max_relationships:
-        retained = _round_robin_relationships(
+        retained = _budgeted_relationships(
             {facet: output[facet]["relationships"] for facet in ARCHITECTURE_FACETS},
             max_relationships,
+            selected_id_set,
+            focus_tokens,
         )
         omitted_relationships += relationship_total - max_relationships
         for facet in ARCHITECTURE_FACETS:
             output[facet]["relationships"] = retained[facet]
 
+    for facet in ARCHITECTURE_FACETS:
+        omitted = facet_relationship_totals[facet] - len(output[facet]["relationships"])
+        if omitted:
+            output[facet]["omitted_relationships"] = omitted
+            output[facet]["status"] = (
+                "partial" if output[facet]["relationships"] else "unknown"
+            )
+
     ranking_limitation = (
-        "Relationships are ordered within each facet by facet-specific kind, "
-        "declared behavioral scenario, focus-term overlap, provenance, and selected-owner directness. "
+        "One relationship per nonempty facet is protected when the budget permits; "
+        "remaining capacity is ranked by focus-term overlap (including behavioral descriptions), "
+        "facet-specific kind, declared behavioral scenario, provenance, and selected-owner directness. "
         "Inspect the selected scenario's normal entry point and asserted effect; declarations do not prove test quality."
     )
     test_facet = output["tests_and_contracts"]
@@ -1299,7 +1433,7 @@ def architecture_slice(
         if validation.get("role") == "focused_tests"
     ]
     return {
-        "snapshot": f"slice-v3:{','.join(selected_ids)}:manifest:{digest}:sources:{source_snapshot}",
+        "snapshot": f"slice-v4:{','.join(selected_ids)}:routing:{routing_digest}:sources:{source_snapshot}",
         "freshness_scope": "selected owners and their incoming/outgoing relationship evidence",
         **output,
         "truncated": graph["status"] != "complete" or omitted_relationships > 0,
@@ -1314,7 +1448,7 @@ def architecture_slice(
             "tool_calls": 1,
             "files_read": files_read + 1,
             "bytes_read": bytes_read + manifest_bytes_read,
-            "late_relationship_discoveries": 0,
+            "late_relationship_discoveries": None,
         },
     }
 
@@ -1432,22 +1566,62 @@ def owner_catalog(manifest: dict) -> dict:
         "owners": [
             {
                 "id": owner["id"],
+                "roots": owner.get("roots", []),
                 "aliases": owner.get("aliases", []),
                 "phrases": owner.get("phrases", []),
             }
             for owner in manifest["owners"]
         ],
-        "next": "python scripts/source_owners.py slice --owner <owner-id> --focus <task> --max-relationships 32",
+        "next": (
+            "python scripts/source_owners.py slice --owner <owner-id> --focus <task> "
+            f"--max-relationships {MAX_SLICE_RELATIONSHIPS}"
+        ),
     }
+
+
+def owners_for_paths(
+    manifest: dict,
+    root: Path,
+    paths: list[str],
+    *,
+    unowned_paths: list[str] | None = None,
+) -> list[str]:
+    """Resolve each path to its most specific declared root, retaining ties."""
+    selected: set[str] = set()
+    resolved_roots: dict[str, Path] = {}
+    owner_roots: list[tuple[Path, str]] = []
+    for owner in manifest["owners"]:
+        for declared in owner.get("roots", []):
+            if declared not in resolved_roots:
+                resolved_roots[declared] = (root / declared).resolve()
+            owner_roots.append((resolved_roots[declared], owner["id"]))
+    for value in paths:
+        path = (root / value).resolve()
+        if not path.is_relative_to(root):
+            raise ValueError(f"path is outside the repository: {value}")
+        matches: list[tuple[int, str]] = []
+        for owner_root, owner_id in owner_roots:
+            if path == owner_root or path.is_relative_to(owner_root):
+                matches.append((len(owner_root.parts), owner_id))
+        if not matches:
+            if unowned_paths is not None:
+                unowned_paths.append(path.relative_to(root).as_posix())
+                continue
+            raise ValueError(
+                f"no source owner declares path: {value}; use list or --owner"
+            )
+        specificity = max(depth for depth, _ in matches)
+        selected.update(owner for depth, owner in matches if depth == specificity)
+    return sorted(selected)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
-        epilog="Use `list` before `slice` when the owner ID is not already known.",
+        epilog="Use `slice --path <file>` for a known file, or `list` to find an owner ID.",
     )
     parser.add_argument(
-        "command", choices=("generate", "check", "list", "query", "slice")
+        "command", choices=("generate", "check", "list", "query", "slice", "validation")
     )
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--source-map", type=Path, default=DEFAULT_SOURCEMAP)
@@ -1459,6 +1633,12 @@ def main() -> int:
         action="append",
         dest="owners",
         help="Owner ID to include in a graph query; repeat for multiple owners.",
+    )
+    parser.add_argument(
+        "--path",
+        action="append",
+        dest="paths",
+        help="Resolve a repository path to its most specific owner; query/slice/validation only. Repeat for multiple paths.",
     )
     parser.add_argument(
         "--max-relationships",
@@ -1476,6 +1656,12 @@ def main() -> int:
         help="Repository root for declared paths (defaults to the manifest directory).",
     )
     args = parser.parse_args()
+    if args.paths and args.command not in {"query", "slice", "validation"}:
+        parser.error("--path is only valid with query, slice, or validation")
+    if args.command == "validation" and not (args.paths or args.owners):
+        parser.error("validation requires --path or --owner")
+    if args.command == "validation" and args.focus is not None:
+        parser.error("--focus is only valid with slice")
     if args.command == "query" and args.focus is not None:
         print(
             "--focus is only valid with slice; select an owner with query, then run "
@@ -1513,39 +1699,75 @@ def main() -> int:
             print(error, file=sys.stderr)
             return 1
     try:
-        if args.command in {"query", "slice"}:
+        if args.command in {"query", "slice", "validation"}:
             manifest_bytes = args.manifest.read_bytes()
+            unowned_paths: list[str] = []
+            if args.paths:
+                resolved = owners_for_paths(
+                    tomllib.loads(manifest_bytes.decode("utf-8")),
+                    root,
+                    args.paths,
+                    unowned_paths=unowned_paths,
+                )
+                args.owners = sorted(set(args.owners or []) | set(resolved))
+            if args.command == "validation":
+                manifest, _ = load_and_validate(
+                    args.manifest, root, owner_ids=args.owners, raw=manifest_bytes
+                )
+                selected = [
+                    owner for owner in manifest["owners"] if owner["id"] in args.owners
+                ]
+                missing = sorted(
+                    owner["id"] for owner in selected if not owner.get("validation")
+                )
+                partial = bool(unowned_paths or missing)
+                print(
+                    json.dumps(
+                        {
+                            "status": "partial" if partial else "declared",
+                            "scope": (
+                                "Declared owner routes; test coverage is not inferred "
+                                "and commands are not executed."
+                            ),
+                            "repository_root": str(root),
+                            "validation": [
+                                {"owner": owner["id"], **route}
+                                for owner in sorted(selected, key=lambda owner: owner["id"])
+                                for route in owner.get("validation", [])
+                            ],
+                            "unowned_paths": sorted(set(unowned_paths)),
+                            "owners_without_validation": missing,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+                return int(partial)
             digest = hashlib.sha256(manifest_bytes).hexdigest()
             cached_graph = load_architecture_index(
                 args.architecture_index,
                 digest,
                 root,
-                refresh_sources=args.command != "slice",
+                refresh_sources=False,
             )
-            if cached_graph is None:
-                manifest, digest = load_and_validate(
-                    args.manifest, root, owner_ids=args.owners, raw=manifest_bytes
-                )
-            else:
-                manifest = None
+            # The index authenticates the manifest projection, not the current
+            # sources. Revalidate the selected declaration closure on warm reads too.
+            manifest, digest = load_and_validate(
+                args.manifest, root, owner_ids=args.owners, raw=manifest_bytes
+            )
             if args.command == "query":
                 if not 1 <= args.max_relationships <= MAX_QUERY_RELATIONSHIPS:
                     raise ValueError(
                         "max_relationships must be between "
                         f"1 and {MAX_QUERY_RELATIONSHIPS}"
                     )
-                result = (
-                    query_graph(
-                        manifest,
-                        digest,
-                        root,
-                        args.owners,
-                        args.max_relationships,
-                    )
-                    if cached_graph is None
-                    else _select_index_graph(
-                        cached_graph, args.owners, args.max_relationships
-                    )
+                result = query_graph(
+                    manifest,
+                    digest,
+                    root,
+                    args.owners,
+                    args.max_relationships,
+                    graph=cached_graph,
                 )
             else:
                 result = architecture_slice(
@@ -1558,6 +1780,42 @@ def main() -> int:
                     len(manifest_bytes),
                     graph=cached_graph,
                 )
+            result["index_status"] = (
+                "reused" if cached_graph is not None else "fallback"
+            )
+            if cached_graph is None:
+                result["index_hint"] = (
+                    "The index is missing, stale, or invalid; declarations were rebuilt "
+                    "from the manifest. Run source_owners.py generate to refresh it."
+                )
+            if unowned_paths:
+                result["unowned_paths"] = sorted(set(unowned_paths))
+                result.setdefault("material_unknowns", []).extend(
+                    f"No declared owner for {path}; inspect its directory before mutation."
+                    for path in result["unowned_paths"]
+                )
+                result["fallback_searches"] = []
+                for path in result["unowned_paths"]:
+                    candidate = root / path
+                    scope = (
+                        path
+                        if candidate.is_dir()
+                        else candidate.parent.relative_to(root).as_posix()
+                    )
+                    result["fallback_searches"].append(
+                        {
+                            "cwd": str(root),
+                            "argv": ["rg", "--files", "--", scope],
+                        }
+                    )
+                if args.command == "query":
+                    result["status"] = "partial"
+                else:
+                    for facet in ARCHITECTURE_FACETS:
+                        result[facet]["status"] = (
+                            "partial" if result[facet]["relationships"] else "unknown"
+                        )
+                        result[facet].pop("not_applicable_reason", None)
             print(
                 json.dumps(
                     result,

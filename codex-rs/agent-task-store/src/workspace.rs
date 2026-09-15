@@ -1213,7 +1213,8 @@ mod overlay_observation_tests {
                     .arg("--ignored")
                     .env(HELPER_DIR, &helper_dir)
                     .env(HELPER_ROLE, role)
-                    .stdout(Stdio::piped())
+                    // The harness output is not a Git NUL-delimited path list.
+                    .stdout(Stdio::null())
                     .stderr(Stdio::piped())
                     .spawn()
             })

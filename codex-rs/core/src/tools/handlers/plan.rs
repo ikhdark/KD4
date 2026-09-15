@@ -1,4 +1,5 @@
 use crate::FunctionCallError;
+use crate::plan_store::PlanToolResponse;
 use crate::plan_store::PlanUpdateEffect;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
@@ -38,12 +39,13 @@ const PLAN_UNCHANGED_MESSAGE: &str = "Plan unchanged";
 
 impl PlanToolOutput {
     fn response_result(&self) -> JsonValue {
-        serde_json::json!({
-            "message": self.message(),
-            "effect": self.effect.as_str(),
-            "no_progress": self.effect == PlanUpdateEffect::NoOp,
-            "current_plan": self.current_plan,
+        serde_json::to_value(PlanToolResponse {
+            message: self.message().to_string(),
+            effect: self.effect.as_str().to_string(),
+            no_progress: self.effect == PlanUpdateEffect::NoOp,
+            current_plan: self.current_plan.clone(),
         })
+        .expect("plan response contains serializable fields")
     }
 
     fn message(&self) -> &'static str {
@@ -200,6 +202,17 @@ impl PlanHandler {
                     "failed to parse function arguments: {error}"
                 ))
             })?;
+        if requested_args
+            .plan
+            .iter()
+            .filter(|item| item.status == codex_protocol::plan_tool::StepStatus::InProgress)
+            .count()
+            > 1
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "update_plan permits at most one in_progress step at a time".to_string(),
+            ));
+        }
         if cancellation_token.is_cancelled() {
             return Err(FunctionCallError::RespondToModel(
                 "update_plan was cancelled before the plan update began".to_string(),

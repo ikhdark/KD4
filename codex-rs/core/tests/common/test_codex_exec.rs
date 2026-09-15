@@ -23,8 +23,14 @@ impl TestCodexExecBuilder {
     pub fn cmd_with_server(&self, server: &MockServer) -> assert_cmd::Command {
         let mut cmd = self.cmd();
         let base = format!("{}/v1", server.uri());
+        // The mock implements HTTP Responses/SSE, not the built-in provider's
+        // WebSocket transport. Register its capabilities under a fixture ID.
         cmd.arg("-c")
-            .arg(format!("openai_base_url={}", toml_string_literal(&base)));
+            .arg(format!(
+                "model_providers.exec_fixture={{ name='Exec HTTP fixture', base_url={}, wire_api='responses', requires_openai_auth=true, supports_websockets=false }}",
+                toml_string_literal(&base)
+            ))
+            .args(["-c", "model_provider='exec_fixture'"]);
         cmd
     }
 

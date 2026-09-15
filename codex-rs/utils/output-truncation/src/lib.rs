@@ -165,7 +165,14 @@ pub fn truncate_text_to_token_ceiling(content: &str, max_tokens: usize) -> Strin
         if actual_tokens <= max_tokens {
             return candidate;
         }
-        retained_bytes = retained_bytes.saturating_sub(actual_tokens - max_tokens);
+        // Scale by the observed token density; a token delta is not a byte delta.
+        retained_bytes = retained_bytes
+            .saturating_mul(max_tokens - marker_tokens)
+            .checked_div(actual_tokens - marker_tokens)
+            .unwrap_or(0)
+            // Guarantee geometric progress even when the sampled density
+            // changes across UTF-8 boundaries or retained regions.
+            .min(retained_bytes.saturating_sub(retained_bytes.div_ceil(8)));
         if retained_bytes < 3 {
             return truncate_middle_to_token_ceiling(content, max_tokens);
         }
@@ -176,17 +183,22 @@ fn truncate_middle_to_token_ceiling(content: &str, max_tokens: usize) -> String 
     const MARKER: &str = "\n[...]\n";
     let marker = if max_tokens >= approx_token_count(MARKER) + 4 {
         MARKER
+    } else if max_tokens > 0 {
+        "…"
     } else {
         ""
     };
     let mut bytes =
         approx_bytes_for_tokens(max_tokens - approx_token_count(marker)).min(content.len());
     loop {
-        let head = if marker.is_empty() {
+        let mut head = if marker.is_empty() {
             bytes
         } else {
             bytes.div_ceil(2)
         };
+        if content.floor_char_boundary(head) == 0 {
+            head = content.floor_char_boundary(bytes);
+        }
         let tail = bytes - head;
         let candidate = format!(
             "{}{marker}{}",
@@ -197,7 +209,12 @@ fn truncate_middle_to_token_ceiling(content: &str, max_tokens: usize) -> String 
         if tokens <= max_tokens {
             return candidate;
         }
-        bytes = bytes.saturating_sub(tokens - max_tokens);
+        let marker_tokens = approx_token_count(marker);
+        bytes = bytes
+            .saturating_mul(max_tokens - marker_tokens)
+            .checked_div(tokens - marker_tokens)
+            .unwrap_or(0)
+            .min(bytes.saturating_sub(bytes.div_ceil(8)));
     }
 }
 
@@ -205,8 +222,15 @@ pub fn formatted_truncate_text_with_output_limit(
     content: &str,
     limits: OutputLimitResolution,
 ) -> TruncatedTextOutput {
+    formatted_truncate_text_to_token_ceiling(content, limits.applied_limit)
+}
+
+fn formatted_truncate_text_to_token_ceiling(
+    content: &str,
+    max_tokens: usize,
+) -> TruncatedTextOutput {
     let original_tokens = approx_token_count(content);
-    if original_tokens <= limits.applied_limit {
+    if original_tokens <= max_tokens {
         return TruncatedTextOutput {
             text: content.to_owned(),
             was_truncated: false,
@@ -217,13 +241,16 @@ pub fn formatted_truncate_text_with_output_limit(
         content.lines().count(),
     );
     let warning_tokens = approx_token_count(&warning);
-    let text = if limits.applied_limit > warning_tokens + 1 {
+    // Keep at least half the budget for source evidence. At small budgets the
+    // inline omission marker communicates truncation without consuming the
+    // space needed to identify each retained text run.
+    let text = if max_tokens > warning_tokens.saturating_mul(2) {
         format!(
             "{warning}{}",
-            truncate_text_to_token_ceiling(content, limits.applied_limit - warning_tokens)
+            truncate_text_to_token_ceiling(content, max_tokens - warning_tokens)
         )
     } else {
-        truncate_text_to_token_ceiling(content, limits.applied_limit)
+        truncate_text_to_token_ceiling(content, max_tokens)
     };
     TruncatedTextOutput {
         text,
@@ -231,47 +258,200 @@ pub fn formatted_truncate_text_with_output_limit(
     }
 }
 
+/// Recognize validation output for diagnostic budgeting and summarization.
+/// This heuristic does not grant execution permission or classify side effects.
+pub fn looks_like_validation_command(command: &str) -> bool {
+    let command = command.to_ascii_lowercase();
+    let words = command.split_ascii_whitespace().collect::<Vec<_>>();
+    validation_invocation(&words)
+}
+
+fn validation_invocation(mut words: &[&str]) -> bool {
+    loop {
+        let Some((program, args)) = words.split_first() else {
+            return false;
+        };
+        let program = program.trim_matches(['\'', '"']);
+        let program = program.rsplit(['/', '\\']).next().unwrap_or(program);
+        let program = program.strip_suffix(".exe").unwrap_or(program);
+        // Only inspect executable positions and known launchers. Mentions in echo,
+        // file reads, commit messages, or other arguments are not validation runs.
+        match (program, args) {
+            ("&" | "npx", args) | ("uv", ["run", args @ ..]) => {
+                words = args;
+                continue;
+            }
+            _ => {}
+        }
+        if args
+            .iter()
+            .take_while(|arg| **arg != "--")
+            .any(|arg| matches!(*arg, "--help" | "-h" | "--version"))
+        {
+            return false;
+        }
+        return match (program, args) {
+            ("cargo", args) => {
+                let args = if args.first().is_some_and(|arg| arg.starts_with('+')) {
+                    &args[1..]
+                } else {
+                    args
+                };
+                matches!(
+                    args,
+                    ["build" | "check" | "test" | "nextest" | "clippy", ..]
+                )
+            }
+            ("rustc" | "pytest" | "tsc" | "eslint" | "ruff" | "mypy", _) => true,
+            ("python" | "python3" | "py", ["-m", "unittest" | "pytest", ..]) => true,
+            ("python" | "python3" | "py", [script, ..]) => {
+                script.rsplit(['/', '\\']).next() == Some("rust_test_runner.py")
+            }
+            ("just", args) => just_validation_invocation(args),
+            ("npm" | "pnpm" | "yarn", ["test" | "build" | "lint" | "typecheck", ..])
+            | ("npm" | "pnpm" | "yarn", ["run", "test" | "build" | "lint" | "typecheck", ..])
+            | ("dotnet" | "go", ["test", ..])
+            | ("node", ["--test", ..]) => true,
+            _ => false,
+        };
+    }
+}
+
+fn just_validation_invocation(mut args: &[&str]) -> bool {
+    while let Some((arg, rest)) = args.split_first() {
+        match *arg {
+            "--" => {
+                args = rest;
+                break;
+            }
+            "-f" | "--justfile" | "-d" | "--working-directory" => {
+                let Some((value, remaining)) = rest.split_first() else {
+                    return false;
+                };
+                args = remaining;
+                // The command display can quote a path containing spaces.
+                if let Some(quote @ ('\'' | '"')) = value.chars().next()
+                    && !value.ends_with(quote)
+                {
+                    let Some(end) = args.iter().position(|word| word.ends_with(quote)) else {
+                        return false;
+                    };
+                    args = &args[end + 1..];
+                }
+            }
+            "-q" | "--quiet" | "-v" | "--verbose" | "--no-dotenv" => args = rest,
+            value
+                if value.starts_with("--justfile=")
+                    || value.starts_with("--working-directory=") =>
+            {
+                args = rest;
+            }
+            _ => break,
+        }
+    }
+    matches!(
+        args,
+        [
+            "test"
+                | "test-fast"
+                | "core-test"
+                | "core-test-fast"
+                | "core-gate"
+                | "core-test-lane"
+                | "_core-test-lane-reserved"
+                | "core-test-parity"
+                | "test-lane"
+                | "test-lane-main"
+                | "test-lane-fast"
+                | "test-lane-package"
+                | "validate-crate"
+                | "validate-crate-focused"
+                | "validate-crate-full"
+                | "clippy"
+                | "clippy-workspace"
+                | "clippy-lane"
+                | "fmt-check"
+                | "fmt-check-fast"
+                | "sdk-ts-check"
+                | "sdk-python-check"
+                | "config-schema-check"
+                | "app-server-schema-check"
+                | "source-map-check"
+                | "source-owners-check"
+                | "check"
+                | "fix",
+            ..,
+        ]
+    )
+}
+
 fn is_high_signal_diagnostic(command_text: Option<&str>, output_text: &str) -> bool {
-    let command = command_text.unwrap_or_default().to_ascii_lowercase();
-    let diagnostic_command = [
-        "cargo check",
-        "cargo test",
-        "cargo nextest",
-        "cargo clippy",
-        "rustc ",
-        "pytest",
-        "python -m unittest",
-        "npm test",
-        "npm run test",
-        "pnpm test",
-        "yarn test",
-        "dotnet test",
-        "go test",
-        "just test",
-        "just check",
-    ]
-    .iter()
-    .any(|needle| command.contains(needle));
-    if diagnostic_command {
+    if command_text.is_some_and(looks_like_validation_command) {
         return true;
     }
 
-    let output = output_text.to_ascii_lowercase();
-    [
-        "stack backtrace:",
-        "traceback (most recent call last):",
-        "thread 'main' panicked at",
-        "error[e",
-        "test result: failed",
-        "failures:",
-        "compiler error",
-        "caused by:",
-    ]
-    .iter()
-    .any(|needle| output.contains(needle))
+    let mut lines = output_text.lines().peekable();
+    while let Some(line) = lines.next() {
+        let line = line.trim_start();
+        let failure_list = line.eq_ignore_ascii_case("failures:") && {
+            while lines.peek().is_some_and(|next| next.trim().is_empty()) {
+                lines.next();
+            }
+            lines
+                .peek()
+                .is_some_and(|next| next.len() > next.trim_start().len())
+        };
+        let compiler_error = line
+            .split_inclusive(':')
+            .filter_map(|part| part.strip_suffix(':'))
+            .any(|part| {
+                let part = part.trim_start();
+                part.eq_ignore_ascii_case("error")
+                    || part.eq_ignore_ascii_case("warning")
+                    || ["error ts", "error msb"].iter().any(|prefix| {
+                        strip_prefix_ascii_case(part, prefix).is_some_and(|code| {
+                            !code.is_empty() && code.bytes().all(|byte| byte.is_ascii_digit())
+                        })
+                    })
+            });
+        let rust_panic = strip_prefix_ascii_case(line, "thread '").is_some_and(|rest| {
+            rest.split_once('\'').is_some_and(|(name, message)| {
+                !name.is_empty() && strip_prefix_ascii_case(message, " panicked at").is_some()
+            })
+        });
+        if compiler_error
+            || rust_panic
+            || line.eq_ignore_ascii_case("FAILED")
+            || failure_list
+            || line.eq_ignore_ascii_case("caused by:")
+            || [
+                "stack backtrace:",
+                "traceback (most recent call last):",
+                "error[e",
+                "npm err!",
+                "test result: failed",
+                "assertionerror",
+                "segmentation fault",
+            ]
+            .iter()
+            .any(|prefix| strip_prefix_ascii_case(line, prefix).is_some())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn strip_prefix_ascii_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    text.get(..prefix.len())
+        .filter(|start| start.eq_ignore_ascii_case(prefix))
+        .map(|_| &text[prefix.len()..])
 }
 
 pub fn formatted_truncate_text(content: &str, policy: TruncationPolicy) -> String {
+    if let TruncationPolicy::Tokens(max_tokens) = policy {
+        return formatted_truncate_text_to_token_ceiling(content, max_tokens).text;
+    }
     if content.len() <= policy.byte_budget() {
         return content.to_string();
     }
@@ -288,6 +468,10 @@ pub fn truncate_text(content: &str, policy: TruncationPolicy) -> String {
     policy.truncate_text(content)
 }
 
+/// Formats truncation warnings and shares the budget across contiguous text
+/// runs, preserving their positions relative to images and encrypted content.
+/// Unlike `truncate_function_output_items_with_policy`, this retains a share
+/// of each text run instead of spending the budget on the earliest items.
 pub fn formatted_truncate_text_content_items_with_policy(
     items: &[FunctionCallOutputContentItem],
     policy: TruncationPolicy,
@@ -313,32 +497,73 @@ pub fn formatted_truncate_text_content_items_with_policy(
         combined.push_str(text);
     }
 
-    if combined.len() <= policy.byte_budget() {
+    let within_budget = match policy {
+        TruncationPolicy::Bytes(max_bytes) => combined.len() <= max_bytes,
+        TruncationPolicy::Tokens(max_tokens) => approx_token_count(&combined) <= max_tokens,
+    };
+    if within_budget {
         return (items.to_vec(), None);
     }
 
     let original_token_count = approx_token_count(&combined);
-    let mut out = vec![FunctionCallOutputContentItem::InputText {
-        text: formatted_truncate_text(&combined, policy),
-    }];
-    out.extend(items.iter().filter_map(|item| match item {
-        FunctionCallOutputContentItem::InputImage { image_url, detail } => {
-            Some(FunctionCallOutputContentItem::InputImage {
-                image_url: image_url.clone(),
-                detail: *detail,
-            })
+    let runs = items
+        .chunk_by(|left, right| {
+            matches!(
+                (left, right),
+                (
+                    FunctionCallOutputContentItem::InputText { .. },
+                    FunctionCallOutputContentItem::InputText { .. }
+                )
+            )
+        })
+        .map(|run| {
+            let mut text = String::new();
+            for item in run {
+                if let FunctionCallOutputContentItem::InputText { text: part } = item {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(part);
+                }
+            }
+            let cost = match policy {
+                TruncationPolicy::Bytes(_) => text.len(),
+                TruncationPolicy::Tokens(_) => approx_token_count(&text),
+            };
+            (run, text, cost)
+        })
+        .collect::<Vec<_>>();
+    let mut remaining_cost = runs.iter().map(|(_, _, cost)| cost).sum::<usize>();
+    let mut remaining_budget = match policy {
+        TruncationPolicy::Bytes(limit) | TruncationPolicy::Tokens(limit) => limit,
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for (run, text, cost) in runs {
+        if !matches!(run[0], FunctionCallOutputContentItem::InputText { .. }) {
+            out.extend_from_slice(run);
+            continue;
         }
-        FunctionCallOutputContentItem::EncryptedContent { encrypted_content } => {
-            Some(FunctionCallOutputContentItem::EncryptedContent {
-                encrypted_content: encrypted_content.clone(),
-            })
-        }
-        FunctionCallOutputContentItem::InputText { .. } => None,
-    }));
+        let budget = if remaining_cost == 0 {
+            0
+        } else {
+            ((remaining_budget as u128 * cost as u128) / remaining_cost as u128) as usize
+        };
+        remaining_budget -= budget;
+        remaining_cost -= cost;
+        let run_policy = match policy {
+            TruncationPolicy::Bytes(_) => TruncationPolicy::Bytes(budget),
+            TruncationPolicy::Tokens(_) => TruncationPolicy::Tokens(budget),
+        };
+        out.push(FunctionCallOutputContentItem::InputText {
+            text: formatted_truncate_text(&text, run_policy),
+        });
+    }
 
     (out, Some(original_token_count))
 }
 
+/// Spends the budget in source order and reports how many later text items
+/// were omitted. Non-text items keep their original relative order.
 pub fn truncate_function_output_items_with_policy(
     items: &[FunctionCallOutputContentItem],
     policy: TruncationPolicy,

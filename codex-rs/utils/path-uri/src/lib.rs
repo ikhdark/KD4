@@ -549,17 +549,20 @@ fn is_windows_drive_uri_segment(segment: &str) -> bool {
     matches!(segment.as_bytes(), [drive, b':'] if drive.is_ascii_alphabetic())
 }
 
-fn containment_path_segments(url: &Url, convention: PathConvention) -> Option<Vec<&str>> {
-    let segments = url
-        .path_segments()?
+fn containment_path_segments(url: &Url, convention: PathConvention) -> Option<Vec<Vec<u8>>> {
+    url.path_segments()?
         .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    (!segments.iter().any(|segment| {
-        urlencoding::decode_binary(segment.as_bytes())
-            .iter()
-            .any(|byte| *byte == b'/' || (convention == PathConvention::Windows && *byte == b'\\'))
-    }))
-    .then_some(segments)
+        .map(|segment| {
+            let decoded = urlencoding::decode_binary(segment.as_bytes());
+            if decoded.iter().any(|byte| {
+                *byte == b'/' || (convention == PathConvention::Windows && *byte == b'\\')
+            }) {
+                None
+            } else {
+                Some(decoded.into_owned())
+            }
+        })
+        .collect()
 }
 
 fn infer_opaque_path_convention(path_bytes: &[u8]) -> Option<PathConvention> {

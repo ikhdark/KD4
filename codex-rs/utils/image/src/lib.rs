@@ -216,7 +216,8 @@ fn cache_image(cache: &ImageCache, key: ImageCacheKey, image: EncodedImage, byte
         return;
     }
 
-    cache.with_mut(|cache| {
+    // Image caching is optional when the cache is contended.
+    let _ = cache.with_mut(|cache| {
         cache.put(key, image);
         let mut cached_bytes = cache
             .iter()

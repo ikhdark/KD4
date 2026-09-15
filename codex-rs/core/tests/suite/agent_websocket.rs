@@ -301,6 +301,10 @@ async fn websocket_cold_resume_and_fork_each_start_with_prewarm() -> Result<()> 
     .await;
 
     let initial = test_codex().build_with_websocket_server(&server).await?;
+    // A real turn cancels unfinished speculative prewarm. Observe the initial
+    // prewarm first so each lifecycle phase has exactly one connection.
+    let initial_prewarm = server.wait_for_request(0, 0).await.body_json();
+    assert_eq!(initial_prewarm["generate"].as_bool(), Some(false));
     initial.submit_turn("seed history").await?;
     let rollout_path = initial
         .session_configured

@@ -859,7 +859,7 @@ async fn initial_output_post_exit_quiet_deadline_resets_after_tail_output() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn initial_output_whitespace_returns_a_live_handle_promptly() {
+async fn initial_output_whitespace_preserves_requested_deadline() {
     let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(1024)));
     let output_notify = Arc::new(Notify::new());
     let output_closed = Arc::new(AtomicBool::new(false));
@@ -881,7 +881,7 @@ async fn initial_output_whitespace_returns_a_live_handle_promptly() {
     .await;
 
     assert_eq!(collected, b" \r\n\t");
-    assert_eq!(Instant::now() - started_at, Duration::from_millis(250));
+    assert_eq!(Instant::now() - started_at, Duration::from_secs(2));
 }
 
 #[tokio::test]
@@ -2431,6 +2431,7 @@ async fn exited_process_rejects_success_when_terminal_watcher_disappears() {
         process_id: None,
         exit_code: Some(0),
         process_exited: true,
+        search_no_match: false,
         original_token_count: None,
         hook_command: None,
         raw_output_artifact: None,

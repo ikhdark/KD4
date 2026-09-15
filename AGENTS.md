@@ -18,7 +18,9 @@
 #### Scope and workspace
 
 - Ask questions in plain language when clarity is needed, do not continue to ask questions after implementation has begun.
-- When edits overlap, compare the versions and pick the most capable one and move on.
+- When edits overlap, preserve independent changes and combine compatible behavior
+  against the requested contract. Verify the combined runtime path; ask only when
+  conflicting intended behavior cannot be resolved from current evidence.
 - Do not communicate with other agents from different sessions.
 - Do not over-engineer implementations.
 - Partial wiring of implemented code is forbidden, this is non-negotiable. End to end wiring is mandatory.
@@ -28,7 +30,8 @@
 ### Validation
 * Both of the following are mandatory*
 1. Every test must assert an expected result and fail for a plausible incorrect implementation of the behavior or logic under test.
-2. Fix any test you encounter that does not meet these requirements.
+2. Repair weak tests covering the changed behavior or blocking its validation.
+   Report unrelated weaknesses encountered without starting a broader test audit.
 
 - If blocked by tests, do not repeat, simply finish the full task then report blocked by tests.
 
@@ -39,35 +42,22 @@ Let each validation run finish before fixing failures. Review the complete resul
 
 ## Routing and task scope
 
-- Reuse known owner paths and current evidence for clear local tasks. When
-  ownership or a relevant relationship is unresolved, query the smallest named
-  owner slice before reading `SOURCEMAP.md` broadly:
-  `python scripts/source_owners.py slice --owner <owner-id> --focus "<task
-description>" --max-relationships 32`. Resolve material unknowns and expand
-  truncated or omitted relationships only when they could affect the requested
-  change, then read the relevant exact evidence locations. Use its
-  representative scenario and focused validation to replace
-  broad test searches; confirm the scenario enters through the normal boundary
-  and asserts an effect. Examples: the inventory benchmark independently expects
-  `TOTAL: 5`; its duration verifier distinguishes `1s` from `1 s` and ASCII from
-  non-ASCII digits. Plan rejection checks absent stored state and cancellation
-  checks absent updates; model-override scenarios inspect the actual config file
-  after shutdown. Reuse these proof patterns, not their incidental setup.
-  Read the broad map only when no owner matches or the slice leaves
-  an unresolved boundary.
-- [`SOURCEMAP.md`](SOURCEMAP.md) owns repository inventory, runtime entrypoints,
-  package and Rust-domain routing, `codex-rs` edit and upstream-sync
-  classification, generated contracts, validation routes, and cross-cutting
-  change routes.
-- Before editing, identify the source-map owner, direct callers and consumers,
-  duplicate or generated representations, compatibility boundary, and named
-  validation route. Record a source path or a scoped search with no match for
-  each category.
-- `SOURCEMAP.md` covers workspace and maintenance-script routing;
-  `.codex/config.toml` and `.codex/skills` own local configuration, fork-local
-  skills, and validation workflows.
-- Modify the requested behavior and the contract relationships identified
-  above.
+- Before editing, identify the source owner and focused validation route. Reuse
+  known paths and current evidence. For unresolved ownership or relationships,
+  follow [source-map lookup instructions](SOURCEMAP.md#how-to-use-this-map);
+  read the broad map only when a focused slice cannot resolve the boundary.
+- Resolve material unknowns and relevant omitted relationships. Inspect exact
+  evidence for affected callers/consumers, generated representations, and
+  compatibility boundaries; record evidence paths or scoped no-matches.
+- Use the owner's representative scenario and focused validation. Confirm the
+  scenario enters through the normal boundary and asserts an independently
+  expected observable effect, including absent effects for rejected or cancelled
+  operations. Keep behavior-specific examples beside their owning tests.
+- Modify the requested behavior and its affected contract relationships.
+  `.codex/config.toml` owns local configuration.
+- Use `just core-test-fast <target> <filter>` for local core tests and the relevant
+  named `just core-gate <gate>` when its declared scope is needed. `core_lib`
+  requires an explicit filter; use `--all` only with user authorization.
 - After adding, deleting, moving, or renaming a repository file or directory,
-  run `just source-map-check`. Run it even when ownership prose is unchanged;
-  the command also rewrites the tracked-path snapshot.
+  run `just source-map-check`, even when ownership prose is unchanged; it also
+  rewrites the tracked-path snapshot.

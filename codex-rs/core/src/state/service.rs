@@ -108,7 +108,7 @@ pub(crate) struct SessionServices {
     /// Session-scoped model client shared across turns.
     pub(crate) model_client: ModelClient,
     pub(crate) code_mode_service: CodeModeService,
-    pub(crate) tool_search_handler_cache: ToolSearchHandlerCache,
+    pub(crate) tool_search_handler_cache: Arc<ToolSearchHandlerCache>,
     pub(crate) turn_environments: Arc<ThreadEnvironments>,
     pub(crate) git_workspace: Arc<GitWorkspaceCache>,
 }
@@ -299,7 +299,10 @@ impl SessionServices {
         runtime
     }
 
-    #[expect(clippy::expect_used, reason = "The private publication semaphore is never closed")]
+    #[expect(
+        clippy::expect_used,
+        reason = "The private publication semaphore is never closed"
+    )]
     pub(crate) async fn shutdown_mcp_managers(&self) {
         // Refresh checks this token under the same publication semaphore before
         // installing its manager. No new generation can escape the shutdown drain.

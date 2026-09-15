@@ -832,7 +832,12 @@ async fn run_websocket_response_stream(
             )),
             response = tokio::time::timeout(idle_timeout, ws_stream.next()) => response,
         }
-        .map_err(|_| ApiError::Stream("idle timeout waiting for websocket".into()));
+        .map_err(|_| {
+            ApiError::Stream(format!(
+                "idle timeout waiting for websocket after {}ms",
+                idle_timeout.as_millis()
+            ))
+        });
         if let Some(t) = telemetry.as_ref() {
             t.on_ws_event(&response, poll_start.elapsed());
         }
@@ -869,10 +874,8 @@ async fn run_websocket_response_stream(
                             "failed to parse websocket event"
                         );
                         return Err(ApiError::Stream(format!(
-                            "failed to parse websocket event: {:?} at line {} column {}",
-                            error.classify(),
-                            error.line(),
-                            error.column()
+                            "failed to parse websocket event ({} payload bytes): {error}",
+                            text.len()
                         )));
                     }
                     Err(ResponsesEventError::Api(error)) => return Err(error),
@@ -892,10 +895,17 @@ async fn run_websocket_response_stream(
             Message::Binary(_) => {
                 return Err(ApiError::Stream("unexpected binary websocket event".into()));
             }
-            Message::Close(_) => {
-                return Err(ApiError::Stream(
-                    "websocket closed by server before response.completed".into(),
-                ));
+            Message::Close(frame) => {
+                let mut message =
+                    "websocket closed by server before response.completed".to_string();
+                if let Some(frame) = frame {
+                    message.push_str(&format!(
+                        " (code {}, reason: {:?})",
+                        frame.code,
+                        frame.reason.as_str()
+                    ));
+                }
+                return Err(ApiError::Stream(message));
             }
             Message::Frame(_) => {}
             Message::Ping(_) | Message::Pong(_) => {}
@@ -923,7 +933,12 @@ async fn send_websocket_request(
     let request_start = Instant::now();
     let result = tokio::time::timeout(idle_timeout, ws_stream.send(Message::Text(request_text)))
         .await
-        .map_err(|_| ApiError::Stream("idle timeout sending websocket request".into()))
+        .map_err(|_| {
+            ApiError::Stream(format!(
+                "idle timeout sending websocket request after {}ms",
+                idle_timeout.as_millis()
+            ))
+        })
         .and_then(|result| {
             result
                 .map_err(|err| ApiError::Stream(format!("failed to send websocket request: {err}")))
@@ -1367,7 +1382,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::await_holding_invalid_type, reason = "Hold the active response lock across cancellation to prove a queued caller cannot dispatch")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Hold the active response lock across cancellation to prove a queued caller cannot dispatch"
+    )]
     async fn canceled_queued_request_leaves_connection_reusable_without_dispatch() {
         let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(1);
         let (tx_message, rx_message) = ws_ingress_channel(2, 1024);
@@ -1418,6 +1436,10 @@ mod tests {
         .await
         .expect("live request must acquire the reusable connection")
         .unwrap();
+        assert!(
+            matches!(live.next().await, Some(Ok(ResponseEvent::RateLimits(snapshot)))
+            if snapshot.limit_id.as_deref() == Some("codex"))
+        );
         let event = tokio::time::timeout(Duration::from_secs(1), live.next())
             .await
             .unwrap()
@@ -1458,6 +1480,10 @@ mod tests {
             .stream_request(test_response_request("gpt-test"), false, None)
             .await
             .unwrap();
+        assert!(
+            matches!(response.next().await, Some(Ok(ResponseEvent::RateLimits(snapshot)))
+            if snapshot.limit_id.as_deref() == Some("codex"))
+        );
         assert!(futures::poll!(response.next()).is_pending());
         drop(response);
         tokio::time::timeout(Duration::from_secs(1), tx_pump_lifetime.closed())
@@ -1512,7 +1538,10 @@ mod tests {
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
-                let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut websocket =
+                    tokio_tungstenite::accept_async_with_config(stream, Some(websocket_config()))
+                        .await
+                        .unwrap();
                 websocket.send(Message::Text("hello".into())).await.unwrap();
                 websocket.send(Message::Close(frame)).await.unwrap();
             });
@@ -1644,7 +1673,7 @@ mod tests {
             let (tx_command, _rx_command) = mpsc::channel::<WsCommand>(1);
             let (tx_message, rx_message) = ws_ingress_channel(2, 1024);
             tx_message
-                .try_send(Message::Text(payload.into()))
+                .try_send(Message::Text(payload.clone().into()))
                 .expect("invalid event should fit ingress queue");
             tx_message
                 .try_send(Message::Text(completed.clone().into()))
@@ -1677,6 +1706,10 @@ mod tests {
                             || message.contains("failed to parse websocket event"),
                         "case {case}: {message}"
                     );
+                    if case == "malformed json" {
+                        assert!(message.contains(&format!("({} payload bytes)", payload.len())));
+                        assert!(message.contains("EOF while parsing an object at line 1 column"));
+                    }
                 }
                 other => panic!("unexpected error for {case}: {other:?}"),
             }
@@ -1684,6 +1717,125 @@ mod tests {
                 rx_event.recv().await.is_none(),
                 "case {case} emitted a response event"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn response_stream_preserves_server_close_details() {
+        for (frame, expected) in [
+            (
+                Some(CloseFrame {
+                    code:
+                        tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                    reason: "policy rejection".into(),
+                }),
+                "websocket closed by server before response.completed (code 1008, reason: \"policy rejection\")",
+            ),
+            (None, "websocket closed by server before response.completed"),
+        ] {
+            let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(1);
+            let (tx_message, rx_message) = ws_ingress_channel(2, 1024);
+            let pump_task = tokio::spawn(async move {
+                let Some(WsCommand::Send { tx_result, .. }) = rx_command.recv().await else {
+                    panic!("response request must dispatch");
+                };
+                tx_result.send(Ok(())).unwrap();
+                tx_message.try_send(Message::Close(frame)).unwrap();
+                tx_message.try_send(Message::Text(
+                    json!({"type": "response.completed", "response": {"id": "must-not-complete"}})
+                        .to_string().into(),
+                )).unwrap();
+                std::future::pending::<()>().await;
+            });
+            let connection = ResponsesWebsocketConnection::new(
+                WsStream {
+                    tx_command,
+                    rx_message,
+                    rx_failure: None,
+                    pending_failure: None,
+                    pump_task,
+                },
+                Duration::from_secs(1),
+                ResponsesStreamMetadata::default(),
+                None,
+            );
+            let mut response = connection
+                .stream_request(test_response_request("test-model"), false, None)
+                .await
+                .unwrap();
+            assert!(
+                matches!(response.next().await, Some(Ok(ResponseEvent::RateLimits(snapshot)))
+                if snapshot.limit_id.as_deref() == Some("codex"))
+            );
+            let error = response.next().await.unwrap().unwrap_err();
+            assert!(
+                matches!(&error, ApiError::Stream(message) if message == expected),
+                "{error:?}"
+            );
+            assert!(
+                response.next().await.is_none(),
+                "close must prevent completion"
+            );
+            assert!(
+                connection.is_closed().await,
+                "failed socket must not be reused"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn response_stream_reports_send_and_receive_timeout_durations() {
+        for send_stalls in [true, false] {
+            let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(1);
+            let (tx_message, rx_message) = ws_ingress_channel(1, 1024);
+            let pump_task = tokio::spawn(async move {
+                let Some(WsCommand::Send { tx_result, .. }) = rx_command.recv().await else {
+                    panic!("response request must dispatch");
+                };
+                if send_stalls {
+                    // Keep the request acknowledgement open until the client times out.
+                    let _tx_result = tx_result;
+                    std::future::pending::<()>().await;
+                } else {
+                    tx_result.send(Ok(())).unwrap();
+                }
+                let _tx_message = tx_message;
+                std::future::pending::<()>().await;
+            });
+            let connection = ResponsesWebsocketConnection::new(
+                WsStream {
+                    tx_command,
+                    rx_message,
+                    rx_failure: None,
+                    pending_failure: None,
+                    pump_task,
+                },
+                Duration::from_millis(1250),
+                ResponsesStreamMetadata::default(),
+                None,
+            );
+            let mut response = connection
+                .stream_request(test_response_request("test-model"), false, None)
+                .await
+                .unwrap();
+            if !send_stalls {
+                assert!(
+                    matches!(response.next().await, Some(Ok(ResponseEvent::RateLimits(snapshot)))
+                    if snapshot.limit_id.as_deref() == Some("codex"))
+                );
+            }
+            let error = response.next().await.unwrap().unwrap_err();
+            let expected = if send_stalls {
+                "idle timeout sending websocket request after 1250ms"
+            } else {
+                "idle timeout waiting for websocket after 1250ms"
+            };
+            assert!(
+                matches!(&error, ApiError::Stream(message) if message == expected),
+                "{error:?}"
+            );
+            assert!(response.next().await.is_none());
+            assert!(connection.is_closed().await);
         }
     }
 

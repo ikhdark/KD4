@@ -14,7 +14,7 @@ When you need extra sandboxed permissions for one command, use:
 
 This keeps execution inside the current sandbox policy, while adding only the requested permissions for that command, unless an exec-policy allow rule applies and authorizes running the command outside the sandbox.
 
-If the command matches an exec-policy allow rule, that rule takes precedence, including any authorized sandbox bypass.
+Across matching exec-policy rules and command segments, precedence is forbidden > prompt > allow. A forbidden decision is terminal; an allow rule cannot override it or a prompt requirement. An allow decision can authorize sandbox bypass. Unmatched commands follow the active approval and sandbox policies.
 
 ## Escalation Requests
 

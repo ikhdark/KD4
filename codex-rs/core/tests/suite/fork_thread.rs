@@ -265,8 +265,16 @@ fn fork_thread_from_history_does_not_require_source_rollout_path() {
             .unwrap();
         let _ = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
+        // Live completion is delivered after queueing the terminal record; explicitly
+        // finish persistence before constructing an independent stored-history snapshot.
+        codex.flush_rollout().await.expect("flush source rollout");
         let source_path = codex.rollout_path().expect("source rollout path");
-        let source_items = read_rollout_items(&source_path);
+        let source_items = read_rollout_items_with_session_meta(&source_path);
+        assert!(
+            source_items
+                .iter()
+                .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TurnComplete(_))))
+        );
         assert!(
             contains_reasoning(&source_items, "reason-fork"),
             "source rollout must retain the full reasoning record"
@@ -296,17 +304,17 @@ fn fork_thread_from_history_does_not_require_source_rollout_path() {
             contains_reasoning(&forked_items, "reason-fork"),
             "forked rollout must retain the full reasoning record"
         );
-        let forked_item_values = forked_items
+        let expected_copied_items = source_items
             .iter()
-            .map(|item| serde_json::to_value(item).unwrap())
+            .filter(|item| !matches!(item, RolloutItem::SessionMeta(_)))
+            .cloned()
             .collect::<Vec<_>>();
-        let source_item_values = source_items
-            .iter()
-            .map(|item| serde_json::to_value(item).unwrap())
-            .collect::<Vec<_>>();
+        assert_fork_rollout(&forked_items, &expected_copied_items);
         assert!(
-            forked_item_values.starts_with(&source_item_values),
-            "forked history should start with the supplied source history"
+            !forked_items
+                .iter()
+                .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TurnAborted(_)))),
+            "a completed source turn must not gain an interrupted boundary when forked"
         );
 
         forked_thread

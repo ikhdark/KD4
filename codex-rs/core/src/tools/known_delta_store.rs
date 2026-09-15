@@ -3,9 +3,11 @@
 //! Blobs and evidence are global below the existing `tool-output` root. Retrieval
 //! handles remain task-scoped and are minted by `command_output_artifact`.
 
+use crate::tools::command_output_artifact::MAX_RAW_OUTPUT_ARTIFACT_BYTES;
 use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::command_output_artifact::create_raw_output_artifact;
 use codex_file_system::FileSystemSandboxContext;
+use codex_git_utils::DISABLED_HOOKS_PATH;
 use codex_protocol::models::SandboxPermissions;
 use serde::Deserialize;
 use serde::Serialize;
@@ -21,6 +23,7 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -206,8 +209,10 @@ impl EvidenceCandidate {
         self.record.reusable
     }
 
-    pub(crate) fn age(&self) -> Duration {
-        Duration::from_millis(now_ms().saturating_sub(self.record.created_at_ms))
+    pub(crate) fn age(&self) -> Option<Duration> {
+        now_ms()
+            .checked_sub(self.record.created_at_ms)
+            .map(Duration::from_millis)
     }
 
     pub(crate) fn provenance(&self) -> &str {
@@ -218,10 +223,15 @@ impl EvidenceCandidate {
 #[derive(Clone, Debug)]
 pub(crate) struct KnownDeltaHit {
     rendered_output: String,
+    original_token_count: usize,
     raw_output_artifact: RawOutputArtifact,
 }
 
 impl KnownDeltaHit {
+    pub(crate) fn original_token_count(&self) -> usize {
+        self.original_token_count
+    }
+
     pub(crate) fn rendered_output(&self) -> &str {
         &self.rendered_output
     }
@@ -242,7 +252,6 @@ pub(crate) struct PreparedKnownDelta {
     identity: EvidenceIdentity,
     candidate: Option<EvidenceCandidate>,
     hit: Option<KnownDeltaHit>,
-    force_fresh: bool,
     #[cfg(test)]
     profitability_costs: Option<(Duration, Duration, Duration)>,
 }
@@ -382,9 +391,7 @@ async fn immutable_git_show_identity_with_authorization_scope(
         ProjectNamespaceHint::Resolved(None) => return None,
         ProjectNamespaceHint::Discover => git_project_namespace(cwd).await?,
     };
-    let cwd_position = git_stdout(cwd, &["rev-parse", "--show-prefix"])
-        .await
-        .unwrap_or_default();
+    let cwd_position = git_stdout(cwd, &["rev-parse", "--show-prefix"]).await?;
     let resolved_blob = git_resolve_blob(cwd, &normalized_requested).await?;
     let program_identity = program.replace('\\', "/");
     let lineage_key = digest(
@@ -479,6 +486,9 @@ pub(crate) async fn prepare_immutable_git_show_with_authorization_scope(
         if raw_output_artifact.model_projection().2.is_none() {
             Some(KnownDeltaHit {
                 rendered_output: render_hit(candidate, &raw_output_artifact),
+                original_token_count: codex_utils_string::approx_token_count(
+                    &String::from_utf8_lossy(&candidate.output),
+                ),
                 raw_output_artifact,
             })
         } else {
@@ -491,7 +501,6 @@ pub(crate) async fn prepare_immutable_git_show_with_authorization_scope(
         identity,
         candidate,
         hit,
-        force_fresh,
         #[cfg(test)]
         profitability_costs,
     })
@@ -510,10 +519,14 @@ pub(crate) async fn lookup(
     {
         return None;
     }
-    let bytes = tokio::fs::read(evidence_path(codex_home, identity))
-        .await
-        .ok()?;
-    let record: EvidenceRecord = serde_json::from_slice(&bytes).ok()?;
+    let bytes = read_cache_file(&evidence_path(codex_home, identity)).await?;
+    let record: EvidenceRecord = match serde_json::from_slice(&bytes) {
+        Ok(record) => record,
+        Err(error) => {
+            tracing::warn!(fingerprint = %identity.fingerprint, %error, "invalid known-delta evidence record; executing command afresh");
+            return None;
+        }
+    };
     if record.schema_version != EVIDENCE_SCHEMA_VERSION
         || record.project_namespace != identity.project_namespace
         || record.lineage_key != identity.lineage_key
@@ -522,10 +535,9 @@ pub(crate) async fn lookup(
     {
         return None;
     }
-    let output = tokio::fs::read(blob_path(codex_home, &record.blob_digest))
-        .await
-        .ok()?;
+    let output = read_cache_file(&blob_path(codex_home, &record.blob_digest)).await?;
     if digest(&output) != record.blob_digest {
+        tracing::warn!(fingerprint = %identity.fingerprint, blob_digest = %record.blob_digest, "known-delta evidence blob digest mismatch; executing command afresh");
         return None;
     }
     // A contradiction may be reported while this lookup is reading the old
@@ -553,6 +565,7 @@ pub(crate) async fn record_success(
     let blob_digest = digest(output);
     if let Some(candidate) = candidate {
         if candidate.record.blob_digest != blob_digest || candidate.output != output {
+            tracing::warn!(fingerprint = %identity.fingerprint, "known-delta execution contradicted cached output; quarantining lineage");
             quarantine(codex_home, identity).await;
             return Observation::Contradiction;
         }
@@ -609,6 +622,7 @@ pub(crate) async fn record_contradictory_failure(
     had_candidate: bool,
 ) {
     if had_candidate {
+        tracing::warn!(fingerprint = %identity.fingerprint, "known-delta execution failed after cached success; quarantining lineage");
         quarantine(codex_home, identity).await;
     }
 }
@@ -631,7 +645,7 @@ pub(crate) async fn record_execution(
                 .profitability_costs
                 .map(|(_, _, executor_cost)| executor_cost)
                 .unwrap_or(executor_cost);
-            let _ = record_success(
+            let observation = record_success(
                 codex_home,
                 &prepared.identity,
                 prepared.candidate.as_ref(),
@@ -639,8 +653,11 @@ pub(crate) async fn record_execution(
                 executor_cost,
             )
             .await;
+            if observation == Observation::PersistenceFailed {
+                tracing::warn!(fingerprint = %prepared.identity.fingerprint, "could not persist known-delta execution evidence");
+            }
         }
-        KnownDeltaExecutionObservation::CompleteFailure if prepared.force_fresh => {
+        KnownDeltaExecutionObservation::CompleteFailure => {
             record_contradictory_failure(
                 codex_home,
                 &prepared.identity,
@@ -648,8 +665,7 @@ pub(crate) async fn record_execution(
             )
             .await;
         }
-        KnownDeltaExecutionObservation::CompleteFailure
-        | KnownDeltaExecutionObservation::Incomplete => {}
+        KnownDeltaExecutionObservation::Incomplete => {}
     }
 }
 
@@ -663,9 +679,13 @@ pub(crate) async fn remint_task_handle(
 
 pub(crate) fn render_hit(candidate: &EvidenceCandidate, artifact: &RawOutputArtifact) -> String {
     let content = String::from_utf8_lossy(&candidate.output);
+    let age = candidate.age().map_or_else(
+        || "unknown (wall clock precedes capture)".to_string(),
+        |age| format!("{}ms", age.as_millis()),
+    );
     format!(
-        "{content}\n\n[known-delta cache hit; age={}ms; provenance={}; {}]",
-        candidate.age().as_millis(),
+        "{content}\n\n[known-delta cache hit; command_was_executed=false; reused prior successful output, not a fresh execution or exit status; age={age}; shadow_validations={}; provenance={}; {}]",
+        candidate.record.shadow_validations,
         candidate.provenance(),
         artifact.render_for_model()
     )
@@ -703,6 +723,7 @@ fn lookup_disabled(codex_home: &Path, unsafe_marker: &Path) -> bool {
     let Ok(state) = runtime_quarantine_state().lock() else {
         // A poisoned deny-state lock must not restore access to suspect cache
         // entries.
+        tracing::warn!("known-delta quarantine lock poisoned; cache lookup disabled");
         return true;
     };
     state.lookup_disabled(&store_root(codex_home), unsafe_marker)
@@ -727,15 +748,34 @@ fn disable_namespace(codex_home: &Path) {
 }
 
 async fn write_blob(codex_home: &Path, blob_digest: &str, output: &[u8]) -> Option<()> {
+    if output.len() > MAX_RAW_OUTPUT_ARTIFACT_BYTES {
+        return None;
+    }
     let path = blob_path(codex_home, blob_digest);
-    if let Ok(existing) = tokio::fs::read(&path).await
+    if let Some(existing) = read_cache_file(&path).await
         && digest(&existing) == blob_digest
     {
         return Some(());
     }
     atomic_write(&path, output).await?;
-    let verified = tokio::fs::read(&path).await.ok()?;
+    let verified = read_cache_file(&path).await?;
     (digest(&verified) == blob_digest).then_some(())
+}
+
+async fn read_cache_file(path: &Path) -> Option<Vec<u8>> {
+    // Reuse the artifact ceiling: larger blobs cannot be reminted completely.
+    // Bound the read itself as well as metadata so a growing file stays bounded.
+    let file = tokio::fs::File::open(path).await.ok()?;
+    let metadata = file.metadata().await.ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .ok()?;
+    (bytes.len() <= MAX_RAW_OUTPUT_ARTIFACT_BYTES).then_some(bytes)
 }
 
 async fn write_record(
@@ -811,7 +851,9 @@ async fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
     test_observation::record_fingerprint_git_subprocess();
     let mut command = Command::new("git");
     command
-        .args(["-c", "core.hooksPath=NUL", "-c", "core.fsmonitor=false"])
+        .arg("-c")
+        .arg(format!("core.hooksPath={DISABLED_HOOKS_PATH}"))
+        .args(["-c", "core.fsmonitor=false"])
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -842,7 +884,9 @@ async fn git_resolve_blob(cwd: &Path, spec: &str) -> Option<String> {
     test_observation::record_fingerprint_git_subprocess();
     let mut command = Command::new("git");
     command
-        .args(["-c", "core.hooksPath=NUL", "-c", "core.fsmonitor=false"])
+        .arg("-c")
+        .arg(format!("core.hooksPath={DISABLED_HOOKS_PATH}"))
+        .args(["-c", "core.fsmonitor=false"])
         .args(["cat-file", "--batch-check=%(objectname) %(objecttype)"])
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -1001,7 +1045,17 @@ mod tests {
                     // wrapper's unread stdin pipe can hold.
                     git_resolve_blob(cwd, &"x".repeat(128 * 1024)).await
                 } else {
-                    git_stdout(cwd, &["rev-parse", "--show-prefix"]).await
+                    prepare_immutable_git_show(
+                        &cwd.join("home"),
+                        "probe-thread",
+                        cwd,
+                        "git",
+                        &["show".to_string(), "a".repeat(40)],
+                        ProjectNamespaceHint::Resolved(Some("probe-project")),
+                        false,
+                    )
+                    .await
+                    .map(|prepared| prepared.identity.fingerprint)
                 }
             };
             let result = if cancel_after_spawn {
@@ -1034,6 +1088,14 @@ mod tests {
             &helper,
             r#"use std::os::windows::process::CommandExt;
 fn main() {
+    // A failed prefix probe must stop preparation even if blob resolution
+    // would succeed. Keep the stdin-timeout scenario on the blocking path.
+    if std::env::var_os("CODEX_KNOWN_DELTA_GIT_PROBE_CHILD_STDIN").is_none()
+        && std::env::args().any(|arg| arg == "cat-file")
+    {
+        println!("{} blob", "a".repeat(40));
+        return;
+    }
     let child = std::process::Command::new("powershell.exe")
         .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
         .creation_flags(0x08000000)
@@ -1453,12 +1515,34 @@ fn main() {
         init_repo(&repo, "immutable\n");
         let blob = run_git(&repo, &["rev-parse", "HEAD:read.txt"]);
         let args = ["show".to_string(), blob];
+        let cwd = codex_utils_path_uri::PathUri::from_abs_path(
+            &codex_utils_absolute_path::AbsolutePathBuf::try_from(repo.clone()).unwrap(),
+        );
+        let read_only = FileSystemSandboxContext::from_legacy_sandbox_policy(
+            codex_protocol::protocol::SandboxPolicy::ReadOnly {
+                network_access: false,
+            },
+            cwd.clone(),
+        )
+        .unwrap();
+        let full_access = FileSystemSandboxContext::from_legacy_sandbox_policy(
+            codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
+            cwd,
+        )
+        .unwrap();
+        let read_only_scope =
+            authorization_scope_fingerprint(&read_only, SandboxPermissions::UseDefault).unwrap();
+        let full_access_scope =
+            authorization_scope_fingerprint(&full_access, SandboxPermissions::UseDefault).unwrap();
+        let escalated_scope =
+            authorization_scope_fingerprint(&read_only, SandboxPermissions::RequireEscalated)
+                .unwrap();
         let identity = immutable_git_show_identity_with_authorization_scope(
             &repo,
             "git",
             &args,
             ProjectNamespaceHint::Discover,
-            "read-only-scope",
+            &read_only_scope,
         )
         .await
         .expect("immutable identity");
@@ -1488,20 +1572,22 @@ fn main() {
             }
         );
 
-        let different_scope = prepare_immutable_git_show_with_authorization_scope(
-            &home,
-            "thread-b",
-            &repo,
-            "git",
-            &args,
-            ProjectNamespaceHint::Discover,
-            "workspace-write-scope",
-            false,
-        )
-        .await
-        .expect("prepared lookup");
-        assert!(!different_scope.has_candidate());
-        assert!(!different_scope.is_hit());
+        for scope in [&full_access_scope, &escalated_scope] {
+            let different_scope = prepare_immutable_git_show_with_authorization_scope(
+                &home,
+                "thread-b",
+                &repo,
+                "git",
+                &args,
+                ProjectNamespaceHint::Discover,
+                scope,
+                false,
+            )
+            .await
+            .expect("prepared lookup");
+            assert!(!different_scope.has_candidate());
+            assert!(!different_scope.is_hit());
+        }
 
         let same_scope = prepare_immutable_git_show_with_authorization_scope(
             &home,
@@ -1510,7 +1596,7 @@ fn main() {
             "git",
             &args,
             ProjectNamespaceHint::Discover,
-            "read-only-scope",
+            &read_only_scope,
             false,
         )
         .await
@@ -1794,13 +1880,29 @@ fn main() {
     }
 
     #[tokio::test]
-    async fn contradictory_force_fresh_failure_quarantines_cached_success() {
+    async fn completed_failure_quarantines_cached_success_but_incomplete_execution_does_not() {
         let home = TempDir::new().unwrap();
         let id = identity("project", "lineage", "fingerprint");
         record_success(home.path(), &id, None, b"success", Duration::from_millis(1)).await;
+        let prepared = PreparedKnownDelta {
+            candidate: Some(lookup(home.path(), &id).await.expect("published success")),
+            identity: id.clone(),
+            hit: None,
+            profitability_costs: None,
+        };
+        record_execution(
+            home.path(),
+            &prepared,
+            KnownDeltaExecutionObservation::Incomplete,
+        )
+        .await;
         assert!(lookup(home.path(), &id).await.is_some());
-
-        record_contradictory_failure(home.path(), &id, true).await;
+        record_execution(
+            home.path(),
+            &prepared,
+            KnownDeltaExecutionObservation::CompleteFailure,
+        )
+        .await;
 
         assert!(lookup(home.path(), &id).await.is_none());
     }
@@ -1962,6 +2064,85 @@ fn main() {
     }
 
     #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn immutable_evidence_respects_the_artifact_byte_ceiling() {
+        let root = TempDir::new().unwrap();
+        let repo = root.path().join("repo");
+        let home = root.path().join("home");
+        init_repo(&repo, "immutable\n");
+        let args = [
+            "show".to_string(),
+            run_git(&repo, &["rev-parse", "HEAD:read.txt"]),
+        ];
+        let prepared = prepare_immutable_git_show(
+            &home,
+            "thread",
+            &repo,
+            "git",
+            &args,
+            ProjectNamespaceHint::Discover,
+            false,
+        )
+        .await
+        .expect("prepared immutable read");
+        let oversized = vec![b'x'; MAX_RAW_OUTPUT_ARTIFACT_BYTES + 1];
+        record_execution(
+            &home,
+            &prepared,
+            KnownDeltaExecutionObservation::CompleteSuccess {
+                output: &oversized,
+                executor_cost: Duration::from_secs(1),
+            },
+        )
+        .await;
+        assert!(!evidence_path(&home, &prepared.identity).exists());
+        assert!(!blob_path(&home, &digest(&oversized)).exists());
+        assert!(logs_contain(
+            "could not persist known-delta execution evidence"
+        ));
+
+        let bounded = &oversized[..MAX_RAW_OUTPUT_ARTIFACT_BYTES];
+        record_execution(
+            &home,
+            &prepared,
+            KnownDeltaExecutionObservation::CompleteSuccess {
+                output: bounded,
+                executor_cost: Duration::from_secs(1),
+            },
+        )
+        .await;
+        let candidate = lookup(&home, &prepared.identity)
+            .await
+            .expect("bounded evidence");
+        assert_eq!(candidate.output, bounded);
+
+        // An old or externally written cache file can exceed the current cap.
+        // Its digest is correct, so only the size limit should reject it.
+        let mut record = candidate.record;
+        record.blob_digest = digest(&oversized);
+        tokio::fs::write(blob_path(&home, &record.blob_digest), &oversized)
+            .await
+            .unwrap();
+        write_record(&home, &prepared.identity, &record)
+            .await
+            .unwrap();
+        let oversized_lookup = prepare_immutable_git_show(
+            &home,
+            "thread",
+            &repo,
+            "git",
+            &args,
+            ProjectNamespaceHint::Discover,
+            false,
+        )
+        .await
+        .expect("oversized evidence falls through to execution");
+        assert!(!oversized_lookup.has_candidate());
+        assert!(!oversized_lookup.is_hit());
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
     async fn corrupt_or_evicted_blob_is_a_miss_and_provenance_is_checkout_free() {
         let home = TempDir::new().unwrap();
         let id = identity("project", "lineage", "fingerprint");
@@ -2005,6 +2186,37 @@ fn main() {
             .await
             .unwrap();
         assert!(lookup(home.path(), &id).await.is_none());
+        assert!(logs_contain("known-delta evidence blob digest mismatch"));
+    }
+
+    #[tokio::test]
+    async fn cache_hit_reports_unknown_age_when_capture_is_in_the_future() {
+        let home = TempDir::new().unwrap();
+        let id = identity("project", "lineage", "fingerprint");
+        assert_eq!(
+            record_success(
+                home.path(),
+                &id,
+                None,
+                b"prior output",
+                Duration::from_secs(1)
+            )
+            .await,
+            Observation::Published
+        );
+        let mut candidate = lookup(home.path(), &id).await.unwrap();
+        candidate.record.created_at_ms = u64::MAX;
+        write_record(home.path(), &id, &candidate.record)
+            .await
+            .unwrap();
+        let candidate = lookup(home.path(), &id).await.unwrap();
+        assert_eq!(candidate.age(), None);
+        let artifact = remint_task_handle(home.path(), "thread", &candidate).await;
+        let rendered = render_hit(&candidate, &artifact);
+        assert!(rendered.starts_with("prior output\n"));
+        assert!(rendered.contains("age=unknown (wall clock precedes capture)"));
+        assert!(!rendered.contains("age=0ms"));
+        assert!(rendered.contains("command_was_executed=false"));
     }
 
     #[test]

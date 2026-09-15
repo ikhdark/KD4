@@ -349,12 +349,21 @@ fn generated_output_returns_generated_image_helper_input_in_code_mode() {
 }
 
 #[test]
-fn generated_output_omits_oversized_output_hint() {
+fn generated_output_preserves_copy_instruction_for_oversized_paths() {
     let long_path = "x".repeat(1024);
     let output = GeneratedImageOutput {
         result: RESULT.to_string(),
         output_hint: extension_image_generation_output_hint("/tmp", long_path),
     };
+
+    let expected_hint = "If you need to use a generated image at another path, copy it and leave the original in place unless the user explicitly asks you to delete it.";
+    assert_eq!(
+        output.code_mode_result(&function_payload()),
+        serde_json::json!({
+            "image_url": format!("data:image/png;base64,{RESULT}"),
+            "output_hint": expected_hint,
+        })
+    );
 
     let ResponseInputItem::FunctionCallOutput {
         output: response_output,
@@ -368,10 +377,15 @@ fn generated_output_omits_oversized_output_hint() {
     };
     assert_eq!(
         content_items,
-        vec![FunctionCallOutputContentItem::InputImage {
-            image_url: format!("data:image/png;base64,{RESULT}"),
-            detail: Some(DEFAULT_IMAGE_DETAIL),
-        }]
+        vec![
+            FunctionCallOutputContentItem::InputImage {
+                image_url: format!("data:image/png;base64,{RESULT}"),
+                detail: Some(DEFAULT_IMAGE_DETAIL),
+            },
+            FunctionCallOutputContentItem::InputText {
+                text: expected_hint.to_string(),
+            },
+        ]
     );
 }
 

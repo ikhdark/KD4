@@ -188,11 +188,9 @@ impl WriteStdinHandler {
 
 fn owner_wait_yield_time_ms(chars: &str, requested_yield_time_ms: Option<u64>) -> u64 {
     if chars.is_empty() {
-        // An empty poll is a wait for progress. A short requested yield must not
-        // repeatedly resume the model while the same silent process is running.
-        requested_yield_time_ms
-            .unwrap_or(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS)
-            .max(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS)
+        // Omitted deadlines favor unattended waits. An explicit short poll may
+        // be needed before a decision and must reach the process manager intact.
+        requested_yield_time_ms.unwrap_or(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS)
     } else {
         requested_yield_time_ms.unwrap_or_else(super::default_write_stdin_yield_time_ms)
     }
@@ -242,8 +240,8 @@ mod tests {
     #[test]
     fn empty_poll_uses_one_owner_wait_deadline() {
         assert_eq!(owner_wait_yield_time_ms("", None), 60_000);
-        assert_eq!(owner_wait_yield_time_ms("", Some(5_000)), 60_000);
-        assert_eq!(owner_wait_yield_time_ms("", Some(0)), 60_000);
+        assert_eq!(owner_wait_yield_time_ms("", Some(5_000)), 5_000);
+        assert_eq!(owner_wait_yield_time_ms("", Some(250)), 250);
         assert_eq!(owner_wait_yield_time_ms("", Some(120_000)), 120_000);
         assert_eq!(owner_wait_yield_time_ms("input", None), 250);
         assert_eq!(owner_wait_yield_time_ms("input", Some(1_000)), 1_000);

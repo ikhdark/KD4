@@ -149,7 +149,11 @@ async fn activity_after_deadline_refreshes_before_serving_catalog() {
     endpoint.wait_for_fetch_count(1).await;
     assert!(futures::poll!(&mut catalog_read).is_pending());
     endpoint.release_fetch.notify_one();
-    assert_eq!(catalog_read.await, vec![refreshed_test_model()]);
+    let mut expected_catalog = codex_models_manager::bundled_models_response()
+        .expect("bundled catalog")
+        .models;
+    expected_catalog.push(refreshed_test_model());
+    assert_eq!(catalog_read.await, expected_catalog);
     assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 1);
     worker.shutdown_and_wait().await;
 }

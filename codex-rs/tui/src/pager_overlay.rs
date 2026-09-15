@@ -962,8 +962,12 @@ fn render_offset_content(
     scroll_offset: u16,
 ) -> u16 {
     let height = renderable.desired_height(area.width);
+    let area = Rect {
+        height: area.height.min(height.saturating_sub(scroll_offset)),
+        ..area
+    };
     if renderable.render_scrolled(area, buf, scroll_offset) {
-        return area.height.min(height.saturating_sub(scroll_offset));
+        return area.height;
     }
 
     let mut tall_buf = Buffer::empty(Rect::new(

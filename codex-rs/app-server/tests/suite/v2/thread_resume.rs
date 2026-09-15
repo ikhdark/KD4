@@ -995,6 +995,7 @@ async fn thread_resume_tracks_thread_initialized_analytics() -> Result<()> {
     )?;
 
     let mut mcp = TestAppServer::builder()
+        .with_args(&["-c", "analytics.enabled=true"])
         .with_codex_home(codex_home.path())
         .without_managed_config()
         .build()
@@ -1043,6 +1044,7 @@ async fn thread_resume_running_thread_tracks_thread_originator_in_analytics() ->
     mount_analytics_capture(&server, codex_home.path()).await?;
 
     let mut mcp = TestAppServer::builder()
+        .with_args(&["-c", "analytics.enabled=true"])
         .with_codex_home(codex_home.path())
         .without_managed_config()
         .build()
@@ -3050,6 +3052,13 @@ async fn thread_resume_defers_updated_at_until_turn_start() -> Result<()> {
     )
     .await??;
 
+    // TurnStarted is ordered but buffered; terminal delivery flushes persisted activity.
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
     let read_id = mcp
         .send_thread_read_request(ThreadReadParams {
             thread_id: thread_id.clone(),
@@ -3066,12 +3075,6 @@ async fn thread_resume_defers_updated_at_until_turn_start() -> Result<()> {
         ..
     } = to_response::<ThreadReadResponse>(read_resp)?;
     assert!(after_turn_start.recency_at > before_resume.recency_at);
-
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("turn/completed"),
-    )
-    .await??;
 
     let after_turn_modified = std::fs::metadata(&rollout.rollout_file_path)?.modified()?;
     assert!(after_turn_modified > rollout.before_modified);
@@ -3311,14 +3314,14 @@ async fn thread_resume_rejects_mismatched_path_for_running_thread_id() -> Result
         responses::ev_assistant_message("msg-1", "Done"),
         responses::ev_completed("resp-1"),
     ]);
-    let second_response = responses::sse_response(responses::sse(vec![
-        responses::ev_response_created("resp-2"),
-        responses::ev_assistant_message("msg-2", "Done"),
-        responses::ev_completed("resp-2"),
-    ]))
-    .set_delay(std::time::Duration::from_millis(500));
-    let _first_response_mock = responses::mount_sse_once(&server, first_body).await;
-    let _second_response_mock = responses::mount_response_once(&server, second_response).await;
+    let _responses = responses::mount_sse_sequence(
+        &server,
+        vec![
+            first_body,
+            app_test_support::create_request_user_input_sse_response("keep-active")?,
+        ],
+    )
+    .await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
@@ -3330,6 +3333,7 @@ async fn thread_resume_rejects_mismatched_path_for_running_thread_id() -> Result
 
     let start_id = primary
         .send_thread_start_request_with_auto_env(ThreadStartParams {
+            approval_policy: Some(codex_app_server_protocol::AskForApproval::OnRequest),
             model: Some("gpt-5.4".to_string()),
             ..Default::default()
         })
@@ -3373,6 +3377,14 @@ async fn thread_resume_rejects_mismatched_path_for_running_thread_id() -> Result
                 text: "keep running".to_string(),
                 text_elements: Vec::new(),
             }],
+            collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
+                mode: codex_protocol::config_types::ModeKind::Plan,
+                settings: codex_protocol::config_types::Settings {
+                    model: "gpt-5.4".to_string(),
+                    reasoning_effort: None,
+                    developer_instructions: None,
+                },
+            }),
             ..Default::default()
         })
         .await?;
@@ -3388,6 +3400,16 @@ async fn thread_resume_rejects_mismatched_path_for_running_thread_id() -> Result
         primary.read_stream_until_notification_message("turn/started"),
     )
     .await??;
+
+    let pending_input = timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_request_message(),
+    )
+    .await??;
+    assert!(matches!(
+        pending_input,
+        ServerRequest::ToolRequestUserInput { .. }
+    ));
 
     {
         let active_path = thread.path.as_ref().expect("thread should have path");
@@ -3911,6 +3933,7 @@ async fn thread_resume_replays_pending_file_change_request_approval() -> Result<
             }],
             cwd: Some(workspace.clone()),
             approval_policy: Some(AskForApproval::UnlessTrusted),
+            sandbox_policy: Some(codex_app_server_protocol::SandboxPolicy::DangerFullAccess),
             ..Default::default()
         })
         .await?;

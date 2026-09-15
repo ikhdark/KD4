@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
+import importlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -87,6 +89,29 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
                 "python rust_build_status.py run-lane"
             )
         )
+
+    def test_focused_rust_runner_recipe_receives_rust_environment(self):
+        shell = load_just_shell_module()
+        command = (
+            "python scripts/rust_test_runner.py run-target core_lib -E 'test(retry)'"
+        )
+        observed = {}
+
+        def run_recipe(*args, **kwargs):
+            observed.update(os.environ)
+            return 7
+
+        with (
+            mock.patch.object(sys, "argv", ["just-shell.py", command]),
+            mock.patch.object(shell, "python_tool_env", return_value={}),
+            mock.patch.object(
+                shell, "rust_tool_env", return_value={"RUSTC_WRAPPER": "test-wrapper"}
+            ),
+            mock.patch.object(shell, "run_powershell", side_effect=run_recipe),
+            mock.patch.dict(os.environ),
+        ):
+            self.assertEqual(shell.main(), 7)
+        self.assertEqual(observed["RUSTC_WRAPPER"], "test-wrapper")
 
     def test_local_just_shell_sets_sccache_without_probe(self) -> None:
         just_shell = load_just_shell_module()
@@ -610,6 +635,57 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
         self.assertNotEqual(first, second)
 
+    def test_local_just_shell_reprobes_future_dated_cache(self) -> None:
+        just_shell = load_just_shell_module()
+        with tempfile.TemporaryDirectory() as directory:
+            cache_dir = Path(directory)
+            command = ["tool", "--version"]
+            just_shell.write_cached_tool_run(command, cache_dir, False)
+            future = time.time() + 86400
+            os.utime(
+                just_shell.tool_run_cache_path(command, cache_dir), (future, future)
+            )
+            with mock.patch.object(just_shell, "tool_runs", return_value=True) as run:
+                self.assertTrue(
+                    just_shell.cached_tool_runs(command, cache_dir=cache_dir)
+                )
+            run.assert_called_once_with(command)
+            self.assertTrue(just_shell.read_cached_tool_run(command, cache_dir))
+
+    def test_local_just_shell_reissues_future_dated_warning(self) -> None:
+        just_shell = load_just_shell_module()
+        with tempfile.TemporaryDirectory() as directory:
+            cache_dir = Path(directory)
+            warning = cache_dir / "fixture.warn"
+            warning.write_text("warned", encoding="utf-8")
+            future = time.time() + 86400
+            os.utime(warning, (future, future))
+            stderr = io.StringIO()
+            just_shell.warn_once(
+                "fixture", "needs setup", cache_dir=cache_dir, stderr=stderr
+            )
+            just_shell.warn_once(
+                "fixture", "needs setup", cache_dir=cache_dir, stderr=stderr
+            )
+            self.assertEqual(stderr.getvalue(), "needs setup\n")
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell is required")
+    def test_local_just_shell_rejects_prompts_without_hanging(self) -> None:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "scripts" / "just-shell.py"),
+                "$ErrorActionPreference = 'Stop'; Read-Host 'Unexpected prompt'",
+                "fixture",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("NonInteractive", completed.stderr)
+
     def test_local_just_shell_stderr_null_must_be_terminal(self) -> None:
         just_shell = load_just_shell_module()
 
@@ -639,6 +715,43 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
         self.assertEqual(result, 1)
         self.assertIn("PowerShell 7.5", stderr.getvalue())
+
+    @unittest.skipUnless(os.name == "nt", "Windows install recipe")
+    def test_windows_install_accepts_supported_powershell_versions(self) -> None:
+        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+        recipe = justfile.split("#!powershell.exe -File\n", 1)[1].split("\n\n", 1)[0]
+        recipe = recipe.replace("{{ python }}", "python").replace(
+            "{{ justfile_directory() }}", str(REPO_ROOT)
+        )
+        for version, expected_code in (
+            ("7.4.9", 2),
+            ("7.5.0", 0),
+            ("7.5.3", 0),
+            ("7.6.0", 0),
+        ):
+            with self.subTest(version=version):
+                setup = (
+                    f"function Get-TestPwshVersion {{ '{version}' }}\n"
+                    "function Get-Command { [pscustomobject]@{ Source = 'Get-TestPwshVersion' } }\n"
+                    "function rustup { $global:LASTEXITCODE = 0; 'rustup ' + ($args -join ' ') }\n"
+                    "function cargo { $global:LASTEXITCODE = 0; 'cargo invoked' }\n"
+                )
+                completed = subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-Command", setup + recipe],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, expected_code, completed.stderr)
+                self.assertEqual(
+                    "cargo invoked" in completed.stdout, expected_code == 0
+                )
+                self.assertEqual(
+                    f"rustup toolchain install {tool_versions.RUSTFMT_TOOLCHAIN} --profile minimal --component rustfmt"
+                    in completed.stdout,
+                    expected_code == 0,
+                )
 
     def test_local_just_shell_reports_powershell_launch_failure(self) -> None:
         just_shell = load_just_shell_module()
@@ -702,10 +815,9 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             self.assertNotIn(crate, members)
             self.assertFalse((REPO_ROOT / "codex-rs" / crate / "Cargo.toml").exists())
 
-        execpolicy_readme = (
-            REPO_ROOT / "codex-rs" / "execpolicy" / "README.md"
-        ).read_text()
-        self.assertNotIn("codex-execpolicy-legacy", execpolicy_readme)
+        dependencies = manifest["workspace"]["dependencies"]
+        for crate in retired_crates:
+            self.assertNotIn(f"codex-{crate}", dependencies)
 
     def test_rust_cargo_config_lets_rustc_discover_msvc_linker(self) -> None:
         config = load_toml(REPO_ROOT / "codex-rs" / ".cargo" / "config.toml")
@@ -735,9 +847,19 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         self.assertEqual(nextest["profile"]["default"]["test-threads"], 4)
         local_profile = nextest["profile"]["local"]
         self.assertEqual(local_profile["inherits"], "default")
+        self.assertEqual(local_profile["retries"], 0)
+        self.assertIs(local_profile["fail-fast"], False)
         fast_profile = nextest["profile"]["fast"]
         self.assertEqual(fast_profile["inherits"], "local")
         self.assertEqual(fast_profile["retries"], 0)
+        self.assertIs(fast_profile.get("fail-fast", local_profile["fail-fast"]), False)
+        for recipe in (
+            "core-test-fast target *args:",
+            "_core-test-lane-reserved target *args:",
+        ):
+            body = justfile.split(recipe, 1)[1].split("\n\n", 1)[0]
+            self.assertIn('$env:NEXTEST_PROFILE = "fast"', body)
+            self.assertNotIn("--fail-fast", body)
         local_app_server_override = {
             "filter": "package(codex-app-server) & kind(test)",
             "test-group": "app_server_integration_local",
@@ -843,7 +965,9 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         self.assertEqual(set(audit_ignores), set(deny_ignores))
         self.assertEqual(audit["output"]["deny"], ["yanked"])
         self.assertFalse(audit["output"]["quiet"])
-        self.assertIn("deps-audit:\n    cargo audit", justfile)
+        self.assertIn(
+            "deps-audit:\n    just deps-advisories-check\n    cargo audit", justfile
+        )
         self.assertNotIn(".github/workflows/cargo-audit.yml", justfile)
 
     def test_rust_toolchain_manifest_stays_lean_for_local_bootstrap(self) -> None:
@@ -952,6 +1076,39 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         )
         self.assertEqual(command.cwd, REPO_ROOT / "codex-rs")
         self.assertFalse(hasattr(command, "discard_stderr"))
+
+    def test_rust_formatter_does_not_read_cargo_lane_registry(self) -> None:
+        original_read_text = Path.read_text
+
+        def read_text(path, *args, **kwargs):
+            if path.name == "cargo_lane_patterns.json":
+                return "{malformed"
+            return original_read_text(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", read_text):
+            importlib.reload(tool_versions)
+            format_script = load_format_module()
+            with (
+                mock.patch.object(
+                    format_script.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess([], 0, stdout=""),
+                ) as run,
+                mock.patch("sys.stdout", io.StringIO()),
+            ):
+                self.assertEqual(format_script.main(["--only", "rust", "--check"]), 0)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(
+            list(run.call_args.args[0]),
+            [
+                "rustup",
+                "run",
+                tool_versions.RUSTFMT_TOOLCHAIN,
+                "cargo",
+                "fmt",
+                "--check",
+            ],
+        )
 
     def test_formatter_full_path_includes_prettier_targets(self) -> None:
         format_script = load_format_module()

@@ -106,6 +106,7 @@ async fn get_goal_flushes_usage_once_and_rejects_stale_turn_updates() -> anyhow:
     harness
         .record_token_usage("turn-1", &token_usage(20, 5, 8, 0, 28))
         .await;
+    let tools = harness.tools();
     for call_id in ["get-first", "get-second"] {
         let call = tool_call("get_goal", call_id, json!({}));
         let payload = call.payload.clone();
@@ -260,10 +261,7 @@ async fn delayed_set_effects_do_not_reactivate_a_paused_goal() -> anyhow::Result
         .await?;
     active.apply_runtime_effects(&harness.goal_service).await;
     let tools = harness.tools();
-    assert_eq!(
-        tool_by_name(&tools, "get_goal").exposure(),
-        ToolExposure::Deferred
-    );
+    assert_eq!(tool_names(&tools), ["create_goal"]);
     let goal = runtime
         .thread_goals()
         .get_thread_goal(thread_id)

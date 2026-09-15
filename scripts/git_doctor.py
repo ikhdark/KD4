@@ -115,7 +115,7 @@ def timed_status(timeout: float) -> GitStatusResult:
     started = time.monotonic()
     try:
         completed = run_git(
-            ["status", "--short", "--untracked-files=no"],
+            ["status", "--short", "--untracked-files=all"],
             timeout=timeout,
             discard_stdout=True,
         )
@@ -197,11 +197,11 @@ def build_report(timeout: float) -> GitDoctorReport:
     if status.timed_out:
         recs = (
             *recs,
-            f"`git status --short --untracked-files=no` exceeded {timeout:g}s.",
+            f"`git status --short --untracked-files=all` exceeded {timeout:g}s.",
         )
     elif status.failed:
         detail = f": {status.error}" if status.error else ""
-        recs = (*recs, f"`git status --short --untracked-files=no` failed{detail}.")
+        recs = (*recs, f"`git status --short --untracked-files=all` failed{detail}.")
     return GitDoctorReport(
         repo_root=root,
         platform=platform.platform(),

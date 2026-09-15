@@ -430,7 +430,7 @@ mod tests {
             ),
             make_handler(
                 HookEventName::UserPromptSubmit,
-                Some("["),
+                Some("^never_matches$"),
                 "echo second",
                 /*display_order*/ 1,
             ),

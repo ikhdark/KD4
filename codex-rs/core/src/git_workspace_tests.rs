@@ -360,28 +360,44 @@ async fn assert_workspace_evidence_cleans_filter_tree(cancel_after_spawn: bool) 
 }
 
 #[tokio::test]
-async fn ordinary_workspace_identity_accepts_256_paths_and_rejects_257() {
+async fn ordinary_workspace_identity_tracks_changes_beyond_256_dirty_paths() {
     let (_temp, repo) = create_clean_git_repo().await;
-    for index in 0..255 {
-        std::fs::write(repo.join(format!("untracked-{index}.txt")), b"").unwrap();
+    for index in 0..512 {
+        std::fs::write(repo.join(format!("untracked-{index:04}.txt")), b"before").unwrap();
     }
-    assert!(
+    let before = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .expect("initial identity");
+    assert!(!before.unavailable);
+    assert_eq!(
         capture_workspace_evidence_identity(repo.as_path())
             .await
-            .is_some()
+            .expect("unchanged identity"),
+        before
     );
-    std::fs::write(repo.join("path-256.txt"), b"").unwrap();
-    assert!(
-        capture_workspace_evidence_identity(repo.as_path())
-            .await
-            .is_some()
-    );
-    std::fs::write(repo.join("path-257.txt"), b"").unwrap();
-    assert!(
-        capture_workspace_evidence_identity(repo.as_path())
-            .await
-            .is_some_and(|identity| identity.unavailable)
-    );
+    // Keep Git status and file size unchanged, and edit beyond the former cap.
+    std::fs::write(repo.join("untracked-0511.txt"), b"after!").unwrap();
+    let after = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .expect("changed identity");
+    assert!(!after.unavailable);
+    assert_eq!(after.head_identity, before.head_identity);
+    assert_eq!(after.index_identity, before.index_identity);
+    assert_ne!(after.worktree_identity, before.worktree_identity);
+
+    run_git(repo.as_path(), &["add", "."]).await;
+    let staged_before = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .expect("staged identity");
+    assert!(!staged_before.unavailable);
+    std::fs::write(repo.join("untracked-0511.txt"), b"staged").unwrap();
+    run_git(repo.as_path(), &["add", "untracked-0511.txt"]).await;
+    let staged_after = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .expect("changed staged identity");
+    assert!(!staged_after.unavailable);
+    assert_eq!(staged_after.head_identity, staged_before.head_identity);
+    assert_ne!(staged_after.index_identity, staged_before.index_identity);
 }
 
 #[tokio::test]
@@ -393,13 +409,11 @@ async fn unavailable_workspace_capture_cannot_reuse_successful_tool_output() {
 
     let (_temp, repo) = create_clean_git_repo().await;
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
-    for index in 0..257 {
-        std::fs::write(
-            repo.join(format!("untracked-{index}.txt")),
-            "first contents",
-        )
+    std::fs::write(repo.join("untracked-0.txt"), "first contents").unwrap();
+    let oversized = std::fs::File::create(repo.join("oversized.bin")).unwrap();
+    oversized
+        .set_len(WORKSPACE_GENERATION_MAX_DECLARED_BYTES + 1)
         .unwrap();
-    }
     let before = cache.workspace_evidence_identity(repo.as_path()).await;
     assert!(before.as_ref().is_some_and(|identity| identity.unavailable));
     assert!(
@@ -580,24 +594,42 @@ fn nul_status_reader_handles_split_renames_conflicts_and_limits() {
         reader.push(format!("? {index}\0").as_bytes()).unwrap();
     }
     reader.push(b"? 0\0").unwrap();
-    assert!(reader.push(b"? path-257\0").is_none());
+    reader.push(b"? path-257\0").unwrap();
+    assert_eq!(reader.finish().unwrap().1.len(), 257);
+
+    for length in [
+        WorkspaceStatusReader::MAX_STATUS_BYTES - 1,
+        WorkspaceStatusReader::MAX_STATUS_BYTES,
+    ] {
+        let mut status = vec![b'x'; length];
+        status[..2].copy_from_slice(b"# ");
+        status[length - 1] = 0;
+        let mut reader = WorkspaceStatusReader::new();
+        assert_eq!(reader.push(&status), Some(()));
+        let (bytes, paths) = reader.finish().expect("status at the byte limit");
+        assert_eq!(bytes, status);
+        assert!(paths.is_empty());
+    }
+    let mut reader = WorkspaceStatusReader::new();
+    assert_eq!(
+        reader.push(&vec![b'x'; WorkspaceStatusReader::MAX_STATUS_BYTES]),
+        Some(())
+    );
+    assert_eq!(reader.push(b"x"), None, "the limit covers all chunks");
+
+    let mut reader = WorkspaceStatusReader::new();
+    assert_eq!(reader.push(b"? incomplete"), Some(()));
+    assert!(
+        reader.finish().is_none(),
+        "EOF must reject an unfinished record"
+    );
+    let mut reader = WorkspaceStatusReader::new();
+    assert_eq!(reader.push(b"x unknown\0"), None);
 }
 
 #[tokio::test]
-async fn workspace_generation_metadata_fails_closed_at_resource_bounds() {
+async fn workspace_generation_metadata_fails_closed_at_byte_bound() {
     let temp = TempDir::new().expect("metadata fixture");
-    let paths = (0..=WORKSPACE_GENERATION_MAX_PATHS)
-        .map(|index| format!("path-{index:04}.txt"))
-        .collect::<Vec<_>>();
-    for path in &paths {
-        std::fs::write(temp.path().join(path), []).expect("write metadata fixture");
-    }
-    assert!(
-        workspace_generation_metadata(temp.path().to_path_buf(), paths)
-            .await
-            .is_none()
-    );
-
     let large_path = temp.path().join("large.bin");
     let large = std::fs::File::create(&large_path).expect("create sparse large fixture");
     large
@@ -1212,7 +1244,10 @@ async fn workspace_evidence_root_resolution_accepts_nested_working_directories()
     );
     std::fs::write(repo.join("README.md"), "nested-capture external edit\n")
         .expect("edit tracked content");
-    let changed = cache.workspace_evidence_identity(&nested).await.expect("changed identity");
+    let changed = cache
+        .workspace_evidence_identity(&nested)
+        .await
+        .expect("changed identity");
     assert!(!changed.unavailable);
     assert_eq!(changed.repository_root, nested_identity.repository_root);
     assert_ne!(changed.worktree_identity, nested_identity.worktree_identity);
@@ -1248,7 +1283,9 @@ async fn concurrent_workspace_evidence_capture_coalesces_without_crossing_mutati
         .expect("same-epoch workspace evidence capture should join the in-flight capture");
     assert_eq!(cache.workspace_evidence_capture_count(), 1);
 
-    cache.note_host_workspace_mutation_paths(repo.as_path(), &["README.md".to_string()]).await;
+    cache
+        .note_host_workspace_mutation_paths(repo.as_path(), &["README.md".to_string()])
+        .await;
     let third_cache = Arc::clone(&cache);
     let third_repo = repo.clone();
     let third = tokio::spawn(async move {
@@ -1267,7 +1304,7 @@ async fn concurrent_workspace_evidence_capture_coalesces_without_crossing_mutati
 }
 
 #[tokio::test]
-async fn workspace_evidence_identity_excludes_codex_eval_artifacts() {
+async fn workspace_evidence_identity_tracks_codex_eval_files_unless_gitignored() {
     let (_temp, repo) = create_clean_git_repo().await;
     let eval_dir = repo.join(".codex").join("evals");
     std::fs::create_dir_all(&eval_dir).expect("create eval directory");
@@ -1282,7 +1319,35 @@ async fn workspace_evidence_identity_excludes_codex_eval_artifacts() {
         .await
         .expect("second identity");
 
-    assert_eq!(second, first);
+    assert!(!first.unavailable && !second.unavailable);
+    assert_ne!(second.worktree_identity, first.worktree_identity);
+
+    std::fs::write(repo.join(".gitignore"), ".codex/evals/\n").unwrap();
+    let ignored = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .expect("ignored identity");
+    assert!(!ignored.unavailable);
+    std::fs::write(&eval_artifact, "ignored edit\n").unwrap();
+    assert_eq!(
+        capture_workspace_evidence_identity(repo.as_path()).await,
+        Some(ignored)
+    );
+
+    workspace_generation_git_output(
+        repo.as_path(),
+        &["add", "--force", ".codex/evals/generated.jsonl"],
+    )
+    .await
+    .expect("track eval file despite ignore rule");
+    let tracked = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .expect("tracked identity");
+    std::fs::write(&eval_artifact, "tracked edit\n").unwrap();
+    let changed = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .expect("tracked edit identity");
+    assert!(!tracked.unavailable && !changed.unavailable);
+    assert_ne!(changed.worktree_identity, tracked.worktree_identity);
 }
 
 #[tokio::test]
@@ -1381,10 +1446,14 @@ async fn source_path_observation_ignores_unrelated_changes_and_fails_open() {
         .begin_source_path_change_observation(root.path(), &source, false)
         .await
         .expect("path observation");
-    cache.note_host_workspace_mutation_paths(root.path(), &["README.md".to_string()]).await;
+    cache
+        .note_host_workspace_mutation_paths(root.path(), &["README.md".to_string()])
+        .await;
     assert!(cache.source_path_change_observation_is_current(&observation));
 
-    cache.note_host_workspace_mutation_paths(root.path(), &["src/lib.rs".to_string()]).await;
+    cache
+        .note_host_workspace_mutation_paths(root.path(), &["src/lib.rs".to_string()])
+        .await;
     assert!(!cache.source_path_change_observation_is_current(&observation));
 
     let uncertain = cache
@@ -1399,7 +1468,9 @@ async fn source_path_observation_ignores_unrelated_changes_and_fails_open() {
         .await
         .expect("overflow path observation");
     for index in 0..=SOURCE_CHANGE_JOURNAL_CAPACITY {
-        cache.note_host_workspace_mutation_paths(root.path(), &[format!("unrelated/{index}.txt")]).await;
+        cache
+            .note_host_workspace_mutation_paths(root.path(), &[format!("unrelated/{index}.txt")])
+            .await;
     }
     assert!(!cache.source_path_change_observation_is_current(&overflowed));
 }
@@ -1484,7 +1555,9 @@ async fn recursive_source_path_observation_detects_descendant_changes() {
         .await
         .expect("recursive path observation");
 
-    cache.note_host_workspace_mutation_paths(root.path(), &["src/nested/lib.rs".to_string()]).await;
+    cache
+        .note_host_workspace_mutation_paths(root.path(), &["src/nested/lib.rs".to_string()])
+        .await;
 
     assert!(!cache.source_path_change_observation_is_current(&observation));
 }
@@ -1747,4 +1820,152 @@ async fn git_watch_worker_root_replacement_retires_only_previous_registration() 
     drop(second);
     drop(cache);
     probe.wait_for(2, true).await;
+}
+
+#[tokio::test]
+async fn remote_workspace_evidence_tracks_content_deletions_and_capture_failures() {
+    use base64::Engine;
+    use futures::SinkExt;
+    use serde_json::json;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let stage = Arc::new(AtomicUsize::new(0));
+    let server_stage = Arc::clone(&stage);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        while let Some(frame) = socket.next().await {
+            let frame = frame.unwrap();
+            if frame.is_close() {
+                break;
+            }
+            let request: serde_json::Value = serde_json::from_slice(&frame.into_data()).unwrap();
+            let current = server_stage.load(Ordering::SeqCst);
+            let method = request["method"].as_str().unwrap();
+            let result = match method {
+                "initialize" => json!({"sessionId": "remote-evidence-test"}),
+                "initialized" => continue,
+                "environment/info" => {
+                    json!({"operatingSystem": "windows", "shell": {"name": "powershell", "path": "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"}, "cwd": "file:///C:/remote-evidence"})
+                }
+                "fs/canonicalize" => json!({"path": request["params"]["path"]}),
+                "fs/getMetadata" => {
+                    let path = request["params"]["path"].as_str().unwrap();
+                    let missing = (current == 2 && path.ends_with("/tracked.txt"))
+                        || (current == 4 && path.ends_with("/.git"))
+                        || current == 5;
+                    if missing || current == 3 {
+                        socket.send(Message::Text(json!({"id": request["id"], "error": {"code": if current == 3 { -32000 } else { -32004 }, "message": "fixture metadata failure"}}).to_string().into())).await.unwrap();
+                        continue;
+                    }
+                    let file = path.ends_with("/tracked.txt");
+                    json!({"isDirectory": !file, "isFile": file, "isSymlink": false, "size": if file { 3 } else { 0 }, "createdAtMs": 0, "modifiedAtMs": 0})
+                }
+                "process/start" => {
+                    assert_eq!(request["params"]["argv"][0], "git");
+                    assert_eq!(request["params"]["cwd"], "file:///C:/remote-evidence");
+                    json!({"processId": request["params"]["processId"]})
+                }
+                "process/read" => {
+                    let status = if current == 2 {
+                        "# branch.oid abc123\0# branch.head main\01 .D N... 100644 100644 000000 abc123 abc123 tracked.txt\0"
+                    } else {
+                        "# branch.oid abc123\0# branch.head main\0? tracked.txt\0"
+                    };
+                    json!({"chunks": [{"seq": 1, "stream": "stdout", "chunk": base64::engine::general_purpose::STANDARD.encode(status)}], "nextSeq": 4, "exited": true, "exitCode": 0, "closed": true, "failure": null, "sandboxDenied": false})
+                }
+                "fs/open" => json!({"handleId": request["params"]["handleId"]}),
+                "fs/readBlock" => {
+                    json!({"chunk": base64::engine::general_purpose::STANDARD.encode(if current == 0 { b"aaa" } else { b"bbb" }), "eof": true})
+                }
+                "fs/close" => json!({}),
+                other => panic!("unexpected remote evidence request: {other}"),
+            };
+            socket
+                .send(Message::Text(
+                    json!({"id": request["id"], "result": result})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+        }
+    });
+    let environment = Arc::new(
+        codex_exec_server::Environment::create_for_tests(Some(format!("ws://{address}"))).unwrap(),
+    );
+    let selected = TurnEnvironmentSnapshot {
+        generation: 1,
+        turn_environments: vec![TurnEnvironment::new(
+            "remote-evidence".to_string(),
+            environment,
+            PathUri::parse("file:///C:/remote-evidence").unwrap(),
+            None,
+        )],
+        starting: Vec::new(),
+    };
+    // A valid host directory must not supply the identity for this remote root.
+    let host = TempDir::new().unwrap();
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let first = cache
+        .workspace_evidence_for_environment(&selected, host.path(), host.path())
+        .await
+        .identity
+        .unwrap();
+    assert!(!first.unavailable);
+    assert!(
+        first
+            .repository_root
+            .as_ref()
+            .unwrap()
+            .ends_with(":file:///C:/remote-evidence")
+    );
+    stage.store(1, Ordering::SeqCst);
+    let changed = cache
+        .workspace_evidence_for_environment(&selected, host.path(), host.path())
+        .await
+        .identity
+        .unwrap();
+    assert_eq!(first.index_identity, changed.index_identity);
+    assert_ne!(
+        first.worktree_identity, changed.worktree_identity,
+        "same-size content changes must invalidate remote evidence"
+    );
+    stage.store(2, Ordering::SeqCst);
+    let deleted = cache
+        .workspace_evidence_for_environment(&selected, host.path(), host.path())
+        .await
+        .identity
+        .unwrap();
+    assert!(!deleted.unavailable);
+    assert_ne!(changed.worktree_identity, deleted.worktree_identity);
+    stage.store(3, Ordering::SeqCst);
+    assert!(
+        cache
+            .workspace_evidence_for_environment(&selected, host.path(), host.path())
+            .await
+            .identity
+            .unwrap()
+            .unavailable
+    );
+    stage.store(4, Ordering::SeqCst);
+    assert_eq!(
+        cache
+            .workspace_evidence_for_environment(&selected, host.path(), host.path())
+            .await
+            .identity,
+        None
+    );
+    stage.store(5, Ordering::SeqCst);
+    assert!(
+        cache
+            .workspace_evidence_for_environment(&selected, host.path(), host.path())
+            .await
+            .identity
+            .unwrap()
+            .unavailable
+    );
+    server.abort();
 }

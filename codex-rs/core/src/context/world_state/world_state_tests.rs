@@ -312,10 +312,13 @@ fn snapshot_merge_patch_changes_and_removes_nested_values() {
         ]),
     };
     let current = WorldStateSnapshot {
-        sections: BTreeMap::from([(
-            "kept".to_string(),
-            json!({"same": true, "changed": "after"}),
-        )]),
+        sections: BTreeMap::from([
+            (
+                "kept".to_string(),
+                json!({"same": true, "changed": "after"}),
+            ),
+            ("added_section".to_string(), json!({"items": [1, 2]})),
+        ]),
     };
 
     assert_eq!(
@@ -323,6 +326,7 @@ fn snapshot_merge_patch_changes_and_removes_nested_values() {
         Some(json!({
             "kept": {"changed": "after", "removed": null},
             "removed_section": null,
+            "added_section": {"items": [1, 2]},
         }))
     );
     previous

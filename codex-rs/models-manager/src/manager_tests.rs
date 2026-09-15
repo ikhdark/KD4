@@ -807,7 +807,7 @@ fn openai_manager_for_tests_with_auth(
 }
 
 #[tokio::test]
-async fn offline_refresh_checks_cache_identity_once_before_the_cache_read() {
+async fn offline_refresh_revalidates_identity_at_cache_and_catalog_boundaries() {
     let codex_home = tempdir().expect("temp dir");
     let identity_reads = Arc::new(AtomicUsize::new(0));
     let identity_reads_for_cache = Arc::clone(&identity_reads);
@@ -831,13 +831,17 @@ async fn offline_refresh_checks_cache_identity_once_before_the_cache_read() {
     .await
     .expect("offline cache refresh should succeed");
 
-    assert_eq!(identity_reads.load(Ordering::SeqCst), 2);
+    // Validate before loading, after acquiring cache I/O, and before publishing the catalog.
+    assert_eq!(identity_reads.load(Ordering::SeqCst), 3);
     assert_eq!(endpoint.eligibility_count.load(Ordering::SeqCst), 0);
     assert!(catalog.models.iter().any(|model| model.slug == "gpt-5.4"));
 }
 
 #[tokio::test]
-#[expect(clippy::await_holding_invalid_type, reason = "Holds a reader to prove model lookup needs no exclusive state access")]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Holds a reader to prove model lookup needs no exclusive state access"
+)]
 async fn unchanged_identity_model_lookup_does_not_need_exclusive_state_access() {
     let codex_home = tempdir().expect("temp dir");
     let manager = openai_manager_for_tests(

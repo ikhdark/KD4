@@ -210,6 +210,7 @@ model_reasoning_effort = "minimal"
 }
 
 fn set_turn_config(turn: &mut TurnContext, config: crate::config::Config) {
+    turn.model_info.supports_search_tool = false;
     turn.multi_agent_version = config.multi_agent_version_from_features();
     turn.config = Arc::new(config);
 }
@@ -555,7 +556,7 @@ async fn spawn_agent_validates_role_locked_reasoning_against_requested_model() {
     assert_eq!(
         result.err(),
         Some(FunctionCallError::RespondToModel(
-            "Reasoning effort `ultra` is not supported for model `gpt-5.6-luna`. Supported reasoning efforts: low, medium, high, xhigh, max"
+            "Reasoning effort `ultra` is not supported for model `gpt-5.6-luna`. Supported reasoning efforts: none, low, medium, high, xhigh, max"
                 .to_string()
         ))
     );
@@ -1223,7 +1224,7 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
 }
 
 #[tokio::test]
-async fn multi_agent_v2_spawn_reuses_completed_explorer_result() {
+async fn multi_agent_v2_spawn_does_not_reuse_completed_explorer_without_input_fingerprint() {
     let (mut session, mut turn) = make_session_and_context().await;
     let mut config = (*turn.config).clone();
     config
@@ -1330,7 +1331,7 @@ async fn multi_agent_v2_spawn_reuses_completed_explorer_result() {
         .await
         .expect("explorer result should seal");
 
-    let reused = SpawnAgentHandlerV2::default()
+    let fresh = SpawnAgentHandlerV2::default()
         .handle(invocation(
             Arc::clone(&session),
             Arc::clone(&turn),
@@ -1338,35 +1339,39 @@ async fn multi_agent_v2_spawn_reuses_completed_explorer_result() {
             assignment(&second_name),
         ))
         .await
-        .expect("duplicate explorer should reuse the sealed result");
-    let (content, success) = expect_text_output(reused);
-    let reused_result: serde_json::Value =
-        serde_json::from_str(&content).expect("reused spawn result should be json");
+        .expect("completed evidence without an input fingerprint requires a fresh explorer");
+    let (content, success) = expect_text_output(fresh);
+    let fresh_result: serde_json::Value =
+        serde_json::from_str(&content).expect("fresh spawn result should be json");
     assert_eq!(success, Some(true));
-    assert_eq!(reused_result["reused"], true);
-    assert_eq!(reused_result["assignment_id"], assignment_id.to_string());
-    assert_eq!(reused_result["attempt_id"], binding.attempt_id.to_string());
-    assert_eq!(reused_result["task_name"], binding.agent_path.as_str());
-    assert_eq!(reused_result["agent_path"], binding.agent_path);
-    assert_eq!(reused_result["thread_id"], first_thread_id.to_string());
-    assert_eq!(reused_result["status"], "completed");
-    assert_eq!(reused_result["receipt_available"], true);
-    assert_eq!(reused_result["integration_plan"], "single_writer");
-    let duplicate_path = AgentPath::root()
+    assert_ne!(fresh_result["reused"], true);
+    assert_ne!(fresh_result["assignment_id"], assignment_id.to_string());
+    assert_ne!(fresh_result["attempt_id"], binding.attempt_id.to_string());
+    let fresh_path = AgentPath::root()
         .join(&second_name)
-        .expect("duplicate candidate path is valid");
-    assert!(
-        agent_control
-            .task_coordinator()
-            .binding_for_agent_path(&duplicate_path)
-            .is_none(),
-        "reuse must not bind or launch a second child"
+        .expect("fresh candidate path is valid");
+    let fresh_binding = agent_control
+        .task_coordinator()
+        .binding_for_agent_path(&fresh_path)
+        .expect("fresh explorer must bind a new child");
+    assert_eq!(
+        fresh_result["assignment_id"],
+        fresh_binding.assignment_id.to_string()
     );
-
-    let _ = agent_control
-        .shutdown_live_agent(first_thread_id)
-        .await
-        .expect("reused explorer child shuts down");
+    let fresh_thread_id = ThreadId::from_string(
+        fresh_binding
+            .thread_id
+            .as_deref()
+            .expect("fresh child thread id"),
+    )
+    .expect("fresh child thread id parses");
+    assert_ne!(fresh_thread_id, first_thread_id);
+    for thread_id in [first_thread_id, fresh_thread_id] {
+        let _ = agent_control
+            .shutdown_live_agent(thread_id)
+            .await
+            .expect("explorer child shuts down");
+    }
 }
 
 #[tokio::test]
@@ -2328,6 +2333,12 @@ async fn multi_agent_v2_registered_message_batch_preserves_delivery_and_partial_
             },
             &Default::default(),
         ));
+        let requested_tool_name = invocation.tool_name.name.clone();
+        invocation.tool_name = router
+            .registered_tool_names_for_test()
+            .into_iter()
+            .find(|name| name.name == requested_tool_name)
+            .expect("registered message tool");
         assert!(invocation.step_context.set_tool_router(router).is_ok());
         let runtime = crate::tools::parallel::ToolCallRuntime::new(
             invocation.session,
@@ -2352,6 +2363,14 @@ async fn multi_agent_v2_registered_message_batch_preserves_delivery_and_partial_
     }
 
     let (mut session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("enable v2");
+    // Keep the root and all three recipients resident while exercising message delivery.
+    config.multi_agent_v2.max_concurrent_threads_per_session = 4;
+    set_turn_config(&mut turn, config);
     let manager = thread_manager();
     let root = manager
         .start_thread((*turn.config).clone())
@@ -2363,12 +2382,6 @@ async fn multi_agent_v2_registered_message_batch_preserves_delivery_and_partial_
         .expect("other session");
     session.services.agent_control = manager.agent_control();
     session.thread_id = root.thread_id;
-    let mut config = (*turn.config).clone();
-    config
-        .features
-        .enable(Feature::MultiAgentV2)
-        .expect("enable v2");
-    set_turn_config(&mut turn, config);
     let session = Arc::new(session);
     let turn = Arc::new(turn);
     for name in ["batch_one", "batch_two", "unselected"] {
@@ -3303,7 +3316,7 @@ async fn multi_agent_v2_send_message_rejects_interrupt_parameter() {
         panic!("expected model-facing parse error");
     };
     assert!(message.starts_with(
-        "failed to parse function arguments: unknown field `interrupt`, expected `target` or `message`"
+        "failed to parse function arguments: unknown field `interrupt`, expected one of `target`, `targets`, `message`"
     ));
 
     let ops = manager.captured_ops();
@@ -5409,7 +5422,22 @@ async fn multi_agent_v2_wait_agent_wakes_on_any_mailbox_notification() {
     assert_eq!(result.message, "Wait completed.");
     assert!(!result.timed_out);
     assert!(result.cursor.is_some());
-    assert_eq!(result.typed_deltas.len(), 2);
+    for task_name in ["worker_a", "worker_b"] {
+        let agent_path = AgentPath::root().join(task_name).expect("worker path");
+        let binding = session
+            .services
+            .agent_control
+            .task_coordinator()
+            .binding_for_agent_path(&agent_path)
+            .expect("worker assignment");
+        assert!(
+            result
+                .typed_deltas
+                .iter()
+                .any(|delta| { delta["assignment_id"] == binding.assignment_id.to_string() }),
+            "wait must include the worker's durable progress"
+        );
+    }
     assert_eq!(success, None);
 }
 
@@ -6336,7 +6364,10 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
     expected.base_instructions = Some(turn.base_instructions.text.clone());
     expected.model = Some(turn.model_info.slug.clone());
     expected.model_provider = turn.provider.info().clone();
-    expected.model_reasoning_effort = turn.reasoning_effort.clone();
+    expected.model_reasoning_effort = turn
+        .reasoning_effort
+        .clone()
+        .or_else(|| turn.model_info.default_reasoning_level.clone());
     expected.model_reasoning_summary = Some(turn.reasoning_summary);
     expected.developer_instructions = turn.developer_instructions.clone();
     expected.cwd = turn.cwd().clone();
@@ -6413,7 +6444,10 @@ async fn build_agent_resume_config_clears_base_instructions() {
     expected.base_instructions = None;
     expected.model = Some(turn.model_info.slug.clone());
     expected.model_provider = turn.provider.info().clone();
-    expected.model_reasoning_effort = turn.reasoning_effort.clone();
+    expected.model_reasoning_effort = turn
+        .reasoning_effort
+        .clone()
+        .or_else(|| turn.model_info.default_reasoning_level.clone());
     expected.model_reasoning_summary = Some(turn.reasoning_summary);
     expected.developer_instructions = turn.developer_instructions.clone();
     expected.cwd = turn.cwd().clone();

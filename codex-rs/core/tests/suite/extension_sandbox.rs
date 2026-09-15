@@ -155,6 +155,7 @@ async fn extension_tool_receives_turn_environment_sandbox() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(codex_home)]
 async fn extension_tool_uses_granted_turn_permissions_without_local_persistence() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -186,6 +187,7 @@ async fn extension_tool_uses_granted_turn_permissions_without_local_persistence(
             model_info.input_modalities = vec![InputModality::Text, InputModality::Image];
         })
         .with_config(move |config| {
+            config.set_windows_elevated_sandbox_enabled(true);
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
             config
                 .permissions

@@ -459,6 +459,40 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
         self.assertEqual(args.model_attempt_jsonl, [Path("attempts.jsonl")])
         self.assertEqual(args.model_attempt_report, Path("report.txt"))
 
+    def test_model_attempt_jsonl_loader_preserves_outer_event_fields(self) -> None:
+        for alias in ("event.name", "event_name"):
+            for nested_key in ("fields", "attributes", "body"):
+                with self.subTest(alias=alias, nested_key=nested_key):
+                    values = [
+                        {
+                            alias: "codex.model_attempt",
+                            "attempt_id": "outer",
+                            "outcome": "success",
+                            nested_key: {
+                                "event.name": "codex.model_context_component",
+                                "attempt_id": "nested",
+                                "outcome": "failed",
+                                "duration_ms": 123,
+                            },
+                        },
+                        {
+                            alias: "unrelated.event",
+                            nested_key: {"event.name": "codex.model_attempt"},
+                        },
+                    ]
+                    with tempfile.TemporaryDirectory() as tempdir:
+                        path = Path(tempdir) / "attempts.jsonl"
+                        path.write_text(
+                            "\n".join(json.dumps(value) for value in values),
+                            encoding="utf-8",
+                        )
+                        records, exclusions = kd4_model_attempt_analysis.load_jsonl([path])
+                    self.assertEqual(len(records), 1)
+                    self.assertEqual(records[0]["attempt_id"], "outer")
+                    self.assertEqual(records[0]["outcome"], "success")
+                    self.assertEqual(records[0]["duration_ms"], 123)
+                    self.assertEqual(exclusions, {"not_model_attempt": 1})
+
     def test_model_attempt_jsonl_loader_deduplicates_overlapping_files(self) -> None:
         attempt = {
             "event.name": "codex.model_attempt",

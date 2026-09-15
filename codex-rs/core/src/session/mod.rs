@@ -1168,7 +1168,9 @@ pub(crate) fn session_loop_termination_from_handle(
     handle: JoinHandle<()>,
 ) -> SessionLoopTermination {
     async move {
-        let _ = handle.await;
+        if let Err(err) = handle.await {
+            error!(%err, "session loop terminated unexpectedly");
+        }
     }
     .boxed()
     .shared()
@@ -1359,7 +1361,7 @@ impl StartupRolloutFacts {
                     if let EventMsg::TokenCount(event) = event
                         && let Some(info) = event.info.as_ref()
                     {
-                        last_token_info = Some(info.clone());
+                        last_token_info = Some(info);
                     }
                 }
                 RolloutItem::InterAgentCommunication(communication) => {
@@ -1378,10 +1380,18 @@ impl StartupRolloutFacts {
             initial_messages,
             mailbox_communication_ids,
             has_prior_user_turns: prior_user_turns.has_prior_user_turns(),
-            last_token_info,
+            last_token_info: last_token_info.cloned(),
             reconstructed_provider_id: persisted_settings.into_settings().model_provider_id,
         }
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ThreadSettingsUpdateError {
+    #[error("invalid thread settings override: {0}")]
+    Invalid(#[from] codex_config::ConstraintError),
+    #[error("failed to persist thread settings override: {0}")]
+    Persistence(#[from] std::io::Error),
 }
 
 impl Session {
@@ -1633,6 +1643,10 @@ impl Session {
             let state = self.state.lock().await;
             state.session_configuration.thread_config_snapshot()
         };
+        Self::thread_settings_event_from_snapshot(snapshot)
+    }
+
+    fn thread_settings_event_from_snapshot(snapshot: ThreadConfigSnapshot) -> EventMsg {
         let cwd = snapshot.cwd().clone();
         let sandbox_policy = snapshot.sandbox_policy();
         EventMsg::ThreadSettingsApplied(ThreadSettingsAppliedEvent {
@@ -1844,14 +1858,19 @@ impl Session {
                     .filter(|model| *model != curr)
                 {
                     warn!("resuming session with different model: previous={prev}, current={curr}");
-                    self.send_event(
-                        &turn_context,
-                        EventMsg::Warning(WarningEvent {
-                            message: format!(
-                                "This session was recorded with model `{prev}` but is resuming with `{curr}`. \
+                    // A resume-time configuration warning is live feedback, not a
+                    // new turn: leave persisted history and its mtime untouched.
+                    self.send_event_raw_with_persistence(
+                        Event {
+                            id: turn_context.sub_id.clone(),
+                            msg: EventMsg::Warning(WarningEvent {
+                                message: format!(
+                                    "This session was recorded with model `{prev}` but is resuming with `{curr}`. \
                          Consider switching back to `{prev}` as it may affect Codex performance."
-                            ),
-                        }),
+                                ),
+                            }),
+                        },
+                        /*persist*/ false,
                     )
                     .await;
                 }
@@ -1865,8 +1884,15 @@ impl Session {
 
                 // Defer seeding the session's initial context until the first turn starts so
                 // turn/start overrides can be merged before we write to the rollout.
-                if !is_subagent {
-                    let _ = self.flush_rollout().await;
+                if !is_subagent && let Err(err) = self.flush_rollout().await {
+                    warn!(%err, "failed to flush resumed rollout");
+                    self.send_event(
+                        &turn_context,
+                        EventMsg::Warning(WarningEvent {
+                            message: format!("Could not save the resumed session history: {err}"),
+                        }),
+                    )
+                    .await;
                 }
             }
             InitialHistory::Forked(mut rollout_items) => {
@@ -1908,8 +1934,15 @@ impl Session {
                 self.ensure_rollout_materialized().await;
 
                 // Flush after seeding history and any persisted rollout copy.
-                if !is_subagent {
-                    let _ = self.flush_rollout().await;
+                if !is_subagent && let Err(err) = self.flush_rollout().await {
+                    warn!(%err, "failed to flush forked rollout");
+                    self.send_event(
+                        &turn_context,
+                        EventMsg::Warning(WarningEvent {
+                            message: format!("Could not save the forked session history: {err}"),
+                        }),
+                    )
+                    .await;
                 }
             }
         }
@@ -1953,6 +1986,7 @@ impl Session {
     ) -> Option<PreviousTurnSettings> {
         let rollout_reconstruction::RolloutReconstruction {
             mut history,
+            plan,
             mut previous_turn_settings,
             reference_context_item,
             world_state_baseline,
@@ -1980,10 +2014,15 @@ impl Session {
         // will be processed again if the rollout is reconstructed in a future session.
         // This meets image resizing requirements without modifying persisted rollouts.
         prepare_response_items(&mut history);
-        self.services
-            .plan_store
-            .restore_from_history(&history)
-            .await;
+        if let Some(plan) = plan {
+            self.services.plan_store.restore(Some(plan)).await;
+        } else {
+            // Older rollouts only carried checklist state in direct tool output.
+            self.services
+                .plan_store
+                .restore_from_history(&history)
+                .await;
+        }
         let prefix_tokens = if matches!(
             turn_context.config.model_auto_compact_token_limit_scope,
             AutoCompactTokenLimitScope::BodyAfterPrefix
@@ -2060,12 +2099,45 @@ impl Session {
             .map(|_| ())
     }
 
-    #[expect(clippy::await_holding_invalid_type, reason = "Serialize settings projection and commit against concurrent accepted updates")]
     async fn update_settings_and_get(
         &self,
         updates: &SessionSettingsUpdate,
         serialize_turn: bool,
     ) -> ConstraintResult<SessionConfiguration> {
+        match self
+            .update_settings_and_get_inner(updates, serialize_turn, false)
+            .await
+        {
+            Ok(configuration) => Ok(configuration),
+            Err(ThreadSettingsUpdateError::Invalid(error)) => Err(error),
+            Err(ThreadSettingsUpdateError::Persistence(_)) => {
+                unreachable!("non-durable settings updates do not write persistence")
+            }
+        }
+    }
+
+    pub(crate) async fn update_settings_durable(
+        &self,
+        updates: &SessionSettingsUpdate,
+    ) -> Result<EventMsg, ThreadSettingsUpdateError> {
+        let configuration = self
+            .update_settings_and_get_inner(updates, true, true)
+            .await?;
+        Ok(Self::thread_settings_event_from_snapshot(
+            configuration.thread_config_snapshot(),
+        ))
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serialize settings projection, persistence and commit against concurrent accepted updates"
+    )]
+    async fn update_settings_and_get_inner(
+        &self,
+        updates: &SessionSettingsUpdate,
+        serialize_turn: bool,
+        persist: bool,
+    ) -> Result<SessionConfiguration, ThreadSettingsUpdateError> {
         // Workspace roots materialize the profile's project-root entries, so
         // changing them can also replace the managed proxy.
         let _refresh_guard = if serialize_turn
@@ -2088,7 +2160,7 @@ impl Session {
                 Ok(updated) => updated,
                 Err(err) => {
                     warn!("rejected session settings update: {err}");
-                    return Err(err);
+                    return Err(ThreadSettingsUpdateError::Invalid(err));
                 }
             };
 
@@ -2116,6 +2188,14 @@ impl Session {
                 .then(|| Self::build_effective_session_config(&state.session_configuration));
             let new_config =
                 notify_config_contributors.then(|| Self::build_effective_session_config(&updated));
+            if persist {
+                let event =
+                    Self::thread_settings_event_from_snapshot(updated.thread_config_snapshot());
+                self.persist_rollout_items_durable(&[RolloutItem::EventMsg(event)])
+                    .await?;
+            }
+            // No await separates successful durability from publishing the configuration
+            // and its prepared proxy. Failed writes leave both accepted values intact.
             state.session_configuration = updated.clone();
             if let Some(proxy) = prepared_proxy {
                 self.services.network_proxy.store(proxy);
@@ -2193,14 +2273,17 @@ impl Session {
         next_config: Config,
         refreshed_features: &[Feature],
     ) {
+        // Serialize refreshes with environment/profile updates while preparing
+        // the hooks that will be published with this configuration.
+        let Ok(_refresh_guard) = self.managed_network_proxy_refresh_lock.acquire().await else {
+            unreachable!("managed network proxy refresh semaphore is never closed");
+        };
         // Refresh only the user layer from the incoming snapshot. Preserve thread-local
         // layers such as request/session overrides that were present when this session
         // was created.
         let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
-        let (previous_config, new_config, config) = {
-            let mut state = self.state.lock().await;
-            let previous_config = notify_config_contributors
-                .then(|| Self::build_effective_session_config(&state.session_configuration));
+        let config = {
+            let state = self.state.lock().await;
             let mut config = (*state.session_configuration.original_config_do_not_use).clone();
             config.config_layer_stack = config
                 .config_layer_stack
@@ -2218,13 +2301,8 @@ impl Session {
             }
             config.tool_suggest =
                 resolve_tool_suggest_config_from_layer_stack(&config.config_layer_stack);
-            let config = Arc::new(config);
-            state.session_configuration.original_config_do_not_use = Arc::clone(&config);
-            let new_config = notify_config_contributors
-                .then(|| Self::build_effective_session_config(&state.session_configuration));
-            (previous_config, new_config, config)
+            Arc::new(config)
         };
-        self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
         self.services.skills_service.clear_cache();
         self.services.plugins_manager.clear_cache();
         let environments = self.services.turn_environments.snapshot().await;
@@ -2235,15 +2313,19 @@ impl Session {
         )
         .await;
 
-        let state = self.state.lock().await;
-        // A newer refresh may have updated the config while this hook build was in flight.
-        // Only publish hooks derived from the current config snapshot.
-        if Arc::ptr_eq(
-            &state.session_configuration.original_config_do_not_use,
-            &config,
-        ) {
+        let (previous_config, new_config) = {
+            let mut state = self.state.lock().await;
+            let previous_config = notify_config_contributors
+                .then(|| Self::build_effective_session_config(&state.session_configuration));
+            // Cancellation during hook discovery leaves both accepted values intact.
+            // Preserve ordinary session updates accepted while the build was pending.
+            state.session_configuration.original_config_do_not_use = config;
             self.services.hooks.store(Arc::new(hooks));
-        }
+            let new_config = notify_config_contributors
+                .then(|| Self::build_effective_session_config(&state.session_configuration));
+            (previous_config, new_config)
+        };
+        self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
     }
 
     fn emit_config_changed_contributors(
@@ -2383,7 +2465,10 @@ impl Session {
 
     /// Publish the original terminal outcome once, retaining its actual live-delivery receipt.
     /// Parent notification is a separate finalizer phase so recovery can finish it independently.
-    #[expect(clippy::expect_used, reason = "Terminal dispatch retains the original terminal source before delivery")]
+    #[expect(
+        clippy::expect_used,
+        reason = "Terminal dispatch retains the original terminal source before delivery"
+    )]
     pub(crate) async fn publish_terminal_event(
         &self,
         turn_context: &TurnContext,
@@ -3163,7 +3248,7 @@ impl Session {
             .environments
             .turn_environments
             .iter()
-            .find(|turn_environment| turn_environment.selection() == environment)
+            .find(|turn_environment| turn_environment.environment_id == environment.environment_id)
             .map(|turn_environment| turn_environment.environment.approval_scope_id().to_string());
         let approval_scope_id = if approval_scope_id.is_none()
             && turn_context
@@ -3177,7 +3262,9 @@ impl Session {
                 .await
                 .turn_environments
                 .iter()
-                .find(|turn_environment| turn_environment.selection() == environment)
+                .find(|turn_environment| {
+                    turn_environment.environment_id == environment.environment_id
+                })
                 .map(|turn_environment| {
                     turn_environment.environment.approval_scope_id().to_string()
                 })
@@ -3547,7 +3634,12 @@ impl Session {
                 {
                     return;
                 }
-                entry.tx_response.send(response).ok();
+                if entry.tx_response.send(response).is_err() {
+                    warn!(
+                        call_id,
+                        "request permissions response arrived after its receiver closed"
+                    );
+                }
             }
             None => {
                 warn!("No pending request_permissions found for call_id: {call_id}");
@@ -3678,7 +3770,12 @@ impl Session {
         };
         match entry {
             Some(tx_response) => {
-                tx_response.send(response).ok();
+                if tx_response.send(response).is_err() {
+                    warn!(
+                        call_id,
+                        "dynamic tool response arrived after its receiver closed"
+                    );
+                }
             }
             None => {
                 warn!("No pending dynamic tool call found for call_id: {call_id}");
@@ -3703,7 +3800,9 @@ impl Session {
         };
         match entry {
             Some(tx_approve) => {
-                tx_approve.send(decision).ok();
+                if tx_approve.send(decision).is_err() {
+                    warn!(approval_id, "approval arrived after its receiver closed");
+                }
             }
             None => {
                 warn!("No pending approval found for call_id: {approval_id}");
@@ -4040,9 +4139,9 @@ impl Session {
             }
             durability_result
         });
-        commit.await.map_err(|err| {
-            std::io::Error::other(format!("durable history commit failed: {err}"))
-        })?
+        commit
+            .await
+            .map_err(|err| std::io::Error::other(format!("durable history commit failed: {err}")))?
     }
 
     pub(crate) async fn persist_missing_call_outputs_durable(
@@ -4364,8 +4463,15 @@ impl Session {
                 None
             };
             let items = Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned();
+            // Reserve the next window under the ordered commit gate, but leave
+            // live metadata unchanged until its rollout record is durable.
+            let (window_number, window_ids) = session.state.lock().await.next_auto_compact_window();
             let compacted_item = CompactedItem {
                 replacement_history: Some(items.clone()),
+                window_number: Some(window_number),
+                first_window_id: Some(window_ids.first_window_id.to_string()),
+                previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
+                window_id: Some(window_ids.window_id.to_string()),
                 ..compacted_item
             };
             let snapshot = if turn_context.config.completed_tool_history_projection {
@@ -4404,6 +4510,7 @@ impl Session {
             {
                 let mut state = session.state.lock().await;
                 state.replace_history(items, None);
+                state.restore_auto_compact_window(window_number, window_ids);
                 if let (Some(turn_context_item), Some(snapshot)) =
                     (reference_context_item, world_state_baseline)
                 {
@@ -5141,6 +5248,17 @@ impl Session {
         state.clone_history()
     }
 
+    pub(crate) async fn dedupe_existing_developer_contexts(
+        &self,
+        candidates: Vec<ResponseItem>,
+    ) -> Vec<ResponseItem> {
+        let state = self.state.lock().await;
+        crate::hook_runtime::dedupe_existing_developer_contexts(
+            state.history.raw_items(),
+            candidates,
+        )
+    }
+
     async fn acquire_tool_history_io_permit(
         &self,
     ) -> CodexResult<(
@@ -5457,6 +5575,7 @@ impl Session {
         format!("{thread_id}:{window_number}")
     }
 
+    #[cfg(test)]
     pub(crate) async fn advance_auto_compact_window(&self) -> (u64, AutoCompactWindowIds) {
         let mut state = self.state.lock().await;
         state.advance_auto_compact_window()
@@ -5689,7 +5808,10 @@ impl Session {
         Some(commit(state_owner))
     }
 
-    #[expect(clippy::await_holding_invalid_type, reason = "Keep planning generation validation atomic with durable context publication")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Keep planning generation validation atomic with durable context publication"
+    )]
     async fn commit_prepared_context_update(
         self: &Arc<Self>,
         prepared: PreparedContextUpdate,
@@ -6233,7 +6355,10 @@ pub(crate) fn emit_subagent_session_started(
 }
 
 /// Builds the hook engine for one config snapshot, including any enabled plugin hooks.
-#[expect(clippy::expect_used, reason = "Hook discovery failure must not silently disable configured hooks")]
+#[expect(
+    clippy::expect_used,
+    reason = "Hook discovery failure must not silently disable configured hooks"
+)]
 async fn build_hooks_for_config(
     config: &Config,
     plugins_manager: &PluginsManager,

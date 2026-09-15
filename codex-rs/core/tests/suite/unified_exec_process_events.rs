@@ -138,9 +138,16 @@ async fn accept_initialized_exec_server(listener: TcpListener) -> WebSocketStrea
     websocket
 }
 
-async fn send_environment_info(websocket: &mut WebSocketStream<TcpStream>) {
+async fn send_environment_info(
+    websocket: &mut WebSocketStream<TcpStream>,
+    scenario: PushedExecScenario,
+) {
     let info = read_exec_server_json(websocket).await;
     assert_eq!(info["method"], "environment/info");
+    let foreign_shell = matches!(
+        scenario,
+        PushedExecScenario::LegacyShellAdapter | PushedExecScenario::RemoteApproval
+    );
     send_exec_server_json(
         websocket,
         json!({
@@ -151,11 +158,36 @@ async fn send_environment_info(websocket: &mut WebSocketStream<TcpStream>) {
                     "name": "powershell",
                     "path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
                 },
-                "cwd": "file:///C:/workspace"
+                "cwd": if foreign_shell { None } else { Some("file:///C:/workspace") }
             },
         }),
     )
     .await;
+}
+
+async fn serve_evidence_filesystem_request(
+    websocket: &mut WebSocketStream<TcpStream>,
+    request: &Value,
+) -> bool {
+    let result = match request["method"].as_str() {
+        Some("fs/canonicalize") => json!({"path": request["params"]["path"]}),
+        Some("fs/getMetadata") => {
+            let path = request["params"]["path"].as_str().expect("metadata path");
+            if path.ends_with("/workspace") || path.ends_with("/nested") {
+                json!({"isDirectory": true, "isFile": false, "isSymlink": false, "size": 0, "createdAtMs": 0, "modifiedAtMs": 0})
+            } else {
+                send_exec_server_json(
+                    websocket,
+                    json!({"id": request["id"], "error": {"code": -32004, "message": "not found"}}),
+                )
+                .await;
+                return true;
+            }
+        }
+        _ => return false,
+    };
+    send_exec_server_json(websocket, json!({"id": request["id"], "result": result})).await;
+    true
 }
 
 async fn serve_exec_with_pushed_events(
@@ -163,7 +195,7 @@ async fn serve_exec_with_pushed_events(
     scenario: PushedExecScenario,
 ) -> usize {
     let mut websocket = accept_initialized_exec_server(listener).await;
-    send_environment_info(&mut websocket).await;
+    send_environment_info(&mut websocket, scenario).await;
 
     let mut snapshot_process_id = None;
     let process_start = loop {
@@ -172,6 +204,9 @@ async fn serve_exec_with_pushed_events(
         else {
             return 0;
         };
+        if serve_evidence_filesystem_request(&mut websocket, &request).await {
+            continue;
+        }
         match request["method"].as_str() {
             Some("process/start")
                 if request["params"]["processId"]
@@ -414,6 +449,9 @@ async fn serve_exec_with_pushed_events(
         else {
             return process_read_requests;
         };
+        if serve_evidence_filesystem_request(&mut websocket, &request).await {
+            continue;
+        }
         match request["method"].as_str() {
             Some("process/read") => {
                 process_read_requests += 1;
@@ -492,10 +530,6 @@ async fn serve_exec_with_pushed_events(
                         }),
                     )
                     .await;
-                    return process_read_requests;
-                }
-                if matches!(scenario, PushedExecScenario::LegacyExit) {
-                    return process_read_requests;
                 }
             }
             Some("process/terminate") => {
@@ -536,19 +570,19 @@ async fn exec_command_consumes_pushed_remote_process_events(
             "kind": "script",
             "command": "ignored by fake exec-server",
             "workdir": "nested",
-            "timeout_ms": 1_000,
+            "yield_time_ms": 30_000,
         }),
         PushedExecScenario::RemoteApproval => json!({
             "kind": "script",
             "cmd": "ignored by fake exec-server",
-            "yield_time_ms": 1_000,
+            "yield_time_ms": 30_000,
             "sandbox_permissions": "require_escalated",
             "justification": "exercise remote approval cwd",
         }),
         _ => json!({
             "kind": "script",
             "cmd": "ignored by fake exec-server",
-            "yield_time_ms": 1_000,
+            "yield_time_ms": 30_000,
         }),
     };
     let mut responses = vec![sse(vec![
@@ -593,10 +627,17 @@ async fn exec_command_consumes_pushed_remote_process_events(
                 .features
                 .enable(Feature::ShellTool)
                 .expect("test config should allow feature update");
-            config
-                .features
-                .enable(Feature::UnifiedExec)
-                .expect("test config should allow feature update");
+            if matches!(scenario, PushedExecScenario::LegacyShellAdapter) {
+                config
+                    .features
+                    .disable(Feature::UnifiedExec)
+                    .expect("legacy shell fixture");
+            } else {
+                config
+                    .features
+                    .enable(Feature::UnifiedExec)
+                    .expect("unified exec fixture");
+            }
         });
     let test = timeout(Duration::from_secs(5), builder.build(&server))
         .await
@@ -709,6 +750,16 @@ async fn exec_command_consumes_pushed_remote_process_events(
         .function_call_output_content_and_success(CALL_ID)
         .context("exec_command output should be model visible")?;
     let output = output.context("exec_command output should contain text")?;
+    let structured: Option<serde_json::Value> = serde_json::from_str(&output).ok();
+    let terminal_exit_code = structured
+        .as_ref()
+        .and_then(|value| value.get("exit_code"))
+        .and_then(serde_json::Value::as_i64);
+    let output = structured
+        .as_ref()
+        .and_then(|value| value.get("output"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&output);
     match scenario {
         PushedExecScenario::Complete
         | PushedExecScenario::LegacyShellAdapter
@@ -718,7 +769,10 @@ async fn exec_command_consumes_pushed_remote_process_events(
                 saw_exec_command_begin,
                 "remote execution did not begin: {output}; advertised tools: {advertised_tools:?}"
             );
-            assert!(output.contains("Process exited with code 0"));
+            assert!(
+                terminal_exit_code == Some(0) || output.contains("Process exited with code 0"),
+                "{output}"
+            );
             assert!(output.contains(COMPLETE_OUTPUT));
             assert_eq!(process_read_requests, 0, "unexpected compatibility read");
         }
@@ -726,8 +780,8 @@ async fn exec_command_consumes_pushed_remote_process_events(
         PushedExecScenario::ReplayGap => {
             assert_ne!(success, Some(false));
             assert!(saw_exec_command_begin);
-            assert_eq!(output.matches(RECOVERED_OUTPUT).count(), 1);
-            assert_eq!(output.matches(RETAINED_OUTPUT).count(), 1);
+            assert_eq!(output.matches(RECOVERED_OUTPUT).count(), 1, "{output}");
+            assert_eq!(output.matches(RETAINED_OUTPUT).count(), 1, "{output}");
             assert_eq!(process_read_requests, 1, "expected replay recovery read");
         }
     }

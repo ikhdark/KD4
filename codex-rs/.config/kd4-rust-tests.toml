@@ -274,7 +274,19 @@ tests = ["tools::handlers::command_preflight::command_preflight_tests::never_rep
 helpers = []
 
 [gates.capability-kd4-phase-reasoning]
-description = "Disabled KD4 runtime preserves configured effort through a real tool continuation and follow-up."
+description = "Reasoning phase transitions, failure classification, validation state, and disabled-runtime effort preservation."
+[[gates.capability-kd4-phase-reasoning.steps]]
+target = "core_lib"
+tests = [
+  "session::reasoning_governor::tests::scripted_phase_and_effort_flow_is_deterministic",
+  "session::reasoning_governor::tests::read_success_retains_sticky_phases_and_selects_their_explicit_effort",
+  "session::reasoning_governor::tests::tool_failures_dominate_a_competing_read",
+  "session::reasoning_governor::tests::non_failure_outcomes_do_not_enter_diagnose",
+  "session::reasoning_governor::tests::only_blocking_skips_reopen_failure_evidence",
+  "session::reasoning_governor::tests::current_validation_failure_dominates_a_competing_read",
+  "session::reasoning_governor::tests::fresh_validation_uses_final_revision_and_active_plan_state",
+]
+helpers = []
 [[gates.capability-kd4-phase-reasoning.steps]]
 target = "core_transport_telemetry"
 tests = ["suite::client::kd4_runtime_off_preserves_effort_after_tool_and_followup"]
@@ -363,4 +375,20 @@ description = "Nonblocking workspace revision and path-event tracking, advisory 
 [[gates.capability-shared-worktree-reliability.steps]]
 target = "agent_task_store_lib"
 tests = ["tests::completed_receipt_rejects_workspace_change_after_validation"]
+helpers = []
+
+[gates.search-scope-regressions]
+description = "Ripgrep argument roles, executable aliases, dependency evidence, and bounded observation latency."
+[[gates.search-scope-regressions.steps]]
+target = "core_lib"
+tests = [
+  "tools::handlers::command_preflight::command_preflight_tests::rg_argument_roles_preserve_flag_like_patterns_and_dependencies",
+  "tools::handlers::command_preflight::command_preflight_tests::rg_supported_executables_share_scope_and_dependency_classification",
+  "tools::handlers::command_preflight::command_preflight_tests::search_operands_respect_option_values_and_terminators",
+  "tools::handlers::command_preflight::command_preflight_tests::search_executable_aliases_have_consistent_dependency_extraction",
+  "tools::handlers::command_preflight::command_preflight_tests::classifies_repository_wide_and_owner_scoped_rg",
+  "tools::handlers::command_preflight::command_preflight_tests::search_scope_state_ignores_unrelated_content_and_detects_target_changes",
+  "tools::handlers::command_search::deadline_tests::slow_scope_observation_releases_the_request_and_discards_late_evidence",
+  "tools::command_execution::tests::rg_pattern_file_changes_invalidate_cached_misses",
+]
 helpers = []

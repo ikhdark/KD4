@@ -244,8 +244,13 @@ impl SessionState {
         self.auto_compact_window.restore(window_number, ids);
     }
 
+    #[cfg(test)]
     pub(crate) fn advance_auto_compact_window(&mut self) -> (u64, AutoCompactWindowIds) {
         self.auto_compact_window.advance()
+    }
+
+    pub(crate) fn next_auto_compact_window(&self) -> (u64, AutoCompactWindowIds) {
+        self.auto_compact_window.clone().advance()
     }
 
     pub(crate) fn token_info(&self) -> Option<TokenUsageInfo> {

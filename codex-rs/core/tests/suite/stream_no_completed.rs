@@ -112,10 +112,17 @@ async fn retries_on_early_close() {
     else {
         unreachable!("predicate guarantees a stream error event");
     };
-    assert_eq!(stream_error.message, "Reconnecting... 1/1");
+    let delay = stream_error
+        .message
+        .strip_prefix("Reconnecting... 1/1 (next retry in ")
+        .and_then(|message| message.strip_suffix("ms)"))
+        .expect("retry notice includes the millisecond backoff");
+    assert!(delay.parse::<f64>().unwrap() > 0.0);
     assert_eq!(
         stream_error.additional_details.as_deref(),
-        Some("Error while reading the server response: stream closed before response.completed")
+        Some(
+            "Error while reading the server response: stream closed before response.completed (received 0 SSE events, 0 payload bytes)"
+        )
     );
     assert!(matches!(
         stream_error.codex_error_info,
@@ -203,7 +210,7 @@ async fn early_close_completes_partial_assistant_before_terminal_error() {
     ));
     assert_eq!(
         error.message,
-        "Error while reading the server response: stream closed before response.completed"
+        "Error while reading the server response: stream closed before response.completed (received 3 SSE events, 278 payload bytes)"
     );
     assert_eq!(terminal.error.as_ref(), Some(error));
     assert!(
@@ -704,7 +711,7 @@ async fn reasoning_closure_preserves_partial_text_and_final_authority() {
                 ));
                 assert_eq!(
                     error.message,
-                    "Error while reading the server response: stream closed before response.completed"
+                    "Error while reading the server response: stream closed before response.completed (received 7 SSE events, 637 payload bytes)"
                 );
                 assert_eq!(terminal.error.as_ref(), Some(error));
                 error_index

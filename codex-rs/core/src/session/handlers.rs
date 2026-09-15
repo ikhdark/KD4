@@ -75,33 +75,24 @@ pub async fn update_thread_settings(
     thread_settings: ThreadSettingsOverrides,
 ) {
     let updates = thread_settings_update(sess, thread_settings).await;
-    match sess.update_settings(updates).await {
-        Ok(()) => {
-            let event = Event {
-                id: sub_id,
-                msg: sess.thread_settings_applied_event().await,
-            };
-            let rollout_items = [RolloutItem::EventMsg(event.msg.clone())];
-            if let Err(err) = sess.persist_rollout_items_durable(&rollout_items).await {
-                sess.send_event_raw_without_materializing_rollout(Event {
-                    id: event.id,
-                    msg: EventMsg::Error(ErrorEvent {
-                        message: format!("failed to persist thread settings override: {err}"),
-                        codex_error_info: Some(CodexErrorInfo::InternalServerError),
-                    }),
-                })
-                .await;
-                return;
-            }
+    match sess.update_settings_durable(&updates).await {
+        Ok(msg) => {
+            let event = Event { id: sub_id, msg };
             sess.send_event_raw_with_persistence(event, /*persist*/ false)
                 .await;
         }
         Err(err) => {
-            sess.send_event_raw(Event {
+            let codex_error_info = match &err {
+                super::ThreadSettingsUpdateError::Invalid(_) => CodexErrorInfo::BadRequest,
+                super::ThreadSettingsUpdateError::Persistence(_) => {
+                    CodexErrorInfo::InternalServerError
+                }
+            };
+            sess.send_event_raw_without_materializing_rollout(Event {
                 id: sub_id,
                 msg: EventMsg::Error(ErrorEvent {
-                    message: format!("invalid thread settings override: {err}"),
-                    codex_error_info: Some(CodexErrorInfo::BadRequest),
+                    message: err.to_string(),
+                    codex_error_info: Some(codex_error_info),
                 }),
             })
             .await;
@@ -222,13 +213,6 @@ pub(super) async fn user_input_or_turn_inner(
             return;
         }
     };
-    if emit_thread_settings_applied {
-        sess.send_event_raw_without_materializing_rollout(Event {
-            id: sub_id.clone(),
-            msg: sess.thread_settings_applied_event().await,
-        })
-        .await;
-    }
     if let Err(err) = sess
         .persist_thread_settings_snapshot_if_unmaterialized()
         .await
@@ -247,6 +231,13 @@ pub(super) async fn user_input_or_turn_inner(
             let _ = admission.send(Err(CodexErr::Fatal(message)));
         }
         return;
+    }
+    if emit_thread_settings_applied {
+        sess.send_event_raw_without_materializing_rollout(Event {
+            id: sub_id.clone(),
+            msg: sess.thread_settings_applied_event().await,
+        })
+        .await;
     }
     let items = if start_only_admission.is_some() {
         items
@@ -601,7 +592,7 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
             turn_context.as_ref(),
             EventMsg::Warning(WarningEvent {
                 message: format!(
-                    "Rolled the thread back, but failed to save the rollback marker. Codex will continue retrying. Error: {err}"
+                    "Rolled the thread back in memory, but failed to save the rollback marker. The rollback may be lost when the thread is reopened. Error: {err}"
                 ),
             }),
         )
@@ -711,12 +702,15 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
         .await;
     }
     info!("Shutting down Codex instance");
-    let history = sess.clone_history().await;
-    let turn_count = history
-        .raw_items()
-        .iter()
-        .filter(|item| is_user_turn_boundary(item))
-        .count();
+    let turn_count = {
+        let state = sess.state.lock().await;
+        state
+            .history
+            .raw_items()
+            .iter()
+            .filter(|item| is_user_turn_boundary(item))
+            .count()
+    };
     sess.services.session_telemetry.counter(
         "codex.conversation.turn.count",
         i64::try_from(turn_count).unwrap_or(0),

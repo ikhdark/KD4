@@ -91,12 +91,13 @@ async fn memory_reset_filesystem_failure_preserves_memory_rows() -> Result<()> {
     let request_id = mcp
         .send_raw_request("memory/reset", /*params*/ None)
         .await?;
-    let response: JSONRPCResponse = timeout(
+    let error = timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
     )
     .await??;
-    let error = to_response::<MemoryResetResponse>(response).expect_err("reset should fail");
+    assert_eq!(error.error.code, -32603);
+    let error = error.error.message;
     assert!(
         error
             .to_string()

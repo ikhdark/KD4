@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, reason = "Test fixtures and assertions must fail immediately on unexpected setup or filesystem calls")]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "Test fixtures and assertions must fail immediately on unexpected setup or filesystem calls"
+)]
 
 use bytes::Bytes;
 use codex_file_system::*;
@@ -134,7 +138,9 @@ impl ExecutorFileSystem for TestFileSystem {
                 .await;
                 self.active.fetch_sub(1, Ordering::SeqCst);
             }
-            let is_directory = *path == root() || path.to_string().ends_with("/dir");
+            let is_directory = *path == root()
+                || path.to_string().ends_with("/dir")
+                || path.to_string().ends_with("/.hidden");
             Ok(FileMetadata {
                 is_directory,
                 is_file: !is_directory,
@@ -299,6 +305,70 @@ fn walk_sorts_bounded_batch_and_pipelines_metadata_in_order() {
     assert_eq!(fs.active.load(Ordering::SeqCst), 0);
     assert!(!outcome.truncated);
     assert!(outcome.errors.is_empty());
+}
+
+#[test]
+fn walk_reports_depth_truncation_without_reading_beyond_limit() {
+    let fs = TestFileSystem {
+        batches: Mutex::new(VecDeque::from([ReadDirectoryOutcome {
+            entries: vec![entry("dir"), entry("file")],
+            entries_examined: 2,
+            limit_reached: false,
+        }])),
+        ..Default::default()
+    };
+    let mut walk_options = options(20);
+    walk_options.max_depth = 0;
+    let outcome = block_on(fs.walk(&root(), walk_options, None)).unwrap();
+
+    assert!(outcome.truncated);
+    assert!(outcome.errors.is_empty());
+    assert_eq!(
+        outcome.entries,
+        vec![
+            WalkEntry {
+                path: root().join("dir").unwrap(),
+                kind: WalkEntryKind::Directory,
+            },
+            WalkEntry {
+                path: root().join("file").unwrap(),
+                kind: WalkEntryKind::File,
+            },
+        ]
+    );
+    assert_eq!(*fs.limits.lock().unwrap(), [(root(), 20)]);
+}
+
+#[test]
+fn walk_at_depth_limit_is_complete_when_no_eligible_directories_remain() {
+    for name in ["file", ".hidden"] {
+        let fs = TestFileSystem {
+            batches: Mutex::new(VecDeque::from([ReadDirectoryOutcome {
+                entries: vec![entry(name)],
+                entries_examined: 1,
+                limit_reached: false,
+            }])),
+            ..Default::default()
+        };
+        let mut walk_options = options(20);
+        walk_options.max_depth = 0;
+        walk_options.prune_hidden_directories = true;
+        let outcome = block_on(fs.walk(&root(), walk_options, None)).unwrap();
+
+        assert!(!outcome.truncated, "unexpected truncation for {name}");
+        assert!(outcome.errors.is_empty());
+        assert_eq!(outcome.entries.len(), 1);
+        assert_eq!(outcome.entries[0].path, root().join(name).unwrap());
+        assert_eq!(
+            outcome.entries[0].kind,
+            if name == ".hidden" {
+                WalkEntryKind::Directory
+            } else {
+                WalkEntryKind::File
+            }
+        );
+        assert_eq!(*fs.limits.lock().unwrap(), [(root(), 20)]);
+    }
 }
 
 #[test]

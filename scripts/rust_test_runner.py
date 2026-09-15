@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,7 @@ SCHEMA_VERSION = 1
 # worker threads from RUST_MIN_STACK. Keep the runner aligned with the justfile
 # and `scripts/rust_build_status.py`.
 RUST_MIN_STACK_BYTES = "8388608"
+MAX_FAILURE_STREAM_CHARS = 4096
 
 
 class RunnerError(RuntimeError):
@@ -489,7 +491,7 @@ class RustTestRunner:
                 "selection": target.selection_args(),
                 "helpers": [helper.name for helper in helpers],
                 "list": self._list_command(target, []),
-                "builds": [self._build_command(helper) for helper in helpers],
+                "builds": [command for _, command in self._helper_builds(helpers)],
                 "run": self._run_command(target, []),
             }
         if name in self.manifest.gates:
@@ -514,7 +516,7 @@ class RustTestRunner:
                 "name": name,
                 "target_dir": str(self.target_dir),
                 "helpers": [helper.name for helper in helpers],
-                "builds": [self._build_command(helper) for helper in helpers],
+                "builds": [command for _, command in self._helper_builds(helpers)],
                 "steps": steps,
             }
         raise RunnerError(f"unknown named Rust test target or gate {name!r}")
@@ -525,8 +527,10 @@ class RustTestRunner:
         filter_args: Sequence[str],
         *,
         no_fail_fast: bool | None = None,
+        allow_all: bool = False,
     ) -> None:
         args = validate_filtering_args(filter_args)
+        require_core_lib_filter(name, args, allow_all=allow_all)
         target = self.target(name)
         self._list_tests(target, args)
         env = self._build_helper_environment(self.active_helpers([name]))
@@ -575,19 +579,24 @@ class RustTestRunner:
                 helper for step in grouped for helper in step.helpers or ()
             )
         )
+        failures: list[RunnerError] = []
         for step in grouped:
             target = self.target(step.target)
-            filter_args = self._gate_filter_args(step) if discover else [
-                "-E", " | ".join(f"test(={test})" for test in step.tests)
-            ]
-            result = self._checked(
-                self._gate_run_command(target, filter_args),
-                env=env,
-                capture_output=True,
+            filter_args = (
+                self._gate_filter_args(step)
+                if discover
+                else ["-E", " | ".join(f"test(={test})" for test in step.tests)]
             )
+            try:
+                result = self._checked(
+                    self._gate_run_command(target, filter_args),
+                    env=env,
+                    capture_output=True,
+                )
+            except RunnerError as error:
+                failures.append(error)
+                continue
             output = (result.stdout or "") + "\n" + (result.stderr or "")
-            if not quiet:
-                print(output, end="" if output.endswith("\n") else "\n")
             # Require completed per-test results from this execution, not just
             # a successful exit or discovery. Suppress summary repetitions and
             # unrelated filtered-out skips, and disallow retries for this proof.
@@ -595,16 +604,29 @@ class RustTestRunner:
                 r"(?m)^\s*PASS\s+\[[^]\r\n]+\]\s+\S+\s+(\S+)\s*$", output
             )
             if len(passed) != len(step.tests) or set(passed) != set(step.tests):
+                if not quiet:
+                    print(output, end="" if output.endswith("\n") else "\n")
                 outcome = "not_executed"
                 if re.search(r"(?m)^\s*SKIP\s+\[", output):
                     outcome = "skipped"
                 elif re.search(r"\b0 tests run\b", output):
                     outcome = "zero_tests"
-                raise RunnerError(
-                    f"gate {step.target!r} did not report every required test passed exactly once: "
-                    f"expected={sorted(step.tests)}, passed={sorted(passed)}",
-                    outcome=outcome,
+                failures.append(
+                    RunnerError(
+                        f"gate {step.target!r} did not report every required test passed exactly once: "
+                        f"expected={sorted(step.tests)}, passed={sorted(passed)}",
+                        outcome=outcome,
+                    )
                 )
+            elif not quiet:
+                print(f"gate {step.target}: {len(passed)} passed")
+        if failures:
+            outcomes = {error.outcome for error in failures}
+            raise RunnerError(
+                "gate runs failed after executing every selected target:\n"
+                + "\n".join(str(error) for error in failures),
+                outcome=next(iter(outcomes)) if len(outcomes) == 1 else "failed",
+            )
         return {
             name: sorted(
                 {test for step in self.gate(name).steps for test in step.tests}
@@ -682,7 +704,7 @@ class RustTestRunner:
                 capture_output=False,
             )
             if result.returncode != 0:
-                detail = (result.stderr or result.stdout or "").strip()
+                detail = self._failure_detail(result)
                 rendered = subprocess.list2cmdline(command)
                 failed_runs.append(
                     f"{target.name}: {rendered}" + (f"\n{detail}" if detail else "")
@@ -771,10 +793,6 @@ class RustTestRunner:
             "pass",
             "--final-status-level",
             "none",
-            "--show-progress",
-            "none",
-            "--success-output",
-            "never",
             "--retries",
             "0",
         ]
@@ -807,21 +825,37 @@ class RustTestRunner:
         return [
             *self._selection_command("run", target),
             "--no-tests=fail",
+            "--show-progress",
+            "none",
+            "--success-output",
+            "never",
             *(["--no-fail-fast"] if keep_going else []),
             *args,
         ]
 
-    def _build_command(self, helper: Helper) -> list[str]:
+    def _helper_builds(
+        self, helpers: Sequence[Helper]
+    ) -> list[tuple[list[Helper], list[str]]]:
+        # Active helpers share this runner's profile, features and target lane.
+        # Group only within a package and keep the exact selected binary set.
+        packages: dict[str, list[Helper]] = {}
+        for helper in helpers:
+            packages.setdefault(helper.package, []).append(helper)
         return [
-            "cargo",
-            "build",
-            "--message-format=json-render-diagnostics",
-            "--target-dir",
-            str(self.target_dir),
-            "-p",
-            helper.package,
-            "--bin",
-            helper.binary,
+            (
+                group,
+                [
+                    "cargo",
+                    "build",
+                    "--message-format=json-render-diagnostics",
+                    "--target-dir",
+                    str(self.target_dir),
+                    "-p",
+                    package,
+                    *(arg for helper in group for arg in ("--bin", helper.binary)),
+                ],
+            )
+            for package, group in packages.items()
         ]
 
     def _list_tests(
@@ -841,15 +875,14 @@ class RustTestRunner:
 
     def _build_helper_environment(self, helpers: Sequence[Helper]) -> dict[str, str]:
         env = dict(self.base_env)
-        for helper in helpers:
-            result = self._checked(
-                self._build_command(helper), env=env, capture_output=True
-            )
-            executable = self._helper_artifact(helper, result.stdout)
-            dashed = f"CARGO_BIN_EXE_{helper.binary}"
-            underscored = f"CARGO_BIN_EXE_{helper.binary.replace('-', '_')}"
-            env[dashed] = str(executable)
-            env[underscored] = str(executable)
+        for group, command in self._helper_builds(helpers):
+            result = self._checked(command, env=env, capture_output=True)
+            for helper in group:
+                executable = self._helper_artifact(helper, result.stdout)
+                dashed = f"CARGO_BIN_EXE_{helper.binary}"
+                underscored = f"CARGO_BIN_EXE_{helper.binary.replace('-', '_')}"
+                env[dashed] = str(executable)
+                env[underscored] = str(executable)
         return env
 
     def _helper_artifact(self, helper: Helper, output: str) -> Path:
@@ -897,12 +930,54 @@ class RustTestRunner:
             capture_output=capture_output,
         )
         if result.returncode != 0:
-            detail = (result.stderr or result.stdout or "").strip()
+            detail = self._failure_detail(result)
             rendered = subprocess.list2cmdline(list(args))
             if detail:
                 raise RunnerError(f"command failed ({rendered}):\n{detail}")
             raise RunnerError(f"command failed ({rendered})")
         return result
+
+    def _failure_detail(self, result: subprocess.CompletedProcess[str]) -> str:
+        streams = [
+            (name, output)
+            for name, output in (("stdout", result.stdout), ("stderr", result.stderr))
+            if output
+        ]
+        full_detail = "\n".join(f"{name}:\n{output}" for name, output in streams)
+        if all(len(output) <= MAX_FAILURE_STREAM_CHARS for _, output in streams):
+            return full_detail
+
+        # Captured output must remain recoverable without rerunning a failed build.
+        try:
+            log_dir = self.target_dir / "test-runner-logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                newline="",
+                suffix=".log",
+                prefix="failure-",
+                dir=log_dir,
+                delete=False,
+            ) as log:
+                log.write(full_detail)
+                log_path = log.name
+        except OSError:
+            return full_detail
+
+        half = MAX_FAILURE_STREAM_CHARS // 2
+        summary = "\n".join(
+            f"{name}:\n"
+            + (
+                output
+                if len(output) <= MAX_FAILURE_STREAM_CHARS
+                else output[:half]
+                + "\n... omitted; see full output ...\n"
+                + output[-half:]
+            )
+            for name, output in streams
+        )
+        return summary + f"\nFull output: {log_path}"
 
 
 def parse_nextest_list(output: str) -> dict[str, bool]:
@@ -1073,6 +1148,32 @@ def validate_filtering_args(raw_args: Sequence[str]) -> list[str]:
     return args
 
 
+def require_core_lib_filter(name: str, args: Sequence[str], *, allow_all: bool) -> None:
+    if name != "core_lib" or allow_all:
+        return
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token in {"--run-ignored", "--skip"}:
+            index += 2
+            continue
+        if token in {"-E", "--filterset"}:
+            if index + 1 < len(args) and args[index + 1].strip():
+                return
+            index += 2
+            continue
+        if token.startswith("--filterset=") and token.split("=", 1)[1].strip():
+            return
+        if token.strip() and not token.startswith("-"):
+            return
+        index += 1
+    raise RunnerError(
+        "core_lib requires an explicit test filter (-E <filterset> or a test name). "
+        "Use a named core-gate for its declared scope, or --all only when the full "
+        "library suite is intended."
+    )
+
+
 def guard_generic_recipe_args(
     raw_args: Sequence[str], *, recipe: str | None = None
 ) -> None:
@@ -1155,6 +1256,11 @@ def build_parser() -> argparse.ArgumentParser:
     plan = subparsers.add_parser("plan")
     plan.add_argument("name")
     run_target = subparsers.add_parser("run-target", parents=[run_options])
+    run_target.add_argument(
+        "--all",
+        action="store_true",
+        help="Explicitly allow an unfiltered core_lib run.",
+    )
     run_target.add_argument("name")
     run_target.add_argument("filter_args", nargs=argparse.REMAINDER)
     run_gate = subparsers.add_parser("run-gate", parents=[run_options])
@@ -1171,7 +1277,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # Execution policy the runner owns even when a recipe forwards it positionally.
-_RUNNER_OWNED_RUN_OPTIONS = {"--no-fail-fast"}
+_RUNNER_OWNED_RUN_OPTIONS = {"--no-fail-fast", "--all"}
 
 
 def _split_runner_owned_options(
@@ -1179,8 +1285,9 @@ def _split_runner_owned_options(
 ) -> tuple[list[str], set[str]]:
     """Separates runner-owned execution flags from caller filtering args.
 
-    Recipes may pass `--no-fail-fast` after the target name; the runner assembles
-    the nextest command, so it consumes the flag instead of forwarding it.
+    Recipes may pass `--no-fail-fast` and the explicit full-library opt-in
+    `--all` after the target name. Consume these policy flags instead of
+    forwarding them as nextest selection overrides.
     """
     remaining: list[str] = []
     owned: set[str] = set()
@@ -1209,12 +1316,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         filter_args: list[str] = []
         no_fail_fast = getattr(args, "no_fail_fast", False)
+        allow_all = getattr(args, "all", False)
         if args.command == "run-target":
             filter_args = list(args.filter_args)
             if filter_args[:1] == ["--"]:
                 filter_args = filter_args[1:]
             filter_args, owned = _split_runner_owned_options(filter_args)
             no_fail_fast = no_fail_fast or "--no-fail-fast" in owned
+            allow_all = allow_all or "--all" in owned
+            require_core_lib_filter(
+                args.name, validate_filtering_args(filter_args), allow_all=allow_all
+            )
 
         manifest = Manifest.load(args.manifest)
         if args.command == "list-targets":
@@ -1238,7 +1350,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "plan":
             print(json.dumps(runner.plan(args.name), indent=2))
         elif args.command == "run-target":
-            runner.run_target(args.name, filter_args)
+            runner.run_target(args.name, filter_args, allow_all=allow_all)
         elif args.command == "run-gate":
             runner.run_gate(args.name)
         elif args.command == "parity":

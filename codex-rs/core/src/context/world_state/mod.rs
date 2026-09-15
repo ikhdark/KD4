@@ -296,9 +296,22 @@ impl WorldStateSnapshot {
         if self == previous {
             return None;
         }
-        let previous = Value::Object(previous.sections.clone().into_iter().collect());
-        let current = Value::Object(self.sections.clone().into_iter().collect());
-        create_merge_patch(&previous, &current)
+        let mut patch = Map::new();
+        for key in previous.sections.keys() {
+            if !self.sections.contains_key(key) {
+                patch.insert(key.clone(), Value::Null);
+            }
+        }
+        for (key, current) in &self.sections {
+            let change = match previous.sections.get(key) {
+                Some(previous) => create_merge_patch(previous, current),
+                None => Some(current.clone()),
+            };
+            if let Some(change) = change {
+                patch.insert(key.clone(), change);
+            }
+        }
+        Some(Value::Object(patch))
     }
 
     pub(crate) fn apply_merge_patch(&mut self, patch: &Value) -> serde_json::Result<()> {
@@ -483,11 +496,10 @@ impl WorldState {
                                         previous.source_digest == source_digest
                                             && previous.role == role
                                             && previous.rendered.len() >= rendered.len()
-                                    }) && let Some(rejected_snapshot) = rejected_snapshot {
-                                        sections.insert(
-                                            (*id).to_string(),
-                                            rejected_snapshot.clone(),
-                                        );
+                                    }) && let Some(rejected_snapshot) = rejected_snapshot
+                                    {
+                                        sections
+                                            .insert((*id).to_string(), rejected_snapshot.clone());
                                         continue;
                                     }
                                     let snapshot = if rendered == replacement_text {

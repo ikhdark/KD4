@@ -54,7 +54,12 @@ fn capped_backoff_preserves_growth_below_the_ceiling() {
         let delay = capped_backoff(base, retry, maximum);
         assert!((Duration::from_millis(minimum)..Duration::from_millis(upper)).contains(&delay));
     }
-    assert_eq!(capped_backoff(base, u64::MAX, maximum), maximum);
+    for retry in [100, u64::MAX] {
+        let delay = capped_backoff(base, retry, maximum);
+        assert!((Duration::from_millis(1_800)..maximum).contains(&delay));
+    }
+    assert_eq!(capped_backoff(base, 1, Duration::ZERO), Duration::ZERO);
+    assert_eq!(capped_backoff(Duration::ZERO, 100, maximum), Duration::ZERO);
 }
 
 #[tokio::test(flavor = "current_thread")]

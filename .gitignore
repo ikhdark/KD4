@@ -44,6 +44,8 @@ AGENTS.override.md
 .eslintcache
 .nyc_output/
 .jest/
+.pytest_cache/
+.ruff_cache/
 *.tsbuildinfo
 /target/
 *.pdb
@@ -78,6 +80,10 @@ coverage/
 
 # personal files
 /current-diff.txt
+# Local diff dumps; use .scratch/ for new scratch output.
+/.d[0-9a-f].txt
+/.e[0-9a-f].txt
+/.scratch/
 personal/
 /kd-ui/
 .codex/locks/

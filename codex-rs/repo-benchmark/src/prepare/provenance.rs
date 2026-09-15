@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -107,36 +108,73 @@ pub fn find_repo_root(start: &Path) -> Result<PathBuf> {
     Ok(fs::canonicalize(root)?)
 }
 
-pub fn hash_tree(root: &Path) -> Result<String> {
-    let mut entries = Vec::new();
+pub struct TreeInventory {
+    pub sha256: String,
+    pub files: BTreeMap<PathBuf, String>,
+    directories: BTreeSet<PathBuf>,
+    permissions: BTreeMap<PathBuf, fs::Permissions>,
+}
+
+fn reject_redirect(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    let redirected = metadata.file_type().is_symlink();
+    #[cfg(windows)]
+    let redirected = {
+        use std::os::windows::fs::MetadataExt;
+        redirected || metadata.file_attributes() & 0x400 != 0
+    };
+    ensure!(!redirected, "redirected fixture path: {}", path.display());
+    Ok(())
+}
+
+fn tree_inventory(root: &Path, excluded: &[&str]) -> Result<TreeInventory> {
+    let mut files = BTreeMap::new();
+    let mut directories = BTreeSet::new();
+    let mut permissions = BTreeMap::new();
     for entry in walkdir::WalkDir::new(root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| e.file_name() != ".git" && e.file_name() != "__pycache__")
+        .filter_entry(|e| {
+            e.depth() == 0 || !excluded.contains(&e.file_name().to_string_lossy().as_ref())
+        })
     {
         let entry = entry?;
-        ensure!(
-            !entry.file_type().is_symlink(),
-            "symbolic link in frozen fixture: {}",
-            entry.path().display()
-        );
-        if entry.file_type().is_file() {
-            entries.push(entry.path().to_path_buf());
+        let metadata = fs::symlink_metadata(entry.path())?;
+        reject_redirect(entry.path(), &metadata)?;
+        let relative = entry.path().strip_prefix(root)?.to_path_buf();
+        if metadata.is_file() {
+            files.insert(relative.clone(), hash_file(entry.path())?);
+            permissions.insert(relative, metadata.permissions());
+        } else {
+            ensure!(
+                metadata.is_dir(),
+                "unsupported fixture entry: {}",
+                entry.path().display()
+            );
+            directories.insert(relative);
         }
     }
-    entries.sort();
     let mut hash = Sha256::new();
-    for path in entries {
-        let relative = path
-            .strip_prefix(root)?
-            .to_string_lossy()
-            .replace('\\', "/");
-        hash.update(relative.as_bytes());
+    for (relative, digest) in &files {
+        hash.update(relative.to_string_lossy().replace('\\', "/").as_bytes());
         hash.update([0]);
-        hash.update(hash_file(&path)?.as_bytes());
+        hash.update(digest.as_bytes());
         hash.update([0]);
     }
-    Ok(format!("{:x}", hash.finalize()))
+    Ok(TreeInventory {
+        sha256: format!("{:x}", hash.finalize()),
+        files,
+        directories,
+        permissions,
+    })
+}
+
+pub fn hash_tree(root: &Path) -> Result<String> {
+    Ok(tree_inventory(root, &[".git", "__pycache__"])?.sha256)
+}
+
+/// Hash source evidence once, excluding generated dependencies and runtime caches.
+pub fn source_tree_inventory(root: &Path) -> Result<TreeInventory> {
+    tree_inventory(root, &[".git", "target", "node_modules", "__pycache__"])
 }
 
 pub fn copy_tree(source: &Path, target: &Path) -> Result<()> {
@@ -162,8 +200,13 @@ pub fn copy_tree(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Deletes only the exact prepared workspace, never a source checkout or parent.
-pub fn reset_workspace(prepared: &Path, workspace: &Path, snapshot: &Path) -> Result<()> {
+/// Restore only the exact owned workspace. Unchanged bytes stay in place.
+pub fn reset_workspace(
+    prepared: &Path,
+    workspace: &Path,
+    snapshot: &Path,
+    expected_sha256: &str,
+) -> Result<()> {
     let prepared = fs::canonicalize(prepared)?;
     ensure!(
         workspace.file_name().is_some_and(|n| n == "workspace"),
@@ -173,15 +216,93 @@ pub fn reset_workspace(prepared: &Path, workspace: &Path, snapshot: &Path) -> Re
         fs::canonicalize(workspace.parent().context("workspace parent")?)? == prepared,
         "reset target escaped preparation"
     );
-    if workspace.exists() {
+    if let Ok(metadata) = fs::symlink_metadata(workspace) {
+        reject_redirect(workspace, &metadata)?;
         ensure!(
             fs::canonicalize(workspace)? == prepared.join("workspace"),
             "workspace is a redirected path"
         );
-        fs::remove_dir_all(workspace)?;
     }
-    copy_tree(snapshot, workspace)?;
+    let snapshot_root = fs::canonicalize(snapshot)?;
+    let target_root = prepared.join("workspace");
+    ensure!(
+        !snapshot_root.starts_with(&target_root) && !target_root.starts_with(&snapshot_root),
+        "snapshot and workspace must be disjoint"
+    );
+    // Complete integrity checking before touching the previous attempt's state.
+    let inventory = tree_inventory(snapshot, &[".git", "__pycache__"])?;
+    ensure!(
+        inventory.sha256 == expected_sha256,
+        "changed fixture snapshot: {}",
+        snapshot.display()
+    );
+    let mut existing = Vec::new();
+    if workspace.exists() {
+        for entry in walkdir::WalkDir::new(workspace).follow_links(false) {
+            let entry = entry?;
+            let metadata = fs::symlink_metadata(entry.path())?;
+            reject_redirect(entry.path(), &metadata)?;
+            ensure!(
+                metadata.is_file() || metadata.is_dir(),
+                "unsupported workspace entry"
+            );
+            if entry.depth() > 0 {
+                existing.push((
+                    entry.path().strip_prefix(workspace)?.to_path_buf(),
+                    metadata.is_dir(),
+                ));
+            }
+        }
+    }
+    // Children are removed first, including stale caches and all old Git state.
+    existing.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+    for (relative, directory) in existing {
+        let keep = if directory {
+            inventory.directories.contains(&relative)
+        } else {
+            inventory.files.contains_key(&relative)
+        };
+        if !keep {
+            let path = workspace.join(relative);
+            if directory {
+                fs::remove_dir(path)?;
+            } else {
+                make_writable(&path)?;
+                fs::remove_file(path)?;
+            }
+        }
+    }
+    fs::create_dir_all(workspace)?;
+    for relative in &inventory.directories {
+        fs::create_dir_all(workspace.join(relative))?;
+    }
+    for (relative, expected) in &inventory.files {
+        let destination = workspace.join(relative);
+        let unchanged = destination.is_file() && hash_file(&destination)? == *expected;
+        if !unchanged {
+            if destination.is_file() {
+                make_writable(&destination)?;
+            }
+            fs::copy(snapshot.join(relative), &destination)?;
+        }
+        // Content equality does not establish executable-bit equality.
+        fs::set_permissions(&destination, inventory.permissions[relative].clone())?;
+    }
     git(workspace, &["init", "--quiet"])?;
+    Ok(())
+}
+
+fn make_writable(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let mut permissions = fs::metadata(path)?.permissions();
+        if permissions.readonly() {
+            permissions.set_readonly(false);
+            fs::set_permissions(path, permissions)?;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = path;
     Ok(())
 }
 
@@ -194,6 +315,18 @@ pub fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
 
 pub fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes = fs::read(path)?;
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if let Some(digest) = value
+        .as_object_mut()
+        .and_then(|v| v.remove("_recordSha256"))
+    {
+        ensure!(
+            digest.as_str() == Some(hash_bytes(&serde_json::to_vec(&value)?).as_str()),
+            "changed JSON artifact: {}",
+            path.display()
+        );
+        return Ok(serde_json::from_value(value)?);
+    }
     let digest = fs::read_to_string(path.with_extension("sha256"))?;
     ensure!(
         hash_bytes(&bytes) == digest.trim(),
@@ -201,6 +334,40 @@ pub fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
         path.display()
     );
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Mutable checkpoints publish their payload and checksum in one atomic rename.
+/// A crash before publication leaves the previous complete record readable.
+pub fn write_atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    use std::io::Write;
+    let mut value = serde_json::to_value(value)?;
+    let digest = hash_bytes(&serde_json::to_vec(&value)?);
+    let object = value
+        .as_object_mut()
+        .context("atomic record must be an object")?;
+    ensure!(
+        !object.contains_key("_recordSha256"),
+        "reserved record checksum key"
+    );
+    object.insert("_recordSha256".into(), digest.into());
+    let bytes = serde_json::to_vec_pretty(&value)?;
+    let temporary = path.with_extension(format!("{}.pending", super::unique_id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| {
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path).context("atomically publish checkpoint")
+    })();
+    if result.is_err() {
+        // The closure releases the file even on write/sync failure, so Windows
+        // can remove the unpublished record without hiding the original error.
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// Materialize exactly the named commit's Git blobs, never the working tree or index.

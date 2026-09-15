@@ -241,14 +241,15 @@ pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItem>) {
 /// When `input_modalities` contains `InputModality::Image`, no stripping is performed.
 pub(crate) fn strip_images_when_unsupported(
     input_modalities: &[InputModality],
-    items: &mut [ResponseItem],
+    items: &mut Vec<ResponseItem>,
 ) {
     let supports_images = input_modalities.contains(&InputModality::Image);
     if supports_images {
         return;
     }
 
-    for item in items.iter_mut() {
+    let mut image_omissions = Vec::new();
+    for (index, item) in items.iter_mut().enumerate() {
         match item {
             ResponseItem::Message { content, .. } => {
                 for content_item in content.iter_mut() {
@@ -275,9 +276,28 @@ pub(crate) fn strip_images_when_unsupported(
                 }
             }
             ResponseItem::ImageGenerationCall { result, .. } => {
+                if !result.is_empty() {
+                    image_omissions.push(index + 1);
+                }
                 result.clear();
             }
             _ => {}
         }
+    }
+    // `result` is base64 image data on the wire. Keep the receipt in a text
+    // message beside the call instead of putting prose in that field.
+    for index in image_omissions.into_iter().rev() {
+        items.insert(
+            index,
+            ResponseItem::Message {
+                id: None,
+                role: "developer".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: format!("Generated {IMAGE_CONTENT_OMITTED_PLACEHOLDER}"),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+        );
     }
 }

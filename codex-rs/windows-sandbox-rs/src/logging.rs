@@ -26,7 +26,15 @@ fn preview(command: &[String]) -> String {
     if joined.len() <= LOG_COMMAND_PREVIEW_LIMIT {
         joined
     } else {
-        joined[..joined.floor_char_boundary(LOG_COMMAND_PREVIEW_LIMIT)].to_string()
+        const MARKER: &str = " … ";
+        let budget = LOG_COMMAND_PREVIEW_LIMIT - MARKER.len();
+        let prefix_end = joined.floor_char_boundary(budget / 2);
+        let suffix_start = joined.ceil_char_boundary(joined.len() - (budget - budget / 2));
+        format!(
+            "{}{MARKER}{}",
+            &joined[..prefix_end],
+            &joined[suffix_start..]
+        )
     }
 }
 
@@ -109,7 +117,26 @@ mod tests {
         let result = std::panic::catch_unwind(|| preview(&command));
         assert!(result.is_ok());
         let previewed = result.unwrap();
-        assert_eq!(previewed, prefix);
+        assert!(previewed.starts_with(&"x".repeat(97)));
+        assert!(previewed.contains(" … "));
+        assert!(previewed.ends_with('😀'));
+        assert!(previewed.len() <= LOG_COMMAND_PREVIEW_LIMIT);
+    }
+
+    #[test]
+    fn log_failure_preserves_command_target_and_failure_detail() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let command = vec![
+            "powershell.exe".to_string(),
+            "x".repeat(300),
+            "C:\\workspace\\target.rs".to_string(),
+        ];
+        log_failure(&command, "access denied", Some(tempdir.path()));
+        let log = std::fs::read_to_string(current_log_file_path(tempdir.path())).expect("log");
+        assert!(log.contains("FAILURE: powershell.exe"));
+        assert!(log.contains(" … "));
+        assert!(log.contains("C:\\workspace\\target.rs (access denied)"));
+        assert!(!log.contains(&"x".repeat(300)));
     }
 
     #[test]

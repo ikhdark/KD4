@@ -774,7 +774,7 @@ pub(crate) async fn list_tools_for_client_uncached(
     server_instructions: Option<&str>,
 ) -> Result<Vec<ToolInfo>> {
     let fetch_start = Instant::now();
-    let tools = collect_tool_list_pages(|params| {
+    let tools = collect_tool_list_pages(server_name, |params| {
         let client = Arc::clone(client);
         async move {
             client
@@ -809,7 +809,10 @@ pub(crate) async fn list_tools_for_client_uncached(
     Ok(tools)
 }
 
-async fn collect_tool_list_pages<F, Fut>(mut fetch_page: F) -> Result<Vec<ToolWithConnectorId>>
+async fn collect_tool_list_pages<F, Fut>(
+    server_name: &str,
+    mut fetch_page: F,
+) -> Result<Vec<ToolWithConnectorId>>
 where
     F: FnMut(Option<PaginatedRequestParams>) -> Fut,
     Fut: Future<Output = Result<codex_rmcp_client::ListToolsWithConnectorIdResult>>,
@@ -818,20 +821,27 @@ where
     let mut cursor: Option<String> = None;
     let mut seen_cursors = HashSet::new();
 
-    for _page in 0..MAX_MCP_TOOL_LIST_PAGES {
+    for page in 1..=MAX_MCP_TOOL_LIST_PAGES {
         let params = cursor
             .as_ref()
             .map(|next| PaginatedRequestParams::default().with_cursor(Some(next.clone())));
         let response = fetch_page(params).await?;
         if collected.len().saturating_add(response.tools.len()) > MAX_MCP_TOOL_LIST_ITEMS {
-            return Err(anyhow!("tools/list exceeded item limit"));
+            return Err(anyhow!(
+                "MCP server {server_name:?}: tools/list exceeded item limit of {MAX_MCP_TOOL_LIST_ITEMS} on page {page} ({} already collected, {} in this page)",
+                collected.len(),
+                response.tools.len()
+            ));
         }
         collected.extend(response.tools);
 
         match response.next_cursor {
             Some(next) => {
                 if !seen_cursors.insert(next.clone()) {
-                    return Err(anyhow!("tools/list returned a repeated cursor"));
+                    return Err(anyhow!(
+                        "MCP server {server_name:?}: tools/list returned a repeated cursor on page {page} ({} tools collected)",
+                        collected.len()
+                    ));
                 }
                 cursor = Some(next);
             }
@@ -839,7 +849,10 @@ where
         }
     }
 
-    Err(anyhow!("tools/list exceeded page limit"))
+    Err(anyhow!(
+        "MCP server {server_name:?}: tools/list exceeded page limit of {MAX_MCP_TOOL_LIST_PAGES} ({} tools collected)",
+        collected.len()
+    ))
 }
 
 async fn discover_tools_if_supported<F, Fut>(
@@ -1513,7 +1526,7 @@ mod tests {
         ])));
         let requested_cursors = Arc::new(StdMutex::new(Vec::new()));
 
-        let tools = collect_tool_list_pages({
+        let tools = collect_tool_list_pages("test-server", {
             let pages = Arc::clone(&pages);
             let requested_cursors = Arc::clone(&requested_cursors);
             move |params| {
@@ -1557,7 +1570,7 @@ mod tests {
             },
         ])));
 
-        let result = collect_tool_list_pages(move |_| {
+        let result = collect_tool_list_pages("test-server", move |_| {
             let page = pages.lock().expect("pages lock").pop_front().expect("page");
             async move { Ok(page) }
         })
@@ -1567,7 +1580,76 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("repeated cursor"));
+        assert_eq!(
+            error.to_string(),
+            "MCP server \"test-server\": tools/list returned a repeated cursor on page 2 (0 tools collected)"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_discovery_reports_item_limit_and_accepts_exact_limit() {
+        for final_page_size in [1, 2] {
+            let mut pages = VecDeque::from([
+                codex_rmcp_client::ListToolsWithConnectorIdResult {
+                    next_cursor: Some("last-page".to_string()),
+                    tools: (0..MAX_MCP_TOOL_LIST_ITEMS - 1)
+                        .map(|_| listed_test_tool("first", None))
+                        .collect(),
+                },
+                codex_rmcp_client::ListToolsWithConnectorIdResult {
+                    next_cursor: None,
+                    tools: (0..final_page_size)
+                        .map(|_| listed_test_tool("last", None))
+                        .collect(),
+                },
+            ]);
+            let result = collect_tool_list_pages("large-server", |_| {
+                let page = pages.pop_front().expect("only two pages should be fetched");
+                async move { Ok(page) }
+            })
+            .await;
+            if final_page_size == 1 {
+                let tools = result.expect("exactly 10,000 tools should be allowed");
+                assert_eq!(tools.len(), 10_000);
+                assert_eq!(tools.last().unwrap().tool.name, "last");
+            } else {
+                let error = result.err().expect("10,001 tools must exceed the limit");
+                assert_eq!(
+                    error.to_string(),
+                    "MCP server \"large-server\": tools/list exceeded item limit of 10000 on page 2 (9999 already collected, 2 in this page)"
+                );
+            }
+            assert!(pages.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_discovery_reports_page_limit_and_accepts_exact_limit() {
+        for has_more in [true, false] {
+            let mut calls = 0;
+            let result = collect_tool_list_pages("paged-server", |_| {
+                calls += 1;
+                let next_cursor =
+                    (has_more || calls < MAX_MCP_TOOL_LIST_PAGES).then(|| calls.to_string());
+                async move {
+                    Ok(codex_rmcp_client::ListToolsWithConnectorIdResult {
+                        next_cursor,
+                        tools: vec![listed_test_tool("page-tool", None)],
+                    })
+                }
+            })
+            .await;
+            assert_eq!(calls, 100, "discovery must stop after 100 pages");
+            if has_more {
+                let error = result.err().expect("a 101st page must exceed the limit");
+                assert_eq!(
+                    error.to_string(),
+                    "MCP server \"paged-server\": tools/list exceeded page limit of 100 (100 tools collected)"
+                );
+            } else {
+                assert_eq!(result.expect("100 pages should be allowed").len(), 100);
+            }
+        }
     }
 
     #[tokio::test]

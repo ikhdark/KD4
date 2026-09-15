@@ -263,7 +263,7 @@ mod tests {
         assert!(description.contains("merely to re-filter a result already returned"));
         assert!(description.contains("Start useful work in the initial exec"));
         assert!(
-            description.contains("Batch independent known reads/probes with `Promise.allSettled`")
+            description.contains("Await `Promise.allSettled` for independent known reads/probes")
         );
         assert!(description.contains("Reuse current applicable `AGENTS.md`"));
         assert!(description.contains("retrieve missing scopes or invalidated content"));
@@ -281,12 +281,11 @@ mod tests {
         assert!(description.contains("otherwise search narrowly within that path"));
         assert!(!description.contains("do not substitute a search or second shell"));
         assert!(description.contains("hard 60s default deadline"));
-        assert!(description.contains("Resume only a returned session/cell ID"));
-        assert!(description.contains("never duplicate a timed-out operation"));
-        assert!(description.contains("Honor tool contracts"));
-        assert!(description.contains("with `Promise.allSettled`"));
+        assert!(description.contains("After a timeout, resume a returned live session/cell ID"));
+        assert!(description.contains("Do not rerun while the original is live or its effects are uncertain"));
+        assert!(description.contains("Retry only if it never started, stopped and is safe to repeat, or the tool permits retry"));
         assert!(description.contains("inspect every result"));
-        assert!(description.contains("Find unknown paths first; sequence dependent calls"));
+        assert!(description.contains("Finish discovery before choosing dependent mutations"));
         assert!(description.contains("Keep status and file outputs distinct"));
         assert!(description.contains("independent calls may share one exec"));
         assert!(description.contains("initial 10s budget"));
@@ -297,18 +296,18 @@ mod tests {
             "Parallelize only tool-permitted commands with independent build locks, output paths, and services"
         ));
         assert!(
-            description.contains("Propagate sequential failures with `&&` or exit-code checks")
+            description.contains("Propagate failures with `&&` or exit-code checks")
         );
         assert!(description.contains("never mask them with `|| true`"));
         assert!(
-            description.contains("Complete requested work and checks, or report failures/blockers")
+            description.contains("Complete work and checks, or report failures/blockers")
         );
         assert!(description.contains("Follow plans while they match the current request"));
         assert!(description.contains("Do not repeat unchanged deterministic failures"));
         assert!(description.contains("resume live operations through documented wait interfaces"));
         assert!(!description.contains("never repeat the same call/poll"));
         assert!(description.contains("Change route/state"));
-        assert!(description.contains("Keep evidence bounded"));
+        assert!(description.contains("Before editing, read the complete enclosing unit and refresh it after intervening writes"));
         assert!(description.contains("relevant ranges for large files"));
         assert!(description.contains("whole files when small or required"));
         assert!(!description.contains("never whole files"));
@@ -324,7 +323,7 @@ mod tests {
         assert!(description.contains("smallest useful budget"));
         assert!(description.contains(r#"first-line `// @exec: {"max_output_tokens": 2000}`"#));
         assert!(
-            description.contains("queues an extra model-visible message without yielding the cell")
+            description.contains("queues a model-visible message without yielding")
         );
         // Retired guidance that pushed the model into wait rounds or extra
         // sampling passes must stay out of the contract.

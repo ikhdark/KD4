@@ -561,6 +561,7 @@ pub(super) async fn store_process_for_test(
         ProcessEntry {
             process,
             command_execution_id: Default::default(),
+            search_exit_one_is_no_match: false,
             parent_tool_execution_id: Default::default(),
             call_id: format!("exec-call-{process_id}"),
             process_id,
@@ -1380,6 +1381,7 @@ async fn cancelled_startup_keeps_store_and_ledger_until_termination_is_confirmed
         ProcessEntry {
             process: Arc::clone(&process),
             command_execution_id: Default::default(),
+            search_exit_one_is_no_match: false,
             parent_tool_execution_id: Default::default(),
             call_id: "cancelled-startup".to_string(),
             process_id,

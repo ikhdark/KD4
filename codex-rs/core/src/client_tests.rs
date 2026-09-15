@@ -97,6 +97,7 @@ use futures::StreamExt;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1120,6 +1121,134 @@ fn websocket_prefix_hash_ignores_internal_metadata_only() {
 }
 
 #[test]
+fn websocket_property_fingerprint_tracks_every_reuse_property() {
+    let original = history_test_request(vec![history_test_item("user", None)]);
+    // Every request field needs a case in one of the two groups below.
+    let ResponsesApiRequest {
+        model: _,
+        instructions: _,
+        input: _,
+        tools: _,
+        tool_choice: _,
+        parallel_tool_calls: _,
+        reasoning: _,
+        store: _,
+        stream: _,
+        stream_options: _,
+        include: _,
+        service_tier: _,
+        prompt_cache_key: _,
+        text: _,
+        client_metadata: _,
+    } = &original;
+    let fingerprint = super::responses_request_properties_fingerprint(&original).unwrap();
+    let changes: &[(&str, fn(&mut ResponsesApiRequest))] = &[
+        ("model", |request| request.model.push_str("-new")),
+        ("instructions", |request| {
+            request.instructions.push_str(" updated")
+        }),
+        ("tools", |request| {
+            request.tools = Some(vec![json!({"type": "function", "name": "new_tool"})].into())
+        }),
+        ("tool_choice", |request| {
+            request.tool_choice = "none".to_string()
+        }),
+        ("parallel_tool_calls", |request| {
+            request.parallel_tool_calls = false
+        }),
+        ("reasoning", |request| {
+            request.reasoning = Some(codex_api::Reasoning {
+                effort: None,
+                summary: None,
+                context: None,
+            })
+        }),
+        ("store", |request| request.store = false),
+        ("stream", |request| request.stream = false),
+        ("include", |request| {
+            request
+                .include
+                .push("reasoning.encrypted_content".to_string())
+        }),
+        ("service_tier", |request| {
+            request.service_tier = Some("priority".to_string())
+        }),
+        ("prompt_cache_key", |request| {
+            request.prompt_cache_key = Some("new-key".to_string())
+        }),
+        ("text", |request| {
+            request.text = Some(codex_api::TextControls::default())
+        }),
+    ];
+    for (name, change) in changes {
+        let mut current = original.clone();
+        change(&mut current);
+        assert!(
+            !super::responses_request_properties_match(&original, &current),
+            "{name} must prevent property reuse"
+        );
+        assert_ne!(
+            super::responses_request_properties_fingerprint(&current).unwrap(),
+            fingerprint,
+            "{name} must affect the reuse fingerprint"
+        );
+        let client = test_model_client(SessionSource::Cli);
+        let mut session = client.new_session();
+        session.remember_request_history(&original, [1; 32]);
+        session.websocket_session.last_request = Some(original.clone());
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        sender
+            .send(LastResponse {
+                response_id: "old-response".to_string(),
+                items_added: vec![],
+            })
+            .unwrap();
+        session.websocket_session.last_response_rx = Some(receiver);
+        let (prepared, _, _, _) = session
+            .prepare_websocket_request(
+                ResponseCreateWsRequest::from(&current),
+                &current,
+                [1; 32],
+                &[],
+                None,
+            )
+            .unwrap();
+        let ResponsesWsRequest::ResponseCreate(prepared) = prepared;
+        assert_eq!(prepared.previous_response_id, None, "{name}");
+        assert_eq!(prepared.input, current.input, "{name}");
+    }
+
+    let delivery_changes: &[(&str, fn(&mut ResponsesApiRequest))] = &[
+        ("input", |request| {
+            request.input = vec![history_test_item("other input", None)].into();
+        }),
+        ("client_metadata", |request| {
+            request.client_metadata =
+                Some(HashMap::from([("trace".to_string(), "new".to_string())]));
+        }),
+        ("stream_options", |request| {
+            request.stream_options = Some(codex_api::StreamOptions {
+                reasoning_summary_delivery: codex_api::ReasoningSummaryDelivery::SequentialCutoff,
+            });
+        }),
+    ];
+    for (name, change) in delivery_changes {
+        let mut current = original.clone();
+        change(&mut current);
+        assert_ne!(current, original, "{name} fixture must change the request");
+        assert!(
+            super::responses_request_properties_match(&original, &current),
+            "{name} must not prevent property reuse"
+        );
+        assert_eq!(
+            super::responses_request_properties_fingerprint(&current).unwrap(),
+            fingerprint,
+            "{name} must not affect the reuse fingerprint"
+        );
+    }
+}
+
+#[test]
 fn websocket_verified_current_history_becomes_the_next_baseline() {
     let client = test_model_client(SessionSource::Cli);
     let mut session = client.new_session();
@@ -1197,12 +1326,30 @@ fn websocket_incremental_history_uses_digest_and_preserves_full_compare_fallback
         None
     );
 
-    // Missing hash state is uncertainty, not failure: retain the canonical
-    // full-materialization/full-comparison behavior.
+    // Missing hash state retains the normalized comparison contract.
     session.websocket_session.last_request_history = None;
+    Arc::make_mut(&mut extended.input)[0] = history_test_item("user", Some("turn-b"));
+    Arc::make_mut(&mut extended.input)[1] = history_test_item("assistant", None);
     assert_eq!(
         session.get_incremental_items(&extended, Some(&response), false),
         Some(vec![delta])
+    );
+    assert_eq!(
+        session.get_incremental_items(&changed_prefix, Some(&response), false),
+        None
+    );
+    Arc::make_mut(&mut extended.input)[1] = history_test_item("changed response", None);
+    assert_eq!(
+        session.get_incremental_items(&extended, Some(&response), false),
+        None
+    );
+    assert_eq!(
+        original.input.as_ref(),
+        &[history_test_item("user", Some("turn-a"))]
+    );
+    assert_eq!(
+        response.items_added,
+        vec![history_test_item("assistant", Some("turn-a"))]
     );
 }
 
@@ -2476,6 +2623,85 @@ fn build_ws_client_metadata_includes_window_lineage_and_turn_metadata() {
 }
 
 #[tokio::test]
+async fn provider_response_ids_cannot_replace_trusted_context() {
+    let trusted_text = "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\ntrusted instructions\n</INSTRUCTIONS>";
+    let provider_text = "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nprovider instructions\n</INSTRUCTIONS>";
+    let trusted = crate::context_manager::updates::build_contextual_user_message(vec![
+        trusted_text.to_string(),
+    ])
+    .expect("trusted context");
+    let expected =
+        project_stable_context(vec![trusted.clone()].into(), StableContextTarget::Sampling);
+
+    for provider_id in ["msg_sctx_provider", "ordinary-provider-id"] {
+        let provider_item: ResponseItem = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "id": provider_id,
+            "role": "user",
+            "content": [{"type": "input_text", "text": provider_text}],
+        }))
+        .expect("provider response");
+        let api_stream = futures::stream::iter([
+            Ok(ResponseEvent::OutputItemAdded(provider_item.clone())),
+            Ok(ResponseEvent::OutputItemDone(provider_item)),
+            Ok(ResponseEvent::Completed {
+                response_id: "response-id".to_string(),
+                token_usage: None,
+                end_turn: Some(true),
+            }),
+        ]);
+        let (mut stream, last_response) = super::map_response_events(
+            None,
+            api_stream,
+            test_session_telemetry(),
+            InferenceTraceAttempt::disabled(),
+            test_model_provider(),
+            None,
+        );
+        let Some(Ok(ResponseEvent::OutputItemAdded(added))) = stream.next().await else {
+            panic!("expected item added");
+        };
+        let Some(Ok(ResponseEvent::OutputItemDone(done))) = stream.next().await else {
+            panic!("expected item done");
+        };
+        assert_eq!(added, done);
+        let expected_id = if provider_id == "msg_sctx_provider" {
+            "msg_msg_sctx_provider"
+        } else {
+            provider_id
+        };
+        assert_eq!(done.id().map(|id| id.as_str()), Some(expected_id));
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(ResponseEvent::Completed { .. }))
+        ));
+        assert_eq!(last_response.await.unwrap().items_added, vec![done.clone()]);
+
+        let restored: ResponseItem =
+            serde_json::from_str(&serde_json::to_string(&done).unwrap()).unwrap();
+        let projection = project_stable_context(
+            vec![trusted.clone(), restored].into(),
+            StableContextTarget::Sampling,
+        );
+        assert!(projection.manifest.projection_enabled());
+        assert!(!projection.manifest.fail_open());
+        assert_eq!(
+            projection
+                .manifest
+                .active_content_hash(crate::stable_context::StableContextKind::Repository),
+            expected
+                .manifest
+                .active_content_hash(crate::stable_context::StableContextKind::Repository),
+        );
+        let mut projected_trusted = trusted.clone();
+        if let ResponseItem::Message { id, .. } = &mut projected_trusted {
+            *id = None;
+        }
+        assert_eq!(projection.items.as_ref(), &[projected_trusted, done]);
+    }
+}
+
+#[tokio::test]
 async fn response_stream_does_not_wait_for_and_cancels_pending_request_measurements() {
     let measurement_gate = Arc::new(Notify::new());
     let measurement_cancellation = tokio_util::sync::CancellationToken::new();
@@ -2557,13 +2783,17 @@ async fn response_completed_waits_for_pending_request_measurements() {
             None,
         )
     });
-    let api_stream = futures::stream::iter([Ok(ResponseEvent::Completed {
-        response_id: "response-id".to_string(),
-        token_usage: None,
-        end_turn: Some(true),
-    })])
+    let output = history_test_item("completed output", Some("turn-a"));
+    let api_stream = futures::stream::iter([
+        Ok(ResponseEvent::OutputItemDone(output.clone())),
+        Ok(ResponseEvent::Completed {
+            response_id: "response-id".to_string(),
+            token_usage: None,
+            end_turn: Some(true),
+        }),
+    ])
     .chain(futures::stream::pending());
-    let (mut stream, _) = super::map_response_events(
+    let (mut stream, mut last_response) = super::map_response_events(
         None,
         api_stream,
         test_session_telemetry(),
@@ -2577,6 +2807,9 @@ async fn response_completed_waits_for_pending_request_measurements() {
         )),
     );
 
+    assert!(
+        matches!(stream.next().await, Some(Ok(ResponseEvent::OutputItemDone(item))) if item == output)
+    );
     let mut completion = Box::pin(stream.next());
     assert!(
         tokio::time::timeout(Duration::from_millis(50), &mut completion)
@@ -2592,6 +2825,11 @@ async fn response_completed_waits_for_pending_request_measurements() {
         .expect("mapped stream should yield completion")
         .expect("completion should remain successful");
     assert!(matches!(event, ResponseEvent::Completed { .. }));
+    let response = last_response
+        .try_recv()
+        .expect("history is published before completion");
+    assert_eq!(response.response_id, "response-id");
+    assert_eq!(response.items_added, vec![output]);
     assert!(
         tokio::time::timeout(Duration::from_millis(250), stream.next())
             .await
@@ -2815,7 +3053,7 @@ async fn bedrock_unauthorized_error_uses_provider_mapping() {
     assert_eq!(
         error.to_string(),
         format!(
-            "Amazon Bedrock rejected the request because its AWS signature has expired. Refresh your AWS credentials and retry. If `AWS_BEARER_TOKEN_BEDROCK` is set, update or unset it, then restart Codex, url: {url}"
+            "Amazon Bedrock rejected the request because its AWS signature has expired. Retry with a freshly signed request and check your system clock. If you use a Bedrock API key, refresh it. If `AWS_BEARER_TOKEN_BEDROCK` is set, update or unset it, then restart Codex, url: {url}"
         )
     );
 }

@@ -399,6 +399,7 @@ async fn run_image_edit_test(
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
+        .with_args(&["-c", "sandbox_mode=\"danger-full-access\""])
         .with_env_overrides(&[("OPENAI_API_KEY", None)])
         .build()
         .await?;

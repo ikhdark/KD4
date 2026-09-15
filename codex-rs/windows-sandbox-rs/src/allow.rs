@@ -153,6 +153,46 @@ mod tests {
     }
 
     #[test]
+    fn native_writable_roots_do_not_grant_command_cwd() {
+        use codex_protocol::permissions::FileSystemAccessMode;
+        use codex_protocol::permissions::FileSystemPath;
+        use codex_protocol::permissions::FileSystemSandboxEntry;
+        use codex_protocol::permissions::FileSystemSandboxPolicy;
+        use codex_protocol::permissions::FileSystemSpecialPath;
+
+        let temp = TempDir::new().expect("tempdir");
+        let cwd = temp.path().join("read-only-cwd");
+        let writable = temp.path().join("writable");
+        fs::create_dir_all(&cwd).expect("create cwd");
+        fs::create_dir_all(&writable).expect("create writable root");
+        let profile = PermissionProfile::from_runtime_permissions(
+            &FileSystemSandboxPolicy::restricted(vec![
+                FileSystemSandboxEntry {
+                    path: FileSystemPath::Special {
+                        value: FileSystemSpecialPath::Root,
+                    },
+                    access: FileSystemAccessMode::Read,
+                },
+                FileSystemSandboxEntry {
+                    path: FileSystemPath::Path {
+                        path: AbsolutePathBuf::from_absolute_path(&writable)
+                            .expect("absolute writable root"),
+                    },
+                    access: FileSystemAccessMode::Write,
+                },
+            ]),
+            NetworkSandboxPolicy::Restricted,
+        );
+        let paths =
+            compute_allow_paths(&profile, &workspace_roots_for(&cwd), &cwd, &HashMap::new());
+        assert_eq!(
+            paths.allow,
+            HashSet::from([canonicalize(&writable).expect("canonical writable root")]),
+            "the ACL allow set must contain only the explicitly writable root",
+        );
+    }
+
+    #[test]
     fn excludes_tmp_env_vars_when_requested() {
         let tmp = TempDir::new().expect("tempdir");
         let command_cwd = tmp.path().join("workspace");

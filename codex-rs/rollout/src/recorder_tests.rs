@@ -1250,20 +1250,12 @@ async fn assert_failed_append_is_written_once(
 
 #[tokio::test]
 async fn writer_state_does_not_retry_an_ambiguously_flushed_record() -> std::io::Result<()> {
-    assert_failed_append_is_written_once(
-        JsonlWriteFault::Complete,
-        "ambiguous-flush-record",
-    )
-    .await
+    assert_failed_append_is_written_once(JsonlWriteFault::Complete, "ambiguous-flush-record").await
 }
 
 #[tokio::test]
 async fn writer_state_rolls_back_a_partial_record_before_retry() -> std::io::Result<()> {
-    assert_failed_append_is_written_once(
-        JsonlWriteFault::Partial(32),
-        "partial-write-record",
-    )
-    .await
+    assert_failed_append_is_written_once(JsonlWriteFault::Partial(32), "partial-write-record").await
 }
 
 #[tokio::test]
@@ -1306,9 +1298,19 @@ async fn unrecoverable_append_stops_writer_with_live_senders() -> std::io::Resul
         .expect("writer task must not panic")
         .expect_err("unrecoverable append must fail");
     assert!(err.to_string().contains("retry is unsafe"));
+    assert!(
+        err.to_string()
+            .contains("1 buffered rollout records could not be confirmed persisted")
+    );
     assert!(tx.is_closed());
     assert!(writer_task.ensure_active("append").is_err());
-    assert!(writer_task.terminal_failure().is_some());
+    assert!(
+        writer_task
+            .terminal_failure()
+            .expect("terminal failure")
+            .to_string()
+            .contains("1 buffered rollout records")
+    );
     assert_eq!(fs::read(&rollout_path)?, b"unexpected bytes");
     Ok(())
 }

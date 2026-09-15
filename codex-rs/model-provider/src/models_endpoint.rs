@@ -640,7 +640,7 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(result, Err(CodexErr::InvalidRequest(message)) if message.contains("304 without an ETag"))
+            matches!(result, Err(CodexErr::UnexpectedStatus(response)) if response.status == http::StatusCode::NOT_MODIFIED)
         );
     }
 

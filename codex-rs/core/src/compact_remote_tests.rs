@@ -299,7 +299,12 @@ async fn trim_function_call_history_scans_past_non_output_boundaries() {
             text: "non-output rewrite boundary".to_string(),
         },
     );
-    let search = tool_search_group("search-1");
+    let mut search = tool_search_group("search-1");
+    if let ResponseItem::ToolSearchOutput { tools, .. } = &mut search[1] {
+        for tool in tools {
+            tool["description"] = serde_json::json!("search documentation ".repeat(256));
+        }
+    }
     let recent_unrecoverable =
         custom_tool_call_output("recent-output-id", "recent-call-id", &"b".repeat(8_192));
     turn_context.model_info.context_window = Some(REMOTE_COMPACTION_TRANSPORT_RESERVE_TOKENS + 1);

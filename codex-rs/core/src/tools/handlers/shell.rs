@@ -134,7 +134,7 @@ pub(super) fn shell_failure_sampling_signal(
     command: &str,
     exit_code: Option<i32>,
 ) -> Option<JsonValue> {
-    if exit_code == Some(0) {
+    if exit_code == Some(0) || attempt_key.is_some_and(|key| key.is_search_no_match(exit_code)) {
         return None;
     }
     let action_fingerprint = attempt_key
@@ -160,13 +160,14 @@ pub(super) fn shell_sampling_signal(
     canonical_output: Option<&[u8]>,
 ) -> Option<JsonValue> {
     shell_failure_sampling_signal(attempt_key, command, exit_code).or_else(|| {
-        (exit_code == Some(0)).then(|| {
-            crate::tools::context::semantic_evidence_sampling_signal(serde_json::json!(
-                crate::tools::context::semantic_evidence_for_command_output(
-                    canonical_output.unwrap_or_default(),
-                )
-            ))
-        })
+        (exit_code == Some(0) || attempt_key.is_some_and(|key| key.is_search_no_match(exit_code)))
+            .then(|| {
+                crate::tools::context::semantic_evidence_sampling_signal(serde_json::json!(
+                    crate::tools::context::semantic_evidence_for_command_output(
+                        canonical_output.unwrap_or_default(),
+                    )
+                ))
+            })
     })
 }
 
@@ -250,14 +251,7 @@ impl ToolOutput for LegacyShellToolOutput {
     }
 
     fn outcome_for_logging(&self) -> codex_tools::ToolOutputOutcome {
-        let outcome = self.inner.outcome_for_logging();
-        if outcome != codex_tools::ToolOutputOutcome::Success {
-            outcome
-        } else if self.exit_code.is_some_and(|code| code != 0) {
-            codex_tools::ToolOutputOutcome::Failure
-        } else {
-            codex_tools::ToolOutputOutcome::Success
-        }
+        self.inner.outcome_for_logging()
     }
 
     fn outcome_context(&self) -> codex_tools::ToolOutputOutcomeContext {
@@ -454,9 +448,7 @@ pub(super) async fn run_exec_like_with_exit_code(
         .await
 }
 
-pub(in crate::tools::handlers) fn validation_environment_hash(
-    env: &HashMap<String, String>,
-) -> String {
+pub(crate) fn validation_environment_hash(env: &HashMap<String, String>) -> String {
     let mut entries = env.iter().collect::<Vec<_>>();
     entries.sort_by_key(|(name, _)| *name);
     let mut digest = Sha256::new();
@@ -699,12 +691,24 @@ async fn run_exec_like_with_exit_code_inner(
     }
 
     if !known_delta_hit && let Some(attempt_key) = attempt_key.as_ref() {
-        session
+        if let Err(blocked) = session
             .services
             .command_execution
             .begin_attempt_with_freshness(attempt_key, command_repaired, force_fresh)
             .await
-            .map_err(|blocked| FunctionCallError::RespondToModel(blocked.render_for_model()))?;
+        {
+            if blocked.is_search_miss() {
+                return Ok(RunExecLikeResult {
+                    output: FunctionToolOutput::from_text(blocked.render_for_model(), Some(true)),
+                    exit_code: Some(1),
+                    validation_execution_outcome: ValidationExecutionOutcome::NotExecuted,
+                    canonical_output: Some(Vec::new()),
+                });
+            }
+            return Err(FunctionCallError::RespondToModel(
+                blocked.render_for_model(),
+            ));
+        }
     }
 
     // Intercept apply_patch if present.
@@ -1009,7 +1013,15 @@ async fn run_exec_like_with_exit_code_inner(
     };
     let canonical_output = canonical_exec_output_bytes(&out);
     let output_bearing_result = shell_result_has_execution_output(&out);
-    let tool_outcome = shell_tool_outcome(&out);
+    let tool_outcome = if out.is_ok()
+        && attempt_key
+            .as_ref()
+            .is_some_and(|key| key.is_search_no_match(exit_code))
+    {
+        codex_tools::ToolOutputOutcome::Success
+    } else {
+        shell_tool_outcome(&out)
+    };
     let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker)
         .with_call_source(&tool_call_source);
     let finish_result = emitter

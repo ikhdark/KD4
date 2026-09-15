@@ -517,3 +517,52 @@ fn failure_advisory_respects_the_active_powershell_script_mode() {
     assert!(advisory.contains("Measure-Object expects property names"));
     assert!(advisory.contains("ForEach-Object"));
 }
+
+#[test]
+fn failure_advisory_distinguishes_string_terminators_from_application_output() {
+    for (output, expected) in [
+        ("The string is missing the terminator: '.", true),
+        (
+            "FullyQualifiedErrorId : TerminatorExpectedAtEndOfString",
+            true,
+        ),
+        ("test terminator_parser failed: expected 3 records", false),
+        ("Terminator service is unavailable", false),
+    ] {
+        assert_eq!(
+            powershell_script_failure_advisory(Some(ShellType::PowerShell), Some(1), false, output)
+                .is_some(),
+            expected,
+            "{output}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn powershell_script_reports_encoded_command_line_overflow() {
+    let shell = Shell {
+        shell_type: ShellType::PowerShell,
+        shell_path: PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+    };
+    let small = CommandInvocation::PowerShellScript("#".repeat(10_000));
+    let command = small.to_exec_args(&shell, false).expect("script fits");
+    assert_eq!(
+        command.first(),
+        Some(&shell.shell_path.to_string_lossy().to_string())
+    );
+    assert_eq!(command[command.len() - 2], "-EncodedCommand");
+
+    for script in ["#".repeat(13_000), "😀".repeat(7_000)] {
+        let large = CommandInvocation::PowerShellScript(script);
+        let error = large
+            .to_exec_args(&shell, false)
+            .expect_err("encoded script is too large");
+        assert!(
+            error
+                .to_string()
+                .contains("32767-character command-line limit")
+        );
+        assert!(error.to_string().contains("-File"));
+    }
+}

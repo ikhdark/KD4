@@ -65,6 +65,7 @@ pub(crate) fn turn_contribution_removal(index: usize) -> String {
 /// rollout persistence and compaction without extending strongly typed
 /// Responses metadata. Ordinary user messages receive `msg_<item-id>` IDs at
 /// ingestion and therefore cannot acquire this core-owned prefix from text.
+/// Provider output is normalized at the response-stream boundary to reserve it.
 pub(crate) fn mark_trusted_stable_context_item(item: &mut ResponseItem) {
     let ResponseItem::Message { id, .. } = item else {
         return;
@@ -78,6 +79,17 @@ pub(crate) fn mark_trusted_stable_context_item(item: &mut ResponseItem) {
 fn is_trusted_stable_context_id(id: &ResponseItemId) -> bool {
     id.as_str()
         .starts_with(TRUSTED_STABLE_CONTEXT_ITEM_ID_PREFIX)
+}
+
+/// Keep provider IDs outside the namespace reserved for local context producers.
+/// The deterministic replacement keeps added/done events and response history
+/// aligned without changing ordinary provider IDs or durable local context IDs.
+pub(crate) fn normalize_provider_context_item_id(item: &mut ResponseItem) {
+    if let ResponseItem::Message { id: Some(id), .. } = item
+        && is_trusted_stable_context_id(id)
+    {
+        *id = ResponseItemId::with_suffix("msg", id.as_str());
+    }
 }
 
 fn is_trusted_stable_context_item(item: &ResponseItem) -> bool {
@@ -1296,6 +1308,7 @@ fn contains_known_open_marker(text: &str) -> bool {
         "<memory_context>",
         MULTI_AGENT_MODE_OPEN_TAG,
         "<configured_developer_instructions",
+        "<turn_context_contribution",
         "<multi_agent_usage_hint",
         "<model_switch>",
         "<personality_spec>",

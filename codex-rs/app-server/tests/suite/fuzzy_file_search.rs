@@ -295,10 +295,109 @@ async fn test_fuzzy_file_search_sorts_and_includes_indices() -> Result<()> {
                     "score": 71,
                     "indices": [0, 1, 4],
                 },
-            ]
+            ],
+            "totalMatchCount": 3,
+            "scannedFileCount": 7,
+            "walkComplete": true,
         })
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fuzzy_file_search_reports_counts_and_incomplete_scans() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let root = TempDir::new()?;
+    for index in 0..80 {
+        std::fs::write(root.path().join(format!("file-{index:03}.txt")), "x")?;
+    }
+    let root_path = root.path().to_string_lossy().into_owned();
+    let missing_path = root.path().join("missing").to_string_lossy().into_owned();
+    let mut mcp = initialized_mcp(&codex_home).await?;
+
+    for (query, roots, returned, matched, scanned, complete) in [
+        ("file-", vec![root_path.clone()], 50, 80, 81, true),
+        ("zzzz", vec![root_path.clone()], 0, 0, 81, true),
+        (
+            "file-",
+            vec![root_path.clone(), missing_path],
+            50,
+            80,
+            81,
+            false,
+        ),
+        ("", vec![root_path], 0, 0, 0, false),
+        ("file-", vec![], 0, 0, 0, true),
+    ] {
+        let request_id = mcp
+            .send_fuzzy_file_search_request(query, roots, None)
+            .await?;
+        let response = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+        )
+        .await??;
+        let value = response.result;
+        assert_eq!(value["files"].as_array().map(Vec::len), Some(returned));
+        assert_eq!(value["totalMatchCount"], json!(matched));
+        assert_eq!(value["scannedFileCount"], json!(scanned));
+        assert_eq!(value["walkComplete"], json!(complete));
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fuzzy_file_search_session_reports_counts_and_incomplete_scans() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let root = TempDir::new()?;
+    for index in 0..80 {
+        std::fs::write(root.path().join(format!("file-{index:03}.txt")), "x")?;
+    }
+    let root_path = root.path().to_string_lossy().into_owned();
+    let missing_path = root.path().join("missing").to_string_lossy().into_owned();
+    let mut mcp = initialized_mcp(&codex_home).await?;
+
+    for (session_id, roots, complete) in [
+        ("complete", vec![root_path.clone()], true),
+        ("incomplete", vec![root_path, missing_path], false),
+    ] {
+        mcp.start_fuzzy_file_search_session(session_id, roots)
+            .await?;
+        mcp.update_fuzzy_file_search_session(session_id, "file-")
+            .await?;
+        wait_for_session_completed(&mut mcp, session_id, "file-").await?;
+        let notification = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_matching_notification("final search counts", |notification| {
+                notification.method == SESSION_UPDATED_METHOD
+                    && notification.params.as_ref().is_some_and(|value| {
+                        value["sessionId"] == session_id
+                            && value["query"] == "file-"
+                            && value["totalMatchCount"] == 80
+                            && value["walkComplete"] == complete
+                    })
+            }),
+        )
+        .await??;
+        let payload: FuzzyFileSearchSessionUpdatedNotification = serde_json::from_value(
+            notification
+                .params
+                .ok_or_else(|| anyhow!("missing params"))?,
+        )?;
+        assert_eq!(payload.files.len(), 50);
+        assert_eq!(payload.total_match_count, 80);
+        assert_eq!(payload.scanned_file_count, 81);
+        assert_eq!(payload.walk_complete, complete);
+
+        mcp.update_fuzzy_file_search_session(session_id, "").await?;
+        let blank =
+            wait_for_session_updated(&mut mcp, session_id, "", FileExpectation::Empty).await?;
+        assert_eq!(blank.total_match_count, 0);
+        assert_eq!(blank.scanned_file_count, 81);
+        assert_eq!(blank.walk_complete, complete);
+        mcp.stop_fuzzy_file_search_session(session_id).await?;
+    }
     Ok(())
 }
 

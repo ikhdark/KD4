@@ -48,12 +48,26 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
     use std::time::Duration;
     use tokio_tungstenite::tungstenite::Message;
 
-    for (sandbox_enabled, deny_write) in [(true, false), (true, true), (false, false)] {
+    for (sandbox_enabled, deny_write, cancel_after_prefix) in [
+        (true, false, false),
+        (true, true, false),
+        (false, false, false),
+        (true, true, true),
+    ] {
         let home = TempDir::new().unwrap();
         let workspace = TempDir::new().unwrap();
         let backing = TempDir::new().unwrap();
         let remote_file = backing.path().join("remote.txt");
+        let blocked_file = backing.path().join("blocked.txt");
         std::fs::write(&remote_file, b"original\n").unwrap();
+        std::fs::write(&blocked_file, b"blocked original\n").unwrap();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let server_cancellation = cancellation.clone();
+        let sandbox_level = if cancel_after_prefix {
+            WindowsSandboxLevel::RestrictedToken
+        } else {
+            WindowsSandboxLevel::Disabled
+        };
         let cwd = workspace.path().abs();
         let cwd_uri = PathUri::from_abs_path(&cwd);
         let target_uri = cwd_uri.join("remote.txt").unwrap();
@@ -83,6 +97,9 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
         let server_file = remote_file.clone();
         let server_target = target_uri.clone();
+        let blocked_target = cwd_uri.join("blocked.txt").unwrap();
+        let server_blocked_target = blocked_target.clone();
+        let server_blocked_file = blocked_file.clone();
         let server_cwd = cwd_uri.clone();
         let observed_operations = Arc::new(std::sync::Mutex::new(Vec::new()));
         let server_operations = Arc::clone(&observed_operations);
@@ -109,6 +126,12 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
                 let method = message["method"].as_str().unwrap();
                 server_operations.lock().unwrap().push(method.to_string());
                 let mut error = None;
+                let blocked = message["params"]["path"] == json!(server_blocked_target);
+                let backing_file = if blocked {
+                    &server_blocked_file
+                } else {
+                    &server_file
+                };
                 let result = match method {
                     "initialize" => json!({"sessionId": "remote-patch-sandbox"}),
                     "initialized" => continue,
@@ -120,16 +143,29 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
                     "fs/canonicalize" => json!({"path": message["params"]["path"]}),
                     "fs/getMetadata" => json!({
                         "isDirectory": false, "isFile": true, "isSymlink": false,
-                        "size": std::fs::metadata(&server_file).unwrap().len(),
+                        "size": std::fs::metadata(backing_file).unwrap().len(),
                     }),
                     "fs/readFile" => json!({
-                        "dataBase64": STANDARD.encode(std::fs::read(&server_file).unwrap()),
+                        "dataBase64": STANDARD.encode(std::fs::read(backing_file).unwrap()),
                     }),
                     "fs/writeFile" => {
                         let params = message["params"].clone();
-                        assert_eq!(params["path"], json!(server_target));
+                        assert_eq!(
+                            params["path"],
+                            json!(if blocked {
+                                &server_blocked_target
+                            } else {
+                                &server_target
+                            })
+                        );
                         writes.push(params.clone());
-                        if deny_write {
+                        if deny_write && (!cancel_after_prefix || blocked) {
+                            // Cancel while the runtime owns a committed prefix and
+                            // an uncertain denied write. It must finish bookkeeping
+                            // and return recovery information through normal dispatch.
+                            if cancel_after_prefix {
+                                server_cancellation.cancel();
+                            }
                             error = Some(
                                 json!({"code": -32000, "message": "Permission denied: remote patch policy"}),
                             );
@@ -137,7 +173,7 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
                             let bytes = STANDARD
                                 .decode(params["dataBase64"].as_str().unwrap())
                                 .unwrap();
-                            std::fs::write(&server_file, bytes).unwrap();
+                            std::fs::write(backing_file, bytes).unwrap();
                         }
                         json!({})
                     }
@@ -173,9 +209,9 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
             )
             .await;
         let turn_mut = Arc::get_mut(&mut turn).unwrap();
-        // On Windows this makes select_initial return None while policy still
-        // requests sandboxing. Other hosts prove the same portable wire policy.
-        turn_mut.windows_sandbox_level = WindowsSandboxLevel::Disabled;
+        // Disabled exercises portable sandbox intent without a host sandbox.
+        // RestrictedToken makes the cancelled denial enter sandbox error handling.
+        turn_mut.windows_sandbox_level = sandbox_level;
         turn_mut.model_info.apply_patch_tool_type =
             Some(codex_protocol::openai_models::ApplyPatchToolType::Freeform);
         turn_mut.environments.turn_environments = vec![TurnEnvironment::new(
@@ -204,16 +240,20 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
             step,
             Arc::new(Mutex::new(TurnDiffTracker::new())),
         );
+        let patch = if cancel_after_prefix {
+            "*** Begin Patch\n*** Add File: remote.txt\n+replacement\n*** Add File: blocked.txt\n+blocked replacement\n*** End Patch"
+        } else {
+            "*** Begin Patch\n*** Add File: remote.txt\n+replacement\n*** End Patch"
+        };
         let call = runtime.handle_tool_call(
             crate::tools::router::ToolCall {
                 tool_name: codex_tools::ToolName::plain("apply_patch"),
                 call_id: "remote-sandbox-patch".into(),
                 payload: ToolPayload::Custom {
-                    input: "*** Begin Patch\n*** Add File: remote.txt\n+replacement\n*** End Patch"
-                        .into(),
+                    input: patch.into(),
                 },
             },
-            tokio_util::sync::CancellationToken::new(),
+            cancellation,
         );
         tokio::pin!(call);
         let mut approvals = 0;
@@ -240,8 +280,8 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
             .unwrap();
         assert_eq!(
             writes.len(),
-            1,
-            "one remote write attempt, no unapproved retry"
+            if cancel_after_prefix { 2 } else { 1 },
+            "each hunk has one remote write attempt, no unapproved retry"
         );
         assert!(
             approvals >= 1,
@@ -259,7 +299,7 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
                 permissions: permissions.into(),
                 cwd: Some(cwd_uri),
                 workspace_roots: Vec::new(),
-                windows_sandbox_level: WindowsSandboxLevel::Disabled,
+                windows_sandbox_level: sandbox_level,
                 windows_sandbox_private_desktop: deny_write,
             });
         assert_eq!(
@@ -271,7 +311,28 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
             panic!("registered patch must return a custom tool output");
         };
         let text = output.body.to_text().unwrap();
-        if deny_write {
+        if cancel_after_prefix {
+            assert!(text.contains("aborted by user"), "{text}");
+            assert!(!text.contains("cancelled before mutation"), "{text}");
+            assert!(text.contains("Exit code: 1"), "{text}");
+            assert_eq!(
+                text.matches(&format!("A {}", target_uri.to_path_buf().display()))
+                    .count(),
+                1,
+                "{text}"
+            );
+            assert!(
+                !text.contains(&format!("A {}", blocked_target.to_path_buf().display())),
+                "{text}"
+            );
+            assert!(
+                text.contains("Additional filesystem changes may not be listed."),
+                "{text}"
+            );
+            assert!(text.contains("do not retry the whole patch"), "{text}");
+            assert_eq!(std::fs::read(&remote_file).unwrap(), b"replacement\n");
+            assert_eq!(std::fs::read(&blocked_file).unwrap(), b"blocked original\n");
+        } else if deny_write {
             assert!(!text.contains("Success. Updated"), "{text}");
             assert!(
                 text.contains("Exit code: 1") && text.contains("Failed to write file"),
@@ -305,6 +366,142 @@ async fn invocation_for_payload(payload: ToolPayload) -> ToolInvocation {
         tool_name: codex_tools::ToolName::plain("apply_patch"),
         source: crate::tools::context::ToolCallSource::Direct,
         payload,
+    }
+}
+
+#[tokio::test]
+async fn patch_workspace_waits_cancel_without_writing_or_publishing_a_diff() {
+    use crate::tools::sandboxing::ExecApprovalRequirement;
+    use codex_protocol::protocol::AskForApproval;
+
+    // All public patch routes must cancel while another writer still holds the
+    // gate, without creating a file or publishing a diff.
+    for route in ["handler", "runtime", "exec_command"] {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let cwd = workspace.path().abs();
+        let cwd_uri = PathUri::from_abs_path(&cwd);
+        let path = cwd.join("hello.txt");
+        let (session, mut turn, _events) =
+            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                codex_login::CodexAuth::from_api_key("test key"),
+                Vec::new(),
+                home.path(),
+                |config| {
+                    config.cwd = cwd.clone();
+                    config.workspace_roots = vec![cwd.clone()];
+                    config.permissions.approval_policy =
+                        crate::config::Constrained::allow_any(AskForApproval::Never);
+                    config
+                        .permissions
+                        .set_permission_profile(PermissionProfile::Disabled)
+                        .unwrap();
+                },
+            )
+            .await;
+        let environment = TurnEnvironment::new(
+            codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
+            Arc::new(codex_exec_server::Environment::default_for_tests()),
+            cwd_uri,
+            None,
+        );
+        Arc::get_mut(&mut turn)
+            .unwrap()
+            .environments
+            .turn_environments = vec![environment.clone()];
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let other_writer = crate::workspace_operation_gate::acquire_workspace_operation(&cwd).await;
+        let handler = ApplyPatchHandler::default();
+        let call = async {
+            if route == "runtime" {
+                let action = codex_apply_patch::ApplyPatchAction::new_add_for_test(
+                    &PathUri::from_abs_path(&path),
+                    "hello\n".to_string(),
+                );
+                let changes = convert_apply_patch_to_protocol(&action);
+                let emitter = ToolEmitter::apply_patch_for_environment(
+                    changes.clone(),
+                    true,
+                    environment.environment_id.clone(),
+                );
+                run_owned_patch(
+                    ApplyPatchRequest {
+                        turn_environment: environment.clone(),
+                        action,
+                        file_paths: vec![PathUri::from_abs_path(&path)],
+                        changes,
+                        exec_approval_requirement: ExecApprovalRequirement::Skip {
+                            bypass_sandbox: true,
+                            proposed_execpolicy_amendment: None,
+                        },
+                        additional_permissions: None,
+                        permissions_preapproved: true,
+                        cancellation_token: cancellation.clone(),
+                    },
+                    ToolCtx {
+                        session: session.clone(),
+                        turn: turn.clone(),
+                        call_id: "cancel-runtime-wait".into(),
+                        tool_name: codex_tools::ToolName::plain("apply_patch"),
+                    },
+                    Some(tracker.clone()),
+                    emitter,
+                )
+                .await
+                .map(|_| ())
+            } else if route == "exec_command" {
+                crate::tools::handlers::unified_exec::ExecCommandHandler::default()
+                    .handle_call(ToolInvocation {
+                        session: session.clone(),
+                        step_context: StepContext::for_test(turn.clone()),
+                        tracker: tracker.clone(),
+                        call_id: "cancel-exec-patch-wait".into(),
+                        tool_name: codex_tools::ToolName::plain("exec_command"),
+                        source: crate::tools::context::ToolCallSource::Direct,
+                        payload: ToolPayload::Function {
+                            arguments: json!({
+                                "kind": "argv", "program": "apply_patch",
+                                "args": [sample_patch()],
+                            })
+                            .to_string(),
+                        },
+                        cancellation_token: cancellation.clone(),
+                    })
+                    .await
+                    .map(|_| ())
+            } else {
+                handler
+                    .handle_call(ToolInvocation {
+                        session: session.clone(),
+                        step_context: StepContext::for_test(turn.clone()),
+                        tracker: tracker.clone(),
+                        call_id: "cancel-handler-wait".into(),
+                        tool_name: codex_tools::ToolName::plain("apply_patch"),
+                        source: crate::tools::context::ToolCallSource::Direct,
+                        payload: ToolPayload::Custom {
+                            input: sample_patch().into(),
+                        },
+                        cancellation_token: cancellation.clone(),
+                    })
+                    .await
+                    .map(|_| ())
+            }
+        };
+        tokio::pin!(call);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), call.as_mut())
+                .await
+                .is_err()
+        );
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), call.as_mut())
+            .await
+            .expect("cancelled patch must not wait for the other writer to finish");
+        assert!(result.is_err(), "cancelled patch must not report success");
+        assert!(!path.exists(), "cancelled patch must not create its target");
+        assert_eq!(tracker.lock().await.get_unified_diff(), None);
+        drop(other_writer);
     }
 }
 

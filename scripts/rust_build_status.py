@@ -28,11 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.tool_versions import JUST_LANE_PATTERN  # noqa: E402
-from scripts.tool_versions import JUST_FIXED_LANE_NAMES  # noqa: E402
-from scripts.tool_versions import JUST_FIXED_LANE_PATTERN  # noqa: E402
-from scripts.tool_versions import LANE_PATH_PATTERN  # noqa: E402
-from scripts.tool_versions import SCRIPT_LANE_PATTERN  # noqa: E402
+from scripts.tool_versions import cargo_lane_patterns  # noqa: E402
 
 from scripts.rust_build_status_support import (  # noqa: E402
     add_prune_arguments,
@@ -83,10 +79,12 @@ __all__ = [
 ]
 
 
-LANE_RE = re.compile(LANE_PATH_PATTERN, re.IGNORECASE)
-SCRIPT_LANE_RE = re.compile(SCRIPT_LANE_PATTERN)
-JUST_LANE_RE = re.compile(JUST_LANE_PATTERN)
-JUST_FIXED_LANE_RE = re.compile(JUST_FIXED_LANE_PATTERN)
+_CARGO_LANE_PATTERNS = cargo_lane_patterns()
+LANE_RE = re.compile(str(_CARGO_LANE_PATTERNS["lane_path_pattern"]), re.IGNORECASE)
+SCRIPT_LANE_RE = re.compile(str(_CARGO_LANE_PATTERNS["script_lane_pattern"]))
+JUST_LANE_RE = re.compile(str(_CARGO_LANE_PATTERNS["just_lane_pattern"]))
+JUST_FIXED_LANE_RE = re.compile(str(_CARGO_LANE_PATTERNS["just_fixed_lane_pattern"]))
+JUST_FIXED_LANE_NAMES = dict(_CARGO_LANE_PATTERNS["just_fixed_lane_names"])
 RUST_PROCESS_NAMES = (
     "cargo",
     "cargo-clippy",

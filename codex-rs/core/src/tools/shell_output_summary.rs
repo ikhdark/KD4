@@ -1,11 +1,15 @@
+use codex_utils_output_truncation::looks_like_validation_command;
+
 const DEFAULT_SUMMARY_AFTER_BYTES: usize = 48 * 1024;
 const DEFAULT_SUMMARY_AFTER_LINES: usize = 600;
-const EARLY_SUMMARY_AFTER_BYTES: usize = 10 * 1024;
-const EARLY_SUMMARY_AFTER_LINES: usize = 160;
 const SUMMARY_MAX_BYTES: usize = 32 * 1024;
 const SUMMARY_MAX_LINES: usize = 240;
+// Reserve room for the retention counts and an explicit cap marker.
+const SUMMARY_FOOTER_BYTES: usize = 128;
+const SUMMARY_FOOTER_LINES: usize = 3;
 const SUCCESS_HEAD_LINES: usize = 24;
 const SUCCESS_TAIL_LINES: usize = 64;
+const VALIDATION_SUCCESS_TAIL_LINES: usize = 16;
 const FAILURE_TAIL_LINES: usize = 140;
 const FOCUS_CONTEXT_LINES: usize = 3;
 // Keep the selected ranges below the summary line ceiling even when every
@@ -17,9 +21,9 @@ const MAX_STATUS_MATCHES: usize = 8;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ShellOutputSummaryOptions<'a> {
     pub(crate) enabled: bool,
-    /// This only lowers the model-visible summarization threshold. It must never
-    /// block, rewrite, deny, reroute, or otherwise alter command execution.
-    pub(crate) turn_cost_guard: bool,
+    /// Summarize when output exceeds the actual projection budget, including
+    /// outputs below the default large-output threshold.
+    pub(crate) applied_token_limit: Option<usize>,
     /// Optional command text may classify output shape, such as validation/build
     /// output. Do not add extra plumbing just to carry this value.
     pub(crate) command_text: Option<&'a str>,
@@ -35,12 +39,12 @@ pub(crate) fn summarize_shell_output_for_model(
         return None;
     }
 
-    let (byte_threshold, line_threshold) = if options.turn_cost_guard {
-        (EARLY_SUMMARY_AFTER_BYTES, EARLY_SUMMARY_AFTER_LINES)
-    } else {
-        (DEFAULT_SUMMARY_AFTER_BYTES, DEFAULT_SUMMARY_AFTER_LINES)
-    };
-    let lines = collect_lines_for_summary(output, byte_threshold, line_threshold)?;
+    let byte_threshold = options
+        .applied_token_limit
+        .map_or(DEFAULT_SUMMARY_AFTER_BYTES, |limit| {
+            codex_utils_string::approx_bytes_for_tokens(limit).min(DEFAULT_SUMMARY_AFTER_BYTES)
+        });
+    let lines = collect_lines_for_summary(output, byte_threshold, DEFAULT_SUMMARY_AFTER_LINES)?;
     let line_count = lines.len();
     let failed = timed_out || exit_code != 0;
     let validation = options
@@ -72,21 +76,26 @@ pub(crate) fn summarize_shell_output_for_model(
     // attached to the context that explains it.
     let ordered = ordered_line_indexes(&line_states);
     let mut previous = None;
+    let mut emitted_source_lines = 0;
     for index in ordered {
         if let Some(previous_index) = previous
             && index != previous_index + 1
+            && !builder.push_line(format!(
+                "... [{} lines omitted]",
+                index - previous_index - 1
+            ))
         {
-            builder.push_line("...");
-        }
-        if let Some(line) = lines.get(index) {
-            builder.push_line(format!("{:>5}: {line}", index + 1));
-        }
-        previous = Some(index);
-        if builder.is_full() {
             break;
         }
+        if let Some(line) = lines.get(index) {
+            if !builder.push_line(format!("{:>5}: {line}", index + 1)) {
+                break;
+            }
+            emitted_source_lines += 1;
+        }
+        previous = Some(index);
     }
-    builder.finish()
+    builder.finish(emitted_source_lines, line_count)
 }
 
 fn collect_lines_for_summary(
@@ -94,24 +103,16 @@ fn collect_lines_for_summary(
     byte_threshold: usize,
     line_threshold: usize,
 ) -> Option<Vec<&str>> {
-    debug_assert!(line_threshold <= DEFAULT_SUMMARY_AFTER_LINES);
-    let mut buffered = [None; DEFAULT_SUMMARY_AFTER_LINES + 1];
-    let mut buffered_len = 0;
+    if output.len() > byte_threshold {
+        return Some(output.lines().collect());
+    }
+    let mut buffered = Vec::new();
     let mut remaining = output.lines();
     while let Some(line) = remaining.next() {
-        if output.len() > byte_threshold {
-            let mut lines = Vec::with_capacity(line_threshold.saturating_add(1));
-            lines.push(line);
-            lines.extend(remaining);
-            return Some(lines);
-        }
-        buffered[buffered_len] = Some(line);
-        buffered_len += 1;
-        if buffered_len > line_threshold {
-            let mut lines = Vec::with_capacity(buffered_len);
-            lines.extend(buffered[..buffered_len].iter().flatten().copied());
-            lines.extend(remaining);
-            return Some(lines);
+        buffered.push(line);
+        if buffered.len() > line_threshold {
+            buffered.extend(remaining);
+            return Some(buffered);
         }
     }
     None
@@ -130,8 +131,10 @@ struct LineState {
     selected: bool,
 }
 
-fn classify_line(line: &str) -> LineClassification {
-    let lower = line.to_ascii_lowercase();
+fn classify_line(line: &str, lower: &mut String) -> LineClassification {
+    lower.clear();
+    lower.push_str(line);
+    lower.make_ascii_lowercase();
     let trimmed = lower.trim_start();
     LineClassification {
         critical: starts_with_diagnostic_label(trimmed, "error")
@@ -139,23 +142,49 @@ fn classify_line(line: &str) -> LineClassification {
             || starts_with_diagnostic_label(trimmed, "failure")
             || starts_with_diagnostic_label(trimmed, "panic")
             || starts_with_diagnostic_label(trimmed, "fatal")
+            || trimmed.starts_with("fail [")
+            || trimmed.strip_prefix("try ").is_some_and(|retry| {
+                retry.split_once(" fail [").is_some_and(|(attempt, _)| {
+                    !attempt.is_empty() && attempt.bytes().all(|byte| byte.is_ascii_digit())
+                })
+            })
             || trimmed.starts_with("failures:")
             || trimmed.starts_with("panicked at ")
             || lower.contains(" panicked at ")
-            || lower.contains(" error:"),
-        advisory: lower.contains("warning")
-            || lower.contains("warning[")
+            || lower.contains(" error:")
+            // TypeScript diagnostics use "error TS<digits>:" after a location.
+            || lower.split_once("error ts").is_some_and(|(_, code)| {
+                code.split_once(':').is_some_and(|(number, _)| {
+                    !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+                })
+            })
+            || lower.contains("npm err!"),
+        advisory: contains_word(lower, "warning")
             || trimmed.starts_with("-->")
             || trimmed.starts_with("note:")
             || trimmed.starts_with("help:"),
         status: lower.contains("test result:")
             || lower.contains("failures:")
             || lower.contains("failed.")
-            || lower.contains("passed")
+            || (contains_word(lower, "passed")
+                && (trimmed.starts_with("test ")
+                    || trimmed.starts_with("tests ")
+                    || trimmed.starts_with("suite ")
+                    || trimmed.split_once(" passed").is_some_and(|(count, _)| {
+                        !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit())
+                    })))
             || lower.contains("finished ")
-            || lower.contains("error:")
-            || lower.contains("summary:"),
+            || starts_with_diagnostic_label(trimmed, "error")
+            || lower.contains("summary:")
+            || trimmed.starts_with("summary ["),
     }
+}
+
+fn contains_word(line: &str, word: &str) -> bool {
+    line.split(|character: char| {
+        !character.is_alphanumeric() && character != '_' && character != '-'
+    })
+    .any(|candidate| candidate == word)
 }
 
 fn starts_with_diagnostic_label(line: &str, label: &str) -> bool {
@@ -168,10 +197,11 @@ fn starts_with_diagnostic_label(line: &str, label: &str) -> bool {
 }
 
 fn select_line_states(lines: &[&str], failed: bool, validation: bool) -> Vec<LineState> {
+    let mut lowercase = String::new();
     let mut states = lines
         .iter()
         .map(|line| LineState {
-            classification: classify_line(line),
+            classification: classify_line(line, &mut lowercase),
             ..LineState::default()
         })
         .collect::<Vec<_>>();
@@ -181,7 +211,14 @@ fn select_line_states(lines: &[&str], failed: bool, validation: bool) -> Vec<Lin
         if !states.iter().any(|state| state.selected) {
             add_head(&mut states, SUCCESS_HEAD_LINES);
         }
-        add_tail(&mut states, FAILURE_TAIL_LINES);
+        add_tail(
+            &mut states,
+            if failed {
+                FAILURE_TAIL_LINES
+            } else {
+                VALIDATION_SUCCESS_TAIL_LINES
+            },
+        );
     } else {
         add_head(&mut states, SUCCESS_HEAD_LINES);
         add_focus_ranges(&mut states);
@@ -215,7 +252,9 @@ fn add_focus_ranges(states: &mut [LineState]) {
     let advisory = states
         .iter()
         .enumerate()
-        .filter_map(|(index, state)| state.classification.advisory.then_some(index))
+        .filter_map(|(index, state)| {
+            (state.classification.advisory && !state.selected).then_some(index)
+        })
         .take(remaining)
         .collect::<Vec<_>>();
     add_context_ranges(states, &advisory);
@@ -249,7 +288,9 @@ fn add_status_lines(states: &mut [LineState]) {
         .iter()
         .enumerate()
         .rev()
-        .filter_map(|(index, state)| state.classification.status.then_some(index))
+        .filter_map(|(index, state)| {
+            (state.classification.status && !state.selected).then_some(index)
+        })
         .take(MAX_STATUS_MATCHES)
         .collect::<Vec<_>>();
     for index in status {
@@ -262,32 +303,6 @@ fn ordered_line_indexes(states: &[LineState]) -> impl Iterator<Item = usize> + '
         .iter()
         .enumerate()
         .filter_map(|(index, state)| state.selected.then_some(index))
-}
-
-fn looks_like_validation_command(command: &str) -> bool {
-    let lower = command.to_ascii_lowercase();
-    [
-        "cargo build",
-        "cargo check",
-        "cargo clippy",
-        "cargo test",
-        "cargo nextest",
-        "just test",
-        "just test-fast",
-        "just check",
-        "just fix",
-        "npm test",
-        "npm run build",
-        "npm run lint",
-        "npm run typecheck",
-        "pnpm test",
-        "pnpm build",
-        "pnpm lint",
-        "pnpm typecheck",
-        "pytest",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
 }
 
 struct SummaryBuilder {
@@ -305,25 +320,21 @@ impl SummaryBuilder {
         }
     }
 
-    fn push_line(&mut self, line: impl AsRef<str>) {
+    fn push_line(&mut self, line: impl AsRef<str>) -> bool {
         if self.is_full() {
             self.capped = true;
-            return;
+            return false;
         }
 
         let line = line.as_ref();
-        if self.lines + 1 > SUMMARY_MAX_LINES {
-            self.capped = true;
-            return;
-        }
-
         let separator_bytes = usize::from(!self.text.is_empty());
         let remaining = SUMMARY_MAX_BYTES
+            .saturating_sub(SUMMARY_FOOTER_BYTES)
             .saturating_sub(self.text.len())
             .saturating_sub(separator_bytes);
         if remaining == 0 {
             self.capped = true;
-            return;
+            return false;
         }
         let rendered = if line.len() > remaining {
             self.capped = true;
@@ -337,16 +348,22 @@ impl SummaryBuilder {
         }
         self.text.push_str(&rendered);
         self.lines += 1;
+        true
     }
 
     fn is_full(&self) -> bool {
-        self.lines >= SUMMARY_MAX_LINES || self.text.len() >= SUMMARY_MAX_BYTES
+        self.lines >= SUMMARY_MAX_LINES - SUMMARY_FOOTER_LINES
+            || self.text.len() >= SUMMARY_MAX_BYTES - SUMMARY_FOOTER_BYTES
     }
 
-    fn finish(mut self) -> Option<String> {
+    fn finish(mut self, emitted_source_lines: usize, original_lines: usize) -> Option<String> {
         if self.text.trim().is_empty() {
             return None;
         }
+        self.text.push_str(&format!(
+            "\n- emitted_source_lines: {emitted_source_lines}\n- omitted_source_lines: {}",
+            original_lines.saturating_sub(emitted_source_lines),
+        ));
         if self.capped && !self.text.ends_with("[summary capped]") {
             if !self.text.is_empty() {
                 self.text.push('\n');
@@ -380,7 +397,7 @@ mod optimization_tests {
     use super::*;
 
     #[test]
-    fn summary_threshold_probe_traverses_lines_once_and_preserves_them() {
+    fn summary_threshold_probe_preserves_lines_at_byte_and_line_boundaries() {
         let at_threshold = "one\ntwo\nthree";
         assert_eq!(collect_lines_for_summary(at_threshold, 128, 3), None);
 
@@ -393,14 +410,29 @@ mod optimization_tests {
             collect_lines_for_summary("abcdef", 5, 20),
             Some(vec!["abcdef"])
         );
+        let large_threshold = DEFAULT_SUMMARY_AFTER_LINES + 100;
+        let output = "line\n".repeat(large_threshold + 1);
+        assert_eq!(
+            collect_lines_for_summary(&output, usize::MAX, large_threshold),
+            Some(vec!["line"; large_threshold + 1])
+        );
+        assert_eq!(
+            collect_lines_for_summary(&output, usize::MAX, usize::MAX),
+            None
+        );
     }
 
     #[test]
-    fn line_classification_computes_all_signals_from_one_normalization() {
-        let classification = classify_line("  ERROR: warning; tests PASSED");
+    fn line_classification_reuses_normalization_without_retaining_previous_signals() {
+        let mut lowercase = String::new();
+        let classification = classify_line("  ERROR: warning; tests PASSED", &mut lowercase);
         assert!(classification.critical);
         assert!(classification.advisory);
         assert!(classification.status);
+        let classification = classify_line("ordinary output", &mut lowercase);
+        assert!(!classification.critical);
+        assert!(!classification.advisory);
+        assert!(!classification.status);
     }
 
     #[test]

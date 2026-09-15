@@ -190,6 +190,7 @@ async fn external_agent_config_import_reports_failed_sync_import_in_completion()
     let analytics_capture_file = codex_home.path().join("analytics-events.jsonl");
     let analytics_capture_file = analytics_capture_file.display().to_string();
     let mut mcp = TestAppServer::builder()
+        .with_args(&["-c", "analytics.enabled=true"])
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .with_env_overrides(&[
@@ -337,6 +338,7 @@ async fn external_agent_config_import_completed_tracks_analytics_event() -> Resu
     let project_root = codex_home.path().join("repo");
     let home_dir = codex_home.path().display().to_string();
     let mut mcp = TestAppServer::builder()
+        .with_args(&["-c", "analytics.enabled=true"])
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .with_env_overrides(&[("HOME", Some(home_dir.as_str()))])
@@ -488,6 +490,7 @@ async fn external_agent_config_import_reinstalls_plugins_from_known_marketplaces
 
     let home_dir = codex_home.path().display().to_string();
     let mut mcp = TestAppServer::builder()
+        .with_args(&["-c", "analytics.enabled=true"])
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .with_env_overrides(&[("HOME", Some(home_dir.as_str()))])

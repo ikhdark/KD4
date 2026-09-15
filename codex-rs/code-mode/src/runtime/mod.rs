@@ -156,7 +156,29 @@ fn output_item_bytes(item: &FunctionCallOutputContentItem) -> usize {
         .max(1)
 }
 
-pub(crate) fn spawn_runtime(
+#[cfg(test)]
+pub(crate) struct StartupTestGate {
+    pub(crate) entered: tokio::sync::Notify,
+    pub(crate) release: std::sync::Mutex<std_mpsc::Receiver<()>>,
+    pub(crate) exited: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static STARTUP_TEST_GATE: Arc<StartupTestGate>;
+}
+
+#[cfg(test)]
+struct StartupTestExit(Arc<StartupTestGate>);
+
+#[cfg(test)]
+impl Drop for StartupTestExit {
+    fn drop(&mut self) {
+        self.0.exited.notify_one();
+    }
+}
+
+pub(crate) async fn spawn_runtime(
     stored_values: HashMap<String, JsonValue>,
     request: ExecuteRequest,
     default_tool_timeout_ms: u64,
@@ -164,12 +186,9 @@ pub(crate) fn spawn_runtime(
     output_admission: Arc<OutputAdmission>,
     task_failure_handler: Option<TaskFailureHandler>,
 ) -> Result<(std_mpsc::Sender<RuntimeCommand>, v8::IsolateHandle), String> {
-    ensure_v8_initialized()?;
-
     let (command_tx, command_rx) = std_mpsc::channel();
     let runtime_command_tx = command_tx.clone();
-    let (isolate_handle_tx, isolate_handle_rx) = std_mpsc::sync_channel(1);
-    let startup_cancelled = Arc::new(AtomicBool::new(false));
+    let (isolate_handle_tx, isolate_handle_rx) = tokio::sync::oneshot::channel();
     let ExecuteRequest {
         tool_call_id,
         enabled_tools,
@@ -196,44 +215,70 @@ pub(crate) fn spawn_runtime(
         output_admission,
     };
 
-    let runtime_startup_cancelled = Arc::clone(&startup_cancelled);
+    #[cfg(test)]
+    let startup_test_gate = STARTUP_TEST_GATE.try_with(Arc::clone).ok();
     spawn_supervised_runtime_thread(event_tx.clone(), task_failure_handler, move || {
+        #[cfg(test)]
+        let _startup_test_exit = startup_test_gate.map(|gate| {
+            gate.entered.notify_one();
+            gate.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            StartupTestExit(gate)
+        });
+        if let Err(error) = ensure_v8_initialized() {
+            let _ = isolate_handle_tx.send(Err(error));
+            return;
+        }
         run_runtime(
             config,
             event_tx,
             command_rx,
             isolate_handle_tx,
             runtime_command_tx,
-            runtime_startup_cancelled,
         );
     });
 
-    let isolate_handle = receive_runtime_startup(
-        &isolate_handle_rx,
-        startup_cancelled.as_ref(),
-        RUNTIME_STARTUP_TIMEOUT,
-    )?;
-    Ok((command_tx, isolate_handle))
+    let isolate_handle =
+        receive_runtime_startup(isolate_handle_rx, RUNTIME_STARTUP_TIMEOUT).await?;
+    Ok((command_tx, isolate_handle.into_inner()))
 }
 
-fn receive_runtime_startup<T>(
-    receiver: &std_mpsc::Receiver<T>,
-    startup_cancelled: &AtomicBool,
+// If startup times out or its caller is cancelled after the runtime sends a handle,
+// dropping the unclaimed message must stop user code on that runtime thread.
+struct StartupIsolateHandle(Option<v8::IsolateHandle>);
+
+impl StartupIsolateHandle {
+    #[expect(
+        clippy::expect_used,
+        reason = "the private startup handle is consumed exactly once"
+    )]
+    fn into_inner(mut self) -> v8::IsolateHandle {
+        self.0.take().expect("startup isolate handle")
+    }
+}
+
+impl Drop for StartupIsolateHandle {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.terminate_execution();
+        }
+    }
+}
+
+async fn receive_runtime_startup<T>(
+    receiver: tokio::sync::oneshot::Receiver<Result<T, String>>,
     timeout: Duration,
 ) -> Result<T, String> {
-    match receiver.recv_timeout(timeout) {
-        Ok(value) => Ok(value),
-        Err(std_mpsc::RecvTimeoutError::Timeout) => {
-            startup_cancelled.store(true, Ordering::Release);
-            Err(format!(
-                "code mode runtime initialization exceeded its {}ms timeout",
-                timeout.as_millis()
-            ))
-        }
-        Err(std_mpsc::RecvTimeoutError::Disconnected) => {
-            startup_cancelled.store(true, Ordering::Release);
-            Err("failed to initialize code mode runtime".to_string())
-        }
+    match tokio::time::timeout(timeout, receiver).await {
+        Ok(Ok(value)) => value,
+        Err(_) => Err(format!(
+            "code mode runtime initialization exceeded its {}ms timeout",
+            timeout.as_millis()
+        )),
+        Ok(Err(_)) => Err("failed to initialize code mode runtime".to_string()),
     }
 }
 
@@ -243,9 +288,14 @@ fn spawn_supervised_runtime_thread(
     runtime: impl FnOnce() + Send + 'static,
 ) {
     thread::spawn(move || {
-        if catch_unwind(AssertUnwindSafe(runtime)).is_err() {
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(runtime)) {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic payload");
             if let Some(task_failure_handler) = task_failure_handler {
-                task_failure_handler("code-mode V8 runtime thread panicked".to_string());
+                task_failure_handler(format!("code-mode V8 runtime thread panicked: {message}"));
             }
             let _ = event_tx.send(RuntimeEvent::ThreadPanicked);
         }
@@ -423,16 +473,18 @@ fn run_runtime(
     config: RuntimeConfig,
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
     command_rx: std_mpsc::Receiver<RuntimeCommand>,
-    isolate_handle_tx: std_mpsc::SyncSender<v8::IsolateHandle>,
+    isolate_handle_tx: tokio::sync::oneshot::Sender<Result<StartupIsolateHandle, String>>,
     runtime_command_tx: std_mpsc::Sender<RuntimeCommand>,
-    startup_cancelled: Arc<AtomicBool>,
 ) {
-    let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
-    if startup_cancelled.load(Ordering::Acquire) {
+    if isolate_handle_tx.is_closed() {
         return;
     }
+    let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
     let isolate_handle = isolate.thread_safe_handle();
-    if isolate_handle_tx.send(isolate_handle).is_err() {
+    if isolate_handle_tx
+        .send(Ok(StartupIsolateHandle(Some(isolate_handle))))
+        .is_err()
+    {
         return;
     }
     isolate.set_host_import_module_dynamically_callback(module_loader::dynamic_import_callback);
@@ -646,20 +698,41 @@ mod tests {
         assert!(catalog.resolve("sample").is_none());
     }
 
-    #[test]
-    fn runtime_startup_receive_is_bounded_and_marks_late_initialization_cancelled() {
-        let (_startup_tx, startup_rx) = std::sync::mpsc::channel::<()>();
-        let startup_cancelled = std::sync::atomic::AtomicBool::new(false);
+    #[tokio::test(start_paused = true)]
+    async fn runtime_startup_receive_is_bounded_and_marks_late_initialization_cancelled() {
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
 
-        let error =
-            receive_runtime_startup(&startup_rx, &startup_cancelled, Duration::from_millis(1))
-                .expect_err("withheld startup handle should time out");
+        let error = receive_runtime_startup(startup_rx, Duration::from_millis(1))
+            .await
+            .expect_err("withheld startup handle should time out");
 
         assert_eq!(
             error,
             "code mode runtime initialization exceeded its 1ms timeout"
         );
-        assert!(startup_cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(startup_tx.is_closed());
+    }
+
+    #[tokio::test]
+    async fn runtime_startup_wait_allows_progress_on_a_current_thread_executor() {
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            startup_tx.send(Ok(42)).unwrap();
+        });
+        assert_eq!(
+            receive_runtime_startup(startup_rx, Duration::from_secs(1)).await,
+            Ok(42)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_runtime_startup_closes_the_handle_receiver() {
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let mut startup = Box::pin(receive_runtime_startup(startup_rx, Duration::from_secs(60)));
+        assert!(futures::poll!(startup.as_mut()).is_pending());
+        drop(startup);
+        assert_eq!(startup_tx.send(Ok(())), Err(Ok(())));
     }
 
     #[tokio::test]
@@ -680,7 +753,7 @@ mod tests {
                 .await
                 .expect("runtime failure timeout")
                 .expect("runtime failure"),
-            "code-mode V8 runtime thread panicked"
+            "code-mode V8 runtime thread panicked: runtime thread panic probe"
         );
     }
 
@@ -712,6 +785,7 @@ mod tests {
             std::sync::Arc::new(OutputAdmission::new(super::MAX_BUFFERED_OUTPUT_BYTES)),
             /*task_failure_handler*/ None,
         )
+        .await
         .unwrap();
 
         let started_event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
@@ -740,6 +814,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_an_unclaimed_startup_handle_stops_cpu_bound_code() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (_runtime_tx, runtime_terminate_handle) = spawn_runtime(
+            HashMap::new(),
+            execute_request("while (true) {}"),
+            60_000,
+            event_tx,
+            std::sync::Arc::new(OutputAdmission::new(super::MAX_BUFFERED_OUTPUT_BYTES)),
+            None,
+        )
+        .await
+        .unwrap();
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        assert!(
+            startup_tx
+                .send(super::StartupIsolateHandle(Some(runtime_terminate_handle)))
+                .is_ok()
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .unwrap(),
+            Some(RuntimeEvent::Started)
+        ));
+
+        drop(startup_rx);
+
+        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .unwrap();
+        assert!(matches!(
+            event,
+            Some(RuntimeEvent::Result {
+                error_text: Some(_),
+                ..
+            })
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn yield_admission_bounds_a_synchronous_flood() {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let (_runtime_tx, _runtime_terminate_handle) = spawn_runtime(
@@ -750,6 +870,7 @@ mod tests {
             std::sync::Arc::new(OutputAdmission::new(super::MAX_BUFFERED_OUTPUT_BYTES)),
             None,
         )
+        .await
         .unwrap();
 
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -785,6 +906,7 @@ mod tests {
             std::sync::Arc::clone(&output_admission),
             /*task_failure_handler*/ None,
         )
+        .await
         .unwrap();
 
         let mut admitted_bytes = 0usize;

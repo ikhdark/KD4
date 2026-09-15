@@ -24,7 +24,6 @@ use codex_plugin::PluginCapabilitySummary;
 use codex_plugin::PluginId;
 use codex_plugin::app_connector_ids_from_declarations;
 use codex_plugin::prompt_safe_plugin_description;
-use codex_plugin::validate_plugin_segment;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Deserialize;
 use serde::Serialize;
@@ -1622,7 +1621,11 @@ fn remove_remote_plugin_cache(
 
     // Remote IDs are opaque; only IDs supported by the old single-segment
     // cache layout can identify a legacy cache directory.
-    if validate_plugin_segment(&legacy_plugin_id, "legacy remote plugin id").is_err() {
+    if legacy_plugin_id.is_empty()
+        || !legacy_plugin_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '~'))
+    {
         return Ok(());
     }
 

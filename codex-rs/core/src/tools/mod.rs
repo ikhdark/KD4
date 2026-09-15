@@ -112,7 +112,7 @@ pub fn format_exec_output_for_model(
         exec_output.timed_out,
         ShellOutputSummaryOptions {
             enabled: true,
-            turn_cost_guard: false,
+            applied_token_limit: Some(truncation_policy.token_budget()),
             command_text: None,
         },
     )
@@ -166,7 +166,7 @@ pub(crate) fn project_exec_output_for_model_with_budget(
                 exec_output.timed_out,
                 ShellOutputSummaryOptions {
                     enabled: true,
-                    turn_cost_guard: false,
+                    applied_token_limit: Some(limits.applied_limit),
                     command_text,
                 },
             )
@@ -240,7 +240,7 @@ pub(crate) fn project_exec_output_text_with_budget(
                 exec_output.timed_out,
                 ShellOutputSummaryOptions {
                     enabled: true,
-                    turn_cost_guard: false,
+                    applied_token_limit: Some(limits.applied_limit),
                     command_text,
                 },
             )

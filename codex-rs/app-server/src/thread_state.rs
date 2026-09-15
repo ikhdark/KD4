@@ -1206,11 +1206,20 @@ mod tests {
                 }),
             })
         };
+        let started = EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
+            turn_id: "turn-1".to_string(),
+            trace_id: None,
+            started_at: Some(42),
+            model_context_window: None,
+            collaboration_mode_kind: ModeKind::Default,
+        });
         let persisted = vec![
+            RolloutItem::EventMsg(started.clone()),
             RolloutItem::EventMsg(event("a", "earlier")),
             RolloutItem::EventMsg(event("b", "old")),
         ];
         let mut state = ThreadState::default();
+        state.track_current_turn_event("turn-1", &started);
         state.track_current_turn_event("turn-1", &event("b", "updated"));
         state.track_current_turn_event("turn-1", &event("c", "later"));
         state.seed_turn_index_from_history(&persisted);

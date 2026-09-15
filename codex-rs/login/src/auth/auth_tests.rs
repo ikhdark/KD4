@@ -2278,9 +2278,11 @@ async fn enforce_login_restrictions_logs_out_for_personal_access_token_workspace
     let err = super::enforce_login_restrictions(&config)
         .await
         .expect_err("expected workspace mismatch to error");
-    assert!(err.to_string().contains(&format!(
-        "current credentials belong to {WORKSPACE_ID_DISALLOWED}"
-    )));
+    assert_eq!(err.kind(), std::io::ErrorKind::Other);
+    assert_eq!(
+        err.to_string(),
+        format!("Login is restricted to workspace id(s) {WORKSPACE_ID_ALLOWED}.")
+    );
     assert!(
         !codex_home.path().join("auth.json").exists(),
         "auth.json should be removed on mismatch"
@@ -2406,8 +2408,11 @@ async fn enforce_login_restrictions_logs_out_for_agent_identity_workspace_mismat
     )
     .await
     .expect_err("expected workspace mismatch to error");
-    let message = err.to_string();
-    assert!(message.contains(WORKSPACE_ID_DISALLOWED), "{message}");
+    assert_eq!(err.kind(), std::io::ErrorKind::Other);
+    assert_eq!(
+        err.to_string(),
+        format!("Login is restricted to workspace id(s) {WORKSPACE_ID_ALLOWED}.")
+    );
     assert!(
         !codex_home.path().join("auth.json").exists(),
         "auth.json should be removed on mismatch"

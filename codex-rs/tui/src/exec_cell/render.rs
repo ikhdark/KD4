@@ -727,7 +727,7 @@ mod tests {
                 .iter()
                 .map(Line::to_string)
                 .collect_vec(),
-            vec!["$ work", "complete", "✓ • 1s"]
+            vec!["$ work", "complete", "✓ • 1.00s"]
         );
     }
 

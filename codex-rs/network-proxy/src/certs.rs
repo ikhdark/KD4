@@ -980,7 +980,7 @@ mod tests {
         ));
         with_contended_ca_cache_and_progress(state.add_allowed_domain("8.8.8.8"), async {
             state
-                .record_blocked(crate::BlockedRequest::new(crate::BlockedRequestArgs {
+                .record_blocked_for_request(crate::BlockedRequest::new(crate::BlockedRequestArgs {
                     host: "8.8.8.8".to_string(),
                     reason: "not_allowed".to_string(),
                     client: None,

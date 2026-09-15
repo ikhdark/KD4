@@ -1676,7 +1676,12 @@ where
 }
 
 fn write_pretty_json(path: PathBuf, value: &impl Serialize) -> Result<()> {
-    let json = serde_json::to_vec_pretty(value)
+    let mut value = serde_json::to_value(value)
+        .with_context(|| format!("Failed to serialize JSON schema to {}", path.display()))?;
+    // Workspace feature unification can enable serde_json/preserve_order.
+    // Fixtures must retain the same canonical ordering in either build.
+    value.sort_all_objects();
+    let json = serde_json::to_vec_pretty(&value)
         .with_context(|| format!("Failed to serialize JSON schema to {}", path.display()))?;
     fs::write(&path, json).with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
@@ -2297,6 +2302,8 @@ mod tests {
                 .is_some_and(|stem| {
                     stem.ends_with("Params")
                         || stem == "InitializeCapabilities"
+                        // Masks distinguish omitted overrides from explicit resets.
+                        || stem == "CollaborationModeMask"
                         // Preserve optional client fields while admitting the nulls
                         // serialized by skill metadata and image inputs.
                         || stem == "SkillInterface"

@@ -470,8 +470,10 @@ fn maybe_wrap_powershell_with_snapshot(
     );
 
     let snapshot_path = powershell_single_quote(snapshot_path);
+    // Keep the command at script scope so PowerShell propagates its final native
+    // exit status; invoking a script block can turn a failed pipeline into success.
     let rewritten_script = format!(
-        "try {{ . '{snapshot_path}' *> $null }} catch {{ [Console]::Error.WriteLine('codex: shell snapshot replay failed: ' + $_.Exception.Message) }}\n{override_restores}\n{proxy_restore}\n& {{\n{original_script}\n}}"
+        "try {{ . '{snapshot_path}' *> $null }} catch {{ [Console]::Error.WriteLine('codex: shell snapshot replay failed: ' + $_.Exception.Message) }}\n{override_restores}\n{proxy_restore}\n{original_script}"
     );
 
     let rewritten = vec![

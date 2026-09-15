@@ -3961,6 +3961,16 @@ fn selector_range_and_children(
             ))
         }
         ToolOutputSelector::JsonPointer { pointer } => {
+            // RFC 6901 allows the empty root pointer, or slash-prefixed
+            // tokens whose only tilde escapes are ~0 and ~1.
+            if (!pointer.is_empty() && !pointer.starts_with('/'))
+                || pointer
+                    .split('~')
+                    .skip(1)
+                    .any(|escape| !escape.starts_with(['0', '1']))
+            {
+                return Err(ToolOutputSelectorStatus::Invalid);
+            }
             let entry = metadata
                 .json_pointers
                 .get(pointer)

@@ -69,6 +69,8 @@ fn objective_updated_prompt_supersedes_previous_goal_context() {
     .replace("\r\n", "\n");
 
     assert!(prompt.contains("edited by the user"));
+    assert!(prompt.contains("Report edits that only served the superseded objective."));
+    assert!(prompt.contains("Preserve unrelated user work."));
     assert!(prompt.contains("supersedes any previous thread goal objective"));
     assert!(
         prompt.contains("<untrusted_objective>\nfinish the revised stack\n</untrusted_objective>")

@@ -1,6 +1,5 @@
 mod common;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -286,7 +285,7 @@ async fn assert_exec_process_streams_output(use_remote: bool) -> Result<()> {
             ),
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
-            env: Default::default(),
+            env: std::env::vars().collect(),
             tty: false,
             pipe_stdin: false,
             arg0: None,
@@ -318,7 +317,7 @@ async fn assert_exec_process_pushes_events(use_remote: bool) -> Result<()> {
             ),
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
-            env: Default::default(),
+            env: std::env::vars().collect(),
             tty: false,
             pipe_stdin: false,
             arg0: None,
@@ -366,7 +365,7 @@ async fn assert_exec_process_replays_events_after_close(use_remote: bool) -> Res
             ),
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
-            env: Default::default(),
+            env: std::env::vars().collect(),
             tty: false,
             pipe_stdin: false,
             arg0: None,
@@ -532,7 +531,7 @@ async fn assert_exec_process_write_then_read_without_tty(use_remote: bool) -> Re
             ),
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
-            env: Default::default(),
+            env: std::env::vars().collect(),
             tty: false,
             pipe_stdin: true,
             arg0: None,
@@ -566,7 +565,7 @@ async fn assert_exec_process_rejects_write_without_pipe_stdin(use_remote: bool) 
             ),
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
-            env: Default::default(),
+            env: std::env::vars().collect(),
             tty: false,
             pipe_stdin: false,
             arg0: None,
@@ -641,7 +640,7 @@ async fn assert_exec_process_preserves_queued_events_before_subscribe(
             argv: powershell("[Console]::Out.Write(\"queued output`n\")"),
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
-            env: Default::default(),
+            env: std::env::vars().collect(),
             tty: false,
             pipe_stdin: false,
             arg0: None,
@@ -680,14 +679,14 @@ async fn remote_exec_process_recovers_after_transport_disconnect() -> Result<()>
                 "[Console]::Out.Write(\"ready:$PID`n\"); ",
                 "while (-not (Test-Path -LiteralPath $env:GATE)) { Start-Sleep -Milliseconds 10 }; ",
                 "[Console]::Out.Write(\"during:$PID`n\"); ",
-                "$null = New-Item -ItemType File -Force -LiteralPath $env:EMITTED; ",
+                "[System.IO.File]::WriteAllText($env:EMITTED, ''); ",
                 "$line = [Console]::In.ReadLine(); ",
-                "[Console]::Out.Write(\"after:$PID:$line`n\"); ",
+                "[Console]::Out.Write(\"after:${PID}:$line`n\"); ",
                 "exit 7"
             )),
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
-            env: HashMap::from([
+            env: std::env::vars().chain([
                 (
                     "GATE".to_string(),
                     gate_path.to_string_lossy().into_owned(),
@@ -696,7 +695,7 @@ async fn remote_exec_process_recovers_after_transport_disconnect() -> Result<()>
                     "EMITTED".to_string(),
                     emitted_path.to_string_lossy().into_owned(),
                 ),
-            ]),
+            ]).collect(),
             tty: false,
             pipe_stdin: true,
             arg0: None,

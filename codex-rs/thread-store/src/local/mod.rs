@@ -1541,7 +1541,10 @@ mod tests {
             .await
             .expect("read external live thread");
 
-        assert_eq!(thread.rollout_path, Some(rollout_path));
+        assert_eq!(
+            thread.rollout_path,
+            Some(rollout_path.canonicalize().expect("canonical rollout path"))
+        );
         assert!(thread.history.expect("history").items.iter().any(|item| {
             matches!(
                 item,

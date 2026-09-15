@@ -50,9 +50,5 @@ def cargo_lane_patterns() -> dict[str, object]:
     return data
 
 
-_CARGO_LANE_PATTERNS = cargo_lane_patterns()
-LANE_PATH_PATTERN = str(_CARGO_LANE_PATTERNS["lane_path_pattern"])
-SCRIPT_LANE_PATTERN = str(_CARGO_LANE_PATTERNS["script_lane_pattern"])
-JUST_LANE_PATTERN = str(_CARGO_LANE_PATTERNS["just_lane_pattern"])
-JUST_FIXED_LANE_PATTERN = str(_CARGO_LANE_PATTERNS["just_fixed_lane_pattern"])
-JUST_FIXED_LANE_NAMES = dict(_CARGO_LANE_PATTERNS["just_fixed_lane_names"])
+if __name__ == "__main__":
+    print(RUSTFMT_TOOLCHAIN)

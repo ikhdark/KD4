@@ -2557,7 +2557,8 @@ async fn codex_home_within_project_tree_is_not_double_loaded() -> std::io::Resul
         .collect();
 
     let child_config: TomlValue = toml::from_str(
-        r#"foo = "child"
+        r#"config_version = 1
+foo = "child"
 "#,
     )
     .expect("parse child config");

@@ -5,6 +5,7 @@ use futures::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
 
 use crate::session::TurnInput;
+use crate::session::turn::LogicalGenerationBudget;
 use crate::session::turn::run_turn;
 use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
@@ -58,6 +59,7 @@ impl SessionTask for RegularTask {
             sess.send_event(ctx.as_ref(), event).await;
             sess.set_server_reasoning_included(/*included*/ false).await;
             let mut next_input = input;
+            let mut logical_generation_budget = LogicalGenerationBudget::default();
             loop {
                 let turn_result = run_turn(
                     Arc::clone(&sess),
@@ -65,6 +67,7 @@ impl SessionTask for RegularTask {
                     Arc::clone(&turn_extension_data),
                     next_input,
                     None,
+                    &mut logical_generation_budget,
                     cancellation_token.child_token(),
                 )
                 .instrument(run_turn_span.clone())

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::ContentItem;
@@ -862,7 +863,9 @@ pub(crate) fn guardian_output_schema() -> Value {
 /// configuration so workspace-managed overrides can keep the configurable
 /// section narrower than the full policy.
 pub(crate) fn guardian_policy_prompt() -> String {
-    guardian_policy_prompt_with_config(include_str!("policy.compact.md"))
+    static DEFAULT_POLICY: LazyLock<String> =
+        LazyLock::new(|| guardian_policy_prompt_with_config(include_str!("policy.compact.md")));
+    DEFAULT_POLICY.clone()
 }
 
 pub(crate) fn guardian_policy_prompt_with_config(tenant_policy_config: &str) -> String {

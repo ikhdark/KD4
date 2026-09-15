@@ -2780,7 +2780,7 @@ async fn default_permissions_profile_can_extend_builtin_workspace() -> std::io::
         !policy.can_write_path_with_cwd(&cwd.path().join(".git"), cwd.path()),
         "expected profile extending :workspace to keep metadata carveouts, policy: {policy:?}"
     );
-    assert!(
+    assert_eq!(
         policy.entries.iter().any(|entry| matches!(
             entry,
             FileSystemSandboxEntry {
@@ -2790,6 +2790,7 @@ async fn default_permissions_profile_can_extend_builtin_workspace() -> std::io::
                 access: FileSystemAccessMode::Write,
             }
         )),
+        !cfg!(windows),
         "expected profile extending :workspace to keep inherited :slash_tmp writes, policy: {policy:?}"
     );
     assert!(
@@ -3032,7 +3033,7 @@ async fn implicit_builtin_workspace_profile_preserves_sandbox_workspace_write_se
             assert!(writable_roots.contains(&extra_root));
             assert!(network_access);
             assert!(exclude_tmpdir_env_var);
-            assert!(!exclude_slash_tmp);
+            assert_eq!(exclude_slash_tmp, cfg!(windows));
         }
         sandbox_policy => panic!("expected workspace-write projection, got {sandbox_policy:?}"),
     }
@@ -3889,19 +3890,35 @@ async fn legacy_remote_thread_store_endpoint_is_rejected() {
     assert!(err.to_string().contains("no longer supported"));
 }
 
-#[test]
-fn profile_tui_rejects_unsupported_settings() {
-    let err = toml::from_str::<ConfigToml>(
+#[tokio::test]
+async fn profile_tui_rejects_legacy_inline_settings() -> anyhow::Result<()> {
+    let codex_home = TempDir::new()?;
+    tokio::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
         r#"profile = "work"
 
 [profiles.work.tui]
-theme = "dark"
+unsupported_setting = true
 "#,
     )
-    .expect_err("profile TUI config should only accept supported fields");
+    .await?;
+    let selected_config = codex_home.path().join("work.config.toml");
+    tokio::fs::write(&selected_config, "").await?;
+    let err = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .loader_overrides(LoaderOverrides {
+            user_config_path: Some(selected_config.abs()),
+            user_config_profile: Some("work".parse()?),
+            ..LoaderOverrides::without_managed_config_for_tests()
+        })
+        .build()
+        .await
+        .expect_err("profile selection must reject legacy inline settings");
 
-    assert!(err.to_string().contains("unknown field"));
-    assert!(err.to_string().contains("theme"));
+    assert!(err.to_string().contains("--profile `work` cannot be used"));
+    assert!(err.to_string().contains("[profiles.work]"));
+    assert!(err.to_string().contains("work.config.toml"));
+    Ok(())
 }
 
 #[tokio::test]
@@ -9841,9 +9858,8 @@ async fn feature_requirements_matching_guardian_aliases_pin_effective_feature()
 -> std::io::Result<()> {
     for required in [false, true] {
         let codex_home = TempDir::new()?;
-        let requirements = format!(
-            "[features]\nauto_review = {required}\nguardian_approval = {required}\n"
-        );
+        let requirements =
+            format!("[features]\nauto_review = {required}\nguardian_approval = {required}\n");
 
         let mut config = ConfigBuilder::without_managed_config_for_tests()
             .codex_home(codex_home.path().to_path_buf())

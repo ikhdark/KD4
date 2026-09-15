@@ -6,7 +6,6 @@ use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::tool_search_spec::create_tool_search_tool;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
-use bm25::TokenEmbedder;
 use bm25::Tokenizer;
 use codex_tools::LoadableToolSpec;
 use codex_tools::ResponsesApiNamespace;
@@ -32,6 +31,7 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::instrument;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -42,6 +42,7 @@ const MAX_TOOL_SEARCH_CACHE_ENTRY_BYTES: usize = 256 * 1024;
 // results near a 768-token projection (using the core's 4 bytes/token estimate).
 const MAX_TOOL_SEARCH_RESULT_BYTES: usize = 3 * 1024;
 const MAX_TOOL_SEARCH_QUERY_BYTES: usize = 4 * 1024;
+const MAX_COMPACT_TOOL_DESCRIPTION_BYTES: usize = 512;
 const MAX_TOOL_SEARCH_LIMIT: usize = 64;
 const TOOL_SEARCH_CANDIDATE_MULTIPLIER: usize = 3;
 
@@ -57,12 +58,13 @@ impl Tokenizer for ToolSearchTokenizer {
     }
 }
 
+#[derive(Clone)]
 pub struct ToolSearchHandler {
     search_infos: Arc<[ToolSearchInfo]>,
-    name_indexes: Vec<ToolSearchNameIndex>,
+    name_indexes: Arc<[ToolSearchNameIndex]>,
     spec: ToolSpec,
-    search_index: ToolSearchIndex,
-    result_cache: Mutex<VecDeque<ToolSearchCacheEntry>>,
+    search_index: Arc<ToolSearchIndex>,
+    result_cache: Arc<Mutex<VecDeque<ToolSearchCacheEntry>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -79,7 +81,7 @@ impl ToolSearchDocumentId {
 }
 
 struct ToolSearchIndex {
-    postings: HashMap<u32, Vec<(ToolSearchDocumentId, f32)>>,
+    postings: HashMap<String, Vec<(ToolSearchDocumentId, f32)>>,
     document_count: usize,
 }
 
@@ -121,17 +123,15 @@ impl ToolSearchIndex {
         let tokenizer = ToolSearchTokenizer;
         let tokenized_documents = search_infos
             .iter()
-            .map(|search_info| {
-                tokenizer
-                    .tokenize(&search_info.entry.search_text)
-                    .into_iter()
-                    .map(|token| <u32 as TokenEmbedder>::embed(&token))
-                    .collect::<Vec<_>>()
-            })
+            .map(|search_info| tokenizer.tokenize(&search_info.entry.search_text))
             .collect::<Vec<_>>();
         let average_document_length = {
             let total_document_length = tokenized_documents.iter().map(Vec::len).sum::<usize>();
-            let average = total_document_length as f64 / tokenized_documents.len() as f64;
+            let average = if tokenized_documents.is_empty() {
+                0.0
+            } else {
+                total_document_length as f64 / tokenized_documents.len() as f64
+            };
             let average = average as f32;
             if average > 0.0 {
                 average
@@ -140,10 +140,10 @@ impl ToolSearchIndex {
             }
         };
 
-        let mut postings = HashMap::<u32, Vec<(ToolSearchDocumentId, f32)>>::new();
+        let mut postings = HashMap::<String, Vec<(ToolSearchDocumentId, f32)>>::new();
         for (index, tokens) in tokenized_documents.into_iter().enumerate() {
             let document_length = tokens.len() as f32;
-            let mut term_frequencies = HashMap::<u32, usize>::new();
+            let mut term_frequencies = HashMap::<String, usize>::new();
             for token in tokens {
                 *term_frequencies.entry(token).or_default() += 1;
             }
@@ -173,7 +173,6 @@ impl ToolSearchIndex {
         let tokenizer = ToolSearchTokenizer;
         let mut scores = HashMap::<ToolSearchDocumentId, f32>::new();
         for token in tokenizer.tokenize(query) {
-            let token = <u32 as TokenEmbedder>::embed(&token);
             let Some(postings) = self.postings.get(&token) else {
                 continue;
             };
@@ -681,14 +680,14 @@ impl ToolSearchHandler {
             has_unnamed_tools,
             TOOL_SEARCH_DEFAULT_LIMIT,
         );
-        let search_index = ToolSearchIndex::new(&search_infos);
+        let search_index = Arc::new(ToolSearchIndex::new(&search_infos));
 
         Self {
             search_infos,
             name_indexes,
             spec,
             search_index,
-            result_cache: Mutex::new(VecDeque::new()),
+            result_cache: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 }
@@ -751,6 +750,7 @@ impl ToolSearchHandler {
         let ToolInvocation {
             payload,
             step_context,
+            cancellation_token,
             ..
         } = invocation;
         let turn = Arc::clone(&step_context.turn);
@@ -765,7 +765,31 @@ impl ToolSearchHandler {
         };
 
         let limit = args.limit.unwrap_or(TOOL_SEARCH_DEFAULT_LIMIT);
-        let result = self.search(&args.query, limit)?;
+        let cancelled =
+            || FunctionCallError::RespondToModel("tool search was cancelled".to_string());
+        if cancellation_token.is_cancelled() {
+            return Err(cancelled());
+        }
+        // Reject invalid requests before scheduling CPU work. The shared index
+        // and cache stay off the async worker even when a search is contended.
+        validate_tool_search_query(&args.query, limit)?;
+        let handler = self.clone();
+        let span = tracing::Span::current();
+        let mut search = AbortOnDropHandle::new(tokio::task::spawn_blocking(move || {
+            span.in_scope(|| handler.search(&args.query, limit))
+        }));
+        let result = tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => {
+                return Err(cancelled());
+            }
+            result = &mut search => result.map_err(|error| {
+                FunctionCallError::Fatal(format!("tool search task failed: {error}"))
+            })??,
+        };
+        if cancellation_token.is_cancelled() {
+            return Err(cancelled());
+        }
         turn.activate_deferred_tools(result.activation_tools.iter().cloned());
 
         Ok(boxed_tool_output(ToolSearchOutput {
@@ -841,12 +865,20 @@ impl ToolSearchHandler {
             )
         });
         let results =
-            promote_exact_name_matches(&self.search_infos, exact_matches, candidates, limit);
+            promote_exact_name_matches(&self.search_infos, &exact_matches, &candidates, limit);
         let result_count = results.len();
         let result_source_count = trace_enabled.then(|| {
             tool_search_info_diversity_count(results.iter().map(|id| id.info(&self.search_infos)))
         });
-        let result = Arc::new(self.search_output_tools(results, Some(&key.query))?);
+        // Preserve the initial diversity selection, but retain ranked candidates
+        // to refill slots whose definitions cannot fit the output budget.
+        let mut seen = results.iter().copied().collect::<HashSet<_>>();
+        let remaining = exact_matches
+            .into_iter()
+            .chain(candidates)
+            .filter(|id| seen.insert(*id));
+        let selection = results.into_iter().chain(remaining).take(candidate_limit);
+        let result = Arc::new(self.search_output_tools(selection, Some(&key.query), limit)?);
         if let (Some(candidate_source_count), Some(result_source_count)) =
             (candidate_source_count, result_source_count)
         {
@@ -874,24 +906,50 @@ impl ToolSearchHandler {
         &self,
         results: impl IntoIterator<Item = ToolSearchDocumentId>,
         exact_query: Option<&str>,
+        limit: usize,
     ) -> Result<ToolSearchResult, FunctionCallError> {
         let mut retained = ToolSearchResultBuilder::new();
         let mut activation_tools = Vec::new();
         let mut omitted_result_count = 0usize;
+        let mut retained_result_count = 0usize;
         for result_id in results {
+            if retained_result_count == limit {
+                break;
+            }
             let result = &result_id.info(&self.search_infos).entry;
             let exact_output_names = exact_query.and_then(|query| {
                 result_id
                     .name_index(&self.name_indexes)
                     .output_names_for(query)
             });
-            if retained.try_push(&result.output) {
+            let narrowed = exact_output_names.and_then(|names| match &result.output {
+                LoadableToolSpec::Namespace(namespace) => {
+                    Some(LoadableToolSpec::Namespace(ResponsesApiNamespace {
+                        name: namespace.name.clone(),
+                        description: namespace.description.clone(),
+                        tools: namespace
+                            .tools
+                            .iter()
+                            .filter(|tool| {
+                                let ResponsesApiNamespaceTool::Function(tool) = tool;
+                                names.contains(&tool.name)
+                            })
+                            .cloned()
+                            .collect(),
+                    }))
+                }
+                LoadableToolSpec::Function(_) => None,
+            });
+            if retained.try_push(narrowed.as_ref().unwrap_or(&result.output)) {
+                retained_result_count += 1;
             } else if let Some(recovery) = exact_output_names
                 .and_then(|names| compact_exact_match_recovery(&result.output, names))
             {
                 if !retained.try_push(&recovery) {
                     activation_tools.extend(loadable_tool_names(&recovery));
                     omitted_result_count = omitted_result_count.saturating_add(1);
+                } else {
+                    retained_result_count += 1;
                 }
             } else {
                 omitted_result_count = omitted_result_count.saturating_add(1);
@@ -997,15 +1055,27 @@ fn compact_exact_match_recovery(
 }
 
 fn compact_recovery_tool(tool: &ResponsesApiTool, qualified_name: &str) -> ResponsesApiTool {
+    let description_end = tool
+        .description
+        .floor_char_boundary(MAX_COMPACT_TOOL_DESCRIPTION_BYTES);
+    let description = &tool.description[..description_end];
+    let truncation = if description_end < tool.description.len() {
+        "…"
+    } else {
+        ""
+    };
     ResponsesApiTool {
         name: tool.name.clone(),
         description: format!(
-            "Compact exact-match definition for `{qualified_name}`; verbose schema details were removed to fit the tool-search response budget."
+            "{description}{truncation}\n\nCompact exact-match definition for `{qualified_name}`; verbose schema details were removed to fit the tool-search response budget."
         ),
         strict: tool.strict,
         defer_loading: Some(true),
         parameters: compact_recovery_schema(&tool.parameters),
-        output_schema: tool.output_schema.clone(),
+        output_schema: tool.output_schema.clone().map(|mut schema| {
+            strip_output_schema_descriptions(&mut schema);
+            schema
+        }),
     }
 }
 
@@ -1052,12 +1122,65 @@ fn strip_schema_descriptions(schema: &mut codex_tools::JsonSchema) {
     }
 }
 
+fn strip_output_schema_descriptions(schema: &mut serde_json::Value) {
+    let Some(schema) = schema.as_object_mut() else {
+        return;
+    };
+    schema.remove("description");
+    // Visit schema positions only: a property named `description` or an
+    // object inside `const`, `enum`, or `default` is part of the contract.
+    for keyword in [
+        "properties",
+        "patternProperties",
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+        "dependencies",
+    ] {
+        if let Some(children) = schema
+            .get_mut(keyword)
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for child in children.values_mut() {
+                strip_output_schema_descriptions(child);
+            }
+        }
+    }
+    for keyword in [
+        "items",
+        "prefixItems",
+        "additionalItems",
+        "additionalProperties",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+        "contains",
+        "propertyNames",
+        "not",
+        "if",
+        "then",
+        "else",
+        "anyOf",
+        "oneOf",
+        "allOf",
+    ] {
+        if let Some(child) = schema.get_mut(keyword) {
+            if let Some(children) = child.as_array_mut() {
+                for child in children {
+                    strip_output_schema_descriptions(child);
+                }
+            } else {
+                strip_output_schema_descriptions(child);
+            }
+        }
+    }
+}
+
 fn normalize_tool_search_query(query: &str) -> String {
     query
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-        .to_ascii_lowercase()
+        .to_lowercase()
 }
 
 fn validate_tool_search_query(
@@ -1106,54 +1229,16 @@ fn tool_search_cache_entry_fits_budget(
         .is_some_and(|encoded_len| encoded_len <= MAX_TOOL_SEARCH_CACHE_ENTRY_BYTES)
 }
 
-#[cfg(test)]
-fn diversify_search_results(results: Vec<&ToolSearchInfo>, limit: usize) -> Vec<&ToolSearchInfo> {
-    if results.len() <= limit {
-        return results;
-    }
-
-    let mut remaining = results;
-    let mut diversified = Vec::with_capacity(limit);
-    let mut seen_this_pass = HashSet::new();
-
-    while !remaining.is_empty() && diversified.len() < limit {
-        let mut deferred = Vec::new();
-        let mut added_this_pass = false;
-
-        for result in remaining {
-            if diversified.len() >= limit {
-                break;
-            }
-            if seen_this_pass.insert(tool_search_info_diversity_key(result)) {
-                diversified.push(result);
-                added_this_pass = true;
-            } else {
-                deferred.push(result);
-            }
-        }
-
-        if !added_this_pass {
-            diversified.extend(deferred.into_iter().take(limit - diversified.len()));
-            break;
-        }
-
-        remaining = deferred;
-        seen_this_pass.clear();
-    }
-
-    diversified
-}
-
 fn promote_exact_name_matches(
     search_infos: &[ToolSearchInfo],
-    exact_matches: Vec<ToolSearchDocumentId>,
-    ranked_results: Vec<ToolSearchDocumentId>,
+    exact_matches: &[ToolSearchDocumentId],
+    ranked_results: &[ToolSearchDocumentId],
     limit: usize,
 ) -> Vec<ToolSearchDocumentId> {
     let mut results = Vec::with_capacity(exact_matches.len().saturating_add(ranked_results.len()));
     let mut seen = HashSet::<ToolSearchDocumentId>::new();
 
-    for result in exact_matches.into_iter().chain(ranked_results) {
+    for result in exact_matches.iter().chain(ranked_results).copied() {
         if seen.insert(result) {
             results.push(result);
         }
@@ -1249,8 +1334,12 @@ fn loadable_tool_spec_diversity_key(spec: &LoadableToolSpec) -> ToolSearchDivers
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::step_context::StepContext;
+    use crate::session::tests::make_session_and_context_with_rx;
+    use crate::tools::context::ToolCallSource;
     use crate::tools::handlers::DynamicToolHandler;
     use crate::tools::handlers::McpHandler;
+    use crate::turn_diff_tracker::TurnDiffTracker;
     use codex_mcp::ToolInfo;
     use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
     use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
@@ -1273,6 +1362,93 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Barrier;
     use std::thread;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn exact_function_search_returns_and_activates_only_the_requested_function() {
+        let mut info = search_info("calendar", None, "calendar", "create_event");
+        let LoadableToolSpec::Namespace(namespace) = &mut info.entry.output else {
+            panic!("expected namespace");
+        };
+        let ResponsesApiNamespaceTool::Function(create) = &namespace.tools[0];
+        let mut delete = create.clone();
+        delete.name = "delete_event".to_string();
+        namespace
+            .tools
+            .push(ResponsesApiNamespaceTool::Function(delete));
+        info.entry.tool_names.push("delete_event".to_string());
+        let full_namespace = serde_json::to_value(&info.entry.output).expect("namespace");
+        let mut exact_namespace = full_namespace.clone();
+        exact_namespace["tools"]
+            .as_array_mut()
+            .expect("functions")
+            .truncate(1);
+        let handler = ToolSearchHandler::new(vec![info]);
+
+        for (query, expected, names) in [
+            (
+                "create_event",
+                exact_namespace.clone(),
+                vec!["create_event"],
+            ),
+            (
+                "mcp__calendar__create_event",
+                exact_namespace,
+                vec!["create_event"],
+            ),
+            (
+                "calendar",
+                full_namespace,
+                vec!["create_event", "delete_event"],
+            ),
+        ] {
+            let (session, turn, _events) = make_session_and_context_with_rx().await;
+            turn.refresh_deferred_tool_capabilities(Arc::new(
+                ["create_event", "delete_event"]
+                    .into_iter()
+                    .map(|name| {
+                        (
+                            ToolName::namespaced("mcp__calendar", name),
+                            "calendar-v1".to_string(),
+                        )
+                    })
+                    .collect(),
+            ));
+            let payload = ToolPayload::ToolSearch {
+                arguments: codex_protocol::models::SearchToolCallParams {
+                    query: query.to_string(),
+                    limit: Some(1),
+                },
+            };
+            let output = handler
+                .handle(ToolInvocation {
+                    session,
+                    step_context: StepContext::for_test(Arc::clone(&turn)),
+                    cancellation_token: CancellationToken::new(),
+                    tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                    call_id: "search".to_string(),
+                    tool_name: ToolName::plain(TOOL_SEARCH_TOOL_NAME),
+                    source: ToolCallSource::Direct,
+                    payload: payload.clone(),
+                })
+                .await
+                .expect("search invocation");
+            let codex_protocol::models::ResponseInputItem::ToolSearchOutput { tools, .. } =
+                output.to_response_item("search", &payload)
+            else {
+                panic!("expected search response");
+            };
+            assert_eq!(tools, vec![expected], "query: {query}");
+            assert_eq!(
+                turn.activated_deferred_tools(),
+                names
+                    .into_iter()
+                    .map(|name| ToolName::namespaced("mcp__calendar", name))
+                    .collect(),
+                "query: {query}"
+            );
+        }
+    }
 
     #[test]
     fn tool_search_tokenizer_splits_unicode_words_and_normalizes_case() {
@@ -1280,6 +1456,283 @@ mod tests {
             ToolSearchTokenizer.tokenize("Launch CALENDAR-events for José"),
             vec!["launch", "calendar", "events", "for", "josé"]
         );
+    }
+
+    #[tokio::test]
+    async fn unicode_exact_search_activates_compact_schema_without_losing_its_contract() {
+        let name = "Créer_Événement";
+        let mut info = search_info("unrelated ranking terms", None, "calendar", name);
+        let LoadableToolSpec::Namespace(namespace) = &mut info.entry.output else {
+            panic!("expected namespace");
+        };
+        let ResponsesApiNamespaceTool::Function(tool) = &mut namespace.tools[0];
+        tool.description = "Create a calendar event with an attendee description.".to_string();
+        let description = tool.description.clone();
+        let expected_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "description": {"type": "string", "minLength": 1},
+                "status": {"const": {"description": "literal data must survive"}},
+                "attendees": {"type": "array", "items": {"$ref": "#/$defs/attendee"}}
+            },
+            "$defs": {"attendee": {"type": "string", "pattern": "@"}},
+            "required": ["description", "status", "attendees"],
+            "additionalProperties": false
+        });
+        let mut verbose_schema = expected_schema.clone();
+        verbose_schema["description"] =
+            serde_json::json!("annotation ".repeat(MAX_TOOL_SEARCH_RESULT_BYTES));
+        verbose_schema["properties"]["description"]["description"] =
+            serde_json::json!("attendee description");
+        verbose_schema["properties"]["attendees"]["items"]["description"] =
+            serde_json::json!("item annotation");
+        verbose_schema["$defs"]["attendee"]["description"] =
+            serde_json::json!("definition annotation");
+        tool.output_schema = Some(verbose_schema);
+        assert_eq!(
+            compact_recovery_tool(tool, &tool.name).output_schema,
+            Some(expected_schema)
+        );
+        let handler = ToolSearchHandler::new(vec![info]);
+
+        for query in ["Créer_Événement", "CRÉER_ÉVÉNEMENT"] {
+            let (session, turn, _events) = make_session_and_context_with_rx().await;
+            let tool_name = ToolName::namespaced("mcp__calendar", name);
+            turn.refresh_deferred_tool_capabilities(Arc::new(
+                [(tool_name.clone(), "calendar-v1".to_string())]
+                    .into_iter()
+                    .collect(),
+            ));
+            let payload = ToolPayload::ToolSearch {
+                arguments: codex_protocol::models::SearchToolCallParams {
+                    query: query.to_string(),
+                    limit: Some(1),
+                },
+            };
+            let output = handler
+                .handle(ToolInvocation {
+                    session,
+                    step_context: StepContext::for_test(Arc::clone(&turn)),
+                    cancellation_token: CancellationToken::new(),
+                    tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                    call_id: "unicode-search".to_string(),
+                    tool_name: ToolName::plain(TOOL_SEARCH_TOOL_NAME),
+                    source: ToolCallSource::Direct,
+                    payload: payload.clone(),
+                })
+                .await
+                .expect("search invocation");
+            let codex_protocol::models::ResponseInputItem::ToolSearchOutput { tools, .. } =
+                output.to_response_item("unicode-search", &payload)
+            else {
+                panic!("expected search output");
+            };
+            assert_eq!(tools.len(), 1, "{query}");
+            assert_eq!(tools[0]["tools"][0]["name"], name);
+            assert!(
+                tools[0]["tools"][0]["description"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(&description)
+            );
+            assert!(tools[0]["tools"][0].get("output_schema").is_none());
+            assert!(serde_json::to_vec(&tools).unwrap().len() <= MAX_TOOL_SEARCH_RESULT_BYTES);
+            assert_eq!(
+                turn.activated_deferred_tools(),
+                [tool_name].into_iter().collect()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_router_build_does_not_block_runtime_or_publish_capabilities() {
+        let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        turn.model_info.supports_search_tool = true;
+        turn.dynamic_tools = vec![codex_protocol::dynamic_tools::DynamicToolSpec::Function(
+            DynamicToolFunctionSpec {
+                name: "deferred_probe".to_string(),
+                description: "Probe router cancellation".to_string(),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                defer_loading: true,
+            },
+        )];
+        let turn = Arc::new(turn);
+        let step = session.capture_step_context(Arc::clone(&turn)).await;
+        let cache = Arc::clone(&session.services.tool_search_handler_cache);
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = thread::spawn(move || {
+            let _guard = cache.state.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+        });
+        locked_rx.await.unwrap();
+
+        let cancellation = CancellationToken::new();
+        let build = crate::session::turn::built_tools(&session, &step, &[], &cancellation);
+        tokio::pin!(build);
+        let waiting = tokio::time::timeout(std::time::Duration::from_millis(100), &mut build)
+            .await
+            .is_err();
+        cancellation.cancel();
+        let result = if waiting {
+            Some(tokio::time::timeout(std::time::Duration::from_secs(1), build).await)
+        } else {
+            None
+        };
+        let _ = release_tx.send(());
+        blocker.join().unwrap();
+
+        assert!(
+            waiting,
+            "router construction must yield while the cache is held"
+        );
+        assert!(matches!(
+            result,
+            Some(Ok(Err(codex_protocol::error::CodexErr::TurnAborted)))
+        ));
+        let tool = ToolName::plain("deferred_probe");
+        turn.activate_deferred_tools([tool.clone()]);
+        assert!(turn.activated_deferred_tools().is_empty());
+
+        // A later, uncancelled build must still publish the same tool normally.
+        let router =
+            crate::session::turn::built_tools(&session, &step, &[], &CancellationToken::new())
+                .await
+                .expect("router builds after cancellation");
+        assert!(
+            router
+                .deferred_tool_capability_revisions()
+                .contains_key(&tool)
+        );
+        turn.activate_deferred_tools([tool.clone()]);
+        assert_eq!(
+            turn.activated_deferred_tools(),
+            [tool].into_iter().collect()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_search_does_not_wait_for_the_index_or_activate_tools() {
+        let handler = ToolSearchHandler::new(vec![search_info(
+            "calendar",
+            None,
+            "calendar",
+            "create_event",
+        )]);
+        let (session, turn, _events) = make_session_and_context_with_rx().await;
+        turn.refresh_deferred_tool_capabilities(Arc::new(HashMap::from([(
+            ToolName::namespaced("mcp__calendar", "create_event"),
+            "calendar-v1".to_string(),
+        )])));
+
+        let cache = Arc::clone(&handler.result_cache);
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = thread::spawn(move || {
+            let _guard = cache.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            // Bound a regression that blocks the current-thread runtime itself.
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+        });
+        locked_rx.await.unwrap();
+
+        let cancellation = CancellationToken::new();
+        let invocation = ToolInvocation {
+            session,
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            cancellation_token: cancellation.clone(),
+            tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+            call_id: "cancelled-search".to_string(),
+            tool_name: ToolName::plain(TOOL_SEARCH_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::ToolSearch {
+                arguments: codex_protocol::models::SearchToolCallParams {
+                    query: "create_event".to_string(),
+                    limit: Some(1),
+                },
+            },
+        };
+        let mut search = handler.handle(invocation);
+        let first_poll = futures::poll!(&mut search);
+        cancellation.cancel();
+        let result = if first_poll.is_pending() {
+            Some(tokio::time::timeout(std::time::Duration::from_secs(1), search).await)
+        } else {
+            None
+        };
+        let _ = release_tx.send(());
+        blocker.join().unwrap();
+
+        assert!(
+            first_poll.is_pending(),
+            "search must yield while its cache is held"
+        );
+        assert!(matches!(
+            result,
+            Some(Ok(Err(FunctionCallError::RespondToModel(message))))
+                if message == "tool search was cancelled"
+        ));
+        assert!(turn.activated_deferred_tools().is_empty());
+    }
+
+    #[tokio::test]
+    async fn colliding_token_hashes_do_not_return_or_activate_unrelated_tools() {
+        // These distinct terms collided when postings used only a u32 hash.
+        assert_eq!(
+            <u32 as bm25::TokenEmbedder>::embed("term10409"),
+            <u32 as bm25::TokenEmbedder>::embed("term10482"),
+        );
+        let first = search_info("term10409", None, "first", "run");
+        let second = search_info("term10482", None, "second", "run");
+        let expected_first = serde_json::to_value(&first.entry.output).unwrap();
+        let expected_second = serde_json::to_value(&second.entry.output).unwrap();
+        let handler = ToolSearchHandler::new(vec![first, second]);
+        for (query, expected, namespace) in [
+            ("term10409", expected_first, "mcp__first"),
+            ("term10482", expected_second, "mcp__second"),
+        ] {
+            let (session, turn, _events) = make_session_and_context_with_rx().await;
+            turn.refresh_deferred_tool_capabilities(Arc::new(
+                ["mcp__first", "mcp__second"]
+                    .into_iter()
+                    .map(|name| (ToolName::namespaced(name, "run"), "v1".to_string()))
+                    .collect(),
+            ));
+            let payload = ToolPayload::ToolSearch {
+                arguments: codex_protocol::models::SearchToolCallParams {
+                    query: query.to_string(),
+                    limit: Some(2),
+                },
+            };
+            let output = handler
+                .handle(ToolInvocation {
+                    session,
+                    step_context: StepContext::for_test(Arc::clone(&turn)),
+                    cancellation_token: CancellationToken::new(),
+                    tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                    call_id: "search".to_string(),
+                    tool_name: ToolName::plain(TOOL_SEARCH_TOOL_NAME),
+                    source: ToolCallSource::Direct,
+                    payload: payload.clone(),
+                })
+                .await
+                .expect("search invocation");
+            let codex_protocol::models::ResponseInputItem::ToolSearchOutput { tools, .. } =
+                output.to_response_item("search", &payload)
+            else {
+                panic!("expected search response");
+            };
+            assert_eq!(tools, vec![expected], "query: {query}");
+            assert_eq!(
+                turn.activated_deferred_tools(),
+                [ToolName::namespaced(namespace, "run")]
+                    .into_iter()
+                    .collect(),
+                "query: {query}",
+            );
+        }
     }
 
     #[test]
@@ -1632,6 +2085,10 @@ mod tests {
         else {
             panic!("test search info should contain one function");
         };
+        source_tool.description = format!(
+            "Create a calendar event. {}",
+            "é".repeat(MAX_TOOL_SEARCH_RESULT_BYTES)
+        );
         source_tool.parameters = codex_tools::JsonSchema::object(
             std::collections::BTreeMap::from([(
                 "title".to_string(),
@@ -1662,6 +2119,8 @@ mod tests {
             panic!("exact-name recovery should retain only the matching function");
         };
         assert_eq!(tool.name, "create_event");
+        assert!(tool.description.starts_with("Create a calendar event."));
+        assert!(tool.description.contains("…\n\nCompact exact-match"));
         assert!(tool.description.contains("verbose schema details"));
         assert_eq!(tool.parameters, expected_parameters);
         assert!(
@@ -1704,9 +2163,8 @@ mod tests {
 
     #[test]
     fn audit_tool_search_contract_compaction_preserves_strictness_and_output_schema() {
-        let output_schema =
-            serde_json::to_value(codex_tools::JsonSchema::string(Some("result".to_string())))
-                .expect("output schema should serialize");
+        let output_schema = serde_json::to_value(codex_tools::JsonSchema::string(None))
+            .expect("output schema should serialize");
         let source = ResponsesApiTool {
             name: "strict_tool".to_string(),
             description: "verbose".to_string(),
@@ -1801,7 +2259,7 @@ mod tests {
         let results = [ToolSearchDocumentId(0), ToolSearchDocumentId(1)];
 
         let tools = handler
-            .search_output_tools(results, None)
+            .search_output_tools(results, None, TOOL_SEARCH_DEFAULT_LIMIT)
             .expect("search results should serialize within the budget");
 
         assert_eq!(tools.tools.len(), 1);
@@ -1816,22 +2274,24 @@ mod tests {
 
     #[test]
     fn search_keeps_later_matches_after_an_oversized_definition() {
-        let mut oversized = search_info("oversized", None, "oversized", "run");
-        let later = search_info("later", None, "later", "run");
+        let mut oversized = search_info("capability", None, "oversized", "run");
+        let later = search_info("capability extra terms", None, "later", "run");
         let LoadableToolSpec::Namespace(namespace) = &mut oversized.entry.output else {
             panic!("test search info should be a namespace");
         };
         namespace.description = "x".repeat(MAX_TOOL_SEARCH_RESULT_BYTES);
         let expected = later.entry.output.clone();
         let handler = ToolSearchHandler::new(vec![oversized, later]);
-        let results = [ToolSearchDocumentId(0), ToolSearchDocumentId(1)];
-
         let tools = handler
-            .search_output_tools(results, None)
+            .search("capability", 1)
             .expect("later search result should fit within the budget");
 
         assert_eq!(tools.tools, vec![expected]);
         assert_eq!(tools.omitted_result_count, 1);
+        assert_eq!(
+            tools.activation_tools,
+            vec![ToolName::namespaced("mcp__later", "run")]
+        );
     }
 
     #[test]
@@ -1880,7 +2340,7 @@ mod tests {
         ];
 
         let tools = handler
-            .search_output_tools(results, None)
+            .search_output_tools(results, None, TOOL_SEARCH_DEFAULT_LIMIT)
             .expect("mixed search output should serialize");
 
         assert_eq!(
@@ -1949,16 +2409,20 @@ mod tests {
         let calendar_update = search_info_with_source("calendar-update", "calendar", "update");
 
         let results = vec![
-            &calendar_create,
-            &calendar_list,
-            &calendar_delete,
-            &docs_search,
-            &calendar_update,
+            calendar_create,
+            calendar_list,
+            calendar_delete,
+            docs_search,
+            calendar_update,
         ];
-        let diversified = diversify_search_results(results, 3);
+        let diversified = diversify_search_result_ids(
+            &results,
+            (0..results.len()).map(ToolSearchDocumentId).collect(),
+            3,
+        );
         let diversified_names = diversified
             .iter()
-            .map(|search_info| search_info.entry.search_text.as_str())
+            .map(|id| id.info(&results).entry.search_text.as_str())
             .collect::<Vec<_>>();
 
         assert_eq!(
@@ -1973,11 +2437,15 @@ mod tests {
         let alpha_second = search_info("alpha-second", None, "alpha", "second");
         let beta_first = search_info("beta-first", None, "beta", "first");
 
-        let diversified =
-            diversify_search_results(vec![&alpha_first, &alpha_second, &beta_first], 2);
+        let results = vec![alpha_first, alpha_second, beta_first];
+        let diversified = diversify_search_result_ids(
+            &results,
+            (0..results.len()).map(ToolSearchDocumentId).collect(),
+            2,
+        );
         let diversified_names = diversified
             .iter()
-            .map(|search_info| search_info.entry.search_text.as_str())
+            .map(|id| id.info(&results).entry.search_text.as_str())
             .collect::<Vec<_>>();
 
         assert_eq!(diversified_names, vec!["alpha-first", "beta-first"]);
@@ -2040,8 +2508,8 @@ mod tests {
 
         let results = promote_exact_name_matches(
             &search_infos,
-            vec![ToolSearchDocumentId(0)],
-            vec![
+            &[ToolSearchDocumentId(0)],
+            &[
                 ToolSearchDocumentId(1),
                 ToolSearchDocumentId(0),
                 ToolSearchDocumentId(2),

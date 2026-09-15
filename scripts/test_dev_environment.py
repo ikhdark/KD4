@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import json
 import os
 import subprocess
 import sys
@@ -23,6 +24,60 @@ from scripts import (
 
 
 class DevEnvironmentDoctorTest(unittest.TestCase):
+    def test_git_version_is_reported_as_an_available_prerequisite(self):
+        with (
+            mock.patch.object(dev_env_doctor.shutil, "which", return_value="git.exe"),
+            mock.patch.object(dev_env_doctor.subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, "git version 2.53.0.windows.1\n", "")),
+        ):
+            check = dev_env_doctor.check_tool("git", ["git", "--version"], required=True, guidance="Install Git")
+        self.assertTrue(check.ok)
+        self.assertEqual(check.version, "git version 2.53.0.windows.1")
+
+    def test_cli_requires_ripgrep_and_reports_its_version(self):
+        for available in (False, True):
+            with (
+                self.subTest(available=available),
+                mock.patch.object(dev_env_doctor, "package_manager_pin", return_value="pnpm@99.0.0"),
+                mock.patch.object(dev_env_doctor.shutil, "which", side_effect=lambda name: None if name == "rg" and not available else name),
+                mock.patch.object(dev_env_doctor.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "99.0.0\n", "")),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                result = dev_env_doctor.main(["--json"])
+            report = json.loads(stdout.getvalue())
+            self.assertEqual(result, 0 if available else 1)
+            self.assertEqual(report["ok"], available)
+            rg = next(check for check in report["checks"] if check["name"] == "rg")
+            self.assertEqual(rg["command"], ["rg", "--version"])
+            self.assertTrue(rg["required"])
+            self.assertEqual(rg["ok"], available)
+            self.assertEqual(rg["version"], "99.0.0" if available else None)
+
+    def test_version_probe_skips_banners_in_either_stream(self) -> None:
+        for stdout, stderr in (
+            ("Warning: deprecated shim\n10.1.0-rc.1\n", ""),
+            ("", "Warning: deprecated shim\n10.1.0-rc.1\n"),
+            ("Warning: deprecated shim\n", "10.1.0-rc.1\n"),
+        ):
+            with (
+                self.subTest(stdout=stdout, stderr=stderr),
+                mock.patch.object(dev_env_doctor.shutil, "which", return_value="pnpm"),
+                mock.patch.object(
+                    dev_env_doctor.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess([], 0, stdout, stderr),
+                ),
+            ):
+                check = dev_env_doctor.check_tool(
+                    "pnpm",
+                    ["pnpm", "--version"],
+                    required=True,
+                    guidance="pin",
+                    required_version="10.1.0-rc.1",
+                )
+                self.assertTrue(check.ok)
+                self.assertEqual(check.version, "10.1.0-rc.1")
+
     def test_pnpm_pin_distinguishes_prerelease(self):
         for actual, expected, ok in (
             ("10.1.0-rc.1", "10.1.0", False),
@@ -69,6 +124,7 @@ class DevEnvironmentDoctorTest(unittest.TestCase):
                 "uv",
                 "node",
                 "pnpm",
+                "rg",
                 "pwsh",
             ],
         )
@@ -373,6 +429,35 @@ class ToolVersionsTest(unittest.TestCase):
 
 
 class ConfigSchemaCheckTest(unittest.TestCase):
+    def test_check_rejects_stale_output_without_regeneration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            schema = root / config_schema_check.GENERATED_OUTPUTS[0]
+            schema.parent.mkdir(parents=True)
+            schema.write_bytes(b'{"stale": true}\n')
+            with (
+                mock.patch.object(config_schema_check, "repo_root", return_value=root),
+                mock.patch.object(
+                    config_schema_check, "run_protocol_check", return_value=1
+                ) as check,
+                mock.patch.object(
+                    config_schema_check, "regenerate_schema"
+                ) as regenerate,
+            ):
+                self.assertEqual(config_schema_check.main(["--mode", "check"]), 1)
+            check.assert_called_once_with(root)
+            regenerate.assert_not_called()
+            self.assertEqual(schema.read_bytes(), b'{"stale": true}\n')
+
+    def test_removed_baseline_is_rejected_by_both_schema_commands(self) -> None:
+        for module in (config_schema_check, app_server_schema_runtime_check):
+            with (
+                self.subTest(module=module.__name__),
+                self.assertRaises(SystemExit) as error,
+            ):
+                module.main(["--mode", "check", "--baseline", "HEAD"])
+            self.assertEqual(error.exception.code, 2)
+
     def test_logged_command_quotes_arguments_with_spaces(self) -> None:
         stdout = io.StringIO()
         with (
@@ -400,23 +485,6 @@ class ConfigSchemaCheckTest(unittest.TestCase):
             config_schema_check.changed_outputs(before, after), ["a", "b", "c"]
         )
 
-    def test_config_schema_inputs_cover_schema_crate_dependencies(self) -> None:
-        self.assertIn("codex-rs/features/src", config_schema_check.SCHEMA_INPUTS)
-        self.assertIn("codex-rs/protocol/src", config_schema_check.SCHEMA_INPUTS)
-        self.assertIn("codex-rs/config/Cargo.toml", config_schema_check.SCHEMA_INPUTS)
-
-    def test_config_schema_status_uses_utf8_and_expanded_inputs(self) -> None:
-        completed = subprocess.CompletedProcess(["git"], 0, stdout="", stderr="")
-        with mock.patch.object(
-            config_schema_check.subprocess, "run", return_value=completed
-        ) as run:
-            self.assertFalse(config_schema_check.schema_inputs_changed(Path("/repo")))
-
-        args = run.call_args.args[0]
-        self.assertIn("codex-rs/features/src", args)
-        self.assertIn("codex-rs/protocol/src", args)
-        self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
-
     def test_missing_config_schema_commands_report_clean_diagnostics(self) -> None:
         for command in ("cargo", "just"):
             with self.subTest(command=command):
@@ -436,26 +504,6 @@ class ConfigSchemaCheckTest(unittest.TestCase):
                 self.assertEqual(code, 127)
                 self.assertIn(f"Could not run {command}:", stderr.getvalue())
                 self.assertNotIn("Traceback", stderr.getvalue())
-
-    def test_missing_git_during_schema_status_marks_inputs_changed_cleanly(
-        self,
-    ) -> None:
-        stderr = io.StringIO()
-        with (
-            mock.patch.object(
-                config_schema_check.subprocess,
-                "run",
-                side_effect=FileNotFoundError(2, "No such file or directory", "git"),
-            ),
-            contextlib.redirect_stderr(stderr),
-        ):
-            self.assertTrue(config_schema_check.schema_inputs_changed(Path("/repo")))
-
-        self.assertIn(
-            "Could not compare config schema inputs with HEAD:",
-            stderr.getvalue(),
-        )
-        self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_config_schema_rejects_removed_auto_mode(self) -> None:
         with self.assertRaises(SystemExit) as raised:
@@ -540,6 +588,21 @@ class GeneratedOutputLockTest(unittest.TestCase):
 
 
 class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
+    def test_command_launch_errors_preserve_exit_classification(self) -> None:
+        for module in (config_schema_check, app_server_schema_runtime_check):
+            for error, expected in (
+                (FileNotFoundError("missing"), 127),
+                (PermissionError("denied"), 1),
+            ):
+                with (
+                    self.subTest(module=module.__name__, error=error),
+                    mock.patch.object(module.subprocess, "run", side_effect=error),
+                    contextlib.redirect_stdout(io.StringIO()),
+                    contextlib.redirect_stderr(io.StringIO()) as stderr,
+                ):
+                    self.assertEqual(module.run(["tool"], cwd=Path.cwd()), expected)
+                    self.assertIn(f"Could not run tool: {error}", stderr.getvalue())
+
     def test_new_constraint_maps_remain_breaking_changes(self):
         compare = app_server_schema_runtime_check.stable_schema_compatibility_issues
         for keyword in ("patternProperties", "dependentSchemas"):
@@ -580,46 +643,6 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
                 ),
                 [f"$/{keyword}:changed"],
             )
-
-    def test_schema_inputs_cover_core_protocol_dependency(self) -> None:
-        self.assertIn(
-            "codex-rs/protocol/src",
-            app_server_schema_runtime_check.SCHEMA_INPUTS,
-        )
-
-    def test_schema_status_uses_utf8_and_expanded_inputs(self) -> None:
-        completed = subprocess.CompletedProcess(["git"], 0, stdout="", stderr="")
-        with mock.patch.object(
-            app_server_schema_runtime_check.subprocess,
-            "run",
-            return_value=completed,
-        ) as run:
-            self.assertFalse(
-                app_server_schema_runtime_check.schema_inputs_changed(Path("/repo"))
-            )
-
-        args = run.call_args.args[0]
-        self.assertIn("codex-rs/protocol/src", args)
-        self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
-
-    def test_missing_schema_status_binary_falls_back_without_traceback(self) -> None:
-        stderr = io.StringIO()
-        with (
-            mock.patch.object(
-                app_server_schema_runtime_check.subprocess,
-                "run",
-                side_effect=FileNotFoundError("git missing"),
-            ),
-            contextlib.redirect_stderr(stderr),
-        ):
-            self.assertTrue(
-                app_server_schema_runtime_check.schema_inputs_changed(Path("/repo"))
-            )
-
-        self.assertIn(
-            "Could not compare app-server schema inputs with HEAD:",
-            stderr.getvalue(),
-        )
 
     def test_missing_command_returns_clean_diagnostic(self) -> None:
         stderr = io.StringIO()
@@ -822,11 +845,6 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
             ),
             mock.patch.object(
                 app_server_schema_runtime_check,
-                "schema_inputs_changed",
-                return_value=False,
-            ) as input_probe,
-            mock.patch.object(
-                app_server_schema_runtime_check,
                 "run_protocol_check",
                 side_effect=lambda _root: calls.append("protocol") or 0,
             ),
@@ -853,7 +871,6 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
                 0,
             )
 
-        input_probe.assert_not_called()
         self.assertEqual(
             calls, ["lock", "protocol", "compatibility:HEAD^", "python-sdk", "unlock"]
         )
@@ -862,11 +879,6 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
         with (
             mock.patch.object(
                 app_server_schema_runtime_check, "repo_root", return_value=Path("/repo")
-            ),
-            mock.patch.object(
-                app_server_schema_runtime_check,
-                "schema_inputs_changed",
-                return_value=False,
             ),
             mock.patch.object(
                 app_server_schema_runtime_check, "run_protocol_check", return_value=0

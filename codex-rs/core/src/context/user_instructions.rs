@@ -23,8 +23,17 @@ impl ContextualUserFragment for UserInstructions {
         let directory = self
             .directory
             .as_ref()
-            .map(|directory| format!(" for {directory}"))
+            .map(|directory| format!(" for {}", escape_xml_text(directory)))
             .unwrap_or_default();
-        format!("{directory}\n\n<INSTRUCTIONS>\n{}\n", self.text)
+        format!(
+            "{directory}\n\n<INSTRUCTIONS>\n{}\n",
+            escape_xml_text(&self.text)
+        )
     }
+}
+
+fn escape_xml_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }

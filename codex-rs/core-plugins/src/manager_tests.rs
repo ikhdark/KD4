@@ -3944,7 +3944,7 @@ plugins = true
         vec!["sample-mcp".to_string()]
     );
     let expected_hooks = vec![PluginHookSummary {
-        key: "sample-plugin@debug:hooks/hooks.json:session_start:0:0".to_string(),
+        key: "sample-plugin@debug:hooks/hooks.json:session_start:v2:sha256:0d201067549d88fbd21b6deb419323b04709d653e715559951b72d5e2870553e:0".to_string(),
         event_name: HookEventName::SessionStart,
     }];
     assert_eq!(outcome.plugin.hooks, expected_hooks);
@@ -4284,7 +4284,7 @@ plugins = true
 [plugins."toolkit@debug"]
 enabled = true
 
-[hooks.state."toolkit@debug:hooks/hooks.json:pre_tool_use:0:0"]
+[hooks.state."toolkit@debug:hooks/hooks.json:pre_tool_use:v2:sha256:d7ac3f3a359b8e90d5aa9a269ee73016c57fe28c03d1a97af3c2b12a3a1b6d2f:0"]
 enabled = false
 "#,
     );
@@ -4335,15 +4335,15 @@ enabled = false
         outcome.plugin.hooks,
         vec![
             PluginHookSummary {
-                key: "toolkit@debug:hooks/hooks.json:pre_tool_use:0:0".to_string(),
+                key: "toolkit@debug:hooks/hooks.json:pre_tool_use:v2:sha256:d7ac3f3a359b8e90d5aa9a269ee73016c57fe28c03d1a97af3c2b12a3a1b6d2f:0".to_string(),
                 event_name: HookEventName::PreToolUse,
             },
             PluginHookSummary {
-                key: "toolkit@debug:hooks/hooks.json:pre_tool_use:0:1".to_string(),
+                key: "toolkit@debug:hooks/hooks.json:pre_tool_use:v2:sha256:17aab124f133af0489e3092736c583186886e661459bf18b725bafbcc0ce4699:0".to_string(),
                 event_name: HookEventName::PreToolUse,
             },
             PluginHookSummary {
-                key: "toolkit@debug:hooks/hooks.json:session_start:0:0".to_string(),
+                key: "toolkit@debug:hooks/hooks.json:session_start:v2:sha256:0d201067549d88fbd21b6deb419323b04709d653e715559951b72d5e2870553e:0".to_string(),
                 event_name: HookEventName::SessionStart,
             },
         ]
@@ -5978,8 +5978,12 @@ fn refresh_curated_plugin_cache_migrates_short_cache_version_and_distinguishes_c
     );
     let store = PluginStore::new(tmp.path().to_path_buf());
     assert!(
-        refresh_curated_plugin_cache(tmp.path(), TEST_CURATED_PLUGIN_SHA, std::slice::from_ref(&plugin_id))
-            .unwrap()
+        refresh_curated_plugin_cache(
+            tmp.path(),
+            TEST_CURATED_PLUGIN_SHA,
+            std::slice::from_ref(&plugin_id)
+        )
+        .unwrap()
     );
     assert_eq!(
         store.active_plugin_version(&plugin_id).as_deref(),
@@ -5991,7 +5995,10 @@ fn refresh_curated_plugin_cache_migrates_short_cache_version_and_distinguishes_c
             .exists()
     );
     let next_revision = "01234567ffffffffffffffffffffffffffffffff";
-    assert!(refresh_curated_plugin_cache(tmp.path(), next_revision, std::slice::from_ref(&plugin_id)).unwrap());
+    assert!(
+        refresh_curated_plugin_cache(tmp.path(), next_revision, std::slice::from_ref(&plugin_id))
+            .unwrap()
+    );
     assert_eq!(
         store.active_plugin_version(&plugin_id).as_deref(),
         Some(next_revision)
@@ -6531,9 +6538,13 @@ fn non_curated_refresh_retains_discovery_errors_while_refreshing_valid_plugins()
     assert!(result.cache_refreshed);
     assert_eq!(result.errors.len(), 1);
     assert!(
-        result.errors[0]
-            .message
-            .contains(&broken.display().to_string())
+        result.errors[0].message.contains(
+            &AbsolutePathBuf::try_from(broken)
+                .unwrap()
+                .as_path()
+                .display()
+                .to_string()
+        )
     );
     let store = PluginStore::new(tmp.path().to_path_buf());
     assert_eq!(

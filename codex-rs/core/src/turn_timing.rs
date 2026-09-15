@@ -72,17 +72,6 @@ const MAX_MODEL_REQUEST_PHYSICAL_ATTEMPT_IDS: usize = 64;
 const MAX_MODEL_REQUEST_PROGRESS_KINDS: usize = 64;
 const RESERVED_TOOL_OUTPUT_RECURSIVE_SPILL_COUNT: u32 = 0;
 
-fn adjust_counter(counter: &AtomicU32, delta: i32) {
-    if delta >= 0 {
-        counter.fetch_add(delta as u32, Ordering::AcqRel);
-    } else {
-        let decrement = delta.unsigned_abs();
-        let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-            Some(value.saturating_sub(decrement))
-        });
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ToolActionClass {
     Infrastructure,
@@ -98,6 +87,7 @@ pub(crate) struct ToolCallTimingLineage<'a> {
 }
 
 fn tool_action_class(tool_name: &str) -> ToolActionClass {
+    let tool_name = tool_name.rsplit('.').next().unwrap_or(tool_name);
     if matches!(
         tool_name,
         "exec"
@@ -1386,23 +1376,48 @@ impl TurnTimingState {
     }
 
     pub(crate) fn adjust_relay_queue_depth(&self, delta: i32) {
-        adjust_counter(&self.relay_queue_depth, delta);
+        self.adjust_counter(&self.relay_queue_depth, delta);
     }
 
     pub(crate) fn adjust_parallel_gate_waiters(&self, delta: i32) {
-        adjust_counter(&self.parallel_gate_waiter_count, delta);
+        self.adjust_counter(&self.parallel_gate_waiter_count, delta);
     }
 
     pub(crate) fn adjust_sampling_gate_waiters(&self, delta: i32) {
-        adjust_counter(&self.sampling_gate_waiter_count, delta);
+        self.adjust_counter(&self.sampling_gate_waiter_count, delta);
     }
 
     pub(crate) fn adjust_process_output_waiters(&self, delta: i32) {
-        adjust_counter(&self.process_output_waiter_count, delta);
+        self.adjust_counter(&self.process_output_waiter_count, delta);
     }
 
     pub(crate) fn adjust_active_tools(&self, delta: i32) {
-        adjust_counter(&self.active_tool_count, delta);
+        self.adjust_counter(&self.active_tool_count, delta);
+    }
+
+    #[expect(
+        clippy::expect_used,
+        reason = "The update closure unconditionally returns Some"
+    )]
+    fn adjust_counter(&self, counter: &AtomicU32, delta: i32) {
+        let magnitude = delta.unsigned_abs();
+        let previous = counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                Some(if delta >= 0 {
+                    value.saturating_add(magnitude)
+                } else {
+                    value.saturating_sub(magnitude)
+                })
+            })
+            .expect("counter updates always return a value");
+        let exact = if delta >= 0 {
+            previous.checked_add(magnitude)
+        } else {
+            previous.checked_sub(magnitude)
+        };
+        if exact.is_none() {
+            self.state().saturated();
+        }
     }
 
     #[cfg(test)]

@@ -316,20 +316,15 @@ impl Session {
     }
 
     pub(crate) async fn schedule_startup_prewarm(self: &Arc<Self>, base_instructions: String) {
-        if !self.services.model_client.startup_websocket_enabled() {
-            return;
-        }
-
         let session_telemetry = self.services.session_telemetry.clone();
         let started_at = Instant::now();
         let startup_prewarm_session = Arc::clone(self);
         let startup_transport = self.take_session_startup_transport().await;
         let startup_prewarm = tokio::spawn(async move {
-            let preconnected_session = resolve_startup_transport(startup_transport).await;
             let result = schedule_startup_prewarm_inner(
                 startup_prewarm_session,
                 base_instructions,
-                preconnected_session,
+                startup_transport,
             )
             .await;
             let status = if result.is_ok() { "ready" } else { "failed" };
@@ -354,7 +349,7 @@ impl Session {
 
     /// Warms the code-mode host in the background so the first cell of the
     /// first turn does not wait for isolate and host startup. This is
-    /// independent of the websocket-gated model prewarm above.
+    /// independent of tool-router and model prewarm above.
     pub(crate) fn schedule_code_mode_prewarm(self: &Arc<Self>, config: &Config) {
         if !(config.features.enabled(Feature::CodeMode)
             || config.features.enabled(Feature::CodeModeOnly))
@@ -419,6 +414,93 @@ mod tests {
 
     struct DropSignal(Arc<AtomicBool>);
 
+    #[tokio::test]
+    async fn non_websocket_startup_prepares_router_without_a_model_request() {
+        let home = tempfile::tempdir().expect("temporary codex home");
+        let (session, _, _events) =
+            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                codex_login::CodexAuth::from_api_key("test"),
+                Vec::new(),
+                home.path(),
+                |config| config.model_provider.supports_websockets = false,
+            )
+            .await;
+        assert!(!session.services.model_client.startup_websocket_enabled());
+        session
+            .schedule_startup_prewarm("startup instructions".to_string())
+            .await;
+        let prewarm = session
+            .take_session_startup_prewarm()
+            .await
+            .expect("HTTP sessions must also schedule tool preparation");
+        tokio::time::timeout(Duration::from_secs(5), prewarm.task)
+            .await
+            .expect("tool preparation completes without waiting for a provider")
+            .expect("prewarm task must finish")
+            .expect("no network request is needed");
+        let prepared = session
+            .startup_prepared_router
+            .take_for_first_turn()
+            .await
+            .expect("the first turn must receive the prepared router");
+        assert_eq!(
+            prepared.planning_generation,
+            session.services.planning_generation()
+        );
+        assert!(
+            session
+                .startup_prepared_router
+                .take_for_first_turn()
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn prewarm_publishes_router_while_transport_is_pending() {
+        let home = tempfile::tempdir().expect("temporary codex home");
+        let (session, _, _events) =
+            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                codex_login::CodexAuth::from_api_key("test"),
+                Vec::new(),
+                home.path(),
+                |config| config.model_provider.supports_websockets = true,
+            )
+            .await;
+        assert!(session.services.model_client.startup_websocket_enabled());
+        let transport = tokio::spawn(std::future::pending::<CodexResult<ModelClientSession>>());
+        let prewarm = AbortOnDropHandle::new(tokio::spawn(schedule_startup_prewarm_inner(
+            Arc::clone(&session),
+            "startup instructions".to_string(),
+            Some(SessionStartupTransportHandle::new(transport)),
+        )));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    &*session.startup_prepared_router.state.lock().await,
+                    StartupPreparedRouterState::Open(Some(_))
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("prompt preparation must not wait for transport completion");
+        let prepared = session
+            .startup_prepared_router
+            .take_for_first_turn()
+            .await
+            .expect("first turn must receive the prepared router");
+        assert_eq!(
+            prepared.planning_generation,
+            session.services.planning_generation()
+        );
+        assert!(!prewarm.is_finished(), "transport is still pending");
+        prewarm.abort();
+        assert!(matches!(prewarm.await, Err(error) if error.is_cancelled()));
+    }
+
     impl Drop for DropSignal {
         fn drop(&mut self) {
             self.0.store(true, Ordering::SeqCst);
@@ -455,7 +537,7 @@ mod tests {
 async fn schedule_startup_prewarm_inner(
     session: Arc<Session>,
     base_instructions: String,
-    preconnected_session: Option<ModelClientSession>,
+    startup_transport: Option<SessionStartupTransportHandle>,
 ) -> CodexResult<ModelClientSession> {
     let _preparation = session
         .startup_timing
@@ -491,7 +573,7 @@ async fn schedule_startup_prewarm_inner(
         .await;
     let startup_router = built_tools(
         session.as_ref(),
-        step_context.as_ref(),
+        &step_context,
         &[],
         &startup_cancellation_token,
     )
@@ -511,6 +593,11 @@ async fn schedule_startup_prewarm_inner(
                 router: Arc::clone(&startup_router),
             })
             .await;
+    }
+    // Tool preparation is useful for every transport. Only the speculative
+    // model request depends on websocket support.
+    if !session.services.model_client.startup_websocket_enabled() {
+        return Ok(session.services.model_client.new_speculative_session());
     }
     let build_prompt_started_at = Instant::now();
     let startup_prompt = build_prompt(
@@ -534,7 +621,10 @@ async fn schedule_startup_prewarm_inner(
             window_id,
             CodexResponsesRequestKind::Prewarm,
         );
-    let mut client_session = preconnected_session
+    // The transport task is already running. Build the tools and prompt while
+    // it connects, and join it only at the first point that needs the session.
+    let mut client_session = resolve_startup_transport(startup_transport)
+        .await
         .unwrap_or_else(|| session.services.model_client.new_speculative_session());
     let websocket_warmup_started_at = Instant::now();
     drop(_preparation);

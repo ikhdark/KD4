@@ -203,7 +203,7 @@ fn selected_profile_controls_mcp_inspection_and_masks_http_headers() -> Result<(
     std::fs::write(
         codex_home.path().join("config.toml"),
         r#"[mcp_servers.docs]
-command = "global-server"
+url = "http://127.0.0.1:8/global"
 "#,
     )?;
     std::fs::write(

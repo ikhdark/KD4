@@ -541,6 +541,38 @@ fn first_useful_action_and_first_model_output_are_distinct_milestones() {
 }
 
 #[test]
+fn namespaced_tools_preserve_domain_action_milestones() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    for (name, start) in [
+        ("functions.exec", 1),
+        ("functions.update_plan", 5),
+        ("functions.tool_search", 9),
+        ("functions.exec_command", 13),
+    ] {
+        clock.set_ms(start);
+        state.record_tool_call(name);
+        clock.set_ms(start + 1);
+        state.record_tool_gate_admitted(name);
+        clock.set_ms(start + 2);
+        state.record_tool_handler_entry(name);
+        clock.set_ms(start + 3);
+        state.record_tool_completion(name, true);
+    }
+    let timing = state.complete_snapshot().protocol_timing();
+    assert_eq!(timing.milestones.first_tool_accepted_ms, Some(1));
+    assert_eq!(timing.milestones.first_infrastructure_action_ms, Some(3));
+    assert_eq!(timing.milestones.first_tool_discovery_action_ms, Some(11));
+    assert_eq!(timing.milestones.first_useful_tool_accepted_ms, Some(13));
+    assert_eq!(timing.milestones.first_useful_tool_gate_admitted_ms, Some(14));
+    assert_eq!(timing.milestones.first_domain_action_ms, Some(15));
+    assert_eq!(timing.milestones.first_useful_action_ms, Some(15));
+    assert_eq!(timing.milestones.first_successful_domain_action_ms, Some(16));
+    assert_eq!(timing.milestones.first_successful_useful_action_ms, Some(16));
+    assert_eq!(timing.counters.tool_call_count, 4);
+}
+
+#[test]
 fn delivered_tool_relay_timing_persists_every_lifecycle_boundary() {
     let (clock, state) = timing();
     state.mark_turn_started();
@@ -2180,6 +2212,39 @@ fn completion_snapshot_is_immutable() {
     assert_eq!(first.completed_at_unix_secs, second.completed_at_unix_secs);
     assert_eq!(first.duration_ms, second.duration_ms);
     assert_eq!(first.profile, second.profile);
+}
+
+#[test]
+fn lifecycle_counter_saturation_invalidates_reported_timing() {
+    for (deltas, expected_value, expected_saturations) in [
+        (vec![1, 1, -2], 0, 0),
+        (vec![1, -2], 0, 5),
+        (vec![i32::MIN], 0, 5),
+        (vec![i32::MAX, i32::MAX, 2], u32::MAX, 5),
+    ] {
+        let (_clock, state) = timing();
+        state.mark_turn_started();
+        for delta in deltas {
+            state.adjust_relay_queue_depth(delta);
+            state.adjust_parallel_gate_waiters(delta);
+            state.adjust_sampling_gate_waiters(delta);
+            state.adjust_process_output_waiters(delta);
+            state.adjust_active_tools(delta);
+        }
+        assert_eq!(
+            state.lifecycle_context(),
+            ToolLifecycleContext {
+                relay_queue_depth: expected_value,
+                parallel_gate_waiter_count: expected_value,
+                sampling_gate_waiter_count: expected_value,
+                process_output_waiter_count: expected_value,
+                active_tool_count: expected_value,
+            }
+        );
+        let timing = state.complete_snapshot().protocol_timing();
+        assert_eq!(timing.counters.saturation_count, expected_saturations);
+        assert_eq!(timing.profile_valid, expected_saturations == 0);
+    }
 }
 
 #[test]

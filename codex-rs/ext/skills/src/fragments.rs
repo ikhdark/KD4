@@ -62,9 +62,9 @@ impl ContextualUserFragment for SkillInstructions {
     }
 
     fn body(&self) -> String {
-        let name = escape_metadata(&self.name);
-        let path = escape_metadata(&self.path);
-        let contents = &self.contents;
+        let name = escape_fragment_text(&self.name);
+        let path = escape_fragment_text(&self.path);
+        let contents = escape_fragment_text(&self.contents);
         let scope = self
             .source_scope
             .map(|scope| format!("\n<scope>{}</scope>", skill_scope_label(scope)))
@@ -73,7 +73,7 @@ impl ContextualUserFragment for SkillInstructions {
     }
 }
 
-fn escape_metadata(value: &str) -> String {
+fn escape_fragment_text(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")

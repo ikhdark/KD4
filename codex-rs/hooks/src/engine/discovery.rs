@@ -459,7 +459,29 @@ fn append_matcher_groups(
     event_name: codex_protocol::protocol::HookEventName,
     groups: Vec<MatcherGroup>,
 ) {
-    for (group_index, group) in groups.into_iter().enumerate() {
+    let mut keys = crate::declarations::HookKeyBuilder::default();
+    let legacy_prefix = format!(
+        "{}:{}:",
+        source.key_source,
+        crate::hook_event_key_label(event_name),
+    );
+    let legacy_states = source
+        .hook_states
+        .iter()
+        .filter(|(key, _)| {
+            key.strip_prefix(&legacy_prefix)
+                .and_then(|suffix| suffix.split_once(':'))
+                .is_some_and(|(group, handler)| {
+                    group.parse::<usize>().is_ok() && handler.parse::<usize>().is_ok()
+                })
+        })
+        .map(|(_, state)| state)
+        .collect::<Vec<_>>();
+    let ambiguous_legacy_disablement = legacy_states
+        .iter()
+        .any(|state| state.enabled == Some(false) && state.trusted_hash.is_none());
+    let mut warned_about_legacy_disablement = false;
+    for group in groups {
         let matcher = matcher_pattern_for_event(event_name, group.matcher.as_deref());
         let compiled_matcher = match matcher.map(HookMatcher::new).transpose() {
             Ok(matcher) => matcher,
@@ -472,7 +494,8 @@ fn append_matcher_groups(
                 continue;
             }
         };
-        for (handler_index, handler) in group.hooks.iter().cloned().enumerate() {
+        for handler in group.hooks.iter().cloned() {
+            let key = keys.next(&source.key_source, event_name, matcher, &handler);
             match handler {
                 HookHandlerConfig::Command {
                     command,
@@ -516,10 +539,30 @@ fn append_matcher_groups(
                         status_message: status_message.clone(),
                     };
                     let current_hash = command_hook_hash(event_name, matcher, normalized_handler);
-                    // TODO(abhinav): replace this positional suffix with a durable hook id.
-                    let key =
-                        crate::hook_key(&source.key_source, event_name, group_index, handler_index);
-                    let state = source.hook_states.get(&key);
+                    // A legacy trusted hash identifies the original handler even
+                    // after it moves. A bare positional disablement cannot do so;
+                    // keep unresolved hooks paused until the user saves v2 state.
+                    let legacy_state = legacy_states
+                        .iter()
+                        .copied()
+                        .filter(|state| state.trusted_hash.as_deref() == Some(&current_hash))
+                        .min_by_key(|state| state.enabled != Some(false));
+                    let unresolved_legacy_state = HookStateToml {
+                        enabled: Some(false),
+                        trusted_hash: None,
+                    };
+                    let mut state = source.hook_states.get(&key).or(legacy_state);
+                    if state.is_none() && ambiguous_legacy_disablement && !source.is_managed {
+                        state = Some(&unresolved_legacy_state);
+                        if !warned_about_legacy_disablement {
+                            warnings.push(format!(
+                                "legacy disabled {} hook state in {} has no identity hash; unresolved hooks are paused until their enabled state is saved again",
+                                crate::hook_event_key_label(event_name),
+                                source.path.display(),
+                            ));
+                            warned_about_legacy_disablement = true;
+                        }
+                    }
                     let enabled = hook_enabled(source.is_managed, state);
                     let trusted_hash = hook_trusted_hash(source.is_managed, state);
                     let trust_status =
@@ -946,7 +989,10 @@ mod tests {
         let mut display_order = 0;
         let source_path = source_path();
         let hook_states = std::collections::HashMap::from([(
-            format!("{}:pre_tool_use:0:0", source_path.display()),
+            format!(
+                "{}:pre_tool_use:v2:sha256:807d410e236f42bf4a314e802fdcec9efab041a4296f6be70233f1970f07155d:0",
+                source_path.display()
+            ),
             HookStateToml {
                 enabled: Some(false),
                 trusted_hash: None,

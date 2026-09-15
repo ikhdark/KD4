@@ -140,7 +140,7 @@ async fn thread_start_normalizes_legacy_dynamic_tools_into_model_request() -> Re
         &json!({
             "type": "function",
             "name": "lookup_ticket",
-            "description": "Look up a ticket\n\nexec tool declaration:\n```ts\ndeclare const tools: { lookup_ticket(args: { ticket_id: string; }, options?: { timeout_ms?: number }): Promise<unknown>; };\n```",
+            "description": "Look up a ticket",
             "strict": false,
             "parameters": visible_schema,
         })
@@ -156,13 +156,13 @@ async fn thread_start_normalizes_legacy_dynamic_tools_into_model_request() -> Re
             "tools": [{
                 "type": "function",
                 "name": "lookup_status",
-                "description": "Look up a ticket status\n\nexec tool declaration:\n```ts\ndeclare const tools: { legacy_app__lookup_status(args: { ticket_id: string; }, options?: { timeout_ms?: number }): Promise<unknown>; };\n```",
+                "description": "Look up a ticket status",
                 "strict": false,
                 "parameters": visible_schema,
             }, {
                 "type": "function",
                 "name": "update_ticket",
-                "description": "Update a ticket\n\nexec tool declaration:\n```ts\ndeclare const tools: { legacy_app__update_ticket(args: {}, options?: { timeout_ms?: number }): Promise<unknown>; };\n```",
+                "description": "Update a ticket",
                 "strict": false,
                 "parameters": {
                     "type": "object",

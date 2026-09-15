@@ -1032,10 +1032,15 @@ async fn respects_max_scan_depth_for_user_scope() {
     )
     .await;
 
-    assert!(
-        outcome.errors.is_empty(),
-        "unexpected errors: {:?}",
-        outcome.errors
+    assert_eq!(
+        outcome.errors,
+        vec![SkillError {
+            path: skills_root.abs(),
+            message: format!(
+                "skills scan reached its traversal limit (root: {})",
+                PathUri::from_abs_path(&skills_root.abs())
+            ),
+        }]
     );
     assert_eq!(
         outcome.skills,
@@ -1049,6 +1054,44 @@ async fn respects_max_scan_depth_for_user_scope() {
             path_to_skills_md: normalized(&within_depth_path),
             scope: SkillScope::User,
             plugin_id: None,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn reports_directory_limit_without_discarding_discovered_skills() {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let skill_path = write_skill(&codex_home, "000-valid", "valid-skill", "loads");
+    let skills_root = codex_home.path().join("skills");
+    for index in 0..MAX_SKILLS_DIRS_PER_ROOT {
+        fs::create_dir(skills_root.join(format!("empty-{index:04}")))
+            .expect("create skill directory");
+    }
+
+    let outcome = load_skills_from_roots(
+        [SkillRoot {
+            path: skills_root.abs(),
+            scope: SkillScope::User,
+            file_system: Arc::clone(&LOCAL_FS),
+            plugin_id: None,
+            plugin_namespace: None,
+            plugin_root: None,
+        }],
+        /*plugin_skill_snapshots*/ None,
+    )
+    .await;
+
+    assert_eq!(outcome.skills.len(), 1);
+    assert_eq!(outcome.skills[0].name, "valid-skill");
+    assert_eq!(outcome.skills[0].path_to_skills_md, normalized(&skill_path));
+    assert_eq!(
+        outcome.errors,
+        vec![SkillError {
+            path: skills_root.abs(),
+            message: format!(
+                "skills scan reached its traversal limit (root: {})",
+                PathUri::from_abs_path(&skills_root.abs())
+            ),
         }]
     );
 }

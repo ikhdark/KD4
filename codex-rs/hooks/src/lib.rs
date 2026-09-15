@@ -100,7 +100,8 @@ pub fn hook_event_key_label(event_name: HookEventName) -> &'static str {
     }
 }
 
-/// Builds the persisted config-state key for one discovered hook handler.
+/// Builds a legacy positional key. New discovery uses content-based keys so
+/// unrelated insertions cannot transfer persisted state between handlers.
 pub fn hook_key(
     key_source: &str,
     event_name: HookEventName,

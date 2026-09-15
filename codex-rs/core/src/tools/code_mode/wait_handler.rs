@@ -871,6 +871,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn owner_timeout_reaches_the_real_code_mode_state_change_path() {
+        // Runtime initialization runs on a native thread, outside Tokio's paused clock.
+        tokio::time::resume();
         let service = Arc::new(crate::tools::code_mode::CodeModeService::new(Arc::new(
             codex_code_mode::InProcessCodeModeSessionProvider,
         )));
@@ -896,6 +898,7 @@ mod tests {
             } if content_items.is_empty()
         ));
 
+        tokio::time::pause();
         let wait_service = Arc::clone(&service);
         let wait_cell_id = cell_id.clone();
         let (_activity_tx, activity_rx) = tokio::sync::watch::channel(InputQueueActivity::Mailbox);

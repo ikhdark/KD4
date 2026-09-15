@@ -3,7 +3,7 @@ use std::path::Path;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_shell_command::bash::parse_shell_script_into_commands;
 use codex_shell_command::is_safe_command::is_known_safe_command;
-use codex_shell_command::parse_command::parse_shell_script;
+use codex_shell_command::parse_command::parse_shell_script_with_full_paths;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 pub const MEMORIES_USAGE_METRIC: &str = "codex.memories.usage";
@@ -44,7 +44,7 @@ pub fn memories_usage_kinds_from_command(
         return Vec::new();
     }
 
-    parse_shell_script(command)
+    parse_shell_script_with_full_paths(command)
         .into_iter()
         .filter_map(|command| match command {
             ParsedCommand::Read { path, .. } => get_memory_kind(&path, cwd, memory_root),
@@ -102,6 +102,15 @@ mod tests {
             ),
             (
                 "rg needle home/memories/rollout_summaries",
+                vec![MemoriesUsageKind::RolloutSummaries],
+            ),
+            ("rg home/memories/rollout_summaries other", vec![]),
+            (
+                "grep needle home/memories/rollout_summaries",
+                vec![MemoriesUsageKind::RolloutSummaries],
+            ),
+            (
+                "cd home/memories && rg needle rollout_summaries",
                 vec![MemoriesUsageKind::RolloutSummaries],
             ),
             ("cat home/memories/MEMORY.md; touch changed", vec![]),

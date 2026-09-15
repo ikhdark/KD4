@@ -2903,9 +2903,6 @@ impl AuthManager {
             let Some(auth) = auth_before_reload.as_ref() else {
                 return Ok(());
             };
-            if let Some(error) = self.refresh_failure_for_auth(auth) {
-                return Err(RefreshTokenError::Permanent(error));
-            }
             if !Self::should_refresh_proactively(auth) {
                 return Ok(());
             }

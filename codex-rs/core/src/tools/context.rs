@@ -103,7 +103,10 @@ impl ToolDispatchState {
         }
     }
 
-    #[expect(clippy::expect_used, reason = "Each dispatch must attach exactly one trace; a duplicate is a programming error")]
+    #[expect(
+        clippy::expect_used,
+        reason = "Each dispatch must attach exactly one trace; a duplicate is a programming error"
+    )]
     pub(crate) fn attach_trace(&self, trace: ToolDispatchTrace) {
         self.trace.set(trace).expect("one trace per dispatch");
     }
@@ -781,6 +784,8 @@ pub struct ExecCommandToolOutput {
     /// Whether the process has exited, even if its output pipe is still draining
     /// or the platform did not provide an exit code.
     pub process_exited: bool,
+    /// Exit 1 from a classified standalone search means no matches.
+    pub search_no_match: bool,
     pub original_token_count: Option<usize>,
     pub hook_command: Option<String>,
     pub raw_output_artifact: Option<RawOutputArtifact>,
@@ -799,11 +804,11 @@ impl ToolOutput for ExecCommandToolOutput {
     }
 
     fn outcome_for_logging(&self) -> ToolOutputOutcome {
-        if self.process_exited && self.exit_code != Some(0) {
+        if self.process_exited && self.exit_code != Some(0) && !self.search_no_match {
             ToolOutputOutcome::Failure
         } else if self.process_id.is_some() {
             ToolOutputOutcome::Yielded
-        } else if self.exit_code == Some(0) {
+        } else if self.exit_code == Some(0) || self.search_no_match {
             ToolOutputOutcome::Success
         } else {
             ToolOutputOutcome::Failure
@@ -908,6 +913,8 @@ impl ToolOutput for ExecCommandToolOutput {
             #[serde(skip_serializing_if = "Option::is_none")]
             original_token_count: Option<usize>,
             #[serde(skip_serializing_if = "Option::is_none")]
+            original_token_count_is_approximate: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             raw_output_artifact_id: Option<String>,
             #[serde(skip_serializing_if = "Option::is_none")]
             raw_output_artifact_bytes: Option<u64>,
@@ -918,6 +925,8 @@ impl ToolOutput for ExecCommandToolOutput {
             raw_output_artifact_retention_limit_reason: Option<&'static str>,
             #[serde(skip_serializing_if = "Option::is_none")]
             repair: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            output_decoding_notice: Option<&'static str>,
             output: String,
             #[serde(skip_serializing_if = "Option::is_none")]
             validation: Option<JsonValue>,
@@ -958,6 +967,7 @@ impl ToolOutput for ExecCommandToolOutput {
             session_id: self.process_id,
             process_exited: self.process_exited,
             original_token_count: self.original_token_count,
+            original_token_count_is_approximate: self.original_token_count.map(|_| true),
             raw_output_artifact_id,
             raw_output_artifact_bytes,
             raw_output_artifact_error,
@@ -970,6 +980,7 @@ impl ToolOutput for ExecCommandToolOutput {
                 .as_ref()
                 .and_then(RawOutputArtifact::retention_limit_reason),
             repair: self.repair_notice.clone(),
+            output_decoding_notice: self.output_decoding_notice(),
             validation: self.declared_validation_metadata(),
             output,
         };
@@ -1265,6 +1276,12 @@ pub(crate) fn declared_validation_metadata(
 }
 
 impl ExecCommandToolOutput {
+    fn output_decoding_notice(&self) -> Option<&'static str> {
+        std::str::from_utf8(&self.raw_output).err().map(|_| {
+            "Output contained invalid UTF-8 bytes, which were replaced with U+FFFD. The displayed text is not byte-exact."
+        })
+    }
+
     fn declared_validation_metadata(&self) -> Option<JsonValue> {
         self.validation.as_ref().map(declared_validation_metadata)
     }
@@ -1325,6 +1342,15 @@ impl ExecCommandToolOutput {
                 .with_id("repair_notice"),
             );
         }
+        if let Some(notice) = self.output_decoding_notice() {
+            fragments.push(
+                ToolOutputProjectionFragment::new(
+                    ToolOutputProjectionFragmentKind::ErrorOrDiagnostic,
+                    notice.to_string(),
+                )
+                .with_id("output_decoding_notice"),
+            );
+        }
         fragments.push(
             ToolOutputProjectionFragment::new(
                 ToolOutputProjectionFragmentKind::ContextualSpillableText,
@@ -1365,6 +1391,12 @@ impl ExecCommandToolOutput {
                 });
                 if let Some(validation) = self.declared_validation_metadata() {
                     metadata["validation"] = validation;
+                }
+                if self.original_token_count.is_some() {
+                    metadata["original_token_count_is_approximate"] = JsonValue::Bool(true);
+                }
+                if let Some(notice) = self.output_decoding_notice() {
+                    metadata["output_decoding_notice"] = JsonValue::String(notice.to_string());
                 }
                 metadata
             },
@@ -1415,7 +1447,7 @@ impl ExecCommandToolOutput {
                         /*timed_out*/ false,
                         ShellOutputSummaryOptions {
                             enabled: true,
-                            turn_cost_guard: false,
+                            applied_token_limit: Some(limits.applied_limit),
                             command_text: self.hook_command.as_deref(),
                         },
                     ),
@@ -1430,23 +1462,14 @@ impl ExecCommandToolOutput {
             && !was_truncated
             && let Some(original_tokens) = self.original_token_count
         {
-            let marker = format!("Warning: output summarized from {original_tokens} tokens");
-            let notice_limit = self
-                .max_output_tokens
-                .unwrap_or(limits.applied_limit)
-                .max(limits.applied_limit);
+            let marker =
+                format!("Warning: output summarized from approximately {original_tokens} tokens");
             let candidate = format!("{marker}\n{projected_text}");
-            projected_text = if codex_utils_string::approx_token_count(&candidate) <= notice_limit {
-                candidate
-            } else {
-                [marker.as_str(), "output truncated", "truncated", "…"]
-                    .into_iter()
-                    .find(|candidate| {
-                        codex_utils_string::approx_token_count(candidate) <= notice_limit
-                    })
-                    .unwrap_or_default()
-                    .to_string()
-            };
+            // The summary already identifies itself. An optional notice must not
+            // displace useful output that fits the caller's budget.
+            if codex_utils_string::approx_token_count(&candidate) <= limits.applied_limit {
+                projected_text = candidate;
+            }
         }
         let artifact_has_more_bytes = self
             .raw_output_artifact
@@ -1505,6 +1528,9 @@ impl ExecCommandToolOutput {
             }
         };
         sections.push(process_status);
+        if let Some(notice) = self.output_decoding_notice() {
+            sections.push(notice.to_string());
+        }
         if let Some(validation) = self.declared_validation_metadata() {
             sections.push(format!(
                 "Declared validation attribution (coverage unverified): {validation}"

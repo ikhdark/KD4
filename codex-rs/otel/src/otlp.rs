@@ -427,8 +427,8 @@ mod tests {
         server.join().expect("test server should finish");
     }
 
-    #[tokio::test]
-    async fn blocking_otlp_adapter_sends_through_shared_client() {
+    #[test]
+    fn blocking_otlp_adapter_sends_through_shared_client() {
         let (url, server) = spawn_http_response_server();
         let client = OtlpBlockingHttpClient(
             BlockingHttpClientBuilder::new()
@@ -441,7 +441,12 @@ mod tests {
             .body(Bytes::from_static(b"payload"))
             .expect("OTLP request");
 
-        let response = client.send_bytes(request).await.expect("OTLP response");
+        let mut future = client.send_bytes(request);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let std::task::Poll::Ready(response) = future.as_mut().poll(&mut context) else {
+            panic!("blocking adapter should finish synchronously");
+        };
+        let response = response.expect("OTLP response");
 
         assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(response.headers()["x-otel-response"], "ok");

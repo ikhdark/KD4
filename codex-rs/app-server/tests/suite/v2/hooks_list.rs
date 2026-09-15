@@ -156,7 +156,10 @@ async fn hooks_list_shows_discovered_hook() -> Result<()> {
         vec![HooksListEntry {
             cwd: cwd.path().to_path_buf(),
             hooks: vec![HookMetadata {
-                key: format!("{}:pre_tool_use:0:0", config_path.as_path().display()),
+                key: format!(
+                    "{}:pre_tool_use:v2:sha256:6d5e071f4bc1df089bc6f704aea08fe2e31369e363cac5ec697121bf3b3c4f62:0",
+                    config_path.as_path().display()
+                ),
                 event_name: HookEventName::PreToolUse,
                 handler_type: HookHandlerType::Command,
                 matcher: Some("Bash".to_string()),
@@ -238,7 +241,7 @@ async fn hooks_list_shows_discovered_plugin_hook() -> Result<()> {
         vec![HooksListEntry {
             cwd: cwd.path().to_path_buf(),
             hooks: vec![HookMetadata {
-                key: "demo@test:hooks/hooks.json:pre_tool_use:0:0".to_string(),
+                key: "demo@test:hooks/hooks.json:pre_tool_use:v2:sha256:ca59a721c6e781b954e19c6555b11b0d5968fa339edb3c2b020972d507e2f5f9:0".to_string(),
                 event_name: HookEventName::PreToolUse,
                 handler_type: HookHandlerType::Command,
                 matcher: Some("Bash".to_string()),
@@ -480,7 +483,7 @@ timeout = 5
                 cwd: workspace.path().to_path_buf(),
                 hooks: vec![HookMetadata {
                     key: format!(
-                        "{}:pre_tool_use:0:0",
+                        "{}:pre_tool_use:v2:sha256:504d2de7c68c74338dfa55948c2963638df70a99b59982dbba2d4f98f7828451:0",
                         project_config_path.as_path().display()
                     ),
                     event_name: HookEventName::PreToolUse,

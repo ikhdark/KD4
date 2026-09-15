@@ -40,6 +40,47 @@ fn identity_projection_reuses_shared_response_items() {
     assert!(Arc::ptr_eq(&projection.items, &canonical));
     assert!(Arc::ptr_eq(&projection.unreplaced_items, &canonical));
 }
+
+#[test]
+fn projection_retain_visits_each_item_once_in_order() {
+    let canonical: Arc<[ResponseItem]> = Arc::from([
+        text_output("first", "one".to_string()),
+        text_output("second", "two".to_string()),
+        text_output("third", "three".to_string()),
+        text_output("fourth", "four".to_string()),
+    ]);
+    for (retain, expected) in [
+        ([true, false, true, false], vec!["first", "third"]),
+        ([false, true, true, true], vec!["second", "third", "fourth"]),
+        ([true; 4], vec!["first", "second", "third", "fourth"]),
+        ([false; 4], vec![]),
+    ] {
+        for mut items in [
+            ProjectedResponseItems::Shared(Arc::clone(&canonical)),
+            ProjectedResponseItems::Owned(canonical.to_vec()),
+        ] {
+            let was_shared = matches!(items, ProjectedResponseItems::Shared(_));
+            let mut visited = Vec::new();
+            items.retain(|item| {
+                visited.push(item_call_id(item).unwrap().to_string());
+                retain[visited.len() - 1]
+            });
+
+            assert_eq!(visited, ["first", "second", "third", "fourth"]);
+            let items = items.into_shared();
+            assert_eq!(
+                items
+                    .iter()
+                    .map(|item| item_call_id(item).unwrap())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            if was_shared && retain == [true; 4] {
+                assert!(Arc::ptr_eq(&items, &canonical));
+            }
+        }
+    }
+}
 use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::command_execution::CommandExecutionLedger;
 use crate::tools::command_output_artifact::create_canonical_output_artifact;
@@ -69,7 +110,7 @@ fn candidate(call_id: &str, bounded_model_output: String) -> ToolHistoryCandidat
         artifact_sha256: sha256(b"canonical artifact"),
         original_output_sha256: sha256(b"raw output before bounding"),
         original_tokens: 24_000,
-        preserved_non_text_tokens: 0,
+        preserved_non_text_tokens: Some(0),
         bounded_model_output,
         complete: true,
         projection_eligible: true,
@@ -263,6 +304,22 @@ fn workspace_evidence_remains_visible_only_for_its_captured_revision() {
     let (_, stale_output) = textual_output_identity(&stale.items[1]).expect("stale output");
     assert!(stale_output.contains("\"stale_workspace_evidence\":true"));
     assert_eq!(stale.unreplaced_items, stale.items);
+    let notice: serde_json::Value = serde_json::from_str(stale_output).unwrap();
+    assert_eq!(notice["reason_code"], "workspace_identity_changed");
+    assert_eq!(notice["valid_for_current_workspace"], false);
+    assert_eq!(
+        notice["observed_revision"],
+        serde_json::to_value(&captured).unwrap()
+    );
+    assert_eq!(
+        notice["current_revision"],
+        serde_json::to_value(&changed).unwrap()
+    );
+    assert_eq!(notice["rerun"]["force_fresh"], true);
+    assert_eq!(
+        notice["if_rerun_unavailable"],
+        "Report the affected claim as unverified; this result does not validate the current workspace."
+    );
 }
 
 #[test]
@@ -363,7 +420,12 @@ fn untracked_legacy_workspace_evidence_fails_closed() {
         .project_with_workspace_identity(canonical, Some(&workspace_identity("current")));
     let (_, output) = textual_output_identity(&projection.items[1]).expect("stale output");
     assert!(output.contains("\"stale_workspace_evidence\":true"));
-    assert!(output.contains("no workspace observation was recorded"));
+    assert!(output.contains("no workspace observation is available"));
+    assert!(output.contains("unrecorded or evicted"));
+    let notice: serde_json::Value = serde_json::from_str(output).unwrap();
+    assert_eq!(notice["reason_code"], "missing_observation");
+    assert_eq!(notice["valid_for_current_workspace"], false);
+    assert_eq!(notice["observed_revision"], serde_json::Value::Null);
     assert!(!output.contains("repository identity"));
 }
 
@@ -389,6 +451,7 @@ fn workspace_evidence_output_mismatch_does_not_claim_the_repository_changed() {
     let (_, output) = textual_output_identity(&projection.items[1]).expect("stale output");
     let notice: serde_json::Value = serde_json::from_str(output).expect("freshness notice");
     assert_eq!(notice["stale_workspace_evidence"], true);
+    assert_eq!(notice["reason_code"], "output_mismatch");
     assert_eq!(notice["rerun"]["force_fresh"], true);
     assert_eq!(
         notice["reason"],
@@ -590,18 +653,15 @@ async fn intersecting_workspace_transition_marks_stale_and_permits_suppressed_re
             Some(&after_overlap),
         )
     );
-    let stale = state.project_with_workspace_identity(canonical, Some(&after_overlap));
-    let ResponseItem::FunctionCall { arguments, .. } = &stale.items[0] else {
-        panic!("projected invocation");
-    };
-    let projected_arguments: serde_json::Value =
-        serde_json::from_str(arguments).expect("projected exec_command arguments");
-    let force_fresh = projected_arguments
-        .get("force_fresh")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    assert!(force_fresh);
+    let stale = state.project_with_workspace_identity(Arc::clone(&canonical), Some(&after_overlap));
+    assert_eq!(
+        stale.items[0], canonical[0],
+        "preserve the historical invocation"
+    );
     let (_, stale_output) = textual_output_identity(&stale.items[1]).expect("stale output");
+    let notice: serde_json::Value = serde_json::from_str(&stale_output).expect("stale notice");
+    let force_fresh = notice["rerun"]["force_fresh"].as_bool().unwrap_or(false);
+    assert!(force_fresh);
     assert!(stale_output.contains("\"rerun\":{\"force_fresh\":true}"));
     ledger
         .begin_attempt_with_freshness(&attempt_key, false, force_fresh)
@@ -996,6 +1056,84 @@ fn cargo_test_dependencies_follow_selected_local_package_graph() {
     );
     assert!(dependencies.contains(&SourceDependencyV1::new(&temp.path().join("support"), true,)));
     assert!(!dependencies.contains(&SourceDependencyV1::new(temp.path(), true)));
+}
+
+#[test]
+fn cargo_configuration_changes_invalidate_observed_validation() {
+    let temp = tempfile::tempdir().expect("workspace fixture");
+    let workspace = temp.path().join("workspace");
+    let app = workspace.join("app");
+    std::fs::create_dir_all(&app).expect("package directory");
+    std::fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers = ['app']\n",
+    )
+    .expect("workspace manifest");
+    std::fs::write(
+        app.join("Cargo.toml"),
+        "[package]\nname = 'app'\nversion = '0.1.0'\n",
+    )
+    .expect("package manifest");
+    let arguments = serde_json::json!({"package": "app", "workdir": app});
+    let payload = ToolPayload::Function {
+        arguments: arguments.to_string(),
+    };
+    let classification = classify_workspace_tool_call("cargo_test", &payload, &app);
+    assert!(classification.observes_workspace);
+    let call_id = "cargo-proof";
+    let output = text_output(call_id, "test result: ok. 1 passed".to_string());
+    let canonical: Arc<[ResponseItem]> = Arc::from([
+        named_function_call_with_arguments(call_id, "cargo_test", arguments),
+        output.clone(),
+    ]);
+    for directory in [workspace.as_path(), temp.path()] {
+        for input in [
+            ".cargo/config",
+            ".cargo/config.toml",
+            "rust-toolchain",
+            "rust-toolchain.toml",
+        ] {
+            let path = directory.join(input);
+            assert!(!path.exists(), "track configuration before it is created");
+            let mut state = ToolHistoryState::default();
+            state.register_workspace_evidence(
+                WorkspaceEvidenceObservation::from_response_item(
+                    Some(workspace_identity("captured")),
+                    &output,
+                    classification.source_dependencies.clone(),
+                )
+                .expect("validation observation"),
+            );
+            let unrelated = workspace_identity("unrelated");
+            state.invalidate_source_dependencies(
+                Some(&BTreeSet::from([workspace.join("notes.txt")])),
+                Some(&unrelated),
+            );
+            assert_eq!(
+                state
+                    .project_with_workspace_identity(Arc::clone(&canonical), Some(&unrelated))
+                    .items,
+                canonical,
+                "unrelated changes must preserve the validation result"
+            );
+            let changed = workspace_identity("configuration-changed");
+            state.invalidate_source_dependencies(
+                Some(&BTreeSet::from([path.clone()])),
+                Some(&changed),
+            );
+            let projected =
+                state.project_with_workspace_identity(Arc::clone(&canonical), Some(&changed));
+            let (_, text) = textual_output_identity(&projected.items[1]).expect("stale result");
+            let notice: serde_json::Value =
+                serde_json::from_str(text).expect("stale evidence notice");
+            assert_eq!(notice["stale_workspace_evidence"], true, "{path:?}");
+            assert_eq!(
+                notice["reason_code"], "source_dependency_changed",
+                "{path:?}"
+            );
+            assert_eq!(notice["rerun"]["force_fresh"], true, "{path:?}");
+        }
+    }
 }
 
 #[test]
@@ -1519,6 +1657,24 @@ async fn remote_compaction_bounds_recovery_metadata_and_keeps_newest_exact_handl
     assert_eq!(pins[0]["bytes"], 96_000);
     assert_eq!(pins[0]["sha256"], sha256(b"canonical artifact"));
     assert_eq!(sidecar.1["omitted_artifact_count"], 96 - pins.len());
+    assert!(
+        sidecar.1["instruction"]
+            .as_str()
+            .unwrap()
+            .contains("read_tool_output")
+    );
+    assert!(pins.iter().all(|pin| pin.get("retrieval").is_none()));
+    // Compact pins must remain recognized as exact artifact references when
+    // this sidecar is the only recovery metadata retained in history.
+    let mut state = ToolHistoryState::default();
+    let mut tracked = candidate("newest", "output-95".to_string());
+    tracked.artifact_id = "artifact-095".to_string();
+    tracked.refresh_derived();
+    state.register(tracked);
+    assert_eq!(
+        state.artifact_reference_positions(&[text_output("sidecar", sidecar.0.clone())]),
+        BTreeMap::from([("newest".to_string(), 0)])
+    );
 }
 
 #[test]
@@ -1572,7 +1728,7 @@ fn token_backfire_tool_history_pressure_keeps_every_result_recoverable(repetitio
         let call_id = format!("call-{index}");
         let output = format!("result-{index} ").repeat(repetitions);
         let mut registered = candidate(&call_id, output.clone());
-        registered.artifact_id = format!("artifact-{index}");
+        registered.artifact_id = format!("00000000-0000-7000-8000-{index:012}");
         state.register(registered);
         items.push(function_call(&call_id));
         items.push(text_output(&call_id, output));
@@ -1605,7 +1761,10 @@ fn token_backfire_tool_history_pressure_keeps_every_result_recoverable(repetitio
                 );
             if !output.starts_with(&format!("result-{index} ")) {
                 let recovery: serde_json::Value = serde_json::from_str(output).unwrap();
-                assert_eq!(recovery["artifact_id"], format!("artifact-{index}"));
+                assert_eq!(
+                    recovery["artifact_id"],
+                    format!("00000000-0000-7000-8000-{index:012}")
+                );
             }
         }
     }
@@ -1620,12 +1779,11 @@ fn tool_history_admission_preserves_newest_unconsumed_non_text_content() {
         detail: None,
     }; 300];
     let mut image_candidate = candidate(call_id, output.clone());
-    image_candidate.preserved_non_text_tokens =
+    let non_text_tokens =
         approx_token_count(&serde_json::to_string(&images).expect("serialize image content"))
             as u64;
-    assert!(
-        image_candidate.preserved_non_text_tokens > MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET as u64
-    );
+    assert!(non_text_tokens > MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET as u64);
+    image_candidate.preserved_non_text_tokens = Some(non_text_tokens);
     let mut content = vec![FunctionCallOutputContentItem::InputText { text: output }];
     content.extend(images);
     let canonical: Arc<[ResponseItem]> = Arc::from([
@@ -2326,6 +2484,31 @@ fn token_backfire_compaction_pins_artifact_without_model_copying_receipt() {
     let pin_payload = state
         .artifact_pin_payload_for_items(&projection.items)
         .expect("the compaction projection must yield a deterministic recovery sidecar");
+    let pins: serde_json::Value = serde_json::from_str(&pin_payload).expect("valid pin payload");
+    let artifact = &pins["artifacts"][0];
+    assert_eq!(
+        artifact["artifact_id"],
+        state.candidates[call_id].artifact_id
+    );
+    let standalone = state.candidates[call_id]
+        .artifact_pin_value()
+        .expect("standalone artifact pin");
+    assert_eq!(standalone["retrieval"]["tool"], "read_tool_output");
+    assert!(artifact.get("retrieval").is_none());
+    for instruction in [
+        pins["instruction"].as_str().expect("sidecar instruction"),
+        standalone["retrieval"]["instruction"]
+            .as_str()
+            .expect("pin instruction"),
+    ] {
+        for selector in ["search", "lines", "bytes", "section", "json_pointer"] {
+            assert!(
+                instruction.contains(selector),
+                "missing selector guidance: {selector}"
+            );
+        }
+        assert!(instruction.contains("continuation or child_selectors"));
+    }
     state.retain_for_history(&[text_output("compaction-summary", pin_payload)]);
 
     assert!(state.candidates.contains_key(call_id));
@@ -3065,6 +3248,11 @@ fn cargo_manifest_read_failures_invalidate_receipts_without_losing_selective_reu
                         "rerun": { "force_fresh": true },
                         "reason": "a source dependency changed after this tool result was captured; rerun the tool before relying on it",
                         "stale_workspace_evidence": true,
+                        "reason_code": "source_dependency_changed",
+                        "valid_for_current_workspace": false,
+                        "observed_revision": if complete { &changed } else { &captured },
+                        "current_revision": changed,
+                        "if_rerun_unavailable": "Report the affected claim as unverified; this result does not validate the current workspace.",
                     }),
                     "{case}"
                 );
@@ -3094,7 +3282,7 @@ fn tool_history_admission_recovers_legacy_non_text_cost_from_response_content() 
             let text = format!("image result for {call_id}");
             let mut registered = candidate(call_id, text.clone());
             registered.artifact_id = format!("artifact-{call_id}");
-            registered.preserved_non_text_tokens = non_text_tokens as u64;
+            registered.preserved_non_text_tokens = Some(non_text_tokens as u64);
             let mut serialized = serde_json::to_value(registered).unwrap();
             if legacy_missing_cost {
                 serialized
@@ -3102,7 +3290,12 @@ fn tool_history_admission_recovers_legacy_non_text_cost_from_response_content() 
                     .unwrap()
                     .remove("preserved_non_text_tokens");
             }
-            state.register(serde_json::from_value(serialized).unwrap());
+            let restored: ToolHistoryCandidate = serde_json::from_value(serialized).unwrap();
+            assert_eq!(
+                restored.preserved_non_text_tokens,
+                (!legacy_missing_cost).then_some(non_text_tokens as u64)
+            );
+            state.register(restored);
             canonical.push(function_call(call_id));
             let mut content = vec![FunctionCallOutputContentItem::InputText { text }];
             content.extend(images.clone());
@@ -3126,22 +3319,34 @@ fn tool_history_admission_recovers_legacy_non_text_cost_from_response_content() 
         assert!(projection.substitutions.is_empty());
     }
 
-    // A genuinely textual legacy result remains eligible for normal raw reuse.
-    let call_id = "legacy-text";
-    let text = "exact text-only result".to_string();
-    let mut serialized = serde_json::to_value(candidate(call_id, text.clone())).unwrap();
-    serialized
-        .as_object_mut()
-        .unwrap()
-        .remove("preserved_non_text_tokens");
-    let mut state = ToolHistoryState::default();
-    state.register(serde_json::from_value(serialized).unwrap());
-    let canonical: Arc<[ResponseItem]> =
-        Arc::from([function_call(call_id), text_output(call_id, text)]);
-    let projection = state.project(Arc::clone(&canonical));
-    assert_eq!(projection.items, canonical);
-    assert_eq!(projection.unreplaced_items, canonical);
-    assert!(projection.substitutions.is_empty());
+    // Persisted zero is a known text-only cost; only legacy omission needs a scan.
+    // Both remain eligible for normal raw reuse after restoring the ledger.
+    for legacy_missing_cost in [false, true] {
+        let call_id = "text-only";
+        let text = "exact text-only result".to_string();
+        let mut serialized = serde_json::to_value(candidate(call_id, text.clone())).unwrap();
+        assert_eq!(serialized["preserved_non_text_tokens"], 0);
+        if legacy_missing_cost {
+            serialized
+                .as_object_mut()
+                .unwrap()
+                .remove("preserved_non_text_tokens");
+        }
+        let restored: ToolHistoryCandidate = serde_json::from_value(serialized).unwrap();
+        assert_eq!(
+            restored.preserved_non_text_tokens,
+            (!legacy_missing_cost).then_some(0)
+        );
+        let mut state = ToolHistoryState::default();
+        state.register(restored);
+        let canonical: Arc<[ResponseItem]> =
+            Arc::from([function_call(call_id), text_output(call_id, text)]);
+        state.register_non_workspace_code_mode_call(call_id.to_string());
+        let projection = state.project_with_workspace_identity(Arc::clone(&canonical), None);
+        assert_eq!(projection.items, canonical);
+        assert_eq!(projection.unreplaced_items, canonical);
+        assert!(projection.substitutions.is_empty());
+    }
 }
 
 #[test]

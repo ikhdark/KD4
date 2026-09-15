@@ -359,7 +359,12 @@ async fn run_codex_thread_interactive_respects_pre_cancelled_spawn() {
 async fn handle_request_permissions_uses_tool_call_id_for_round_trip() {
     let (parent_session, mut parent_ctx, rx_events) =
         crate::session::tests::make_session_and_context_with_rx().await;
-    *parent_session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+    *parent_session.active_turn.lock().await = Some(crate::state::ActiveTurn {
+        terminal: Some(crate::state::TurnTerminalCoordinator::new(
+            parent_ctx.sub_id.clone(),
+        )),
+        ..Default::default()
+    });
     let parent_ctx_mut = Arc::get_mut(&mut parent_ctx).expect("single turn context ref");
     parent_ctx_mut.environments.turn_environments[0].environment_id = "remote".to_string();
 
@@ -571,6 +576,117 @@ async fn handle_exec_approval_uses_call_id_for_guardian_review_and_approval_id_f
 }
 
 #[tokio::test]
+async fn delegated_user_input_preserves_answers_and_reports_interruption() {
+    for outcome in ["cancelled", "closed", "empty", "answered", "interrupted"] {
+        let (parent_session, parent_ctx, rx_events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        *parent_session.active_turn.lock().await = Some(crate::state::ActiveTurn {
+            terminal: Some(crate::state::TurnTerminalCoordinator::new(
+                parent_ctx.sub_id.clone(),
+            )),
+            ..Default::default()
+        });
+        let (tx_sub, rx_sub) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+        let (_tx_events, rx_child_events) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+        let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
+        let child = Codex {
+            tx_sub,
+            rx_event: rx_child_events,
+            agent_status,
+            session: Arc::clone(&parent_session),
+            session_loop_termination: completed_session_loop_termination(),
+        };
+        let pending_mcp_invocations = Arc::new(Mutex::new(HashMap::new()));
+        let cancel_token = CancellationToken::new();
+        let mut request = Box::pin(handle_request_user_input(
+            &child,
+            "child-input".to_string(),
+            &parent_session,
+            &parent_ctx,
+            &pending_mcp_invocations,
+            RequestUserInputEvent {
+                call_id: "child-input".to_string(),
+                turn_id: "child-turn".to_string(),
+                questions: vec![RequestUserInputQuestion {
+                    id: "next".to_string(),
+                    header: "Next".to_string(),
+                    question: "What next?".to_string(),
+                    is_other: false,
+                    is_secret: false,
+                    options: None,
+                }],
+                auto_resolution_ms: None,
+            },
+            &cancel_token,
+        ));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        let event = timeout(Duration::from_secs(2), rx_events.recv())
+            .await
+            .expect("parent input request timed out")
+            .expect("parent input request missing");
+        let EventMsg::RequestUserInput(event) = event.msg else {
+            panic!("expected parent user-input request");
+        };
+        assert_eq!(event.turn_id, parent_ctx.sub_id);
+        assert_eq!(event.questions[0].id, "next");
+
+        let expected = RequestUserInputResponse {
+            answers: if outcome == "answered" {
+                HashMap::from([(
+                    "next".to_string(),
+                    RequestUserInputAnswer {
+                        answers: vec!["Continue".to_string()],
+                    },
+                )])
+            } else {
+                HashMap::new()
+            },
+            interrupted: matches!(outcome, "cancelled" | "closed" | "interrupted"),
+        };
+        match outcome {
+            "cancelled" => cancel_token.cancel(),
+            "closed" => {
+                let active = parent_session.active_turn.lock().await;
+                let mut turn_state = active.as_ref().unwrap().turn_state.lock().await;
+                assert!(
+                    turn_state
+                        .remove_pending_user_input(&parent_ctx.sub_id)
+                        .is_some()
+                );
+            }
+            _ => {
+                parent_session
+                    .notify_user_input_response(&parent_ctx.sub_id, expected.clone())
+                    .await;
+            }
+        }
+        timeout(Duration::from_secs(2), request)
+            .await
+            .expect("delegated input request hung");
+        let submission = rx_sub.try_recv().expect("child input response missing");
+        assert_eq!(
+            submission.op,
+            Op::UserInputAnswer {
+                id: "child-input".to_string(),
+                response: expected,
+            },
+            "outcome: {outcome}"
+        );
+        assert!(rx_sub.try_recv().is_err(), "duplicate input response");
+        let active = parent_session.active_turn.lock().await;
+        assert!(
+            !active
+                .as_ref()
+                .unwrap()
+                .turn_state
+                .lock()
+                .await
+                .has_pending_user_input(&parent_ctx.sub_id)
+        );
+    }
+}
+
+#[tokio::test]
 async fn delegated_mcp_guardian_abort_returns_synthetic_decline_answer() {
     let (parent_session, parent_ctx, _rx_events) =
         crate::session::tests::make_session_and_context_with_rx().await;
@@ -598,11 +714,23 @@ async fn delegated_mcp_guardian_abort_returns_synthetic_decline_answer() {
     let cancel_token = CancellationToken::new();
     cancel_token.cancel();
 
-    let response = maybe_auto_review_mcp_request_user_input(
+    let (tx_sub, rx_sub) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+    let (_tx_events, rx_child_events) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+    let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
+    let child = Codex {
+        tx_sub,
+        rx_event: rx_child_events,
+        agent_status,
+        session: Arc::clone(&parent_session),
+        session_loop_termination: completed_session_loop_termination(),
+    };
+    handle_request_user_input(
+        &child,
+        "child-input".to_string(),
         &parent_session,
         &parent_ctx,
         &pending_mcp_invocations,
-        &RequestUserInputEvent {
+        RequestUserInputEvent {
             call_id: "call-1".to_string(),
             turn_id: "child-turn-1".to_string(),
             questions: vec![RequestUserInputQuestion {
@@ -619,17 +747,21 @@ async fn delegated_mcp_guardian_abort_returns_synthetic_decline_answer() {
     )
     .await;
 
+    let submission = rx_sub.try_recv().expect("child guardian response missing");
     assert_eq!(
-        response,
-        Some(RequestUserInputResponse {
-            answers: HashMap::from([(
-                format!("{MCP_TOOL_APPROVAL_QUESTION_ID_PREFIX}_call-1"),
-                RequestUserInputAnswer {
-                    answers: vec![MCP_TOOL_APPROVAL_DECLINE_SYNTHETIC.to_string()],
-                },
-            )]),
-            interrupted: false,
-        })
+        submission.op,
+        Op::UserInputAnswer {
+            id: "child-input".to_string(),
+            response: RequestUserInputResponse {
+                answers: HashMap::from([(
+                    format!("{MCP_TOOL_APPROVAL_QUESTION_ID_PREFIX}_call-1"),
+                    RequestUserInputAnswer {
+                        answers: vec![MCP_TOOL_APPROVAL_DECLINE_SYNTHETIC.to_string()],
+                    },
+                )]),
+                interrupted: true,
+            },
+        }
     );
 }
 

@@ -92,7 +92,9 @@ fn write_last_message(output_file: &Path, message: &str) -> std::io::Result<()> 
     }
     staged.write_all(message.as_bytes())?;
     staged.flush()?;
-    staged.persist(output_file).map_err(|error| error.error)?;
+    // std uses POSIX replacement semantics on supported Windows versions,
+    // retaining existing readers of the old generation.
+    std::fs::rename(staged.path(), output_file)?;
     Ok(())
 }
 

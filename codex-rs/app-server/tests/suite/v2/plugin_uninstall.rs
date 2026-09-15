@@ -105,6 +105,7 @@ async fn plugin_uninstall_tracks_analytics_event() -> Result<()> {
     )?;
 
     let mut mcp = TestAppServer::builder()
+        .with_args(&["-c", "analytics.enabled=true"])
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .build()
@@ -216,6 +217,14 @@ async fn plugin_uninstall_writes_remote_plugin_to_cloud_when_remote_plugin_enabl
     )?;
 
     mount_remote_plugin_detail(&server, REMOTE_PLUGIN_ID, "1.0.0", "GLOBAL").await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/ps/plugins/installed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "plugins": [],
+            "pagination": {"limit": 50, "next_page_token": null},
+        })))
+        .mount(&server)
+        .await;
 
     Mock::given(method("POST"))
         .and(path(format!(
@@ -255,6 +264,7 @@ async fn plugin_uninstall_writes_remote_plugin_to_cloud_when_remote_plugin_enabl
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
+        .with_args(&["-c", "analytics.enabled=true"])
         .without_auto_env()
         .build()
         .await?;

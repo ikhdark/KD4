@@ -49,7 +49,7 @@ an SDK, schema, package, installed binary, or Codex Desktop.
 Update it in the same change whenever the repository materially changes.
 
 <!-- BEGIN TRACKED PATH SNAPSHOT -->
-Tracked repository path snapshot: `count=4966 sha256=d00e3cf5d4a7832cb5bd79209e6d29428cfee5980fec8bc75ef17b3d09537fc2`.
+Tracked repository path snapshot: `count=4988 sha256=002489146a83758d11294b2ddd3ae7aa39a000d922d6e92dd8e2282e631e0be8`.
 <!-- END TRACKED PATH SNAPSHOT -->
 
 Every repository file or directory add, delete, move, or rename also requires
@@ -86,9 +86,11 @@ map remains useful.
 1. Read the root `AGENTS.md`.
 2. For a clear local task, reuse known owner paths, current evidence, and the
    closest owner instructions. When ownership or a relevant relationship is
-   unresolved, query the smallest named owner slice before reading the broad map:
-   `python scripts/source_owners.py slice --owner <owner-id>
---focus "<task description>" --max-relationships 32`.
+   unresolved, query the smallest owner slice before reading the broad map.
+   For a known file, use
+   `python scripts/source_owners.py slice --path <file> --focus "<task>"`.
+   For a known owner, use
+   `python scripts/source_owners.py slice --owner <owner-id> --focus "<task description>" --max-relationships 32`.
 3. Resolve material unknowns. Expand truncated or omitted relationships when
    they could affect the requested change; unrelated omissions do not require
    broader discovery. Establish the applicable control/data flow, callers/consumers,
@@ -116,6 +118,34 @@ stale graph or managed map block and runs representative architectural recall
 cases. Its evaluator reports insufficient evidence separately from bounded but
 potentially noisy evidence, plus ranked-noise reduction, reading-volume, and
 late-relationship metrics.
+
+`source_owners.py list` includes declared roots. Path queries preserve matched
+owners and report uncovered paths in `unowned_paths`, with scoped `rg --files`
+commands in `fallback_searches`; they do not infer ownership or validation
+routes. Query and slice output reports `index_status` as `reused` or `fallback`.
+Reuse still revalidates the selected source evidence. A missing, stale, or invalid
+index falls back to the manifest; `just source-owners-generate` refreshes it.
+
+`just gate-for <repository-relative-path>` prints the most specific matching
+owners' declared validation commands, including each command's working directory
+and argument list. It does not execute them or infer test coverage. Unowned paths
+and owners without validation routes produce a partial result and a nonzero exit
+status. To resolve several paths together, use
+`python scripts/source_owners.py validation --path <file> --path <file>`.
+
+The source-owner manifest is the authority for declared ownership and validation
+routes. Repo Atlas can resolve remaining symbol, caller, or impact questions
+within that boundary; its results do not replace declared contracts. When the
+relevant paths and relationships are already known, read their source directly.
+
+Workspace-evidence recovery is owned by `codex-rs/core/src/tool_history.rs` and
+`codex-rs/core/src/tools/command_execution.rs`. A response with
+`stale_workspace_evidence: true` and `valid_for_current_workspace: false` cannot
+support a current-workspace claim. Rerun the original bounded read with
+`force_fresh: true`; normal execution permissions still apply. If a fresh read is
+unavailable, report the claim as unverified. Missing observations or output
+mismatches alone do not establish that repository contents changed. The owning
+`tool_history::tests` exercise these response fields and recovery reasons.
 
 ## Runtime architecture
 
@@ -205,7 +235,7 @@ below.
 
 | Domain                                            | Package roots                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Workspace and repository tooling                  | `codex-rs`, `tools/argument-comment-lint`                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Workspace and repository tooling                  | `codex-rs`, `codex-rs/repo-benchmark`, `tools/argument-comment-lint`                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | CLI, authentication, home, and install context    | `codex-rs/arg0`, `codex-rs/aws-auth`, `codex-rs/cli`, `codex-rs/codex-home`, `codex-rs/install-context`, `codex-rs/keyring-store`, `codex-rs/login`, `codex-rs/secrets`                                                                                                                                                                                                                                                                                                           |
 | Interactive and headless clients                  | `codex-rs/tui`, `codex-rs/exec`                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | Core runtime, configuration, context, and prompts | `codex-rs/config`, `codex-rs/context-fragments`, `codex-rs/core`, `codex-rs/core/tests/common`, `codex-rs/features`, `codex-rs/prompts`                                                                                                                                                                                                                                                                                                                                           |
@@ -310,6 +340,26 @@ revalidate tree equality, generated outputs, and affected callers on every sync.
 
 ## Extension boundary
 
+Code mode has three independent configuration roles, defined in
+`codex-rs/features/src/lib.rs` and wired by `core/src/thread_manager.rs` and
+`core/src/tools/spec_plan.rs` (both under `codex-rs`):
+
+| `code_mode` | `code_mode_only` | Tool surface |
+| ----------- | ---------------- | ------------ |
+| false | false | Direct tools; no code-mode batching surface |
+| true | false | Code-mode batching alongside direct tools |
+| either | true | Normalization enables code mode; eligible tools are nested, with direct-only exceptions |
+
+`code_mode_host` selects a process-owned runtime with an in-process fallback;
+false selects the in-process runtime. It does not enable the tool surface by
+itself. Defaults are `code_mode=true`, `code_mode_host=true`, and
+`code_mode_only=false`. Multi-agent v2's `non_code_mode_only` controls direct-only
+exposure when tool search is disabled; tool search takes the deferred route.
+The representative exposure tests live in `core/src/tools/spec_plan_tests.rs`.
+Code-mode JavaScript orchestrates tools; unified exec owns subprocess execution,
+including when invoked as a nested tool. The model-visible batching guidance is
+owned by `code-mode-protocol/src/description/exec_prompt.rs`.
+
 `codex-rs/ext/extension-api` is the typed host-extension boundary. Prefer an
 existing contributor contract and the immutable registry in
 `codex-rs/ext/extension-api/src/registry.rs` before adding a fork-only hook in
@@ -337,6 +387,13 @@ hook engine and policy surface, not a substitute for the typed extension API.
 by app-server and MCP-server hosts; hosts provide dependencies and event sinks
 instead of maintaining separate built-in extension lists.
 
+Plugins can also contribute command hooks, including `PreToolUse` handlers.
+`codex-rs/core-plugins/src/manager.rs` loads their declarations and
+`codex-rs/hooks/src/engine/discovery.rs::append_plugin_hook_sources` applies
+hook trust, enablement, and plugin identity before engine dispatch. Plugin
+installation therefore contributes executable hook behavior as well as skills
+and tool metadata; pre-tool hooks participate in tool admission.
+
 ## Persistence and stored state
 
 | State                            | Primary owner                                                                | Consumers and compatibility boundary                                                                                                                                                  |
@@ -355,16 +412,34 @@ Treat migrations, rollout records, serialized protocol items, stored thread
 metadata, and resume behavior as one compatibility surface. A change to one
 owner must trace every reader and writer before completion.
 
+`codex-rs/rollout` persists the session records used for resume and context
+reconstruction. Cold records may be stored as `.jsonl.zst` through
+`rollout/src/compression.rs`. `scripts/rollout_snapshot.py` captures the physical
+file bytes and their checksum; the session analyzers decode that snapshot and
+discover both representations, preferring a plain sibling to avoid counting a
+session twice. Python 3.14 supplies Zstandard decoding; older supported Python
+versions use the dependency declared in `scripts/pyproject.toml`.
+
+`codex-rs/rollout-trace` owns a separate diagnostic bundle with `trace.jsonl`,
+raw payloads, and a reducer exposed as `replay_bundle`. Its thread, inference,
+tool-dispatch, and code-cell contexts record execution relationships for
+diagnostic replay. This is distinct from restoring a core session from its
+persisted conversation. `codex-rs/message-history` stores global user-input
+history in `CODEX_HOME/history.jsonl`; `core/src/context_manager/history.rs`
+maintains the current conversation items used to construct model context.
+
 ## Contracts and generated artifacts
 
 | Contract or output                            | Source owner                                                                                                                          | Update and validation path                                                                                                                                                                            |
 | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | App-server request/notification schema        | `codex-rs/app-server`, `codex-rs/app-server-protocol`, `codex-rs/protocol`                                                            | Focused protocol/app-server tests plus check-only `just app-server-schema-check`; intentional regeneration uses serialized `just app-server-schema-regenerate <owner>`                                |
 | App-server schema tree                        | `codex-rs/app-server-protocol/schema`                                                                                                 | Generated output; never hand-edit; inspect the generator-produced diff                                                                                                                                |
+| Code-mode import and host boundary | `codex-rs/code-mode/src/runtime/module_loader.rs`, `runtime/mod.rs`, and `codex-rs/code-mode-protocol/src/description/exec_prompt.rs` | Static and dynamic imports are rejected; host globals expose registered tools and helpers, with no Node/filesystem/network APIs. Changes require focused code-mode runtime and protocol tests. |
+| Rollout analysis snapshot | `scripts/rollout_snapshot.py`, `scripts/kd4_turn_latency_audit.py`, `scripts/kd4_first_useful_action_analysis.py` | Preserve physical-byte checksums when decoding `.jsonl.zst`; validate CLI discovery, corrupt inputs, and first-action results with `python -m unittest scripts.test_rollout_snapshot`. |
 | Config schema                                 | `codex-rs/config`, `codex-rs/features`, `codex-rs/core`                                                                               | Focused config/core tests plus check-only `just config-schema-check`; intentional regeneration uses serialized `just config-schema-regenerate <owner>` and outputs `codex-rs/core/config.schema.json` |
 | Thread-config protobuf binding                | `codex-rs/config/src/thread_config/proto/codex.thread_config.v1.proto`                                                                | `just generate-config-proto-check`; intentional regeneration uses `just generate-config-proto`                                                                                                        |
 | Exec-server relay protobuf binding            | `codex-rs/exec-server/src/proto/codex.exec_server.relay.v1.proto`                                                                     | `just generate-exec-server-relay-proto-check`; intentional regeneration uses `just generate-exec-server-relay-proto`                                                                                  |
-| Hook schemas                                  | `codex-rs/hooks/src`                                                                                                                  | Focused hook tests; intentional regeneration uses `just write-hooks-schema` and produces `codex-rs/hooks/schema/generated`                                                                            |
+| Hook schemas                                  | `codex-rs/hooks/src`                                                                                                                  | `just hooks-schema-check`; intentional regeneration uses `just write-hooks-schema` and produces `codex-rs/hooks/schema/generated`                                                                            |
 | Python SDK generated package                  | Fork-local app-server schema bundle under `codex-rs/app-server-protocol/schema/json` via `sdk/python/scripts/update_sdk_artifacts.py` | `generate-types` replaces the complete `src/openai_codex/generated` tree, including its initializer, and the focused Python SDK freshness test rejects drift, retired contracts, or abandoned files   |
 | npm package layout                            | `codex-cli`, `scripts/stage_npm_packages.py`, `scripts/codex_package`                                                                 | Staging/package tests, archive inspection, and the owning dry-run                                                                                                                                     |
 | Cargo package membership and dependency state | Rust package manifests, `codex-rs/Cargo.toml`, `codex-rs/Cargo.lock`                                                                  | Cargo owns the lock update; never hand-edit generated dependency state                                                                                                                                |
@@ -388,7 +463,7 @@ owner must trace every reader and writer before completion.
 | Desktop-visible completion                  | local publish output plus app-server/CLI runtime                                                                                                                              | publish final, restart Desktop, prove process path and binary hash/version, inspect initialize/model metadata, capture visible evidence                                       |
 | Source-owner and architecture index refresh | `source_owners.toml`, `scripts/source_owners.py`, `scripts/test_source_owners.py`                                                                                             | regenerate `architecture_index.json` and the marked `SOURCEMAP.md` block through the owner workflow; run source-owner freshness and representative relationship-recall checks |
 | Generated schema freshness                  | `scripts/config_schema_check.py`, `scripts/app_server_schema_runtime_check.py`, `scripts/generated_output_lock.py`                                                            | use the owning check/regeneration command under the shared generated-output lock; never hand-edit generated schemas                                                           |
-| KD4 audits, evaluation, and measurement | `codex-rs/repo-benchmark`, `scripts/kd4_sync_audit.py`, `scripts/kd4_perf_snapshot.py`, `scripts/kd4_turn_latency_audit.py`, `scripts/kd4_timing_analysis.py`, `scripts/kd4_first_useful_action_analysis.py`, `scripts/kd4_model_attempt_analysis.py`, `scripts/investigation_evidence_smoke.py`, `scripts/investigation_eval` | Repo Benchmark alone schedules native variant comparisons; the frozen Python audit owns session diagnostics, timing and real-model token analysis; aggregate before trace retention; keep Git preflight and local workflow timing separate |
+| KD4 audits, evaluation, and measurement | `codex-rs/repo-benchmark`, `scripts/kd4_sync_audit.py`, `scripts/kd4_perf_snapshot.py`, `scripts/kd4_turn_latency_audit.py`, `scripts/kd4_timing_analysis.py`, `scripts/kd4_first_useful_action_analysis.py`, `scripts/kd4_model_attempt_analysis.py`, `scripts/investigation_evidence_smoke.py`, `scripts/investigation_eval` | Repo Benchmark alone schedules native variant comparisons; the frozen Python audit owns session diagnostics, timing, observed tool-item behavior and real-model token/cache analysis; aggregate before trace retention; keep Git preflight and local workflow timing separate |
 | Runtime binary selection proof              | `scripts/vscode_runtime_proof.py`                                                                                                                                             | read-only path, version, and environment evidence; binary replacement remains owned by the explicit publish/update flow                                                       |
 
 `just publish-local-codex-final` runs only the local publisher. Release-tooling tests
@@ -418,7 +493,9 @@ remain required.
 | Source map or structural inventory           | `python -m unittest scripts.test_source_map_check` and `just source-map-check`                                                                                                   |
 | Source-owner manifest or architecture index  | `just source-owners-check` (freshness and representative relationship tests)                                                                                                     |
 | Root or Python maintenance scripts           | closest `python -m unittest scripts.test_<name>` plus syntax/lint appropriate to the script                                                                                      |
+| Dependency manifest or lockfile             | Rust: `just deps-policy-check` plus focused consumer tests; JavaScript: frozen pnpm lockfile validation and the affected package's focused checks                                |
 | KD4 audit, evaluation, or measurement script | closest matching `python -m unittest scripts.test_<name>` plus only the fixture/freshness check owned by the changed surface                                                     |
+| Repo Benchmark configuration, reports or diagnostics | `cargo test --locked --jobs 6 -p repo-benchmark --lib` from `codex-rs`, plus affected `scripts.test_kd4_timing_analysis` / `scripts.test_kd4_turn_latency_audit` tests; no live benchmark required for report-only changes |
 | Named Rust test runner or manifest           | `python -m unittest scripts.test_rust_test_runner` and `just core-test-manifest-check`                                                                                           |
 | `codex-core` Rust tests                      | `just core-test <target>`, `just core-test-fast <target>`, or `just core-gate <gate>`; `just core-test-list` prints the names                                                    |
 | Focused Rust crate                           | `just test-fast -p <crate>` or the nearest focused recipe/filter                                                                                                                 |
@@ -426,7 +503,7 @@ remain required.
 | Config schema                                | focused config/core tests plus `just config-schema-check`                                                                                                                        |
 | Adaptive-reasoning config and sampling       | `just adaptive-reasoning-contract-check`                                                                                                                                         |
 | Thread-config protobuf                       | `just generate-config-proto-check`                                                                                                                                               |
-| Hooks/schema                                 | focused hook tests; run `just write-hooks-schema` only for intentional regeneration                                                                                              |
+| Hooks/schema                                 | `just hooks-schema-check` plus focused behavior tests; run `just write-hooks-schema` only for intentional regeneration                                                                                              |
 | TypeScript SDK                               | `just sdk-ts-check`                                                                                                                                                              |
 | Python SDK                                   | focused `uv run pytest` and `uv run ruff check .`                                                                                                                                |
 | Package/archive flow                         | package-local tests followed by the relevant staging or dry-run proof                                                                                                            |
@@ -436,6 +513,15 @@ remain required.
 Green tooling alone does not prove runtime behavior. Use the focused failing
 test or approved runtime gate for the behavior being changed, and confirm that
 an exact test filter selected at least one relevant test.
+
+For the normal core test loop, use `just core-test-fast <target> <filter>`.
+`core-test` uses the local profile and continues through failures; `core-gate`
+runs a named, declared collection of tests. `core-test-lane` isolates a core
+target's build when another Rust build is active. For other crates, use
+`just test-fast -p <crate>` with the relevant filter, or `test-lane-fast` when an
+isolated build is needed. `validate-crate-focused` is an alias for
+`test-fast -p <crate>`, not an additional validation layer. Core library runs
+require an explicit filter; broad test runs require user authorization.
 
 ## Rust workflow reference
 
@@ -496,7 +582,7 @@ This map owns cross-cutting navigation and structural inventory.
 | Dependency or build-system change                    | owning manifest -> lock state -> workspace/recipe consumers -> focused build/test/package proof                                                                                                                                             |
 | New top-level area or package                        | add the owner and policy boundary -> update the machine-checked inventory in this file -> add routing/validation -> run `just source-map-check`                                                                                             |
 
-<!-- BEGIN KD4 SOURCE OWNERS schema=2 manifest_sha256=c444eac5825b5ed5ecffa2d84b01edaed0859edcec6490590fc0a04db880b679 -->
+<!-- BEGIN KD4 SOURCE OWNERS schema=2 manifest_sha256=963e2f72ed11f770848ce86743671edf0d2ea1a011f513420af8100733675b27 -->
 ### Managed KD4 source-owner index
 
 This table is generated by `scripts/source_owners.py`; edit `source_owners.toml`, not this block.
@@ -511,20 +597,24 @@ This table is generated by `scripts/source_owners.py`; edit `source_owners.toml`
 | `code-mode-protocol-contracts` | `codex-rs/code-mode-protocol` | `codex-rs/code-mode-protocol/src/lib.rs::build_exec_tool_description` | `callers_consumers:consumed_by` -> `path:codex-rs/code-mode-host`<br>`control_flow:calls` -> `path:codex-rs/code-mode-protocol/src/description.rs`<br>`runtime_registration:registers` -> `path:codex-rs/code-mode-protocol/src/lib.rs`<br>+1 more | `compatibility:code-mode-description-contract` | `code-mode-protocol-focused` |
 | `core-agent-runtime` | `codex-rs/core/src`<br>`codex-rs/core/tests`<br>`codex-rs/core/benches` | `codex-rs/core/src/session/mod.rs::Codex` | `callers_consumers:consumed_by` -> `owner:app-server-runtime`<br>`configuration:gated_by` -> `owner:feature-registry`<br>`tests_contracts:validated_by` -> `path:codex-rs/core/tests`<br>+1 more | `semantic:registered-tool-routing` | `core-focused` |
 | `feature-registry` | `codex-rs/features` | `codex-rs/features/src/lib.rs::Feature` | `callers_consumers:consumed_by` -> `owner:core-agent-runtime`<br>`runtime_registration:registers` -> `path:codex-rs/features/src/lib.rs` | `compatibility:feature-key-compatibility` | `features-focused` |
+| `hooks-schema-contracts` | `codex-rs/hooks/src/schema.rs`<br>`codex-rs/hooks/src/bin/write_hooks_schema_fixtures.rs`<br>`codex-rs/hooks/schema/generated` | `codex-rs/hooks/src/schema.rs::write_schema_fixtures` | `control_flow:calls` -> `path:codex-rs/hooks/src/schema.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/hooks/src/lib.rs`<br>`runtime_registration:registers` -> `path:justfile`<br>+2 more | - | `hooks-schema-freshness` |
 | `kd4-capability-manifest` | `kd4_features.toml`<br>`scripts/check_kd4_features.py` | `scripts/check_kd4_features.py::validate_manifest` | `configuration:reads_config` -> `config:kd4_features.toml`<br>`callers_consumers:consumed_by` -> `path:scripts/kd4_perf_snapshot.py`<br>`runtime_registration:registers` -> `path:justfile`<br>+1 more | `semantic:capability-evidence-reachability` | `kd4-capability-manifest-focused` |
 | `model-catalog-runtime` | `codex-rs/models-manager` | `codex-rs/models-manager/src/manager.rs::ModelsManager` | `callers_consumers:consumed_by` -> `owner:core-agent-runtime`<br>`control_flow:calls` -> `path:codex-rs/models-manager/src/model_info.rs`<br>`runtime_registration:constructs` -> `path:codex-rs/models-manager/src/manager.rs`<br>+1 more | `semantic:model-instruction-resolution` | `models-manager-focused` |
+| `output-truncation` | `codex-rs/utils/output-truncation` | `codex-rs/utils/output-truncation/src/lib.rs::formatted_truncate_text`<br>`codex-rs/utils/output-truncation/src/lib.rs::resolve_output_limits` | `callers_consumers:consumed_by` -> `path:codex-rs/core/src/tools/context.rs`<br>`control_flow:calls` -> `path:codex-rs/utils/output-truncation/src/lib.rs`<br>`tests_contracts:validated_by` -> `path:codex-rs/utils/output-truncation/src/truncate_tests.rs` | `semantic:formatted-output-obeys-token-ceiling` | `output-truncation-focused` |
 | `planning-architecture-runtime` | `codex-rs/core/src/plan_store.rs`<br>`codex-rs/core/src/tools/handlers/plan.rs`<br>`codex-rs/core/src/tools/handlers/plan_tests.rs`<br>`codex-rs/core/src/tools/spec_plan.rs`<br>`codex-rs/core/src/session/reasoning_governor.rs` | `codex-rs/core/src/tools/handlers/plan.rs::PlanHandler`<br>`codex-rs/core/src/plan_store.rs::PlanStore` | `callers_consumers:consumed_by` -> `path:codex-rs/core/src/session/reasoning_governor.rs`<br>`runtime_registration:registers` -> `path:codex-rs/core/src/tools/spec_plan.rs`<br>`tests_contracts:validated_by` -> `path:codex-rs/core/src/tools/handlers/plan_tests.rs`<br>+1 more | `semantic:session-plan-update` | `planning-focused` |
 | `plugin-manifest-namespace` | `codex-rs/plugin/src/namespace.rs`<br>`codex-rs/plugin/src/lib.rs`<br>`codex-rs/plugin/Cargo.toml` | `codex-rs/plugin/src/namespace.rs::plugin_namespace_for_root_uri`<br>`codex-rs/plugin/src/namespace.rs::plugin_namespace_for_skill_path` | `control_flow:calls` -> `path:codex-rs/plugin/src/namespace.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/core-skills/src/loader/namespace.rs`<br>`callers_consumers:calls` -> `path:codex-rs/file-system/src/lib.rs`<br>+2 more | `semantic:plugin-manifest-namespace-behavior`<br>`compatibility:plugin-manifest-namespace-compatibility` | `plugin-namespace` |
 | `remote-plugin-lifecycle` | `codex-rs/core-plugins/src/remote.rs`<br>`codex-rs/core-plugins/src/remote_tests.rs`<br>`codex-rs/core-plugins/src/remote` | `codex-rs/core-plugins/src/remote.rs::install_remote_plugin`<br>`codex-rs/core-plugins/src/remote.rs::uninstall_remote_plugin`<br>`codex-rs/core-plugins/src/remote/share.rs::save_remote_plugin_share` | `control_flow:calls` -> `path:codex-rs/core-plugins/src/remote.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/app-server/src/request_processors/plugins.rs`<br>`runtime_registration:registers` -> `path:codex-rs/core-plugins/src/lib.rs`<br>+3 more | `semantic:remote-plugin-lifecycle-request-and-cache`<br>`semantic:remote-plugin-lifecycle-share-requests`<br>`compatibility:remote-plugin-lifecycle-compatibility` | `remote-plugin-install`<br>`remote-plugin-uninstall`<br>`remote-plugin-skill`<br>`remote-plugin-share`<br>`remote-plugin-share-targets`<br>`remote-plugin-share-delete` |
-| `repo-benchmark` | `codex-rs/repo-benchmark`<br>`docs/benchmarks/repo-benchmark`<br>`scripts/kd4_timing_analysis.py`<br>`scripts/kd4_turn_latency_audit.py`<br>`scripts/kd4_first_useful_action_analysis.py`<br>`scripts/test_kd4_timing_analysis.py`<br>`scripts/test_kd4_turn_latency_audit.py`<br>`scripts/test_kd4_first_useful_action_analysis.py` | `codex-rs/repo-benchmark/src/main.rs::main`<br>`codex-rs/repo-benchmark/src/cli.rs::run`<br>`scripts/kd4_turn_latency_audit.py::main` | `generated_artifacts:emits` -> `path:docs/benchmarks/repo-benchmark`<br>`control_flow:calls` -> `owner:app-server-runtime`<br>`control_flow:calls` -> `path:codex-rs/app-server-test-client/src/lib.rs`<br>+10 more | `semantic:one-benchmark-two-sequential-segments`<br>`semantic:repo-benchmark-report-provenance-and-failures`<br>`semantic:native-source-and-independent-verification-integrity`<br>+2 more | `repo-benchmark-focused`<br>`session-diagnostics-focused` |
+| `repo-benchmark` | `codex-rs/repo-benchmark`<br>`docs/benchmarks/repo-benchmark`<br>`scripts/kd4_timing_analysis.py`<br>`scripts/kd4_turn_latency_audit.py`<br>`scripts/kd4_first_useful_action_analysis.py`<br>`scripts/rollout_snapshot.py`<br>`scripts/test_rollout_snapshot.py`<br>`scripts/test_kd4_timing_analysis.py`<br>`scripts/test_kd4_turn_latency_audit.py`<br>`scripts/test_kd4_first_useful_action_analysis.py` | `codex-rs/repo-benchmark/src/main.rs::main`<br>`codex-rs/repo-benchmark/src/cli.rs::run`<br>`scripts/kd4_turn_latency_audit.py::main` | `generated_artifacts:emits` -> `path:docs/benchmarks/repo-benchmark`<br>`control_flow:calls` -> `owner:app-server-runtime`<br>`control_flow:calls` -> `path:codex-rs/app-server-test-client/src/lib.rs`<br>+10 more | `semantic:one-benchmark-two-sequential-segments`<br>`semantic:repo-benchmark-report-provenance-and-failures`<br>`semantic:native-source-and-independent-verification-integrity`<br>+3 more | `repo-benchmark-focused`<br>`session-diagnostics-focused` |
 | `repository-context-discovery` | `codex-rs/core/src/git_workspace.rs`<br>`codex-rs/core/src/agents_md.rs` | `codex-rs/core/src/git_workspace.rs::GitWorkspaceCache`<br>`codex-rs/core/src/agents_md.rs::load_project_instructions` | `control_flow:calls` -> `path:codex-rs/core/src/agents_md.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/core/src/session/mod.rs`<br>`runtime_registration:constructs` -> `path:codex-rs/core/src/git_workspace.rs`<br>+1 more | `semantic:snapshot-scoped-discovery` | `repository-context-focused` |
+| `rust-test-routing` | `scripts/rust_test_runner.py`<br>`scripts/test_rust_test_runner.py`<br>`codex-rs/.config/kd4-rust-tests.toml` | `scripts/rust_test_runner.py::main` | `control_flow:calls` -> `path:scripts/rust_test_runner.py`<br>`callers_consumers:consumed_by` -> `path:scripts/check_kd4_features.py`<br>`configuration:reads_config` -> `config:codex-rs/.config/kd4-rust-tests.toml`<br>+2 more | `semantic:declared-tests-must-run` | `rust-test-routing-focused`<br>`rust-test-manifest-contract` |
 | `shared-protocol-contracts` | `codex-rs/protocol` | `codex-rs/protocol/src/lib.rs::protocol` | `callers_consumers:consumed_by` -> `owner:core-agent-runtime`<br>`control_flow:consumed_by` -> `owner:app-server-runtime`<br>`runtime_registration:registers` -> `path:codex-rs/protocol/src/lib.rs`<br>+1 more | `compatibility:shared-protocol-compatibility` | `protocol-focused` |
 | `shared-utility-crates` | `codex-rs/utils` | `codex-rs/utils/build-info/src/lib.rs::BuildInfo`<br>`codex-rs/utils/der/src/lib.rs::first_der_item` | `control_flow:consumed_by` -> `owner:cli-entrypoints`<br>`callers_consumers:consumed_by` -> `owner:app-server-runtime`<br>`runtime_registration:registers` -> `path:codex-rs/Cargo.toml`<br>+1 more | `semantic:shared-utility-single-source` | `shared-utilities-focused` |
 | `source-owner-index` | `scripts/source_owners.py`<br>`source_owners.toml` | `scripts/source_owners.py::main` | `control_flow:generates` -> `generated:architecture_index.json`<br>`callers_consumers:consumed_by` -> `path:SOURCEMAP.md`<br>`configuration:reads_config` -> `config:source_owners.toml`<br>+3 more | `compatibility:fresh-index` | `source-owner-focused` |
-| `tool-output-recovery` | `codex-rs/core/src/tools/command_output_artifact.rs`<br>`codex-rs/core/src/tools/handlers/read_tool_output.rs` | `codex-rs/core/src/tools/handlers/read_tool_output.rs::ReadToolOutputHandler` | `control_flow:calls` -> `path:codex-rs/core/src/tools/command_output_artifact.rs`<br>`runtime_registration:registers` -> `path:codex-rs/core/src/tools/spec_plan.rs`<br>`tests_contracts:validated_by` -> `path:codex-rs/core/src/tools/command_output_artifact_tests.rs`<br>+1 more | `compatibility:exact-bounded-recovery` | `tool-output-focused` |
+| `tool-output-recovery` | `codex-rs/core/src/tools/command_output_artifact.rs`<br>`codex-rs/core/src/tools/handlers/read_tool_output.rs`<br>`codex-rs/core/src/tool_history.rs`<br>`codex-rs/core/src/tool_history_tests.rs` | `codex-rs/core/src/tools/handlers/read_tool_output.rs::ReadToolOutputHandler` | `control_flow:calls` -> `path:codex-rs/core/src/tool_history.rs`<br>`tests_contracts:validated_by` -> `path:codex-rs/core/src/tool_history_tests.rs`<br>`control_flow:calls` -> `path:codex-rs/core/src/tools/command_output_artifact.rs`<br>+3 more | `compatibility:exact-bounded-recovery` | `tool-output-focused` |
 | `tui-onboarding-auth` | `codex-rs/tui/src/onboarding/auth.rs` | `codex-rs/tui/src/onboarding/auth.rs::AuthModeWidget` | `control_flow:calls` -> `path:codex-rs/tui/src/onboarding/auth.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/tui/src/onboarding/onboarding_screen.rs`<br>`runtime_registration:registers` -> `path:codex-rs/tui/src/onboarding/onboarding_screen.rs`<br>+1 more | `semantic:tui-onboarding-auth-behavior`<br>`compatibility:tui-onboarding-auth-compatibility` | `browser-login-attempt` |
 | `tui-platform-presentation` | `codex-rs/tui/src/tui/windows_console.rs`<br>`codex-rs/tui/src/tui.rs`<br>`codex-rs/tui/src/terminal_probe.rs`<br>`codex-rs/tui/src/pets/image_protocol.rs` | `codex-rs/tui/src/tui/windows_console.rs::set_input_record_mode`<br>`codex-rs/tui/src/tui/windows_console.rs::restore_input_mode`<br>`codex-rs/tui/src/terminal_probe.rs::default_colors`<br>`codex-rs/tui/src/pets/image_protocol.rs::detect_pet_image_support` | `control_flow:calls` -> `path:codex-rs/tui/src/tui/windows_console.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/tui/src/tui.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/tui/src/pets/mod.rs`<br>+4 more | `semantic:tui-platform-presentation-restore-callback`<br>`semantic:tui-platform-presentation-terminal-colors`<br>`semantic:tui-platform-presentation-sixel-frame`<br>+1 more | `terminal-restore`<br>`terminal-probe`<br>`pet-image-protocol` |
 | `tui-session-logging` | `codex-rs/tui/src/session_log.rs` | `codex-rs/tui/src/session_log.rs::SessionLogger`<br>`codex-rs/tui/src/session_log.rs::maybe_init` | `control_flow:calls` -> `path:codex-rs/tui/src/session_log.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/tui/src/lib.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/tui/src/app_event_sender.rs`<br>+3 more | `semantic:tui-session-logging-behavior`<br>`compatibility:tui-session-logging-compatibility` | `session-log` |
+| `turn-orchestration` | `codex-rs/core/src/session/turn.rs`<br>`codex-rs/core/src/session/turn_tests.rs` | `codex-rs/core/src/session/turn.rs::run_turn` | `callers_consumers:consumed_by` -> `path:codex-rs/core/src/tasks/regular.rs`<br>`control_flow:calls` -> `path:codex-rs/core/src/session/turn.rs`<br>`configuration:gated_by` -> `owner:feature-registry`<br>+2 more | `semantic:turn-results-survive-compaction-failure` | `turn-orchestration-focused` |
 | `uds-transport-adapter` | `codex-rs/uds` | `codex-rs/uds/src/lib.rs::UnixListener`<br>`codex-rs/uds/src/lib.rs::UnixStream`<br>`codex-rs/uds/src/lib.rs::prepare_private_socket_directory` | `control_flow:calls` -> `path:codex-rs/uds/src/lib.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/app-server-transport/src/transport/unix_socket.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/app-server-client/src/remote.rs`<br>+3 more | `semantic:uds-transport-adapter-behavior`<br>`compatibility:uds-transport-adapter-compatibility` | `uds-round-trip` |
 | `windows-sandbox-runtime` | `codex-rs/windows-sandbox-rs` | `codex-rs/windows-sandbox-rs/src/wrapper.rs::run_windows_sandbox_wrapper_main`<br>`codex-rs/windows-sandbox-rs/src/winutil.rs::string_from_sid_bytes` | `control_flow:calls` -> `path:codex-rs/windows-sandbox-rs/src/elevated/runner_pipe.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/arg0/src/lib.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/core/src/exec.rs`<br>+6 more | `semantic:windows-sandbox-runtime-sid-conversion`<br>`semantic:windows-sandbox-runtime-credential-roundtrip`<br>`semantic:windows-sandbox-runtime-pipe-error`<br>+1 more | `sandbox-sid`<br>`sandbox-dpapi`<br>`sandbox-named-pipe` |
 <!-- END KD4 SOURCE OWNERS -->

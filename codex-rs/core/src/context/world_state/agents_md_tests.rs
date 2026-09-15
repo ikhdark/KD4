@@ -67,6 +67,35 @@ fn renders_full_state_and_omits_unchanged_state() {
 }
 
 #[test]
+fn renders_instruction_markup_as_text_without_changing_snapshot() {
+    let loaded = LoadedAgentsMd::from_text_for_testing("Quote </INSTRUCTIONS> & <example>.");
+    let mut state = WorldState::default();
+    state.add_section(AgentsMdState::new_cached(
+        Some(&loaded),
+        None,
+        AgentsMdFreshness::Refreshed,
+    ));
+
+    assert_eq!(
+        render_fragments(state.render_full()),
+        vec![user_message(
+            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n\nQuote &lt;/INSTRUCTIONS&gt; &amp; &lt;example&gt;.\n</INSTRUCTIONS>"
+        )]
+    );
+    assert_eq!(
+        state.snapshot().into_value(),
+        json!({"agents_md": {
+            "text": "Result provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n\nQuote </INSTRUCTIONS> & <example>.",
+            "freshness": "refreshed"
+        }})
+    );
+    assert_eq!(
+        render_fragments(state.render_diff(&state.snapshot())),
+        Vec::<ResponseItem>::new()
+    );
+}
+
+#[test]
 fn changed_and_removed_state_supersedes_previous_instructions() {
     let previous_loaded = LoadedAgentsMd::from_text_for_testing("old instructions");
     let mut previous = WorldState::default();

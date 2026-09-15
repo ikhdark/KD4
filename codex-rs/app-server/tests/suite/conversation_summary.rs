@@ -201,7 +201,7 @@ async fn get_conversation_summary_reads_configured_in_memory_store() -> Result<(
     assert_eq!(summary.conversation_id, thread_id);
     assert_eq!(summary.path, PathBuf::new());
     assert_eq!(summary.cwd, PathBuf::new());
-    assert_eq!(summary.model_provider, "test");
+    assert_eq!(summary.model_provider, "test-provider");
 
     let rollout_path = codex_home.path().join("in-memory-rollout.jsonl");
     store

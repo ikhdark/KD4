@@ -13,6 +13,17 @@ pub enum ShellType {
 }
 
 impl ShellType {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "zsh" => Some(Self::Zsh),
+            "bash" => Some(Self::Bash),
+            "sh" => Some(Self::Sh),
+            "cmd" => Some(Self::Cmd),
+            "pwsh" | "powershell" => Some(Self::PowerShell),
+            _ => None,
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::Zsh => "zsh",
@@ -66,18 +77,7 @@ fn shell_basename(path: &std::path::Path) -> Option<String> {
 }
 
 pub fn detect_shell_type(shell_path: impl AsRef<std::path::Path>) -> Option<ShellType> {
-    match shell_basename(shell_path.as_ref())?.as_str() {
-        "zsh" => Some(ShellType::Zsh),
-        "bash" => Some(ShellType::Bash),
-        "sh" => Some(ShellType::Sh),
-        "cmd" => Some(ShellType::Cmd),
-        "pwsh" | "powershell" => Some(ShellType::PowerShell),
-        _ => None,
-    }
-}
-
-fn get_user_shell_path() -> Option<PathBuf> {
-    None
+    ShellType::from_name(&shell_basename(shell_path.as_ref())?)
 }
 
 fn file_exists(path: &std::path::Path) -> Option<PathBuf> {
@@ -89,21 +89,12 @@ fn file_exists(path: &std::path::Path) -> Option<PathBuf> {
 }
 
 fn get_shell_path(
-    shell_type: ShellType,
     provided_path: Option<&PathBuf>,
     binary_name: &str,
     fallback_paths: &[&str],
 ) -> Option<PathBuf> {
     if let Some(path) = provided_path.and_then(|path| file_exists(path)) {
         return Some(path);
-    }
-
-    let default_shell_path = get_user_shell_path();
-    if let Some(default_shell_path) = default_shell_path
-        && detect_shell_type(&default_shell_path) == Some(shell_type)
-        && file_exists(&default_shell_path).is_some()
-    {
-        return Some(default_shell_path);
     }
 
     if let Ok(path) = which::which(binary_name) {
@@ -133,13 +124,6 @@ fn get_powershell_shell(path: Option<&PathBuf>) -> Option<DetectedShell> {
     let shell_path = select_powershell_host(
         || path.and_then(|path| file_exists(path)),
         || find_binary_or_fallback("pwsh", PWSH_FALLBACK_PATHS),
-        || {
-            get_user_shell_path().and_then(|default_shell_path| {
-                (detect_shell_type(&default_shell_path) == Some(ShellType::PowerShell))
-                    .then(|| file_exists(&default_shell_path))
-                    .flatten()
-            })
-        },
         || find_binary_or_fallback("powershell", POWERSHELL_FALLBACK_PATHS),
     );
 
@@ -160,17 +144,13 @@ fn find_binary_or_fallback(binary_name: &str, fallback_paths: &[&str]) -> Option
 fn select_powershell_host(
     provided: impl FnOnce() -> Option<PathBuf>,
     pwsh: impl FnOnce() -> Option<PathBuf>,
-    default_powershell: impl FnOnce() -> Option<PathBuf>,
     windows_powershell: impl FnOnce() -> Option<PathBuf>,
 ) -> Option<PathBuf> {
-    provided()
-        .or_else(pwsh)
-        .or_else(default_powershell)
-        .or_else(windows_powershell)
+    provided().or_else(pwsh).or_else(windows_powershell)
 }
 
 fn get_cmd_shell(path: Option<&PathBuf>) -> Option<DetectedShell> {
-    let shell_path = get_shell_path(ShellType::Cmd, path, "cmd", &[]);
+    let shell_path = get_shell_path(path, "cmd", &[]);
 
     shell_path.map(|shell_path| DetectedShell {
         shell_type: ShellType::Cmd,
@@ -198,10 +178,6 @@ pub fn get_shell(shell_type: ShellType, path: Option<&PathBuf>) -> Option<Detect
 }
 
 pub fn default_user_shell() -> DetectedShell {
-    default_user_shell_from_path(get_user_shell_path())
-}
-
-pub fn default_user_shell_from_path(_user_shell_path: Option<PathBuf>) -> DetectedShell {
     get_shell(ShellType::PowerShell, /*path*/ None).unwrap_or_else(ultimate_fallback_shell)
 }
 
@@ -317,29 +293,18 @@ mod tests {
     #[test]
     fn powershell_resolver_prefers_pwsh_then_compatibility_host() {
         let pwsh = PathBuf::from("C:/Program Files/PowerShell/7/pwsh.exe");
-        let default = PathBuf::from("D:/custom/powershell.exe");
         let compatibility = PathBuf::from("C:/Windows/System32/powershell.exe");
 
         assert_eq!(
             select_powershell_host(
                 || None,
                 || Some(pwsh.clone()),
-                || Some(default.clone()),
                 || Some(compatibility.clone())
             ),
             Some(pwsh)
         );
         assert_eq!(
-            select_powershell_host(
-                || None,
-                || None,
-                || Some(default.clone()),
-                || Some(compatibility.clone())
-            ),
-            Some(default)
-        );
-        assert_eq!(
-            select_powershell_host(|| None, || None, || None, || Some(compatibility.clone())),
+            select_powershell_host(|| None, || None, || Some(compatibility.clone())),
             Some(compatibility)
         );
     }
@@ -350,7 +315,7 @@ mod tests {
         let pwsh = PathBuf::from("C:/Program Files/PowerShell/7/pwsh.exe");
 
         assert_eq!(
-            select_powershell_host(|| Some(provided.clone()), || Some(pwsh), || None, || None),
+            select_powershell_host(|| Some(provided.clone()), || Some(pwsh), || None),
             Some(provided)
         );
         assert_eq!(
@@ -367,7 +332,6 @@ mod tests {
     fn powershell_resolver_stops_probing_after_the_first_available_host() {
         let provided_calls = Cell::new(0);
         let pwsh_calls = Cell::new(0);
-        let default_calls = Cell::new(0);
         let compatibility_calls = Cell::new(0);
         let provided = PathBuf::from("D:/pinned/powershell.exe");
 
@@ -382,10 +346,6 @@ mod tests {
                     Some(PathBuf::from("pwsh.exe"))
                 },
                 || {
-                    default_calls.set(default_calls.get() + 1);
-                    Some(PathBuf::from("default-powershell.exe"))
-                },
-                || {
                     compatibility_calls.set(compatibility_calls.get() + 1);
                     Some(PathBuf::from("powershell.exe"))
                 },
@@ -394,7 +354,6 @@ mod tests {
         );
         assert_eq!(provided_calls.get(), 1);
         assert_eq!(pwsh_calls.get(), 0);
-        assert_eq!(default_calls.get(), 0);
         assert_eq!(compatibility_calls.get(), 0);
 
         assert_eq!(
@@ -405,10 +364,6 @@ mod tests {
                     Some(PathBuf::from("pwsh.exe"))
                 },
                 || {
-                    default_calls.set(default_calls.get() + 1);
-                    None
-                },
-                || {
                     compatibility_calls.set(compatibility_calls.get() + 1);
                     None
                 },
@@ -416,7 +371,6 @@ mod tests {
             Some(PathBuf::from("pwsh.exe"))
         );
         assert_eq!(pwsh_calls.get(), 1);
-        assert_eq!(default_calls.get(), 0);
         assert_eq!(compatibility_calls.get(), 0);
     }
 }

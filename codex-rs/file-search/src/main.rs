@@ -85,6 +85,8 @@ fn run_main(
     let FileSearchResults {
         total_match_count,
         matches,
+        walk_complete,
+        ..
     } = run(
         &pattern_text,
         vec![search_directory],
@@ -104,6 +106,9 @@ fn run_main(
     }
     if total_match_count > match_count {
         reporter.warn_matches_truncated(total_match_count, match_count);
+    }
+    if !walk_complete {
+        reporter.warn_walk_incomplete();
     }
 
     Ok(())
@@ -172,6 +177,16 @@ impl StdioReporter {
             "No search pattern specified. Showing the contents of the current directory ({}):",
             search_directory.to_string_lossy()
         );
+    }
+
+    fn warn_walk_incomplete(&self) {
+        if self.write_output_as_json {
+            println!("{}", json!({"walk_incomplete": true}));
+        } else {
+            eprintln!(
+                "Warning: the directory walk was incomplete; matching files may be missing. Narrow the search directory or check for inaccessible paths."
+            );
+        }
     }
 }
 

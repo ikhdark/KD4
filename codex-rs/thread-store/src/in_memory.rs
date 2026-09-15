@@ -525,7 +525,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::await_holding_invalid_type, reason = "Blocks discard deliberately to verify cancellation retains cleanup ownership")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Blocks discard deliberately to verify cancellation retains cleanup ownership"
+    )]
     async fn cancelled_explicit_discard_keeps_initialization_guard_armed() {
         let store = Arc::new(InMemoryThreadStore::default());
         let live = LiveThread::create(
@@ -1310,15 +1313,12 @@ impl ThreadStore for InMemoryThreadStore {
         })
     }
 
-    fn unarchive_thread(
-        &self,
-        _params: ArchiveThreadParams,
-    ) -> ThreadStoreFuture<'_, StoredThread> {
+    fn unarchive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreFuture<'_, StoredThread> {
         Box::pin(async move {
-            self.state.lock().await.calls.unarchive_thread += 1;
-            Err(ThreadStoreError::Unsupported {
-                operation: "in_memory_unarchive_thread",
-            })
+            let mut state = self.state.lock().await;
+            state.calls.unarchive_thread += 1;
+            // In-memory threads are always active, so unarchive is idempotent.
+            stored_thread_from_state(&state, params.thread_id, false)
         })
     }
 

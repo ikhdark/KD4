@@ -2867,16 +2867,25 @@ mod tests {
     #[test]
     fn key_value_table_keeps_header_links_in_aligned_and_stacked_layouts() {
         let destination = "https://example.com/header";
+        let headers = std::iter::once(format!("[Header]({destination})"))
+            .chain((2..=18).map(|index| format!("c{index}")))
+            .collect::<Vec<_>>();
+        let values = std::iter::once("value".to_string())
+            .chain((2..=18).map(|index| index.to_string()))
+            .collect::<Vec<_>>();
         let markdown = format!(
-            "| [Header]({destination}) | c2 | c3 | c4 | c5 | c6 |\n| --- | --- | --- | --- | --- | --- |\n| value | 2 | 3 | 4 | 5 | 6 |\n"
+            "| {} |\n| {} |\n| {} |\n",
+            headers.join(" | "),
+            vec!["---"; 18].join(" | "),
+            values.join(" | ")
         );
-        for width in [22, 12] {
+        for width in [64, 12] {
             let lines = render_markdown_lines_with_width_and_cwd(&markdown, Some(width), None);
             let header = lines
                 .iter()
                 .find(|line| line.line.to_string().contains("Header"))
                 .unwrap();
-            assert_eq!(header.line.to_string().contains("value"), width == 22);
+            assert_eq!(header.line.to_string().contains("value"), width == 64);
             let labels = lines
                 .iter()
                 .flat_map(|line| {
@@ -2891,7 +2900,7 @@ mod tests {
                     })
                 })
                 .collect::<String>();
-            assert_eq!(labels, "Header", "width {width}");
+            assert_eq!(labels, format!("Header{destination}"), "width {width}");
         }
     }
 

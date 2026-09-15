@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 
 class Incorrect(Exception):
@@ -25,7 +26,7 @@ def require(condition, message):
         raise Incorrect(message)
 
 
-def run(argv, cwd, expect_failure=False):
+def run(argv, cwd, expect_failure=False, test_kind=None, expected_names=(), completion=None):
     remaining = 115 - (time.monotonic() - START)
     if remaining <= 0:
         raise subprocess.TimeoutExpired(argv, 115)
@@ -44,15 +45,74 @@ def run(argv, cwd, expect_failure=False):
     result = subprocess.CompletedProcess(argv, child.returncode, stdout, stderr)
     print(json.dumps({"command": argv, "cwd": str(cwd), "returncode": result.returncode,
                       "stdout": result.stdout, "stderr": result.stderr}), flush=True)
-    if expect_failure:
-        # Reject compilation/import/infrastructure failures: a working assertion must fail.
-        combined = result.stdout + result.stderr
-        require(result.returncode != 0 and any(marker in combined for marker in (
-            "assertion `left == right` failed", "assertion failed:", "AssertionError", "ERR_ASSERTION")),
-            "model tests did not reject a plausible wrong implementation through an assertion")
+    if completion is not None:
+        require(completion in result.stdout.splitlines(), 'protected oracle did not complete its checks')
+    if test_kind is not None:
+        check_test_completion(result, test_kind, expected_names, bool(expect_failure))
     else:
         require(result.returncode == 0, "task behavior or focused tests failed: " + " ".join(argv))
     return result
+
+
+def check_test_completion(result, kind, expected_names, failing):
+    output = result.stdout + result.stderr
+    if kind == 'rust':
+        started = re.findall(r'^running (\d+) tests?$', result.stdout, re.MULTILINE)
+        summaries = re.findall(r'^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; '
+                               r'(\d+) measured; (\d+) filtered out;', result.stdout, re.MULTILINE)
+        outcomes = re.findall(r'^test (.+?)(?: - should panic)? \.\.\. (ok|FAILED)$', result.stdout, re.MULTILINE)
+        complete = len(started) == 1 and len(summaries) == 1
+        if complete:
+            status, passed, failed, ignored, measured, filtered = summaries[0]
+            passed, failed = int(passed), int(failed)
+            complete = (int(started[0]) == passed + failed and int(ignored) == 0
+                        and int(measured) == 0 and int(filtered) == 0
+                        and len(outcomes) == passed + failed
+                        and sum(state == 'FAILED' for _, state in outcomes) == failed
+                        and status == ('FAILED' if failing else 'ok'))
+    elif kind == 'node':
+        counts = {name: int(value) for name, value in re.findall(
+            r'^# (tests|suites|pass|fail|cancelled|skipped|todo) (\d+)$', result.stdout, re.MULTILINE)}
+        outcomes = re.findall(r'^\s*(?:not )?ok \d+ - (.+)$', result.stdout, re.MULTILINE)
+        # TAP emits an outcome for each suite as well as each leaf test, while
+        # Node's tests/pass/fail counters describe only the leaves.
+        complete = (set(counts) == {'tests', 'suites', 'pass', 'fail', 'cancelled', 'skipped', 'todo'}
+                    and counts['tests'] == counts['pass'] + counts['fail']
+                    and counts['tests'] + counts['suites'] == len(outcomes)
+                    and counts['cancelled'] == counts['skipped'] == counts['todo'] == 0
+                    and not re.search(r'^\s+exitCode:', result.stdout, re.MULTILINE))
+        passed, failed = counts.get('pass', 0), counts.get('fail', 0)
+        outcomes = [(name, '') for name in outcomes]
+    else:
+        summaries = re.findall(r'^Ran (\d+) tests? in .+$', output, re.MULTILINE)
+        outcomes = re.findall(r'^(test\w+) \(.*?\).*? \.\.\. (ok|FAIL|ERROR)$', output, re.MULTILINE)
+        terminal = re.search(r'^(OK|FAILED \(.*?\))$', output, re.MULTILINE)
+        failed = sum(state in ('FAIL', 'ERROR') for _, state in outcomes)
+        passed = len(outcomes) - failed
+        complete = (len(summaries) == 1 and int(summaries[0]) == len(outcomes)
+                    and terminal is not None and terminal.group(1).startswith('FAILED' if failing else 'OK'))
+    complete = (complete and passed + failed > 0
+                and set(expected_names) <= {name.split('::')[-1] if kind == 'rust' else name for name, _ in outcomes})
+    require(complete and (failed > 0 if failing else failed == 0)
+            and (result.returncode != 0 if failing else result.returncode == 0),
+            'model tests did not reject a plausible wrong implementation in a completed '
+            + kind + ' test run' if failing else 'required ' + kind + ' tests did not complete successfully')
+
+
+def task_tests(root, kind, failing=False):
+    if kind == 'rust':
+        names = set(re.findall(r'#\[test\]\s*(?:#\[[^\]]+\]\s*)*fn\s+(\w+)',
+                               (root / 'tests/regression.rs').read_text(encoding='utf-8')))
+        return run(['cargo', 'test', '--offline', '--locked', '--jobs', '6', '--test', 'regression',
+                    '--', '--format', 'pretty', '--color', 'never', '--test-threads=1'], root,
+                   expect_failure=failing, test_kind=kind, expected_names=names)
+    if kind == 'node':
+        names = original_test_names('typescript_feature', (root / 'tests/regression.test.ts').read_text(encoding='utf-8'))
+        return run(['node', '--experimental-strip-types', '--test', '--test-reporter=tap', 'tests/regression.test.ts'],
+                   root, expect_failure=failing, test_kind=kind, expected_names=names)
+    names = original_test_names('kd4_python_refactor', (root / 'test_repo_benchmark_refactor.py').read_text(encoding='utf-8'))
+    return run(['python', '-m', 'unittest', '-v', 'test_repo_benchmark_refactor'], root,
+               expect_failure=failing, test_kind='python', expected_names=names)
 
 
 RUST_CASES = r'''
@@ -70,6 +130,43 @@ RUST_CASES = r'''
         "18446744073709552s", "18446744073709551s616ms"] {
         assert!(candidate::parse_duration(input).is_err(), "accepted {input}");
     }
+}
+'''
+
+# Classify syntactically valid overflowing durations independently of candidate errors.
+RUST_OVERFLOW_CLASSIFIER = r'''
+fn benchmark_duration_overflows(text: &str) -> bool {
+    let bytes = text.as_bytes(); let mut i = 0; let mut total = 0u128;
+    let mut rank = 4; let mut matched = false;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+        if i == bytes.len() { break; }
+        let start = i; let mut value = 0u128;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            value = value.saturating_mul(10).saturating_add((bytes[i] - b'0') as u128); i += 1;
+        }
+        if i == start { return false; }
+        let (next, scale, size) = if bytes[i..].starts_with(b"ms") { (0, 1, 2) } else {
+            match bytes.get(i) { Some(b's') => (1, 1000, 1), Some(b'm') => (2, 60000, 1),
+                Some(b'h') => (3, 3600000, 1), _ => return false }
+        };
+        if next >= rank { return false; }
+        total = total.saturating_add(value.saturating_mul(scale));
+        rank = next; i += size; matched = true;
+    }
+    matched && total > u64::MAX as u128
+}
+'''
+
+TS_OVERFLOW_CLASSIFIER = r'''
+function benchmarkOverflows(text: string): boolean {
+    let total = 0n;
+    for (const line of text.split(/\r?\n/).filter(line => line.trim())) {
+        const fields = line.split(',');
+        if (fields.length !== 2 || !fields[0].trim() || !/^[0-9]+$/.test(fields[1].trim())) return false;
+        total += BigInt(fields[1].trim());
+    }
+    return total > 9007199254740991n;
 }
 '''
 
@@ -95,8 +192,9 @@ def rust_verify(root, protected):
     oracle.write_text(RUST_CASES.replace('__SOURCE__', json.dumps(str(root / 'src/lib.rs'))), encoding='utf-8')
     executable = protected / ('oracle.exe' if os.name == 'nt' else 'oracle')
     run(['rustc', '--edition=2021', '--test', str(oracle), '-o', str(executable)], protected)
-    run([str(executable)], protected)
-    run(['cargo', 'test', '--offline', '--locked', '--jobs', '6', '--test', 'regression'], root)
+    run([str(executable), "--format", "pretty", "--test-threads=1"], protected, test_kind="rust",
+        expected_names=("expected_durations", "rejects_invalid_durations"))
+    task_tests(root, 'rust')
     # Use the unchanged original defective implementation to test the submitted regression tests.
     scratch = Path(tempfile.mkdtemp(prefix='mutation-', dir=protected))
     for name in ('Cargo.toml', 'Cargo.lock'):
@@ -106,25 +204,78 @@ def rust_verify(root, protected):
     (scratch / 'src/lib.rs').write_text('pub fn parse_duration(text: &str) -> Result<u64,String> {\n'
         'for (unit,scale) in [("ms",1),("s",1000),("m",60000),("h",3600000)] { '
         'if let Some(v)=text.trim().strip_suffix(unit) { return v.parse::<u64>().ok().and_then(|v| v.checked_mul(scale)).ok_or("invalid".into()); }} Err("invalid".into()) }', encoding='utf-8')
-    run(['cargo', 'test', '--offline', '--locked', '--jobs', '6', '--test', 'regression'], scratch, expect_failure=True)
+    compiled = run(['cargo', 'test', '--offline', '--locked', '--jobs', '6', '--test', 'regression',
+                    '--no-run', '--message-format=json'], scratch)
+    artifacts = [json.loads(line) for line in compiled.stdout.splitlines() if line.strip()]
+    executables = [artifact['executable'] for artifact in artifacts
+                   if artifact.get('reason') == 'compiler-artifact'
+                   and artifact.get('target', {}).get('name') == 'regression'
+                   and artifact.get('profile', {}).get('test')
+                   and artifact.get('executable')]
+    require(len(executables) == 1, 'mutation build did not identify one Rust regression test executable')
+    run([executables[0], '--format', 'pretty', '--color', 'never', '--test-threads=1'],
+        scratch, expect_failure=True, test_kind='rust')
+    submitted = (root / 'src/lib.rs').read_text(encoding='utf-8')
+    for category, condition in [
+        ('invalid-input', '!benchmark_duration_overflows(text)'),
+        ('overflow', 'benchmark_duration_overflows(text)'),
+    ]:
+        wrapper = ('mod submitted {\n' + submitted + '\n}\npub use submitted::*;\n'
+                   'pub fn parse_duration(text: &str) -> Result<u64,String> { '
+                   'let result = submitted::parse_duration(text); '
+                   f'if result.is_err() && ({condition}) {{ Ok(0) }} else {{ result }} }}\n')
+        (scratch / 'src/lib.rs').write_text(wrapper + RUST_OVERFLOW_CLASSIFIER, encoding='utf-8')
+        print('Regression coverage: ' + category, flush=True)
+        task_tests(scratch, 'rust', failing=True)
+
+
+
+def source_file_uri(path):
+    # Rust canonical paths use the Windows verbatim prefix. Python versions
+    # differ in as_uri handling of it; it is not a file-URL authority.
+    text = str(path)
+    if text.startswith('\\\\?\\UNC\\'):
+        text = '\\\\' + text[8:]
+    elif text.startswith('\\\\?\\'):
+        text = text[4:]
+    return Path(text).as_uri()
 
 
 def typescript_verify(root, protected):
     oracle = protected / 'oracle.mjs'
-    oracle.write_text(TS_ORACLE.replace('__PARSER__', json.dumps((root / 'src/parser.ts').as_uri()))
-                      .replace('__REPORT__', json.dumps((root / 'src/report.ts').as_uri())), encoding='utf-8')
-    run(['node', '--experimental-strip-types', str(oracle)], protected)
-    run(['node', '--experimental-strip-types', '--test', 'tests/regression.test.ts'], root)
+    oracle.write_text(TS_ORACLE.replace('__PARSER__', json.dumps(source_file_uri(root / 'src/parser.ts')))
+                      .replace('__REPORT__', json.dumps(source_file_uri(root / 'src/report.ts'))), encoding='utf-8')
+    completion = uuid.uuid4().hex
+    with oracle.open('a', encoding='utf-8') as stream:
+        stream.write('\nconsole.log(' + json.dumps(completion) + ');\n')
+    run(['node', '--experimental-strip-types', str(oracle)], protected, completion=completion)
+    task_tests(root, 'node')
     scratch = Path(tempfile.mkdtemp(prefix='mutation-', dir=protected))
     shutil.copy2(root / 'package.json', scratch / 'package.json')
     shutil.copytree(root / 'src', scratch / 'src')
     shutil.copytree(root / 'tests', scratch / 'tests')
     (scratch / 'src/report.ts').write_text("import { parseRows } from './parser.ts';\n"
         "export function renderReport(text: string): string { const rows=parseRows(text); return [...rows.map(r=>`${r.name}: ${r.quantity}`), `TOTAL: ${rows.reduce((s,r)=>s+r.quantity,0)}`].join('\\n'); }\n", encoding='utf-8')
-    run(['node', '--experimental-strip-types', '--test', 'tests/regression.test.ts'], scratch, expect_failure=True)
+    task_tests(scratch, 'node', failing=True)
+    variants = [
+        ('parsing', 'parser', "export function parseRows(text: string) { return original.parseRows(text).map(row => ({...row, name: text !== text.trim() ? ' '+row.name+' ' : row.name})); }"),
+        ('ordering', 'report', "export function renderReport(text: string) { const lines=original.renderReport(text).split('\\n'); const total=lines.pop(); return [...lines.reverse(), total].join('\\n'); }"),
+        ('malformed', 'parser', "export function parseRows(text: string) { try { return original.parseRows(text); } catch(error) { if(benchmarkOverflows(text)) throw error; return []; } }"),
+        ('overflow', 'report', "export function renderReport(text: string) { try { return original.renderReport(text); } catch(error) { if(benchmarkOverflows(text)) return 'TOTAL: 0'; throw error; } }"),
+    ]
+    for category, module, wrapper in variants:
+        shutil.rmtree(scratch / 'src')
+        shutil.copytree(root / 'src', scratch / 'src')
+        source = scratch / 'src' / (module + '.ts')
+        source.rename(scratch / 'src' / (module + '_submitted.ts'))
+        source.write_text(f"import * as original from './{module}_submitted.ts';\n"
+                          f"export * from './{module}_submitted.ts';\n" + wrapper + TS_OVERFLOW_CLASSIFIER, encoding='utf-8')
+        print('Regression coverage: ' + category, flush=True)
+        task_tests(scratch, 'node', failing=True)
 
 
-def python_verify(root, protected):
+
+def python_oracle(root):
     source = root / 'scripts/readme_toc.py'
     spec = importlib.util.spec_from_file_location('benchmark_readme_toc', source)
     module = importlib.util.module_from_spec(spec)
@@ -155,14 +306,31 @@ def python_verify(root, protected):
     require(module.generate_toc_lines(['### Child']) == ['sentinel'] and calls == [(3, 'Child', 'child')],
             'generate_toc_lines does not use the extracted helper')
     module.format_toc_entry = original
-    run(['python', '-m', 'unittest', '-q', 'test_repo_benchmark_refactor'], root)
+
+
+def python_verify(root, protected):
+    completion = uuid.uuid4().hex
+    run([sys.executable, str(Path(__file__).resolve()), '--python-oracle', str(root), completion],
+        protected, completion=completion)
+    source = root / 'scripts/readme_toc.py'
+    task_tests(root, 'python')
     scratch = Path(tempfile.mkdtemp(prefix='mutation-', dir=protected))
     (scratch / 'scripts').mkdir(parents=True, exist_ok=False)
     shutil.copy2(source, scratch / 'scripts/readme_toc.py')
     shutil.copy2(root / 'test_repo_benchmark_refactor.py', scratch / 'test_repo_benchmark_refactor.py')
-    with (scratch / 'scripts/readme_toc.py').open('a', encoding='utf-8') as stream:
-        stream.write('\ndef format_toc_entry(level, text, slug):\n    return f"- [{text}](#{slug})"\n')
-    run(['python', '-m', 'unittest', '-q', 'test_repo_benchmark_refactor'], scratch, expect_failure=True)
+    mutations = [
+        ('indentation', "def format_toc_entry(level, text, slug):\n    label = text.replace(chr(92),chr(92)*2).replace('[',chr(92)+'[').replace(']',chr(92)+']')\n    return f'- [{label}](#{slug})'\n"),
+        ('escaping', "def format_toc_entry(level, text, slug):\n    return '  '*(level-2) + f'- [{text}](#{slug})'\n"),
+        ('repeated-headings', "def disambiguate_slug(slug, used_slugs):\n    return slug\n"),
+        ('fenced-code', "def advance_code_fence(line, code_fence):\n    return None, False\n"),
+    ]
+    submitted = source.read_text(encoding='utf-8')
+    for category, mutation in mutations:
+        shutil.rmtree(scratch / 'scripts/__pycache__', ignore_errors=True)
+        (scratch / 'scripts/readme_toc.py').write_text(submitted + '\n' + mutation, encoding='utf-8')
+        print('Regression coverage: ' + category, flush=True)
+        task_tests(scratch, 'python', failing=True)
+
 
 
 def workspace_hashes(root):
@@ -210,12 +378,12 @@ def verify_original_tests(fixture, root, protected):
     if task == 'rust_bugfix':
         for name in ('Cargo.toml', 'Cargo.lock'):
             shutil.copy2(root / name, scratch / name)
-        run(['cargo', 'test', '--offline', '--locked', '--jobs', '6', '--test', 'regression'], scratch)
+        task_tests(scratch, 'rust')
     elif task == 'typescript_feature':
         shutil.copy2(root / 'package.json', scratch / 'package.json')
-        run(['node', '--experimental-strip-types', '--test', 'tests/regression.test.ts'], scratch)
+        task_tests(scratch, 'node')
     else:
-        run(['python', '-m', 'unittest', '-q', 'test_repo_benchmark_refactor'], scratch)
+        task_tests(scratch, 'python')
 
 
 def main():
@@ -227,7 +395,9 @@ def main():
     current_workspace = workspace_hashes(root)
     unexpected = sorted(name for name in set(initial_workspace) | set(current_workspace)
                         if name not in allowed and initial_workspace.get(name) != current_workspace.get(name))
-    require(not unexpected, f'files changed outside permitted task scope: {unexpected}')
+    if unexpected:
+        print(f'files changed outside permitted task scope: {unexpected}', flush=True)
+        sys.exit(4)
     source_changed = []
     for name, initial in fixture['initial_source_hashes'].items():
         path = root / name
@@ -248,7 +418,11 @@ def main():
 
 if __name__ == '__main__':
     try:
-        main()
+        if len(sys.argv) > 1 and sys.argv[1] == '--python-oracle':
+            python_oracle(Path(sys.argv[2]))
+            print(sys.argv[3], flush=True)
+        else:
+            main()
     except Incorrect as error:
         print(str(error), flush=True)
         sys.exit(1)

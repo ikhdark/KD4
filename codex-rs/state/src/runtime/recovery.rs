@@ -195,6 +195,15 @@ async fn backup_sqlite_paths(
                 return Ok(None);
             }
             let backup_path = backup_dir.join(file_name(path.as_path())?);
+            if tokio::fs::try_exists(&backup_path).await? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "backup destination already exists: {}",
+                        backup_path.display()
+                    ),
+                ));
+            }
             tokio::fs::rename(path.as_path(), backup_path.as_path()).await?;
             Ok(Some(RuntimeDbBackup {
                 original_path: path,

@@ -267,3 +267,169 @@ fn native_deadline_preserves_pending_tool_evidence_without_fabricating_completio
     assert_eq!(saved["status"], "timeout");
     assert_eq!(saved["completedTurns"], 0);
 }
+
+#[test]
+#[cfg(windows)]
+fn delayed_native_interrupt_is_observed_before_the_next_tool_turn_completes() {
+    let temp = tempfile::tempdir().unwrap();
+    let request = peer_request(temp.path(), "unused");
+    fs::create_dir(&request.evidence_dir).unwrap();
+    fs::write(temp.path().join("peer.ps1"), r#"
+function Send($value) { [Console]::WriteLine(($value | ConvertTo-Json -Depth 30 -Compress)) }
+$turn = 0
+$interrupted = $false
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+    $request = $line | ConvertFrom-Json
+    switch ($request.method) {
+        'turn/start' {
+            $turn++
+            $id = "turn-$turn"
+            Send @{method='item/started';params=@{threadId='thread-1';turnId=$id;item=@{id="tool-$turn";type='commandExecution'}}}
+            Send @{id=$request.id;result=@{turn=@{id=$id}}}
+            if ($turn -eq 1) {
+                Start-Sleep -Milliseconds 500
+                [System.IO.File]::WriteAllText((Join-Path $PSScriptRoot 'running-checkpoint.txt'), 'running')
+            }
+            if ($turn -gt 1) {
+                if (-not $interrupted) { Send @{method='turn/completed';params=@{threadId='thread-1';turn=@{id=$id;status='failed'}}}; continue }
+                [System.IO.File]::WriteAllText((Join-Path $PSScriptRoot 'next-tool.txt'), 'executed after interruption')
+                Send @{method='item/completed';params=@{threadId='thread-1';turnId=$id;item=@{id="tool-$turn";type='commandExecution';status='completed'}}}
+                Send @{method='turn/completed';params=@{threadId='thread-1';turn=@{id=$id;status='completed'}}}
+            }
+        }
+        'turn/interrupt' {
+            Start-Sleep -Milliseconds 500
+            if ($request.params.turnId -ne 'turn-1') { Send @{id=$request.id;error=@{code=-1;message='wrong turn interrupted'}}; continue }
+            $interrupted = $true
+            Send @{id=$request.id;result=@{}}
+            Send @{method='turn/completed';params=@{threadId='thread-1';turn=@{id='turn-1';status='interrupted'}}}
+        }
+    }
+}
+"#).unwrap();
+    let started = Instant::now();
+    let mut client =
+        client::NativeClient::spawn(&request, &[], started, started + Duration::from_secs(10), 0)
+            .unwrap();
+    let first = client
+        .rpc("turn/start", json!({"threadId":"thread-1"}))
+        .unwrap();
+    assert_eq!(first["turn"]["id"], "turn-1");
+    let mut checkpoint = || {
+        Ok(temp
+            .path()
+            .join("running-checkpoint.txt")
+            .is_file()
+            .then(|| json!({"runningCheckpoint":"running-checkpoint.txt"})))
+    };
+    let terminal = client
+        .finish_turn("thread-1", "turn-1", Some(&mut checkpoint))
+        .unwrap();
+    assert_eq!(terminal.status, "interrupted");
+    assert_eq!(terminal.tool_executions, 0);
+    assert!(!temp.path().join("next-tool.txt").exists());
+    let second = client
+        .rpc("turn/start", json!({"threadId":"thread-1"}))
+        .unwrap();
+    assert_eq!(second["turn"]["id"], "turn-2");
+    let terminal = client.finish_turn("thread-1", "turn-2", None).unwrap();
+    assert_eq!(terminal.status, "completed");
+    assert_eq!(terminal.tool_executions, 1);
+    assert_eq!(
+        fs::read_to_string(temp.path().join("next-tool.txt")).unwrap(),
+        "executed after interruption"
+    );
+    client.stop().unwrap();
+    let terminals = client
+        .events
+        .iter()
+        .filter(|event| event["message"]["method"] == "turn/completed")
+        .map(|event| {
+            event["message"]["params"]["turn"]["status"]
+                .as_str()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminals, vec!["interrupted", "completed"]);
+    let writes: Vec<Value> =
+        fs::read_to_string(request.evidence_dir.join("app-server-0.requests.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    let first_sent = writes
+        .iter()
+        .find(|event| event["message"]["method"] == "turn/start")
+        .unwrap()["elapsedMs"]
+        .as_u64()
+        .unwrap();
+    let interrupted_at = writes
+        .iter()
+        .find(|event| event["message"]["method"] == "turn/interrupt")
+        .unwrap()["elapsedMs"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        interrupted_at >= first_sent + 500,
+        "outer item/started alone must not trigger interruption"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn native_deadline_terminates_a_peer_that_stops_reading_large_requests() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut request = peer_request(temp.path(), "completed");
+    let path = temp.path().join("peer.ps1");
+    let original = fs::read_to_string(&path).unwrap();
+    let target = "'thread/start' { Send @{id=$request.id;result=@{thread=@{id='thread-1'}}} }";
+    assert_eq!(
+        original.matches(target).count(),
+        1,
+        "fixture must suspend its only thread/start handler"
+    );
+    let source = original.replace(
+        target,
+        "'thread/start' { Send @{id=$request.id;result=@{thread=@{id='thread-1'}}}; Start-Sleep -Seconds 30 }",
+    );
+    fs::write(path, source).unwrap();
+    request.prompt = "large history record ".repeat(512 * 1024);
+    request.timeout_ms = 3000;
+    let started = Instant::now();
+    let evidence = run_attempt(&request);
+    assert_eq!(evidence.status, "timeout", "{:?}", evidence.failure);
+    assert_eq!(evidence.failure.as_ref().unwrap().kind, "attempt_timeout");
+    assert_eq!(
+        evidence.thread_id.as_deref(),
+        Some("thread-1"),
+        "peer completed initialization before ceasing to read"
+    );
+    assert_eq!(evidence.completed_turns, 0);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "stdin backpressure must not escape the attempt ceiling"
+    );
+    assert!(
+        !evidence
+            .events
+            .iter()
+            .any(|event| event["message"]["method"] == "item/started")
+    );
+    let writes: Vec<Value> =
+        fs::read_to_string(request.evidence_dir.join("app-server-0.requests.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    let sent = writes
+        .iter()
+        .find(|event| event["message"]["method"] == "turn/start")
+        .unwrap();
+    assert_eq!(
+        sent["message"]["params"]["input"][0]["text"]
+            .as_str()
+            .unwrap()
+            .len(),
+        request.prompt.len()
+    );
+}

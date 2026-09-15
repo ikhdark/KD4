@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 const MAX_CONTEXT_BYTES: usize = 64 * 1024;
 const MAX_TOTAL_CONTEXT_BYTES: usize = 128 * 1024;
+const MAX_OMISSION_BYTES: usize = 4 * 1024;
 const MAX_SELECTED_PATHS: usize = 16;
 const MAX_PATH_CANDIDATES: usize = 256;
 const CONTEXT_OMISSION: &str = "\n<context_omission recovery=\"read the original local path; additional content or instructions omitted\">\n";
@@ -76,15 +77,27 @@ fn collect_with_discovery(
     let mut candidates = HashSet::new();
     let mut instructions_seen = HashSet::new();
     let mut contexts: Vec<(PathBuf, String)> = Vec::new();
-    let mut remaining = MAX_TOTAL_CONTEXT_BYTES;
-    for token in path_tokens(text).into_iter().take(MAX_PATH_CANDIDATES) {
-        if contexts.len() == MAX_SELECTED_PATHS || remaining < 1024 {
+    // Keep recovery information inside both the submission and per-path budgets.
+    let mut remaining = MAX_TOTAL_CONTEXT_BYTES - MAX_OMISSION_BYTES;
+    let tokens = path_tokens(text);
+    for (index, token) in tokens.iter().enumerate() {
+        if contexts.len() == MAX_SELECTED_PATHS || remaining < 1024 || index == MAX_PATH_CANDIDATES
+        {
             if let Some((_, content)) = contexts.last_mut() {
-                content.push_str(CONTEXT_OMISSION);
+                let omitted = serde_json::to_string(&tokens[index..]).expect("path strings");
+                content.push_str(&truncate_context(
+                    format!(
+                        "\n<context_omission>\nLocal path candidates not collected: {omitted}\n\
+                         Read these paths directly. If this list is truncated or the candidate \
+                         limit was reached, inspect the original user message for remaining paths.\n\
+                         </context_omission>\n"
+                    ),
+                    MAX_OMISSION_BYTES,
+                ));
             }
             break;
         }
-        let path = PathBuf::from(&token);
+        let path = PathBuf::from(token);
         let path = if path.is_absolute() {
             path
         } else {
@@ -93,10 +106,22 @@ fn collect_with_discovery(
         if !candidates.insert(path.clone()) {
             continue;
         }
-        let Ok(metadata) = fs::symlink_metadata(&path) else {
-            continue;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let content = truncate_context(
+                    format!("<local_path_unavailable: {error}>\n"),
+                    remaining.min(MAX_OMISSION_BYTES),
+                );
+                remaining = remaining.saturating_sub(content.len());
+                contexts.push((path, content));
+                continue;
+            }
         };
         if metadata.file_type().is_symlink() || !(metadata.is_file() || metadata.is_dir()) {
+            let content = "<local_path_omission: symbolic links and special files are not included automatically; inspect the original path explicitly>\n".to_string();
+            remaining = remaining.saturating_sub(content.len());
+            contexts.push((path, content));
             continue;
         }
         let identity = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
@@ -108,14 +133,14 @@ fn collect_with_discovery(
                 &identity,
                 &discovery,
                 &mut instructions_seen,
-                remaining.min(MAX_CONTEXT_BYTES),
+                remaining.min(MAX_CONTEXT_BYTES - MAX_OMISSION_BYTES),
             )
         } else {
             render_file_selection(
                 &identity,
                 &discovery,
                 &mut instructions_seen,
-                remaining.min(MAX_CONTEXT_BYTES),
+                remaining.min(MAX_CONTEXT_BYTES - MAX_OMISSION_BYTES),
             )
         };
         remaining = remaining.saturating_sub(content.len() + CONTEXT_OMISSION.len());
@@ -219,11 +244,16 @@ fn push_token(tokens: &mut Vec<String>, current: &mut String, was_quoted: bool) 
         && !matches!(token, "." | ".." | "/" | "\\")
         && !token.contains("://")
         && (was_quoted
+            || !token.strip_prefix('/').is_some_and(|name| {
+                name.parse::<crate::slash_command::SlashCommand>().is_ok()
+            }))
+        && (was_quoted
             || token.contains(['/', '\\'])
             || Path::new(token)
                 .extension()
                 .is_some_and(|extension| !extension.is_empty()))
-        && tokens.len() < MAX_PATH_CANDIDATES
+        // One lookahead lets collection report that the candidate budget was hit.
+        && tokens.len() <= MAX_PATH_CANDIDATES
     {
         tokens.push(token.to_string());
     }
@@ -550,6 +580,121 @@ mod tests {
         );
         assert_eq!(contexts.len(), 1);
         assert!(contexts[0].1.contains("selected contents"));
+    }
+
+    #[test]
+    fn selection_limit_names_uncollected_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let names = (0..20)
+            .map(|index| format!("file{index}.rs"))
+            .collect::<Vec<_>>();
+        for name in &names {
+            fs::write(temp.path().join(name), "selected contents").expect("write");
+        }
+        let contexts = collect_with_discovery(
+            &names.join(" "),
+            temp.path(),
+            &default_discovery(temp.path()),
+        );
+        assert_eq!(contexts.len(), MAX_SELECTED_PATHS);
+        let last = &contexts.last().expect("context").1;
+        for name in &names[16..] {
+            assert!(last.contains(name), "missing recovery path: {name}");
+        }
+        assert!(
+            contexts
+                .iter()
+                .all(|(_, body)| body.len() <= MAX_CONTEXT_BYTES)
+        );
+        assert!(
+            contexts.iter().map(|(_, body)| body.len()).sum::<usize>() <= MAX_TOTAL_CONTEXT_BYTES
+        );
+    }
+
+    #[test]
+    fn submission_byte_limit_names_remaining_paths_within_budget() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let names = (0..12)
+            .map(|index| format!("file{index}.rs"))
+            .collect::<Vec<_>>();
+        for name in &names {
+            fs::write(temp.path().join(name), "x".repeat(MAX_FILE_BYTES)).expect("write");
+        }
+        let contexts = collect_with_discovery(
+            &names.join(" "),
+            temp.path(),
+            &default_discovery(temp.path()),
+        );
+        assert!(!contexts.is_empty());
+        assert!(contexts.len() < names.len());
+        let last = &contexts.last().expect("context").1;
+        for name in &names[contexts.len()..] {
+            assert!(last.contains(name), "missing recovery path: {name}");
+        }
+        assert!(
+            contexts
+                .iter()
+                .all(|(_, body)| body.len() <= MAX_CONTEXT_BYTES)
+        );
+        assert!(
+            contexts.iter().map(|(_, body)| body.len()).sum::<usize>() <= MAX_TOTAL_CONTEXT_BYTES
+        );
+    }
+
+    #[test]
+    fn candidate_limit_names_first_unexamined_path_and_reports_remaining_message() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("selected.rs"), "SELECTED_CONTENT").expect("write");
+        let mut names = vec!["selected.rs"; MAX_PATH_CANDIDATES];
+        names.extend(["unexamined.rs", "later.rs"]);
+        let contexts = collect_with_discovery(
+            &names.join(" "),
+            temp.path(),
+            &default_discovery(temp.path()),
+        );
+        assert_eq!(contexts.len(), 1);
+        assert!(contexts[0].1.contains("SELECTED_CONTENT"));
+        assert!(contexts[0].1.contains("unexamined.rs"));
+        assert!(
+            contexts[0]
+                .1
+                .contains("inspect the original user message for remaining paths")
+        );
+        assert!(!contexts[0].1.contains("local_path_unavailable"));
+    }
+
+    #[test]
+    fn missing_path_reports_failure_and_keeps_other_selections() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("exists.rs"), "SELECTED_CONTENT").expect("write");
+        let contexts = collect_with_discovery(
+            "missing.rs exists.rs",
+            temp.path(),
+            &default_discovery(temp.path()),
+        );
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts[0].0, temp.path().join("missing.rs"));
+        assert!(contexts[0].1.contains("local_path_unavailable"));
+        assert!(!contexts[0].1.contains("SELECTED_CONTENT"));
+        assert!(contexts[1].1.contains("SELECTED_CONTENT"));
+    }
+
+    #[test]
+    fn symlink_selection_explains_omission_without_reading_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("target.rs");
+        let link = temp.path().join("link.rs");
+        fs::write(&target, "TARGET_CONTENT").expect("write");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&target, &link).expect("symlink");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let contexts =
+            collect_with_discovery("link.rs", temp.path(), &default_discovery(temp.path()));
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].0, link);
+        assert!(contexts[0].1.contains("symbolic links"));
+        assert!(!contexts[0].1.contains("TARGET_CONTENT"));
     }
 
     #[test]

@@ -89,6 +89,7 @@ async fn exec_output_logging_and_projection_materialize_response_once() {
         process_id: None,
         exit_code: Some(0),
         process_exited: true,
+        search_no_match: false,
         original_token_count: None,
         hook_command: None,
         raw_output_artifact: None,
@@ -3651,7 +3652,7 @@ fn admission_fallback_does_not_retype_structured_tool_search_output() {
 #[tokio::test]
 async fn admission_only_projection_preserves_original_response_and_registers_candidate() {
     let temp = tempfile::tempdir().expect("temporary Codex home");
-    let output = "ordinary inline result".to_string();
+    let output = "ordinary inline result\n".repeat(1_000);
     let canonical = CanonicalToolResult::text(output.clone());
     let original_response = ResponseInputItem::FunctionCallOutput {
         call_id: "ordinary-call".to_string(),
@@ -3672,7 +3673,7 @@ async fn admission_only_projection_preserves_original_response_and_registers_can
             omitted_inline_ids: Vec::new(),
             partial_ids: Vec::new(),
         },
-        applied_token_limit: 1_000,
+        applied_token_limit: 10_000,
         projected_text: output.clone(),
         preserved_content: Vec::new(),
         codex_home: temp.path().to_path_buf(),
@@ -3699,6 +3700,7 @@ async fn admission_only_projection_preserves_original_response_and_registers_can
     assert_eq!(projection.response(), original_response);
     let candidate = projection.candidate.expect("admission candidate");
     assert_eq!(candidate.bounded_model_output, output);
+    assert_eq!(candidate.preserved_non_text_tokens, Some(0));
     assert!(
         candidate
             .supersession_identity

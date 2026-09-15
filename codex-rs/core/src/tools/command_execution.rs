@@ -122,13 +122,9 @@ impl CommandAttemptKey {
 
     #[cfg(test)]
     pub(crate) fn with_environment(self, environment: &HashMap<String, String>) -> Self {
-        let mut entries = environment.iter().collect::<Vec<_>>();
-        entries.sort_unstable_by(|(left_key, left_value), (right_key, right_value)| {
-            left_key
-                .cmp(right_key)
-                .then_with(|| left_value.cmp(right_value))
-        });
-        self.with_context_fingerprint("environment", &entries)
+        self.with_environment_fingerprint(&crate::tools::handlers::validation_environment_hash(
+            environment,
+        ))
     }
 
     pub(crate) fn with_environment_fingerprint(self, fingerprint: &str) -> Self {
@@ -198,6 +194,10 @@ impl CommandAttemptKey {
             .filter(|search| search.can_record_miss)
     }
 
+    pub(crate) fn is_search_no_match(&self, exit_code: Option<i32>) -> bool {
+        exit_code == Some(1) && self.eligible_search_miss().is_some()
+    }
+
     fn search_miss_cache_key_for(
         &self,
         search: &SearchNarrowingAttempt,
@@ -232,7 +232,15 @@ impl CommandAttemptKey {
 fn fingerprint_value<T: Serialize + ?Sized>(value: &T) -> String {
     let encoded = match serde_json::to_vec(value) {
         Ok(encoded) => encoded,
-        Err(error) => unreachable!("command fingerprint input must serialize: {error}"),
+        Err(error) => {
+            tracing::warn!(%error, "command fingerprint unavailable; disabling equivalent-attempt reuse");
+            // A unique value fails open for execution without equating two
+            // authorization contexts that could not be serialized.
+            return format!(
+                "{COMMAND_FINGERPRINT_VERSION}:unavailable:{}",
+                uuid::Uuid::new_v4()
+            );
+        }
     };
     let mut hasher = Sha256::new();
     hasher.update(b"kd4-command-fingerprint\0");
@@ -263,15 +271,25 @@ enum CommandAttemptBlockedReason {
 }
 
 impl CommandAttemptBlocked {
+    pub(crate) fn is_search_miss(&self) -> bool {
+        matches!(self.reason, CommandAttemptBlockedReason::SearchMiss)
+    }
+
     pub(crate) fn render_for_model(&self) -> String {
         match &self.reason {
-            CommandAttemptBlockedReason::DeterministicFailure(prior_failure) => format!(
-                "Command failed: exact repeat of deterministic `{}` failure from the original attempt (fingerprint `{}`, exit code {}, evidence {:?}); execution was suppressed.",
-                prior_failure.proof.outcome_class(),
-                self.fingerprint,
-                prior_failure.exit_code,
-                prior_failure.evidence,
-            ),
+            CommandAttemptBlockedReason::DeterministicFailure(prior_failure) => {
+                let (artifact_id, _, _) = prior_failure.evidence.model_projection();
+                let evidence = artifact_id.map_or_else(
+                    || "original output artifact unavailable".to_string(),
+                    |id| format!("read_tool_output artifact `{id}`"),
+                );
+                format!(
+                    "Command failed: exact repeat of deterministic `{}` failure from the original attempt (fingerprint `{}`, exit code {}, {evidence}); execution was suppressed. Correct the invocation, or use `force_fresh` to retry explicitly.",
+                    prior_failure.proof.outcome_class(),
+                    self.fingerprint,
+                    prior_failure.exit_code,
+                )
+            }
             CommandAttemptBlockedReason::SearchMiss => format!(
                 "Search returned no matches: an equivalent search already produced a negative result under the unchanged repository and execution context (fingerprint `{}`); execution was suppressed. Change the query or scope, or use `force_fresh` when external state changed.",
                 self.fingerprint,
@@ -417,6 +435,7 @@ struct CommandRetryState {
 #[derive(Default)]
 struct CommandSearchState {
     revision: u64,
+    persisted_cache_loaded: bool,
     allowed_expansions: HashSet<SearchNarrowingScope>,
     misses: HashSet<SearchMissCacheKey>,
     miss_order: VecDeque<SearchMissCacheKey>,
@@ -668,7 +687,8 @@ impl CommandExecutionLedger {
                 None => None,
             },
         };
-        let cached_document = if repository_epoch == 0 {
+        let load_persisted_cache = !self.state.lock().await.search.persisted_cache_loaded;
+        let cached_document = if load_persisted_cache {
             match self.persistence.as_ref() {
                 Some(persistence) => tokio::fs::read(&persistence.cache_path)
                     .await
@@ -692,6 +712,8 @@ impl CommandExecutionLedger {
         });
         let mut state = self.state.lock().await;
         if state.repository.epoch == repository_epoch {
+            state.search.persisted_cache_loaded |=
+                load_persisted_cache && workspace_identity_hash.is_some();
             state.repository.workspace_identity_observation_epoch = Some(repository_epoch);
             if let (Some(workspace_identity), Some(workspace_identity_hash)) =
                 (observed_workspace_identity, workspace_identity_hash)
@@ -1415,7 +1437,9 @@ fn record_search_result_locked(
                 state.search.misses.remove(&oldest);
             }
         }
-    } else if exit_code == 0 && state.search.misses.remove(&search_miss_key) {
+    } else if exit_code != 1 && state.search.misses.remove(&search_miss_key) {
+        // A fresh execution error supersedes an older negative result too.
+        // Only an attributable no-match exit can keep that result authoritative.
         state.search.revision = state.search.revision.wrapping_add(1);
         state
             .search
@@ -1518,9 +1542,9 @@ pub(crate) fn persist_synced_file(
     _parent: &Path,
 ) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
+    use windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING;
+    use windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
     let temporary = temporary.into_temp_path();
     let source: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
     let destination: Vec<u16> = cache_path
@@ -1740,16 +1764,28 @@ mod tests {
             .await
             .expect("an unattributable compound command must not be blocked by an rg miss");
 
-        ledger
-            .begin_attempt_with_freshness(&equivalent, false, true)
-            .await
-            .expect("force_fresh bypasses the negative cache");
-        ledger.record_exit(&equivalent, 0).await;
-        ledger
-            .begin_attempt(&equivalent, false)
-            .await
-            .expect("a fresh successful search clears the cached miss");
+        for exit_code in [0, 2, 130] {
+            ledger.record_exit(&first, 1).await;
+            assert!(
+                ledger
+                    .begin_attempt(&equivalent, false)
+                    .await
+                    .unwrap_err()
+                    .is_search_miss()
+            );
+            ledger
+                .begin_attempt_with_freshness(&equivalent, false, true)
+                .await
+                .expect("force_fresh bypasses the negative cache");
+            ledger.record_exit(&equivalent, exit_code).await;
+            ledger
+                .begin_attempt(&equivalent, false)
+                .await
+                .expect("a fresh match, error, or interruption supersedes the cached miss");
+        }
 
+        // Scope changes must be admitted while the original miss is still cached.
+        ledger.record_exit(&first, 1).await;
         ledger
             .begin_attempt(
                 &key("rg needle tests")
@@ -1776,6 +1812,13 @@ mod tests {
             )
             .await
             .expect("changed search scope state executes");
+        assert!(
+            ledger
+                .begin_attempt(&equivalent, false)
+                .await
+                .unwrap_err()
+                .is_search_miss()
+        );
     }
 
     #[tokio::test]
@@ -1995,10 +2038,14 @@ mod tests {
             )
             .await;
 
-        ledger
+        let blocked = ledger
             .begin_attempt(&attempt_key, false)
             .await
             .expect_err("the closed production proof blocks an exact retry");
+        let message = blocked.render_for_model();
+        assert!(message.contains("original output artifact unavailable"));
+        assert!(message.contains("force_fresh"));
+        assert!(!message.contains("Failed {"));
         ledger
             .begin_attempt(&attempt_key, true)
             .await
@@ -2015,6 +2062,35 @@ mod tests {
             .begin_attempt(&key("fails.exe").with_repository_epoch(2), false)
             .await
             .expect("repository revision change executes");
+    }
+
+    #[tokio::test]
+    async fn suppressed_failure_exposes_only_the_opaque_evidence_handle() {
+        let home = tempfile::TempDir::new().unwrap();
+        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
+            home.path(),
+            "thread",
+            b"Use apply_patch directly.",
+        )
+        .await;
+        let artifact_id = artifact.model_projection().0.expect("stored artifact");
+        let ledger = CommandExecutionLedger::default();
+        let attempt_key = key("apply_patch patch");
+        ledger.begin_attempt(&attempt_key, false).await.unwrap();
+        ledger
+            .record_input_state_determined_failure(
+                &attempt_key,
+                InputStateDetermined::ApplyPatchImplicitInvocation,
+                artifact,
+                -1,
+            )
+            .await;
+        let blocked = ledger.begin_attempt(&attempt_key, false).await.unwrap_err();
+        let message = blocked.render_for_model();
+        assert!(message.contains(&format!("read_tool_output artifact `{artifact_id}`")));
+        assert!(message.contains("force_fresh"));
+        assert!(!message.contains(home.path().to_string_lossy().as_ref()));
+        assert!(!message.contains("Stored {"));
     }
 
     #[tokio::test]
@@ -2175,6 +2251,19 @@ mod tests {
     }
 
     #[test]
+    fn unserializable_execution_contexts_do_not_collide_or_panic() {
+        struct Unserializable;
+        impl Serialize for Unserializable {
+            fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("fixture serialization failure"))
+            }
+        }
+        let first = key("git status").with_permission_context(&Unserializable);
+        let second = key("git status").with_permission_context(&Unserializable);
+        assert_ne!(first.fingerprint(), second.fingerprint());
+    }
+
+    #[test]
     fn retry_identity_tracks_executed_command_and_execution_context() {
         let original = vec!["rg".to_string(), "--ignorecase".to_string()];
         let repaired = vec!["rg".to_string(), "--ignore-case".to_string()];
@@ -2205,7 +2294,9 @@ mod tests {
 
         let direct_repaired =
             CommandAttemptKey::new("shell_command", "local", "C:/repo", &repaired)
-                .with_environment(&environment)
+                .with_environment_fingerprint(&crate::tools::handlers::validation_environment_hash(
+                    &environment,
+                ))
                 .with_timeout_ms(Some(1_000))
                 .with_sandbox_context(&"workspace-write")
                 .with_runtime_context(&"classic")
@@ -2601,8 +2692,12 @@ mod tests {
                 .await
                 .expect("matching supplied identity");
         let matching_epoch = matching
-            .observe_repository_revision_with_identity("turn-match", 0, Some(supplied_identity))
+            .observe_repository_revision_with_identity("turn-match", 1, Some(supplied_identity))
             .await;
+        assert!(
+            matching_epoch > 0,
+            "first observation follows a mutation revision"
+        );
         let matching_identity = matching
             .current_workspace_identity_hash(codex_exec_server::LOCAL_ENVIRONMENT_ID, &repository)
             .await

@@ -13,7 +13,6 @@ use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
-use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
@@ -49,7 +48,8 @@ pub async fn apply_patch_harness() -> Result<TestCodexHarness> {
 async fn apply_patch_harness_with(
     configure: impl FnOnce(TestCodexBuilder) -> TestCodexBuilder,
 ) -> Result<TestCodexHarness> {
-    let builder = configure(test_codex());
+    let builder =
+        configure(test_codex().with_config(|config| config.set_windows_sandbox_enabled(true)));
     // Box harness construction so apply_patch_cli tests do not inline the
     // full test-thread startup path into each test future.
     Box::pin(TestCodexHarness::with_auto_env_builder(builder)).await
@@ -111,20 +111,19 @@ fn restrictive_workspace_write_profile() -> PermissionProfile {
 }
 
 fn workspace_write_with_read_only_root(read_only_root: AbsolutePathBuf) -> PermissionProfile {
-    let file_system_sandbox_policy = FileSystemSandboxPolicy::restricted(vec![
-        FileSystemSandboxEntry {
+    let mut file_system_sandbox_policy = FileSystemSandboxPolicy::workspace_write(
+        &[],
+        /*exclude_tmpdir_env_var*/ true,
+        /*exclude_slash_tmp*/ true,
+    );
+    file_system_sandbox_policy
+        .entries
+        .push(FileSystemSandboxEntry {
             path: FileSystemPath::Path {
                 path: read_only_root,
             },
             access: FileSystemAccessMode::Read,
-        },
-        FileSystemSandboxEntry {
-            path: FileSystemPath::Special {
-                value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
-            },
-            access: FileSystemAccessMode::Write,
-        },
-    ]);
+        });
     PermissionProfile::from_runtime_permissions(
         &file_system_sandbox_policy,
         NetworkSandboxPolicy::Restricted,
@@ -257,7 +256,7 @@ async fn apply_patch_cli_moves_file_to_new_directory() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn apply_patch_cli_updates_file_appends_trailing_newline() -> Result<()> {
+async fn apply_patch_cli_updates_file_preserves_missing_trailing_newline() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let harness = apply_patch_harness().await?;
@@ -273,8 +272,7 @@ async fn apply_patch_cli_updates_file_appends_trailing_newline() -> Result<()> {
     harness.submit("apply newline patch").await?;
 
     let contents = harness.read_file_text("no_newline.txt").await?;
-    assert!(contents.ends_with('\n'));
-    assert_eq!(contents, "first line\nsecond line\n");
+    assert_eq!(contents, "first line\nsecond line");
     Ok(())
 }
 
@@ -558,10 +556,14 @@ async fn apply_patch_cli_delete_directory_reports_verification_error() -> Result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(codex_home)]
 async fn apply_patch_cli_rejects_path_traversal_outside_workspace() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let harness = apply_patch_harness().await?;
+    let harness = apply_patch_harness_with(|builder| {
+        builder.with_config(|config| config.set_windows_elevated_sandbox_enabled(true))
+    })
+    .await?;
 
     let escape_path = harness
         .test()
@@ -598,6 +600,7 @@ async fn apply_patch_cli_rejects_path_traversal_outside_workspace() -> Result<()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(codex_home)]
 async fn apply_patch_cli_does_not_write_through_symlink_escape_outside_workspace() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -610,6 +613,7 @@ async fn apply_patch_cli_does_not_write_through_symlink_escape_outside_workspace
     let harness_work_dir = work_dir.clone();
     let harness = apply_patch_harness_with(move |builder| {
         builder.with_config(move |config| {
+            config.set_windows_elevated_sandbox_enabled(true);
             config.cwd = harness_work_dir;
         })
     })
@@ -620,13 +624,7 @@ async fn apply_patch_cli_does_not_write_through_symlink_escape_outside_workspace
 
     let link_rel = "soft-link.txt";
     let link_path = harness.path(link_rel);
-    match create_file_symlink(&outside_file, &link_path) {
-        Ok(()) => {}
-        Err(error) => {
-            eprintln!("Skipping Windows symlink apply_patch sandbox test: {error}");
-            return Ok(());
-        }
-    }
+    create_file_symlink(&outside_file, &link_path)?;
 
     let patch = format!(
         r#"*** Begin Patch
@@ -647,6 +645,12 @@ async fn apply_patch_cli_does_not_write_through_symlink_escape_outside_workspace
         .await?;
 
     let out = harness.apply_patch_output(call_id).await;
+    assert!(
+        out.contains(
+            "patch rejected: writing outside of the project; rejected by user approval settings"
+        ),
+        "expected rejection of the resolved symlink target: {out}"
+    );
     assert_eq!(
         std::fs::read_to_string(&outside_file)?,
         original_contents,
@@ -658,6 +662,7 @@ async fn apply_patch_cli_does_not_write_through_symlink_escape_outside_workspace
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(codex_home)]
 async fn apply_patch_cli_preserves_existing_hard_link_outside_workspace() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -670,6 +675,7 @@ async fn apply_patch_cli_preserves_existing_hard_link_outside_workspace() -> Res
     let harness_work_dir = work_dir.clone();
     let harness = apply_patch_harness_with(move |builder| {
         builder.with_config(move |config| {
+            config.set_windows_elevated_sandbox_enabled(true);
             config.cwd = harness_work_dir;
         })
     })

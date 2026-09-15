@@ -185,8 +185,12 @@ impl AgentControlHarness {
             std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
             state_db.clone(),
             Arc::new(crate::test_support::EmptyUserInstructionsProvider),
-        )
-        .with_agent_graph_store_for_tests(agent_graph_store);
+        );
+        let manager = if let Some(agent_graph_store) = agent_graph_store {
+            manager.with_agent_graph_store_for_tests(Some(agent_graph_store))
+        } else {
+            manager
+        };
         let control = manager.agent_control();
         Self {
             _home: home,
@@ -1928,10 +1932,13 @@ fn registered_cancelled_spawn_retains_usage_until_child_termination() {
             use crate::session::step_context::StepContext;
             use crate::tools::context::ToolPayload;
             use crate::tools::parallel::ToolCallRuntime;
-            use crate::tools::router::{ToolCall, ToolRouter, ToolRouterParams};
+            use crate::tools::router::ToolCall;
+            use crate::tools::router::ToolRouter;
+            use crate::tools::router::ToolRouterParams;
             use codex_protocol::models::ResponseInputItem;
             use core_test_support::responses;
-            use core_test_support::streaming_sse::{StreamingSseChunk, start_streaming_sse_server};
+            use core_test_support::streaming_sse::StreamingSseChunk;
+            use core_test_support::streaming_sse::start_streaming_sse_server;
             let (release_model, model_gate) = tokio::sync::oneshot::channel();
             let (server, _) = start_streaming_sse_server(vec![vec![StreamingSseChunk {
                 gate: Some(model_gate),
@@ -3244,6 +3251,15 @@ async fn resume_agent_respects_max_threads_limit() {
         )
         .await
         .expect("spawn_agent should succeed");
+    let resumable_thread = manager
+        .get_thread(resumable_id)
+        .await
+        .expect("resumable thread");
+    persist_thread_for_tree_resume(&resumable_thread, "legacy resumable agent").await;
+    assert_eq!(
+        resumable_thread.multi_agent_version(),
+        Some(MultiAgentVersion::V1)
+    );
     let _ = control
         .shutdown_live_agent(resumable_id)
         .await
@@ -3577,7 +3593,12 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
 
 #[tokio::test]
 async fn completion_watcher_seals_missing_typed_receipt_and_retires_metrics() {
-    let harness = AgentControlHarness::new().await;
+    let (home, mut config) = test_config().await;
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("enable V2");
+    let harness = AgentControlHarness::new_with_config(home, config).await;
     let (parent_thread_id, parent_thread) = harness.start_thread().await;
     let (child_thread_id, child_thread) = harness.start_thread().await;
     let coordinator = harness.control.task_coordinator();
@@ -3694,24 +3715,47 @@ async fn completion_watcher_seals_missing_typed_receipt_and_retires_metrics() {
     .expect("completion watcher should seal the missing receipt and retire its metrics");
 
     timeout(Duration::from_secs(5), async {
-        loop {
-            let history_items = parent_thread
-                .codex
-                .session
-                .clone_history()
-                .await
-                .raw_items()
-                .to_vec();
-            if history_contains_text(&history_items, "needs_main")
-                && history_contains_text(&history_items, "blocked")
-            {
-                break;
-            }
-            sleep(Duration::from_millis(10)).await;
+        while !parent_thread
+            .codex
+            .session
+            .input_queue
+            .has_pending_mailbox_items()
+            .await
+        {
+            tokio::task::yield_now().await;
         }
     })
     .await
     .expect("completion watcher should notify the parent with the durable blocked outcome");
+    let pending = parent_thread
+        .codex
+        .session
+        .input_queue
+        .get_pending_input(&parent_thread.codex.session.active_turn)
+        .await;
+    let [crate::session::TurnInput::InterAgentCommunication(delivered)] = pending.as_slice() else {
+        panic!("one delivered parent message expected: {pending:?}");
+    };
+    assert_eq!(delivered.author, child_agent_path);
+    assert_eq!(delivered.recipient, AgentPath::root());
+    assert!(delivered.content.contains("Agent errored:"));
+    assert!(
+        delivered
+            .content
+            .contains("durable typed receipt status: needs_main:")
+    );
+    assert!(delivered.content.contains("without submitting a receipt"));
+    assert!(delivered.other_recipients.is_empty());
+    assert!(!delivered.trigger_turn);
+    assert!(
+        parent_thread
+            .codex
+            .session
+            .active_turn
+            .lock()
+            .await
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -5462,6 +5506,7 @@ fn registered_v2_child_completion_records_only_delivered_parent_result() {
             let bundles = std::fs::read_dir(&trace_root)
                 .expect("read trace root")
                 .map(|entry| entry.expect("trace bundle entry").path())
+                .filter(|path| path.join("trace.jsonl").is_file())
                 .collect::<Vec<_>>();
             assert_eq!(
                 bundles.len(),
@@ -5952,7 +5997,7 @@ async fn cancelled_tree_shutdown_keeps_closing_protection_until_termination() {
     let control = harness.control.clone();
     let shutdown = tokio::spawn(async move { control.shutdown_agent_tree(thread_id).await });
     timeout(Duration::from_secs(5), async {
-        while !matches!(thread.agent_status().await, AgentStatus::Shutdown) {
+        while !thread.codex.session.terminal_tasks.is_closed() {
             tokio::task::yield_now().await;
         }
     })
@@ -6031,6 +6076,7 @@ async fn timed_out_live_shutdown_retains_cleanup_until_termination() {
 async fn assert_live_shutdown_finishes_after_requester_leaves(use_timeout: bool) {
     let harness = AgentControlHarness::new().await;
     let (thread_id, thread) = harness.start_thread().await;
+    harness.control.register_session_root(thread_id, None);
     let release = crate::test_support::block_thread_terminal_tasks(thread.as_ref());
     if use_timeout {
         let result = timeout(
@@ -6046,7 +6092,7 @@ async fn assert_live_shutdown_finishes_after_requester_leaves(use_timeout: bool)
         let control = harness.control.clone();
         let shutdown = tokio::spawn(async move { control.shutdown_live_agent(thread_id).await });
         timeout(Duration::from_secs(5), async {
-            while !matches!(thread.agent_status().await, AgentStatus::Shutdown) {
+            while !thread.codex.session.terminal_tasks.is_closed() {
                 tokio::task::yield_now().await;
             }
         })

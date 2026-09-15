@@ -1046,7 +1046,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_thread_falls_back_to_rollout_search_when_sqlite_path_is_stale() {
+    async fn read_thread_resolves_stale_sqlite_path_and_preserves_metadata() {
         let home = TempDir::new().expect("temp dir");
         let external = TempDir::new().expect("external temp dir");
         let config = test_config(home.path());
@@ -1087,8 +1087,8 @@ mod tests {
 
         assert_eq!(thread.thread_id, thread_id);
         assert_eq!(thread.rollout_path, Some(rollout_path));
-        assert_eq!(thread.preview, "Hello from user");
-        assert_eq!(thread.model_provider, config.default_model_provider_id);
+        assert_eq!(thread.preview, "stale sqlite preview");
+        assert_eq!(thread.model_provider, "stale-sqlite-provider");
         let history = thread.history.expect("history should load");
         assert_eq!(history.thread_id, thread_id);
         assert_eq!(history.items.len(), 2);

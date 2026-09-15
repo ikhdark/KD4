@@ -405,31 +405,15 @@ fn parse_tool_input_schema_preserves_nested_empty_schema() {
 }
 
 #[test]
-fn parse_tool_input_schema_infers_array_from_prefix_items() {
-    // Example schema shape:
-    // {
-    //   "prefixItems": [
-    //     { "type": "string" }
-    //   ]
-    // }
-    //
-    // Expected normalization behavior:
-    // - `prefixItems` implies an array schema when `type` is omitted.
-    // - The normalized result is stored as a regular array schema with string
-    //   items.
-    let schema = parse_tool_input_schema(&serde_json::json!({
-        "prefixItems": [
-            {"type": "string"}
-        ]
+fn parse_tool_input_schema_rejects_prefix_items_without_type() {
+    // Flattening tuple constraints into homogeneous items would change the schema.
+    let error = parse_tool_input_schema(&serde_json::json!({
+        "prefixItems": [{"type": "string"}]
     }))
-    .expect("parse schema");
-
+    .expect_err("unsupported tuple constraints must not be silently discarded");
     assert_eq!(
-        schema,
-        JsonSchema::array(
-            JsonSchema::string(/*description*/ None),
-            /*description*/ None,
-        )
+        error.to_string(),
+        "unsupported tool input schema assertion: prefixItems"
     );
 }
 
