@@ -29,6 +29,7 @@ SCCACHE_CACHE_SIZE_ENV_VAR = shared_rust_tool_env.SCCACHE_CACHE_SIZE_ENV_VAR
 DEFAULT_SCCACHE_CACHE_SIZE = shared_rust_tool_env.DEFAULT_SCCACHE_CACHE_SIZE
 PACKAGE_TARGET_DIR_ENV = "CODEX_PACKAGE_TARGET_DIR"
 SOURCE_BUILD_STAMP = "codex-package-source-builds.json"
+DISCOVERY_TIMEOUT_SECONDS = 15
 WINDOWS_LLVM_LLD_LINK_DEFAULT = shared_rust_tool_env.WINDOWS_LLVM_LLD_LINK_DEFAULT
 
 
@@ -88,6 +89,7 @@ def build_source_binaries(
             output_dir / "codex-windows-sandbox-setup.exe",
         ),
     )
+    validate_distinct_output_paths(outputs)
 
     requested_binaries = source_binaries_for_target(
         spec,
@@ -104,6 +106,10 @@ def build_source_binaries(
         if requested_binaries
         else None
     )
+    # Evidence belongs to this invocation only. Reuse discovers it lazily;
+    # a build fills any missing observations before invoking Cargo.
+    observation: dict[str, dict] = {}
+    reused_outputs: dict[str, dict] = {}
     binaries = binaries_missing_for_reuse(
         requested_binaries,
         build_env=build_env,
@@ -116,6 +122,8 @@ def build_source_binaries(
         force_rebuild=force_rebuild,
         cargo=cargo,
         release_version=release_version,
+        observation=observation,
+        reused_outputs=reused_outputs,
     )
     if requested_binaries and not binaries:
         print(
@@ -124,6 +132,18 @@ def build_source_binaries(
         )
 
     if binaries:
+        # A failed or interrupted rebuild must not leave an older proof reusable.
+        source_build_stamp_path(target_dir).unlink(missing_ok=True)
+        if "source" not in observation:
+            observation["source"] = source_tree_fingerprint()
+        if "recipe" not in observation:
+            observation["recipe"] = build_recipe_fingerprint(
+                spec=spec,
+                profile=profile,
+                cargo=cargo,
+                release_version=release_version,
+                build_env=build_env,
+            )
         run_cargo_build(
             cargo,
             spec,
@@ -143,6 +163,9 @@ def build_source_binaries(
             variant=variant,
             outputs=outputs,
             proven_binaries=requested_binaries,
+            source_before=observation["source"],
+            recipe_before=observation["recipe"],
+            reused_outputs=reused_outputs,
             build_env=build_env,
             cargo=cargo,
             release_version=release_version,
@@ -312,6 +335,25 @@ def resolve_output_path(
     return default_path
 
 
+def validate_distinct_output_paths(outputs: SourceBuildOutputs) -> None:
+    resolved: list[tuple[str, Path]] = []
+    for role, path in vars(outputs).items():
+        if path is None:
+            continue
+        canonical = path.resolve()
+        for prior_role, prior_path in resolved:
+            if canonical == prior_path or (
+                canonical.exists()
+                and prior_path.exists()
+                and canonical.samefile(prior_path)
+            ):
+                raise RuntimeError(
+                    f"{role} and {prior_role} must refer to distinct executables; "
+                    f"both resolve to {canonical}"
+                )
+        resolved.append((role, canonical))
+
+
 def cargo_profile_output_dir(
     spec: TargetSpec,
     profile: str,
@@ -374,7 +416,7 @@ def cargo_build_env(
             if lld_link:
                 env[linker_env_name] = lld_link
     rustc_wrapper = env.get("RUSTC_WRAPPER")
-    if not rustc_wrapper and shutil.which("sccache"):
+    if rustc_wrapper is None and shutil.which("sccache"):
         env["RUSTC_WRAPPER"] = "sccache"
         set_sccache_env(env)
     elif rustc_wrapper and is_sccache_wrapper(rustc_wrapper):
@@ -428,20 +470,14 @@ def binaries_missing_for_reuse(
     cargo: str = "cargo",
     release_version: str | None = None,
     build_env: dict[str, str] | None = None,
+    observation: dict[str, dict] | None = None,
+    reused_outputs: dict[str, dict] | None = None,
 ) -> list[str]:
     if force_rebuild or not reuse_existing:
         return binaries
 
     stamp = read_source_build_stamp(target_dir)
-    if stamp is None or not source_build_stamp_metadata_matches(
-        stamp,
-        spec=spec,
-        profile=profile,
-        variant=variant,
-        cargo=cargo,
-        release_version=release_version,
-        build_env=build_env,
-    ):
+    if stamp is None:
         return binaries
 
     stamp_outputs = stamp.get("outputs")
@@ -461,8 +497,31 @@ def binaries_missing_for_reuse(
 
     if missing == binaries:
         return binaries
-    if not source_build_stamp_source_matches(stamp):
+    if observation is None:
+        observation = {}
+    observation["recipe"] = build_recipe_fingerprint(
+        spec=spec,
+        profile=profile,
+        cargo=cargo,
+        release_version=release_version,
+        build_env=build_env,
+    )
+    if not source_build_stamp_metadata_matches(
+        stamp,
+        spec=spec,
+        profile=profile,
+        variant=variant,
+        recipe=observation["recipe"],
+    ):
         return binaries
+    observation["source"] = source_tree_fingerprint()
+    if not source_build_stamp_source_matches(stamp, source=observation["source"]):
+        return binaries
+    if reused_outputs is not None:
+        for binary in binaries:
+            if binary not in missing:
+                key = source_output_key_for_binary(binary, variant=variant)
+                reused_outputs[key] = stamp_outputs[key]
     return missing
 
 
@@ -542,6 +601,9 @@ def write_source_build_stamp(
     release_version: str | None = None,
     build_env: dict[str, str] | None = None,
     proven_binaries: list[str] | None = None,
+    source_before: dict | None = None,
+    recipe_before: dict | None = None,
+    reused_outputs: dict[str, dict] | None = None,
 ) -> None:
     stamp = {
         "target": spec.target,
@@ -569,6 +631,28 @@ def write_source_build_stamp(
         ),
     }
     path = source_build_stamp_path(target_dir)
+    for key, fingerprint in (reused_outputs or {}).items():
+        if stamp["outputs"].get(key) != fingerprint:
+            path.unlink(missing_ok=True)
+            raise RuntimeError(f"package reused output changed during build: {key}")
+    if source_before is not None and (
+        (source_before.get("status") == "ok" and stamp["source"] != source_before)
+        or stamp["build_recipe"] != recipe_before
+    ):
+        path.unlink(missing_ok=True)
+        raise RuntimeError("package build inputs changed during build; retry packaging")
+    if source_before is not None and (
+        source_before.get("status") != "ok"
+        or any(
+            stamp["build_recipe"][tool].get("status") == "unavailable"
+            for tool in ("cargo", "rustc")
+        )
+    ):
+        path.unlink(missing_ok=True)
+        print(
+            "package cargo reuse disabled: build inputs changed or could not be verified"
+        )
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     contents = json.dumps(stamp, sort_keys=True, indent=2) + "\n"
     file_descriptor, temporary_name = tempfile.mkstemp(
@@ -627,6 +711,7 @@ def source_build_stamp_metadata_matches(
     cargo: str = "cargo",
     release_version: str | None = None,
     build_env: dict[str, str] | None = None,
+    recipe: dict | None = None,
 ) -> bool:
     if (
         stamp.get("target") != spec.target
@@ -634,12 +719,16 @@ def source_build_stamp_metadata_matches(
         or stamp.get("variant") != variant.name
     ):
         return False
-    recipe = build_recipe_fingerprint(
-        spec=spec,
-        profile=profile,
-        cargo=cargo,
-        release_version=release_version,
-        build_env=build_env,
+    recipe = (
+        recipe
+        if recipe is not None
+        else build_recipe_fingerprint(
+            spec=spec,
+            profile=profile,
+            cargo=cargo,
+            release_version=release_version,
+            build_env=build_env,
+        )
     )
     return (
         all(recipe[tool].get("status") != "unavailable" for tool in ("cargo", "rustc"))
@@ -665,31 +754,11 @@ def build_recipe_fingerprint(
         )
     )
     rustc = effective_env.get("RUSTC", "rustc")
-    environment_names = {
-        name
-        for name in effective_env
-        if name.startswith("CARGO_PROFILE_")
-        or name.startswith("CARGO_TARGET_")
-        or "V8" in name
-    }
-    environment_names.update(
-        {
-            "AR",
-            "CARGO",
-            "CARGO_HOME",
-            "RUSTUP_TOOLCHAIN",
-            "CODEX_RELEASE_VERSION",
-            "CARGO_ENCODED_RUSTFLAGS",
-            "CC",
-            "CXX",
-            "RUSTC",
-            "RUSTC_WRAPPER",
-            "RUSTC_WORKSPACE_WRAPPER",
-            "RUSTFLAGS",
-        }
-    )
+    # Build scripts and env!/option_env! can consume arbitrary variables.
+    # Conservatively hash the full supplied environment, including absent vs
+    # empty values, rather than treating an allowlist as Cargo freshness proof.
     environment: dict[str, object] = {}
-    for name in sorted(environment_names):
+    for name in sorted(effective_env):
         value = effective_env.get(name)
         if value is None:
             continue
@@ -709,7 +778,7 @@ def build_recipe_fingerprint(
     ]
 
     return {
-        "schema_version": 3,
+        "schema_version": 5,
         "target": spec.target,
         "profile": profile,
         "cargo": command_identity(cargo, "--version", "--verbose", env=effective_env),
@@ -736,13 +805,53 @@ def build_recipe_fingerprint(
                 REPO_ROOT / "codex-rs" / ".cargo" / "config.toml",
             )
         ),
+        "cargo_config": files_fingerprint(cargo_config_paths(effective_env)),
     }
+
+
+def cargo_config_paths(env: dict[str, str]) -> tuple[Path, ...]:
+    # Cargo searches from its invocation directory to the filesystem root,
+    # then CARGO_HOME (including the default home when the variable is unset).
+    cwd = CODEX_RS_ROOT.resolve()
+    home = Path(env.get("CARGO_HOME") or Path.home() / ".cargo")
+    if not home.is_absolute():
+        home = cwd / home
+    directories = [path / ".cargo" for path in (cwd, *cwd.parents)]
+    directories.append(home)
+    return tuple(
+        directory / name
+        for directory in directories
+        for name in ("config", "config.toml")
+    )
 
 
 def command_identity(
     command: str, *args: str, env: dict[str, str] | None = None
 ) -> dict[str, object]:
-    executable = shutil.which(command) or command
+    effective_env = os.environ if env is None else env
+    cwd = CODEX_RS_ROOT.resolve()
+    command_path = Path(command)
+    if command_path.is_absolute() or "/" in command or "\\" in command:
+        executable = str((cwd / command_path).resolve())
+    else:
+        search_directories = [
+            (cwd / entry).resolve()
+            for entry in effective_env.get("PATH", os.defpath).split(os.pathsep)
+        ]
+        if os.name == "nt":
+            search_directories.insert(0, cwd)
+        # Absolute candidates prevent shutil.which on Windows from inserting
+        # the parent process's working directory ahead of the supplied PATH.
+        executable = next(
+            (
+                found
+                for directory in search_directories
+                if (found := shutil.which(str(directory / command)))
+            ),
+            None,
+        )
+    if executable is None:
+        return {"path": command, "status": "unavailable", "error": "tool not found"}
     try:
         completed = subprocess.run(
             [executable, *args],
@@ -752,8 +861,9 @@ def command_identity(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            timeout=DISCOVERY_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.CalledProcessError) as error:
+    except (OSError, subprocess.SubprocessError) as error:
         return {"path": executable, "status": "unavailable", "error": str(error)}
     return {
         "path": str(Path(executable).resolve()),
@@ -763,14 +873,20 @@ def command_identity(
 
 def files_fingerprint(paths: tuple[Path, ...]) -> dict[str, object]:
     return {
-        str(path.relative_to(REPO_ROOT)): source_output_fingerprint(path)
+        (
+            str(path.relative_to(REPO_ROOT))
+            if path.is_relative_to(REPO_ROOT)
+            else str(path)
+        ): source_output_fingerprint(path)
         for path in paths
         if path.is_file()
     }
 
 
-def source_build_stamp_source_matches(stamp: dict) -> bool:
-    source = source_tree_fingerprint()
+def source_build_stamp_source_matches(
+    stamp: dict, *, source: dict | None = None
+) -> bool:
+    source = source if source is not None else source_tree_fingerprint()
     return source.get("status") == "ok" and stamp.get("source") == source
 
 
@@ -808,7 +924,7 @@ def source_tree_fingerprint() -> dict[str, str]:
             except OSError:
                 return {"status": "unavailable", "reason": "unreadable-source"}
             untracked_contents.update(b"\0")
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, subprocess.SubprocessError):
         return {"status": "unavailable", "reason": "git-unavailable"}
 
     return {
@@ -828,7 +944,12 @@ def run_git_bytes(git: str, *args: str) -> bytes:
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
     )
-    stdout, _ = process.communicate()
+    try:
+        stdout, _ = process.communicate(timeout=DISCOVERY_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate(timeout=DISCOVERY_TIMEOUT_SECONDS)
+        raise
     if process.returncode != 0:
         raise subprocess.CalledProcessError(process.returncode, [git, *args])
     return stdout

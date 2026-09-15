@@ -79,7 +79,7 @@ async fn unchanged_generation_reuses_one_mcp_process_for_100_calls() -> anyhow::
             .await?;
     }
 
-    assert!(process_is_alive(&original_pid)?);
+    assert!(process_is_alive(&original_pid).await?);
     assert!(
         !pid_file.exists(),
         "unchanged generation must not launch a replacement MCP process"

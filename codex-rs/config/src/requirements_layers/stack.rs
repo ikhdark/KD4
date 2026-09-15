@@ -203,7 +203,6 @@ fn populate_merged_regular_fields_with_sources(
     // whether it belongs in the regular TOML merge path or in a special merger.
     let ConfigRequirementsToml {
         allowed_approval_policies,
-        allowed_approvals_reviewers,
         allowed_sandbox_modes,
         allowed_permission_profiles,
         default_permissions,
@@ -225,14 +224,9 @@ fn populate_merged_regular_fields_with_sources(
         network,
         permissions,
         models,
-        guardian_policy_config,
     } = requirements;
 
     set_sourced!(allowed_approval_policies, &["allowed_approval_policies"]);
-    set_sourced!(
-        allowed_approvals_reviewers,
-        &["allowed_approvals_reviewers"]
-    );
     set_sourced!(allowed_sandbox_modes, &["allowed_sandbox_modes"]);
     set_sourced!(
         allowed_permission_profiles,
@@ -254,15 +248,6 @@ fn populate_merged_regular_fields_with_sources(
     set_sourced!(network, &["experimental_network"]);
     set_sourced!(permissions, &["permissions"]);
     set_sourced!(models, &["models"]);
-
-    if let Some(guardian_policy_config) =
-        guardian_policy_config.filter(|value| !value.trim().is_empty())
-    {
-        output.guardian_policy_config = Some(Sourced::new(
-            guardian_policy_config,
-            source_for_top_level_keys(layers, &["guardian_policy_config"]),
-        ));
-    }
 }
 
 fn source_for_top_level_keys(

@@ -6773,3 +6773,94 @@ async fn isolated_overlap_integrates_only_through_versioned_handoff() {
         .expect("worktree cleanup launches");
     assert!(cleanup.status.success());
 }
+
+#[tokio::test]
+async fn malformed_git_lineage_metadata_rejects_assignment_without_persisting_fallback_identity() {
+    for invalid in [
+        "marker",
+        "missing_gitdir",
+        "empty_commondir",
+        "unreadable_commondir",
+    ] {
+        let fixture = Fixture::new().await;
+        let root = fixture.repo.path();
+        std::fs::create_dir(root.join("src")).expect("source directory");
+        std::fs::write(root.join("src/lib.rs"), "before\n").expect("source file");
+        let git_dir = root.join(".git-metadata");
+        let common_dir = root.join(".git-common");
+        std::fs::create_dir(&common_dir).expect("common Git directory");
+        if invalid != "missing_gitdir" {
+            std::fs::create_dir(&git_dir).expect("worktree Git directory");
+        }
+        std::fs::write(
+            root.join(".git"),
+            if invalid == "marker" {
+                "not a Git directory marker\n"
+            } else {
+                "gitdir: .git-metadata\n"
+            },
+        )
+        .expect("Git marker");
+        match invalid {
+            "empty_commondir" => {
+                std::fs::write(git_dir.join("commondir"), " \n").expect("empty commondir")
+            }
+            "unreadable_commondir" => {
+                std::fs::write(git_dir.join("commondir"), [0xff]).expect("invalid UTF-8 commondir")
+            }
+            _ => {}
+        }
+        let error = fixture
+            .store
+            .create_assignment(root, worker_draft("invalid-lineage", "src/lib.rs"))
+            .await
+            .expect_err("invalid Git metadata must reject admission");
+        assert!(
+            matches!(error, StoreError::InvalidScope(_)),
+            "{invalid}: {error}"
+        );
+        let pool = coordination_pool(&fixture).await;
+        for (table, query) in [
+            ("assignments", "SELECT COUNT(*) FROM assignments"),
+            (
+                "assignment_repositories",
+                "SELECT COUNT(*) FROM assignment_repositories",
+            ),
+            (
+                "workspace_repositories",
+                "SELECT COUNT(*) FROM workspace_repositories",
+            ),
+        ] {
+            let count: i64 = sqlx::query_scalar(query)
+                .fetch_one(&pool)
+                .await
+                .expect("persisted identity count");
+            assert_eq!(count, 0, "{invalid}: rejected admission wrote {table}");
+        }
+        pool.close().await;
+        std::fs::create_dir_all(&git_dir).expect("repair worktree Git directory");
+        std::fs::write(root.join(".git"), "gitdir: .git-metadata\n").expect("repair Git marker");
+        std::fs::write(git_dir.join("commondir"), "../.git-common\n")
+            .expect("repair common directory");
+        let other_workspace = TempDir::new().expect("linked peer workspace");
+        std::fs::write(
+            other_workspace.path().join(".git"),
+            format!("gitdir: {}\n", common_dir.display()),
+        )
+        .expect("peer Git marker");
+        let peer_lineage = repository_lineage_id(other_workspace.path()).expect("peer lineage");
+        let (assignment, _) = fixture
+            .store
+            .create_assignment(root, worker_draft("repaired-lineage", "src/lib.rs"))
+            .await
+            .expect("repaired metadata admits assignment");
+        assert_eq!(
+            assignment.repository_id, peer_lineage,
+            "linked workspaces share coordination lineage"
+        );
+        assert_ne!(
+            assignment.repository_id, assignment.workspace_id,
+            "Git lineage must not fall back to checkout identity"
+        );
+    }
+}

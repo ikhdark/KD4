@@ -83,6 +83,7 @@ pub(crate) struct ThreadEnvironments {
     non_blocking_snapshots: bool,
     environments: ArcSwap<SelectedTurnEnvironmentState>,
     lifecycles: Mutex<Vec<Weak<TurnEnvironmentLifecycle>>>,
+    snapshot_tasks: Vec<tokio_util::task::TaskTracker>,
 }
 
 impl ThreadEnvironments {
@@ -95,6 +96,16 @@ impl ThreadEnvironments {
     ) -> Self {
         // Reuse only attached environments from the supplied snapshot; drop starting entries.
         let generation = current.generation;
+        // Retain inherited trackers even if their selections are later replaced:
+        // an already-released remote snapshot can still be awaiting deletion.
+        let snapshot_tasks = std::iter::once(shell_snapshot.tasks())
+            .chain(
+                current
+                    .turn_environments
+                    .iter()
+                    .filter_map(|environment| environment.shell_snapshot_tasks.clone()),
+            )
+            .collect();
         let environments: Vec<SelectedTurnEnvironment> = current
             .turn_environments
             .into_iter()
@@ -124,6 +135,7 @@ impl ThreadEnvironments {
                 environments,
             }),
             lifecycles: Mutex::new(lifecycles),
+            snapshot_tasks,
         }
     }
 
@@ -233,6 +245,8 @@ impl ThreadEnvironments {
                 TurnEnvironment::new(selection.environment_id, environment, selection.cwd, shell);
             turn_environment.operating_system = operating_system;
             turn_environment.attach_lifecycle(lifecycle);
+            let snapshot_tasks = shell_snapshot.tasks();
+            turn_environment.shell_snapshot_tasks = Some(snapshot_tasks.clone());
             let mut snapshot_environment = turn_environment.clone();
             snapshot_environment.detach_lifecycle();
             let snapshot_cancellation = cancellation.clone();
@@ -244,7 +258,7 @@ impl ThreadEnvironments {
             }
             .boxed()
             .shared();
-            drop(tokio::spawn(task.clone()));
+            drop(snapshot_tasks.spawn(task.clone()));
             turn_environment.shell_snapshot = task;
             Ok(turn_environment)
         }
@@ -303,6 +317,30 @@ impl ThreadEnvironments {
                 false
             }
         });
+    }
+
+    /// Release this session's snapshot ownership before waiting for deletions.
+    /// A live inheriting session keeps its shared file and drains the same tracker
+    /// when it releases the final owner; no cleanup task waits for that owner here.
+    pub(crate) async fn finish_shutdown(&self) {
+        let current = self.environments.load_full();
+        for environment in &current.environments {
+            if let Ok(environment) = environment.resolution.clone().await {
+                // Cancellation must retire a pending builder before its tracker is
+                // checked, including a file published just before validation.
+                drop(environment.shell_snapshot.clone().await);
+            }
+        }
+        self.environments
+            .store(Arc::new(SelectedTurnEnvironmentState {
+                generation: current.generation,
+                environments: Vec::new(),
+            }));
+        drop(current);
+        for tasks in &self.snapshot_tasks {
+            tasks.close();
+            tasks.wait().await;
+        }
     }
 }
 

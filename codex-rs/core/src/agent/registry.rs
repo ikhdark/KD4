@@ -510,15 +510,19 @@ impl SpawnReservation {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn commit(mut self, agent_metadata: AgentMetadata) -> Result<()> {
-        let result = self
-            .state
-            .register_spawned_thread(agent_metadata, self.parent_thread_id);
+        self.try_commit(agent_metadata)
+    }
+
+    /// Keep failed admission owned by the caller until its live child terminates.
+    pub(crate) fn try_commit(&mut self, agent_metadata: AgentMetadata) -> Result<()> {
+        self.state
+            .register_spawned_thread(agent_metadata, self.parent_thread_id)?;
         if let Some(parent_thread_id) = self.parent_thread_id.take() {
             self.state
                 .release_parent_spawn_reservation(parent_thread_id);
         }
-        result?;
         self.reserved_agent_path = None;
         self.active = false;
         Ok(())

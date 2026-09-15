@@ -29,13 +29,17 @@ use codex_app_server_protocol::AppReview;
 use codex_app_server_protocol::AppScreenshot;
 use codex_app_server_protocol::AppsListParams;
 use codex_app_server_protocol::AppsListResponse;
+use codex_app_server_protocol::ConfigValueWriteParams;
+use codex_app_server_protocol::ConfigWriteResponse;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::LoginAccountResponse;
+use codex_app_server_protocol::MergeStrategy;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::WriteStatus;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_login::AuthDotJson;
 use codex_login::AuthKeyringBackendKind;
@@ -422,18 +426,22 @@ async fn list_apps_uses_thread_feature_flag_when_thread_id_is_provided() -> Resu
     .await??;
     let ThreadStartResponse { thread, .. } = to_response(start_response)?;
 
-    std::fs::write(
-        codex_home.path().join("config.toml"),
-        format!(
-            r#"
-chatgpt_base_url = "{server_url}"
-mcp_oauth_credentials_store = "file"
-
-[features]
-apps = false
-"#
-        ),
-    )?;
+    let write_request = mcp
+        .send_config_value_write_request(ConfigValueWriteParams {
+            key_path: "features.apps".to_string(),
+            value: json!(false),
+            merge_strategy: MergeStrategy::Replace,
+            file_path: None,
+            expected_version: None,
+        })
+        .await?;
+    let write_response = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(write_request)),
+    )
+    .await??;
+    let write: ConfigWriteResponse = to_response(write_response)?;
+    assert_eq!(write.status, WriteStatus::Ok);
 
     let global_request = mcp
         .send_apps_list_request(AppsListParams {

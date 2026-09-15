@@ -22,7 +22,6 @@ use crate::config::Config;
 use crate::mcp::McpManager;
 use crate::plugins::list_tool_suggest_discoverable_plugins;
 use crate::session::INITIAL_SUBMIT_ID;
-use codex_config::types::ApprovalsReviewer;
 use codex_config::types::ToolSuggestDiscoverableType;
 use codex_core_plugins::PluginsManager;
 use codex_features::Feature;
@@ -289,7 +288,6 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
         ToolPluginProvenance::default(),
         auth.as_ref(),
         codex_apps_auth_manager,
-        /*elicitation_reviewer*/ None,
         /*elicitation_lifecycle*/ None,
         codex_mcp::ElicitationRequestRouter::default(),
         /*previous_manager*/ None,
@@ -527,40 +525,6 @@ pub fn with_app_plugin_sources(
             .to_vec();
     }
     connectors
-}
-
-pub(crate) fn mcp_approvals_reviewer(
-    config: &Config,
-    server_name: &str,
-    connector_id: Option<&str>,
-) -> ApprovalsReviewer {
-    let app_reviewer = if server_name == CODEX_APPS_MCP_SERVER_NAME {
-        apps_config_from_layer_stack(&config.config_layer_stack).and_then(|apps_config| {
-            connector_id
-                .and_then(|connector_id| apps_config.apps.get(connector_id))
-                .and_then(|app| app.approvals_reviewer)
-                .or_else(|| {
-                    apps_config
-                        .default
-                        .and_then(|defaults| defaults.approvals_reviewer)
-                })
-        })
-    } else {
-        None
-    };
-
-    if let Some(reviewer) = app_reviewer
-        && config
-            .config_layer_stack
-            .requirements()
-            .approvals_reviewer
-            .can_set(&reviewer)
-            .is_ok()
-    {
-        return reviewer;
-    }
-
-    config.approvals_reviewer
 }
 
 #[cfg(test)]

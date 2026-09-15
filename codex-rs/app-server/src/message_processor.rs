@@ -1249,11 +1249,6 @@ impl MessageProcessor {
                 .thread_shell_command(&request_id, params)
                 .await
                 .map(|response| Some(response.into())),
-            ClientRequest::ThreadApproveGuardianDeniedAction { params, .. } => self
-                .thread_processor
-                .thread_approve_guardian_denied_action(&request_id, params)
-                .await
-                .map(|response| Some(response.into())),
             ClientRequest::GetConversationSummary { params, .. } => self
                 .thread_processor
                 .conversation_summary(params)

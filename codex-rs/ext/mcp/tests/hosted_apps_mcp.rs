@@ -147,7 +147,7 @@ async fn hosted_apps_mcp_requires_chatgpt_auth() -> TestResult {
 }
 
 #[tokio::test]
-async fn disabled_apps_remove_reserved_server_config_for_all_hosts() -> TestResult {
+async fn disabled_apps_prevent_calls_and_retain_installed_endpoint_identity() -> TestResult {
     let codex_home = tempfile::tempdir()?;
     let config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
@@ -167,9 +167,18 @@ async fn disabled_apps_remove_reserved_server_config_for_all_hosts() -> TestResu
             config.codex_home.to_path_buf(),
         ))),
     ];
-    for manager in managers {
+    for (index, manager) in managers.into_iter().enumerate() {
         let servers = manager.runtime_servers(&config).await;
-        assert!(!servers.contains_key(CODEX_APPS_MCP_SERVER_NAME));
+        if index == 0 {
+            let server = servers
+                .get(CODEX_APPS_MCP_SERVER_NAME)
+                .expect("cached endpoint identity");
+            assert!(!server.enabled);
+            let serialized = serde_json::to_string(server)?;
+            assert!(!serialized.contains("https://example.com/mcp"));
+        } else {
+            assert!(!servers.contains_key(CODEX_APPS_MCP_SERVER_NAME));
+        }
     }
     Ok(())
 }

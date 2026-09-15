@@ -2348,6 +2348,22 @@ LIMIT 1
                 "automatic wake cursor keys cannot be empty".to_string(),
             ));
         }
+        // Existing cursors are read-only observations. Do not wait for a
+        // maintenance writer before the wait owner's deadline can start.
+        if let Some(row) = sqlx::query(
+            "SELECT event_id FROM automatic_wake_cursors
+             WHERE root_session_id = ? AND consuming_agent_path = ?",
+        )
+        .bind(&root_session_id)
+        .bind(&consuming_agent_path)
+        .fetch_optional(&self.pool)
+        .await?
+        {
+            return row
+                .get::<Option<String>, _>("event_id")
+                .map(|value| WakeEventId::parse(&value))
+                .transpose();
+        }
         let mut transaction = self.pool.begin().await?;
         // Reserve the writer before sampling the initial watermark. Upgrading a
         // read snapshot after concurrent mailbox writes fails with SQLITE_BUSY_SNAPSHOT.

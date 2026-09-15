@@ -1103,7 +1103,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lifecycle_builders_share_config_mapping_and_preserve_resume_reviewer() {
+    async fn lifecycle_builders_share_config_and_permission_mapping() {
         let mut config = build_test_config().await;
         config.bypass_hook_trust = true;
         config.service_tier = Some("priority".to_string());
@@ -1116,12 +1116,8 @@ mod tests {
         };
 
         let start = thread_start_params_from_config(&config, overrides.clone(), None);
-        let resume = thread_resume_params_from_config(
-            &config,
-            "thread-id".to_string(),
-            overrides.clone(),
-            /*approvals_reviewer_override*/ None,
-        );
+        let resume =
+            thread_resume_params_from_config(&config, "thread-id".to_string(), overrides.clone());
         let fork = thread_fork_params_from_config(&config, "thread-id".to_string(), overrides);
 
         assert_eq!(start.config, resume.config);
@@ -1142,15 +1138,6 @@ mod tests {
         assert_eq!(resume.permission_profile, fork.permission_profile);
         assert_eq!(start.sandbox, resume.sandbox);
         assert_eq!(resume.sandbox, fork.sandbox);
-        assert_eq!(
-            start.approvals_reviewer,
-            Some(config.approvals_reviewer.into())
-        );
-        assert_eq!(resume.approvals_reviewer, None);
-        assert_eq!(
-            fork.approvals_reviewer,
-            Some(config.approvals_reviewer.into())
-        );
         assert!(resume.exclude_turns);
         assert!(fork.exclude_turns);
     }

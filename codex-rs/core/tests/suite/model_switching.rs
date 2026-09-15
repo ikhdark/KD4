@@ -87,7 +87,6 @@ fn test_model_info(
         used_fallback_model_metadata: false,
         supports_search_tool: false,
         use_responses_lite: false,
-        auto_review_model_override: None,
         tool_mode: None,
         multi_agent_version: None,
         priority: 1,
@@ -186,8 +185,8 @@ async fn model_change_appends_compact_compatibility_delta() -> Result<()> {
     assert_eq!(session_base_instructions, SESSION_BASE_INSTRUCTIONS);
     assert_eq!(
         second_request.instructions_text(),
-        session_base_instructions,
-        "model switching should preserve the session base instructions"
+        NEXT_MODEL_BASE_INSTRUCTIONS,
+        "a new turn should use the active model base instructions"
     );
     let developer_texts = second_request.message_input_texts("developer");
     let model_switch_text = developer_texts
@@ -949,7 +948,6 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         used_fallback_model_metadata: false,
         supports_search_tool: false,
         use_responses_lite: false,
-        auto_review_model_override: None,
         tool_mode: None,
         multi_agent_version: None,
         priority: 1,

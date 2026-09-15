@@ -363,7 +363,6 @@ async fn refresh_adopts_an_unchanged_client_without_old_manager_shutdown_cancell
         ToolPluginProvenance::default(),
         /*auth*/ None,
         /*codex_apps_auth_manager*/ None,
-        /*elicitation_reviewer*/ None,
         /*elicitation_lifecycle*/ None,
         ElicitationRequestRouter::default(),
         Some(&previous),
@@ -786,7 +785,6 @@ async fn disabled_permissions_auto_accept_elicitation_with_empty_form_schema() {
     let manager = ElicitationRequestManager::new(
         AskForApproval::Never,
         PermissionProfile::Disabled,
-        /*reviewer*/ None,
         /*lifecycle*/ None,
         ElicitationRequestRouter::default(),
     );
@@ -823,7 +821,6 @@ async fn disabled_permissions_do_not_auto_accept_elicitation_with_requested_fiel
     let manager = ElicitationRequestManager::new(
         AskForApproval::Never,
         PermissionProfile::Disabled,
-        /*reviewer*/ None,
         /*lifecycle*/ None,
         ElicitationRequestRouter::default(),
     );
@@ -864,7 +861,6 @@ async fn elicitation_closed_event_channel_returns_error_without_waiting_for_a_re
     let manager = ElicitationRequestManager::new(
         AskForApproval::OnRequest,
         PermissionProfile::default(),
-        /*reviewer*/ None,
         /*lifecycle*/ None,
         ElicitationRequestRouter::default(),
     );
@@ -898,7 +894,6 @@ async fn elicitation_cancelled_request_removes_its_response_route() {
     let manager = ElicitationRequestManager::new(
         AskForApproval::OnRequest,
         PermissionProfile::default(),
-        /*reviewer*/ None,
         /*lifecycle*/ None,
         ElicitationRequestRouter::default(),
     );
@@ -967,14 +962,12 @@ async fn shared_elicitation_router_targets_the_exact_pending_request() {
     let manager_a = ElicitationRequestManager::new(
         AskForApproval::OnRequest,
         PermissionProfile::default(),
-        /*reviewer*/ None,
         Some(lifecycle.clone()),
         router.clone(),
     );
     let manager_b = ElicitationRequestManager::new(
         AskForApproval::OnRequest,
         PermissionProfile::default(),
-        /*reviewer*/ None,
         Some(lifecycle),
         router,
     );
@@ -2198,7 +2191,6 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
         ToolPluginProvenance::default(),
         /*auth*/ None,
         /*codex_apps_auth_manager*/ None,
-        /*elicitation_reviewer*/ None,
         /*elicitation_lifecycle*/ None,
         ElicitationRequestRouter::default(),
         /*previous_manager*/ None,

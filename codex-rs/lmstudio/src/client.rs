@@ -160,6 +160,12 @@ impl LMStudioClient {
             Some(dir) => dir.to_string(),
             None => std::env::var("USERPROFILE").unwrap_or_default(),
         };
+        if home.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "LM Studio not found: USERPROFILE is unavailable for the home-directory fallback.",
+            ));
+        }
 
         let fallback_path = format!("{home}/.lmstudio/bin/lms.exe");
 
@@ -427,6 +433,22 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_find_lms_without_userprofile() {
+        if std::env::var_os("CODEX_LMS_DISCOVERY_CHILD").is_some() {
+            let error = missing_model_readiness_error().await;
+            assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            assert!(error.to_string().contains("USERPROFILE is unavailable"));
+        } else {
+            run_discovery_child_with_home(
+                "client::tests::test_find_lms_without_userprofile",
+                false,
+                false,
+            )
+            .await;
+        }
+    }
+
     async fn missing_model_readiness_error() -> io::Error {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -462,6 +484,14 @@ mod tests {
     }
 
     async fn run_discovery_child(test: &str, install_failing_executable: bool) {
+        run_discovery_child_with_home(test, install_failing_executable, true).await;
+    }
+
+    async fn run_discovery_child_with_home(
+        test: &str,
+        install_failing_executable: bool,
+        include_home: bool,
+    ) {
         let home = tempfile::tempdir().unwrap();
         if install_failing_executable {
             let bin = home.path().join(".lmstudio/bin");
@@ -475,14 +505,17 @@ mod tests {
             )
             .unwrap();
         }
-        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
             .args(["--exact", test, "--nocapture"])
             .env("CODEX_LMS_DISCOVERY_CHILD", "1")
-            .env("USERPROFILE", home.path())
-            .env("PATH", "")
-            .output()
-            .await
-            .unwrap();
+            .env("PATH", "");
+        if include_home {
+            command.env("USERPROFILE", home.path());
+        } else {
+            command.env_remove("USERPROFILE");
+        }
+        let output = command.output().await.unwrap();
         assert!(
             output.status.success(),
             "discovery subprocess failed: {}\n{}",

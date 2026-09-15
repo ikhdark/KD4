@@ -145,7 +145,13 @@ async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
 #[tokio::test]
 async fn list_models_includes_hidden_models() -> Result<()> {
     let codex_home = TempDir::new()?;
-    write_models_cache(codex_home.path())?;
+    let mut models = codex_models_manager::bundled_models_response()?.models;
+    let mut hidden = models[0].clone();
+    hidden.slug = "hidden-test-model".to_string();
+    hidden.visibility = codex_protocol::openai_models::ModelVisibility::Hide;
+    hidden.supported_in_api = true;
+    models.push(hidden);
+    app_test_support::write_models_cache_with_models(codex_home.path(), models)?;
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
@@ -173,7 +179,30 @@ async fn list_models_includes_hidden_models() -> Result<()> {
         next_cursor,
     } = to_response::<ModelListResponse>(response)?;
 
-    assert!(items.iter().any(|item| item.hidden));
+    assert!(
+        items
+            .iter()
+            .any(|item| item.model == "hidden-test-model" && item.hidden)
+    );
+    let request_id = mcp
+        .send_list_models_request(ModelListParams {
+            limit: Some(100),
+            cursor: None,
+            include_hidden: Some(false),
+        })
+        .await?;
+    let response = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let visible = to_response::<ModelListResponse>(response)?;
+    assert!(
+        !visible
+            .data
+            .iter()
+            .any(|item| item.model == "hidden-test-model")
+    );
     assert!(next_cursor.is_none());
     Ok(())
 }

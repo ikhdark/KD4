@@ -60,7 +60,6 @@ fn empty_layers_compose_to_none() {
 fn composition_preserves_semantic_emptiness() {
     for (contents, empty, composed_empty) in [
         ("", true, true),
-        ("guardian_policy_config = '   '", true, true),
         ("[features]", true, true),
         ("[hooks]", true, true),
         ("[models.new_thread]", true, true),
@@ -73,7 +72,6 @@ fn composition_preserves_semantic_emptiness() {
         ("allowed_approval_policies = []", false, false),
         ("allow_remote_control = false", false, false),
         ("default_permissions = ''", false, false),
-        ("guardian_policy_config = 'policy'", false, false),
         ("[models.new_thread]\nmodel = 'model'", false, false),
         ("[mcp_servers]", false, false),
         // Special-field stripping prunes an empty permissions table.

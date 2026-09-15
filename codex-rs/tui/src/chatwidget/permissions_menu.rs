@@ -35,31 +35,19 @@ impl ChatWidget {
                     .description
                     .replace(" (Identical to Agent mode)", ""),
                 AskForApproval::from(default.approval),
-                ApprovalsReviewer::User,
             ),
         ];
-        if self.config.features.enabled(Feature::GuardianApproval) {
-            items.push(self.builtin_permission_mode_selection_item(
-                default,
-                ":workspace",
-                AUTO_REVIEW_DESCRIPTION.to_string(),
-                AskForApproval::OnRequest,
-                ApprovalsReviewer::AutoReview,
-            ));
-        }
         items.push(self.builtin_permission_mode_selection_item(
             full_access,
             BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS,
             full_access.description.to_string(),
             AskForApproval::from(full_access.approval),
-            ApprovalsReviewer::User,
         ));
         items.push(self.builtin_permission_mode_selection_item(
             read_only,
             ":read-only",
             read_only.description.to_string(),
             AskForApproval::from(read_only.approval),
-            ApprovalsReviewer::User,
         ));
         items.extend(
             self.config
@@ -94,12 +82,11 @@ impl ChatWidget {
         id: &str,
         description: String,
         approval_policy: AskForApproval,
-        approvals_reviewer: ApprovalsReviewer,
     ) -> SelectionItem {
-        let label = match (preset.id, approvals_reviewer) {
-            ("auto", ApprovalsReviewer::AutoReview) => APPROVE_FOR_ME_LABEL,
-            ("auto", ApprovalsReviewer::User) => ASK_FOR_APPROVAL_LABEL,
-            _ => preset.label,
+        let label = if preset.id == "auto" {
+            ASK_FOR_APPROVAL_LABEL
+        } else {
+            preset.label
         };
         let active_profile_id = self
             .config
@@ -108,24 +95,20 @@ impl ChatWidget {
             .map(|profile| profile.id);
         let current_approval =
             AskForApproval::from(self.config.permissions.approval_policy.value());
-        let current_reviewer = self.config.approvals_reviewer;
         let profile_id = id.to_string();
         let selection = PermissionProfileSelection {
             profile_id,
             approval_policy: Some(approval_policy),
-            approvals_reviewer: Some(approvals_reviewer),
             display_label: label.to_string(),
         };
         SelectionItem {
             name: label.to_string(),
             description: Some(description),
             is_current: active_profile_id.as_deref() == Some(id)
-                && current_approval == approval_policy
-                && current_reviewer == approvals_reviewer,
+                && current_approval == approval_policy,
             actions: self.permission_mode_actions(
                 preset,
                 label.to_string(),
-                approvals_reviewer,
                 Some(selection),
                 /*return_to_permissions*/ true,
             ),
@@ -165,7 +148,6 @@ impl ChatWidget {
         let selection = PermissionProfileSelection {
             profile_id: id_for_action.clone(),
             approval_policy: None,
-            approvals_reviewer: None,
             display_label: id_for_action,
         };
         SelectionItem {

@@ -31,7 +31,7 @@ use crate::auth::AuthKeyringBackendKind;
 use crate::auth::save_auth;
 use crate::callback_params::LoginCallbackResult;
 use crate::callback_params::login_callback_result_from_state;
-use crate::default_client::create_raw_auth_client;
+use crate::default_client::create_raw_auth_client_async;
 use crate::default_client::originator;
 use crate::outbound_proxy::AuthRouteConfig;
 use crate::pkce::PkceCodes;
@@ -955,7 +955,8 @@ pub(crate) async fn exchange_code_for_tokens(
 
     // The route selected for the issuer is reused for token exchange; the token endpoint path is
     // not resolved separately.
-    let client = create_raw_auth_client(issuer.trim_end_matches('/'), auth_route_config)?;
+    let client =
+        create_raw_auth_client_async(issuer.trim_end_matches('/'), auth_route_config).await?;
     let token_endpoint = format!("{}/oauth/token", issuer.trim_end_matches('/'));
     info!(
         issuer = %sanitize_url_for_logging(issuer),
@@ -1270,7 +1271,8 @@ pub(crate) async fn obtain_api_key(
         access_token: String,
     }
     let token_endpoint = format!("{}/oauth/token", issuer.trim_end_matches('/'));
-    let client = create_raw_auth_client(issuer.trim_end_matches('/'), auth_route_config)?;
+    let client =
+        create_raw_auth_client_async(issuer.trim_end_matches('/'), auth_route_config).await?;
     let resp = client
         .post(token_endpoint)
         .timeout(Duration::from_secs(10))

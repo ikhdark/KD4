@@ -94,13 +94,6 @@ class AdditionalContextKind(Enum):
     application = "application"
 
 
-class AdditionalNetworkPermissions(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    enabled: bool | None = None
-
-
 class InputTextAgentMessageInputContent(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -223,17 +216,10 @@ class AppToolsConfig(BaseModel):
     )
 
 
-class ApprovalsReviewer(Enum):
-    user = "user"
-    auto_review = "auto_review"
-    guardian_subagent = "guardian_subagent"
-
-
 class AppsDefaultConfig(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
-    approvals_reviewer: ApprovalsReviewer | None = None
     default_tools_approval_mode: AppToolApproval | None = None
     destructive_enabled: bool | None = True
     enabled: bool | None = True
@@ -352,18 +338,6 @@ class AuthMode(Enum):
 class AutoCompactTokenLimitScope(Enum):
     total = "total"
     body_after_prefix = "body_after_prefix"
-
-
-class AutoReviewDecisionSource(RootModel[Literal["agent"]]):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    root: Annotated[
-        Literal["agent"],
-        Field(
-            description="[UNSTABLE] Source that produced a terminal approval auto-review decision."
-        ),
-    ]
 
 
 class BugCreateParams(BaseModel):
@@ -1641,57 +1615,6 @@ class GitInfo(BaseModel):
     sha: str | None = None
 
 
-class McpToolCallGuardianApprovalReviewAction(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    connector_id: Annotated[str | None, Field(alias="connectorId")] = None
-    connector_name: Annotated[str | None, Field(alias="connectorName")] = None
-    server: str
-    tool_name: Annotated[str, Field(alias="toolName")]
-    tool_title: Annotated[str | None, Field(alias="toolTitle")] = None
-    type: Annotated[
-        Literal["mcpToolCall"], Field(title="McpToolCallGuardianApprovalReviewActionType")
-    ]
-
-
-class GuardianApprovalReviewStatus(Enum):
-    in_progress = "inProgress"
-    approved = "approved"
-    denied = "denied"
-    timed_out = "timedOut"
-    aborted = "aborted"
-
-
-class GuardianCommandSource(Enum):
-    shell = "shell"
-    unified_exec = "unifiedExec"
-
-
-class GuardianRiskLevel(Enum):
-    low = "low"
-    medium = "medium"
-    high = "high"
-    critical = "critical"
-
-
-class GuardianUserAuthorization(Enum):
-    unknown = "unknown"
-    low = "low"
-    medium = "medium"
-    high = "high"
-
-
-class GuardianWarningNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    message: Annotated[str, Field(description="Concise guardian warning message for the user.")]
-    thread_id: Annotated[
-        str, Field(alias="threadId", description="Thread target for the guardian warning.")
-    ]
-
-
 class HookErrorInfo(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -2456,13 +2379,6 @@ class ModelVerificationNotification(BaseModel):
 class NetworkAccess(Enum):
     restricted = "restricted"
     enabled = "enabled"
-
-
-class NetworkApprovalProtocol(Enum):
-    http = "http"
-    https = "https"
-    socks5_tcp = "socks5Tcp"
-    socks5_udp = "socks5Udp"
 
 
 class NetworkDomainPermission(Enum):
@@ -3763,14 +3679,6 @@ class ModelSafetyBufferingUpdatedServerNotification(BaseModel):
     params: ModelSafetyBufferingUpdatedNotification
 
 
-class GuardianWarningServerNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    method: Annotated[Literal["guardianWarning"], Field(title="GuardianWarningNotificationMethod")]
-    params: GuardianWarningNotification
-
-
 class DeprecationNoticeServerNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -4069,23 +3977,6 @@ class TextRange(BaseModel):
 class ThreadActiveFlag(Enum):
     waiting_on_approval = "waitingOnApproval"
     waiting_on_user_input = "waitingOnUserInput"
-
-
-class ThreadApproveGuardianDeniedActionParams(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    event: Annotated[
-        Any, Field(description="Serialized `codex_protocol::protocol::GuardianAssessmentEvent`.")
-    ]
-    thread_id: Annotated[str, Field(alias="threadId")]
-
-
-class ThreadApproveGuardianDeniedActionResponse(BaseModel):
-    pass
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
 
 
 class ThreadArchiveParams(BaseModel):
@@ -4555,13 +4446,6 @@ class ThreadResumeParams(BaseModel):
         populate_by_name=True,
     )
     approval_policy: Annotated[AskForApproval | None, Field(alias="approvalPolicy")] = None
-    approvals_reviewer: Annotated[
-        ApprovalsReviewer | None,
-        Field(
-            alias="approvalsReviewer",
-            description="Override where approval requests are routed for review on this thread and subsequent turns.",
-        ),
-    ] = None
     base_instructions: Annotated[str | None, Field(alias="baseInstructions")] = None
     config: dict[str, Any] | None = None
     cwd: str | None = None
@@ -5389,96 +5273,6 @@ class UserInput(
     )
 
 
-class V2FileSystemAccessMode(Enum):
-    read = "read"
-    write = "write"
-    deny = "deny"
-
-
-class PathV2FileSystemPath(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    path: LegacyAppPathString
-    type: Annotated[Literal["path"], Field(title="PathV2FileSystemPathType")]
-
-
-class GlobPatternV2FileSystemPath(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    pattern: str
-    type: Annotated[Literal["glob_pattern"], Field(title="GlobPatternV2FileSystemPathType")]
-
-
-class RootV2FileSystemSpecialPath(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    kind: Literal["root"]
-
-
-class MinimalV2FileSystemSpecialPath(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    kind: Literal["minimal"]
-
-
-class KindV2FileSystemSpecialPath(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    kind: Literal["project_roots"]
-    subpath: str | None = None
-
-
-class TmpdirV2FileSystemSpecialPath(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    kind: Literal["tmpdir"]
-
-
-class SlashTmpV2FileSystemSpecialPath(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    kind: Literal["slash_tmp"]
-
-
-class V2FileSystemSpecialPath1(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    kind: Literal["unknown"]
-    path: str
-    subpath: str | None = None
-
-
-class V2FileSystemSpecialPath(
-    RootModel[
-        RootV2FileSystemSpecialPath
-        | MinimalV2FileSystemSpecialPath
-        | KindV2FileSystemSpecialPath
-        | TmpdirV2FileSystemSpecialPath
-        | SlashTmpV2FileSystemSpecialPath
-        | V2FileSystemSpecialPath1
-    ]
-):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    root: (
-        RootV2FileSystemSpecialPath
-        | MinimalV2FileSystemSpecialPath
-        | KindV2FileSystemSpecialPath
-        | TmpdirV2FileSystemSpecialPath
-        | SlashTmpV2FileSystemSpecialPath
-        | V2FileSystemSpecialPath1
-    )
-
-
 class Verbosity(Enum):
     low = "low"
     medium = "medium"
@@ -5692,7 +5486,6 @@ class AppConfig(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
-    approvals_reviewer: ApprovalsReviewer | None = None
     default_tools_approval_mode: AppToolApproval | None = None
     default_tools_enabled: bool | None = None
     destructive_enabled: bool | None = None
@@ -5879,18 +5672,6 @@ class ThreadShellCommandRequest(BaseModel):
         Literal["thread/shellCommand"], Field(title="Thread/shellCommandRequestMethod")
     ]
     params: ThreadShellCommandParams
-
-
-class ThreadApproveGuardianDeniedActionRequest(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    id: RequestId
-    method: Annotated[
-        Literal["thread/approveGuardianDeniedAction"],
-        Field(title="Thread/approveGuardianDeniedActionRequestMethod"),
-    ]
-    params: ThreadApproveGuardianDeniedActionParams
 
 
 class ThreadRollbackRequest(BaseModel):
@@ -6942,63 +6723,6 @@ class GetAccountResponse(BaseModel):
     requires_openai_auth: Annotated[bool, Field(alias="requiresOpenaiAuth")]
 
 
-class GuardianApprovalReview(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    rationale: str | None = None
-    risk_level: Annotated[GuardianRiskLevel | None, Field(alias="riskLevel")] = None
-    status: GuardianApprovalReviewStatus
-    user_authorization: Annotated[
-        GuardianUserAuthorization | None, Field(alias="userAuthorization")
-    ] = None
-
-
-class CommandGuardianApprovalReviewAction(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    command: str
-    cwd: LegacyAppPathString
-    source: GuardianCommandSource
-    type: Annotated[Literal["command"], Field(title="CommandGuardianApprovalReviewActionType")]
-
-
-class ExecveGuardianApprovalReviewAction(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    argv: list[str]
-    cwd: LegacyAppPathString
-    program: str
-    source: GuardianCommandSource
-    type: Annotated[Literal["execve"], Field(title="ExecveGuardianApprovalReviewActionType")]
-
-
-class ApplyPatchGuardianApprovalReviewAction(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    cwd: LegacyAppPathString
-    files: list[LegacyAppPathString]
-    type: Annotated[
-        Literal["applyPatch"], Field(title="ApplyPatchGuardianApprovalReviewActionType")
-    ]
-
-
-class NetworkAccessGuardianApprovalReviewAction(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    host: str
-    port: Annotated[int, Field(ge=0)]
-    protocol: NetworkApprovalProtocol
-    target: str
-    type: Annotated[
-        Literal["networkAccess"], Field(title="NetworkAccessGuardianApprovalReviewActionType")
-    ]
-
-
 class HookMetadata(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -7799,13 +7523,6 @@ class ThreadForkParams(BaseModel):
         populate_by_name=True,
     )
     approval_policy: Annotated[AskForApproval | None, Field(alias="approvalPolicy")] = None
-    approvals_reviewer: Annotated[
-        ApprovalsReviewer | None,
-        Field(
-            alias="approvalsReviewer",
-            description="Override where approval requests are routed for review on this thread and subsequent turns.",
-        ),
-    ] = None
     base_instructions: Annotated[str | None, Field(alias="baseInstructions")] = None
     config: dict[str, Any] | None = None
     cwd: str | None = None
@@ -8116,7 +7833,6 @@ class ThreadSettings(BaseModel):
         ActivePermissionProfile | None, Field(alias="activePermissionProfile")
     ] = None
     approval_policy: Annotated[AskForApproval, Field(alias="approvalPolicy")]
-    approvals_reviewer: Annotated[ApprovalsReviewer, Field(alias="approvalsReviewer")]
     collaboration_mode: Annotated[CollaborationMode, Field(alias="collaborationMode")]
     cwd: AbsolutePathBuf
     effort: ReasoningEffort | None = None
@@ -8141,13 +7857,6 @@ class ThreadStartParams(BaseModel):
         populate_by_name=True,
     )
     approval_policy: Annotated[AskForApproval | None, Field(alias="approvalPolicy")] = None
-    approvals_reviewer: Annotated[
-        ApprovalsReviewer | None,
-        Field(
-            alias="approvalsReviewer",
-            description="Override where approval requests are routed for review on this thread and subsequent turns.",
-        ),
-    ] = None
     base_instructions: Annotated[str | None, Field(alias="baseInstructions")] = None
     config: dict[str, Any] | None = None
     cwd: str | None = None
@@ -8260,13 +7969,6 @@ class TurnStartParams(BaseModel):
         Field(
             alias="approvalPolicy",
             description="Override the approval policy for this turn and subsequent turns.",
-        ),
-    ] = None
-    approvals_reviewer: Annotated[
-        ApprovalsReviewer | None,
-        Field(
-            alias="approvalsReviewer",
-            description="Override where approval requests are routed for review on this turn and subsequent turns.",
         ),
     ] = None
     client_user_message_id: Annotated[str | None, Field(alias="clientUserMessageId")] = None
@@ -8805,31 +8507,6 @@ class TurnTimingToolClosure(BaseModel):
     ] = None
 
 
-class SpecialV2FileSystemPath(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    type: Annotated[Literal["special"], Field(title="SpecialV2FileSystemPathType")]
-    value: V2FileSystemSpecialPath
-
-
-class V2FileSystemPath(
-    RootModel[PathV2FileSystemPath | GlobPatternV2FileSystemPath | SpecialV2FileSystemPath]
-):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    root: PathV2FileSystemPath | GlobPatternV2FileSystemPath | SpecialV2FileSystemPath
-
-
-class V2FileSystemSandboxEntry(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    access: V2FileSystemAccessMode
-    path: V2FileSystemPath
-
-
 class WindowsSandboxSetupCompletedNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -8889,27 +8566,6 @@ class AccountRateLimitsUpdatedNotification(BaseModel):
         populate_by_name=True,
     )
     rate_limits: Annotated[RateLimitSnapshot, Field(alias="rateLimits")]
-
-
-class AdditionalFileSystemPermissions(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    entries: Annotated[
-        list[V2FileSystemSandboxEntry] | None,
-        Field(
-            description="When present, replaces legacy `read` and `write`, including when empty."
-        ),
-    ] = None
-    glob_scan_max_depth: Annotated[int | None, Field(alias="globScanMaxDepth", ge=1)] = None
-    read: Annotated[
-        list[LegacyAppPathString] | None,
-        Field(description="This will be removed in favor of `entries`."),
-    ] = None
-    write: Annotated[
-        list[LegacyAppPathString] | None,
-        Field(description="This will be removed in favor of `entries`."),
-    ] = None
 
 
 class AgentMessageDeltaNotification(BaseModel):
@@ -9441,15 +9097,6 @@ class ReasoningPolicyHistory(BaseModel):
     turn_id: Annotated[str, Field(alias="turnId")]
 
 
-class RequestPermissionProfile(BaseModel):
-    model_config = ConfigDict(
-        extra="forbid",
-        populate_by_name=True,
-    )
-    file_system: Annotated[AdditionalFileSystemPermissions | None, Field(alias="fileSystem")] = None
-    network: AdditionalNetworkPermissions | None = None
-
-
 class FunctionCallOutputResponseItem(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -9942,103 +9589,6 @@ class ExternalAgentConfigImportParams(BaseModel):
     ] = None
 
 
-class RequestPermissionsGuardianApprovalReviewAction(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    permissions: RequestPermissionProfile
-    reason: str | None = None
-    type: Annotated[
-        Literal["requestPermissions"],
-        Field(title="RequestPermissionsGuardianApprovalReviewActionType"),
-    ]
-
-
-class GuardianApprovalReviewAction(
-    RootModel[
-        CommandGuardianApprovalReviewAction
-        | ExecveGuardianApprovalReviewAction
-        | ApplyPatchGuardianApprovalReviewAction
-        | NetworkAccessGuardianApprovalReviewAction
-        | McpToolCallGuardianApprovalReviewAction
-        | RequestPermissionsGuardianApprovalReviewAction
-    ]
-):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    root: (
-        CommandGuardianApprovalReviewAction
-        | ExecveGuardianApprovalReviewAction
-        | ApplyPatchGuardianApprovalReviewAction
-        | NetworkAccessGuardianApprovalReviewAction
-        | McpToolCallGuardianApprovalReviewAction
-        | RequestPermissionsGuardianApprovalReviewAction
-    )
-
-
-class ItemGuardianApprovalReviewCompletedNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    action: GuardianApprovalReviewAction
-    completed_at_ms: Annotated[
-        int,
-        Field(
-            alias="completedAtMs",
-            description="Unix timestamp (in milliseconds) when this review completed.",
-        ),
-    ]
-    decision_source: Annotated[AutoReviewDecisionSource, Field(alias="decisionSource")]
-    review: GuardianApprovalReview
-    review_id: Annotated[
-        str, Field(alias="reviewId", description="Stable identifier for this review.")
-    ]
-    started_at_ms: Annotated[
-        int,
-        Field(
-            alias="startedAtMs",
-            description="Unix timestamp (in milliseconds) when this review started.",
-        ),
-    ]
-    target_item_id: Annotated[
-        str | None,
-        Field(
-            alias="targetItemId",
-            description="Identifier for the reviewed item or tool call when one exists.\n\nIn most cases, one review maps to one target item. The exceptions are - execve reviews, where a single command may contain multiple execve calls to review - network policy reviews, where there is no target item\n\nA network call is triggered by a CommandExecution item, so having a target_item_id set to the CommandExecution item would be misleading because the review is about the network call, not the command execution. Therefore, target_item_id is set to None for network policy reviews.",
-        ),
-    ] = None
-    thread_id: Annotated[str, Field(alias="threadId")]
-    turn_id: Annotated[str, Field(alias="turnId")]
-
-
-class ItemGuardianApprovalReviewStartedNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    action: GuardianApprovalReviewAction
-    review: GuardianApprovalReview
-    review_id: Annotated[
-        str, Field(alias="reviewId", description="Stable identifier for this review.")
-    ]
-    started_at_ms: Annotated[
-        int,
-        Field(
-            alias="startedAtMs",
-            description="Unix timestamp (in milliseconds) when this review started.",
-        ),
-    ]
-    target_item_id: Annotated[
-        str | None,
-        Field(
-            alias="targetItemId",
-            description="Identifier for the reviewed item or tool call when one exists.\n\nIn most cases, one review maps to one target item. The exceptions are - execve reviews, where a single command may contain multiple execve calls to review - network policy reviews, where there is no target item\n\nA network call is triggered by a CommandExecution item, so having a target_item_id set to the CommandExecution item would be misleading because the review is about the network call, not the command execution. Therefore, target_item_id is set to None for network policy reviews.",
-        ),
-    ] = None
-    thread_id: Annotated[str, Field(alias="threadId")]
-    turn_id: Annotated[str, Field(alias="turnId")]
-
-
 class PluginDetail(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -10110,28 +9660,6 @@ class TurnReasoningPolicySummaryServerNotification(BaseModel):
         Field(title="Turn/reasoningPolicy/summaryNotificationMethod"),
     ]
     params: TurnReasoningPolicySummaryNotification
-
-
-class ItemAutoApprovalReviewStartedServerNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    method: Annotated[
-        Literal["item/autoApprovalReview/started"],
-        Field(title="Item/autoApprovalReview/startedNotificationMethod"),
-    ]
-    params: ItemGuardianApprovalReviewStartedNotification
-
-
-class ItemAutoApprovalReviewCompletedServerNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    method: Annotated[
-        Literal["item/autoApprovalReview/completed"],
-        Field(title="Item/autoApprovalReview/completedNotificationMethod"),
-    ]
-    params: ItemGuardianApprovalReviewCompletedNotification
 
 
 class TurnTiming(BaseModel):
@@ -10294,7 +9822,6 @@ class ClientRequest(
         | ThreadUnarchiveRequest
         | ThreadCompactStartRequest
         | ThreadShellCommandRequest
-        | ThreadApproveGuardianDeniedActionRequest
         | ThreadRollbackRequest
         | ThreadListRequest
         | ThreadLoadedListRequest
@@ -10390,7 +9917,6 @@ class ClientRequest(
         | ThreadUnarchiveRequest
         | ThreadCompactStartRequest
         | ThreadShellCommandRequest
-        | ThreadApproveGuardianDeniedActionRequest
         | ThreadRollbackRequest
         | ThreadListRequest
         | ThreadLoadedListRequest
@@ -10710,13 +10236,6 @@ class ThreadForkResponse(BaseModel):
         populate_by_name=True,
     )
     approval_policy: Annotated[AskForApproval, Field(alias="approvalPolicy")]
-    approvals_reviewer: Annotated[
-        ApprovalsReviewer,
-        Field(
-            alias="approvalsReviewer",
-            description="Reviewer currently used for approval requests on this thread.",
-        ),
-    ]
     cwd: AbsolutePathBuf
     instruction_sources: Annotated[
         list[LegacyAppPathString] | None,
@@ -10778,13 +10297,6 @@ class ThreadResumeResponse(BaseModel):
         populate_by_name=True,
     )
     approval_policy: Annotated[AskForApproval, Field(alias="approvalPolicy")]
-    approvals_reviewer: Annotated[
-        ApprovalsReviewer,
-        Field(
-            alias="approvalsReviewer",
-            description="Reviewer currently used for approval requests on this thread.",
-        ),
-    ]
     cwd: AbsolutePathBuf
     instruction_sources: Annotated[
         list[LegacyAppPathString] | None,
@@ -10833,13 +10345,6 @@ class ThreadStartResponse(BaseModel):
         populate_by_name=True,
     )
     approval_policy: Annotated[AskForApproval, Field(alias="approvalPolicy")]
-    approvals_reviewer: Annotated[
-        ApprovalsReviewer,
-        Field(
-            alias="approvalsReviewer",
-            description="Reviewer currently used for approval requests on this thread.",
-        ),
-    ]
     cwd: AbsolutePathBuf
     instruction_sources: Annotated[
         list[LegacyAppPathString] | None,
@@ -10907,8 +10412,6 @@ class ServerNotification(
         | TurnDiffUpdatedServerNotification
         | TurnPlanUpdatedServerNotification
         | ItemStartedServerNotification
-        | ItemAutoApprovalReviewStartedServerNotification
-        | ItemAutoApprovalReviewCompletedServerNotification
         | ItemCompletedServerNotification
         | ItemAgentMessageDeltaServerNotification
         | ItemPlanDeltaServerNotification
@@ -10938,7 +10441,6 @@ class ServerNotification(
         | TurnModerationMetadataServerNotification
         | ModelSafetyBufferingUpdatedServerNotification
         | WarningServerNotification
-        | GuardianWarningServerNotification
         | DeprecationNoticeServerNotification
         | ConfigWarningServerNotification
         | FuzzyFileSearchSessionUpdatedServerNotification
@@ -10974,8 +10476,6 @@ class ServerNotification(
         | TurnDiffUpdatedServerNotification
         | TurnPlanUpdatedServerNotification
         | ItemStartedServerNotification
-        | ItemAutoApprovalReviewStartedServerNotification
-        | ItemAutoApprovalReviewCompletedServerNotification
         | ItemCompletedServerNotification
         | ItemAgentMessageDeltaServerNotification
         | ItemPlanDeltaServerNotification
@@ -11005,7 +10505,6 @@ class ServerNotification(
         | TurnModerationMetadataServerNotification
         | ModelSafetyBufferingUpdatedServerNotification
         | WarningServerNotification
-        | GuardianWarningServerNotification
         | DeprecationNoticeServerNotification
         | ConfigWarningServerNotification
         | FuzzyFileSearchSessionUpdatedServerNotification

@@ -2,7 +2,6 @@ use anyhow::Context;
 use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use codex_config::types::ApprovalsReviewer;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::config::Constrained;
 use codex_exec_server::REMOTE_ENVIRONMENT_ID;
@@ -342,7 +341,6 @@ async fn deferred_executor_updates_context_and_tools_after_startup() -> Result<(
                 .permissions
                 .set_permission_profile(permission_profile_for_config)
                 .expect("set permission profile");
-            config.approvals_reviewer = ApprovalsReviewer::User;
             assert!(config.features.enable(Feature::DeferredExecutor).is_ok());
             assert!(config.features.enable(Feature::UnifiedExec).is_ok());
             assert!(
@@ -369,7 +367,6 @@ async fn deferred_executor_updates_context_and_tools_after_startup() -> Result<(
             additional_context: Default::default(),
             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
                 approval_policy: Some(approval_policy),
-                approvals_reviewer: Some(ApprovalsReviewer::User),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
                 ..Default::default()
@@ -399,7 +396,6 @@ async fn deferred_executor_updates_context_and_tools_after_startup() -> Result<(
             response: RequestPermissionsResponse {
                 permissions: RequestPermissionProfile::default(),
                 scope: PermissionGrantScope::Turn,
-                strict_auto_review: false,
             },
         })
         .await?;

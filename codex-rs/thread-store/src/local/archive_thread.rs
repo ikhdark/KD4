@@ -30,7 +30,7 @@ pub(super) async fn archive_thread(
         "sessions",
     )
     .await?;
-    let file_name = matching_rollout_file_name(
+    matching_rollout_file_name(
         canonical_rollout_path.as_path(),
         thread_id,
         rollout_path.as_path(),
@@ -40,17 +40,12 @@ pub(super) async fn archive_thread(
         .config
         .codex_home
         .join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR);
-    tokio::fs::create_dir_all(&archive_folder)
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to archive thread: {err}"),
-        })?;
-    let archived_path = archive_folder.join(&file_name);
-    tokio::fs::rename(&canonical_rollout_path, &archived_path)
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to archive thread: {err}"),
-        })?;
+    let archived_path =
+        codex_rollout::move_rollout_to_directory(&canonical_rollout_path, &archive_folder)
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("failed to archive thread: {err}"),
+            })?;
 
     if let Some(ctx) = state_db_ctx
         && let Err(err) = ctx
@@ -94,12 +89,17 @@ mod tests {
         let active_path =
             write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("session file");
 
+        let stale_compressed_path = active_path.with_extension("jsonl.zst");
+        std::fs::write(&stale_compressed_path, b"stale compressed sibling")
+            .expect("write stale sibling");
+
         store
             .archive_thread(ArchiveThreadParams { thread_id })
             .await
             .expect("archive thread");
 
         assert!(!active_path.exists());
+        assert!(!stale_compressed_path.exists());
         let archived_path = home
             .path()
             .join(ARCHIVED_SESSIONS_SUBDIR)

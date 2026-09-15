@@ -44,6 +44,7 @@ use codex_http_client::HttpClient;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::RouteAwareClientPool;
 use codex_login::AuthManager;
+use codex_login::default_client::create_client_pool_without_request_logging;
 use codex_state::StateRuntime;
 use futures::FutureExt;
 use gethostname::gethostname;
@@ -69,10 +70,7 @@ use tracing::warn;
 pub(super) const REMOTE_CONTROL_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
 
 fn remote_control_http_clients(factory: HttpClientFactory) -> RouteAwareClientPool {
-    RouteAwareClientPool::with_chatgpt_cloudflare_cookies_without_request_logging(
-        factory,
-        ClientRouteClass::Api,
-    )
+    create_client_pool_without_request_logging(factory, ClientRouteClass::Api)
 }
 
 pub struct RemoteControlStartConfig {

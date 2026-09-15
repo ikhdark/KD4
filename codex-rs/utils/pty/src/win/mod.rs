@@ -281,7 +281,10 @@ impl std::future::Future for WinChild {
                 }
                 // oneshot replaces the registered waker on each poll. Repolling
                 // the child never creates another native waiter thread.
-                let receiver = self.waiter.as_mut().ok_or_else(|| anyhow::anyhow!("process waiter was not initialized"))?;
+                let receiver = self
+                    .waiter
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("process waiter was not initialized"))?;
                 match std::future::Future::poll(Pin::new(receiver), cx) {
                     Poll::Pending => Poll::Pending,
                     Poll::Ready(result) => {
@@ -466,7 +469,10 @@ mod waiter_tests {
         process.0.wait()?;
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while latest.0.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(
+                Duration::from_millis(5)
+                    .min(deadline.saturating_duration_since(std::time::Instant::now())),
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
         assert_eq!(old.0.load(Ordering::SeqCst), 0);
@@ -490,9 +496,10 @@ mod waiter_tests {
                 .spawn()?,
         );
         // SAFETY: the child owns this live process handle while it is duplicated.
-        let native =
-            unsafe { std::os::windows::io::BorrowedHandle::borrow_raw(AsRawHandle::as_raw_handle(&process.0)) }
-                .try_clone_to_owned()?;
+        let native = unsafe {
+            std::os::windows::io::BorrowedHandle::borrow_raw(AsRawHandle::as_raw_handle(&process.0))
+        }
+        .try_clone_to_owned()?;
         use std::os::windows::io::IntoRawHandle;
         // SAFETY: ownership of the duplicate is transferred into the native wrapper.
         let owned = unsafe { OwnedHandle::from_raw_handle(native.into_raw_handle()) };

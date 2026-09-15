@@ -938,6 +938,7 @@ impl ContextManager {
         self.items
     }
 
+    #[cfg(test)]
     pub(crate) fn history_version(&self) -> u64 {
         self.history_version
     }

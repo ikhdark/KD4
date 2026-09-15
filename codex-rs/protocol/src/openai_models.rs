@@ -417,8 +417,6 @@ pub struct ModelInfo {
     pub supports_search_tool: bool,
     #[serde(default)]
     pub use_responses_lite: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auto_review_model_override: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -491,7 +489,6 @@ pub struct ModelMessages {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 pub struct ApprovalMessages {
     pub on_request: Option<String>,
-    pub on_request_auto_review: Option<String>,
 }
 
 impl ModelMessages {
@@ -730,7 +727,6 @@ mod tests {
             used_fallback_model_metadata: false,
             supports_search_tool: false,
             use_responses_lite: false,
-            auto_review_model_override: None,
             tool_mode: None,
             multi_agent_version: None,
         }
@@ -770,7 +766,6 @@ mod tests {
             messages.approvals,
             Some(ApprovalMessages {
                 on_request: Some(String::new()),
-                on_request_auto_review: None,
             })
         );
     }
@@ -1040,7 +1035,6 @@ mod tests {
         assert!(!model.supports_search_tool);
         assert!(!model.use_responses_lite);
         assert_eq!(model.comp_hash, None);
-        assert_eq!(model.auto_review_model_override, None);
         assert_eq!(model.tool_mode, None);
     }
 

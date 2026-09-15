@@ -381,7 +381,9 @@ pub(crate) async fn rollback_created_thread_persistence(
         return match local_store.rollback_created_thread(thread_id).await {
             Ok(()) => true,
             Err(err) => {
-                warn!("failed to remove local persistence for rolled-back thread {thread_id}: {err}");
+                warn!(
+                    "failed to remove local persistence for rolled-back thread {thread_id}: {err}"
+                );
                 false
             }
         };
@@ -492,15 +494,6 @@ fn apply_reconstructed_settings_to_config(
             .approval_policy
             .set(approval_policy)
             .map_err(invalid_reconstructed_setting)?;
-    }
-    if let Some(approvals_reviewer) = settings.approvals_reviewer {
-        config
-            .config_layer_stack
-            .requirements()
-            .approvals_reviewer
-            .can_set(&approvals_reviewer)
-            .map_err(invalid_reconstructed_setting)?;
-        config.approvals_reviewer = approvals_reviewer;
     }
 
     if let Some(permission_profile) = settings.permission_profile.as_ref() {

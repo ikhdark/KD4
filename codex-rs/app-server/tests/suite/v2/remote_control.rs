@@ -280,13 +280,9 @@ async fn listen_off_honors_persisted_remote_control_enable_with_residency_before
         .build()
         .await?;
     let request = timeout(STARTUP_TIMEOUT, read_http_request(&listener)).await??;
-    assert!(
-        request
-            .request_line
-            .starts_with("GET /backend-api/wham/remote/control/server ")
-            || request
-                .request_line
-                .starts_with("POST /backend-api/wham/remote/control/server/refresh ")
+    assert_eq!(
+        request.request_line,
+        "POST /backend-api/wham/remote/control/server/refresh HTTP/1.1"
     );
     assert_eq!(
         request
@@ -294,6 +290,35 @@ async fn listen_off_honors_persisted_remote_control_enable_with_residency_before
             .get("x-openai-internal-codex-residency")
             .map(String::as_str),
         Some("us")
+    );
+    respond_with_json(
+        request.reader.into_inner(),
+        serde_json::json!({
+            "server_id": "server-id",
+            "environment_id": "environment-id",
+            "remote_control_token": "remote-control-token",
+            "expires_at": "3026-05-22T12:34:56Z",
+        }),
+    )
+    .await?;
+    let websocket_request = timeout(STARTUP_TIMEOUT, read_http_request(&listener)).await??;
+    assert_eq!(
+        websocket_request.request_line,
+        "GET /backend-api/wham/remote/control/server HTTP/1.1"
+    );
+    assert_eq!(
+        websocket_request
+            .headers
+            .get("x-openai-internal-codex-residency")
+            .map(String::as_str),
+        Some("us")
+    );
+    assert_eq!(
+        websocket_request
+            .headers
+            .get("authorization")
+            .map(String::as_str),
+        Some("Bearer remote-control-token")
     );
     Ok(())
 }

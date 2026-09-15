@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use codex_app_server_protocol::ApprovalsReviewer;
 use codex_app_server_protocol::SandboxMode;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadResumeParams;
@@ -35,7 +34,6 @@ pub fn thread_start_params_from_config(
         cwd: overrides.cwd,
         runtime_workspace_roots: Some(config.workspace_roots.clone()),
         approval_policy: Some(config.permissions.approval_policy.value().into()),
-        approvals_reviewer: Some(config.approvals_reviewer.into()),
         sandbox: sandbox_override_from_config(config, overrides.permissions.as_ref()),
         permission_profile: permission_profile_override_from_config(
             config,
@@ -52,14 +50,10 @@ pub fn thread_start_params_from_config(
 }
 
 /// Builds the common thread/resume request.
-///
-/// Persisted reviewer selection remains authoritative unless the caller supplies
-/// an explicit override for this resume operation.
 pub fn thread_resume_params_from_config(
     config: &Config,
     thread_id: String,
     overrides: ThreadLifecycleOverrides,
-    approvals_reviewer_override: Option<ApprovalsReviewer>,
 ) -> ThreadResumeParams {
     ThreadResumeParams {
         thread_id,
@@ -69,7 +63,6 @@ pub fn thread_resume_params_from_config(
         cwd: overrides.cwd,
         runtime_workspace_roots: Some(config.workspace_roots.clone()),
         approval_policy: Some(config.permissions.approval_policy.value().into()),
-        approvals_reviewer: approvals_reviewer_override,
         sandbox: sandbox_override_from_config(config, overrides.permissions.as_ref()),
         permission_profile: permission_profile_override_from_config(
             config,
@@ -97,7 +90,6 @@ pub fn thread_fork_params_from_config(
         cwd: overrides.cwd,
         runtime_workspace_roots: Some(config.workspace_roots.clone()),
         approval_policy: Some(config.permissions.approval_policy.value().into()),
-        approvals_reviewer: Some(config.approvals_reviewer.into()),
         sandbox: sandbox_override_from_config(config, overrides.permissions.as_ref()),
         permission_profile: permission_profile_override_from_config(
             config,

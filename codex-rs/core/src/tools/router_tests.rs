@@ -1770,8 +1770,7 @@ async fn router_apply_patch_cancel_during_approval_has_no_mutation() -> anyhow::
     let turn_mut = Arc::get_mut(&mut turn).expect("uniquely owned turn fixture");
     set_router_environment(turn_mut, &repo);
     turn_mut.permission_profile = PermissionProfile::Disabled;
-    let mut config = (*turn_mut.config).clone();
-    config.approvals_reviewer = codex_protocol::config_types::ApprovalsReviewer::User;
+    let config = (*turn_mut.config).clone();
     turn_mut.config = Arc::new(config);
     turn_mut
         .approval_policy

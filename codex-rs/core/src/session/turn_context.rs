@@ -91,6 +91,7 @@ pub(crate) struct TurnEnvironment {
     pub(crate) shell: Option<shell::Shell>,
     pub(crate) operating_system: Option<String>,
     pub(crate) shell_snapshot: ShellSnapshotTask,
+    pub(crate) shell_snapshot_tasks: Option<tokio_util::task::TaskTracker>,
     lifecycle: Option<Arc<TurnEnvironmentLifecycle>>,
 }
 
@@ -108,6 +109,7 @@ impl TurnEnvironment {
             cwd,
             shell,
             shell_snapshot: futures::future::ready(None).boxed().shared(),
+            shell_snapshot_tasks: None,
             lifecycle: None,
         }
     }
@@ -237,7 +239,6 @@ fn same_turn_config_projection(left: &Config, right: &Config) -> bool {
         && left.model_reasoning_summary == right.model_reasoning_summary
         && left.service_tier == right.service_tier
         && left.personality == right.personality
-        && left.approvals_reviewer == right.approvals_reviewer
         && left.web_search_mode == right.web_search_mode
         && left.features == right.features
 }
@@ -665,7 +666,6 @@ impl TurnContext {
             current_date: self.current_date.clone(),
             timezone: self.timezone.clone(),
             approval_policy: self.approval_policy.value(),
-            approvals_reviewer: Some(self.config.approvals_reviewer),
             sandbox_policy: self.sandbox_policy(),
             permission_profile: Some(self.permission_profile()),
             network: self.turn_context_network_item(),
@@ -734,7 +734,6 @@ impl Session {
         per_turn_config.model_reasoning_summary = session_configuration.model_reasoning_summary;
         per_turn_config.service_tier = session_configuration.service_tier.clone();
         per_turn_config.personality = session_configuration.personality;
-        per_turn_config.approvals_reviewer = session_configuration.approvals_reviewer;
         session_configuration
             .apply_permission_profile_to_permissions(&mut per_turn_config.permissions);
         let permission_profile = session_configuration.permission_profile();

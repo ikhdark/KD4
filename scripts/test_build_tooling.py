@@ -23,6 +23,26 @@ from scripts.build_tooling_test_support import (
 
 
 class BuildToolingEnvironmentTest(unittest.TestCase):
+    def test_recipe_preserves_explicit_empty_compiler_wrapper(self):
+        shell = load_just_shell_module()
+        observed = {}
+
+        def run_recipe(*args, **kwargs):
+            observed.update(os.environ)
+            return 7
+
+        with (
+            mock.patch.object(sys, "argv", ["just-shell.py", "cargo check"]),
+            mock.patch.dict(os.environ, {"RUSTC_WRAPPER": ""}, clear=True),
+            mock.patch.object(shell, "python_tool_env", return_value={}),
+            mock.patch.object(shell.shutil, "which", return_value="/tools/sccache"),
+            mock.patch.object(shell, "run_powershell", side_effect=run_recipe),
+        ):
+            self.assertEqual(shell.main(), 7)
+        self.assertEqual(observed["RUSTC_WRAPPER"], "")
+        self.assertNotIn("SCCACHE_BASEDIR", observed)
+        self.assertNotIn("SCCACHE_CACHE_SIZE", observed)
+
     def test_dynamic_loader_registers_postponed_dataclass_and_restores_on_failure(self):
         from scripts import build_tooling_test_support as support
 
@@ -855,11 +875,15 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         self.assertIs(fast_profile.get("fail-fast", local_profile["fail-fast"]), False)
         for recipe in (
             "core-test-fast target *args:",
-            "_core-test-lane-reserved target *args:",
+            "core-test-lane target *args:",
         ):
             body = justfile.split(recipe, 1)[1].split("\n\n", 1)[0]
-            self.assertIn('$env:NEXTEST_PROFILE = "fast"', body)
+            self.assertIn('just _core-test-reserved fast "{{ target }}"', body)
             self.assertNotIn("--fail-fast", body)
+        reserved = justfile.split("_core-test-reserved profile target *args:", 1)[1].split(
+            "\n\n", 1
+        )[0]
+        self.assertIn('$env:NEXTEST_PROFILE = "{{ profile }}"', reserved)
         local_app_server_override = {
             "filter": "package(codex-app-server) & kind(test)",
             "test-group": "app_server_integration_local",

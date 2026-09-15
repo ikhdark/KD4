@@ -22,8 +22,6 @@ pub enum SlashCommand {
     #[strum(serialize = "sandbox-add-read-dir")]
     SandboxReadRoot,
     Experimental,
-    #[strum(to_string = "approve")]
-    AutoReview,
     Memories,
     Skills,
     Import,
@@ -132,7 +130,6 @@ impl SlashCommand {
                 "let sandbox read a directory: /sandbox-add-read-dir <absolute_path>"
             }
             SlashCommand::Experimental => "toggle experimental features",
-            SlashCommand::AutoReview => "approve one retry of a recent auto-review denial",
             SlashCommand::Memories => "configure memory use and generation",
             SlashCommand::Mcp => "list configured MCP tools; use /mcp verbose for details",
             SlashCommand::Apps => "manage apps",
@@ -229,7 +226,6 @@ impl SlashCommand {
             | SlashCommand::Plugins
             | SlashCommand::Title
             | SlashCommand::Statusline
-            | SlashCommand::AutoReview
             | SlashCommand::Feedback
             | SlashCommand::Ide
             | SlashCommand::Quit
@@ -299,15 +295,6 @@ mod tests {
         assert!(SlashCommand::Raw.available_in_side_conversation());
         assert!(SlashCommand::Raw.supports_inline_args());
         assert!(SlashCommand::App.available_during_task());
-    }
-
-    #[test]
-    fn auto_review_command_is_approve() {
-        assert_eq!(SlashCommand::AutoReview.command(), "approve");
-        assert_eq!(
-            SlashCommand::from_str("approve"),
-            Ok(SlashCommand::AutoReview)
-        );
     }
 
     #[test]

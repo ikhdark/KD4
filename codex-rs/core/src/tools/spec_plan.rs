@@ -239,11 +239,11 @@ fn build_tool_specs_and_registry(
     promote_deferred_tools_without_search(turn_context, &mut planned_tools);
     apply_direct_model_only_namespace_overrides(turn_context, &mut planned_tools);
     retain_unique_planned_tool_names(&mut planned_tools);
-    if !crate::guardian::is_guardian_reviewer_source(&turn_context.session_source) {
-        for spec in hosted_model_tool_specs(&context, &planned_tools) {
-            planned_tools.add_hosted_spec(spec);
-        }
+
+    for spec in hosted_model_tool_specs(&context, &planned_tools) {
+        planned_tools.add_hosted_spec(spec);
     }
+
     apply_namespace_description_budget(&mut planned_tools);
     append_tool_search_executor(&context, &mut planned_tools);
     prepend_code_mode_executors(&context, &mut planned_tools)?;
@@ -832,44 +832,6 @@ fn merge_into_namespaces(specs: Vec<ToolSpec>) -> Vec<ToolSpec> {
 
 #[instrument(level = "trace", skip_all)]
 fn add_tool_sources(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools) {
-    if crate::guardian::is_guardian_reviewer_source(&context.step_context.turn.session_source) {
-        let turn_context = context.step_context.turn.as_ref();
-        let environment_mode = tool_environment_mode(context.step_context);
-        if environment_mode.has_environment() {
-            let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
-            planned_tools.add_with_authorization_class(
-                ExecCommandHandler::new(ExecCommandHandlerOptions {
-                    allow_login_shell: turn_context.config.permissions.allow_login_shell,
-                    allow_escalated_sandbox_permissions: matches!(
-                        turn_context.approval_policy.value(),
-                        AskForApproval::OnRequest
-                    ),
-                    exec_permission_approvals_enabled: false,
-                    include_environment_id,
-                    include_shell_parameter: true,
-                }),
-                TypedToolClass::Shell,
-            );
-            planned_tools.add_with_authorization_class(WriteStdinHandler, TypedToolClass::Shell);
-            if turn_context
-                .model_info
-                .input_modalities
-                .contains(&InputModality::Image)
-            {
-                planned_tools.add_with_authorization_class(
-                    ViewImageHandler::new(ViewImageToolOptions {
-                        can_request_original_image_detail: can_request_original_image_detail(
-                            &turn_context.model_info,
-                        ),
-                        include_environment_id,
-                    }),
-                    TypedToolClass::ReadSearch,
-                );
-            }
-        }
-        return;
-    }
-
     add_shell_tools(context, planned_tools);
     add_mcp_resource_tools(context, planned_tools);
     add_core_utility_tools(context, planned_tools);

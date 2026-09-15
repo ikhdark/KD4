@@ -23,8 +23,6 @@ impl ChatWidget {
         let current_approval =
             AskForApproval::from(self.config.permissions.approval_policy.value());
         let current_permission_profile = self.config.permissions.permission_profile().clone();
-        let guardian_approval_enabled = self.config.features.enabled(Feature::GuardianApproval);
-        let current_review_policy = self.config.approvals_reviewer;
         let mut items: Vec<SelectionItem> = Vec::new();
         let presets: Vec<ApprovalPreset> = builtin_approval_presets();
 
@@ -35,16 +33,6 @@ impl ChatWidget {
 
         let show_elevate_sandbox_hint =
             windows_degraded_sandbox_enabled && presets.iter().any(|preset| preset.id == "auto");
-
-        let guardian_disabled_reason = |enabled: bool| {
-            let mut next_features = self.config.features.get().clone();
-            next_features.set_enabled(Feature::GuardianApproval, enabled);
-            self.config
-                .features
-                .can_set(&next_features)
-                .err()
-                .map(|err| err.to_string())
-        };
 
         for preset in presets.into_iter() {
             if !include_read_only && preset.id == "read-only" {
@@ -75,73 +63,26 @@ impl ChatWidget {
                     .err()
                     .map(|err| err.to_string())
             });
-            let default_disabled_reason = approval_disabled_reason
-                .clone()
-                .or_else(|| guardian_disabled_reason(false));
             let default_actions = self.permission_mode_actions(
                 &preset,
                 base_name.clone(),
-                ApprovalsReviewer::User,
                 /*profile_selection*/ None,
                 /*return_to_permissions*/ !include_read_only,
             );
-            if preset.id == "auto" {
-                items.push(SelectionItem {
-                    name: base_name.clone(),
-                    description: base_description.clone(),
-                    is_current: current_review_policy == ApprovalsReviewer::User
-                        && Self::preset_matches_current(
-                            current_approval,
-                            &current_permission_profile,
-                            self.config.cwd.as_path(),
-                            &preset,
-                        ),
-                    actions: default_actions,
-                    dismiss_on_select: true,
-                    disabled_reason: default_disabled_reason,
-                    ..Default::default()
-                });
-
-                if guardian_approval_enabled {
-                    items.push(SelectionItem {
-                        name: APPROVE_FOR_ME_LABEL.to_string(),
-                        description: Some(AUTO_REVIEW_DESCRIPTION.to_string()),
-                        is_current: current_review_policy == ApprovalsReviewer::AutoReview
-                            && Self::preset_matches_current(
-                                current_approval,
-                                &current_permission_profile,
-                                self.config.cwd.as_path(),
-                                &preset,
-                            ),
-                        actions: self.permission_mode_actions(
-                            &preset,
-                            APPROVE_FOR_ME_LABEL.to_string(),
-                            ApprovalsReviewer::AutoReview,
-                            /*profile_selection*/ None,
-                            /*return_to_permissions*/ !include_read_only,
-                        ),
-                        dismiss_on_select: true,
-                        disabled_reason: approval_disabled_reason
-                            .or_else(|| guardian_disabled_reason(true)),
-                        ..Default::default()
-                    });
-                }
-            } else {
-                items.push(SelectionItem {
-                    name: base_name,
-                    description: base_description,
-                    is_current: Self::preset_matches_current(
-                        current_approval,
-                        &current_permission_profile,
-                        self.config.cwd.as_path(),
-                        &preset,
-                    ),
-                    actions: default_actions,
-                    dismiss_on_select: true,
-                    disabled_reason: default_disabled_reason,
-                    ..Default::default()
-                });
-            }
+            items.push(SelectionItem {
+                name: base_name,
+                description: base_description,
+                is_current: Self::preset_matches_current(
+                    current_approval,
+                    &current_permission_profile,
+                    self.config.cwd.as_path(),
+                    &preset,
+                ),
+                actions: default_actions,
+                dismiss_on_select: true,
+                disabled_reason: approval_disabled_reason,
+                ..Default::default()
+            });
         }
 
         let footer_note = show_elevate_sandbox_hint.then(|| {
@@ -163,107 +104,16 @@ impl ChatWidget {
         });
     }
 
-    pub(crate) fn open_auto_review_denials_popup(&mut self) {
-        if self.review.recent_auto_review_denials.is_empty() {
-            self.add_info_message(
-                "No recent auto-review denials in this thread.".to_string(),
-                Some("Denials are recorded after auto-review rejects an action.".to_string()),
-            );
-            return;
-        }
-        let Some(thread_id) = self.thread_id() else {
-            self.add_error_message("That thread is no longer available.".to_string());
-            return;
-        };
-
-        let mut items = vec![SelectionItem {
-            name: "Command".to_string(),
-            description: Some("Rationale".to_string()),
-            is_disabled: true,
-            search_value: Some(String::new()),
-            ..Default::default()
-        }];
-        items.extend(
-            self.review
-                .recent_auto_review_denials
-                .entries()
-                .map(|event| {
-                    let id = event.id.clone();
-                    let summary = auto_review_denials::action_summary(&event.action);
-                    let rationale = event
-                        .rationale
-                        .as_deref()
-                        .unwrap_or("Auto-review did not include a rationale.");
-                    SelectionItem {
-                        name: summary.clone(),
-                        description: Some(rationale.to_string()),
-                        selected_description: Some(rationale.to_string()),
-                        search_value: Some(format!("{summary} {rationale}")),
-                        actions: vec![Box::new(move |tx| {
-                            tx.send(AppEvent::ApproveRecentAutoReviewDenial {
-                                thread_id,
-                                id: id.clone(),
-                            });
-                        })],
-                        dismiss_on_select: true,
-                        ..Default::default()
-                    }
-                }),
-        );
-
-        self.bottom_pane.show_selection_view(SelectionViewParams {
-            title: Some("Auto-review Denials".to_string()),
-            subtitle: Some("Select a denied action to approve.".to_string()),
-            footer_hint: Some(standard_popup_hint_line()),
-            items,
-            is_searchable: true,
-            col_width_mode: ColumnWidthMode::AutoAllRows,
-            ..Default::default()
-        });
-        self.request_redraw();
-    }
-
-    pub(crate) fn recent_auto_review_denial(
-        &mut self,
-        thread_id: ThreadId,
-        id: &str,
-    ) -> Option<GuardianAssessmentEvent> {
-        if self.thread_id() != Some(thread_id) {
-            self.add_error_message("That thread is no longer available.".to_string());
-            return None;
-        }
-        let event = self
-            .review
-            .recent_auto_review_denials
-            .entries()
-            .find(|event| event.id == id)
-            .cloned();
-        if event.is_none() {
-            self.add_error_message("That auto-review denial is no longer available.".to_string());
-        }
-        event
-    }
-
-    pub(crate) fn complete_recent_auto_review_denial(&mut self, id: &str) {
-        self.review.recent_auto_review_denials.take(id);
-        self.add_info_message(
-            "Approval submitted for one retry of the selected auto-review denial.".to_string(),
-            Some("The retry still goes through auto-review.".to_string()),
-        );
-    }
-
     pub(super) fn approval_preset_actions(
         approval: AskForApproval,
         permission_profile: PermissionProfile,
         active_permission_profile: ActivePermissionProfile,
         label: String,
-        approvals_reviewer: ApprovalsReviewer,
     ) -> Vec<SelectionAction> {
         vec![Box::new(move |tx| {
             tx.send(AppEvent::CodexOp(AppCommand::override_turn_context(
                 /*cwd*/ None,
                 Some(approval),
-                Some(approvals_reviewer),
                 Some(permission_profile.clone()),
                 Some(active_permission_profile.clone()),
                 /*windows_sandbox_level*/ None,
@@ -278,7 +128,6 @@ impl ChatWidget {
             tx.send(AppEvent::UpdateActivePermissionProfile(
                 active_permission_profile.clone(),
             ));
-            tx.send(AppEvent::UpdateApprovalsReviewer(approvals_reviewer));
             tx.send(AppEvent::InsertHistoryCell(Box::new(
                 history_cell::new_info_event(
                     format!("Permissions updated to {label}"),
@@ -300,7 +149,6 @@ impl ChatWidget {
         &self,
         preset: &ApprovalPreset,
         label: String,
-        approvals_reviewer: ApprovalsReviewer,
         profile_selection: Option<PermissionProfileSelection>,
         return_to_permissions: bool,
     ) -> Vec<SelectionAction> {
@@ -312,14 +160,12 @@ impl ChatWidget {
                         preset.permission_profile.clone(),
                         preset.active_permission_profile.clone(),
                         label.clone(),
-                        approvals_reviewer,
                     )
                 },
                 Self::permission_profile_selection_actions,
             )
         };
-        let requires_confirmation =
-            approvals_reviewer == ApprovalsReviewer::User && preset.id == "full-access";
+        let requires_confirmation = preset.id == "full-access";
         if requires_confirmation {
             let preset = preset.clone();
             return vec![Box::new(move |tx| {
@@ -330,7 +176,7 @@ impl ChatWidget {
                 });
             })];
         }
-        if approvals_reviewer == ApprovalsReviewer::User && preset.id == "auto" {
+        if preset.id == "auto" {
             {
                 if crate::windows_sandbox::level_from_config(&self.config)
                     == WindowsSandboxLevel::Disabled
@@ -354,7 +200,6 @@ impl ChatWidget {
                         tx.send(AppEvent::CheckWorldWritablePermissionMode {
                             preset: preset.clone(),
                             label: label.clone(),
-                            approvals_reviewer,
                             profile_selection: profile_selection.clone(),
                         });
                     })];
@@ -368,7 +213,6 @@ impl ChatWidget {
         &mut self,
         preset: ApprovalPreset,
         label: String,
-        approvals_reviewer: ApprovalsReviewer,
         profile_selection: Option<PermissionProfileSelection>,
     ) {
         if let Some((sample_paths, extra_count, failed_scan)) =
@@ -390,7 +234,6 @@ impl ChatWidget {
                     preset.permission_profile,
                     preset.active_permission_profile,
                     label,
-                    approvals_reviewer,
                 )
             },
             Self::permission_profile_selection_actions,
@@ -468,7 +311,6 @@ impl ChatWidget {
                     preset.permission_profile,
                     preset.active_permission_profile,
                     selected_name,
-                    ApprovalsReviewer::User,
                 )
             },
             Self::permission_profile_selection_actions,

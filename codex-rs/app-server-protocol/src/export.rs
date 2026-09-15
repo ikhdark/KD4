@@ -41,6 +41,9 @@ use std::thread;
 use ts_rs::TS;
 
 pub(crate) const GENERATED_TS_HEADER: &str = "// GENERATED CODE! DO NOT MODIFY BY HAND!\n\n";
+// Header processing also visits existing user files in the output directory.
+// Support up to 64 MiB per TypeScript file without an unbounded allocation.
+const MAX_TYPESCRIPT_HEADER_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 const IGNORED_DEFINITIONS: &[&str] = &["Option<()>"];
 const JSON_V1_ALLOWLIST: &[&str] = &["InitializeParams", "InitializeResponse"];
 const EXPERIMENTAL_CLIENT_METHOD_DEPENDENCY_TYPES: &[&str] = &[
@@ -2049,13 +2052,20 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 }
 
 fn prepend_header_if_missing(path: &Path) -> Result<()> {
-    let mut content = String::new();
-    {
-        let mut f = fs::File::open(path)
-            .with_context(|| format!("Failed to open {} for reading", path.display()))?;
-        f.read_to_string(&mut content)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .with_context(|| format!("Failed to open {} for reading", path.display()))?
+        .take(MAX_TYPESCRIPT_HEADER_INPUT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    if bytes.len() as u64 > MAX_TYPESCRIPT_HEADER_INPUT_BYTES {
+        return Err(anyhow!(
+            "TypeScript file {} exceeds the {MAX_TYPESCRIPT_HEADER_INPUT_BYTES}-byte header processing limit",
+            path.display()
+        ));
     }
+    let content = String::from_utf8(bytes)
+        .with_context(|| format!("Failed to read {} as UTF-8", path.display()))?;
 
     if content.starts_with(GENERATED_TS_HEADER) {
         return Ok(());
@@ -2227,6 +2237,47 @@ mod tests {
     use std::path::Path;
     use std::path::PathBuf;
     use uuid::Uuid;
+
+    #[test]
+    fn generate_ts_rejects_oversized_existing_file_without_rewriting_it() -> Result<()> {
+        use std::io::Seek;
+        use std::io::SeekFrom;
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("existing-user-file.ts");
+        let original_prefix = b"// preserve this user file\n";
+        let original_suffix = b"// end\n";
+        let original_len = MAX_TYPESCRIPT_HEADER_INPUT_BYTES + 1;
+        let mut file = fs::File::create(&path)?;
+        file.write_all(original_prefix)?;
+        file.set_len(original_len)?;
+        file.seek(SeekFrom::End(-(original_suffix.len() as i64)))?;
+        file.write_all(original_suffix)?;
+        drop(file);
+
+        let error = generate_ts_with_options(
+            dir.path(),
+            None,
+            GenerateTsOptions {
+                run_prettier: false,
+                ..GenerateTsOptions::default()
+            },
+        )
+        .expect_err("oversized existing TypeScript must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("existing-user-file.ts"));
+        assert!(message.contains("header processing limit"));
+        let mut file = fs::File::open(&path)?;
+        assert_eq!(file.metadata()?.len(), original_len);
+        let mut prefix = vec![0; original_prefix.len()];
+        file.read_exact(&mut prefix)?;
+        assert_eq!(prefix, original_prefix);
+        file.seek(SeekFrom::End(-(original_suffix.len() as i64)))?;
+        let mut suffix = vec![0; original_suffix.len()];
+        file.read_exact(&mut suffix)?;
+        assert_eq!(suffix, original_suffix);
+        Ok(())
+    }
 
     #[test]
     fn generated_ts_optional_nullable_fields_only_in_params() -> Result<()> {

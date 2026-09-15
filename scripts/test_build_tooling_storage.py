@@ -24,6 +24,319 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 class BuildToolingStorageTest(unittest.TestCase):
+    def test_indirect_roots_are_rejected_before_launch_or_prune(self):
+        for source in ("default", "environment", "explicit", "ancestor"):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as temp:
+                repo = Path(temp) / "repo"
+                external = Path(temp) / "external"
+                external.mkdir()
+                lanes = repo / "codex-rs" / "target" / "lanes"
+                link = lanes if source in {"default", "ancestor"} else repo / "custom"
+                if source == "ancestor":
+                    link = lanes.parent
+                link.parent.mkdir(parents=True)
+                outside_lanes = external / "lanes" if source == "ancestor" else external
+                sentinel = outside_lanes / "family-photos" / "keep.txt"
+                sentinel.parent.mkdir(parents=True)
+                sentinel.write_text("keep", encoding="utf-8")
+                if os.name == "nt":
+                    result = subprocess.run(
+                        [
+                            powershell(),
+                            "-NoProfile",
+                            "-Command",
+                            f"New-Item -ItemType Junction -Path {ps_single_quote(link)} "
+                            f"-Target {ps_single_quote(external)} | Out-Null",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        creationflags=CREATE_NO_WINDOW,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                else:
+                    link.symlink_to(external, target_is_directory=True)
+                selected = lanes if source == "ancestor" else link
+                env = (
+                    {}
+                    if source in {"default", "ancestor"}
+                    else {"CODEX_CARGO_LANES_ROOT": str(selected)}
+                )
+                with (
+                    mock.patch.dict(os.environ, env, clear=True),
+                    mock.patch.object(rust_build_status.subprocess, "run") as child,
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    arguments = ["run-lane", "--repo-root", str(repo), "--lane", "unit"]
+                    if source == "explicit":
+                        arguments += ["--lanes-root", str(selected)]
+                    self.assertEqual(
+                        rust_build_status.main([*arguments, "--", "cargo", "check"]), 2
+                    )
+                    with self.assertRaisesRegex(
+                        rust_build_status.CargoLanesRootValidationError, "indirect"
+                    ):
+                        rust_build_status.prune_stale_lanes(
+                            repo_root=repo,
+                            processes=[],
+                            keep_warm_per_base=0,
+                        )
+                child.assert_not_called()
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+                self.assertEqual(
+                    sorted(path.name for path in outside_lanes.iterdir()),
+                    ["family-photos"],
+                )
+
+    def test_disappearing_profile_does_not_authorize_pruning(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            lane = repo / "codex-rs" / "target" / "lanes" / "unit"
+            profile = lane / "debug"
+            profile.mkdir(parents=True)
+            sentinel = lane / "keep.txt"
+            sentinel.write_text("keep", encoding="utf-8")
+            original = Path.iterdir
+
+            def raced_iterdir(path):
+                if path == profile:
+                    raise FileNotFoundError("profile disappeared during inspection")
+                return original(path)
+
+            with mock.patch.object(Path, "iterdir", raced_iterdir):
+                self.assertTrue(rust_build_status.cargo_lock_is_busy(lane))
+                self.assertEqual(
+                    rust_build_status.prune_stale_lanes(
+                        repo_root=repo,
+                        processes=[],
+                        keep_warm_per_base=0,
+                    ),
+                    [],
+                )
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+
+    def test_failed_deletion_does_not_stamp_success_and_retries_are_throttled(self):
+        for error in (
+            PermissionError("held file"),
+            FileNotFoundError("child vanished"),
+        ):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as temp:
+                repo = Path(temp)
+                lanes = repo / "codex-rs" / "target" / "lanes"
+                old = lanes / "old"
+                old.mkdir(parents=True)
+                (old / "artifact").write_text("old", encoding="utf-8")
+                (old / ".lane-last-used").touch()
+                os.utime(old / ".lane-last-used", (1, 1))
+                with (
+                    mock.patch.dict(os.environ, {}, clear=True),
+                    mock.patch.object(
+                        rust_build_status, "active_rust_processes", return_value=[]
+                    ),
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    with mock.patch.object(
+                        rust_build_status,
+                        "remove_tree_allow_readonly",
+                        side_effect=error,
+                    ) as remove:
+                        rust_build_status.maintain_cargo_lanes(repo, lanes)
+                        self.assertEqual(remove.call_count, 1)
+                    trash = list(lanes.glob("old.trash-*"))
+                    self.assertEqual(len(trash), 1)
+                    self.assertEqual((trash[0] / "artifact").read_text(), "old")
+                    self.assertFalse((lanes / ".gc-stamp").exists())
+                    retry = lanes / ".gc-retry"
+                    self.assertTrue(retry.is_file())
+                    with mock.patch.object(
+                        rust_build_status, "prune_stale_lanes"
+                    ) as prune:
+                        rust_build_status.maintain_cargo_lanes(repo, lanes)
+                        prune.assert_not_called()
+                    os.utime(retry, (1, 1))
+                    rust_build_status.maintain_cargo_lanes(repo, lanes)
+                self.assertFalse(list(lanes.glob("*.trash-*")))
+                self.assertTrue((lanes / ".gc-stamp").is_file())
+                self.assertFalse(retry.exists())
+
+    def test_maintenance_skips_held_lock_then_rechecks_success_stamp(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            handle = rust_build_status._try_acquire_binary_file_lock(
+                root / ".lane-gc.lock"
+            )
+            self.assertIsNotNone(handle)
+            try:
+                with mock.patch.object(rust_build_status, "prune_stale_lanes") as prune:
+                    rust_build_status.maintain_cargo_lanes(root, root)
+                    prune.assert_not_called()
+                self.assertFalse((root / ".gc-stamp").exists())
+            finally:
+                rust_build_status._release_binary_file_lock(handle)
+                handle.close()
+            acquire = rust_build_status._try_acquire_binary_file_lock
+
+            def completed_while_acquiring(path):
+                (root / ".gc-stamp").write_text(
+                    "another caller completed", encoding="utf-8"
+                )
+                return acquire(path)
+
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.object(
+                    rust_build_status,
+                    "_try_acquire_binary_file_lock",
+                    side_effect=completed_while_acquiring,
+                ),
+                mock.patch.object(rust_build_status, "prune_stale_lanes") as prune,
+            ):
+                rust_build_status.maintain_cargo_lanes(root, root)
+                prune.assert_not_called()
+            self.assertEqual(
+                (root / ".gc-stamp").read_text(), "another caller completed"
+            )
+
+    def test_run_lane_proceeds_while_another_process_owns_maintenance(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            lanes = repo / "codex-rs" / "target" / "lanes"
+            rust_build_status.initialize_cargo_lanes_root(repo, lanes)
+            lock = rust_build_status._try_acquire_binary_file_lock(
+                lanes / ".lane-gc.lock"
+            )
+            self.assertIsNotNone(lock)
+            with (
+                lock,
+                mock.patch.object(rust_build_status, "prune_stale_lanes") as prune,
+            ):
+                result = rust_build_status.run_in_cargo_lane(
+                    repo_root=repo,
+                    requested_lane="unit",
+                    command=[sys.executable, "-c", "raise SystemExit(7)"],
+                )
+                self.assertEqual(result, 7)
+                prune.assert_not_called()
+                self.assertFalse((lanes / ".gc-stamp").exists())
+
+    def test_maintenance_rechecks_stamp_after_acquiring_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            acquire = rust_build_status._try_acquire_binary_file_lock
+
+            def finish_other_maintenance(path):
+                (root / ".gc-stamp").write_text("other command completed")
+                return acquire(path)
+
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.object(
+                    rust_build_status,
+                    "_try_acquire_binary_file_lock",
+                    side_effect=finish_other_maintenance,
+                ),
+                mock.patch.object(rust_build_status, "prune_stale_lanes") as prune,
+            ):
+                rust_build_status.maintain_cargo_lanes(root, root)
+            prune.assert_not_called()
+            self.assertEqual(
+                (root / ".gc-stamp").read_text(), "other command completed"
+            )
+            with acquire(root / ".lane-gc.lock") as released:
+                self.assertIsNotNone(released)
+
+    def test_auto_lane_prefers_last_used_stamp_over_directory_mtime(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            lanes = repo / "codex-rs" / "target" / "lanes"
+            rust_build_status.initialize_cargo_lanes_root(repo, lanes)
+            for name, stamp_time, dir_time in (("probe-2", 10, 30), ("probe-3", 20, 1)):
+                lane = lanes / name
+                lane.mkdir()
+                stamp = lane / ".lane-last-used"
+                stamp.touch()
+                os.utime(stamp, (stamp_time, stamp_time))
+                os.utime(lane, (dir_time, dir_time))
+            with rust_build_status.reserve_cargo_lane(
+                repo_root=repo,
+                requested_lane="auto",
+                command=["cargo", "check", "-p=probe"],
+            ) as (name, target):
+                self.assertEqual(name, "probe-3")
+                self.assertEqual(target, lanes / "probe-3")
+
+    def test_run_lane_maintains_before_failed_child_without_forcing_post_cleanup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            lanes = repo / "codex-rs" / "target" / "lanes"
+            rust_build_status.initialize_cargo_lanes_root(repo, lanes)
+            old = lanes / "old"
+            old.mkdir()
+            (old / "artifact").write_text("old", encoding="utf-8")
+            old_stamp = old / ".lane-last-used"
+            old_stamp.write_text("old", encoding="utf-8")
+            os.utime(old_stamp, (1, 1))
+            late = lanes / "late"
+            # The child proves pre-cleanup happened. An expired lane it creates
+            # must survive until scheduled or explicitly requested maintenance.
+            script = (
+                "import os,pathlib,sys; "
+                "assert not pathlib.Path(sys.argv[1]).exists(); "
+                "p=pathlib.Path(sys.argv[2]); p.mkdir(); os.utime(p,(1,1)); sys.exit(7)"
+            )
+            with (
+                mock.patch.object(
+                    rust_build_status, "active_rust_processes", return_value=[]
+                ),
+                mock.patch.object(
+                    rust_build_status, "directory_sizes_bytes"
+                ) as lane_sizes,
+                mock.patch.object(
+                    rust_build_status, "target_non_lane_size_bytes"
+                ) as target_size,
+            ):
+                result = rust_build_status.run_in_cargo_lane(
+                    repo_root=repo,
+                    requested_lane="unit",
+                    command=[sys.executable, "-c", script, str(old), str(late)],
+                )
+            self.assertEqual(result, 7)
+            self.assertFalse(old.exists())
+            self.assertTrue(late.exists())
+            self.assertTrue((lanes / "unit").is_dir())
+            self.assertTrue((lanes / ".gc-stamp").is_file())
+            lane_sizes.assert_not_called()
+            target_size.assert_not_called()
+
+    def test_maintenance_honors_budgets_interval_and_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.object(rust_build_status, "prune_stale_lanes") as prune,
+            ):
+                rust_build_status.maintain_cargo_lanes(root, root)
+                self.assertIsNone(prune.call_args.kwargs["max_total_lane_bytes"])
+                self.assertIsNone(prune.call_args.kwargs["max_total_target_bytes"])
+                rust_build_status.maintain_cargo_lanes(root, root)
+                self.assertEqual(prune.call_count, 1)
+                stamp = root / ".gc-stamp"
+                previous = stamp.read_bytes()
+                os.utime(stamp, (1, 1))
+                os.environ["CODEX_CARGO_LANE_MAX_TOTAL_BYTES"] = str(200 * 1024**3)
+                os.environ["CODEX_CARGO_TARGET_MAX_TOTAL_BYTES"] = str(250 * 1024**3)
+                prune.side_effect = OSError("failed maintenance")
+                rust_build_status.maintain_cargo_lanes(root, root)
+                self.assertEqual(prune.call_count, 2)
+                self.assertEqual(
+                    prune.call_args.kwargs["max_total_lane_bytes"], 200 * 1024**3
+                )
+                self.assertEqual(
+                    prune.call_args.kwargs["max_total_target_bytes"], 250 * 1024**3
+                )
+                self.assertEqual(stamp.read_bytes(), previous)
+                self.assertNotIn("CODEX_CARGO_LANES_ROOT", os.environ)
+
     def test_configured_lane_root_and_nested_disk_accounting(self):
         with tempfile.TemporaryDirectory() as temp:
             repo = Path(temp)
@@ -213,6 +526,9 @@ class BuildToolingStorageTest(unittest.TestCase):
 
     def test_run_lane_directly_launches_known_nextest_recipe_with_argv(self) -> None:
         target = Path("C:/target path/lane")
+        maintenance = mock.patch.object(rust_build_status, "maintain_cargo_lanes")
+        maintenance.start()
+        self.addCleanup(maintenance.stop)
         command = [
             "just",
             "_test-lane-local-reserved",
@@ -266,42 +582,45 @@ class BuildToolingStorageTest(unittest.TestCase):
             child_env["RUST_MIN_STACK"], rust_build_status.RUST_MIN_STACK_BYTES
         )
 
-    def test_run_lane_keeps_shell_fallback_when_core_helpers_are_required(
-        self,
-    ) -> None:
-        target = Path("C:/target/lane")
-        command = [
-            "just",
-            "_test-lane-fast-reserved",
-            "-p",
-            "codex-core",
-            "test(core_filter)",
-        ]
-        with (
-            mock.patch.dict(rust_build_status.os.environ, {}, clear=True),
-            mock.patch.object(
-                rust_build_status,
-                "reserve_cargo_lane",
-                return_value=contextlib.nullcontext(("unit", target)),
-            ),
-            mock.patch.object(rust_build_status.shutil, "which", return_value=None),
-            mock.patch.object(
-                rust_build_status.subprocess,
-                "run",
-                return_value=subprocess.CompletedProcess(command, 0),
-            ) as run,
+    def test_run_lane_rejects_all_generic_core_selections_before_launch(self):
+        for recipe, prefix in (
+            ("_test-lane-fast-reserved", []),
+            ("_test-lane-local-reserved", []),
+            ("_test-lane-package-reserved", ["codex-tui"]),
         ):
-            result = rust_build_status.run_in_cargo_lane(
-                repo_root=Path.cwd(),
-                requested_lane="unit",
-                command=command,
-            )
-
-        self.assertEqual(result, 0)
-        self.assertEqual(run.call_args.args[0], command)
-        child_env = run.call_args.kwargs["env"]
-        self.assertNotIn("NEXTEST_PROFILE", child_env)
-        self.assertEqual(child_env["CODEX_CARGO_LANE_TARGET_DIR"], str(target))
+            for selection in (
+                ["--package=codex-core"],
+                ["-pcodex-core"],
+                ["-p=codex-core"],
+                ["-p", "path+file:///repo/core#codex-core@0.0.0"],
+                ["-p", "path+file:///repo/core#0.0.0"],
+                ["--workspace"],
+                ["-p", "codex-core"],
+                [],
+            ):
+                if prefix and not selection:
+                    continue
+                command = ["just", recipe, *prefix, *selection]
+                with (
+                    self.subTest(command=command),
+                    mock.patch.object(
+                        rust_build_status,
+                        "reserve_cargo_lane",
+                        return_value=contextlib.nullcontext(
+                            ("unit", Path("C:/target/lane"))
+                        ),
+                    ),
+                    mock.patch.object(rust_build_status.subprocess, "run") as run,
+                    mock.patch.object(
+                        rust_build_status, "maintain_cargo_lanes"
+                    ) as maintain,
+                    self.assertRaises(ValueError),
+                ):
+                    rust_build_status.run_in_cargo_lane(
+                        repo_root=Path.cwd(), requested_lane="unit", command=command
+                    )
+                run.assert_not_called()
+                maintain.assert_not_called()
 
     def test_direct_reserved_lane_commands_cover_fast_and_package_recipes(
         self,
@@ -347,6 +666,8 @@ class BuildToolingStorageTest(unittest.TestCase):
                 actual = rust_build_status._direct_reserved_lane_command(
                     command,
                     child_env,
+                    repo_root=REPO_ROOT,
+                    target_dir=Path("lane-target"),
                 )
 
                 self.assertEqual(actual, expected)
@@ -355,6 +676,161 @@ class BuildToolingStorageTest(unittest.TestCase):
                     child_env["RUST_MIN_STACK"],
                     rust_build_status.RUST_MIN_STACK_BYTES,
                 )
+
+    def test_compile_and_run_reuse_package_lane_for_equivalent_package_spellings(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            target = repo / "codex-rs" / "target" / "lanes" / "codex-tui"
+            for selection, flags in (
+                (["-p", "codex-tui"], ["--no-run"]),
+                (["-pcodex-tui"], ["first_filter"]),
+                (["-p=codex-tui"], ["second_filter"]),
+                (["--package=codex-tui"], ["--no-fail-fast"]),
+                (["--package", "codex-tui"], ["third_filter"]),
+            ):
+                with (
+                    self.subTest(selection=selection),
+                    mock.patch.object(
+                        rust_build_status, "maintain_cargo_lanes"
+                    ) as maintain,
+                    mock.patch.object(
+                        rust_build_status.shutil, "which", return_value=None
+                    ),
+                    mock.patch.object(rust_build_status.subprocess, "run") as run,
+                ):
+                    run.return_value.returncode = 0
+                    self.assertEqual(
+                        rust_build_status.run_in_cargo_lane(
+                            repo_root=repo,
+                            requested_lane="auto",
+                            command=["cargo", "nextest", "run", *selection, *flags],
+                        ),
+                        0,
+                    )
+                self.assertEqual(
+                    run.call_args.args[0],
+                    [
+                        "cargo",
+                        "nextest",
+                        "run",
+                        "--target-dir",
+                        str(target),
+                        *selection,
+                        *flags,
+                    ],
+                )
+                maintain.assert_called_once_with(repo, target.parent)
+                self.assertFalse(rust_build_status.lane_active_lock_is_held(target))
+
+    def test_watch_exec_retains_package_lane_affinity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            target = repo / "codex-rs" / "target" / "lanes" / "codex-tui"
+            for selection in (
+                ["-x", "check -p codex-tui"],
+                ["--exec=check -p=codex-tui"],
+            ):
+                with (
+                    self.subTest(selection=selection),
+                    mock.patch.object(rust_build_status, "maintain_cargo_lanes"),
+                    mock.patch.object(
+                        rust_build_status.shutil, "which", return_value=None
+                    ),
+                    mock.patch.object(rust_build_status.subprocess, "run") as run,
+                ):
+                    run.return_value.returncode = 0
+                    self.assertEqual(
+                        rust_build_status.run_in_cargo_lane(
+                            repo_root=repo,
+                            requested_lane="auto",
+                            command=["cargo", "watch", *selection],
+                        ),
+                        0,
+                    )
+                    self.assertEqual(
+                        run.call_args.kwargs["env"]["CODEX_CARGO_LANE_TARGET_DIR"],
+                        str(target),
+                    )
+                    self.assertIn(f"--target-dir {target}", run.call_args.args[0][-1])
+
+    def test_core_reserved_recipes_launch_runner_directly_with_reserved_target(self):
+        cases = (
+            (
+                [
+                    "_core-test-reserved",
+                    "local",
+                    "core_lib",
+                    "--no-fail-fast",
+                    "-E",
+                    "test(alpha with spaces)",
+                ],
+                [
+                    "run-target",
+                    "--profile",
+                    "local",
+                    "core_lib",
+                    "--no-fail-fast",
+                    "-E",
+                    "test(alpha with spaces)",
+                ],
+                "local",
+            ),
+            (
+                ["_core-test-reserved", "fast", "core_lib", "alpha"],
+                ["run-target", "--profile", "fast", "core_lib", "alpha"],
+                "fast",
+            ),
+            (
+                ["_core-gate-reserved", "first", "second"],
+                ["run-gate", "--profile", "fast", "first", "second"],
+                "fast",
+            ),
+            (
+                ["_core-parity-reserved", "legacy", "first", "second"],
+                ["parity", "--profile", "fast", "legacy", "first", "second"],
+                "fast",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            target = repo / "codex-rs" / "target" / "lanes" / "core-tests"
+            for arguments, expected, profile in cases:
+                with (
+                    self.subTest(arguments=arguments),
+                    mock.patch.object(rust_build_status, "maintain_cargo_lanes"),
+                    mock.patch.object(rust_build_status.subprocess, "run") as run,
+                ):
+
+                    def child(command, *, env, check):
+                        self.assertTrue(
+                            rust_build_status.lane_active_lock_is_held(target)
+                        )
+                        self.assertEqual(env["NEXTEST_PROFILE"], profile)
+                        self.assertEqual(env["RUST_MIN_STACK"], "8388608")
+                        self.assertNotIn("CODEX_CARGO_LANE_TARGET_DIR", env)
+                        self.assertNotIn("CARGO_TARGET_DIR", env)
+                        return subprocess.CompletedProcess(command, 7)
+
+                    run.side_effect = child
+                    self.assertEqual(
+                        rust_build_status.run_in_cargo_lane(
+                            repo_root=repo,
+                            requested_lane="core-tests",
+                            command=["just", *arguments],
+                        ),
+                        7,
+                    )
+                self.assertEqual(
+                    run.call_args.args[0],
+                    [
+                        sys.executable,
+                        str(repo / "scripts" / "rust_test_runner.py"),
+                        "--target-dir",
+                        str(target),
+                        *expected,
+                    ],
+                )
+                self.assertFalse(rust_build_status.lane_active_lock_is_held(target))
 
     def test_cargo_command_parses_toolchain_and_value_taking_global_options(
         self,
@@ -418,10 +894,10 @@ class BuildToolingStorageTest(unittest.TestCase):
                 target,
             )
 
-    def test_cargo_config_disables_duplicate_incremental_cache_by_default(self) -> None:
+    def test_cargo_config_enables_incremental_cache_by_default(self) -> None:
         config = load_toml(REPO_ROOT / "codex-rs" / ".cargo" / "config.toml")
 
-        self.assertFalse(config["build"]["incremental"])
+        self.assertTrue(config["build"]["incremental"])
 
     def test_missing_lane_mtime_is_safe_during_concurrent_gc(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -583,10 +1059,17 @@ class BuildToolingStorageTest(unittest.TestCase):
         older = FakeEntry(root, "unit", 1.0)
         newer = FakeEntry(root, "unit-2", 2.0)
         unrelated = FakeEntry(root, "other", 3.0)
-        with mock.patch.object(
-            rust_build_status.os,
-            "scandir",
-            return_value=contextlib.nullcontext([older, newer, unrelated]),
+        with (
+            mock.patch.object(
+                rust_build_status.os,
+                "scandir",
+                return_value=contextlib.nullcontext([older, newer, unrelated]),
+            ),
+            mock.patch.object(
+                rust_build_status,
+                "lane_last_used_mtime",
+                side_effect=lambda path: 10.0 if path.name == "unit" else 5.0,
+            ),
         ):
             candidates = rust_build_status._lane_reservation_candidates(
                 root,
@@ -596,7 +1079,7 @@ class BuildToolingStorageTest(unittest.TestCase):
 
         self.assertEqual(
             [candidate.name for candidate in candidates[:2]],
-            ["unit-2", "unit"],
+            ["unit", "unit-2"],
         )
         self.assertEqual(older.stat_calls, 1)
         self.assertEqual(newer.stat_calls, 1)
@@ -810,6 +1293,7 @@ class BuildToolingStorageTest(unittest.TestCase):
     def test_unreadable_lock_files_are_treated_as_busy(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             lane = Path(temp_dir)
+            (lane / "debug").mkdir()
             with mock.patch.object(Path, "stat", side_effect=PermissionError("denied")):
                 self.assertTrue(rust_build_status.cargo_lock_is_busy(lane))
                 self.assertTrue(rust_build_status.lane_active_lock_is_held(lane))

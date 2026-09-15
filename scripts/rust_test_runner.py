@@ -8,6 +8,7 @@ import fnmatch
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,11 @@ from pathlib import Path
 from typing import Any
 
 import tomllib
+
+try:
+    from .rust_tool_env import cargo_package_specs
+except ImportError:
+    from rust_tool_env import cargo_package_specs
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CODEX_RS_ROOT = REPO_ROOT / "codex-rs"
@@ -301,27 +307,33 @@ class MetadataIndex:
 
     def validate_manifest(self, manifest: Manifest) -> None:
         for helper in manifest.helpers.values():
-            package = self._package(helper.package, f"helper {helper.name!r}")
-            if not self._has_target(package, helper.binary, "bin"):
-                raise RunnerError(
-                    f"helper {helper.name!r} declares missing binary "
-                    f"{helper.package}/{helper.binary}"
-                )
+            self.validate_helper(helper)
         for target in manifest.targets.values():
-            package = self._package(target.package, f"target {target.name!r}")
-            if target.selector_kind == "lib":
-                if not self._has_kind(package, "lib"):
-                    raise RunnerError(
-                        f"target {target.name!r} declares --lib for package "
-                        f"{target.package!r}, which has no library target"
-                    )
-            elif not self._has_target(
-                package, target.selector_value or "", target.selector_kind
-            ):
+            self.validate_target(target)
+
+    def validate_helper(self, helper: Helper) -> None:
+        package = self._package(helper.package, f"helper {helper.name!r}")
+        if not self._has_target(package, helper.binary, "bin"):
+            raise RunnerError(
+                f"helper {helper.name!r} declares missing binary "
+                f"{helper.package}/{helper.binary}"
+            )
+
+    def validate_target(self, target: Target) -> None:
+        package = self._package(target.package, f"target {target.name!r}")
+        if target.selector_kind == "lib":
+            if not self._has_kind(package, "lib"):
                 raise RunnerError(
-                    f"target {target.name!r} declares missing test target "
-                    f"{target.package}/{target.selector_value}"
+                    f"target {target.name!r} declares --lib for package "
+                    f"{target.package!r}, which has no library target"
                 )
+        elif not self._has_target(
+            package, target.selector_value or "", target.selector_kind
+        ):
+            raise RunnerError(
+                f"target {target.name!r} declares missing test target "
+                f"{target.package}/{target.selector_value}"
+            )
 
     def package_id(self, package_name: str) -> str:
         package = self._package(package_name, f"package {package_name!r}")
@@ -361,20 +373,29 @@ class MetadataIndex:
 
 Executor = Callable[..., subprocess.CompletedProcess[str]]
 
+# Cargo and nextest put machine-readable output on stdout and build progress,
+# rendered diagnostics, and test status on stderr. Capturing both streams hides
+# every "Compiling ..." line, so a narrow run that still has to build looks
+# hung. Capture only the stream the runner has to parse.
+CAPTURE_NONE = "none"
+CAPTURE_STDOUT = "stdout"
+CAPTURE_BOTH = "both"
+
 
 def _default_executor(
     args: Sequence[str],
     *,
     cwd: Path,
     env: Mapping[str, str],
-    capture_output: bool,
+    capture: str,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         list(args),
         cwd=cwd,
         env=dict(env),
         text=True,
-        capture_output=capture_output,
+        stdout=subprocess.PIPE if capture != CAPTURE_NONE else None,
+        stderr=subprocess.PIPE if capture == CAPTURE_BOTH else None,
         check=False,
     )
 
@@ -401,7 +422,6 @@ class RustTestRunner:
         env: Mapping[str, str] | None = None,
         cwd: Path = CODEX_RS_ROOT,
     ) -> None:
-        metadata.validate_manifest(manifest)
         self.manifest = manifest
         self.metadata = metadata
         self.target_dir = (target_dir or metadata.target_directory).resolve()
@@ -413,12 +433,21 @@ class RustTestRunner:
         # Ordinary acceptance must never update its expected outputs implicitly.
         self.base_env["INSTA_UPDATE"] = "no"
         self.base_env.setdefault("RUST_MIN_STACK", RUST_MIN_STACK_BYTES)
+        # CARGO_INCREMENTAL stays untouched on purpose. `scripts/just-shell.py`
+        # points RUSTC_WRAPPER at sccache for every recipe, and sccache aborts
+        # the whole build when that variable asks for incremental compilation
+        # while refusing to honor it when it asks for "0". Leaving it unset lets
+        # `codex-rs/.cargo/config.toml` give workspace crates the incremental
+        # cache -- the only one a narrow edit/test loop can use -- while sccache
+        # still serves the registry dependencies it does cache.
         if profile is not None:
             self.base_env["NEXTEST_PROFILE"] = profile
 
     def target(self, name: str) -> Target:
         try:
-            return self.manifest.targets[name]
+            target = self.manifest.targets[name]
+            self.metadata.validate_target(target)
+            return target
         except KeyError as exc:
             raise RunnerError(f"unknown named Rust test target {name!r}") from exc
 
@@ -442,14 +471,19 @@ class RustTestRunner:
             helper = self.manifest.helpers[helper_name]
             if helper.platform is not None and helper.platform != self.platform:
                 continue
+            self.metadata.validate_helper(helper)
             selected.append(helper)
             seen.add(helper_name)
         return selected
 
-    def _group_gate_steps(self, names: Sequence[str]) -> list[GateStep]:
+    def _group_gate_steps(
+        self, names: Sequence[str], *, exact_only: bool = False
+    ) -> list[GateStep]:
         groups: dict[tuple[str, str, str | None], list[GateStep]] = {}
         for name in dict.fromkeys(names):
             for step in self.gate(name).steps:
+                if exact_only and step.filterset is not None:
+                    continue
                 target = self.target(step.target)
                 key = (target.package, target.selector_kind, target.selector_value)
                 groups.setdefault(key, []).append(step)
@@ -490,8 +524,7 @@ class RustTestRunner:
                 "target_dir": str(self.target_dir),
                 "selection": target.selection_args(),
                 "helpers": [helper.name for helper in helpers],
-                "list": self._list_command(target, []),
-                "builds": [command for _, command in self._helper_builds(helpers)],
+                "builds": self._helper_build_commands(helpers),
                 "run": self._run_command(target, []),
             }
         if name in self.manifest.gates:
@@ -508,7 +541,10 @@ class RustTestRunner:
                         "target": step.target,
                         "tests": list(step.tests),
                         "list": self._list_command(target, filter_args),
-                        "run": self._gate_run_command(target, filter_args),
+                        "run": self._gate_run_command(
+                            target,
+                            ["-E", " | ".join(f"test(={test})" for test in step.tests)],
+                        ),
                     }
                 )
             return {
@@ -516,7 +552,7 @@ class RustTestRunner:
                 "name": name,
                 "target_dir": str(self.target_dir),
                 "helpers": [helper.name for helper in helpers],
-                "builds": [command for _, command in self._helper_builds(helpers)],
+                "builds": self._helper_build_commands(helpers),
                 "steps": steps,
             }
         raise RunnerError(f"unknown named Rust test target or gate {name!r}")
@@ -532,25 +568,30 @@ class RustTestRunner:
         args = validate_filtering_args(filter_args)
         require_core_lib_filter(name, args, allow_all=allow_all)
         target = self.target(name)
-        self._list_tests(target, args)
         env = self._build_helper_environment(self.active_helpers([name]))
+        # No discovery pass here: it would build the same test binary through a
+        # second Cargo invocation to learn what `--no-tests=fail` already
+        # enforces on the run itself.
         self._checked(
             self._run_command(target, args, no_fail_fast=no_fail_fast),
             env=env,
-            capture_output=False,
+            capture=CAPTURE_NONE,
         )
 
-    def run_gate(self, name: str) -> None:
-        self.run_gates([name])
-
-    def run_gates(
-        self, names: Sequence[str], *, quiet: bool = False, discover: bool = True
-    ) -> dict[str, list[str]]:
-        """Verify exact selections, prepare helpers once, and execute each test once."""
+    def check_gates(self, names: Sequence[str]) -> None:
+        """Verify declared filter/ID parity without running tests or helpers."""
         if not names:
             raise RunnerError("at least one gate is required")
-        grouped = self._group_gate_steps(names)
-        for step in grouped if discover else ():
+        # Generated exact filters can share discovery. Explicit filters must
+        # prove their own contract: another step must not hide over-selection.
+        discovery_steps = self._group_gate_steps(names, exact_only=True)
+        discovery_steps.extend(
+            step
+            for name in dict.fromkeys(names)
+            for step in self.gate(name).steps
+            if step.filterset is not None
+        )
+        for step in discovery_steps:
             target = self.target(step.target)
             listed = self._list_tests(target, self._gate_filter_args(step))
             actual = set(listed)
@@ -574,6 +615,19 @@ class RustTestRunner:
                     outcome="skipped",
                 )
 
+    def run_gate(self, name: str) -> None:
+        self.run_gates([name])
+
+    def run_gates(
+        self, names: Sequence[str], *, quiet: bool = False, discover: bool = False
+    ) -> dict[str, list[str]]:
+        """Verify exact selections, prepare helpers once, and execute each test once."""
+        if not names:
+            raise RunnerError("at least one gate is required")
+        grouped = self._group_gate_steps(names)
+        if discover:
+            self.check_gates(names)
+
         env = self._build_helper_environment(
             self._active_helper_names(
                 helper for step in grouped for helper in step.helpers or ()
@@ -582,16 +636,12 @@ class RustTestRunner:
         failures: list[RunnerError] = []
         for step in grouped:
             target = self.target(step.target)
-            filter_args = (
-                self._gate_filter_args(step)
-                if discover
-                else ["-E", " | ".join(f"test(={test})" for test in step.tests)]
-            )
+            filter_args = ["-E", " | ".join(f"test(={test})" for test in step.tests)]
             try:
                 result = self._checked(
                     self._gate_run_command(target, filter_args),
                     env=env,
-                    capture_output=True,
+                    capture=CAPTURE_BOTH,
                 )
             except RunnerError as error:
                 failures.append(error)
@@ -701,7 +751,7 @@ class RustTestRunner:
                 command,
                 cwd=CODEX_RS_ROOT,
                 env=run_env,
-                capture_output=False,
+                capture=CAPTURE_NONE,
             )
             if result.returncode != 0:
                 detail = self._failure_detail(result)
@@ -833,37 +883,34 @@ class RustTestRunner:
             *args,
         ]
 
-    def _helper_builds(
-        self, helpers: Sequence[Helper]
-    ) -> list[tuple[list[Helper], list[str]]]:
-        # Active helpers share this runner's profile, features and target lane.
-        # Group only within a package and keep the exact selected binary set.
-        packages: dict[str, list[Helper]] = {}
-        for helper in helpers:
-            packages.setdefault(helper.package, []).append(helper)
+    def _helper_build(self, helpers: Sequence[Helper]) -> list[str] | None:
+        # Active helpers share this runner's profile, features and target lane,
+        # and Cargo resolves `--bin` across every selected package. One
+        # invocation keeps the exact selected binary set while paying a single
+        # dependency-graph resolution instead of one per helper package.
+        if not helpers:
+            return None
+        packages = list(dict.fromkeys(helper.package for helper in helpers))
         return [
-            (
-                group,
-                [
-                    "cargo",
-                    "build",
-                    "--message-format=json-render-diagnostics",
-                    "--target-dir",
-                    str(self.target_dir),
-                    "-p",
-                    package,
-                    *(arg for helper in group for arg in ("--bin", helper.binary)),
-                ],
-            )
-            for package, group in packages.items()
+            "cargo",
+            "build",
+            "--message-format=json-render-diagnostics",
+            "--target-dir",
+            str(self.target_dir),
+            *(arg for package in packages for arg in ("-p", package)),
+            *(arg for helper in helpers for arg in ("--bin", helper.binary)),
         ]
+
+    def _helper_build_commands(self, helpers: Sequence[Helper]) -> list[list[str]]:
+        command = self._helper_build(helpers)
+        return [] if command is None else [command]
 
     def _list_tests(
         self, target: Target, filter_args: Sequence[str]
     ) -> dict[str, bool]:
         args = _list_only_args(validate_filtering_args(filter_args))
         result = self._checked(
-            self._list_command(target, args), env=self.base_env, capture_output=True
+            self._list_command(target, args), env=self.base_env, capture=CAPTURE_STDOUT
         )
         tests = parse_nextest_list(result.stdout)
         if not tests:
@@ -875,14 +922,30 @@ class RustTestRunner:
 
     def _build_helper_environment(self, helpers: Sequence[Helper]) -> dict[str, str]:
         env = dict(self.base_env)
-        for group, command in self._helper_builds(helpers):
-            result = self._checked(command, env=env, capture_output=True)
-            for helper in group:
-                executable = self._helper_artifact(helper, result.stdout)
-                dashed = f"CARGO_BIN_EXE_{helper.binary}"
-                underscored = f"CARGO_BIN_EXE_{helper.binary.replace('-', '_')}"
-                env[dashed] = str(executable)
-                env[underscored] = str(executable)
+        command = self._helper_build(helpers)
+        if command is None:
+            return env
+        result = self._checked(command, env=env, capture=CAPTURE_STDOUT)
+        helper_dirs: list[str] = []
+        for helper in helpers:
+            executable = self._helper_artifact(helper, result.stdout)
+            if str(executable.parent) not in helper_dirs:
+                helper_dirs.append(str(executable.parent))
+            dashed = f"CARGO_BIN_EXE_{helper.binary}"
+            underscored = f"CARGO_BIN_EXE_{helper.binary.replace('-', '_')}"
+            env[dashed] = str(executable)
+            env[underscored] = str(executable)
+            # Test executables resolve bundled helpers before consulting PATH.
+            # Refresh that generated layout after every helper build as well.
+            if os.name == "nt" and helper.binary in {
+                "codex-windows-sandbox-setup", "codex-command-runner"
+            }:
+                resources = executable.parent / "deps" / "codex-resources"
+                resources.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(executable, resources / executable.name)
+        # Native sandbox setup also locates helpers by executable name. Prefer
+        # this build over an older installed executable inherited through PATH.
+        env["PATH"] = os.pathsep.join([*helper_dirs, env.get("PATH", "")])
         return env
 
     def _helper_artifact(self, helper: Helper, output: str) -> Path:
@@ -921,26 +984,38 @@ class RustTestRunner:
         args: Sequence[str],
         *,
         env: Mapping[str, str],
-        capture_output: bool,
+        capture: str,
     ) -> subprocess.CompletedProcess[str]:
         result = self.executor(
             list(args),
             cwd=self.cwd,
             env=env,
-            capture_output=capture_output,
+            capture=capture,
         )
         if result.returncode != 0:
-            detail = self._failure_detail(result)
+            # A CAPTURE_STDOUT command captured only machine-readable output and
+            # already streamed its diagnostics to the terminal.
+            detail = self._failure_detail(
+                result, include_stdout=capture == CAPTURE_BOTH
+            )
             rendered = subprocess.list2cmdline(list(args))
             if detail:
                 raise RunnerError(f"command failed ({rendered}):\n{detail}")
             raise RunnerError(f"command failed ({rendered})")
         return result
 
-    def _failure_detail(self, result: subprocess.CompletedProcess[str]) -> str:
+    def _failure_detail(
+        self,
+        result: subprocess.CompletedProcess[str],
+        *,
+        include_stdout: bool = True,
+    ) -> str:
         streams = [
             (name, output)
-            for name, output in (("stdout", result.stdout), ("stderr", result.stderr))
+            for name, output in (
+                ("stdout", result.stdout if include_stdout else None),
+                ("stderr", result.stderr),
+            )
             if output
         ]
         full_detail = "\n".join(f"{name}:\n{output}" for name, output in streams)
@@ -1178,31 +1253,31 @@ def guard_generic_recipe_args(
     raw_args: Sequence[str], *, recipe: str | None = None
 ) -> None:
     args = list(raw_args)
-    index = 0
-    while index < len(args):
-        token = args[index]
-        if token == "--":
-            return
-        package_spec: str | None = None
-        if token in {"-p", "--package"}:
-            if index + 1 < len(args):
-                package_spec = args[index + 1]
-                index += 1
-        elif token.startswith("--package="):
-            package_spec = token.split("=", 1)[1]
-        elif token.startswith("-p") and token != "-p":
-            package_spec = token[2:]
-        if token in {"--workspace", "--all"} or (
-            package_spec is not None
-            and fnmatch.fnmatchcase("codex-core", package_spec.split("@", 1)[0])
-        ):
-            owner = f"{recipe} cannot" if recipe else "generic Rust test recipes cannot"
+    if "--" in args:
+        args = args[: args.index("--")]
+    packages = cargo_package_specs(args)
+    for spec in packages:
+        if not re.fullmatch(r"[A-Za-z0-9_*?\[\]!-]+(?:@[A-Za-z0-9.+-]+)?", spec):
             raise RunnerError(
-                f"{owner} select codex-core; the package is owned by named targets. "
-                "Use just core-test <target>, just core-test-fast <target>, or "
-                "just core-gate <gate>; just core-test-list prints the names."
+                f"unsupported package selection {spec!r}; use a package name "
+                "or name@version (named core targets for codex-core)"
             )
-        index += 1
+    if any(token in {"--workspace", "--all"} for token in args) or any(
+        fnmatch.fnmatchcase("codex-core", spec.split("@", 1)[0]) for spec in packages
+    ):
+        owner = f"{recipe} cannot" if recipe else "generic Rust test recipes cannot"
+        raise RunnerError(
+            f"{owner} select codex-core; the package is owned by named targets. "
+            "Use just core-test <target>, just core-test-fast <target>, or "
+            "just core-gate <gate>; just core-test-list prints the names."
+        )
+    if not packages:
+        owner = recipe or "generic Rust test recipes"
+        raise RunnerError(
+            f"{owner} require an explicit -p/--package selection; "
+            "the default workspace includes codex-core. Use just core-test "
+            "<target> or just core-gate <gate> for core tests."
+        )
 
 
 def load_metadata(
@@ -1212,7 +1287,7 @@ def load_metadata(
         ["cargo", "metadata", "--no-deps", "--format-version", "1"],
         cwd=cwd,
         env=os.environ,
-        capture_output=True,
+        capture=CAPTURE_BOTH,
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
@@ -1253,6 +1328,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("check-manifest")
     subparsers.add_parser("list-targets")
+    check_gates = subparsers.add_parser("check-gates")
+    check_gates.add_argument("names", nargs="+")
     plan = subparsers.add_parser("plan")
     plan.add_argument("name")
     run_target = subparsers.add_parser("run-target", parents=[run_options])
@@ -1264,7 +1341,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_target.add_argument("name")
     run_target.add_argument("filter_args", nargs=argparse.REMAINDER)
     run_gate = subparsers.add_parser("run-gate", parents=[run_options])
-    run_gate.add_argument("name")
+    run_gate.add_argument("names", nargs="+")
     parity = subparsers.add_parser("parity", parents=[run_options])
     parity.add_argument("legacy_target")
     parity.add_argument("replacement_targets", nargs="+")
@@ -1344,15 +1421,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             no_fail_fast=no_fail_fast,
         )
         if args.command == "check-manifest":
+            metadata.validate_manifest(manifest)
             print(
                 f"validated Rust test manifest version {manifest.version}: {args.manifest}"
             )
+        elif args.command == "check-gates":
+            runner.check_gates(args.names)
         elif args.command == "plan":
             print(json.dumps(runner.plan(args.name), indent=2))
         elif args.command == "run-target":
             runner.run_target(args.name, filter_args, allow_all=allow_all)
         elif args.command == "run-gate":
-            runner.run_gate(args.name)
+            runner.run_gates(args.names)
         elif args.command == "parity":
             runner.parity(args.legacy_target, args.replacement_targets)
         else:  # pragma: no cover - argparse enforces the command set.

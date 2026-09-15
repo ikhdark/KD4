@@ -1,11 +1,9 @@
 use super::*;
-use crate::guardian::GuardianRejection;
 use crate::sandboxing::SandboxPermissions;
 use codex_network_proxy::BlockedRequestArgs;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::GuardianAssessmentDecisionSource;
 use core_test_support::PathBufExt;
 use core_test_support::test_path_buf;
 use pretty_assertions::assert_eq;
@@ -87,8 +85,6 @@ async fn http_disconnect_denies_follower_and_requires_fresh_approval() -> anyhow
     let context = Arc::get_mut(&mut turn).expect("fixture has one turn context owner");
     context.permission_profile = PermissionProfile::read_only();
     context.approval_policy = codex_config::Constrained::allow_any(AskForApproval::OnRequest);
-    Arc::make_mut(&mut context.config).approvals_reviewer =
-        codex_config::types::ApprovalsReviewer::User;
     let service = Arc::clone(&session.services.network_approval);
     let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
         codex_network_proxy::NetworkProxyConfig {
@@ -240,33 +236,6 @@ async fn pending_approvals_are_deduped_per_host_protocol_and_port() {
 }
 
 #[tokio::test]
-async fn ownerless_guardian_denial_consumes_its_rejection_rationale() {
-    let (session, _turn) = crate::session::tests::make_session_and_context().await;
-    let review_id = "ownerless-network-denial";
-    session.services.guardian_rejections.lock().await.insert(
-        review_id.to_string(),
-        GuardianRejection {
-            rationale: "blocked by the test reviewer".to_string(),
-            source: GuardianAssessmentDecisionSource::Agent,
-        },
-    );
-
-    assert!(
-        guardian_denial_outcome(&session, review_id, /*has_owner*/ false)
-            .await
-            .is_none()
-    );
-    assert!(
-        !session
-            .services
-            .guardian_rejections
-            .lock()
-            .await
-            .contains_key(review_id)
-    );
-}
-
-#[tokio::test]
 async fn pending_approvals_do_not_dedupe_across_ports() {
     let service = NetworkApprovalService::default();
     let first_key = HostApprovalKey {
@@ -374,131 +343,6 @@ async fn session_approved_hosts_are_scoped_by_environment_incarnation() {
 }
 
 #[tokio::test]
-async fn session_approved_hosts_preserve_protocol_and_port_scope() {
-    let source = NetworkApprovalService::default();
-    {
-        let mut approved_hosts = source.session_approved_hosts.lock().await;
-        approved_hosts.extend([
-            HostApprovalKey {
-                environment_id: "local".to_string(),
-                approval_scope_id: "local-scope".to_string(),
-                host: "example.com".to_string(),
-                protocol: "https",
-                port: 443,
-            },
-            HostApprovalKey {
-                environment_id: "local".to_string(),
-                approval_scope_id: "local-scope".to_string(),
-                host: "example.com".to_string(),
-                protocol: "https",
-                port: 8443,
-            },
-            HostApprovalKey {
-                environment_id: "local".to_string(),
-                approval_scope_id: "local-scope".to_string(),
-                host: "example.com".to_string(),
-                protocol: "http",
-                port: 80,
-            },
-        ]);
-    }
-
-    let seeded = NetworkApprovalService::default();
-    source.sync_session_approved_hosts_to(&seeded).await;
-
-    let mut copied = seeded
-        .session_approved_hosts
-        .lock()
-        .await
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    copied.sort_by(|a, b| {
-        (&a.environment_id, &a.host, a.protocol, a.port).cmp(&(
-            &b.environment_id,
-            &b.host,
-            b.protocol,
-            b.port,
-        ))
-    });
-
-    assert_eq!(
-        copied,
-        vec![
-            HostApprovalKey {
-                environment_id: "local".to_string(),
-                approval_scope_id: "local-scope".to_string(),
-                host: "example.com".to_string(),
-                protocol: "http",
-                port: 80,
-            },
-            HostApprovalKey {
-                environment_id: "local".to_string(),
-                approval_scope_id: "local-scope".to_string(),
-                host: "example.com".to_string(),
-                protocol: "https",
-                port: 443,
-            },
-            HostApprovalKey {
-                environment_id: "local".to_string(),
-                approval_scope_id: "local-scope".to_string(),
-                host: "example.com".to_string(),
-                protocol: "https",
-                port: 8443,
-            },
-        ]
-    );
-}
-
-#[tokio::test]
-async fn sync_session_approved_hosts_to_replaces_existing_target_hosts() {
-    let source = NetworkApprovalService::default();
-    {
-        let mut approved_hosts = source.session_approved_hosts.lock().await;
-        approved_hosts.insert(HostApprovalKey {
-            environment_id: "local".to_string(),
-            approval_scope_id: "local-scope".to_string(),
-            host: "source.example.com".to_string(),
-            protocol: "https",
-            port: 443,
-        });
-    }
-
-    let target = NetworkApprovalService::default();
-    {
-        let mut approved_hosts = target.session_approved_hosts.lock().await;
-        approved_hosts.insert(HostApprovalKey {
-            environment_id: "local".to_string(),
-            approval_scope_id: "local-scope".to_string(),
-            host: "stale.example.com".to_string(),
-            protocol: "https",
-            port: 8443,
-        });
-    }
-
-    source.sync_session_approved_hosts_to(&target).await;
-
-    let copied = target
-        .session_approved_hosts
-        .lock()
-        .await
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
-
-    assert_eq!(
-        copied,
-        vec![HostApprovalKey {
-            environment_id: "local".to_string(),
-            approval_scope_id: "local-scope".to_string(),
-            host: "source.example.com".to_string(),
-            protocol: "https",
-            port: 443,
-        }]
-    );
-}
-
-#[tokio::test]
 async fn pending_waiters_receive_owner_decision() {
     let pending = Arc::new(PendingHostApproval::new());
 
@@ -572,7 +416,7 @@ fn denied_blocked_request_for_execution(host: &str, execution_id: &str) -> Block
     blocked
 }
 
-async fn register_call_with_default_shell_trigger(
+async fn register_default_shell_call(
     service: &NetworkApprovalService,
     registration_id: &str,
 ) -> CancellationToken {
@@ -580,17 +424,7 @@ async fn register_call_with_default_shell_trigger(
     service
         .register_call(
             registration_id.to_string(),
-            "turn-1".to_string(),
-            GuardianNetworkAccessTrigger {
-                call_id: "call-1".to_string(),
-                tool_name: "shell_command".to_string(),
-                command: vec!["curl".to_string(), "https://example.com".to_string()],
-                cwd: test_path_buf("/tmp").abs().into(),
-                sandbox_permissions: SandboxPermissions::UseDefault,
-                additional_permissions: None,
-                justification: None,
-                tty: None,
-            },
+            test_path_buf("/tmp").abs().into(),
             "curl https://example.com".to_string(),
             "local".to_string(),
             "local-scope".to_string(),
@@ -603,21 +437,11 @@ async fn register_call_with_default_shell_trigger(
 #[tokio::test]
 async fn active_call_preserves_triggering_command_context() {
     let service = NetworkApprovalService::default();
-    let expected = GuardianNetworkAccessTrigger {
-        call_id: "call-1".to_string(),
-        tool_name: "shell_command".to_string(),
-        command: vec!["curl".to_string(), "https://example.com".to_string()],
-        cwd: test_path_buf("/repo").abs().into(),
-        sandbox_permissions: SandboxPermissions::UseDefault,
-        additional_permissions: None,
-        justification: Some("fetch release metadata".to_string()),
-        tty: None,
-    };
+    let expected: codex_utils_path_uri::PathUri = test_path_buf("/repo").abs().into();
 
     service
         .register_call(
             "registration-1".to_string(),
-            "turn-1".to_string(),
             expected.clone(),
             "curl https://example.com".to_string(),
             "remote".to_string(),
@@ -631,7 +455,7 @@ async fn active_call_preserves_triggering_command_context() {
         .await
         .expect("single active call should resolve");
 
-    assert_eq!(&call.trigger, &expected);
+    assert_eq!(&call.cwd, &expected);
     assert_eq!(call.command, "curl https://example.com");
     assert_eq!(call.environment_id, "remote");
     assert_eq!(call.approval_scope_id, "remote-scope");
@@ -640,8 +464,8 @@ async fn active_call_preserves_triggering_command_context() {
 #[tokio::test]
 async fn multiple_active_calls_are_ambiguous_even_in_the_same_environment() {
     let service = NetworkApprovalService::default();
-    register_call_with_default_shell_trigger(&service, "registration-1").await;
-    register_call_with_default_shell_trigger(&service, "registration-2").await;
+    register_default_shell_call(&service, "registration-1").await;
+    register_default_shell_call(&service, "registration-2").await;
 
     match service.resolve_active_call_attribution().await {
         ActiveNetworkApprovalAttribution::Ambiguous => {}
@@ -654,8 +478,7 @@ async fn multiple_active_calls_are_ambiguous_even_in_the_same_environment() {
 #[tokio::test]
 async fn record_blocked_request_sets_policy_outcome_for_owner_call() {
     let service = NetworkApprovalService::default();
-    let cancellation_token =
-        register_call_with_default_shell_trigger(&service, "registration-1").await;
+    let cancellation_token = register_default_shell_call(&service, "registration-1").await;
 
     service
         .record_blocked_request(denied_blocked_request("example.com"))
@@ -673,7 +496,7 @@ async fn record_blocked_request_sets_policy_outcome_for_owner_call() {
 #[tokio::test]
 async fn blocked_request_policy_does_not_override_user_denial_outcome() {
     let service = NetworkApprovalService::default();
-    register_call_with_default_shell_trigger(&service, "registration-1").await;
+    register_default_shell_call(&service, "registration-1").await;
 
     service
         .record_call_outcome("registration-1", NetworkApprovalOutcome::DeniedByUser)
@@ -691,7 +514,7 @@ async fn blocked_request_policy_does_not_override_user_denial_outcome() {
 #[tokio::test]
 async fn finish_call_returns_denial_and_unregisters_active_call() {
     let service = NetworkApprovalService::default();
-    register_call_with_default_shell_trigger(&service, "registration-1").await;
+    register_default_shell_call(&service, "registration-1").await;
 
     service
         .record_call_outcome(
@@ -713,8 +536,7 @@ async fn finish_call_returns_denial_and_unregisters_active_call() {
 #[tokio::test]
 async fn deferred_finish_reuses_denial_result_after_first_consumer() {
     let service = Arc::new(NetworkApprovalService::default());
-    let cancellation_token =
-        register_call_with_default_shell_trigger(&service, "registration-1").await;
+    let cancellation_token = register_default_shell_call(&service, "registration-1").await;
     let deferred = DeferredNetworkApproval {
         registration: Arc::new(NetworkApprovalRegistration::new(
             "registration-1".to_string(),
@@ -747,8 +569,7 @@ async fn deferred_finish_reuses_denial_result_after_first_consumer() {
 #[tokio::test]
 async fn record_call_outcome_ignores_inactive_call() {
     let service = NetworkApprovalService::default();
-    let cancellation_token =
-        register_call_with_default_shell_trigger(&service, "registration-1").await;
+    let cancellation_token = register_default_shell_call(&service, "registration-1").await;
     service.unregister_call("registration-1").await;
 
     service
@@ -765,8 +586,8 @@ async fn record_call_outcome_ignores_inactive_call() {
 #[tokio::test]
 async fn ambiguous_unattributed_blocked_request_marks_and_cancels_every_candidate() {
     let service = NetworkApprovalService::default();
-    let first = register_call_with_default_shell_trigger(&service, "registration-1").await;
-    let second = register_call_with_default_shell_trigger(&service, "registration-2").await;
+    let first = register_default_shell_call(&service, "registration-1").await;
+    let second = register_default_shell_call(&service, "registration-2").await;
 
     service
         .record_blocked_request(denied_blocked_request("example.com"))
@@ -815,40 +636,23 @@ fn dropped_network_registration_is_unregistered_without_explicit_finish() -> any
         let spec = |mode| NetworkApprovalSpec {
             network: Some(proxy_owner.proxy()),
             mode,
-            trigger: GuardianNetworkAccessTrigger {
-                call_id: "drop-registration".to_string(),
-                tool_name: "shell_command".to_string(),
-                command: vec!["curl".to_string(), "https://example.com".to_string()],
-                cwd: turn.cwd().clone().into(),
-                sandbox_permissions: SandboxPermissions::UseDefault,
-                additional_permissions: None,
-                justification: None,
-                tty: None,
-            },
+            cwd: turn.cwd().clone().into(),
             command: "curl https://example.com".to_string(),
             environment_id: "local".to_string(),
             approval_scope_id: "local-scope".to_string(),
         };
-        let deferred = begin_network_approval(
-            &session,
-            &turn.sub_id,
-            true,
-            Some(spec(NetworkApprovalMode::Deferred)),
-        )
-        .await
-        .expect("normal deferred registration succeeds")
-        .expect("normal registration returns its owner")
-        .into_deferred()
-        .expect("deferred mode transfers its owner");
-        let immediate = begin_network_approval(
-            &session,
-            &turn.sub_id,
-            true,
-            Some(spec(NetworkApprovalMode::Immediate)),
-        )
-        .await
-        .expect("normal immediate registration succeeds")
-        .expect("independent immediate registration");
+        let deferred =
+            begin_network_approval(&session, true, Some(spec(NetworkApprovalMode::Deferred)))
+                .await
+                .expect("normal deferred registration succeeds")
+                .expect("normal registration returns its owner")
+                .into_deferred()
+                .expect("deferred mode transfers its owner");
+        let immediate =
+            begin_network_approval(&session, true, Some(spec(NetworkApprovalMode::Immediate)))
+                .await
+                .expect("normal immediate registration succeeds")
+                .expect("independent immediate registration");
         Ok::<_, anyhow::Error>((session, proxy_owner, deferred, immediate))
     })?;
     let service = &session.services.network_approval;
@@ -912,8 +716,8 @@ fn dropped_network_registration_is_unregistered_without_explicit_finish() -> any
 #[tokio::test]
 async fn attributed_blocked_request_targets_one_of_multiple_active_calls() {
     let service = NetworkApprovalService::default();
-    let first = register_call_with_default_shell_trigger(&service, "registration-1").await;
-    let second = register_call_with_default_shell_trigger(&service, "registration-2").await;
+    let first = register_default_shell_call(&service, "registration-1").await;
+    let second = register_default_shell_call(&service, "registration-2").await;
 
     service
         .record_blocked_request(denied_blocked_request_for_execution(
@@ -957,8 +761,6 @@ async fn http_network_approval_preserves_foreign_environment_cwd_uri() -> anyhow
     let context = Arc::get_mut(&mut turn).expect("fixture has one turn context owner");
     context.permission_profile = PermissionProfile::read_only();
     context.approval_policy = codex_config::Constrained::allow_any(AskForApproval::OnRequest);
-    Arc::make_mut(&mut context.config).approvals_reviewer =
-        codex_config::types::ApprovalsReviewer::User;
     let shell = context.environments.primary().unwrap().shell.clone();
     context.environments.turn_environments[0] = crate::session::turn_context::TurnEnvironment::new(
         "remote-network-approval".to_string(),
@@ -1037,7 +839,6 @@ async fn http_network_approval_preserves_foreign_environment_cwd_uri() -> anyhow
     };
     let registered = begin_network_approval(
         &session,
-        &turn.sub_id,
         true,
         runtime.network_approval_spec(&request, &context),
     )
@@ -1050,13 +851,7 @@ async fn http_network_approval_preserves_foreign_environment_cwd_uri() -> anyhow
         .resolve_single_active_call()
         .await
         .expect("registered execution context");
-    assert_eq!(call.trigger.call_id, "foreign-network-exec");
-    assert_eq!(call.trigger.command, command);
-    assert_eq!(call.trigger.cwd, foreign_cwd);
-    assert_eq!(
-        serde_json::to_value(&call.trigger)?["cwd"],
-        serde_json::json!(foreign_cwd)
-    );
+    assert_eq!(call.cwd, foreign_cwd);
     drop(call);
     session
         .spawn_task(Arc::clone(&turn), Vec::new(), NetworkApprovalActiveTask)

@@ -2,12 +2,21 @@
 #![cfg(windows)]
 
 use super::*;
+use crate::prepare::FrozenFixture;
+use crate::prepare::MANIFEST_VERSION;
+use crate::prepare::SourceIdentity;
 use crate::prepare::builds::BuildIdentity;
-use crate::prepare::environment::{BASE_CONFIG, Environment, ToolIdentity};
-use crate::prepare::provenance::{FileIdentity, hash_tree, read_json};
-use crate::prepare::{FrozenFixture, MANIFEST_VERSION, SourceIdentity};
-use crate::schedule::{Mode, Variant, schedule};
-use crate::workloads::{LiveTask, prepare_fixture};
+use crate::prepare::environment::BASE_CONFIG;
+use crate::prepare::environment::Environment;
+use crate::prepare::environment::ToolIdentity;
+use crate::prepare::provenance::FileIdentity;
+use crate::prepare::provenance::hash_tree;
+use crate::prepare::provenance::read_json;
+use crate::schedule::Mode;
+use crate::schedule::Variant;
+use crate::schedule::schedule;
+use crate::workloads::LiveTask;
+use crate::workloads::prepare_fixture;
 use serde_json::Value;
 
 #[test]
@@ -201,14 +210,23 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             .into_iter()
             .map(|variant| (variant, vec![]))
             .collect(),
-        fixtures: BTreeMap::from([(
-            "scripted".into(),
-            FrozenFixture {
-                sha256: hash_tree(&snapshot).unwrap(),
-                snapshot: snapshot.clone(),
-                descriptor: None,
-            },
-        )]),
+        fixtures: schedule(Mode::Fast)
+            .into_iter()
+            .map(|scheduled| {
+                let name = match scheduled.segment {
+                    Segment::Scripted => "scripted".to_string(),
+                    Segment::RealModel => scheduled.workload,
+                };
+                (
+                    name,
+                    FrozenFixture {
+                        sha256: hash_tree(&snapshot).unwrap(),
+                        snapshot: snapshot.clone(),
+                        descriptor: None,
+                    },
+                )
+            })
+            .collect(),
         shared_inputs: snapshot.clone(),
         shared_sha256: hash_tree(&snapshot).unwrap(),
         analyzer: analyzer_files[0].clone(),
@@ -1146,4 +1164,108 @@ fn final_source_evidence_preserves_changes_without_hashing_build_products() {
     assert_eq!(source_tree_inventory(&workspace).unwrap().sha256, digest);
     fs::write(workspace.join("source.rs"), "regression").unwrap();
     assert_ne!(source_tree_inventory(&workspace).unwrap().sha256, digest);
+}
+
+#[test]
+fn import_publishes_complete_reports_and_failed_copy_is_retryable() {
+    let temp = tempfile::tempdir().unwrap();
+    let prepared = prepared_peer(temp.path(), false);
+    let manifest = prepared.directory.join("prepared.json");
+    write_json(&manifest, &prepared).unwrap();
+    let directory = prepared.runs_directory.join("atomic-import");
+    fs::create_dir_all(&directory).unwrap();
+    let result = RunResult {
+        schema_version: 1,
+        id: "atomic-import".into(),
+        prepared_manifest: manifest.clone(),
+        prepared_manifest_sha256: hash_file(&manifest).unwrap(),
+        directory: directory.clone(),
+        mode: prepared.mode,
+        original_run: None,
+        attempts: prepared
+            .schedule
+            .iter()
+            .map(|scheduled| {
+                let mut unrun = attempt(
+                    &prepared,
+                    scheduled.segment == Segment::RealModel,
+                    &scheduled.id,
+                );
+                unrun.scheduled = scheduled.clone();
+                unrun
+            })
+            .collect(),
+        scripted_execution_ms: 0,
+        real_model_execution_ms: 0,
+        finished: true,
+    };
+    let result_path = directory.join("result.json");
+    write_json(&result_path, &result).unwrap();
+    crate::reports::write(&prepared, &result).unwrap();
+    let names = [
+        "result.json",
+        "report.json",
+        "report.md",
+        "reports-manifest.json",
+    ];
+    let original: Vec<_> = names
+        .iter()
+        .map(|name| fs::read(directory.join(name)).unwrap())
+        .collect();
+    let destination = prepared.import_directory.join(&result.id);
+    fs::create_dir_all(&destination).unwrap();
+    assert!(
+        crate::reports::import(&result_path)
+            .unwrap_err()
+            .to_string()
+            .contains("already exists")
+    );
+    assert_eq!(
+        fs::read_dir(&destination).unwrap().count(),
+        0,
+        "existing empty import must remain untouched"
+    );
+    fs::remove_dir(&destination).unwrap();
+    crate::reports::FAIL_IMPORT_AFTER_COPY.with(|remaining| remaining.set(Some(1)));
+    assert!(
+        crate::reports::import(&result_path)
+            .unwrap_err()
+            .to_string()
+            .contains("injected report import copy failure")
+    );
+    assert!(
+        !destination.exists(),
+        "failed staging must not reserve the accepted run ID"
+    );
+    assert!(
+        !fs::read_dir(&prepared.import_directory)
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".report-import-")),
+        "failed staging must be removed"
+    );
+    for (name, bytes) in names.iter().zip(&original) {
+        assert_eq!(
+            &fs::read(directory.join(name)).unwrap(),
+            bytes,
+            "import must preserve source {name}"
+        );
+    }
+    assert_eq!(crate::reports::import(&result_path).unwrap(), destination);
+    assert_eq!(fs::read_dir(&destination).unwrap().count(), 3);
+    for name in &names[1..] {
+        assert_eq!(
+            fs::read(destination.join(name)).unwrap(),
+            fs::read(directory.join(name)).unwrap()
+        );
+    }
+    assert!(
+        crate::reports::import(&result_path)
+            .unwrap_err()
+            .to_string()
+            .contains("already exists")
+    );
 }

@@ -39,7 +39,6 @@ fn build_permissions_update_item(
             &next.permission_profile,
             next.approval_policy.value(),
             ApprovalPromptContext::new(
-                next.config.approvals_reviewer,
                 next.model_info
                     .model_messages
                     .as_ref()

@@ -38,6 +38,83 @@ def repository_owned_paths() -> list[Path]:
 
 
 class BuildToolingPolicyTest(unittest.TestCase):
+    def test_dead_code_preserves_target_config_and_rejects_unused_code(self):
+        shell = powershell()
+        if shell is None or shutil.which("cargo") is None:
+            self.skipTest("PowerShell and Cargo are required")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            analyzer = root / "cargo-workspace-analyzer.ps1"
+            shutil.copyfile(REPO_ROOT / "scripts" / analyzer.name, analyzer)
+            shutil.copyfile(
+                REPO_ROOT / "scripts" / "common-rust-env.ps1",
+                root / "common-rust-env.ps1",
+            )
+            (root / "cargo-lane.ps1").write_text(
+                "$cargoArgs = @($args | Select-Object -Skip 3)\n"
+                "& cargo @cargoArgs\nexit $LASTEXITCODE\n",
+                encoding="utf-8",
+            )
+            (root / "Cargo.toml").write_text(
+                '[package]\nname="lint-probe"\nversion="0.1.0"\nedition="2021"\n'
+                '[lib]\npath="lib.rs"\n',
+                encoding="utf-8",
+            )
+            config = root / ".cargo" / "config.toml"
+            config.parent.mkdir()
+            config.write_text(
+                "[target.'cfg(all())']\nrustflags=[\"--cfg=normal_flags\"]\n",
+                encoding="utf-8",
+            )
+            source = root / "lib.rs"
+            prefix = '#[cfg(not(normal_flags))]\ncompile_error!("lost target flags");\n'
+            env = os.environ.copy()
+            for key in list(env):
+                if key.startswith("CARGO_") or key in (
+                    "RUSTFLAGS",
+                    "RUSTC_WRAPPER",
+                    "RUSTC_WORKSPACE_WRAPPER",
+                ):
+                    env.pop(key)
+            env["CARGO_HOME"] = str(root / "cargo-home")
+            command = [
+                shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(analyzer),
+                "-Analyzer",
+                "dead-code",
+                "--offline",
+                "-p",
+                "lint-probe",
+            ]
+            source.write_text(prefix + "fn unused_probe() {}\n", encoding="utf-8")
+            rejected = subprocess.run(
+                command,
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("function `unused_probe` is never used", rejected.stderr)
+            self.assertNotIn("lost target flags", rejected.stderr)
+            source.write_text(prefix + "pub fn used_probe() {}\n", encoding="utf-8")
+            accepted = subprocess.run(
+                command,
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+
     def test_advisory_ignores_match_between_audit_and_deny(self) -> None:
         audit = load_toml(REPO_ROOT / "codex-rs" / ".cargo" / "audit.toml")
         deny = load_toml(REPO_ROOT / "codex-rs" / "deny.toml")
@@ -179,12 +256,41 @@ console.log(JSON.stringify(results));
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(len(calls), 1)
 
-    def test_dead_code_updates_authoritative_encoded_flags(self):
+    def test_dead_code_preserves_authoritative_encoded_flags(self):
         result, calls = self.run_workspace_analyzer(
             "dead-code", "--package=codex-core", encoded_flags="--cfg\x1fexisting"
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(calls[0]["encoded"], "--cfg\x1fexisting\x1f-Ddead_code")
+        self.assertEqual(calls[0]["encoded"], "--cfg\x1fexisting")
+        self.assertEqual(
+            calls[0]["args"][-4:], ["--", "-A", "clippy::all", "-Ddead_code"]
+        )
+
+    def test_dead_code_package_spellings_remain_package_scoped(self):
+        for selection in (
+            ["-p", "codex-core"],
+            ["--package", "codex-core"],
+            ["--package=codex-core"],
+            ["-pcodex-core"],
+            ["-p=codex-core"],
+        ):
+            with self.subTest(selection=selection):
+                result, calls = self.run_workspace_analyzer("dead-code", *selection)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(
+                    calls[0]["args"],
+                    [
+                        "cargo",
+                        "clippy",
+                        "--all-targets",
+                        *selection,
+                        "--",
+                        "-A",
+                        "clippy::all",
+                        "-Ddead_code",
+                    ],
+                )
 
     def run_just_recipe(
         self,
@@ -201,6 +307,10 @@ console.log(JSON.stringify(results));
             (root / "codex-rs").mkdir()
             (root / "scripts").mkdir()
             shutil.copyfile(REPO_ROOT / "justfile", root / "justfile")
+            shutil.copyfile(
+                REPO_ROOT / "scripts" / "common-rust-env.ps1",
+                root / "scripts" / "common-rust-env.ps1",
+            )
             # Keep real just dispatch and PowerShell argument handling; record
             # external build/sign/publish commands without executing them.
             prefix = r"""
@@ -283,6 +393,10 @@ function Get-Command($Name) {
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
             analyzer_path = temp_root / "cargo-workspace-analyzer.ps1"
+            shutil.copyfile(
+                REPO_ROOT / "scripts" / "common-rust-env.ps1",
+                temp_root / "common-rust-env.ps1",
+            )
             shutil.copyfile(
                 REPO_ROOT / "scripts" / "cargo-workspace-analyzer.ps1",
                 analyzer_path,
@@ -2021,7 +2135,7 @@ function Get-Command($Name) {
         self.assertEqual(len(payloads), 1, result.stdout)
         self.assertEqual(
             payloads[0]["rustflags"],
-            "-C target-cpu=native --cfg existing -Ddead_code",
+            "-C target-cpu=native --cfg existing",
         )
         self.assertNotIn("--workspace", payloads[0]["args"])
 
@@ -2076,6 +2190,9 @@ function Get-Command($Name) {
             ("--package", "codex-cli"),
             ("--package=codex-cli",),
             ("-pcodex-cli",),
+            ("-p=codex-cli",),
+            ("-p=codex-cli@0.0.0",),
+            ("-p=codex-utils-*",),
             ("-p", "codex-cli", "-p", "codex-utils-pty", "--", "-Dwarnings"),
         )
         for recipe in ("clippy", "fix"):
@@ -2141,34 +2258,16 @@ function Get-Command($Name) {
     ) -> None:
         result, calls = self.run_just_recipe("app-server-runtime-check")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual([call["program"] for call in calls], ["cargo"] * 3)
-        expected = (
-            (
-                "codex-app-server-protocol",
-                {
-                    "command_exec_response_round_trips_runtime_status",
-                    "process_notifications_round_trip",
-                },
-            ),
-            (
-                "codex-app-server",
-                {
-                    "suite::v2::command_exec::command_exec_non_streaming_respects_output_cap",
-                    "process_spawn_reports_buffered_output_cap_reached",
-                    "thread_status::tests::stale_active_running_thread_resume_clears_watch_status",
-                    "thread_status::tests::stale_active_repair_preserves_pending_approval_status",
-                },
-            ),
+        self.assertEqual([call["program"] for call in calls], ["python", "cargo"])
+        self.assertEqual(
+            calls[0]["args"][1:],
+            [
+                "run-lane", "--lane", "core-tests", "just", "_core-gate-reserved",
+                "app-server-command-exec", "app-server-process-exec",
+                "app-server-thread-status",
+            ],
         )
-        for call, (package, tests) in zip(calls[:2], expected, strict=True):
-            self.assertEqual(call["args"][:2], ["nextest", "run"])
-            self.assertEqual(call["args"][call["args"].index("--profile") + 1], "local")
-            self.assertEqual(call["args"][call["args"].index("-p") + 1], package)
-            self.assertEqual(
-                set(call["args"][call["args"].index("-E") + 1].split(" | ")),
-                {f"test({test})" for test in tests},
-            )
-        self.assertEqual(calls[2]["args"], ["check", "-p", "codex-app-server"])
+        self.assertEqual(calls[1]["args"], ["check", "-p", "codex-app-server"])
 
     def test_release_tooling_recipe_runs_from_repository_root(self) -> None:
         result, calls = self.run_just_recipe(
@@ -2198,15 +2297,28 @@ function Get-Command($Name) {
         )
 
         self.assertIn("[windows]\ntest-windows-sandbox-processes *args:", justfile)
-        # The two non-core legs still force the zero-test policy inline. The
-        # codex-core leg gets it from its named gate, which forces
-        # `--no-tests=fail` inside `scripts/rust_test_runner.py`.
         sandbox_recipe = justfile.split("test-windows-sandbox-processes *args:", 1)[
             1
         ].split("\n\n", 1)[0]
-        self.assertEqual(sandbox_recipe.count("--no-tests=fail"), 2)
-        self.assertIn("just core-gate windows-sandbox-core-exec", sandbox_recipe)
-        self.assertIn("-p codex-utils-pty", justfile)
+        self.assertIn(
+            "just core-gate windows-process windows-sandbox-core-exec", sandbox_recipe
+        )
+        manifest = load_toml(REPO_ROOT / "codex-rs/.config/kd4-rust-tests.toml")
+        steps = manifest["gates"]["windows-process"]["steps"]
+        self.assertEqual(
+            {test for step in steps for test in step["tests"]},
+            {
+                "tests::windows_tests::terminate_kills_descendants_for_best_effort_pipe_and_atomic_conpty",
+                "tests::windows_tests::normal_exit_preserves_descendants_for_pipe_and_conpty",
+                "tests::windows_tests::conpty_delivers_input_to_foreground_children",
+                "tests::windows_tests::conpty_ctrl_c_interrupts_powershell_foreground_child",
+                "tests::windows_tests::required_process_test_prerequisites_report_unverified_coverage",
+                "unified_exec::tests::legacy_capture_cancellation_terminates_descendants_without_timeout",
+                "windows_impl::tests::process_wait_failure_is_not_treated_as_exit",
+                "win::tests::controlling_ipc_eof_terminates_process_tree",
+                "win::tests::invalid_process_wait_is_not_treated_as_exit",
+            },
+        )
         self.assertIn("CODEX_REQUIRE_WINDOWS_SANDBOX_PROCESS_TESTS", justfile)
         # Sandbox tests require their prerequisite unconditionally. The flag
         # controls only PTY tests that can also run as ordinary developer tests.
@@ -2436,6 +2548,26 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
         self.assertEqual(justfile.count("scripts\\cargo-lane.ps1"), 1)
         self.assertIn('cargo-lane.ps1" -Lane "{{ lane }}" -IsolateCargoHome', justfile)
 
+    def test_compile_and_test_recipes_share_automatic_package_lanes(self) -> None:
+        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+        for recipe in ("test", "test-fast", "test-compile"):
+            body = justfile.split(f"\n{recipe} *args:\n", 1)[1].split("\n\n", 1)[0]
+            self.assertIn(
+                'rust_build_status.py" run-lane --lane auto -- cargo nextest run',
+                body,
+            )
+            self.assertIn("@forwarded_args", body)
+
+    def test_gate_recipes_forward_all_requested_gates(self) -> None:
+        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+        for recipe, command in (
+            ("core-gate", "-- just _core-gate-reserved @forwarded_args"),
+            ("_core-gate-reserved", "run-gate @forwarded_args"),
+        ):
+            body = justfile.split(f"\n{recipe} +gates:\n", 1)[1].split("\n\n", 1)[0]
+            self.assertIn("$forwarded_args = @($args | Select-Object -Skip 1)", body)
+            self.assertIn(command, body)
+
     def test_high_contention_just_recipes_use_cargo_lanes_on_windows(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
 
@@ -2487,12 +2619,59 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
             "core-test target *args:",
             "core-test-fast target *args:",
             "core-test-lane target *args:",
-            "_core-test-lane-reserved target *args:",
-            "core-gate gate:",
+            "_core-test-reserved profile target *args:",
+            "core-gate +gates:",
+            "_core-gate-reserved +gates:",
+            "core-test-parity legacy *args:",
+            "_core-parity-reserved legacy *args:",
             "core-test-list:",
             "core-test-manifest-check:",
         ):
             self.assertIn(recipe, justfile)
+
+        # Every recipe that compiles a named target or gate reserves a Cargo
+        # lane first: a build sharing codex-rs/target would otherwise invalidate
+        # the whole graph between runs.
+        for recipe, reserved in (
+            ("core-test target *args:", "just _core-test-reserved local"),
+            ("core-test-fast target *args:", "just _core-test-reserved fast"),
+            ("core-test-lane target *args:", "just _core-test-reserved fast"),
+            ("core-gate +gates:", "just _core-gate-reserved"),
+            ("core-test-parity legacy *args:", "just _core-parity-reserved"),
+        ):
+            body = justfile.split(f"\n{recipe}\n", 1)[1].split("\n\n", 1)[0]
+            self.assertIn('rust_build_status.py" run-lane --lane', body, recipe)
+            self.assertIn(reserved, body, recipe)
+            self.assertNotIn('rust_test_runner.py" run-', body, recipe)
+
+        # Shared-lane recipes must name the one lane variable, and only the
+        # explicit per-target escape hatch may open a lane of its own.
+        for recipe in (
+            "core-test target *args:",
+            "core-test-fast target *args:",
+            "core-gate +gates:",
+            "core-test-parity legacy *args:",
+        ):
+            body = justfile.split(f"\n{recipe}\n", 1)[1].split("\n\n", 1)[0]
+            self.assertIn('--lane "{{ core_test_lane }}"', body, recipe)
+        lane_body = justfile.split("\ncore-test-lane target *args:\n", 1)[1].split(
+            "\n\n", 1
+        )[0]
+        self.assertIn('--lane "{{ target }}"', lane_body)
+
+        # Each reserved body must consume the reservation instead of falling
+        # back to the default target directory.
+        for reserved in (
+            "_core-test-reserved profile target *args:",
+            "_core-gate-reserved +gates:",
+            "_core-parity-reserved legacy *args:",
+        ):
+            body = justfile.split(f"\n{reserved}\n", 1)[1].split("\n\n", 1)[0]
+            self.assertIn("$target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR", body)
+            self.assertIn("missing Cargo lane reservation", body)
+            self.assertIn(
+                'rust_test_runner.py" --target-dir $target_dir', body, reserved
+            )
         self.assertNotIn("_core-test-helpers", justfile)
         self.assertNotIn("(?i)rmcp|mcp|plugin|test_stdio_server", justfile)
         self.assertNotIn("(?i)windows_sandbox|windows-sandbox|sandbox", justfile)
@@ -2509,21 +2688,66 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
             "config-schema-protocol",
             "windows-sandbox-core-exec",
         ):
-            self.assertIn(f"just core-gate {gate}", justfile)
+            self.assertRegex(justfile, rf"just core-gate [^\n]*\b{gate}\b")
             self.assertIn(gate, manifest["gates"])
 
-        # The app-server thread-status recipe kept only its two real contracts.
         thread_status = justfile.split("_app-server-thread-status-tests:", 1)[1].split(
             "\n\n", 1
         )[0]
-        self.assertNotIn(
-            "validated_invalidated_tracker_still_requests_diff_fallback", thread_status
+        self.assertIn("just core-gate app-server-thread-status", thread_status)
+        self.assertEqual(
+            manifest["gates"]["app-server-thread-status"]["steps"][0]["tests"],
+            [
+                "thread_status::tests::stale_guards_cannot_clear_requests_from_a_new_lifecycle",
+                "thread_status::tests::stale_guard_drop_does_not_reload_removed_or_shutdown_thread",
+            ],
         )
-        self.assertIn(
-            "stale_active_running_thread_resume_clears_watch_status", thread_status
+
+    def test_core_test_recipes_forward_only_the_caller_arguments(self) -> None:
+        # `set positional-arguments` puts the shell's own argument first, then
+        # one slot per named parameter, ahead of the variadic tail. Skipping the
+        # wrong count silently drops a caller's filter or forwards the recipe's
+        # own profile or target name as one, so pin it per recipe signature.
+        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+        signature = re.compile(
+            r"^(core-test|core-test-fast|core-test-lane|core-test-parity"
+            r"|core-gate|_core-test-reserved|_core-gate-reserved"
+            r"|_core-parity-reserved)"
+            r"((?: [^:\n]*)?):[ \t]*$"
         )
-        self.assertIn(
-            "stale_active_repair_preserves_pending_approval_status", thread_status
+        skip = re.compile(r"\$args \| Select-Object -Skip (\d+)")
+        checked: dict[str, int] = {}
+        current: tuple[str, int] | None = None
+        for line in justfile.splitlines():
+            match = signature.match(line)
+            if match is not None:
+                named = [
+                    token
+                    for token in match.group(2).split()
+                    if not token.startswith(("*", "+"))
+                ]
+                current = (match.group(1), len(named))
+                continue
+            found = skip.search(line)
+            if found is None or current is None:
+                continue
+            recipe, named_count = current
+            checked[recipe] = int(found.group(1))
+            self.assertEqual(int(found.group(1)), named_count + 1, recipe)
+            current = None
+        self.assertEqual(
+            checked,
+            {
+                "core-test": 2,
+                "core-test-fast": 2,
+                "core-test-lane": 2,
+                "core-test-parity": 2,
+                # A `+`/`*` variadic occupies no slot of its own.
+                "core-gate": 1,
+                "_core-test-reserved": 3,
+                "_core-gate-reserved": 1,
+                "_core-parity-reserved": 2,
+            },
         )
 
     def test_perf_env_recipes_pass_structured_argv(self) -> None:

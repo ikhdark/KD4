@@ -111,11 +111,6 @@ impl ChatWidget {
         enabled
     }
 
-    pub(crate) fn set_approvals_reviewer(&mut self, policy: ApprovalsReviewer) {
-        self.config.approvals_reviewer = policy;
-        self.refresh_status_surfaces();
-    }
-
     pub(crate) fn set_world_writable_warning_acknowledged(&mut self, acknowledged: bool) {
         self.config.notices.hide_world_writable_warning = Some(acknowledged);
     }
@@ -517,7 +512,6 @@ impl ChatWidget {
         {
             tracing::warn!(%err, "failed to set approval_policy on chat config");
         }
-        self.config.approvals_reviewer = settings.approvals_reviewer.to_core();
         self.config.personality = settings.personality;
 
         let permission_profile = settings.permission_profile.take().unwrap_or_else(|| {
@@ -761,7 +755,6 @@ impl ChatWidget {
             op: AppCommand::override_turn_context(
                 /*cwd*/ None,
                 /*approval_policy*/ None,
-                /*approvals_reviewer*/ None,
                 /*permission_profile*/ None,
                 /*active_permission_profile*/ None,
                 /*windows_sandbox_level*/ None,

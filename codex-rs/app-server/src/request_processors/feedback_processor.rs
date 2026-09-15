@@ -190,19 +190,6 @@ impl FeedbackRequestProcessor {
                         });
                     }
                 }
-                if let Some(conversation_id) = conversation_id
-                    && let Ok(conversation) = self.thread_manager.get_thread(conversation_id).await
-                    && let Some(guardian_rollout_path) =
-                        conversation.guardian_trunk_rollout_path().await
-                    && seen_attachment_paths.insert(guardian_rollout_path.clone())
-                {
-                    attachment_paths.push(FeedbackAttachmentPath {
-                        path: guardian_rollout_path,
-                        attachment_filename_override: Some(auto_review_rollout_filename(
-                            conversation_id,
-                        )),
-                    });
-                }
                 if let Some(sandbox_log_attachment) =
                     windows_sandbox_log_attachment(&self.config.codex_home)
                     && seen_attachment_paths.insert(sandbox_log_attachment.path.clone())
@@ -284,10 +271,6 @@ fn select_feedback_thread_ids(root: ThreadId, thread_ids: Vec<ThreadId>) -> Vec<
     std::iter::once(root)
         .chain(descendants.into_values())
         .collect()
-}
-
-fn auto_review_rollout_filename(thread_id: ThreadId) -> String {
-    format!("auto-review-rollout-{thread_id}.jsonl")
 }
 
 fn windows_sandbox_log_attachment(codex_home: &Path) -> Option<FeedbackAttachmentPath> {

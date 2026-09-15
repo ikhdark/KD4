@@ -21,7 +21,6 @@ use crate::SkillMetadata;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::skills::model::SkillToolDependency;
-use codex_mcp::ElicitationReviewerHandle;
 use codex_mcp::McpOAuthLoginSupport;
 use codex_mcp::McpPermissionPromptAutoApproveContext;
 use codex_mcp::mcp_permission_prompt_is_auto_approved;
@@ -102,7 +101,6 @@ pub(crate) async fn apply_mcp_dependency_effect(
     turn_context: &TurnContext,
     cancellation_token: &CancellationToken,
     effect: &PlannedMcpDependencyEffect,
-    elicitation_reviewer: Option<ElicitationReviewerHandle>,
 ) -> Result<McpDependencyEffectOutcome, String> {
     let should_install = should_install_planned_mcp_dependencies(
         sess,
@@ -121,7 +119,6 @@ pub(crate) async fn apply_mcp_dependency_effect(
         turn_context.config.as_ref(),
         &effect.missing,
         cancellation_token,
-        elicitation_reviewer,
     )
     .await?;
     let inventory_matches = tokio::select! {
@@ -180,7 +177,6 @@ async fn install_planned_mcp_dependencies(
     config: &crate::config::Config,
     missing: &HashMap<String, McpServerConfig>,
     cancellation_token: &CancellationToken,
-    elicitation_reviewer: Option<ElicitationReviewerHandle>,
 ) -> Result<(), String> {
     let codex_home = config.codex_home.clone();
     let mut servers = tokio::select! {
@@ -324,7 +320,7 @@ async fn install_planned_mcp_dependencies(
         () = sess.refresh_mcp_servers_now(
             turn_context,
             &refresh_config,
-            elicitation_reviewer,
+
         ) => {}
     }
     Ok(())

@@ -1,7 +1,7 @@
 {
-  "index_sha256": "d32c74235509792e0a407b242d32977b2fedc983535a545e4ec349868ac60f0c",
+  "index_sha256": "ad34bfd9869193e4a007b74a39554a170e4d80bf7aa8978af4c859fe42c3ed04",
   "index_version": 1,
-  "manifest_sha256": "963e2f72ed11f770848ce86743671edf0d2ea1a011f513420af8100733675b27",
+  "manifest_sha256": "a0777249655f516a771912d0e17f7a1371f145e650ae705ecf1d12008796e9b6",
   "omitted": {
     "relationships": 0
   },
@@ -399,8 +399,7 @@
       ],
       "roots": [
         "codex-rs/core/src",
-        "codex-rs/core/tests",
-        "codex-rs/core/benches"
+        "codex-rs/core/tests"
       ],
       "tests": [
         "codex-rs/core/tests"
@@ -633,7 +632,8 @@
       ],
       "facet_exclusions": {
         "configuration_and_gates": "The producing tool supplies TruncationPolicy or OutputLimitResolution; these helpers do not read repository configuration.",
-        "generated_artifacts": "Formatted output is runtime text and does not generate checked-in artifacts."
+        "generated_artifacts": "Formatted output is runtime text and does not generate checked-in artifacts.",
+        "registration_and_entrypoints": "These statically linked library helpers are invoked directly by the declared tool-output consumers; they have no runtime registration step."
       },
       "feature_ids": [],
       "generated_artifacts": [],
@@ -3497,7 +3497,7 @@
         },
         {
           "path": "justfile",
-          "symbol": "core-gate gate"
+          "symbol": "core-gate +gates"
         }
       ],
       "kind": "registers",
@@ -3958,13 +3958,17 @@
       "confidence": "declared",
       "evidence": [
         {
-          "path": "codex-rs/tui/src/app_event_sender.rs",
-          "symbol": "session_log"
+          "path": "codex-rs/tui/src/app/event_dispatch.rs",
+          "symbol": "session_log::log_inbound_app_event"
+        },
+        {
+          "path": "codex-rs/tui/src/app/thread_routing.rs",
+          "symbol": "session_log::log_outbound_op"
         }
       ],
       "kind": "consumed_by",
       "source": "owner:tui-session-logging",
-      "target": "path:codex-rs/tui/src/app_event_sender.rs"
+      "target": "path:codex-rs/tui/src/app/event_dispatch.rs"
     },
     {
       "category": "callers_consumers",
@@ -4344,7 +4348,7 @@
       "target": "path:codex-rs/windows-sandbox-rs/src/winutil.rs"
     }
   ],
-  "repository_revision": "manifest:963e2f72ed11f770848ce86743671edf0d2ea1a011f513420af8100733675b27:sources:3f2c528a27693fcd83d420d3820b40164dbc1c3ef2df469005fecf03c75b2e0b",
+  "repository_revision": "manifest:a0777249655f516a771912d0e17f7a1371f145e650ae705ecf1d12008796e9b6:sources:c67817cc240f5cb73f7728bc9077cde40a8c615370f7db917a220a46807ab9b6",
   "schema_version": 2,
   "status": "complete",
   "unresolved": []

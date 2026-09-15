@@ -112,7 +112,6 @@ impl AppsRequestProcessor {
                         tool_plugin_provenance(&mcp_config),
                         auth.as_ref(),
                         codex_apps_auth_manager,
-                        /*elicitation_reviewer*/ None,
                         /*elicitation_lifecycle*/ None,
                         codex_mcp::ElicitationRequestRouter::default(),
                         /*previous_manager*/ None,

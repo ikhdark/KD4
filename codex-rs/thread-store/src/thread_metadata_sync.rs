@@ -440,9 +440,6 @@ fn git_info_patch_from_observation(git_info: GitInfo) -> GitInfoPatch {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use codex_protocol::config_types::ApprovalsReviewer;
     use codex_protocol::config_types::CollaborationMode;
     use codex_protocol::config_types::ModeKind;
     use codex_protocol::config_types::Personality;
@@ -467,6 +464,7 @@ mod tests {
     use codex_protocol::protocol::UserMessageEvent;
     use codex_protocol::user_input::UserInput;
     use pretty_assertions::assert_eq;
+    use std::sync::Arc;
 
     use super::*;
     use crate::ThreadPersistenceMetadata;
@@ -523,7 +521,6 @@ mod tests {
             service_tier: Some(Some("flex".to_string())),
             developer_instructions: Some(None),
             approval_policy: AskForApproval::Never,
-            approvals_reviewer: ApprovalsReviewer::User,
             permission_profile: permission_profile.clone(),
             active_permission_profile: Some(None),
             environments: Some(TurnEnvironmentSelections::new(cwd.clone(), Vec::new())),

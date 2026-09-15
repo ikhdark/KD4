@@ -858,7 +858,6 @@ pub(crate) async fn resolve_server_request_on_thread_listener(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_app_server_protocol::ApprovalsReviewer;
     use codex_app_server_protocol::AskForApproval;
     use codex_app_server_protocol::SandboxPolicy;
     use codex_protocol::config_types::CollaborationMode;
@@ -1584,7 +1583,6 @@ mod tests {
         ThreadSettings {
             cwd: AbsolutePathBuf::from_absolute_path("/tmp").expect("absolute path"),
             approval_policy: AskForApproval::OnRequest,
-            approvals_reviewer: ApprovalsReviewer::User,
             sandbox_policy: SandboxPolicy::ReadOnly {
                 network_access: false,
             },

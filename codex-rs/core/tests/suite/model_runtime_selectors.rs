@@ -91,7 +91,8 @@ async fn wait_for_model_available(manager: &SharedModelsManager, slug: &str) -> 
         if Instant::now() >= deadline {
             panic!("timed out waiting for the remote model {slug} to appear");
         }
-        sleep(Duration::from_millis(25)).await;
+        sleep(Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())))
+            .await;
     }
 }
 

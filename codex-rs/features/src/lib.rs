@@ -219,8 +219,6 @@ pub enum Feature {
     SkillMcpDependencyInstall,
     /// Allow request_user_input in Default collaboration mode.
     DefaultModeRequestUserInput,
-    /// Enable automatic review for approval prompts.
-    GuardianApproval,
     /// Enable persisted thread goals and automatic goal continuation.
     Goals,
     /// Add current-time reminders to model-visible context.
@@ -521,7 +519,6 @@ pub fn user_settable_feature_for_key(key: &str) -> Option<Feature> {
 /// accepted by current user-facing feature configuration.
 pub fn feature_requirement_for_key(key: &str) -> Option<Feature> {
     match key {
-        "auto_review" => Some(Feature::GuardianApproval),
         _ => user_settable_feature_for_key(key),
     }
 }
@@ -1076,12 +1073,6 @@ define_features! {
         key: "terminal_visualization_instructions",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::GuardianApproval,
-        key: "guardian_approval",
-        stage: Stage::Stable,
-        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::Goals,

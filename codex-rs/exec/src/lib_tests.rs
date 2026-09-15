@@ -1,6 +1,5 @@
 use super::*;
 use codex_otel::set_parent_from_w3c_trace_context;
-use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use codex_utils_absolute_path::test_support::PathBufExt;
@@ -618,27 +617,22 @@ fn canceled_mcp_server_elicitation_response_uses_cancel_action() {
 }
 
 #[tokio::test]
-async fn thread_start_params_include_review_policy_when_review_policy_is_manual_only() {
+async fn thread_start_params_preserve_configured_permissions() {
     let codex_home = tempdir().expect("create temp codex home");
     let cwd = tempdir().expect("create temp cwd");
     let config = ConfigBuilder::default()
         .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
         .codex_home(codex_home.path().to_path_buf())
         .harness_overrides(ConfigOverrides {
-            approvals_reviewer: Some(ApprovalsReviewer::User),
             ..Default::default()
         })
         .fallback_cwd(Some(cwd.path().to_path_buf()))
         .build()
         .await
-        .expect("build config with manual-only review policy");
+        .expect("build config with default permissions");
 
     let params = thread_start_params_from_config(&config);
 
-    assert_eq!(
-        params.approvals_reviewer,
-        Some(codex_app_server_protocol::ApprovalsReviewer::User)
-    );
     assert_eq!(params.sandbox, None);
     assert_eq!(
         params.permissions,
@@ -647,111 +641,7 @@ async fn thread_start_params_include_review_policy_when_review_policy_is_manual_
 }
 
 #[tokio::test]
-async fn thread_start_params_include_review_policy_when_auto_review_is_enabled() {
-    let codex_home = tempdir().expect("create temp codex home");
-    let cwd = tempdir().expect("create temp cwd");
-    let config = ConfigBuilder::default()
-        .codex_home(codex_home.path().to_path_buf())
-        .harness_overrides(ConfigOverrides {
-            approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
-            ..Default::default()
-        })
-        .fallback_cwd(Some(cwd.path().to_path_buf()))
-        .build()
-        .await
-        .expect("build config with guardian review policy");
-
-    let params = thread_start_params_from_config(&config);
-
-    assert_eq!(
-        params.approvals_reviewer,
-        Some(codex_app_server_protocol::ApprovalsReviewer::AutoReview)
-    );
-}
-
-#[tokio::test]
-async fn thread_resume_params_only_include_explicit_review_policy_override() {
-    let codex_home = tempdir().expect("create temp codex home");
-    let cwd = tempdir().expect("create temp cwd");
-    let config = ConfigBuilder::default()
-        .codex_home(codex_home.path().to_path_buf())
-        .harness_overrides(ConfigOverrides {
-            approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
-            ..Default::default()
-        })
-        .fallback_cwd(Some(cwd.path().to_path_buf()))
-        .build()
-        .await
-        .expect("build config with guardian review policy");
-
-    let params_without_override = thread_resume_params_from_config(
-        &config,
-        "thread-id".to_string(),
-        /*approvals_reviewer_override*/ None,
-    );
-    let params_with_override = thread_resume_params_from_config(
-        &config,
-        "thread-id".to_string(),
-        Some(codex_app_server_protocol::ApprovalsReviewer::AutoReview),
-    );
-
-    assert_eq!(params_without_override.approvals_reviewer, None);
-    assert_eq!(
-        params_with_override.approvals_reviewer,
-        Some(codex_app_server_protocol::ApprovalsReviewer::AutoReview)
-    );
-}
-
-#[tokio::test]
-async fn headless_approval_policy_defers_to_auto_review() {
-    let codex_home = tempdir().expect("create temp codex home");
-    let cwd = tempdir().expect("create temp cwd");
-    std::fs::write(
-        codex_home.path().join("config.toml"),
-        r#"
-approval_policy = "on-request"
-approvals_reviewer = "auto_review"
-"#,
-    )
-    .expect("write config");
-    let requirements_path = codex_home.path().join("requirements.toml");
-    std::fs::write(
-        &requirements_path,
-        r#"
-allowed_approval_policies = ["never", "on-request"]
-allowed_sandbox_modes = ["read-only", "workspace-write"]
-"#,
-    )
-    .expect("write requirements");
-    let mut loader_overrides = LoaderOverrides::without_managed_config_for_tests();
-    loader_overrides.system_requirements_path = Some(requirements_path);
-    let overrides = ConfigOverrides {
-        cwd: Some(cwd.path().to_path_buf()),
-        headless_approval_policy: Some(AskForApproval::Never),
-        sandbox_mode: Some(SandboxMode::ReadOnly),
-        ..Default::default()
-    };
-    let build_config = |overrides| {
-        ConfigBuilder::default()
-            .codex_home(codex_home.path().to_path_buf())
-            .loader_overrides(loader_overrides.clone())
-            .harness_overrides(overrides)
-            .build()
-    };
-
-    let config = build_config(overrides)
-        .await
-        .expect("auto-review config should ignore the synthetic headless policy");
-
-    assert_eq!(
-        config.permissions.approval_policy.value(),
-        AskForApproval::OnRequest
-    );
-    assert_eq!(config.approvals_reviewer, ApprovalsReviewer::AutoReview);
-}
-
-#[tokio::test]
-async fn headless_approval_policy_applies_for_user_review() {
+async fn headless_approval_policy_applies() {
     let codex_home = tempdir().expect("create temp codex home");
     let cwd = tempdir().expect("create temp cwd");
     let config = ConfigBuilder::default()
@@ -759,12 +649,11 @@ async fn headless_approval_policy_applies_for_user_review() {
         .harness_overrides(ConfigOverrides {
             cwd: Some(cwd.path().to_path_buf()),
             headless_approval_policy: Some(AskForApproval::Never),
-            approvals_reviewer: Some(ApprovalsReviewer::User),
             ..Default::default()
         })
         .build()
         .await
-        .expect("user-reviewed headless config should apply the headless policy");
+        .expect("headless config should apply the headless policy");
 
     assert_eq!(
         config.permissions.approval_policy.value(),
@@ -806,11 +695,7 @@ async fn thread_lifecycle_params_preserve_hook_trust_bypass() {
         .await
         .expect("build config with hook trust bypass");
     let start_params = thread_start_params_from_config(&config);
-    let resume_params = thread_resume_params_from_config(
-        &config,
-        "thread-id".to_string(),
-        /*approvals_reviewer_override*/ None,
-    );
+    let resume_params = thread_resume_params_from_config(&config, "thread-id".to_string());
 
     assert_eq!(start_params.config, resume_params.config);
     assert_eq!(
@@ -848,11 +733,7 @@ async fn thread_lifecycle_params_include_legacy_sandbox_when_no_active_profile()
         .expect("build config with legacy sandbox override");
 
     let start_params = thread_start_params_from_config(&config);
-    let resume_params = thread_resume_params_from_config(
-        &config,
-        "thread-id".to_string(),
-        /*approvals_reviewer_override*/ None,
-    );
+    let resume_params = thread_resume_params_from_config(&config, "thread-id".to_string());
 
     assert_eq!(config.permissions.active_permission_profile(), None);
     assert_eq!(
@@ -892,7 +773,6 @@ async fn session_configured_from_thread_response_preserves_session_contract() {
         event.thread_id.to_string(),
         "67e55044-10b1-426f-9247-bb680e5fe0c8"
     );
-    assert_eq!(event.approvals_reviewer, ApprovalsReviewer::AutoReview);
     assert_eq!(
         event.permission_profile,
         config.permissions.effective_permission_profile()
@@ -938,7 +818,6 @@ fn sample_thread_start_response() -> ThreadStartResponse {
         runtime_workspace_roots: Vec::new(),
         instruction_sources: Vec::new(),
         approval_policy: codex_app_server_protocol::AskForApproval::OnRequest,
-        approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::AutoReview,
         sandbox: codex_app_server_protocol::SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![],
             network_access: false,
@@ -950,4 +829,19 @@ fn sample_thread_start_response() -> ThreadStartResponse {
         reasoning_effort: None,
         selected_environment: None,
     }
+}
+
+#[test]
+fn read_prompt_input_preserves_input_and_rejects_oversize_without_draining() {
+    use std::io::Read as _;
+
+    assert_eq!(
+        super::read_prompt_input(b"normal prompt\n".as_slice()).unwrap(),
+        b"normal prompt\n".to_vec()
+    );
+    let mut input = std::io::repeat(b'x').take(super::MAX_PROMPT_INPUT_BYTES + 2);
+    let error = super::read_prompt_input(&mut input).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("exceeds"));
+    assert_eq!(input.limit(), 1, "must stop after the first excess byte");
 }

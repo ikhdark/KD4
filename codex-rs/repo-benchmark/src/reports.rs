@@ -1,19 +1,33 @@
 //! Assemble preserved results and canonical Python diagnostics without model calls.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
+use std::fs::{self};
 use std::io::Write as _;
-use std::path::{Component, Path, PathBuf};
+use std::path::Component;
+use std::path::Path;
+use std::path::PathBuf;
 
-use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
+use serde::Deserialize;
+use serde::Serialize;
+use serde_json::Value;
+use serde_json::json;
 
 use crate::prepare::Prepared;
-use crate::prepare::provenance::{hash_file, read_json, write_json};
-use crate::runner::{Attempt, RunResult};
-use crate::schedule::{Segment, Variant};
-use crate::statistics::{Comparison, Observation, summarize};
+use crate::prepare::provenance::hash_file;
+use crate::prepare::provenance::read_json;
+use crate::prepare::provenance::write_json;
+use crate::runner::Attempt;
+use crate::runner::RunResult;
+use crate::schedule::Segment;
+use crate::schedule::Variant;
+use crate::statistics::Comparison;
+use crate::statistics::Observation;
+use crate::statistics::summarize;
 use crate::workloads::VerificationStatus;
 
 const REPORT_VERSION: u32 = 2;
@@ -1098,19 +1112,50 @@ pub fn import(result_path: &Path) -> Result<PathBuf> {
     );
     ensure!(safe_id(&result.id), "unsafe report run identity");
     fs::create_dir_all(&prepared.import_directory)?;
+    let import_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(prepared.import_directory.join(".import.lock"))?;
+    import_lock
+        .try_lock()
+        .context("another report import is in progress")?;
     let destination = prepared.import_directory.join(&result.id);
-    // Atomic directory creation rejects a prior import; file creation also never
-    // follows a pre-existing target or overwrites a report.
-    fs::create_dir(&destination)
-        .context("import destination already exists or cannot be created")?;
+    match fs::symlink_metadata(&destination) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect import destination"),
+        Ok(_) => anyhow::bail!("import destination already exists"),
+    }
+    // Publish only a complete report. The owned staging directory is removed on
+    // every failed copy, keeping this run ID available for an unchanged retry.
+    let staging = tempfile::Builder::new()
+        .prefix(".report-import-")
+        .tempdir_in(&prepared.import_directory)?;
     for (source, name) in [
         (&json_path, "report.json"),
         (&markdown_path, "report.md"),
         (&manifest_path, "reports-manifest.json"),
     ] {
-        copy_new(source, &destination.join(name))?;
+        copy_new(source, &staging.path().join(name))?;
+        #[cfg(test)]
+        if FAIL_IMPORT_AFTER_COPY.with(|remaining| {
+            let Some(count) = remaining.get() else {
+                return false;
+            };
+            remaining.set(count.checked_sub(1));
+            count == 1
+        }) {
+            anyhow::bail!("injected report import copy failure");
+        }
     }
+    fs::rename(staging.path(), &destination).context("publish complete report import")?;
     Ok(destination)
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_IMPORT_AFTER_COPY: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 fn verify_hash(path: &Path, expected: &str) -> Result<()> {
@@ -1135,6 +1180,7 @@ fn copy_new(source: &Path, destination: &Path) -> Result<()> {
         .write(true)
         .open(destination)?;
     output.write_all(&fs::read(source)?)?;
+    output.sync_all()?;
     Ok(())
 }
 

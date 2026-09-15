@@ -430,3 +430,62 @@ fn typescript_submitted_tests_must_complete_after_positive_oracle() {
         "{result:?}"
     );
 }
+
+#[test]
+fn timed_out_verifier_reaps_its_owned_process_tree() {
+    let (_temp, mut fixture) = setup(LiveTask::RustBugfix);
+    // A real verifier can delegate to cargo/node/python. Keep this fixture short
+    // even if a broken termination implementation leaves the subprocess alive.
+    fs::write(
+        &fixture.verifier_path,
+        r#"import os, pathlib, subprocess, sys, time
+child = subprocess.Popen([sys.executable, '-I', '-c', 'import time; time.sleep(10)'])
+pathlib.Path('owned-pids.txt').write_text(str(os.getpid()) + '\n' + str(child.pid) + '\n')
+time.sleep(10)
+"#,
+    )
+    .unwrap();
+    fixture.verifier_sha256 = hash_file(&fixture.verifier_path).unwrap();
+    let result = verify_fixture_with_timeout(&fixture, None, Duration::from_secs(2));
+    let pids = fs::read_to_string(fixture.protected_dir.join("owned-pids.txt"))
+        .expect("the timed verifier actually spawned its child before the deadline");
+    let mut survivors = Vec::new();
+    for pid in pids.lines() {
+        let pid: u32 = pid.parse().expect("owned process ID");
+        let mut probe = Command::new("tasklist");
+        configure_helper(&mut probe, None);
+        let output = probe
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .expect("query owned process after timeout");
+        assert!(
+            output.status.success(),
+            "tasklist failed: {:?}",
+            output.status
+        );
+        let listed = String::from_utf8_lossy(&output.stdout);
+        if listed.contains(&format!(",\"{pid}\",")) {
+            survivors.push(pid);
+            let mut cleanup = Command::new("taskkill");
+            configure_helper(&mut cleanup, None);
+            let cleanup = cleanup
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .output()
+                .expect("clean up surviving test process");
+            assert!(
+                cleanup.status.success(),
+                "test cleanup failed: {:?}",
+                cleanup.status
+            );
+        }
+    }
+    assert!(
+        survivors.is_empty(),
+        "timed-out verifier left owned processes: {survivors:?}"
+    );
+    let outcome = result.expect("owned verifier termination completes");
+    assert_eq!(outcome.status, VerificationStatus::TimedOut);
+    assert!(outcome.detail.contains("exceeded 2 seconds"));
+    assert!(outcome.stdout_path.is_file());
+    assert!(outcome.stderr_path.is_file());
+}

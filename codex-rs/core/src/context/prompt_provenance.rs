@@ -1156,8 +1156,9 @@ mod tests {
                 );
                 assert_eq!(
                     measured.bytes(PromptContextCategory::Memory),
-                    item_bytes(&replay[2]) + 4 // Two array brackets and two item separators.
+                    item_bytes(&replay[2])
                 );
+                assert_eq!(measured.bytes(PromptContextCategory::OtherInjected), 4);
             }
             assert_eq!(FINGERPRINT_CALLS.get(), 0);
         }

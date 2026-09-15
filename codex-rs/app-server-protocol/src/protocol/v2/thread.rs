@@ -1,5 +1,4 @@
 use super::ActivePermissionProfile;
-use super::ApprovalsReviewer;
 use super::AskForApproval;
 use super::SandboxMode;
 use super::SandboxPolicy;
@@ -99,10 +98,6 @@ pub struct ThreadStartParams {
     #[experimental(nested)]
     #[ts(optional = nullable)]
     pub approval_policy: Option<AskForApproval>,
-    /// Override where approval requests are routed for review on this thread
-    /// and subsequent turns.
-    #[ts(optional = nullable)]
-    pub approvals_reviewer: Option<ApprovalsReviewer>,
     #[ts(optional = nullable)]
     pub sandbox: Option<SandboxMode>,
     /// Exact permission profile for this thread. When both this and the legacy
@@ -211,8 +206,6 @@ pub struct ThreadStartResponse {
     pub instruction_sources: Vec<LegacyAppPathString>,
     #[experimental(nested)]
     pub approval_policy: AskForApproval,
-    /// Reviewer currently used for approval requests on this thread.
-    pub approvals_reviewer: ApprovalsReviewer,
     /// Legacy sandbox policy retained for compatibility. Experimental clients
     /// should prefer `permissionProfile` for exact permissions and
     /// `activePermissionProfile` for profile provenance.
@@ -251,9 +244,6 @@ pub struct ThreadSettingsUpdateParams {
     #[experimental(nested)]
     #[ts(optional = nullable)]
     pub approval_policy: Option<AskForApproval>,
-    /// Override where approval requests are routed for subsequent turns.
-    #[ts(optional = nullable)]
-    pub approvals_reviewer: Option<ApprovalsReviewer>,
     /// Override the sandbox policy for subsequent turns.
     #[ts(optional = nullable)]
     pub sandbox_policy: Option<SandboxPolicy>,
@@ -311,7 +301,6 @@ pub struct ThreadSettingsUpdateResponse {}
 pub struct ThreadSettings {
     pub cwd: AbsolutePathBuf,
     pub approval_policy: AskForApproval,
-    pub approvals_reviewer: ApprovalsReviewer,
     pub sandbox_policy: SandboxPolicy,
     /// Exact permission profile enforced for this thread.
     #[experimental("thread/settings/update.permissionProfile")]
@@ -399,10 +388,6 @@ pub struct ThreadResumeParams {
     #[experimental(nested)]
     #[ts(optional = nullable)]
     pub approval_policy: Option<AskForApproval>,
-    /// Override where approval requests are routed for review on this thread
-    /// and subsequent turns.
-    #[ts(optional = nullable)]
-    pub approvals_reviewer: Option<ApprovalsReviewer>,
     #[ts(optional = nullable)]
     pub sandbox: Option<SandboxMode>,
     /// Exact permission profile for the resumed thread. When both this and the
@@ -464,8 +449,6 @@ pub struct ThreadResumeResponse {
     pub instruction_sources: Vec<LegacyAppPathString>,
     #[experimental(nested)]
     pub approval_policy: AskForApproval,
-    /// Reviewer currently used for approval requests on this thread.
-    pub approvals_reviewer: ApprovalsReviewer,
     /// Legacy sandbox policy retained for compatibility. Experimental clients
     /// should prefer `permissionProfile` for exact permissions and
     /// `activePermissionProfile` for profile provenance.
@@ -583,10 +566,6 @@ pub struct ThreadForkParams {
     #[experimental(nested)]
     #[ts(optional = nullable)]
     pub approval_policy: Option<AskForApproval>,
-    /// Override where approval requests are routed for review on this thread
-    /// and subsequent turns.
-    #[ts(optional = nullable)]
-    pub approvals_reviewer: Option<ApprovalsReviewer>,
     #[ts(optional = nullable)]
     pub sandbox: Option<SandboxMode>,
     /// Exact permission profile for the forked thread. When both this and the
@@ -644,8 +623,6 @@ pub struct ThreadForkResponse {
     pub instruction_sources: Vec<LegacyAppPathString>,
     #[experimental(nested)]
     pub approval_policy: AskForApproval,
-    /// Reviewer currently used for approval requests on this thread.
-    pub approvals_reviewer: ApprovalsReviewer,
     /// Legacy sandbox policy retained for compatibility. Experimental clients
     /// should prefer `permissionProfile` for exact permissions and
     /// `activePermissionProfile` for profile provenance.
@@ -1025,20 +1002,6 @@ pub struct ThreadShellCommandParams {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadShellCommandResponse {}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct ThreadApproveGuardianDeniedActionParams {
-    pub thread_id: String,
-    /// Serialized `codex_protocol::protocol::GuardianAssessmentEvent`.
-    pub event: JsonValue,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct ThreadApproveGuardianDeniedActionResponse {}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]

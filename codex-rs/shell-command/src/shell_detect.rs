@@ -5,10 +5,15 @@ use serde::Serialize;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
 pub enum ShellType {
+    #[serde(rename = "Zsh")]
     Zsh,
+    #[serde(rename = "Bash")]
     Bash,
+    #[serde(rename = "PowerShell")]
     PowerShell,
+    #[serde(rename = "Sh")]
     Sh,
+    #[serde(rename = "Cmd")]
     Cmd,
 }
 
@@ -43,7 +48,9 @@ pub struct DetectedShell {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PowerShellHostKind {
+    #[serde(rename = "Pwsh")]
     Pwsh,
+    #[serde(rename = "WindowsPowerShell")]
     WindowsPowerShell,
 }
 

@@ -264,7 +264,6 @@ pub(crate) fn apply_spawn_agent_runtime_overrides(
         .map_err(|err| {
             FunctionCallError::RespondToModel(format!("approval_policy is invalid: {err}"))
         })?;
-    config.approvals_reviewer = turn.config.approvals_reviewer;
     let turn_cwd = turn.cwd().clone();
     config.cwd = turn_cwd;
     Ok(())

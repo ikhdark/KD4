@@ -906,7 +906,7 @@ def _kw_signature_lines(fields: list[PublicFieldSpec]) -> list[str]:
 
 def _approval_mode_start_signature_lines() -> list[str]:
     """Return the approval mode kwarg for new threads."""
-    return ["        approval_mode: ApprovalMode = ApprovalMode.auto_review,"]
+    return ["        approval_mode: ApprovalMode = ApprovalMode.deny_all,"]
 
 
 def _approval_mode_override_signature_lines() -> list[str]:
@@ -916,14 +916,13 @@ def _approval_mode_override_signature_lines() -> list[str]:
 
 def _approval_mode_assignment_line(helper_name: str, *, indent: str = "        ") -> str:
     """Return the local mapping from public mode to app-server params."""
-    return f"{indent}approval_policy, approvals_reviewer = {helper_name}(approval_mode)"
+    return f"{indent}approval_policy = {helper_name}(approval_mode)"
 
 
 def _approval_mode_model_arg_lines(*, indent: str = "            ") -> list[str]:
     """Return app-server approval params derived from ApprovalMode."""
     return [
         f"{indent}approval_policy=approval_policy,",
-        f"{indent}approvals_reviewer=approvals_reviewer,",
     ]
 
 
@@ -1208,7 +1207,7 @@ def generate_public_api_flat_methods() -> None:
     if src_dir_str not in sys.path:
         sys.path.insert(0, src_dir_str)
 
-    approval_fields = {"approval_policy", "approvals_reviewer"}
+    approval_fields = {"approval_policy"}
     thread_start_fields = _load_public_fields(
         "openai_codex.generated.v2_all",
         "ThreadStartParams",

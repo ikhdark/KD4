@@ -517,7 +517,10 @@ fn wait_for_complete_frame(pipe_read: &File, timeout: Duration) -> Result<()> {
             ));
         }
 
-        std::thread::sleep(RUNNER_SPAWN_READY_POLL_INTERVAL);
+        std::thread::sleep(
+            RUNNER_SPAWN_READY_POLL_INTERVAL
+                .min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
 }
 

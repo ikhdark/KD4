@@ -124,21 +124,6 @@ pub const CONFIG_OPTION_DOCS: &[ConfigOptionDoc] = &[
         "Default policy for when command execution asks for approval.",
     ),
     doc(
-        "approvals_reviewer",
-        "Approvals and sandbox",
-        "Where escalated approval requests are routed.",
-    ),
-    doc(
-        "auto_review.policy",
-        "Approvals and sandbox",
-        "Extra policy text inserted into guardian auto-review prompts.",
-    ),
-    doc(
-        "auto_review",
-        "Approvals and sandbox",
-        "Guardian auto-review policy settings.",
-    ),
-    doc(
         "sandbox_mode",
         "Approvals and sandbox",
         "Command sandbox level: `read-only`, `workspace-write`, or `danger-full-access`.",

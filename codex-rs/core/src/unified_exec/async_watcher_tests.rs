@@ -671,21 +671,11 @@ async fn exit_watcher_applies_late_network_denial_before_terminal_event_and_cach
         let command = vec!["git".to_string(), "show".to_string(), blob.clone()];
         let deferred = begin_network_approval(
             &session,
-            &turn.sub_id,
             true,
             Some(NetworkApprovalSpec {
                 network: Some(proxy_owner.proxy().clone()),
                 mode: NetworkApprovalMode::Deferred,
-                trigger: crate::guardian::GuardianNetworkAccessTrigger {
-                    call_id: "late-denial".to_string(),
-                    tool_name: "exec_command".to_string(),
-                    command: command.clone(),
-                    cwd: turn.cwd().clone().into(),
-                    sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
-                    additional_permissions: None,
-                    justification: None,
-                    tty: None,
-                },
+                cwd: turn.cwd().clone().into(),
                 command: command.join(" "),
                 environment_id: "local".to_string(),
                 approval_scope_id: "local".to_string(),

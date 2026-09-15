@@ -2899,10 +2899,34 @@ async fn registered_exec_preserves_foreign_grant_with_explicit_network_request()
                 let mut socket = tokio_tungstenite::accept_async(accepted.0).await.unwrap();
                 let mut starts = Vec::new();
                 let mut read_release_rx = Some(read_release_rx);
+                let mut process_id = None;
                 loop {
                     let frame = tokio::select! {
                         frame = socket.next() => frame,
                         _ = &mut stop_rx => break,
+                        released = async {
+                            match read_release_rx.as_mut() {
+                                Some(receiver) => receiver.await,
+                                None => std::future::pending().await,
+                            }
+                        }, if process_id.is_some() => {
+                            released.expect("test releases output after the yielded result");
+                            read_release_rx = None;
+                            // Normal live exec-server output uses notifications. process/read
+                            // is recovery, so a read-only peer would never settle a live process.
+                            let process_id = process_id.take().expect("started remote process");
+                            for notification in [
+                                json!({"method": "process/output", "params": {"processId": process_id, "seq": 1, "stream": "stdout", "chunk": "cmVtb3RlLXVyaS1wcm9vZgo="}}),
+                                json!({"method": "process/exited", "params": {"processId": process_id, "seq": 2, "exitCode": 7, "sandboxDenied": false}}),
+                                json!({"method": "process/closed", "params": {"processId": process_id, "seq": 3}}),
+                            ] {
+                                socket
+                                    .send(Message::Text(notification.to_string().into()))
+                                    .await
+                                    .unwrap();
+                            }
+                            continue;
+                        },
                     };
                     let Some(Ok(frame)) = frame else { break };
                     let message: serde_json::Value = match frame {
@@ -2912,9 +2936,34 @@ async fn registered_exec_preserves_foreign_grant_with_explicit_network_request()
                         Message::Close(_) => break,
                         other => panic!("unexpected executor frame: {other:?}"),
                     };
+                    // This fixture is a directory outside a Git repository. Reporting
+                    // a .git directory would launch unrelated evidence processes.
+                    if message["method"] == "fs/getMetadata"
+                        && message["params"]["path"]
+                            .as_str()
+                            .is_some_and(|path| path.ends_with("/.git"))
+                    {
+                        socket
+                            .send(Message::Text(
+                                json!({
+                                    "id": message["id"],
+                                    "error": {"code": -32004, "message": "path does not exist"}
+                                })
+                                .to_string()
+                                .into(),
+                            ))
+                            .await
+                            .unwrap();
+                        continue;
+                    }
                     let result = match message["method"].as_str().unwrap() {
                         "initialize" => json!({"sessionId": "uri-permission-session"}),
                         "initialized" => continue,
+                        "fs/canonicalize" => json!({"path": message["params"]["path"]}),
+                        "fs/getMetadata" => json!({
+                            "isDirectory": true, "isFile": false, "isSymlink": false,
+                            "size": 0, "createdAtMs": 0, "modifiedAtMs": 0
+                        }),
                         "environment/info" => json!({
                             "operatingSystem": "windows",
                             "shell": {"name": "cmd", "path": "cmd.exe"},
@@ -2922,6 +2971,7 @@ async fn registered_exec_preserves_foreign_grant_with_explicit_network_request()
                         }),
                         "process/start" => {
                             starts.push(message["params"].clone());
+                            process_id = Some(message["params"]["processId"].clone());
                             json!({"processId": message["params"]["processId"]})
                         }
                         "process/read" => json!({
@@ -2929,7 +2979,7 @@ async fn registered_exec_preserves_foreign_grant_with_explicit_network_request()
                             "nextSeq": 4, "exited": true, "exitCode": 7,
                             "closed": true, "failure": null, "sandboxDenied": false
                         }),
-                        "process/terminate" => json!({}),
+                        "process/terminate" => json!({"running": false}),
                         method => panic!("unexpected executor operation {method}: {message}"),
                     };
                     socket
@@ -2940,26 +2990,6 @@ async fn registered_exec_preserves_foreign_grant_with_explicit_network_request()
                         ))
                         .await
                         .unwrap();
-                    if message["method"] == "process/start" {
-                        read_release_rx
-                            .take()
-                            .expect("one remote process")
-                            .await
-                            .expect("test releases remote output after the real yielded result");
-                        // Normal live exec-server output uses notifications. process/read
-                        // is recovery, so a read-only peer would never settle a live process.
-                        let process_id = &message["params"]["processId"];
-                        for notification in [
-                            json!({"method": "process/output", "params": {"processId": process_id, "seq": 1, "stream": "stdout", "chunk": "cmVtb3RlLXVyaS1wcm9vZgo="}}),
-                            json!({"method": "process/exited", "params": {"processId": process_id, "seq": 2, "exitCode": 7, "sandboxDenied": false}}),
-                            json!({"method": "process/closed", "params": {"processId": process_id, "seq": 3}}),
-                        ] {
-                            socket
-                                .send(Message::Text(notification.to_string().into()))
-                                .await
-                                .unwrap();
-                        }
-                    }
                 }
                 starts
             });
@@ -3087,7 +3117,7 @@ async fn registered_exec_preserves_foreign_grant_with_explicit_network_request()
                     }
                 }
             }
-        }).await.expect("registered execution must complete");
+        }).await.unwrap_or_else(|err| panic!("registered {tool_name} execution must complete ({feature_enabled}, {policy:?}): {err}"));
             let codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } =
                 response
             else {

@@ -961,11 +961,16 @@ fn windows_snapshot_queued_spawn_obeys_original_deadline() -> Result<()> {
 
 #[test]
 fn windows_snapshot_expired_ready_child_returns_before_owned_cleanup() -> Result<()> {
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
-    };
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::FromRawHandle;
+    use std::os::windows::io::OwnedHandle;
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+    use windows_sys::Win32::System::Threading::OpenProcess;
+    use windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::PROCESS_TERMINATE;
+    use windows_sys::Win32::System::Threading::TerminateProcess;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     struct ObservedChild(OwnedHandle);
     impl Drop for ObservedChild {
@@ -1048,4 +1053,250 @@ fn windows_snapshot_expired_ready_child_returns_before_owned_cleanup() -> Result
         assert!(!dir.path().join("forbidden.txt").exists());
         Ok(())
     })
+}
+
+#[tokio::test]
+async fn remote_snapshot_shutdown_waits_for_file_removal() -> Result<()> {
+    assert_remote_snapshot_shutdown(false, false).await
+}
+
+#[tokio::test]
+async fn inherited_remote_snapshot_survives_parent_shutdown_until_child_releases_it() -> Result<()>
+{
+    assert_remote_snapshot_shutdown(true, false).await
+}
+
+#[tokio::test]
+async fn remote_snapshot_removal_survives_bounded_shutdown_wait() -> Result<()> {
+    assert_remote_snapshot_shutdown(false, true).await
+}
+
+async fn assert_remote_snapshot_shutdown(inherit: bool, expire_wait: bool) -> Result<()> {
+    use crate::environment_selection::ThreadEnvironments;
+    use crate::environment_selection::TurnEnvironmentSnapshot;
+    use codex_exec_server::EnvironmentManager;
+    use codex_exec_server::REMOTE_ENVIRONMENT_ID;
+    use codex_protocol::protocol::TurnEnvironmentSelection;
+    use futures::SinkExt;
+    use futures::StreamExt;
+    use serde_json::json;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (remove_started, remove_observed) = tokio::sync::oneshot::channel();
+    let (allow_remove, remove_allowed) = tokio::sync::oneshot::channel();
+    let removals = Arc::new(AtomicUsize::new(0));
+    let peer_removals = removals.clone();
+    let peer = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await?;
+        let mut websocket = tokio_tungstenite::accept_async(socket).await?;
+        let mut remove_started = Some(remove_started);
+        let mut remove_allowed = Some(remove_allowed);
+        let mut published_path = None;
+        let mut process_count = 0;
+        while let Some(message) = websocket.next().await {
+            let request: serde_json::Value = serde_json::from_slice(&message?.into_data())?;
+            let method = request["method"].as_str().context("request method")?;
+            if method == "initialized" {
+                continue;
+            }
+            let result = match method {
+                "initialize" => json!({"sessionId":"snapshot-shutdown-test"}),
+                "environment/info" => json!({
+                    "operatingSystem":"windows",
+                    "shell":{"name":"cmd","path":"cmd.exe"},
+                    "cwd":"file:///C:/workspace"
+                }),
+                "fs/createDirectory" => json!({}),
+                "process/start" => {
+                    process_count += 1;
+                    if process_count > 1 {
+                        assert!(published_path.is_some(), "validate a published snapshot");
+                        assert_eq!(
+                            peer_removals.load(Ordering::SeqCst),
+                            0,
+                            "a live snapshot owner must retain its remote file"
+                        );
+                    }
+                    json!({"processId":request["params"]["processId"]})
+                }
+                "process/read" => {
+                    let chunks = if process_count == 1 {
+                        let raw = b"# Snapshot file\n# Codex Cmd snapshot format: 1\n# exports\nSNAPSHOT_MARKER=retained\n";
+                        vec![json!({"seq":1,"stream":"stdout","chunk":
+                            codex_exec_server::ByteChunk::from(raw.to_vec())})]
+                    } else {
+                        vec![]
+                    };
+                    json!({"chunks":chunks,"nextSeq":2,"exited":true,
+                        "exitCode":0,"closed":true,"failure":null})
+                }
+                "fs/writeFile" => {
+                    assert!(published_path.is_none(), "publish once");
+                    published_path = Some(request["params"]["path"].clone());
+                    json!({})
+                }
+                "fs/remove" => {
+                    assert_eq!(Some(&request["params"]["path"]), published_path.as_ref());
+                    assert_eq!(request["params"]["recursive"], false);
+                    assert_eq!(request["params"]["force"], true);
+                    remove_started
+                        .take()
+                        .context("one removal")?
+                        .send(())
+                        .map_err(|_| anyhow!("shutdown observer dropped"))?;
+                    remove_allowed
+                        .take()
+                        .context("one removal permission")?
+                        .await?;
+                    assert_eq!(peer_removals.fetch_add(1, Ordering::SeqCst), 0);
+                    json!({})
+                }
+                other => bail!("unexpected snapshot shutdown request: {other}"),
+            };
+            websocket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"jsonrpc":"2.0","id":request["id"],"result":result})
+                        .to_string()
+                        .into(),
+                ))
+                .await?;
+            if method == "fs/remove" {
+                return Ok::<_, anyhow::Error>(());
+            }
+        }
+        bail!("snapshot transport closed before acknowledged removal")
+    });
+    let directory = tempdir()?;
+    let manager =
+        Arc::new(EnvironmentManager::create_for_tests(Some(format!("ws://{address}")), None).await);
+    let session_id = ThreadId::new();
+    let snapshot = ShellSnapshot::new(
+        directory.path().abs(),
+        session_id,
+        SessionTelemetry::new(
+            session_id,
+            "test-model",
+            "test-model",
+            None,
+            None,
+            None,
+            "test".to_string(),
+            false,
+            "unknown".to_string(),
+            codex_protocol::protocol::SessionSource::Cli,
+        ),
+        None,
+        HashMap::new(),
+        ShellEnvironmentPolicy::default(),
+    );
+    let shell = Shell {
+        shell_type: ShellType::Cmd,
+        shell_path: "cmd.exe".into(),
+    };
+    let cwd = PathUri::from_abs_path(&directory.path().abs());
+    let selection = TurnEnvironmentSelection {
+        environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
+        cwd: cwd.clone(),
+    };
+    let parent = Arc::new(ThreadEnvironments::new(
+        manager.clone(),
+        shell.clone(),
+        snapshot,
+        TurnEnvironmentSnapshot::default(),
+        false,
+    ));
+    parent.update_selections(std::slice::from_ref(&selection));
+    let ready = timeout(Duration::from_secs(5), parent.snapshot()).await?;
+    let file = timeout(
+        Duration::from_secs(5),
+        ready
+            .primary()
+            .context("remote environment")?
+            .shell_snapshot(&cwd),
+    )
+    .await?
+    .context("completed remote snapshot")?;
+    assert!(file.contents().contains("SNAPSHOT_MARKER"));
+    drop(file);
+    let owner = if inherit {
+        let child = Arc::new(ThreadEnvironments::new(
+            manager,
+            shell.clone(),
+            ShellSnapshot::disabled(),
+            ready,
+            false,
+        ));
+        child.update_selections(std::slice::from_ref(&selection));
+        parent.shutdown();
+        timeout(Duration::from_secs(2), parent.finish_shutdown()).await?;
+        assert_eq!(removals.load(Ordering::SeqCst), 0);
+        let child_ready = child.snapshot().await;
+        let environment = child_ready.primary().context("inherited environment")?;
+        let file = environment
+            .shell_snapshot(&cwd)
+            .await
+            .context("inherited snapshot")?;
+        let remote_path = match &file.location {
+            ShellSnapshotLocation::Remote { path, .. } => path,
+            ShellSnapshotLocation::Local(_) => bail!("expected remote snapshot"),
+        };
+        validate_snapshot_remote(
+            &shell,
+            remote_path,
+            &cwd,
+            &HashMap::new(),
+            exec_env_policy_from_shell_policy(&ShellEnvironmentPolicy::default()),
+            environment.environment.as_ref(),
+            session_id,
+        )
+        .await?;
+        drop(file);
+        drop(child_ready);
+        child
+    } else {
+        drop(ready);
+        parent
+    };
+    owner.shutdown();
+    let shutdown_owner = owner.clone();
+    let shutdown = tokio::spawn(async move {
+        timeout(
+            if expire_wait {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_secs(5)
+            },
+            shutdown_owner.finish_shutdown(),
+        )
+        .await
+    });
+    timeout(Duration::from_secs(5), remove_observed).await??;
+    assert_eq!(
+        removals.load(Ordering::SeqCst),
+        0,
+        "peer has not removed the file yet"
+    );
+    if expire_wait {
+        assert!(
+            shutdown.await?.is_err(),
+            "unavailable remote removal must respect the caller's shutdown bound"
+        );
+        allow_remove
+            .send(())
+            .map_err(|_| anyhow!("removal owner vanished on timeout"))?;
+        timeout(Duration::from_secs(2), owner.finish_shutdown()).await?;
+    } else {
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown must await remote removal acknowledgment"
+        );
+        allow_remove
+            .send(())
+            .map_err(|_| anyhow!("removal owner vanished"))?;
+        shutdown.await??;
+    }
+    timeout(Duration::from_secs(2), peer).await???;
+    assert_eq!(removals.load(Ordering::SeqCst), 1);
+    Ok(())
 }

@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use codex_extension_api::ApprovalReviewContributor;
 use codex_extension_api::ConfigContributor;
 use codex_extension_api::ContextContributor;
 use codex_extension_api::ContextualUserFragment;
@@ -24,12 +23,10 @@ use codex_extension_api::TurnInputContext;
 use codex_extension_api::TurnInputContributor;
 use codex_extension_api::TurnItemContributor;
 use codex_extension_api::TurnLifecycleContributor;
-use codex_extension_api::empty_extension_registry;
 use codex_protocol::items::HookPromptItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::WarningEvent;
 use pretty_assertions::assert_eq;
 
@@ -164,20 +161,6 @@ impl TurnItemContributor for AllContributors {
     }
 }
 
-impl ApprovalReviewContributor for AllContributors {
-    fn contribute<'a>(
-        &'a self,
-        _session_store: &'a ExtensionData,
-        _thread_store: &'a ExtensionData,
-        _prompt: &'a str,
-    ) -> ExtensionFuture<'a, Option<ReviewDecision>> {
-        Box::pin(async move {
-            let _self = self;
-            Some(ReviewDecision::ApprovedForSession)
-        })
-    }
-}
-
 #[tokio::test]
 async fn build_round_trips_every_contributor_category() {
     let contributor = Arc::new(AllContributors);
@@ -191,7 +174,6 @@ async fn build_round_trips_every_contributor_category() {
     builder.tool_contributor(contributor.clone());
     builder.tool_lifecycle_contributor(contributor.clone());
     builder.turn_item_contributor(contributor.clone());
-    builder.approval_review_contributor(contributor);
     let registry = builder.build();
 
     assert_eq!(registry.thread_lifecycle_contributors().len(), 1);
@@ -210,16 +192,6 @@ async fn build_round_trips_every_contributor_category() {
     );
     assert_eq!(registry.tool_lifecycle_contributors().len(), 1);
     assert_eq!(registry.turn_item_contributors().len(), 1);
-    assert_eq!(
-        registry
-            .approval_review(
-                &ExtensionData::new("session"),
-                &ExtensionData::new("thread"),
-                "review this",
-            )
-            .await,
-        Some(ReviewDecision::ApprovedForSession)
-    );
 }
 
 struct NamedContextContributor(&'static str);
@@ -342,87 +314,6 @@ async fn contributors_preserve_registration_order() {
     );
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct ApprovalCall {
-    contributor: &'static str,
-    session_id: String,
-    thread_id: String,
-    prompt: String,
-}
-
-struct RecordingApprovalContributor {
-    name: &'static str,
-    decision: Option<ReviewDecision>,
-    calls: Arc<Mutex<Vec<ApprovalCall>>>,
-}
-
-impl ApprovalReviewContributor for RecordingApprovalContributor {
-    fn contribute<'a>(
-        &'a self,
-        session_store: &'a ExtensionData,
-        thread_store: &'a ExtensionData,
-        prompt: &'a str,
-    ) -> ExtensionFuture<'a, Option<ReviewDecision>> {
-        Box::pin(async move {
-            self.calls
-                .lock()
-                .expect("approval calls lock should not be poisoned")
-                .push(ApprovalCall {
-                    contributor: self.name,
-                    session_id: session_store.level_id().to_string(),
-                    thread_id: thread_store.level_id().to_string(),
-                    prompt: prompt.to_string(),
-                });
-            self.decision.clone()
-        })
-    }
-}
-
-#[tokio::test]
-async fn approval_review_returns_first_claim_and_short_circuits() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let mut builder = ExtensionRegistryBuilder::<()>::new();
-    for (name, decision) in [
-        ("first", None),
-        ("second", Some(ReviewDecision::Approved)),
-        ("third", Some(ReviewDecision::Denied)),
-    ] {
-        builder.approval_review_contributor(Arc::new(RecordingApprovalContributor {
-            name,
-            decision,
-            calls: Arc::clone(&calls),
-        }));
-    }
-    let registry = builder.build();
-
-    let decision = registry
-        .approval_review(
-            &ExtensionData::new("session-1"),
-            &ExtensionData::new("thread-1"),
-            "allow command?",
-        )
-        .await;
-
-    assert_eq!(decision, Some(ReviewDecision::Approved));
-    assert_eq!(
-        calls.lock().expect("approval calls lock").as_slice(),
-        [
-            ApprovalCall {
-                contributor: "first",
-                session_id: "session-1".to_string(),
-                thread_id: "thread-1".to_string(),
-                prompt: "allow command?".to_string(),
-            },
-            ApprovalCall {
-                contributor: "second",
-                session_id: "session-1".to_string(),
-                thread_id: "thread-1".to_string(),
-                prompt: "allow command?".to_string(),
-            },
-        ]
-    );
-}
-
 #[derive(Default)]
 struct RecordingEventSink {
     events: Mutex<Vec<(String, String)>>,
@@ -467,22 +358,6 @@ fn custom_event_sink_survives_registry_build() {
             ("registry".to_string(), "after".to_string()),
             ("turn-correlation".to_string(), "scoped".to_string()),
         ]
-    );
-}
-
-#[tokio::test]
-async fn empty_registry_does_not_claim_approval_review() {
-    let registry = empty_extension_registry::<()>();
-
-    assert_eq!(
-        registry
-            .approval_review(
-                &ExtensionData::new("session"),
-                &ExtensionData::new("thread"),
-                "unclaimed",
-            )
-            .await,
-        None
     );
 }
 

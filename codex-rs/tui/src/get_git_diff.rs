@@ -1259,7 +1259,7 @@ mod tests {
                         "--relative",
                     ],
                 ),
-                /*exit_code*/ 0,
+                /*exit_code*/ 1,
                 "tracked\n",
             ),
             response(

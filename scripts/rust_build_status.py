@@ -144,7 +144,7 @@ class CargoLanesRootValidationError(ValueError):
 
 
 def default_cargo_lanes_root(repo_root: Path = REPO_ROOT) -> Path:
-    return (repo_root / "codex-rs" / "target" / "lanes").resolve()
+    return (repo_root / "codex-rs" / "target" / "lanes").absolute()
 
 
 def cargo_lanes_root(
@@ -157,6 +157,19 @@ def cargo_lanes_root(
     path = Path(raw).expanduser()
     if not path.is_absolute():
         path = repo_root / path
+    return path.absolute()
+
+
+def _checked_cargo_lanes_path(path: Path) -> Path:
+    # Inspect the original spelling, including ancestors, before resolving it.
+    # Otherwise a default-path junction can authorize cleanup of its destination.
+    path = path.expanduser().absolute()
+    for component in (path, *path.parents):
+        observation = _lane_path_observation(component)
+        if observation is not None and _observation_is_indirect(observation):
+            raise CargoLanesRootValidationError(
+                f"refusing indirect Cargo lanes root {path}: {component}"
+            )
     return path.resolve()
 
 
@@ -164,7 +177,7 @@ def validate_cargo_lanes_root(
     repo_root: Path = REPO_ROOT,
     env: Mapping[str, str] = os.environ,
 ) -> Path:
-    lane_root = cargo_lanes_root(repo_root, env)
+    lane_root = _checked_cargo_lanes_path(cargo_lanes_root(repo_root, env))
     if lane_root == default_cargo_lanes_root(repo_root):
         return lane_root
 
@@ -409,7 +422,29 @@ def has_shared_target_rust_jobs(processes: Sequence[RustProcess] | None = None) 
 
 
 def cargo_lock_is_busy(target_dir: Path) -> bool:
-    lock_path = target_dir / ".cargo-lock"
+    # Cargo locks each profile directory, optionally below a target triple.
+    # Inspect only those two levels; never follow junctions into other trees.
+    try:
+        for child in target_dir.iterdir():
+            if not child.is_dir():
+                continue
+            if is_indirect_directory(child):
+                return True
+            if _cargo_lock_file_is_busy(child / ".cargo-lock"):
+                return True
+            for profile in child.iterdir():
+                if profile.is_dir():
+                    if is_indirect_directory(profile):
+                        return True
+                    if _cargo_lock_file_is_busy(profile / ".cargo-lock"):
+                        return True
+    except OSError:
+        # A disappearing child does not prove the remaining profiles are idle.
+        return True
+    return False
+
+
+def _cargo_lock_file_is_busy(lock_path: Path) -> bool:
     try:
         if not stat.S_ISREG(lock_path.stat().st_mode):
             return False
@@ -599,12 +634,12 @@ def _auto_lane_base(command: Sequence[str]) -> str:
         r"(?:^|\s)(?:--release|-r|--profile(?:=|\s+)release)(?:\s|$)",
         signature,
     )
-    package = re.search(
-        r"(?:^|\s)--package(?:=|\s+)([A-Za-z0-9_.-]+)(?:\s|$)",
-        signature,
-    ) or re.search(r"(?:^|\s)-p\s+([A-Za-z0-9_.-]+)(?:\s|$)", signature)
-    if package is not None:
-        base = package.group(1)
+    from scripts.rust_tool_env import cargo_package_specs
+
+    # Affinity also covers Cargo watch's embedded --exec/-x command strings.
+    packages = cargo_package_specs(signature.split())
+    if packages:
+        base = packages[0]
     elif command:
         program = Path(command[0]).stem
         digest = hashlib.sha1(signature.encode("utf-8")).hexdigest()[:8]
@@ -616,12 +651,7 @@ def _auto_lane_base(command: Sequence[str]) -> str:
 
 
 def initialize_cargo_lanes_root(repo_root: Path, lane_root: Path) -> Path:
-    lane_root = lane_root.expanduser()
-    if lane_root.exists() and is_indirect_directory(lane_root):
-        raise CargoLanesRootValidationError(
-            f"refusing indirect Cargo lanes root {lane_root}"
-        )
-    lane_root = lane_root.resolve()
+    lane_root = _checked_cargo_lanes_path(lane_root)
     default_root = default_cargo_lanes_root(repo_root)
     if not lane_root.exists():
         lane_root.mkdir(parents=True)
@@ -707,7 +737,7 @@ def _lane_reservation_candidates(
         ) -> tuple[float, str, str]:
             assert candidate.observation is not None
             return (
-                -candidate.observation.st_mtime,
+                -lane_last_used_mtime(candidate.path),
                 candidate.name.casefold(),
                 candidate.name,
             )
@@ -765,6 +795,8 @@ def reserve_cargo_lane(
                     f"refusing indirect Cargo lane path {candidate_dir}"
                 )
             candidate_dir.mkdir(exist_ok=True)
+            if cargo_lock_is_busy(candidate_dir):
+                continue
             active_handle = _try_acquire_binary_file_lock(
                 candidate_dir / ".lane-active.lock"
             )
@@ -1053,43 +1085,120 @@ def _cargo_command_with_target_dir(
     ]
 
 
-def _requires_core_test_helpers(arguments: Sequence[str]) -> bool:
-    return "codex-core" in arguments and ("-p" in arguments or "--package" in arguments)
-
-
 def _direct_reserved_lane_command(
     command: Sequence[str],
     child_env: dict[str, str],
+    *,
+    repo_root: Path,
+    target_dir: Path,
 ) -> list[str] | None:
     if len(command) < 2 or Path(command[0]).stem.lower() != "just":
         return None
 
     recipe = command[1]
     arguments = list(command[2:])
+    runner_arguments: list[str] | None = None
+    if recipe == "_core-test-reserved" and len(arguments) >= 2:
+        profile, target, *forwarded = arguments
+        runner_arguments = ["run-target", "--profile", profile, target, *forwarded]
+    elif recipe == "_core-gate-reserved" and arguments:
+        profile = "fast"
+        runner_arguments = ["run-gate", "--profile", profile, *arguments]
+    elif recipe == "_core-parity-reserved" and len(arguments) >= 2:
+        profile = "fast"
+        runner_arguments = ["parity", "--profile", profile, *arguments]
+    if runner_arguments is not None:
+        child_env["RUST_MIN_STACK"] = RUST_MIN_STACK_BYTES
+        child_env["NEXTEST_PROFILE"] = profile
+        return [
+            sys.executable,
+            str(repo_root / "scripts" / "rust_test_runner.py"),
+            "--target-dir",
+            str(target_dir),
+            *runner_arguments,
+        ]
+
     profile: str | None = None
     cargo_arguments: list[str] | None = None
     if recipe == "_test-lane-local-reserved":
-        if _requires_core_test_helpers(arguments):
-            return None
         profile = "local"
         cargo_arguments = ["--no-fail-fast", *arguments]
     elif recipe == "_test-lane-fast-reserved":
-        if _requires_core_test_helpers(arguments):
-            return None
         profile = "fast"
         cargo_arguments = arguments
     elif recipe == "_test-lane-package-reserved" and arguments:
         package, *forwarded = arguments
-        if package == "codex-core":
-            return None
         profile = "fast"
         cargo_arguments = ["-p", package, *forwarded]
     else:
         return None
 
+    from scripts.rust_test_runner import RunnerError, guard_generic_recipe_args
+
+    try:
+        guard_generic_recipe_args(cargo_arguments, recipe=recipe)
+    except RunnerError as exc:
+        raise ValueError(str(exc)) from exc
     child_env["RUST_MIN_STACK"] = RUST_MIN_STACK_BYTES
     child_env["NEXTEST_PROFILE"] = profile
     return ["cargo", "nextest", "run", *cargo_arguments]
+
+
+def maintain_cargo_lanes(repo_root: Path, lane_root: Path) -> None:
+    """Apply age/warm-lane cleanup; recursive byte accounting is opt-in."""
+
+    def setting(name: str, default: int, minimum: int = 0) -> int:
+        try:
+            value = int(os.environ.get(name, str(default)))
+        except ValueError:
+            return default
+        return value if value >= minimum else default
+
+    previous_root = os.environ.get("CODEX_CARGO_LANES_ROOT")
+    gc_handle = None
+    try:
+        stamp = lane_root / ".gc-stamp"
+        interval = setting("CODEX_CARGO_LANE_GC_INTERVAL_HOURS", 1) * 3600
+        if stamp.exists() and time.time() - stamp.stat().st_mtime < interval:
+            return
+        gc_handle = _try_acquire_binary_file_lock(lane_root / ".lane-gc.lock")
+        if gc_handle is None:
+            return
+        # Another command may have completed maintenance since the first check.
+        if stamp.exists() and time.time() - stamp.stat().st_mtime < interval:
+            return
+        retry_stamp = lane_root / ".gc-retry"
+        if retry_stamp.exists() and time.time() - retry_stamp.stat().st_mtime < 60:
+            return
+        os.environ["CODEX_CARGO_LANES_ROOT"] = str(lane_root)
+        prune_stale_lanes(
+            repo_root=repo_root,
+            keep_warm_per_base=1,
+            max_age_days=setting("CODEX_CARGO_LANE_MAX_AGE_DAYS", 7, 1),
+            max_lane_bytes=setting("CODEX_CARGO_LANE_MAX_LANE_BYTES", 0) or None,
+            max_total_lane_bytes=setting("CODEX_CARGO_LANE_MAX_TOTAL_BYTES", 0) or None,
+            max_total_target_bytes=setting("CODEX_CARGO_TARGET_MAX_TOTAL_BYTES", 0)
+            or None,
+        )
+        stamp.write_text(f"{time.time()}\n", encoding="utf-8")
+        retry_stamp.unlink(missing_ok=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        if gc_handle is not None:
+            try:
+                (lane_root / ".gc-retry").touch()
+            except OSError:
+                pass
+        print(f"warning: Cargo lane pruning failed: {exc}", file=sys.stderr)
+    finally:
+        if gc_handle is not None:
+            try:
+                _release_binary_file_lock(gc_handle)
+            finally:
+                gc_handle.close()
+        if previous_root is None:
+            os.environ.pop("CODEX_CARGO_LANES_ROOT", None)
+        else:
+            os.environ["CODEX_CARGO_LANES_ROOT"] = previous_root
 
 
 def run_in_cargo_lane(
@@ -1121,7 +1230,9 @@ def run_in_cargo_lane(
         # explicit --target-dir; nested just recipes consume the CODEX value.
         child_env.pop("CARGO_TARGET_DIR", None)
         child_env.pop("CODEX_CARGO_LANE_TARGET_DIR", None)
-        direct_command = _direct_reserved_lane_command(command, child_env)
+        direct_command = _direct_reserved_lane_command(
+            command, child_env, repo_root=repo_root, target_dir=target_dir
+        )
         if direct_command is None:
             child_env["CODEX_CARGO_LANE_TARGET_DIR"] = str(target_dir)
         child_command = _cargo_command_with_target_dir(
@@ -1135,6 +1246,9 @@ def run_in_cargo_lane(
             )
             if resolved_program is not None:
                 child_command[0] = resolved_program
+        maintain_cargo_lanes(repo_root, target_dir.parent)
+        # Keep routine maintenance hourly-throttled. Explicit target-prune can
+        # enforce disk budgets immediately after an unusually large build.
         return subprocess.run(child_command, env=child_env, check=False).returncode
 
 
@@ -1458,6 +1572,7 @@ def prune_stale_lanes(
     )
     resolved_lane_root = lane_root.resolve()
     removed: list[Path] = []
+    failures: list[Path] = []
     for path in prunable_lane_dirs(
         repo_root=repo_root,
         processes=snapshot.processes,
@@ -1513,23 +1628,30 @@ def prune_stale_lanes(
                 # A new reservation may now recreate `path`; delete only the
                 # uniquely renamed tree after releasing the coordination lock.
                 remove_tree_allow_readonly(trash_path)
-            except FileNotFoundError:
-                continue
             except OSError as exc:
+                if (
+                    isinstance(exc, FileNotFoundError)
+                    and not (trash_path if trash_path is not None else path).exists()
+                ):
+                    continue
                 if trash_path is None:
                     if cargo_lock_is_busy(path) or lane_active_lock_is_held(path):
                         continue
+                    failures.append(path)
                     print(
                         f"warning: failed to prune lane {path}: {exc}",
                         file=sys.stderr,
                     )
                     continue
+                failures.append(trash_path)
                 print(
                     f"warning: lane moved to deferred cleanup path {trash_path}: {exc}",
                     file=sys.stderr,
                 )
                 continue
         removed.append(path)
+    if failures:
+        raise OSError(f"Cargo lane cleanup incomplete; pending paths: {failures}")
     return removed
 
 
@@ -1797,7 +1919,7 @@ def main(argv: list[str] | None = None) -> int:
             if command_args[:1] == ["--"]:
                 command_args = command_args[1:]
             return run_in_cargo_lane(
-                repo_root=args.repo_root.resolve(),
+                repo_root=args.repo_root.absolute(),
                 requested_lane=args.lane,
                 command=command_args,
                 lane_root=args.lanes_root,

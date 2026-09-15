@@ -150,19 +150,100 @@ enum SpawnInitialInput {
     TaskCapsule(String),
 }
 
+// Before publication, capacity belongs to the created child even when its caller
+// is cancelled. Foreground rollback can finish before session termination.
+struct PendingSpawnCapacity {
+    reservation: Option<crate::agent::registry::SpawnReservation>,
+    residency_slot: Option<super::residency::V2ResidencySlot>,
+}
+
+impl PendingSpawnCapacity {
+    fn retain_until_terminated(self, child_thread: Arc<crate::CodexThread>) {
+        if self.reservation.is_some() || self.residency_slot.is_some() {
+            tokio::spawn(async move {
+                child_thread.wait_until_terminated().await;
+                drop(self);
+            });
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PendingSpawnCleanupKind {
+    Spawn,
+    Resume,
+}
+
+impl PendingSpawnCleanupKind {
+    async fn rollback(
+        self,
+        control: &AgentControl,
+        child_thread: &crate::CodexThread,
+        child_thread_id: ThreadId,
+        error: CodexErr,
+    ) -> CodexErr {
+        match self {
+            Self::Spawn => {
+                control
+                    .rollback_failed_initial_submission(child_thread, child_thread_id, error)
+                    .await
+            }
+            // A failed resume must keep its durable edge/history resumable and
+            // leave previously retained descendants alone.
+            Self::Resume => match control.shutdown_live_agent(child_thread_id).await {
+                Ok(_) | Err(CodexErr::ThreadNotFound(_)) | Err(CodexErr::InternalAgentDied) => {
+                    error
+                }
+                Err(shutdown_error) => CodexErr::Fatal(format!(
+                    "failed to register resumed agent {child_thread_id} ({error}); cleanup failed: {shutdown_error}"
+                )),
+            },
+        }
+    }
+}
+
 struct PendingSpawnCleanup {
     control: AgentControl,
     child_thread: Arc<crate::CodexThread>,
     child_thread_id: ThreadId,
     armed: bool,
+    capacity: PendingSpawnCapacity,
+    kind: PendingSpawnCleanupKind,
 }
 
 struct PendingSpawnCleanupJob {
     control: AgentControl,
     child_thread: Arc<crate::CodexThread>,
     child_thread_id: ThreadId,
+    capacity: PendingSpawnCapacity,
+    kind: PendingSpawnCleanupKind,
     #[cfg(test)]
     completion: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl PendingSpawnCleanupJob {
+    async fn run(self) {
+        let error = self
+            .kind
+            .rollback(
+                &self.control,
+                self.child_thread.as_ref(),
+                self.child_thread_id,
+                CodexErr::TurnAborted,
+            )
+            .await;
+        self.capacity
+            .retain_until_terminated(Arc::clone(&self.child_thread));
+        // Successful rollback returns the original cancellation error.
+        if !matches!(error, CodexErr::TurnAborted) {
+            warn!(child_thread_id = %self.child_thread_id, %error,
+                "cancelled agent spawn cleanup was incomplete");
+        }
+        #[cfg(test)]
+        if let Some(completion) = self.completion {
+            let _ = completion.send(());
+        }
+    }
 }
 
 type PendingSpawnCleanupSender = tokio::sync::mpsc::UnboundedSender<PendingSpawnCleanupJob>;
@@ -197,23 +278,7 @@ fn start_pending_spawn_cleanup_worker() -> Option<PendingSpawnCleanupSender> {
             // Drive delayed cleanup and closing-guard tasks even while the queue is idle.
             runtime.block_on(async move {
                 while let Some(job) = receiver.recv().await {
-                    let error = job
-                        .control
-                        .rollback_failed_initial_submission(
-                            job.child_thread.as_ref(),
-                            job.child_thread_id,
-                            CodexErr::TurnAborted,
-                        )
-                        .await;
-                    // Successful rollback returns the original cancellation error.
-                    if !matches!(error, CodexErr::TurnAborted) {
-                        warn!(child_thread_id = %job.child_thread_id, %error,
-                            "cancelled agent spawn cleanup was incomplete");
-                    }
-                    #[cfg(test)]
-                    if let Some(completion) = job.completion {
-                        let _ = completion.send(());
-                    }
+                    job.run().await;
                 }
             });
         });
@@ -277,26 +342,44 @@ impl PendingSpawnCleanup {
         control: AgentControl,
         child_thread: Arc<crate::CodexThread>,
         child_thread_id: ThreadId,
+        reservation: crate::agent::registry::SpawnReservation,
+        residency_slot: Option<super::residency::V2ResidencySlot>,
+        kind: PendingSpawnCleanupKind,
     ) -> Self {
         Self {
             control,
             child_thread,
             child_thread_id,
             armed: true,
+            kind,
+            capacity: PendingSpawnCapacity {
+                reservation: Some(reservation),
+                residency_slot,
+            },
         }
     }
 
     async fn rollback(mut self, submission_error: CodexErr) -> CodexErr {
         let error = self
-            .control
-            .rollback_failed_initial_submission(
+            .kind
+            .rollback(
+                &self.control,
                 self.child_thread.as_ref(),
                 self.child_thread_id,
                 submission_error,
             )
             .await;
         self.armed = false;
+        self.take_capacity()
+            .retain_until_terminated(Arc::clone(&self.child_thread));
         error
+    }
+
+    fn take_capacity(&mut self) -> PendingSpawnCapacity {
+        PendingSpawnCapacity {
+            reservation: self.capacity.reservation.take(),
+            residency_slot: self.capacity.residency_slot.take(),
+        }
     }
 
     fn disarm(&mut self) {
@@ -309,19 +392,25 @@ impl Drop for PendingSpawnCleanup {
         if !self.armed {
             return;
         }
-        if schedule_pending_spawn_cleanup(PendingSpawnCleanupJob {
+        if let Err(job) = schedule_pending_spawn_cleanup(PendingSpawnCleanupJob {
             control: self.control.clone(),
             child_thread: Arc::clone(&self.child_thread),
             child_thread_id: self.child_thread_id,
+            capacity: self.take_capacity(),
+            kind: self.kind,
             #[cfg(test)]
             completion: None,
-        })
-        .is_err()
-        {
-            warn!(
-                child_thread_id = %self.child_thread_id,
-                "unable to schedule cleanup for cancelled agent spawn"
-            );
+        }) {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                // A native cleanup worker may fail to start while this runtime is
+                // still healthy. Keep the job and its capacity on that runtime.
+                runtime.spawn(job.run());
+            } else {
+                warn!(
+                    child_thread_id = %self.child_thread_id,
+                    "unable to schedule cleanup for cancelled agent spawn: no cleanup worker or current runtime"
+                );
+            }
         }
     }
 }
@@ -1130,6 +1219,9 @@ impl AgentControl {
             self.clone(),
             Arc::clone(&new_thread.thread),
             new_thread.thread_id,
+            reservation,
+            residency_slot,
+            PendingSpawnCleanupKind::Spawn,
         );
         agent_metadata.agent_id = Some(new_thread.thread_id);
 
@@ -1240,10 +1332,16 @@ impl AgentControl {
             return Err(pending_cleanup.rollback(err).await);
         }
         agent_metadata.last_task_message = initial_last_task_message;
-        if let Err(err) = reservation.commit(agent_metadata.clone()) {
+        let reservation = pending_cleanup
+            .capacity
+            .reservation
+            .as_mut()
+            .expect("created child retains its uncommitted spawn reservation");
+        if let Err(err) = reservation.try_commit(agent_metadata.clone()) {
             return Err(pending_cleanup.rollback(err).await);
         }
-        if let Some(residency_slot) = residency_slot {
+        drop(pending_cleanup.capacity.reservation.take());
+        if let Some(residency_slot) = pending_cleanup.capacity.residency_slot.take() {
             residency_slot.commit(new_thread.thread_id);
         }
 
@@ -1379,39 +1477,7 @@ impl AgentControl {
     }
 
     pub(super) fn estimate_forked_rollout_tokens(items: &[RolloutItem]) -> i64 {
-        let mut active_history = Vec::new();
-        let start = items
-            .iter()
-            .rposition(|item| {
-                matches!(item,
-                    RolloutItem::Compacted(compacted) if compacted.replacement_history.is_some()
-                )
-            })
-            .unwrap_or(0);
-        for item in &items[start..] {
-            match item {
-                RolloutItem::ResponseItem(response_item) => {
-                    active_history.push(response_item.clone());
-                }
-                RolloutItem::InterAgentCommunication(communication) => {
-                    active_history.push(communication.to_model_input_item());
-                }
-                RolloutItem::Compacted(compacted) => {
-                    if let Some(replacement_history) = &compacted.replacement_history {
-                        active_history.clone_from(replacement_history);
-                    } else {
-                        let user_messages = crate::compact::collect_user_messages(&active_history);
-                        active_history = crate::compact::build_compacted_history(
-                            Vec::new(),
-                            &user_messages,
-                            &compacted.message,
-                        );
-                    }
-                }
-                _ => {}
-            }
-        }
-        active_history
+        crate::session::Session::reconstruct_model_history_from_rollout(items)
             .iter()
             .map(crate::context_manager::estimate_item_token_count)
             .fold(0_i64, i64::saturating_add)
@@ -1842,23 +1908,29 @@ impl AgentControl {
                 inherited_exec_policy,
             })
             .await?;
+        let mut pending_cleanup = PendingSpawnCleanup::new(
+            self.clone(),
+            Arc::clone(&resumed_thread.thread),
+            resumed_thread.thread_id,
+            reservation,
+            residency_slot,
+            PendingSpawnCleanupKind::Resume,
+        );
         let mut agent_metadata = agent_metadata;
         agent_metadata.agent_id = Some(resumed_thread.thread_id);
-        if let Err(err) = reservation.commit(agent_metadata.clone()) {
-            let shutdown_result = self.shutdown_live_agent(resumed_thread.thread_id).await;
-            return match shutdown_result {
-                Ok(_) | Err(CodexErr::ThreadNotFound(_)) | Err(CodexErr::InternalAgentDied) => {
-                    Err(err)
-                }
-                Err(shutdown_err) => Err(CodexErr::Fatal(format!(
-                    "failed to register resumed agent {} ({err}); cleanup failed: {shutdown_err}",
-                    resumed_thread.thread_id
-                ))),
-            };
+        let reservation = pending_cleanup
+            .capacity
+            .reservation
+            .as_mut()
+            .expect("resumed child retains its uncommitted spawn reservation");
+        if let Err(err) = reservation.try_commit(agent_metadata.clone()) {
+            return Err(pending_cleanup.rollback(err).await);
         }
-        if let Some(residency_slot) = residency_slot {
+        drop(pending_cleanup.capacity.reservation.take());
+        if let Some(residency_slot) = pending_cleanup.capacity.residency_slot.take() {
             residency_slot.commit(resumed_thread.thread_id);
         }
+        pending_cleanup.disarm();
         if let Some(agent_path) = agent_metadata.agent_path.clone()
             && self
                 .task_coordinator()
@@ -1933,6 +2005,11 @@ mod pending_spawn_cleanup_worker_tests {
             .await
             .expect("start cleanup target");
         let release = crate::test_support::block_thread_terminal_tasks(child.thread.as_ref());
+        let control = manager.agent_control();
+        let reservation = control
+            .state
+            .reserve_spawn_slot(Some(1))
+            .expect("reserve the child's uncommitted capacity");
         let sender = super::start_pending_spawn_cleanup_worker().expect("start isolated worker");
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         assert!(
@@ -1941,6 +2018,11 @@ mod pending_spawn_cleanup_worker_tests {
                     control: manager.agent_control(),
                     child_thread: std::sync::Arc::clone(&child.thread),
                     child_thread_id: child.thread_id,
+                    capacity: super::PendingSpawnCapacity {
+                        reservation: Some(reservation),
+                        residency_slot: None,
+                    },
+                    kind: super::PendingSpawnCleanupKind::Spawn,
                     completion: Some(completion_tx),
                 })
                 .is_ok()
@@ -1952,6 +2034,13 @@ mod pending_spawn_cleanup_worker_tests {
         assert!(
             manager.get_thread(child.thread_id).await.is_ok(),
             "late termination still owns runtime"
+        );
+        assert!(
+            matches!(
+                control.state.reserve_spawn_slot(Some(1)),
+                Err(codex_protocol::error::CodexErr::AgentLimitReached { max_threads: 1 })
+            ),
+            "foreground rollback completion must not release a live child's capacity"
         );
         release
             .send(())
@@ -1970,6 +2059,19 @@ mod pending_spawn_cleanup_worker_tests {
         })
         .await
         .expect("idle worker must drive delayed cleanup without a second job");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match control.state.reserve_spawn_slot(Some(1)) {
+                    Ok(reservation) => break reservation,
+                    Err(codex_protocol::error::CodexErr::AgentLimitReached { max_threads: 1 }) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("unexpected capacity error: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("actual termination releases the retained capacity");
         drop(sender);
     }
 

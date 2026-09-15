@@ -39,15 +39,6 @@ pub struct StartedNetworkProxy {
 }
 
 impl StartedNetworkProxy {
-    #[cfg(test)]
-    pub(crate) fn from_running_proxy_for_test(
-        proxy: NetworkProxy,
-        handle: NetworkProxyHandle,
-        codex_home: PathBuf,
-    ) -> Self {
-        Self::new(proxy, handle, codex_home)
-    }
-
     fn new(proxy: NetworkProxy, handle: NetworkProxyHandle, codex_home: PathBuf) -> Self {
         Self {
             proxy,

@@ -318,7 +318,6 @@ mod tests {
                         ..RequestPermissionProfile::default()
                     },
                     scope: PermissionGrantScope::Session,
-                    strict_auto_review: false,
                 },
             )
             .await;

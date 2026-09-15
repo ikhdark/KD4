@@ -1,6 +1,5 @@
 use codex_context_fragments::ContextualUserFragment;
 use codex_execpolicy::Policy;
-use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::format_allow_prefixes;
@@ -23,7 +22,6 @@ const APPROVAL_POLICY_ON_REQUEST_RULE: &str =
     include_str!("../templates/permissions/approval_policy/on_request.md");
 const APPROVAL_POLICY_ON_REQUEST_RULE_REQUEST_PERMISSION: &str =
     include_str!("../templates/permissions/approval_policy/on_request_rule_request_permission.md");
-const AUTO_REVIEW_APPROVAL_SUFFIX: &str = "`approvals_reviewer` is `auto_review`: Sandbox escalations with require_escalated will be reviewed for compliance with the policy. If a rejection happens, you should proceed only with a materially safer alternative, or inform the user of the risk and send a final message to ask for approval.";
 const MAX_APPROVAL_MESSAGE_BYTES: usize = 12_000;
 const APPROVAL_MESSAGE_TRUNCATED_MARKER: &str =
     "\n\n[Additional approval instructions were truncated.]";
@@ -53,7 +51,6 @@ static SANDBOX_MODE_READ_ONLY_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
 
 struct PermissionsPromptConfig<'a> {
     approval_policy: AskForApproval,
-    approvals_reviewer: ApprovalsReviewer,
     approval_messages: Option<&'a ApprovalMessages>,
     exec_policy: &'a Policy,
     exec_permission_approvals_enabled: bool,
@@ -68,13 +65,12 @@ pub struct PermissionsInstructions {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ApprovalPromptContext<'a> {
-    reviewer: ApprovalsReviewer,
     messages: Option<&'a ApprovalMessages>,
 }
 
 impl<'a> ApprovalPromptContext<'a> {
-    pub fn new(reviewer: ApprovalsReviewer, messages: Option<&'a ApprovalMessages>) -> Self {
-        Self { reviewer, messages }
+    pub fn new(messages: Option<&'a ApprovalMessages>) -> Self {
+        Self { messages }
     }
 }
 
@@ -98,7 +94,6 @@ impl PermissionsInstructions {
             network_access_from_policy(permission_profile.network_sandbox_policy()),
             PermissionsPromptConfig {
                 approval_policy,
-                approvals_reviewer: approval_context.reviewer,
                 approval_messages: approval_context.messages,
                 exec_policy,
                 exec_permission_approvals_enabled,
@@ -142,7 +137,6 @@ impl PermissionsInstructions {
             &mut text,
             &approval_text(
                 config.approval_policy,
-                config.approvals_reviewer,
                 config.approval_messages,
                 config.exec_policy,
                 config.exec_permission_approvals_enabled,
@@ -213,7 +207,6 @@ fn append_section(text: &mut String, section: &str) {
 
 fn approval_text(
     approval_policy: AskForApproval,
-    approvals_reviewer: ApprovalsReviewer,
     approval_messages: Option<&ApprovalMessages>,
     exec_policy: &Policy,
     exec_permission_approvals_enabled: bool,
@@ -222,10 +215,7 @@ fn approval_text(
     if approval_policy == AskForApproval::OnRequest
         && let Some(approval_messages) = approval_messages
     {
-        let selected = match approvals_reviewer {
-            ApprovalsReviewer::User => approval_messages.on_request.as_ref(),
-            ApprovalsReviewer::AutoReview => approval_messages.on_request_auto_review.as_ref(),
-        };
+        let selected = approval_messages.on_request.as_ref();
         if let Some(selected) = selected {
             return truncate_prompt_text(
                 selected,
@@ -273,13 +263,7 @@ fn approval_text(
         ),
     };
 
-    if approvals_reviewer == ApprovalsReviewer::AutoReview
-        && approval_policy != AskForApproval::Never
-    {
-        format!("{text}\n\n{AUTO_REVIEW_APPROVAL_SUFFIX}")
-    } else {
-        text
-    }
+    text
 }
 
 fn sandbox_text(mode: SandboxMode, network_access: NetworkAccess) -> String {

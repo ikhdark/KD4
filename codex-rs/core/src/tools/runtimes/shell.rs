@@ -7,13 +7,11 @@ builds sandbox transform inputs, and runs them under the current SandboxAttempt.
 use crate::command_canonicalization::canonicalize_command_for_approval;
 use crate::exec::CommandProgress;
 use crate::exec::ExecCapturePolicy;
-use crate::guardian::GuardianNetworkAccessTrigger;
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::SandboxPermissions;
 use crate::sandboxing::execute_exec_request_with_after_spawn;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
-use crate::tools::flat_tool_name;
 use crate::tools::known_delta_store::KnownDeltaHit;
 use crate::tools::known_delta_store::PreparedKnownDelta;
 use crate::tools::network_approval::NetworkApprovalMode;
@@ -24,7 +22,6 @@ use crate::tools::runtimes::exec_env_for_sandbox_permissions;
 use crate::tools::runtimes::prepare_shell_command;
 use crate::tools::runtimes::shell_snapshot_additional_read_roots;
 use crate::tools::sandboxing::Approvable;
-use crate::tools::sandboxing::ApprovalAction;
 use crate::tools::sandboxing::ApprovalCtx;
 use crate::tools::sandboxing::ExecApprovalRequirement;
 use crate::tools::sandboxing::PermissionRequestPayload;
@@ -243,21 +240,6 @@ impl Approvable<ShellRequest> for ShellRuntime {
         })
     }
 
-    fn approval_action(
-        &self,
-        req: &ShellRequest,
-        ctx: &ApprovalCtx<'_>,
-    ) -> std::io::Result<ApprovalAction> {
-        Ok(ApprovalAction::Shell {
-            id: ctx.call_id.to_string(),
-            command: req.command_for_approval.clone(),
-            cwd: req.cwd.clone(),
-            sandbox_permissions: req.sandbox_permissions,
-            additional_permissions: req.additional_permissions.clone(),
-            justification: req.justification.clone(),
-        })
-    }
-
     fn exec_approval_requirement(&self, req: &ShellRequest) -> Option<ExecApprovalRequirement> {
         Some(req.exec_approval_requirement.clone())
     }
@@ -290,16 +272,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         Some(NetworkApprovalSpec {
             network: Some(network.clone()),
             mode: NetworkApprovalMode::Immediate,
-            trigger: GuardianNetworkAccessTrigger {
-                call_id: ctx.call_id.clone(),
-                tool_name: flat_tool_name(&ctx.tool_name).into_owned(),
-                command: req.command.clone(),
-                cwd: codex_utils_path_uri::PathUri::from_abs_path(&req.cwd),
-                sandbox_permissions: req.sandbox_permissions,
-                additional_permissions: req.additional_permissions.clone(),
-                justification: req.justification.clone(),
-                tty: None,
-            },
+            cwd: codex_utils_path_uri::PathUri::from_abs_path(&req.cwd),
             command: req.hook_command.clone(),
             environment_id: req.turn_environment.environment_id.clone(),
             approval_scope_id: req

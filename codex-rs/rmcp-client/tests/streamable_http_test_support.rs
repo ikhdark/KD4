@@ -433,6 +433,7 @@ async fn wait_for_streamable_http_server(
             }
         }
 
-        sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())))
+            .await;
     }
 }

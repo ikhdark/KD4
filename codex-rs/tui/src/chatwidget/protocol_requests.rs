@@ -1,7 +1,7 @@
 //! App-server request and notification dispatch for `ChatWidget`.
 //!
 //! This module translates protocol requests into the focused chat-widget flows
-//! that render approvals, permissions, tool input, and guardian reviews.
+//! that render approvals, permissions, and tool input.
 
 use super::*;
 
@@ -59,96 +59,6 @@ impl ChatWidget {
 
     pub(crate) fn handle_skills_list_response(&mut self, response: SkillsListResponse) {
         self.on_list_skills(response);
-    }
-
-    pub(super) fn on_guardian_review_notification(
-        &mut self,
-        id: String,
-        turn_id: String,
-        started_at_ms: i64,
-        review: codex_app_server_protocol::GuardianApprovalReview,
-        completion: Option<(i64, codex_app_server_protocol::AutoReviewDecisionSource)>,
-        action: GuardianApprovalReviewAction,
-    ) {
-        // TODO(anp): Remove this native-path localization error path once core permission paths
-        // remain PathUri after crossing the app-server boundary.
-        let action = match action.try_into() {
-            Ok(action) => action,
-            Err(err) => {
-                self.add_error_message(format!(
-                    "failed to localize guardian filesystem paths: {err}"
-                ));
-                return;
-            }
-        };
-        let (completed_at_ms, decision_source) = match completion {
-            Some((completed_at_ms, decision_source)) => {
-                (Some(completed_at_ms), Some(decision_source))
-            }
-            None => (None, None),
-        };
-
-        self.on_guardian_assessment(GuardianAssessmentEvent {
-            id,
-            target_item_id: None,
-            turn_id,
-            started_at_ms,
-            completed_at_ms,
-            status: match review.status {
-                codex_app_server_protocol::GuardianApprovalReviewStatus::InProgress => {
-                    GuardianAssessmentStatus::InProgress
-                }
-                codex_app_server_protocol::GuardianApprovalReviewStatus::Approved => {
-                    GuardianAssessmentStatus::Approved
-                }
-                codex_app_server_protocol::GuardianApprovalReviewStatus::Denied => {
-                    GuardianAssessmentStatus::Denied
-                }
-                codex_app_server_protocol::GuardianApprovalReviewStatus::TimedOut => {
-                    GuardianAssessmentStatus::TimedOut
-                }
-                codex_app_server_protocol::GuardianApprovalReviewStatus::Aborted => {
-                    GuardianAssessmentStatus::Aborted
-                }
-            },
-            risk_level: review.risk_level.map(|risk_level| match risk_level {
-                codex_app_server_protocol::GuardianRiskLevel::Low => {
-                    codex_protocol::approvals::GuardianRiskLevel::Low
-                }
-                codex_app_server_protocol::GuardianRiskLevel::Medium => {
-                    codex_protocol::approvals::GuardianRiskLevel::Medium
-                }
-                codex_app_server_protocol::GuardianRiskLevel::High => {
-                    codex_protocol::approvals::GuardianRiskLevel::High
-                }
-                codex_app_server_protocol::GuardianRiskLevel::Critical => {
-                    codex_protocol::approvals::GuardianRiskLevel::Critical
-                }
-            }),
-            user_authorization: review.user_authorization.map(|user_authorization| {
-                match user_authorization {
-                    codex_app_server_protocol::GuardianUserAuthorization::Unknown => {
-                        codex_protocol::approvals::GuardianUserAuthorization::Unknown
-                    }
-                    codex_app_server_protocol::GuardianUserAuthorization::Low => {
-                        codex_protocol::approvals::GuardianUserAuthorization::Low
-                    }
-                    codex_app_server_protocol::GuardianUserAuthorization::Medium => {
-                        codex_protocol::approvals::GuardianUserAuthorization::Medium
-                    }
-                    codex_app_server_protocol::GuardianUserAuthorization::High => {
-                        codex_protocol::approvals::GuardianUserAuthorization::High
-                    }
-                }
-            }),
-            rationale: review.rationale,
-            decision_source: decision_source.map(|source| match source {
-                codex_app_server_protocol::AutoReviewDecisionSource::Agent => {
-                    GuardianAssessmentDecisionSource::Agent
-                }
-            }),
-            action,
-        });
     }
 
     pub(super) fn on_shutdown_complete(&mut self) {

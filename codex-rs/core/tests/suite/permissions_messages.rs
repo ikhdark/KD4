@@ -42,7 +42,6 @@ fn permissions_texts(request: &ResponsesRequest) -> Vec<String> {
 fn model_with_approval_messages(
     slug: &str,
     on_request: &str,
-    on_request_auto_review: &str,
 ) -> codex_protocol::openai_models::ModelInfo {
     let mut model = model_info_from_slug(slug);
     model.model_messages = Some(ModelMessages {
@@ -50,7 +49,6 @@ fn model_with_approval_messages(
         instructions_variables: None,
         approvals: Some(ApprovalMessages {
             on_request: Some(on_request.to_string()),
-            on_request_auto_review: Some(on_request_auto_review.to_string()),
         }),
     });
     model
@@ -87,11 +85,7 @@ async fn catalog_approval_message_is_sent_in_initial_permissions() -> Result<()>
     )
     .await;
     let model_slug = "catalog-approvals-model";
-    let model = model_with_approval_messages(
-        model_slug,
-        "catalog user approval instructions",
-        "catalog auto-review approval instructions",
-    );
+    let model = model_with_approval_messages(model_slug, "catalog user approval instructions");
     let mut builder = test_codex()
         .with_model(model_slug)
         .with_config(move |config| {
@@ -129,8 +123,8 @@ async fn model_change_appends_new_catalog_approval_message() -> Result<()> {
     .await;
     let first_slug = "catalog-approvals-model-a";
     let second_slug = "catalog-approvals-model-b";
-    let first = model_with_approval_messages(first_slug, "model A approvals", "model A auto");
-    let second = model_with_approval_messages(second_slug, "model B approvals", "model B auto");
+    let first = model_with_approval_messages(first_slug, "model A approvals");
+    let second = model_with_approval_messages(second_slug, "model B approvals");
     let mut builder = test_codex()
         .with_model(first_slug)
         .with_config(move |config| {
@@ -687,7 +681,7 @@ async fn permissions_message_includes_writable_roots() -> Result<()> {
     let expected = PermissionsInstructions::from_permission_profile(
         &permission_profile,
         AskForApproval::OnRequest,
-        ApprovalPromptContext::new(test.config.approvals_reviewer, /*messages*/ None),
+        ApprovalPromptContext::new(/*messages*/ None),
         &exec_policy,
         test.config.cwd.as_path(),
         test.config

@@ -268,6 +268,24 @@ async fn resolve_environment_id(ctx: &BackendContext, requested: &str) -> anyhow
     }
 }
 
+// Support large query inputs while bounding allocation from pipes without EOF.
+const MAX_QUERY_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+
+fn read_query_input(reader: impl Read) -> std::io::Result<String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_QUERY_INPUT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_QUERY_INPUT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("query input exceeds the {MAX_QUERY_INPUT_BYTES}-byte limit"),
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+}
+
 fn resolve_query_input(query_arg: Option<String>) -> anyhow::Result<String> {
     match query_arg {
         Some(q) if q != "-" => Ok(q),
@@ -281,9 +299,7 @@ fn resolve_query_input(query_arg: Option<String>) -> anyhow::Result<String> {
             if !force_stdin {
                 eprintln!("Reading query from stdin...");
             }
-            let mut buffer = String::new();
-            std::io::stdin()
-                .read_to_string(&mut buffer)
+            let buffer = read_query_input(std::io::stdin().lock())
                 .map_err(|e| anyhow!("failed to read query from stdin: {e}"))?;
             if buffer.trim().is_empty() {
                 return Err(anyhow!(
@@ -2210,6 +2226,21 @@ fn pretty_lines_from_error(raw: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn read_query_input_preserves_input_and_rejects_oversize_without_draining() {
+        use std::io::Read as _;
+
+        assert_eq!(
+            super::read_query_input(b"normal prompt\n".as_slice()).unwrap(),
+            "normal prompt\n"
+        );
+        let mut input = std::io::repeat(b'x').take(super::MAX_QUERY_INPUT_BYTES + 2);
+        let error = super::read_query_input(&mut input).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds"));
+        assert_eq!(input.limit(), 1, "must stop after the first excess byte");
+    }
+
     use super::*;
     use crate::resolve_git_ref_with_git_info;
     use codex_cloud_tasks_client::DiffSummary;

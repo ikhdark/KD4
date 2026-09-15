@@ -64,7 +64,6 @@ EXPECTED_ROOT_EXPORTS = [
 EXPECTED_TYPES_EXPORTS = [
     "Account",
     "AccountLoginCompletedNotification",
-    "ApprovalsReviewer",
     "AskForApproval",
     "CancelLoginAccountResponse",
     "CancelLoginAccountStatus",
@@ -178,7 +177,6 @@ def test_root_exports_approval_mode() -> None:
     """The root package should expose the high-level approval mode enum."""
     assert [(mode.name, mode.value) for mode in ApprovalMode] == [
         ("deny_all", "deny_all"),
-        ("auto_review", "auto_review"),
     ]
 
 
@@ -394,15 +392,15 @@ def test_generated_public_signatures_are_snake_case_and_typed() -> None:
             _assert_no_any_annotations(fn)
 
 
-def test_new_thread_methods_default_to_auto_review() -> None:
-    """New threads should start with auto-review unless callers opt out."""
+def test_new_thread_methods_default_to_deny_all() -> None:
+    """New threads should disable approval escalation by default."""
     funcs = [
         Codex.thread_start,
         AsyncCodex.thread_start,
     ]
 
     assert {fn: _keyword_default(fn, "approval_mode") for fn in funcs} == dict.fromkeys(
-        funcs, ApprovalMode.auto_review
+        funcs, ApprovalMode.deny_all
     )
 
 

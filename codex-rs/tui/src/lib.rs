@@ -111,7 +111,6 @@ mod config_update;
 pub(crate) mod custom_terminal;
 mod pets;
 pub use custom_terminal::Terminal;
-mod auto_review_denials;
 mod cwd_prompt;
 mod debug_config;
 mod diff_model;

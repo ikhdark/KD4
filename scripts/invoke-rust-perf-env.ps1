@@ -109,6 +109,7 @@ $oldSccacheCacheSize = $env:SCCACHE_CACHE_SIZE
 $oldCargoIncremental = $env:CARGO_INCREMENTAL
 $oldCargoTargetDir = $env:CARGO_TARGET_DIR
 $oldRustcWrapper = $env:RUSTC_WRAPPER
+$oldRustcWorkspaceWrapper = $env:RUSTC_WORKSPACE_WRAPPER
 $oldWindowsMsvcLinker = $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER
 $oldWindowsArm64MsvcLinker = $env:CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER
 $hadSccacheBaseDir = Test-Path Env:SCCACHE_BASEDIR
@@ -116,6 +117,7 @@ $hadSccacheCacheSize = Test-Path Env:SCCACHE_CACHE_SIZE
 $hadCargoIncremental = Test-Path Env:CARGO_INCREMENTAL
 $hadCargoTargetDir = Test-Path Env:CARGO_TARGET_DIR
 $hadRustcWrapper = Test-Path Env:RUSTC_WRAPPER
+$hadRustcWorkspaceWrapper = Test-Path Env:RUSTC_WORKSPACE_WRAPPER
 $hadWindowsMsvcLinker = Test-Path Env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER
 $hadWindowsArm64MsvcLinker = Test-Path Env:CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER
 $oldNativeCommandUseErrorActionPreference = Get-Variable -Name PSNativeCommandUseErrorActionPreference -ValueOnly -ErrorAction SilentlyContinue
@@ -130,6 +132,10 @@ try {
         Remove-Item Env:SCCACHE_BASEDIR -ErrorAction SilentlyContinue
         Remove-Item Env:SCCACHE_CACHE_SIZE -ErrorAction SilentlyContinue
         $env:RUSTC_WRAPPER = ""
+        $env:RUSTC_WORKSPACE_WRAPPER = ""
+        # This lane isolates sccache's effect, so it must not silently fall back
+        # to the repository's incremental cache instead of running uncached.
+        $env:CARGO_INCREMENTAL = "0"
     }
     elseif (-not (Test-Path Env:RUSTC_WRAPPER) -and (Get-Command sccache -ErrorAction SilentlyContinue)) {
         Set-CodexRustSccacheEnvironment -RepoRoot $repoRoot
@@ -174,13 +180,14 @@ try {
         $didPushLocation = $true
     }
 
-    Write-Output ("rustPerfEnv: rustcWrapper={0}; cargoIncremental={1}; sccacheBaseDir={2}; cargoTargetDir={3}; windowsMsvcLinker={4}; windowsArm64MsvcLinker={5}" -f `
+    Write-Output ("rustPerfEnv: rustcWrapper={0}; cargoIncremental={1}; sccacheBaseDir={2}; cargoTargetDir={3}; windowsMsvcLinker={4}; windowsArm64MsvcLinker={5}; rustcWorkspaceWrapper={6}" -f `
             (Format-EnvProofValue -Name "RUSTC_WRAPPER"),
             (Format-EnvProofValue -Name "CARGO_INCREMENTAL"),
             (Format-EnvProofValue -Name "SCCACHE_BASEDIR"),
             $cargoTargetDirProof,
             (Format-EnvProofValue -Name "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"),
-            (Format-EnvProofValue -Name "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER"))
+            (Format-EnvProofValue -Name "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER"),
+            (Format-EnvProofValue -Name "RUSTC_WORKSPACE_WRAPPER"))
 
     $global:LASTEXITCODE = $null
     $program = $ProgramArgs[0]
@@ -208,6 +215,7 @@ finally {
     Restore-ProcessEnvironmentVariable -Name "CARGO_INCREMENTAL" -Value $oldCargoIncremental -WasSet $hadCargoIncremental
     Restore-ProcessEnvironmentVariable -Name "CARGO_TARGET_DIR" -Value $oldCargoTargetDir -WasSet $hadCargoTargetDir
     Restore-ProcessEnvironmentVariable -Name "RUSTC_WRAPPER" -Value $oldRustcWrapper -WasSet $hadRustcWrapper
+    Restore-ProcessEnvironmentVariable -Name "RUSTC_WORKSPACE_WRAPPER" -Value $oldRustcWorkspaceWrapper -WasSet $hadRustcWorkspaceWrapper
     Restore-ProcessEnvironmentVariable -Name "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER" -Value $oldWindowsMsvcLinker -WasSet $hadWindowsMsvcLinker
     Restore-ProcessEnvironmentVariable -Name "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER" -Value $oldWindowsArm64MsvcLinker -WasSet $hadWindowsArm64MsvcLinker
     if ($hadNativeCommandUseErrorActionPreference) {

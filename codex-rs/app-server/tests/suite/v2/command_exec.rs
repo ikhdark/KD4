@@ -1333,7 +1333,8 @@ async fn wait_for_process_marker(marker: &str, should_exist: bool) -> Result<()>
             let expectation = if should_exist { "appear" } else { "exit" };
             anyhow::bail!("process marker {marker:?} did not {expectation} before timeout");
         }
-        sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())))
+            .await;
     }
 }
 

@@ -393,7 +393,7 @@ fn turn_metadata_state_includes_known_parent_for_non_thread_spawn_subagents_with
         ThreadId::from_string("44444444-4444-4444-8444-444444444444").expect("thread id");
     let sources = [
         (SubAgentSource::Review, "review"),
-        (SubAgentSource::Other("guardian".to_string()), "guardian"),
+        (SubAgentSource::Other("helper".to_string()), "helper"),
         (
             SubAgentSource::Other("agent_job:job-1".to_string()),
             "agent_job:job-1",

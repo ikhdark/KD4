@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 
@@ -11,6 +11,27 @@ SCCACHE_CACHE_SIZE_ENV_VAR = "CODEX_SCCACHE_CACHE_SIZE"
 DEFAULT_SCCACHE_CACHE_SIZE = "80G"
 WINDOWS_LLVM_LLD_LINK_DEFAULT = Path("C:/Program Files/LLVM/bin/lld-link.exe")
 _SCOOP_LLVM_LLD_LINK = Path("apps/llvm/current/bin/lld-link.exe")
+
+
+def cargo_package_specs(args: Sequence[str]) -> list[str]:
+    """Read Cargo package selectors before the compiler/test separator."""
+    packages: list[str] = []
+    tokens = iter(args)
+    for token in tokens:
+        if token == "--":
+            break
+        spec = None
+        if token in {"-p", "--package"}:
+            spec = next(tokens, None)
+            if spec == "--":
+                break
+        elif token.startswith("--package="):
+            spec = token[len("--package=") :]
+        elif token.startswith("-p"):
+            spec = token[2:].removeprefix("=")
+        if spec and not spec.startswith("-"):
+            packages.append(spec)
+    return packages
 
 
 def is_sccache_wrapper(value: str) -> bool:

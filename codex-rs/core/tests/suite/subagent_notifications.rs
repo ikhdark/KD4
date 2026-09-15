@@ -324,7 +324,8 @@ async fn wait_for_hook_log(
                 inputs.len()
             );
         }
-        sleep(Duration::from_millis(10)).await;
+        sleep(Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())))
+            .await;
     }
 }
 
@@ -358,7 +359,8 @@ async fn wait_for_requests(
         if Instant::now() >= deadline {
             anyhow::bail!("expected at least 1 request, got {}", requests.len());
         }
-        sleep(Duration::from_millis(10)).await;
+        sleep(Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())))
+            .await;
     }
 }
 
@@ -1039,7 +1041,8 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
                 .collect::<Vec<_>>();
             anyhow::bail!("timed out waiting for forked child request; observed={observed:?}");
         }
-        sleep(Duration::from_millis(10)).await;
+        sleep(Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())))
+            .await;
     };
     assert!(body_contains(&child_request, TURN_0_FORK_PROMPT));
     assert!(!body_contains(&child_request, SPAWN_CALL_ID));
@@ -1251,7 +1254,8 @@ async fn spawned_multi_agent_v2_child_inherits_developer_context_without_parent_
         if Instant::now() >= deadline {
             anyhow::bail!("timed out waiting for child task capsule request");
         }
-        sleep(Duration::from_millis(10)).await;
+        sleep(Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())))
+            .await;
     };
     assert!(child_request.body_contains_text("Parent developer instructions."));
     assert!(child_request.body_contains_text(CHILD_PROMPT));
@@ -1335,7 +1339,8 @@ async fn legacy_multi_agent_v2_spawn_sends_task_capsule_to_child() -> Result<()>
         if Instant::now() >= deadline {
             anyhow::bail!("timed out waiting for child task capsule request");
         }
-        sleep(Duration::from_millis(10)).await;
+        sleep(Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())))
+            .await;
     };
     assert!(child_request.has_message_with_input_texts("user", |texts| {
         texts.iter().any(|text| {

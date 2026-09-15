@@ -289,3 +289,17 @@ async fn failed_device_login_preserves_existing_auth() -> Result<()> {
     assert_eq!(read_auth_json(codex_home.path())?, original);
     Ok(())
 }
+
+#[test]
+fn login_rejects_oversized_stdin_without_writing_auth() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    write_file_auth_config(codex_home.path())?;
+    codex_command(codex_home.path())?
+        .args(["login", "--with-api-key"])
+        .write_stdin(vec![b'x'; 1024 * 1024 + 1])
+        .assert()
+        .failure()
+        .stderr(contains("secret input exceeds the 1048576-byte limit"));
+    assert!(!codex_home.path().join("auth.json").exists());
+    Ok(())
+}

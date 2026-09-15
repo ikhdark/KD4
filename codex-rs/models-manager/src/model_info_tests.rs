@@ -19,7 +19,6 @@ fn base_instruction_override_preserves_catalog_approval_messages() {
     let mut model = model_info_from_slug("unknown-model");
     let approvals = ApprovalMessages {
         on_request: Some("user approvals".to_string()),
-        on_request_auto_review: Some("auto approvals".to_string()),
     };
     model.model_messages = Some(ModelMessages {
         instructions_template: Some("template".to_string()),
@@ -54,7 +53,6 @@ fn disabled_personality_preserves_catalog_approval_messages() {
     let mut model = model_info_from_slug("unknown-model");
     let approvals = ApprovalMessages {
         on_request: Some("user approvals".to_string()),
-        on_request_auto_review: None,
     };
     model.model_messages = Some(ModelMessages {
         instructions_template: Some("template".to_string()),

@@ -237,7 +237,7 @@ async fn turn_start_sends_nested_subagent_lineage_after_cold_thread_resume_v2() 
         "Saved subagent message",
         Some("mock_provider"),
         /*git_info*/ None,
-        SessionSource::SubAgent(SubAgentSource::Other("guardian".to_string())),
+        SessionSource::SubAgent(SubAgentSource::Other("custom_worker".to_string())),
         root_thread_id.into(),
         parent_thread_id,
     )?;
@@ -266,7 +266,7 @@ async fn turn_start_sends_nested_subagent_lineage_after_cold_thread_resume_v2() 
     assert_eq!(thread.parent_thread_id, Some(parent_thread_id_str.clone()));
     assert_eq!(
         thread.source,
-        ApiSessionSource::SubAgent(SubAgentSource::Other("guardian".to_string()))
+        ApiSessionSource::SubAgent(SubAgentSource::Other("custom_worker".to_string()))
     );
 
     let turn_req = mcp
@@ -302,7 +302,7 @@ async fn turn_start_sends_nested_subagent_lineage_after_cold_thread_resume_v2() 
         metadata["parent_thread_id"].as_str(),
         Some(parent_thread_id_str.as_str())
     );
-    assert_eq!(metadata["subagent_kind"].as_str(), Some("guardian"));
+    assert_eq!(metadata["subagent_kind"].as_str(), Some("custom_worker"));
     assert_eq!(
         metadata["session_id"].as_str(),
         Some(thread.session_id.as_str())

@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use tracing::warn;
 
 use super::BedrockApiKeyAuth;
@@ -176,6 +177,9 @@ pub(super) trait AuthStorageBackend: Debug + Send + Sync {
     fn delete(&self) -> std::io::Result<bool>;
 }
 
+// Leave ample room for credentials and account metadata while bounding corrupt files.
+const MAX_AUTH_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 pub(super) struct FileAuthStorage {
     codex_home: PathBuf,
@@ -189,10 +193,17 @@ impl FileAuthStorage {
     /// Attempt to read and parse the `auth.json` file in the given `CODEX_HOME` directory.
     /// Returns the full AuthDotJson structure.
     pub(super) fn try_read_auth_json(&self, auth_file: &Path) -> std::io::Result<AuthDotJson> {
-        let mut file = File::open(auth_file)?;
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)?;
-        let auth_dot_json: AuthDotJson = serde_json::from_str(&contents)?;
+        let file = File::open(auth_file)?;
+        let mut contents = Vec::new();
+        file.take(MAX_AUTH_FILE_BYTES + 1)
+            .read_to_end(&mut contents)?;
+        if contents.len() as u64 > MAX_AUTH_FILE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("auth.json exceeds the {MAX_AUTH_FILE_BYTES}-byte limit"),
+            ));
+        }
+        let auth_dot_json: AuthDotJson = serde_json::from_slice(&contents)?;
 
         Ok(auth_dot_json)
     }
@@ -217,10 +228,16 @@ impl AuthStorageBackend for FileAuthStorage {
     fn save(&self, auth_dot_json: &AuthDotJson) -> std::io::Result<()> {
         let auth_file = get_auth_file(&self.codex_home);
 
+        let json_data = serde_json::to_string_pretty(auth_dot_json)?;
+        if json_data.len() as u64 > MAX_AUTH_FILE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("auth.json exceeds the {MAX_AUTH_FILE_BYTES}-byte limit"),
+            ));
+        }
         if let Some(parent) = auth_file.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let json_data = serde_json::to_string_pretty(auth_dot_json)?;
         codex_file_system::write_atomically(&auth_file, &json_data)
     }
 
@@ -485,18 +502,30 @@ static EPHEMERAL_AUTH_STORE: LazyLock<Mutex<HashMap<String, AuthDotJson>>> =
 #[derive(Clone, Debug)]
 struct EphemeralAuthStorage {
     codex_home: PathBuf,
+    key: OnceLock<String>,
 }
 
 impl EphemeralAuthStorage {
     fn new(codex_home: PathBuf) -> Self {
-        Self { codex_home }
+        Self {
+            codex_home,
+            key: OnceLock::new(),
+        }
+    }
+
+    fn key(&self) -> std::io::Result<&str> {
+        if let Some(key) = self.key.get() {
+            return Ok(key);
+        }
+        let key = compute_store_key(&self.codex_home)?;
+        Ok(self.key.get_or_init(|| key))
     }
 
     fn with_store<F, T>(&self, action: F) -> std::io::Result<T>
     where
         F: FnOnce(&mut HashMap<String, AuthDotJson>, String) -> std::io::Result<T>,
     {
-        let key = compute_store_key(&self.codex_home)?;
+        let key = self.key()?.to_owned();
         let mut store = EPHEMERAL_AUTH_STORE
             .lock()
             .map_err(|_| std::io::Error::other("failed to lock ephemeral auth storage"))?;
@@ -506,6 +535,9 @@ impl EphemeralAuthStorage {
 
 impl AuthStorageBackend for EphemeralAuthStorage {
     fn lock(&self) -> std::io::Result<Option<AuthStorageLock>> {
+        // Resolve filesystem aliases before excluding other credential writers.
+        // Reuse that identity throughout this backend's read/merge/save transaction.
+        self.key()?;
         EPHEMERAL_AUTH_WRITER
             .lock()
             .map(|_lock| Some(AuthStorageLock::Ephemeral { _lock }))

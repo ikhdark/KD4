@@ -51,83 +51,6 @@ fn wants_no_sandbox_approval_granular_respects_sandbox_flag() {
     );
 }
 
-#[tokio::test]
-async fn guardian_review_request_includes_patch_context() {
-    let path = std::env::temp_dir()
-        .join("guardian-apply-patch-test.txt")
-        .abs();
-    let action =
-        ApplyPatchAction::new_add_for_test(&PathUri::from_abs_path(&path), "hello".to_string());
-    let expected_cwd = action.cwd.clone();
-    let expected_patch = action.patch.clone();
-    let request = ApplyPatchRequest {
-        cancellation_token: tokio_util::sync::CancellationToken::new(),
-        turn_environment: test_turn_environment(codex_exec_server::LOCAL_ENVIRONMENT_ID),
-        action,
-        file_paths: vec![PathUri::from_abs_path(&path)],
-        changes: HashMap::from([(
-            path.to_path_buf(),
-            FileChange::Add {
-                content: "hello".to_string(),
-            },
-        )]),
-        exec_approval_requirement: ExecApprovalRequirement::NeedsApproval {
-            reason: None,
-            proposed_execpolicy_amendment: None,
-        },
-        additional_permissions: None,
-        permissions_preapproved: false,
-    };
-
-    let guardian_request = ApplyPatchRuntime::build_guardian_review_request(&request, "call-1")
-        .expect("native guardian request cwd");
-
-    assert_eq!(
-        guardian_request,
-        ApprovalAction::ApplyPatch {
-            id: "call-1".to_string(),
-            cwd: expected_cwd,
-            files: vec![PathUri::from_abs_path(&path)],
-            patch: expected_patch,
-        }
-    );
-}
-
-#[tokio::test]
-async fn guardian_review_request_preserves_foreign_paths() {
-    let path = PathUri::parse("file:///tmp/guardian-remote.txt").expect("POSIX path URI");
-    let action = ApplyPatchAction::new_add_for_test(&path, "hello".to_string());
-    let expected_cwd = action.cwd.clone();
-    let expected_patch = action.patch.clone();
-    let request = ApplyPatchRequest {
-        cancellation_token: tokio_util::sync::CancellationToken::new(),
-        turn_environment: test_turn_environment("remote"),
-        action,
-        file_paths: vec![path.clone()],
-        changes: HashMap::new(),
-        exec_approval_requirement: ExecApprovalRequirement::NeedsApproval {
-            reason: None,
-            proposed_execpolicy_amendment: None,
-        },
-        additional_permissions: None,
-        permissions_preapproved: false,
-    };
-
-    let guardian_request =
-        ApplyPatchRuntime::build_guardian_review_request(&request, "call-remote")
-            .expect("foreign guardian paths should not require host conversion");
-
-    assert_eq!(
-        guardian_request,
-        ApprovalAction::ApplyPatch {
-            id: "call-remote".to_string(),
-            cwd: expected_cwd,
-            files: vec![path],
-            patch: expected_patch,
-        }
-    );
-}
-
 #[test]
 fn unbound_mutation_evidence_allows_paths_outside_the_repo() {
     let repo_root = std::env::temp_dir().join("apply-patch-repo").abs();
@@ -270,7 +193,6 @@ async fn sandbox_retry_session_approval_is_cached_separately() {
                         session: &session,
                         turn: &turn,
                         call_id: &retry_one_id,
-                        guardian_review_id: None,
                         retry_reason: Some("retry without sandbox?".to_string()),
                         network_approval_context: None,
                     },
@@ -284,7 +206,6 @@ async fn sandbox_retry_session_approval_is_cached_separately() {
                         session: &session,
                         turn: &turn,
                         call_id: &retry_two_id,
-                        guardian_review_id: None,
                         retry_reason: Some("retry without sandbox?".to_string()),
                         network_approval_context: None,
                     },
@@ -298,7 +219,6 @@ async fn sandbox_retry_session_approval_is_cached_separately() {
                         session: &session,
                         turn: &turn,
                         call_id: &ordinary_id,
-                        guardian_review_id: None,
                         retry_reason: None,
                         network_approval_context: None,
                     },

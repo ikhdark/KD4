@@ -1,6 +1,24 @@
 use std::io::Read;
 use std::io::Write;
 
+// Support large PATCH inputs while bounding allocation from pipes without EOF.
+const MAX_PATCH_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+
+fn read_patch_input(reader: impl Read) -> std::io::Result<String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_PATCH_INPUT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_PATCH_INPUT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("PATCH input exceeds the {MAX_PATCH_INPUT_BYTES}-byte limit"),
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+}
+
 pub fn main() -> ! {
     let exit_code = run_main();
     std::process::exit(exit_code);
@@ -23,9 +41,8 @@ pub fn run_main() -> i32 {
         },
         None => {
             // No argument provided; attempt to read the patch from stdin.
-            let mut buf = String::new();
-            match std::io::stdin().read_to_string(&mut buf) {
-                Ok(_) => {
+            match read_patch_input(std::io::stdin().lock()) {
+                Ok(buf) => {
                     if buf.is_empty() {
                         eprintln!("Usage: apply_patch 'PATCH'\n       echo 'PATCH' | apply_patch");
                         return 2;
@@ -91,5 +108,23 @@ pub fn run_apply_patch(patch: &str) -> i32 {
             }
         }
         Err(_) => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn read_patch_input_preserves_input_and_rejects_oversize_without_draining() {
+        use std::io::Read as _;
+
+        assert_eq!(
+            super::read_patch_input(b"normal prompt\n".as_slice()).unwrap(),
+            "normal prompt\n"
+        );
+        let mut input = std::io::repeat(b'x').take(super::MAX_PATCH_INPUT_BYTES + 2);
+        let error = super::read_patch_input(&mut input).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds"));
+        assert_eq!(input.limit(), 1, "must stop after the first excess byte");
     }
 }

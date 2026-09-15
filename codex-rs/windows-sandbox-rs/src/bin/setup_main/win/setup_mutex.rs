@@ -11,7 +11,7 @@ use windows_sys::Win32::System::Threading::INFINITE;
 use windows_sys::Win32::System::Threading::ReleaseMutex;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
-const SETUP_MUTEX_NAME: &str = "Local\\CodexSandboxSetup";
+const SETUP_MUTEX_NAME: &str = "Global\\CodexSandboxSetup";
 
 pub(super) struct SetupMutexGuard {
     handle: HANDLE,

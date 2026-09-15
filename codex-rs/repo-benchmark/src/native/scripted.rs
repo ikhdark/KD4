@@ -1,14 +1,25 @@
-use anyhow::{Context, Result, bail};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
 use codex_app_server_test_client::LoopbackResponsesServer;
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use std::fs::{self, File, OpenOptions};
+use serde::Deserialize;
+use serde::Serialize;
+use serde_json::Value;
+use serde_json::json;
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::fs::{self};
 use std::io::Read;
 use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::time::Duration;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -260,7 +271,9 @@ impl ScriptedProvider {
                     process.pid
                 );
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(
+                Duration::from_millis(20).min(until.saturating_duration_since(Instant::now())),
+            );
         }
         let late_effect = request.cwd.join(marker_file(0, 0));
         if late_effect.exists() {
@@ -617,7 +630,9 @@ impl CancellationProcess {
                 codex_app_server_test_client::terminate_owned_process(&mut child)?;
                 return Err(super::client::DeadlineExpired.into());
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
     }
 }
@@ -737,7 +752,8 @@ fn session_id(text: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::Read;
+    use std::io::Write;
     use std::net::TcpStream;
 
     fn post(server: &ScriptedProvider, body: &Value) -> String {
@@ -949,7 +965,9 @@ mod tests {
             let checkpoint_path = temp.path().join("repo-benchmark-cancellation-started.json");
             let until = Instant::now() + Duration::from_secs(5);
             while !checkpoint_path.is_file() && Instant::now() < until {
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(
+                    Duration::from_millis(10).min(until.saturating_duration_since(Instant::now())),
+                );
             }
             assert!(
                 checkpoint_path.is_file(),
@@ -981,7 +999,9 @@ mod tests {
             while provider.state.lock().unwrap().retained_session.is_none()
                 && Instant::now() < until
             {
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(
+                    Duration::from_millis(10).min(until.saturating_duration_since(Instant::now())),
+                );
             }
             let checkpoint = provider
                 .cancellation_checkpoint(&request, deadline)

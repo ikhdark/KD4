@@ -384,3 +384,21 @@ fn test_apply_patch_cli_preserves_extra_carriage_return() -> anyhow::Result<()> 
     assert_eq!(fs::read(tmp.path().join("a.txt"))?, b"x\r\n");
     Ok(())
 }
+
+#[test]
+fn test_apply_patch_cli_rejects_oversized_stdin_without_writes() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    let mut patch = String::from("*** Begin Patch\n*** Add File: oversized.txt\n+");
+    patch.push_str(&"x".repeat(64 * 1024 * 1024));
+    patch.push_str("\n*** End Patch\n");
+    let output = apply_patch_command()?
+        .current_dir(tmp.path())
+        .write_stdin(patch)
+        .output()?;
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)?.contains("PATCH input exceeds the 67108864-byte limit")
+    );
+    assert!(!tmp.path().join("oversized.txt").exists());
+    Ok(())
+}

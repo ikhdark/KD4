@@ -872,27 +872,51 @@ fn canonical_workspace_resource_key(
     cache: &Mutex<std::collections::HashMap<std::path::PathBuf, Option<std::path::PathBuf>>>,
 ) -> Option<std::path::PathBuf> {
     let classification = classification?;
-    let mut cache = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(resource) = cache.get(&classification.workspace_cwd) {
-        return resource.clone();
+    {
+        let cache = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(resource) = cache.get(&classification.workspace_cwd) {
+            return resource.clone();
+        }
     }
     let resource = codex_git_utils::get_git_repo_root(&classification.workspace_cwd)
         .and_then(|repo_root| dunce::canonicalize(repo_root).ok());
-    cache.insert(classification.workspace_cwd.clone(), resource.clone());
-    resource
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(classification.workspace_cwd.clone())
+        .or_insert(resource)
+        .clone()
 }
 
-fn workspace_resource_key_for_admission(
+async fn workspace_resource_key_for_admission(
     classification: &crate::tool_history::WorkspaceCallClassification,
-    cache: &Mutex<std::collections::HashMap<std::path::PathBuf, Option<std::path::PathBuf>>>,
+    cache: &Arc<Mutex<std::collections::HashMap<std::path::PathBuf, Option<std::path::PathBuf>>>>,
     supports_parallel: bool,
     workspace_capable: bool,
 ) -> Option<std::path::PathBuf> {
-    (supports_parallel && workspace_capable)
-        .then(|| canonical_workspace_resource_key(Some(classification), cache))
-        .flatten()
+    if !supports_parallel || !workspace_capable {
+        return None;
+    }
+    // Cached admission stays on the executor only when the short map lookup
+    // is immediately available. Discovery and contention belong on a worker.
+    if let Ok(cache) = cache.try_lock()
+        && let Some(resource) = cache.get(&classification.workspace_cwd)
+    {
+        return resource.clone();
+    }
+    let classification = classification.clone();
+    let cache = Arc::clone(cache);
+    tokio::task::spawn_blocking(move || {
+        canonical_workspace_resource_key(Some(&classification), cache.as_ref())
+    })
+    .await
+    .unwrap_or_else(|error| {
+        // Failed discovery retains conservative global workspace serialization.
+        warn!(%error, "workspace resource discovery worker failed");
+        None
+    })
 }
 
 #[derive(Debug)]
@@ -920,18 +944,13 @@ fn workspace_call_may_share_resource(
 fn workspace_admission_plan(
     tool_name: &codex_tools::ToolName,
     classification: &crate::tool_history::WorkspaceCallClassification,
-    cache: &Mutex<std::collections::HashMap<std::path::PathBuf, Option<std::path::PathBuf>>>,
+    resource_key: Option<std::path::PathBuf>,
     supports_parallel: bool,
     workspace_capable: bool,
 ) -> WorkspaceAdmissionPlan {
     WorkspaceAdmissionPlan {
         bypass_outer_gate: bypasses_outer_workspace_gate(tool_name),
-        resource_key: workspace_resource_key_for_admission(
-            classification,
-            cache,
-            supports_parallel,
-            workspace_capable,
-        ),
+        resource_key,
         shared_resource: workspace_call_may_share_resource(tool_name, classification),
         supports_parallel,
         workspace_capable,
@@ -2157,15 +2176,10 @@ impl ToolCallRuntime {
         let evidence_call = call.clone();
         let workspace_capable =
             crate::tool_history::tool_observes_workspace(evidence_call.tool_name.name.as_str());
-        let workspace_admission = workspace_admission_plan(
-            &evidence_call.tool_name,
-            &workspace_admission_classification,
-            self.canonical_workspace_resources.as_ref(),
-            supports_parallel,
-            workspace_capable,
-        );
-        let tracks_workspace =
-            workspace_capable || !supports_parallel || workspace_admission.bypass_outer_gate;
+        let canonical_workspace_resources = Arc::clone(&self.canonical_workspace_resources);
+        let tracks_workspace = workspace_capable
+            || !supports_parallel
+            || bypasses_outer_workspace_gate(&evidence_call.tool_name);
         if tracks_workspace {
             step_context
                 .workspace_evidence_generation_batch
@@ -2198,12 +2212,27 @@ impl ToolCallRuntime {
         // path as explicit cancellation. A child token isolates it from sibling calls.
         let cancellation_token = cancellation_token.child_token();
         let caller_drop = cancellation_token.clone().drop_guard();
+        let admission_cancellation_token = cancellation_token.clone();
         let mut commit_guard = (owns_unified_exec_processes || requires_commit_barrier)
             .then(|| self.session.retain_tool_dispatch_commit());
         let terminal_tasks = self.session.terminal_tasks.clone();
 
         let mut dispatch_handle: AbortOnDropHandle<Result<AnyToolResult, FunctionCallError>> =
             AbortOnDropHandle::new(tokio::spawn(async move {
+                let resource_key = workspace_resource_key_for_admission(
+                    &workspace_admission_classification,
+                    &canonical_workspace_resources,
+                    supports_parallel,
+                    workspace_capable,
+                )
+                .await;
+                let workspace_admission = workspace_admission_plan(
+                    &evidence_call.tool_name,
+                    &workspace_admission_classification,
+                    resource_key,
+                    supports_parallel,
+                    workspace_capable,
+                );
                 if tracks_workspace {
                     tracker
                         .lock()
@@ -2228,7 +2257,9 @@ impl ToolCallRuntime {
                         .await,
                     )
                 };
-                if !admission_dispatch_state.try_admit() {
+                if admission_cancellation_token.is_cancelled()
+                    || !admission_dispatch_state.try_admit()
+                {
                     // The cancellation owner won the admission race. Release
                     // any newly acquired guard without entering the handler;
                     // the outer task immediately aborts this pending future and
@@ -3331,18 +3362,17 @@ mod tests {
             workspace_cwd: std::path::PathBuf::from("missing-workspace"),
             source_dependencies: Default::default(),
         };
-        let canonical_resources = Mutex::new(std::collections::HashMap::new());
         let exec = workspace_admission_plan(
             &codex_tools::ToolName::plain(crate::tools::code_mode::PUBLIC_TOOL_NAME),
             &classification,
-            &canonical_resources,
+            None,
             true,
             true,
         );
         let nested = workspace_admission_plan(
             &codex_tools::ToolName::plain("shell_command"),
             &classification,
-            &canonical_resources,
+            None,
             false,
             true,
         );
@@ -3466,15 +3496,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn non_workspace_or_serial_admission_skips_workspace_resource_resolution() {
+    #[tokio::test]
+    async fn non_workspace_or_serial_admission_skips_workspace_resource_resolution() {
         let missing = std::path::PathBuf::from("definitely-missing-workspace-resource");
         let classification = crate::tool_history::WorkspaceCallClassification {
             observes_workspace: false,
             workspace_cwd: missing,
             source_dependencies: Default::default(),
         };
-        let canonical_resources = Mutex::new(std::collections::HashMap::new());
+        let canonical_resources = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
         assert_eq!(
             workspace_resource_key_for_admission(
@@ -3482,7 +3512,8 @@ mod tests {
                 &canonical_resources,
                 true,
                 false,
-            ),
+            )
+            .await,
             None
         );
         assert_eq!(
@@ -3491,7 +3522,8 @@ mod tests {
                 &canonical_resources,
                 false,
                 true,
-            ),
+            )
+            .await,
             None
         );
         assert!(
@@ -3502,8 +3534,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn workspace_resource_resolution_is_cached_for_the_turn() {
+    #[tokio::test]
+    async fn workspace_resource_resolution_is_cached_for_the_turn() {
         let root = tempfile::tempdir().expect("temporary workspace root");
         let repo = root.path().join("repo");
         std::fs::create_dir_all(repo.join(".git")).expect("repository marker");
@@ -3512,14 +3544,16 @@ mod tests {
             workspace_cwd: repo.clone(),
             source_dependencies: Default::default(),
         };
-        let canonical_resources = Mutex::new(std::collections::HashMap::new());
+        let canonical_resources = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
         let first =
             workspace_resource_key_for_admission(&classification, &canonical_resources, true, true)
+                .await
                 .expect("first canonical resource");
         std::fs::remove_dir_all(repo.join(".git")).expect("remove repository marker");
         let second =
             workspace_resource_key_for_admission(&classification, &canonical_resources, true, true)
+                .await
                 .expect("cached canonical resource");
 
         assert_eq!(second, first);
@@ -4382,7 +4416,20 @@ mod tests {
         command: &str,
         scoped: bool,
     ) {
-        let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+        let (session, mut turn_context) = crate::session::tests::make_session_and_context().await;
+        let workspace = tempfile::tempdir().expect("isolated workspace");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("initialize workspace")
+                .success()
+        );
+        std::fs::write(workspace.path().join("contract.txt"), "contract").unwrap();
+        Arc::make_mut(&mut turn_context.config).cwd =
+            codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(workspace.path())
+                .unwrap();
         let session = Arc::new(session);
         let turn_context = Arc::new(turn_context);
         let tool_name = codex_tools::ToolName::plain("exec_command");
@@ -5573,6 +5620,117 @@ mod tests {
                     .push(outcome);
             })
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn workspace_discovery_contention_does_not_block_dispatch_cancellation()
+    -> anyhow::Result<()> {
+        struct AdmissionProbeHandler {
+            entered: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl ToolExecutor<ToolInvocation> for AdmissionProbeHandler {
+            fn tool_name(&self) -> codex_tools::ToolName {
+                codex_tools::ToolName::plain("shell_command")
+            }
+
+            fn spec(&self) -> codex_tools::ToolSpec {
+                ParallelImmediateHandler {
+                    tool_name: self.tool_name(),
+                }
+                .spec()
+            }
+
+            fn supports_parallel_tool_calls(&self) -> bool {
+                true
+            }
+
+            fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+                self.entered
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async {
+                    Ok(
+                        Box::new(FunctionToolOutput::from_text("ok".to_string(), Some(true)))
+                            as Box<dyn crate::tools::context::ToolOutput>,
+                    )
+                })
+            }
+        }
+
+        impl CoreToolRuntime for AdmissionProbeHandler {}
+
+        let (mut session, turn_context) = crate::session::tests::make_session_and_context().await;
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let mut builder =
+            codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+        builder.tool_lifecycle_contributor(Arc::new(FinishRecorder {
+            records: Arc::clone(&records),
+        }));
+        session.services.extensions = Arc::new(builder.build());
+        let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler = Arc::new(AdmissionProbeHandler {
+            entered: Arc::clone(&entered),
+        }) as Arc<dyn CoreToolRuntime>;
+        let step_context =
+            StepContext::for_test(Arc::new(turn_context)).with_tool_router_for_test(Arc::new(
+                ToolRouter::from_parts(ToolRegistry::from_tools([handler]), Vec::new()),
+            ));
+        let runtime = ToolCallRuntime::new(
+            Arc::new(session),
+            step_context,
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        );
+        let cache = Arc::clone(&runtime.canonical_workspace_resources);
+        let (locked_tx, locked_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = std::thread::spawn(move || {
+            let _guard = cache.lock().expect("canonical resource cache");
+            let _ = locked_tx.send(());
+            // A watchdog lets a regression fail rather than hang the test runtime.
+            release_rx.recv_timeout(Duration::from_secs(5)).is_ok()
+        });
+        locked_rx.await.expect("cache holder started");
+
+        let cancellation = CancellationToken::new();
+        let response_task = tokio::spawn(runtime.handle_tool_call(
+            ToolCall {
+                tool_name: codex_tools::ToolName::plain("shell_command"),
+                call_id: "cancel-during-workspace-discovery".to_string(),
+                payload: ToolPayload::Function {
+                    arguments: r#"{"command":"pwd"}"#.to_string(),
+                },
+            },
+            cancellation.clone(),
+        ));
+        // Let supervised dispatch poll discovery while the cache remains held.
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        let response = tokio::time::timeout(Duration::from_secs(1), response_task)
+            .await
+            .expect("workspace discovery must not delay cancellation")
+            .expect("response task joins")?;
+        let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
+            anyhow::bail!("cancelled tool should return function output");
+        };
+        let FunctionCallOutputBody::Text(text) = output.body else {
+            anyhow::bail!("cancelled tool output should be text");
+        };
+        assert!(text.contains("aborted by user"));
+        assert_eq!(entered.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            records.lock().expect("terminal records").as_slice(),
+            &[ToolCallOutcome::Aborted],
+        );
+        let released_before_watchdog = release_tx.send(()).is_ok();
+        let released =
+            tokio::task::spawn_blocking(move || blocker.join().expect("cache holder joins"))
+                .await?;
+        assert!(
+            released_before_watchdog && released,
+            "cancellation must finish while discovery is held"
+        );
+        assert_eq!(entered.load(std::sync::atomic::Ordering::SeqCst), 0);
+        Ok(())
     }
 
     #[tokio::test]

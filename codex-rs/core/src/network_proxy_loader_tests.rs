@@ -18,6 +18,100 @@ use std::collections::BTreeMap;
 use std::fs;
 use tempfile::tempdir;
 
+struct ConfigDiscoveryEdit {
+    codex_home: AbsolutePathBuf,
+    contents: String,
+    modified: std::time::SystemTime,
+}
+
+thread_local! {
+    static CONFIG_DISCOVERY_EDIT: std::cell::RefCell<Option<ConfigDiscoveryEdit>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+pub(super) fn after_config_discovery(codex_home: &AbsolutePathBuf) {
+    let edit = CONFIG_DISCOVERY_EDIT.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        if pending
+            .as_ref()
+            .is_some_and(|edit| &edit.codex_home == codex_home)
+        {
+            pending.take()
+        } else {
+            None
+        }
+    });
+    if let Some(edit) = edit {
+        write_config_with_mtime(&edit.codex_home, &edit.contents, edit.modified);
+    }
+}
+
+fn write_config_with_mtime(
+    codex_home: &AbsolutePathBuf,
+    contents: &str,
+    modified: std::time::SystemTime,
+) {
+    let path = codex_home.join(CONFIG_TOML_FILE);
+    fs::write(&path, contents).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn config_reload_does_not_acknowledge_a_policy_changed_after_read() {
+    let home = tempdir().expect("create isolated Codex home");
+    let codex_home = AbsolutePathBuf::from_absolute_path(home.path()).unwrap();
+    let policy = |domain: &str| {
+        format!(
+            r#"default_permissions = "reload"
+[permissions.reload.network]
+mode = "full"
+[permissions.reload.network.domains]
+"{domain}" = "deny"
+"#
+        )
+    };
+    let initial_mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    write_config_with_mtime(&codex_home, &policy("initial.example.com"), initial_mtime);
+    let (initial_state, layer_mtimes) = build_config_state_with_mtimes(&codex_home).await.unwrap();
+    assert!(initial_state.deny_set.is_match("initial.example.com"));
+    let reloader = MtimeConfigReloader::new(layer_mtimes, codex_home.clone());
+    let entry: &dyn ConfigReloader = &reloader;
+    assert!(entry.maybe_reload().await.unwrap().is_none());
+
+    write_config_with_mtime(
+        &codex_home,
+        &policy("intermediate.example.com"),
+        initial_mtime + std::time::Duration::from_secs(10),
+    );
+    CONFIG_DISCOVERY_EDIT.with(|pending| {
+        *pending.borrow_mut() = Some(ConfigDiscoveryEdit {
+            codex_home,
+            contents: policy("latest.example.com"),
+            modified: initial_mtime + std::time::Duration::from_secs(20),
+        });
+    });
+    let first = entry
+        .maybe_reload()
+        .await
+        .unwrap()
+        .expect("changed policy must reload");
+    assert!(CONFIG_DISCOVERY_EDIT.with(|pending| pending.borrow().is_none()));
+    let published = entry.maybe_reload().await.unwrap().unwrap_or(first);
+    assert!(published.deny_set.is_match("latest.example.com"));
+    assert!(!published.deny_set.is_match("intermediate.example.com"));
+    assert!(!published.deny_set.is_match("initial.example.com"));
+    assert!(
+        entry.maybe_reload().await.unwrap().is_none(),
+        "stable policy must settle"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn config_reload_retries_failed_mitm_build_without_committing_mtime() {
     let home = tempdir().expect("create isolated Codex home");

@@ -541,9 +541,7 @@ async fn refresh_requested_mcp_servers_after_install(
         return true;
     }
 
-    session
-        .refresh_mcp_servers_now(turn, config, Some(session.mcp_elicitation_reviewer()))
-        .await;
+    session.refresh_mcp_servers_now(turn, config).await;
     let runtime = session.services.latest_mcp_runtime();
     let manager = runtime.manager();
     let ready = tokio::time::timeout(PLUGIN_MCP_READY_TIMEOUT, async {

@@ -7,14 +7,12 @@ the process manager to spawn PTYs once an ExecRequest is prepared.
 use crate::command_canonicalization::canonicalize_command_for_approval;
 use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecExpiration;
-use crate::guardian::GuardianNetworkAccessTrigger;
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::ExecServerEnvConfig;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::command_output_artifact::RawOutputArtifact;
-use crate::tools::flat_tool_name;
 use crate::tools::known_delta_store::KnownDeltaHit;
 use crate::tools::network_approval::NetworkApprovalMode;
 use crate::tools::network_approval::NetworkApprovalSpec;
@@ -23,7 +21,6 @@ use crate::tools::runtimes::exec_env_for_sandbox_permissions;
 use crate::tools::runtimes::prepare_shell_command;
 use crate::tools::runtimes::shell_snapshot_additional_read_roots;
 use crate::tools::sandboxing::Approvable;
-use crate::tools::sandboxing::ApprovalAction;
 use crate::tools::sandboxing::ApprovalCtx;
 use crate::tools::sandboxing::ExecApprovalRequirement;
 use crate::tools::sandboxing::PermissionRequestPayload;
@@ -313,14 +310,6 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
         })
     }
 
-    fn approval_action(
-        &self,
-        req: &UnifiedExecRequest,
-        ctx: &ApprovalCtx<'_>,
-    ) -> std::io::Result<ApprovalAction> {
-        Ok(Self::build_guardian_review_request(req, ctx.call_id))
-    }
-
     fn exec_approval_requirement(
         &self,
         req: &UnifiedExecRequest,
@@ -343,19 +332,7 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
     }
 }
 
-impl UnifiedExecRuntime<'_> {
-    fn build_guardian_review_request(req: &UnifiedExecRequest, call_id: &str) -> ApprovalAction {
-        ApprovalAction::ExecCommand {
-            id: call_id.to_string(),
-            command: req.command_for_approval.clone(),
-            cwd: req.cwd.clone(),
-            sandbox_permissions: req.sandbox_permissions,
-            additional_permissions: req.additional_permissions.clone(),
-            justification: req.justification.clone(),
-            tty: req.tty,
-        }
-    }
-}
+impl UnifiedExecRuntime<'_> {}
 
 impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRuntime<'a> {
     fn sandbox_cwd<'b>(&self, req: &'b UnifiedExecRequest) -> Option<&'b PathUri> {
@@ -380,16 +357,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
         Some(NetworkApprovalSpec {
             network: Some(network.clone()),
             mode: NetworkApprovalMode::Deferred,
-            trigger: GuardianNetworkAccessTrigger {
-                call_id: ctx.call_id.clone(),
-                tool_name: flat_tool_name(&ctx.tool_name).into_owned(),
-                command: req.command.clone(),
-                cwd: req.cwd.clone(),
-                sandbox_permissions: req.sandbox_permissions,
-                additional_permissions: req.additional_permissions.clone(),
-                justification: req.justification.clone(),
-                tty: Some(req.tty),
-            },
+            cwd: req.cwd.clone(),
             command: req.hook_command.clone(),
             environment_id: req.turn_environment.environment_id.clone(),
             approval_scope_id: req
@@ -570,29 +538,6 @@ mod tests {
             }
             other => panic!("expected timeout-or-cancellation expiration, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn guardian_review_request_preserves_foreign_cwd() {
-        let foreign_cwd =
-            PathUri::parse("file:///tmp/remote-workspace").expect("POSIX remote workspace URI");
-        let mut request = test_request(
-            SandboxPermissions::RequireEscalated,
-            ExecApprovalRequirement::NeedsApproval {
-                reason: None,
-                proposed_execpolicy_amendment: None,
-            },
-        );
-        request.cwd = foreign_cwd.clone();
-
-        let action =
-            UnifiedExecRuntime::build_guardian_review_request(&request, "remote-exec-call");
-
-        assert!(matches!(
-            action,
-            ApprovalAction::ExecCommand { id, cwd, .. }
-                if id == "remote-exec-call" && cwd == foreign_cwd
-        ));
     }
 
     #[tokio::test]

@@ -28,6 +28,18 @@ use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 
+#[cfg(test)]
+pub(crate) struct SessionInitPersistenceTestHook {
+    pub codex_home: PathBuf,
+    pub ready: tokio::sync::oneshot::Sender<ThreadId>,
+    pub release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+pub(crate) static SESSION_INIT_PERSISTENCE_TEST_HOOK: std::sync::Mutex<
+    Option<SessionInitPersistenceTestHook>,
+> = std::sync::Mutex::new(None);
+
 const TOOL_HISTORY_JOURNAL_COMPACTION_RECORDS: u64 = 128;
 const TOOL_HISTORY_JOURNAL_COMPACTION_BYTES: u64 = 1024 * 1024;
 
@@ -620,7 +632,6 @@ pub(crate) struct Session {
     /// `experimental_raw_events` semantics.
     pub(crate) raw_response_items_requested: std::sync::atomic::AtomicBool,
     pub(crate) input_queue: InputQueue,
-    pub(crate) guardian_review_session: GuardianReviewSessionManager,
     pub(crate) services: SessionServices,
     pub(super) next_internal_sub_id: AtomicU64,
 }
@@ -653,7 +664,6 @@ pub(crate) struct SessionConfiguration {
 
     /// When to escalate for approval for execution
     pub(super) approval_policy: Constrained<AskForApproval>,
-    pub(super) approvals_reviewer: ApprovalsReviewer,
     /// Permission profile state for the session. Keep the constrained profile,
     /// active profile id, and profile-defined workspace roots in sync by using
     /// the methods below instead of mutating the fields independently.
@@ -766,7 +776,6 @@ impl SessionConfiguration {
             service_tier: self.service_tier.clone(),
             developer_instructions: self.developer_instructions.clone(),
             approval_policy: self.approval_policy.value(),
-            approvals_reviewer: self.approvals_reviewer,
             permission_profile: self.permission_profile(),
             active_permission_profile: self.active_permission_profile(),
             windows_sandbox_level: self.windows_sandbox_level,
@@ -849,9 +858,7 @@ impl SessionConfiguration {
         if let Some(approval_policy) = updates.approval_policy {
             next_configuration.approval_policy.set(approval_policy)?;
         }
-        if let Some(approvals_reviewer) = updates.approvals_reviewer {
-            next_configuration.approvals_reviewer = approvals_reviewer;
-        }
+
         if let Some(windows_sandbox_level) = updates.windows_sandbox_level {
             next_configuration.windows_sandbox_level = windows_sandbox_level;
         }
@@ -1025,7 +1032,6 @@ pub(crate) struct SessionSettingsUpdate {
     pub(crate) workspace_roots: Option<Vec<AbsolutePathBuf>>,
     pub(crate) profile_workspace_roots: Option<Vec<AbsolutePathBuf>>,
     pub(crate) approval_policy: Option<AskForApproval>,
-    pub(crate) approvals_reviewer: Option<ApprovalsReviewer>,
     pub(crate) sandbox_policy: Option<SandboxPolicy>,
     pub(crate) permission_profile: Option<PermissionProfile>,
     pub(crate) active_permission_profile: Option<ActivePermissionProfile>,
@@ -1044,7 +1050,6 @@ impl SessionSettingsUpdate {
             && self.workspace_roots.is_none()
             && self.profile_workspace_roots.is_none()
             && self.approval_policy.is_none()
-            && self.approvals_reviewer.is_none()
             && self.sandbox_policy.is_none()
             && self.permission_profile.is_none()
             && self.active_permission_profile.is_none()
@@ -1220,9 +1225,24 @@ impl Session {
         // - initialize thread persistence with new or resumed session info
         // - perform default shell discovery
         // - load history metadata (skipped for subagents)
+        #[cfg(test)]
+        let (persistence_ready, startup_release) = {
+            let mut hook = SESSION_INIT_PERSISTENCE_TEST_HOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if hook
+                .as_ref()
+                .is_some_and(|hook| hook.codex_home == config.codex_home.as_path())
+            {
+                let hook = hook.take().expect("matching startup hook");
+                (Some(hook.ready), Some(hook.release))
+            } else {
+                (None, None)
+            }
+        };
         let thread_persistence_fut = async {
             if config.ephemeral {
-                Ok::<_, anyhow::Error>(None)
+                Ok::<_, anyhow::Error>(LiveThreadInitGuard::new(None))
             } else {
                 let live_thread = match &initial_history {
                     InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => {
@@ -1281,7 +1301,14 @@ impl Session {
                         .await?
                     }
                 };
-                Ok(Some(live_thread))
+                // The other joined branches may still be pending when this one
+                // completes. Keep persistence guarded while join! owns its result.
+                let guarded = LiveThreadInitGuard::new(Some(live_thread));
+                #[cfg(test)]
+                if let Some(ready) = persistence_ready {
+                    let _ = ready.send(thread_id);
+                }
+                Ok(guarded)
             }
         }
         .instrument(info_span!(
@@ -1322,6 +1349,10 @@ impl Session {
             McpRuntimeContext::new(Arc::clone(&environment_manager), mcp_runtime_cwd);
         let mcp_runtime_context_for_auth = mcp_runtime_context.clone();
         let auth_and_mcp_fut = async move {
+            #[cfg(test)]
+            if let Some(release) = startup_release {
+                let _ = release.await;
+            }
             let auth = auth_manager_clone.auth().await;
             let mcp_projection = mcp_manager_for_mcp
                 .runtime_config_for_step(
@@ -1364,11 +1395,10 @@ impl Session {
             (auth, mcp_projection, mcp_servers, auth_statuses, tool_plugin_provenance),
         ) = tokio::join!(thread_persistence_fut, state_db_fut, auth_and_mcp_fut);
 
-        let mut live_thread_init =
-            LiveThreadInitGuard::new(thread_persistence_result.map_err(|e| {
-                error!("failed to initialize thread persistence: {e:#}");
-                e
-            })?);
+        let mut live_thread_init = thread_persistence_result.map_err(|e| {
+            error!("failed to initialize thread persistence: {e:#}");
+            e
+        })?;
         if let Some(state_runtime) = state_db_ctx.as_ref() {
             if let Err(error) =
                 crate::tools::handlers::agent_jobs::reconcile_orphaned_agent_jobs_after_restart(
@@ -1782,9 +1812,7 @@ impl Session {
                 session_telemetry,
                 models_manager: Arc::clone(&models_manager),
                 tool_approvals: Mutex::new(ApprovalStore::default()),
-                guardian_rejections: Mutex::new(HashMap::new()),
-                guardian_rejection_circuit_breaker: Mutex::new(Default::default()),
-                runtime_handle: tokio::runtime::Handle::current(),
+
                 skills_service,
                 agents_md_manager,
                 plugins_manager: Arc::clone(&plugins_manager),
@@ -1830,12 +1858,6 @@ impl Session {
                         .enabled(Feature::ConcurrentReasoningSummaries),
                     attestation_provider,
                     config.http_client_factory(),
-                )
-                .with_prompt_cache_key_override(
-                    crate::guardian::prompt_cache_key_override_for_review_session(
-                        &session_configuration.session_source,
-                        session_configuration.parent_thread_id,
-                    ),
                 ),
                 code_mode_service: crate::tools::code_mode::CodeModeService::new(Arc::clone(
                     &code_mode_session_provider,
@@ -1885,7 +1907,6 @@ impl Session {
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 raw_response_items_requested: std::sync::atomic::AtomicBool::new(false),
                 input_queue: InputQueue::new(),
-                guardian_review_session: GuardianReviewSessionManager::default(),
                 services,
                 next_internal_sub_id: AtomicU64::new(0),
             });
@@ -1916,7 +1937,6 @@ impl Session {
                     model_provider_id: config.model_provider_id.clone(),
                     service_tier: session_configuration.service_tier.clone(),
                     approval_policy: session_configuration.approval_policy.value(),
-                    approvals_reviewer: session_configuration.approvals_reviewer,
                     permission_profile: session_configuration.permission_profile(),
                     active_permission_profile: session_configuration.active_permission_profile(),
                     cwd: session_configuration.cwd().clone(),
@@ -1977,7 +1997,6 @@ impl Session {
                 tool_plugin_provenance,
                 auth,
                 codex_apps_auth_manager,
-                Some(sess.mcp_elicitation_reviewer()),
                 Some(sess.mcp_elicitation_lifecycle()),
                 codex_mcp::ElicitationRequestRouter::default(),
                 /*previous_manager*/ None,

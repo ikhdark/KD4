@@ -9,33 +9,22 @@
 //!   synthetic items, so sharing the logic avoids drift between those paths.
 //! - The projection is presentation-specific. Core protocol events stay generic, while the
 //!   app-server protocol decides how to surface those events as `ThreadItem`s for clients.
-use crate::protocol::common::ServerNotification;
-use crate::protocol::v2::AutoReviewDecisionSource;
 use crate::protocol::v2::CommandAction;
-use crate::protocol::v2::CommandExecutionSource;
 use crate::protocol::v2::CommandExecutionStatus;
 use crate::protocol::v2::FileUpdateChange;
-use crate::protocol::v2::GuardianApprovalReview;
-use crate::protocol::v2::GuardianApprovalReviewStatus;
-use crate::protocol::v2::ItemGuardianApprovalReviewCompletedNotification;
-use crate::protocol::v2::ItemGuardianApprovalReviewStartedNotification;
 use crate::protocol::v2::PatchApplyStatus;
 use crate::protocol::v2::PatchChangeKind;
 use crate::protocol::v2::ThreadItem;
-use codex_protocol::ThreadId;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::ExecCommandBeginEvent;
 use codex_protocol::protocol::ExecCommandEndEvent;
 use codex_protocol::protocol::FileChange;
-use codex_protocol::protocol::GuardianAssessmentAction;
-use codex_protocol::protocol::GuardianAssessmentEvent;
 use codex_protocol::protocol::PatchApplyBeginEvent;
 use codex_protocol::protocol::PatchApplyEndEvent;
 use codex_protocol::protocol::ReviewOutputEvent;
 use codex_protocol::review_format::REVIEW_FALLBACK_MESSAGE;
 use codex_protocol::review_format::render_review_output_text;
-use codex_shell_command::parse_command::parse_command;
 use codex_shell_command::parse_command::shlex_join;
 use codex_utils_absolute_path::is_windows_absolute_path;
 use codex_utils_path_uri::PathConvention;
@@ -169,11 +158,13 @@ pub(crate) fn command_actions_for_path_uri(
         .iter()
         .cloned()
         .filter_map(|parsed| match parsed {
-            ParsedCommand::Read { cmd, name, path } => native_cwd.as_ref().map(|native_cwd| CommandAction::Read {
+            ParsedCommand::Read { cmd, name, path } => {
+                native_cwd.as_ref().map(|native_cwd| CommandAction::Read {
                     command: cmd,
                     name,
                     path: native_cwd.join(path),
-                }),
+                })
+            }
             ParsedCommand::ListFiles { cmd, path } => {
                 Some(CommandAction::ListFiles { command: cmd, path })
             }
@@ -185,159 +176,6 @@ pub(crate) fn command_actions_for_path_uri(
             ParsedCommand::Unknown { cmd } => Some(CommandAction::Unknown { command: cmd }),
         })
         .collect()
-}
-
-/// Build a guardian-derived [`ThreadItem`].
-///
-/// Currently this only synthesizes [`ThreadItem::CommandExecution`] for
-/// [`GuardianAssessmentAction::Command`] and [`GuardianAssessmentAction::Execve`].
-pub fn build_item_from_guardian_event(
-    assessment: &GuardianAssessmentEvent,
-    status: CommandExecutionStatus,
-) -> Option<ThreadItem> {
-    match &assessment.action {
-        GuardianAssessmentAction::Command { command, cwd, .. } => {
-            let id = assessment.target_item_id.as_ref()?;
-            let command = command.clone();
-            let command_actions = vec![CommandAction::Unknown {
-                command: command.clone(),
-            }];
-            Some(ThreadItem::CommandExecution {
-                id: id.clone(),
-                command,
-                cwd: cwd.clone(),
-                process_id: None,
-                parent_call_id: None,
-                parent_cell_id: None,
-                runtime_tool_call_id: None,
-                execution_id: None,
-                source: CommandExecutionSource::Agent,
-                status,
-                command_actions,
-                aggregated_output: None,
-                exit_code: None,
-                duration_ms: None,
-            })
-        }
-        GuardianAssessmentAction::Execve {
-            program, argv, cwd, ..
-        } => {
-            let id = assessment.target_item_id.as_ref()?;
-            let argv = if argv.is_empty() {
-                vec![program.clone()]
-            } else {
-                std::iter::once(program.clone())
-                    .chain(argv.iter().skip(1).cloned())
-                    .collect::<Vec<_>>()
-            };
-            let command = command_display_string(&argv);
-            let parsed_cmd = parse_command(&argv);
-            let command_actions = if parsed_cmd.is_empty() {
-                vec![CommandAction::Unknown {
-                    command: command.clone(),
-                }]
-            } else if let Some(cwd_uri) = cwd.to_inferred_path_uri() {
-                command_actions_for_path_uri(&parsed_cmd, &cwd_uri)
-            } else {
-                vec![CommandAction::Unknown {
-                    command: command.clone(),
-                }]
-            };
-            Some(ThreadItem::CommandExecution {
-                id: id.clone(),
-                command,
-                cwd: cwd.clone(),
-                process_id: None,
-                parent_call_id: None,
-                parent_cell_id: None,
-                runtime_tool_call_id: None,
-                execution_id: None,
-                source: CommandExecutionSource::Agent,
-                status,
-                command_actions,
-                aggregated_output: None,
-                exit_code: None,
-                duration_ms: None,
-            })
-        }
-        GuardianAssessmentAction::ApplyPatch { .. }
-        | GuardianAssessmentAction::NetworkAccess { .. }
-        | GuardianAssessmentAction::McpToolCall { .. }
-        | GuardianAssessmentAction::RequestPermissions { .. } => None,
-    }
-}
-
-pub fn guardian_auto_approval_review_notification(
-    conversation_id: &ThreadId,
-    event_turn_id: &str,
-    assessment: &GuardianAssessmentEvent,
-) -> ServerNotification {
-    let turn_id = if assessment.turn_id.is_empty() {
-        event_turn_id.to_string()
-    } else {
-        assessment.turn_id.clone()
-    };
-    let review = GuardianApprovalReview {
-        status: match assessment.status {
-            codex_protocol::protocol::GuardianAssessmentStatus::InProgress => {
-                GuardianApprovalReviewStatus::InProgress
-            }
-            codex_protocol::protocol::GuardianAssessmentStatus::Approved => {
-                GuardianApprovalReviewStatus::Approved
-            }
-            codex_protocol::protocol::GuardianAssessmentStatus::Denied => {
-                GuardianApprovalReviewStatus::Denied
-            }
-            codex_protocol::protocol::GuardianAssessmentStatus::TimedOut => {
-                GuardianApprovalReviewStatus::TimedOut
-            }
-            codex_protocol::protocol::GuardianAssessmentStatus::Aborted => {
-                GuardianApprovalReviewStatus::Aborted
-            }
-        },
-        risk_level: assessment.risk_level.map(Into::into),
-        user_authorization: assessment.user_authorization.map(Into::into),
-        rationale: assessment.rationale.clone(),
-    };
-    let action = assessment.action.clone().into();
-    match assessment.status {
-        codex_protocol::protocol::GuardianAssessmentStatus::InProgress => {
-            ServerNotification::ItemGuardianApprovalReviewStarted(
-                ItemGuardianApprovalReviewStartedNotification {
-                    thread_id: conversation_id.to_string(),
-                    turn_id,
-                    review_id: assessment.id.clone(),
-                    started_at_ms: assessment.started_at_ms,
-                    target_item_id: assessment.target_item_id.clone(),
-                    review,
-                    action,
-                },
-            )
-        }
-        codex_protocol::protocol::GuardianAssessmentStatus::Approved
-        | codex_protocol::protocol::GuardianAssessmentStatus::Denied
-        | codex_protocol::protocol::GuardianAssessmentStatus::TimedOut
-        | codex_protocol::protocol::GuardianAssessmentStatus::Aborted => {
-            ServerNotification::ItemGuardianApprovalReviewCompleted(
-                ItemGuardianApprovalReviewCompletedNotification {
-                    thread_id: conversation_id.to_string(),
-                    turn_id,
-                    review_id: assessment.id.clone(),
-                    started_at_ms: assessment.started_at_ms,
-                    completed_at_ms: assessment
-                        .completed_at_ms
-                        .unwrap_or(assessment.started_at_ms),
-                    target_item_id: assessment.target_item_id.clone(),
-                    decision_source: assessment
-                        .decision_source
-                        .map(AutoReviewDecisionSource::from)
-                        .unwrap_or(AutoReviewDecisionSource::Agent),
-                    review,
-                    action,
-                },
-            )
-        }
-    }
 }
 
 pub fn convert_patch_changes(changes: &HashMap<PathBuf, FileChange>) -> Vec<FileUpdateChange> {

@@ -719,7 +719,6 @@ async fn remote_model_friendly_personality_instructions_with_feature() -> anyhow
         used_fallback_model_metadata: false,
         supports_search_tool: false,
         use_responses_lite: false,
-        auto_review_model_override: None,
         tool_mode: None,
         multi_agent_version: None,
     };
@@ -843,7 +842,6 @@ async fn user_turn_personality_remote_model_template_includes_update_message() -
         used_fallback_model_metadata: false,
         supports_search_tool: false,
         use_responses_lite: false,
-        auto_review_model_override: None,
         tool_mode: None,
         multi_agent_version: None,
     };
@@ -945,6 +943,7 @@ async fn wait_for_model_available(manager: &SharedModelsManager, slug: &str) {
         if Instant::now() >= deadline {
             panic!("timed out waiting for the remote model {slug} to appear");
         }
-        sleep(Duration::from_millis(25)).await;
+        sleep(Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())))
+            .await;
     }
 }

@@ -41,36 +41,55 @@ use ts_rs::TS;
 #[serde(tag = "type")]
 #[ts(tag = "type")]
 pub enum TurnItem {
+    #[serde(rename = "UserMessage")]
     UserMessage(UserMessageItem),
+    #[serde(rename = "HookPrompt")]
     HookPrompt(HookPromptItem),
+    #[serde(rename = "AgentMessage")]
     AgentMessage(AgentMessageItem),
+    #[serde(rename = "Plan")]
     Plan(PlanItem),
+    #[serde(rename = "Reasoning")]
     Reasoning(ReasoningItem),
+    #[serde(rename = "CommandExecution")]
     CommandExecution(CommandExecutionItem),
+    #[serde(rename = "DynamicToolCall")]
     DynamicToolCall(DynamicToolCallItem),
+    #[serde(rename = "CollabAgentToolCall")]
     CollabAgentToolCall(CollabAgentToolCallItem),
+    #[serde(rename = "SubAgentActivity")]
     SubAgentActivity(SubAgentActivityItem),
     /// Hosted Responses API web-search item handled directly by core.
     ///
     /// Standalone web search uses Self::Extension instead because its display
     /// schema is owned by the web-search extension.
+    #[serde(rename = "WebSearch")]
     WebSearch(WebSearchItem),
+    #[serde(rename = "ImageView")]
     ImageView(ImageViewItem),
+    #[serde(rename = "Sleep")]
     Sleep(SleepItem),
     /// Item whose schema and lifecycle details are owned by an extension.
     ///
     /// Standalone image generation and web search use this path. App-server
     /// wraps the same typed items in their public variants.
+    #[serde(rename = "Extension")]
     Extension(ExtensionItem),
     /// Hosted Responses API image-generation item handled directly by core.
     ///
     /// This remains separate from [`Self::Extension`] because core still owns
     /// hosted image persistence and legacy-event fanout.
+    #[serde(rename = "ImageGeneration")]
     ImageGeneration(ImageGenerationItem),
+    #[serde(rename = "EnteredReviewMode")]
     EnteredReviewMode(EnteredReviewModeItem),
+    #[serde(rename = "ExitedReviewMode")]
     ExitedReviewMode(ExitedReviewModeItem),
+    #[serde(rename = "FileChange")]
     FileChange(FileChangeItem),
+    #[serde(rename = "McpToolCall")]
     McpToolCall(McpToolCallItem),
+    #[serde(rename = "ContextCompaction")]
     ContextCompaction(ContextCompactionItem),
 }
 
@@ -116,6 +135,7 @@ enum HookPromptRoot {
 #[serde(tag = "type")]
 #[ts(tag = "type")]
 pub enum AgentMessageContent {
+    #[serde(rename = "Text")]
     Text { text: String },
 }
 

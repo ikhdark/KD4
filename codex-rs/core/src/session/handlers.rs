@@ -18,15 +18,11 @@ use crate::tasks::CompactTask;
 use crate::tasks::UserShellCommandMode;
 use crate::tasks::UserShellCommandTask;
 use crate::tasks::execute_user_shell_command;
-use codex_protocol::models::ContentItem;
-use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::GuardianAssessmentEvent;
-use codex_protocol::protocol::GuardianAssessmentStatus;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::McpServerRefreshConfig;
 use codex_protocol::protocol::Op;
@@ -109,7 +105,6 @@ async fn thread_settings_update(
         workspace_roots,
         profile_workspace_roots,
         approval_policy,
-        approvals_reviewer,
         sandbox_policy,
         permission_profile,
         active_permission_profile,
@@ -138,7 +133,6 @@ async fn thread_settings_update(
         workspace_roots,
         profile_workspace_roots,
         approval_policy,
-        approvals_reviewer,
         sandbox_policy,
         permission_profile,
         active_permission_profile,
@@ -284,7 +278,7 @@ pub(super) async fn user_input_or_turn_inner(
         .await;
     current_context.update_multi_agent_spawn_authorization(&items);
     current_context.session_telemetry.user_prompt(&items);
-    sess.refresh_mcp_servers_if_requested(&current_context, Some(sess.mcp_elicitation_reviewer()))
+    sess.refresh_mcp_servers_if_requested(&current_context)
         .await;
     let additional_context_input = {
         let mut state = sess.state.lock().await;
@@ -651,11 +645,21 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) -> Option<CodexErr> {
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
     sess.services.turn_environments.shutdown();
     sess.terminal_tasks.close();
-    if tokio::time::timeout(Duration::from_secs(10), sess.terminal_tasks.wait())
+    let terminal_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    if tokio::time::timeout_at(terminal_deadline, sess.terminal_tasks.wait())
         .await
         .is_err()
     {
         warn!("timed out waiting for turn terminal finalization during session shutdown");
+    }
+    if tokio::time::timeout_at(
+        terminal_deadline,
+        sess.services.turn_environments.finish_shutdown(),
+    )
+    .await
+    .is_err()
+    {
+        warn!("timed out waiting for remote snapshot cleanup during session shutdown");
     }
     sess.services
         .unified_exec_manager
@@ -678,7 +682,6 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) -> Option<CodexErr> {
         )),
     };
     sess.services.shutdown_mcp_managers().await;
-    sess.guardian_review_session.shutdown().await;
     persistence_error
 }
 
@@ -765,8 +768,7 @@ pub async fn review(
     let turn_context = sess.new_default_turn_with_sub_id(sub_id.clone()).await;
     sess.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
         .await;
-    sess.refresh_mcp_servers_if_requested(&turn_context, Some(sess.mcp_elicitation_reviewer()))
-        .await;
+    sess.refresh_mcp_servers_if_requested(&turn_context).await;
     let cwd = turn_context.cwd().clone();
     // Base-branch resolution runs Git and reads repository metadata. The worker owns
     // only its inputs, so dropping this handler cannot start a review after cancellation.
@@ -904,10 +906,7 @@ pub(super) async fn submission_loop(
                     review(&sess, &config, sub.id.clone(), review_request).await;
                     false
                 }
-                Op::ApproveGuardianDeniedAction { event } => {
-                    approve_guardian_denied_action(&sess, event).await;
-                    false
-                }
+
                 _ => false, // Ignore unknown ops; enum is non_exhaustive to allow extensions.
             }
         }
@@ -934,46 +933,6 @@ pub(super) async fn submission_loop(
         }
     }
     debug!("Agent loop exited");
-}
-
-async fn approve_guardian_denied_action(sess: &Arc<Session>, event: GuardianAssessmentEvent) {
-    if event.status != GuardianAssessmentStatus::Denied {
-        warn!(
-            review_id = event.id.as_str(),
-            "ignoring approval for non-denied Guardian assessment"
-        );
-        return;
-    }
-
-    let approved_action = serde_json::json!({
-        "action": &event.action,
-        "outcome": "allowed",
-    });
-    let approved_action_json = match serde_json::to_string_pretty(&approved_action) {
-        Ok(approved_action_json) => approved_action_json,
-        Err(error) => {
-            warn!(%error, review_id = event.id.as_str(), "failed to serialize approved Guardian action");
-            return;
-        }
-    };
-    let approval_prefix = crate::guardian::AUTO_REVIEW_DENIED_ACTION_APPROVAL_DEVELOPER_PREFIX;
-    let text = format!(
-        r#"{approval_prefix}
-
-Treat this as approval to perform that exact action in the same context in which it was originally requested.
-Do not assume this also authorizes similar operations with different payloads.
-
-Approved action:
-{approved_action_json}"#,
-    );
-    let items = vec![ResponseItem::from(ResponseInputItem::Message {
-        role: "developer".to_string(),
-        content: vec![ContentItem::InputText { text }],
-        phase: None,
-    })];
-
-    sess.inject_no_new_turn(items, /*current_turn_context*/ None)
-        .await;
 }
 
 pub(super) fn submission_dispatch_span(sub: &Submission) -> tracing::Span {

@@ -3256,7 +3256,10 @@ mod tests {
                     if err.kind() == std::io::ErrorKind::WouldBlock
                         && Instant::now() < deadline =>
                 {
-                    std::thread::sleep(Duration::from_millis(5))
+                    std::thread::sleep(
+                        Duration::from_millis(5)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    )
                 }
                 Err(err) => panic!("probe request did not arrive: {err}"),
             }

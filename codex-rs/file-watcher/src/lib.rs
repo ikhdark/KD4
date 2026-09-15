@@ -950,16 +950,26 @@ impl FileWatcher {
                     let Some(inner) = inner.upgrade() else {
                         return;
                     };
-                    if !Self::reconcile_degraded_paths(&state, &inner) {
-                        break;
+                    let reconcile_state = Arc::clone(&state);
+                    let retry = tokio::task::spawn_blocking(move || {
+                        Self::reconcile_degraded_paths(&reconcile_state, &inner)
+                    })
+                    .await;
+                    match retry {
+                        Ok(false) => break,
+                        Ok(true) => {}
+                        Err(err) => {
+                            warn!("file watcher reconciliation worker failed: {err}");
+                            break;
+                        }
                     }
-                    drop(inner);
 
                     sleep(retry_delay).await;
                     retry_delay = retry_delay
                         .saturating_mul(2)
                         .min(DEGRADED_RECONCILE_MAX_DELAY);
-                    while reconcile_rx.try_recv().is_ok() {}
+                    // Capacity is one; a live producer can refill it indefinitely.
+                    let _ = reconcile_rx.try_recv();
                 }
             }
         });
@@ -1200,169 +1210,193 @@ impl FileWatcher {
     }
 
     async fn require_rescan_and_reconcile(
-        state: &RwLock<WatchState>,
+        state: &Arc<RwLock<WatchState>>,
         inner: Option<&Arc<Mutex<FileWatcherInner>>>,
         reconcile_tx: Option<&mpsc::Sender<()>>,
     ) {
-        Self::mark_all_subscribers_rescan(state);
+        let rescan_state = Arc::clone(state);
+        if let Err(err) = tokio::task::spawn_blocking(move || {
+            Self::mark_all_subscribers_rescan(&rescan_state);
+        })
+        .await
+        {
+            warn!("file watcher rescan worker failed: {err}");
+            return;
+        }
         Self::notify_subscribers(state, inner, reconcile_tx, &[]).await;
     }
 
     async fn notify_subscribers(
-        state: &RwLock<WatchState>,
+        state: &Arc<RwLock<WatchState>>,
         inner: Option<&Arc<Mutex<FileWatcherInner>>>,
         reconcile_tx: Option<&mpsc::Sender<()>>,
         event_paths: &[PathBuf],
     ) {
-        let subscribers_to_notify: Vec<(WatchSender, Vec<PathBuf>)> = {
-            let mut state = state
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut actual_watch_moves = Vec::new();
-            let mut subscribers_to_notify = Vec::new();
-            #[cfg(test)]
-            let mut actual_watch_path_resolution_count = 0;
+        let state = Arc::clone(state);
+        let inner = inner.cloned();
+        let reconcile_tx = reconcile_tx.cloned();
+        let event_paths = event_paths.to_vec();
+        let subscribers_to_notify = tokio::task::spawn_blocking(move || {
+            Self::reconcile_subscribers(&state, inner.as_ref(), reconcile_tx.as_ref(), &event_paths)
+        })
+        .await;
+        match subscribers_to_notify {
+            Ok(subscribers) => {
+                for (subscriber, changed_paths) in subscribers {
+                    subscriber.add_changed_paths(&changed_paths).await;
+                }
+            }
+            Err(err) => warn!("file watcher event reconciliation worker failed: {err}"),
+        }
+    }
 
-            for (subscriber_id, subscriber) in &mut state.subscribers {
-                let mut changed_paths = BTreeSet::new();
-                let mut rescan_required = false;
-                for (subscriber_watch, subscriber_watch_state) in &mut subscriber.watched_paths {
-                    if !subscriber_watch_state.fallback
-                        && !event_paths.is_empty()
-                        && !event_paths.iter().any(|event_path| {
-                            path_namespaces_overlap(event_path, &subscriber_watch.requested.path)
-                                || path_namespaces_overlap(
-                                    event_path,
-                                    &subscriber_watch_state.matched.path,
-                                )
-                        })
-                    {
-                        continue;
-                    }
-                    let stable_descendant_event =
-                        subscriber_watch_is_stable(subscriber_watch, subscriber_watch_state)
-                            && event_paths.iter().all(|event_path| {
-                                is_strict_descendant(
-                                    event_path,
-                                    &subscriber_watch_state.matched.path,
-                                ) || is_strict_descendant(
+    fn reconcile_subscribers(
+        state: &RwLock<WatchState>,
+        inner: Option<&Arc<Mutex<FileWatcherInner>>>,
+        reconcile_tx: Option<&mpsc::Sender<()>>,
+        event_paths: &[PathBuf],
+    ) -> Vec<(WatchSender, Vec<PathBuf>)> {
+        let mut state = state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut actual_watch_moves = Vec::new();
+        let mut subscribers_to_notify = Vec::new();
+        #[cfg(test)]
+        let mut actual_watch_path_resolution_count = 0;
+
+        for (subscriber_id, subscriber) in &mut state.subscribers {
+            let mut changed_paths = BTreeSet::new();
+            let mut rescan_required = false;
+            for (subscriber_watch, subscriber_watch_state) in &mut subscriber.watched_paths {
+                if !subscriber_watch_state.fallback
+                    && !event_paths.is_empty()
+                    && !event_paths.iter().any(|event_path| {
+                        path_namespaces_overlap(event_path, &subscriber_watch.requested.path)
+                            || path_namespaces_overlap(
+                                event_path,
+                                &subscriber_watch_state.matched.path,
+                            )
+                    })
+                {
+                    continue;
+                }
+                let stable_descendant_event =
+                    subscriber_watch_is_stable(subscriber_watch, subscriber_watch_state)
+                        && event_paths.iter().all(|event_path| {
+                            is_strict_descendant(event_path, &subscriber_watch_state.matched.path)
+                                || is_strict_descendant(
                                     event_path,
                                     &subscriber_watch.requested.path,
                                 )
-                            });
-                    let (new_actual, new_matched, fallback) = if stable_descendant_event {
-                        (
-                            subscriber_watch_state.actual.clone(),
-                            subscriber_watch_state.matched.clone(),
-                            false,
-                        )
-                    } else {
-                        #[cfg(test)]
-                        {
-                            actual_watch_path_resolution_count += 1;
-                        }
-                        actual_watch_path(&subscriber_watch.requested)
-                    };
-                    for event_path in event_paths {
-                        let changed_path = changed_path_for_event(
-                            subscriber_watch,
-                            subscriber_watch_state,
-                            event_path,
-                        )
-                        .or_else(|| {
-                            if subscriber_watch_state.matched == new_matched {
-                                None
-                            } else {
-                                changed_path_for_matched_path(
-                                    subscriber_watch,
-                                    subscriber_watch_state,
-                                    &new_matched,
-                                    event_path,
-                                )
-                            }
                         });
-                        if let Some(path) = changed_path
-                            && !rescan_required
-                        {
-                            if changed_paths.len() >= SUBSCRIBER_PATH_BUFFER_CAPACITY
-                                && !changed_paths.contains(&path)
-                                && !compress_changed_paths(
-                                    &mut changed_paths,
-                                    SUBSCRIBER_PATH_BUFFER_CAPACITY,
-                                )
-                            {
-                                changed_paths.clear();
-                                rescan_required = true;
-                            } else {
-                                changed_paths.insert(path);
-                            }
-                        }
-                    }
-
-                    subscriber_watch_state.fallback |= fallback;
-                    if subscriber_watch_state.actual == new_actual {
-                        if subscriber_watch_state.matched != new_matched {
-                            subscriber_watch_state.last_exists = new_matched.path.exists();
-                        }
-                        subscriber_watch_state.matched = new_matched;
-                    } else {
-                        actual_watch_moves.push((
-                            *subscriber_id,
-                            subscriber_watch.clone(),
-                            subscriber_watch_state.actual.clone(),
-                            new_actual,
-                            new_matched,
-                            subscriber_watch_state.count,
-                        ));
-                    }
-                }
-                if rescan_required {
-                    subscriber.tx.mark_rescan_required();
-                } else if !changed_paths.is_empty() {
-                    subscribers_to_notify
-                        .push((subscriber.tx.clone(), changed_paths.into_iter().collect()));
-                }
-            }
-            #[cfg(test)]
-            {
-                state.actual_watch_path_resolution_count += actual_watch_path_resolution_count;
-            }
-
-            let mut inner_guard: Option<std::sync::MutexGuard<'_, FileWatcherInner>> = None;
-            for (subscriber_id, subscriber_watch, old_actual, new_actual, new_matched, count) in
-                actual_watch_moves
-            {
-                let moved = Self::apply_actual_watch_move(
-                    &mut state,
-                    &old_actual,
-                    &new_actual,
-                    count,
-                    inner,
-                    reconcile_tx,
-                    &mut inner_guard,
-                );
-                let Some(subscriber) = state.subscribers.get_mut(&subscriber_id) else {
-                    continue;
-                };
-                if moved {
-                    if let Some(watch_state) = subscriber.watched_paths.get_mut(&subscriber_watch)
-                        && watch_state.actual == old_actual
-                    {
-                        watch_state.actual = new_actual;
-                        watch_state.last_exists = new_matched.path.exists();
-                        watch_state.matched = new_matched;
-                    }
+                let (new_actual, new_matched, fallback) = if stable_descendant_event {
+                    (
+                        subscriber_watch_state.actual.clone(),
+                        subscriber_watch_state.matched.clone(),
+                        false,
+                    )
                 } else {
-                    subscriber.tx.mark_rescan_required();
+                    #[cfg(test)]
+                    {
+                        actual_watch_path_resolution_count += 1;
+                    }
+                    actual_watch_path(&subscriber_watch.requested)
+                };
+                for event_path in event_paths {
+                    let changed_path = changed_path_for_event(
+                        subscriber_watch,
+                        subscriber_watch_state,
+                        event_path,
+                    )
+                    .or_else(|| {
+                        if subscriber_watch_state.matched == new_matched {
+                            None
+                        } else {
+                            changed_path_for_matched_path(
+                                subscriber_watch,
+                                subscriber_watch_state,
+                                &new_matched,
+                                event_path,
+                            )
+                        }
+                    });
+                    if let Some(path) = changed_path
+                        && !rescan_required
+                    {
+                        if changed_paths.len() >= SUBSCRIBER_PATH_BUFFER_CAPACITY
+                            && !changed_paths.contains(&path)
+                            && !compress_changed_paths(
+                                &mut changed_paths,
+                                SUBSCRIBER_PATH_BUFFER_CAPACITY,
+                            )
+                        {
+                            changed_paths.clear();
+                            rescan_required = true;
+                        } else {
+                            changed_paths.insert(path);
+                        }
+                    }
+                }
+
+                subscriber_watch_state.fallback |= fallback;
+                if subscriber_watch_state.actual == new_actual {
+                    if subscriber_watch_state.matched != new_matched {
+                        subscriber_watch_state.last_exists = new_matched.path.exists();
+                    }
+                    subscriber_watch_state.matched = new_matched;
+                } else {
+                    actual_watch_moves.push((
+                        *subscriber_id,
+                        subscriber_watch.clone(),
+                        subscriber_watch_state.actual.clone(),
+                        new_actual,
+                        new_matched,
+                        subscriber_watch_state.count,
+                    ));
                 }
             }
-
-            subscribers_to_notify
-        };
-
-        for (subscriber, changed_paths) in subscribers_to_notify {
-            subscriber.add_changed_paths(&changed_paths).await;
+            if rescan_required {
+                subscriber.tx.mark_rescan_required();
+            } else if !changed_paths.is_empty() {
+                subscribers_to_notify
+                    .push((subscriber.tx.clone(), changed_paths.into_iter().collect()));
+            }
         }
+        #[cfg(test)]
+        {
+            state.actual_watch_path_resolution_count += actual_watch_path_resolution_count;
+        }
+
+        let mut inner_guard: Option<std::sync::MutexGuard<'_, FileWatcherInner>> = None;
+        for (subscriber_id, subscriber_watch, old_actual, new_actual, new_matched, count) in
+            actual_watch_moves
+        {
+            let moved = Self::apply_actual_watch_move(
+                &mut state,
+                &old_actual,
+                &new_actual,
+                count,
+                inner,
+                reconcile_tx,
+                &mut inner_guard,
+            );
+            let Some(subscriber) = state.subscribers.get_mut(&subscriber_id) else {
+                continue;
+            };
+            if moved {
+                if let Some(watch_state) = subscriber.watched_paths.get_mut(&subscriber_watch)
+                    && watch_state.actual == old_actual
+                {
+                    watch_state.actual = new_actual;
+                    watch_state.last_exists = new_matched.path.exists();
+                    watch_state.matched = new_matched;
+                }
+            } else {
+                subscriber.tx.mark_rescan_required();
+            }
+        }
+
+        subscribers_to_notify
     }
 
     #[cfg(test)]

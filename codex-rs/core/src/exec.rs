@@ -53,6 +53,7 @@ use codex_sandboxing::resolve_windows_elevated_filesystem_overrides;
 #[cfg(test)]
 use codex_sandboxing::resolve_windows_restricted_token_filesystem_overrides;
 use codex_sandboxing::select_initial;
+use codex_sandboxing::should_sandbox;
 use codex_sandboxing::transform;
 #[cfg(test)]
 use codex_sandboxing::unsupported_windows_restricted_token_sandbox_reason;
@@ -488,6 +489,19 @@ pub fn build_exec_request(
         enforce_managed_network,
     );
     tracing::debug!("Sandbox type: {sandbox_type:?}");
+    if sandbox_type == SandboxType::None
+        && should_sandbox(
+            &file_system_sandbox_policy,
+            network_sandbox_policy,
+            SandboxablePreference::Auto,
+            enforce_managed_network,
+        )
+    {
+        return Err(CodexErr::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "requested restrictions require a sandbox, but no sandbox backend is available; refusing to run unsandboxed",
+        )));
+    }
 
     if let Some(network) = network.as_ref() {
         network

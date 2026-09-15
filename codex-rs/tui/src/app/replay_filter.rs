@@ -25,9 +25,7 @@ pub(super) fn event_is_notice(event: &ThreadBufferedEvent) -> bool {
     matches!(
         event,
         ThreadBufferedEvent::Notification(
-            ServerNotification::Warning(_)
-                | ServerNotification::GuardianWarning(_)
-                | ServerNotification::ConfigWarning(_)
+            ServerNotification::Warning(_) | ServerNotification::ConfigWarning(_)
         )
     )
 }

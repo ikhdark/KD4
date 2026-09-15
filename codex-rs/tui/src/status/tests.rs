@@ -36,7 +36,6 @@ use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::test_support::construct_model_info_offline_for_tests;
 use codex_models_manager::test_support::get_model_offline_for_tests;
 use codex_protocol::ThreadId;
-use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
@@ -129,7 +128,6 @@ async fn test_config(temp_home: &TempDir) -> Config {
         .build()
         .await
         .expect("load config");
-    config.approvals_reviewer = ApprovalsReviewer::User;
     config.model = Some("gpt-5.6-sol".to_string());
     config
         .permissions
@@ -487,30 +485,6 @@ async fn status_permissions_named_workspace_profile_shows_builtin_label() {
 }
 
 #[tokio::test]
-async fn status_permissions_workspace_auto_review_shows_reviewer_label() {
-    let temp_home = TempDir::new().expect("temp home");
-    let mut config = test_config(&temp_home).await;
-    config.approvals_reviewer = ApprovalsReviewer::AutoReview;
-    config
-        .permissions
-        .approval_policy
-        .set(AskForApproval::OnRequest.to_core())
-        .expect("set approval policy");
-    config
-        .permissions
-        .set_permission_profile_from_session_snapshot(PermissionProfileSnapshot::active(
-            PermissionProfile::workspace_write(),
-            ActivePermissionProfile::new(BUILT_IN_PERMISSION_PROFILE_WORKSPACE),
-        ))
-        .expect("set permission profile");
-
-    assert_eq!(
-        permissions_text_for(&config).as_deref(),
-        Some("Workspace (Approve for me)")
-    );
-}
-
-#[tokio::test]
 async fn status_permissions_named_profile_hides_internal_writable_roots() {
     let temp_home = TempDir::new().expect("temp home");
     let mut config = test_config(&temp_home).await;
@@ -805,54 +779,6 @@ async fn status_model_provider_uses_bedrock_runtime_base_url_and_gates_usage_lin
         .map(|link| link.destination)
         .collect();
     assert_eq!(narrow_destinations, Vec::<String>::new());
-}
-
-#[tokio::test]
-async fn status_snapshot_shows_auto_review_permissions() {
-    let temp_home = TempDir::new().expect("temp home");
-    let mut config = test_config(&temp_home).await;
-    config.model = Some("gpt-5.1-codex-max".to_string());
-    set_workspace_cwd(&mut config, test_path_buf("/workspace/tests").abs());
-    config.approvals_reviewer = ApprovalsReviewer::AutoReview;
-    config
-        .permissions
-        .set_permission_profile_from_session_snapshot(PermissionProfileSnapshot::active(
-            PermissionProfile::workspace_write(),
-            ActivePermissionProfile::new(BUILT_IN_PERMISSION_PROFILE_WORKSPACE),
-        ))
-        .expect("set permission profile");
-
-    let usage = TokenUsage::default();
-    let captured_at = chrono::Local
-        .with_ymd_and_hms(2024, 1, 2, 3, 4, 5)
-        .single()
-        .expect("timestamp");
-    let model_slug = get_model_offline_for_tests(config.model.as_deref());
-    let token_info = token_info_for(&model_slug, &config, &usage);
-
-    let composite = new_status_output(
-        &config,
-        test_status_account_display().as_ref(),
-        Some(&token_info),
-        &usage,
-        &None,
-        /*thread_name*/ None,
-        /*forked_from*/ None,
-        /*rate_limits*/ None,
-        None,
-        captured_at,
-        &model_slug,
-        /*collaboration_mode*/ None,
-        /*reasoning_effort_override*/ None,
-    );
-    let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 80));
-    {
-        for line in &mut rendered_lines {
-            *line = line.replace('\\', "/");
-        }
-    }
-    let sanitized = sanitize_directory(rendered_lines).join("\n");
-    assert_snapshot!(sanitized);
 }
 
 #[tokio::test]

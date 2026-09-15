@@ -180,7 +180,6 @@ impl ChatWidget {
                 permission_profile,
                 active_permission_profile,
                 mode_label.to_string(),
-                ApprovalsReviewer::User,
             ));
         }
 
@@ -200,7 +199,6 @@ impl ChatWidget {
                 permission_profile,
                 active_permission_profile,
                 mode_label.to_string(),
-                ApprovalsReviewer::User,
             ));
         }
 

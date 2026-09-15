@@ -18,8 +18,7 @@ mod suite {
     mod agent_jobs;
     #[path = "agent_websocket.rs"]
     mod agent_websocket;
-    #[path = "auto_review.rs"]
-    mod auto_review;
+
     #[path = "codex_delegate.rs"]
     mod codex_delegate;
     #[path = "collaboration_instructions.rs"]

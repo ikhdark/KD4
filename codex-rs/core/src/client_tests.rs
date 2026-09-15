@@ -1002,7 +1002,7 @@ async fn http_request_cache_identity_reaches_turn_timing_protocol_without_raw_ke
     let client = ModelClient::new(
         /*auth_manager*/ None,
         AgentIdentityAuthPolicy::JwtOnly,
-        ThreadId::new(),
+        ThreadId::from_string("018f31aa-1111-7111-8111-111111111111")?,
         provider,
         SessionSource::Cli,
         "test_originator".to_string(),
@@ -1013,8 +1013,7 @@ async fn http_request_cache_identity_reaches_turn_timing_protocol_without_raw_ke
         /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
-    )
-    .with_prompt_cache_key_override(Some("private-cache-key".to_string()));
+    );
     let timing = Arc::new(TurnTimingState::default());
     timing.mark_turn_started();
     let mut session = client.new_session();
@@ -1070,11 +1069,11 @@ async fn http_request_cache_identity_reaches_turn_timing_protocol_without_raw_ke
     for request in &protocol.model_requests {
         assert_eq!(
             request.prompt_cache_key_fingerprint.as_deref(),
-            Some("fe058f5a51c2624acfd1804a248fe377f6a507f21f534de572efd087d6659837"),
+            Some("10110fe0b9b7ef55cf1ce055b9ed7af83cf1369c41937b4146c1e059d71f2152"),
         );
     }
     let serialized = serde_json::to_string(&protocol)?;
-    assert!(!serialized.contains("private-cache-key"));
+    assert!(!serialized.contains("018f31aa-1111-7111-8111-111111111111"));
 
     Ok(())
 }

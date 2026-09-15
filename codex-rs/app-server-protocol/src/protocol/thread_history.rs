@@ -3,12 +3,10 @@ use crate::protocol::item_builders::build_command_execution_end_item;
 use crate::protocol::item_builders::build_file_change_approval_request_item;
 use crate::protocol::item_builders::build_file_change_begin_item;
 use crate::protocol::item_builders::build_file_change_end_item;
-use crate::protocol::item_builders::build_item_from_guardian_event;
 use crate::protocol::item_builders::review_output_text;
 use crate::protocol::v2::CollabAgentState;
 use crate::protocol::v2::CollabAgentTool;
 use crate::protocol::v2::CollabAgentToolCallStatus;
-use crate::protocol::v2::CommandExecutionStatus;
 use crate::protocol::v2::DynamicToolCallOutputContentItem;
 use crate::protocol::v2::DynamicToolCallStatus;
 use crate::protocol::v2::McpToolCallAppContext;
@@ -43,8 +41,6 @@ use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecCommandBeginEvent;
 use codex_protocol::protocol::ExecCommandEndEvent;
-use codex_protocol::protocol::GuardianAssessmentEvent;
-use codex_protocol::protocol::GuardianAssessmentStatus;
 use codex_protocol::protocol::ImageGenerationBeginEvent;
 use codex_protocol::protocol::ImageGenerationEndEvent;
 use codex_protocol::protocol::ItemCompletedEvent;
@@ -172,7 +168,10 @@ struct ThreadHistoryChangeAccumulator {
 }
 
 impl ThreadHistoryChangeAccumulator {
-    #[expect(clippy::expect_used, reason = "The accumulator records live turn positions and rollback removes invalid positions before finishing")]
+    #[expect(
+        clippy::expect_used,
+        reason = "The accumulator records live turn positions and rollback removes invalid positions before finishing"
+    )]
     fn finish(self, builder: &ThreadHistoryBuilder) -> ThreadHistoryChangeSet {
         let changed_items = self
             .changed_items
@@ -347,7 +346,6 @@ impl ThreadHistoryBuilder {
             EventMsg::WebSearchEnd(payload) => self.handle_web_search_end(payload),
             EventMsg::ExecCommandBegin(payload) => self.handle_exec_command_begin(payload),
             EventMsg::ExecCommandEnd(payload) => self.handle_exec_command_end(payload),
-            EventMsg::GuardianAssessment(payload) => self.handle_guardian_assessment(payload),
             EventMsg::ApplyPatchApprovalRequest(payload) => {
                 self.handle_apply_patch_approval_request(payload)
             }
@@ -656,25 +654,6 @@ impl ThreadHistoryBuilder {
         // newer user turn may already have started. Route by event turn_id so
         // replay preserves the original turn association.
         self.upsert_item_in_turn_id(&payload.turn_id, item);
-    }
-
-    fn handle_guardian_assessment(&mut self, payload: &GuardianAssessmentEvent) {
-        let status = match payload.status {
-            GuardianAssessmentStatus::InProgress => CommandExecutionStatus::InProgress,
-            GuardianAssessmentStatus::Denied | GuardianAssessmentStatus::Aborted => {
-                CommandExecutionStatus::Declined
-            }
-            GuardianAssessmentStatus::TimedOut => CommandExecutionStatus::Failed,
-            GuardianAssessmentStatus::Approved => return,
-        };
-        let Some(item) = build_item_from_guardian_event(payload, status) else {
-            return;
-        };
-        if payload.turn_id.is_empty() {
-            self.upsert_item_in_current_turn(item);
-        } else {
-            self.upsert_item_in_turn_id(&payload.turn_id, item);
-        }
     }
 
     fn handle_apply_patch_approval_request(&mut self, payload: &ApplyPatchApprovalRequestEvent) {
@@ -1719,6 +1698,7 @@ impl From<&PendingTurn> for Turn {
 mod tests {
     use super::*;
     use crate::protocol::v2::CommandExecutionSource;
+    use crate::protocol::v2::CommandExecutionStatus;
     use codex_extension_items::ExtensionItem as CoreExtensionItem;
     use codex_protocol::ThreadId;
     use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem as CoreDynamicToolCallOutputContentItem;
@@ -3333,166 +3313,6 @@ mod tests {
                     diff: "hello\n".into(),
                 }],
                 status: PatchApplyStatus::Declined,
-            }
-        );
-    }
-
-    #[test]
-    fn reconstructs_declined_guardian_command_item() {
-        let events = vec![
-            EventMsg::TurnStarted(TurnStartedEvent {
-                turn_id: "turn-1".into(),
-                trace_id: None,
-                started_at: None,
-                model_context_window: None,
-                collaboration_mode_kind: Default::default(),
-            }),
-            EventMsg::UserMessage(UserMessageEvent {
-                client_id: None,
-                message: "review this command".into(),
-                images: None,
-                text_elements: Vec::new(),
-                local_images: Vec::new(),
-                ..Default::default()
-            }),
-            EventMsg::GuardianAssessment(GuardianAssessmentEvent {
-                id: "review-guardian-exec".into(),
-                target_item_id: Some("guardian-exec".into()),
-                turn_id: "turn-1".into(),
-                started_at_ms: 1_000,
-                completed_at_ms: None,
-                status: GuardianAssessmentStatus::InProgress,
-                risk_level: None,
-                user_authorization: None,
-                rationale: None,
-                decision_source: None,
-                action: serde_json::from_value(serde_json::json!({
-                    "type": "command",
-                    "source": "shell",
-                    "command": "rm -rf /tmp/guardian",
-                    "cwd": test_path_buf("/tmp"),
-                }))
-                .expect("guardian action"),
-            }),
-            EventMsg::GuardianAssessment(GuardianAssessmentEvent {
-                id: "review-guardian-exec".into(),
-                target_item_id: Some("guardian-exec".into()),
-                turn_id: "turn-1".into(),
-                started_at_ms: 1_000,
-                completed_at_ms: Some(1_042),
-                status: GuardianAssessmentStatus::Denied,
-                risk_level: Some(codex_protocol::protocol::GuardianRiskLevel::High),
-                user_authorization: Some(codex_protocol::protocol::GuardianUserAuthorization::Low),
-                rationale: Some("Would delete user data.".into()),
-                decision_source: Some(
-                    codex_protocol::protocol::GuardianAssessmentDecisionSource::Agent,
-                ),
-                action: serde_json::from_value(serde_json::json!({
-                    "type": "command",
-                    "source": "shell",
-                    "command": "rm -rf /tmp/guardian",
-                    "cwd": test_path_buf("/tmp"),
-                }))
-                .expect("guardian action"),
-            }),
-        ];
-
-        let items = events
-            .into_iter()
-            .map(RolloutItem::EventMsg)
-            .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
-        assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].items.len(), 2);
-        assert_eq!(
-            turns[0].items[1],
-            ThreadItem::CommandExecution {
-                id: "guardian-exec".into(),
-                command: "rm -rf /tmp/guardian".into(),
-                cwd: test_path_buf("/tmp").abs().into(),
-                process_id: None,
-                parent_call_id: None,
-                parent_cell_id: None,
-                runtime_tool_call_id: None,
-                execution_id: None,
-                source: CommandExecutionSource::Agent,
-                status: CommandExecutionStatus::Declined,
-                command_actions: vec![CommandAction::Unknown {
-                    command: "rm -rf /tmp/guardian".into(),
-                }],
-                aggregated_output: None,
-                exit_code: None,
-                duration_ms: None,
-            }
-        );
-    }
-
-    #[test]
-    fn reconstructs_in_progress_guardian_execve_item() {
-        let events = vec![
-            EventMsg::TurnStarted(TurnStartedEvent {
-                turn_id: "turn-1".into(),
-                trace_id: None,
-                started_at: None,
-                model_context_window: None,
-                collaboration_mode_kind: Default::default(),
-            }),
-            EventMsg::UserMessage(UserMessageEvent {
-                client_id: None,
-                message: "run a subcommand".into(),
-                images: None,
-                text_elements: Vec::new(),
-                local_images: Vec::new(),
-                ..Default::default()
-            }),
-            EventMsg::GuardianAssessment(GuardianAssessmentEvent {
-                id: "review-guardian-execve".into(),
-                target_item_id: Some("guardian-execve".into()),
-                turn_id: "turn-1".into(),
-                started_at_ms: 2_000,
-                completed_at_ms: None,
-                status: GuardianAssessmentStatus::InProgress,
-                risk_level: None,
-                user_authorization: None,
-                rationale: None,
-                decision_source: None,
-                action: serde_json::from_value(serde_json::json!({
-                    "type": "execve",
-                    "source": "shell",
-                    "program": "/bin/rm",
-                    "argv": ["/usr/bin/rm", "-f", "/tmp/file.sqlite"],
-                    "cwd": test_path_buf("/tmp"),
-                }))
-                .expect("guardian action"),
-            }),
-        ];
-
-        let items = events
-            .into_iter()
-            .map(RolloutItem::EventMsg)
-            .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
-        assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].items.len(), 2);
-        assert_eq!(
-            turns[0].items[1],
-            ThreadItem::CommandExecution {
-                id: "guardian-execve".into(),
-                command: "/bin/rm -f /tmp/file.sqlite".into(),
-                cwd: test_path_buf("/tmp").abs().into(),
-                process_id: None,
-                parent_call_id: None,
-                parent_cell_id: None,
-                runtime_tool_call_id: None,
-                execution_id: None,
-                source: CommandExecutionSource::Agent,
-                status: CommandExecutionStatus::InProgress,
-                command_actions: vec![CommandAction::Unknown {
-                    command: "/bin/rm -f /tmp/file.sqlite".into(),
-                }],
-                aggregated_output: None,
-                exit_code: None,
-                duration_ms: None,
             }
         );
     }

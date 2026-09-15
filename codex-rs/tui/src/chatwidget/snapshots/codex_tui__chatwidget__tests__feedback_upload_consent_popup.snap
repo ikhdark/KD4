@@ -9,7 +9,6 @@ expression: popup
     • codex-logs.log
     • codex-doctor-report.json
     • windows-sandbox.log
-    • auto-review-rollout-thread-1.jsonl
     • codex-connectivity-diagnostics.txt
 
   Connectivity diagnostics

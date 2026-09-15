@@ -140,12 +140,15 @@ fn marketplace_plugin_source_to_info(source: MarketplacePluginSource) -> PluginS
     }
 }
 
-fn load_shared_plugin_ids_by_local_path(
+async fn load_shared_plugin_ids_by_local_path(
     config: &Config,
 ) -> Result<std::collections::BTreeMap<AbsolutePathBuf, String>, JSONRPCErrorError> {
-    codex_core_plugins::remote::load_plugin_share_remote_ids_by_local_path(
-        config.codex_home.as_path(),
-    )
+    let codex_home = config.codex_home.clone();
+    tokio::task::spawn_blocking(move || {
+        codex_core_plugins::remote::load_plugin_share_remote_ids_by_local_path(codex_home.as_path())
+    })
+    .await
+    .map_err(|err| internal_error(format!("plugin share mapping worker failed: {err}")))?
     .map_err(|err| {
         internal_error(format!(
             "failed to load plugin share local path mapping: {err}"
@@ -604,7 +607,8 @@ impl PluginRequestProcessor {
             let config_for_marketplace_listing = plugins_input.clone();
             let plugins_manager_for_marketplace_listing = plugins_manager.clone();
             let roots_for_marketplace_listing = roots.clone();
-            let shared_plugin_ids_by_local_path = load_shared_plugin_ids_by_local_path(&config)?;
+            let shared_plugin_ids_by_local_path =
+                load_shared_plugin_ids_by_local_path(&config).await?;
             match tokio::task::spawn_blocking(move || {
                 let outcome = plugins_manager_for_marketplace_listing
                     .list_marketplaces_for_config(
@@ -886,7 +890,7 @@ impl PluginRequestProcessor {
         JSONRPCErrorError,
     > {
         let config_for_marketplace_listing = plugins_input.clone();
-        let shared_plugin_ids_by_local_path = load_shared_plugin_ids_by_local_path(config)?;
+        let shared_plugin_ids_by_local_path = load_shared_plugin_ids_by_local_path(config).await?;
         match tokio::task::spawn_blocking(move || {
             let outcome = plugins_manager.list_marketplaces_for_config(
                 &config_for_marketplace_listing,
@@ -1034,7 +1038,7 @@ impl PluginRequestProcessor {
                     .await
                     .map_err(|err| Self::marketplace_error(err, "read plugin details"))?;
                 let shared_plugin_ids_by_local_path =
-                    load_shared_plugin_ids_by_local_path(&config)?;
+                    load_shared_plugin_ids_by_local_path(&config).await?;
                 let share_context = share_context_for_source(
                     &outcome.plugin.source,
                     &shared_plugin_ids_by_local_path,
@@ -1604,7 +1608,13 @@ impl PluginRequestProcessor {
                 config.codex_home.as_path(),
                 &actual_remote_marketplace_name,
                 &remote_plugin_name,
-            );
+            )
+            .await
+            .map_err(|error| {
+                internal_error(format!(
+                    "failed to acquire remote plugin cache mutation: {error}"
+                ))
+            })?;
         let validated_bundle = codex_core_plugins::remote_bundle::validate_remote_plugin_bundle(
             &remote_plugin_id,
             &actual_remote_marketplace_name,

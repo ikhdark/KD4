@@ -58,7 +58,23 @@ pub async fn list_cached_all_connectors(
 
     let auth = connector_auth(auth).ok()?;
     let cache_context = connector_directory_cache_context(config, &auth);
-    let connectors = codex_connectors::cached_directory_connectors(&cache_context)?;
+    // A cold lookup reads and parses the disk cache before promoting it to memory.
+    let connectors = match tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        assert!(
+            !CACHE_LOOKUP_RUNTIME_THREAD.get(),
+            "connector cache I/O must not run on the async runtime thread"
+        );
+        codex_connectors::cached_directory_connectors(&cache_context)
+    })
+    .await
+    {
+        Ok(connectors) => connectors?,
+        Err(error) => {
+            tracing::warn!(%error, "connector directory cache lookup task failed");
+            return None;
+        }
+    };
     Some(merge_directory_and_plugin_connectors(
         connectors,
         plugin_apps,
@@ -175,13 +191,19 @@ pub fn merge_connectors_with_accessible(
 }
 
 #[cfg(test)]
+thread_local! {
+    // The normal-boundary regression marks its current-thread runtime before lookup.
+    static CACHE_LOOKUP_RUNTIME_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use codex_connectors::metadata::connector_install_url;
     use codex_plugin::AppConnectorId;
     use pretty_assertions::assert_eq;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn listing_preserves_disabled_uncached_and_cached_results() {
         use codex_core::config::ConfigBuilder;
         use wiremock::Mock;
@@ -200,6 +222,7 @@ mod tests {
             .expect("config");
         let server = MockServer::start().await;
         config.chatgpt_base_url = server.uri();
+        CACHE_LOOKUP_RUNTIME_THREAD.set(true);
         assert_eq!(
             list_cached_all_connectors(&config, &[]).await,
             Some(Vec::new())
@@ -234,8 +257,33 @@ mod tests {
         );
         assert_eq!(
             list_cached_all_connectors(&config, &[]).await,
+            Some(expected.clone())
+        );
+        // Replace the one-entry in-memory cache through its normal refresh API.
+        // The original identity can now be restored only from its on-disk cache.
+        let other_context = ConnectorDirectoryCacheContext::new(
+            home.path().to_path_buf(),
+            ConnectorDirectoryCacheKey::new(
+                format!("{}/other", config.chatgpt_base_url),
+                None,
+                None,
+                false,
+            ),
+        );
+        let other =
+            codex_connectors::list_all_connectors_with_options(other_context, true, |_| async {
+                Ok(serde_json::from_value(serde_json::json!({
+                    "apps": [], "next_token": null
+                }))?)
+            })
+            .await
+            .expect("replace in-memory cache");
+        assert!(other.is_empty());
+        assert_eq!(
+            list_cached_all_connectors(&config, &[]).await,
             Some(expected)
         );
+        CACHE_LOOKUP_RUNTIME_THREAD.set(false);
         server.verify().await;
     }
 

@@ -17,7 +17,6 @@ from openai_codex.errors import CodexError, TransportClosedError
 from openai_codex.generated.v2_all import (
     AccountUpdatedNotification,
     AgentMessageDeltaNotification,
-    ApprovalsReviewer,
     ChatgptAccount,
     PlanType,
     ThreadListParams,
@@ -92,12 +91,11 @@ def test_account_and_notification_decode_the_same_public_plan_enum() -> None:
     assert account.plan_type is update.plan_type is PlanType.pro
 
 
-def test_thread_resume_response_accepts_auto_review_reviewer() -> None:
-    """Generated response models should keep accepting the auto review enum value."""
+def test_thread_resume_response_preserves_approval_policy() -> None:
+    """Generated response models should decode the active approval policy."""
     response = ThreadResumeResponse.model_validate(
         {
             "approvalPolicy": "on-request",
-            "approvalsReviewer": "auto_review",
             "cwd": "/tmp",
             "model": "gpt-5",
             "modelProvider": "openai",
@@ -120,7 +118,7 @@ def test_thread_resume_response_accepts_auto_review_reviewer() -> None:
         }
     )
 
-    assert response.approvals_reviewer is ApprovalsReviewer.auto_review
+    assert response.approval_policy.root.value == "on-request"
 
 
 def test_turn_handle_close_discards_late_events_and_releases_completed_turn() -> None:

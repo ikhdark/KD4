@@ -8,7 +8,6 @@ use crate::exec::is_likely_sandbox_denied;
 use crate::session::turn_context::TurnEnvironment;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::sandboxing::Approvable;
-use crate::tools::sandboxing::ApprovalAction;
 use crate::tools::sandboxing::ApprovalCtx;
 use crate::tools::sandboxing::ExecApprovalRequirement;
 use crate::tools::sandboxing::PermissionRequestPayload;
@@ -253,18 +252,6 @@ impl ApplyPatchRuntime {
         }
     }
 
-    fn build_guardian_review_request(
-        req: &ApplyPatchRequest,
-        call_id: &str,
-    ) -> std::io::Result<ApprovalAction> {
-        Ok(ApprovalAction::ApplyPatch {
-            id: call_id.to_string(),
-            cwd: req.action.cwd.clone(),
-            files: req.file_paths.clone(),
-            patch: req.action.patch.clone(),
-        })
-    }
-
     fn file_system_sandbox_context_for_attempt(
         req: &ApplyPatchRequest,
         attempt: &SandboxAttempt<'_>,
@@ -426,14 +413,6 @@ impl Approvable<ApplyPatchRequest> for ApplyPatchRuntime {
             )
             .await
         })
-    }
-
-    fn approval_action(
-        &self,
-        req: &ApplyPatchRequest,
-        ctx: &ApprovalCtx<'_>,
-    ) -> std::io::Result<ApprovalAction> {
-        ApplyPatchRuntime::build_guardian_review_request(req, ctx.call_id)
     }
 
     fn wants_no_sandbox_approval(&self, policy: AskForApproval) -> bool {

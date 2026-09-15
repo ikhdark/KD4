@@ -54,22 +54,33 @@ pub async fn build_network_proxy_state_and_reloader() -> Result<(ConfigState, Mt
 async fn build_config_state_with_mtimes(
     codex_home: &AbsolutePathBuf,
 ) -> Result<(ConfigState, Vec<LayerMtime>)> {
-    let cli_overrides = Vec::new();
-    let overrides = LoaderOverrides::default();
-    let config_layer_stack = load_config_layers_state(
+    let discovered_layers = load_network_config_layers(codex_home).await?;
+    #[cfg(test)]
+    tests::after_config_discovery(codex_home);
+
+    // Capture timestamps before reading the policy that will be published. A write
+    // after that read must remain visible to the next reload probe.
+    let layer_mtimes = collect_layer_mtimes(&discovered_layers).await?;
+    let config_layer_stack = load_network_config_layers(codex_home).await?;
+    anyhow::ensure!(
+        config_layer_paths(&discovered_layers) == config_layer_paths(&config_layer_stack),
+        "network configuration layers changed while loading; retry the reload"
+    );
+    let state = build_config_state_from_layers(&config_layer_stack, codex_home).await?;
+    Ok((state, layer_mtimes))
+}
+
+async fn load_network_config_layers(codex_home: &AbsolutePathBuf) -> Result<ConfigLayerStack> {
+    load_config_layers_state(
         LOCAL_FS.as_ref(),
         codex_home,
         /*cwd*/ None,
-        &cli_overrides,
-        overrides,
+        &[],
+        LoaderOverrides::default(),
         &codex_config::NoopThreadConfigLoader,
     )
     .await
-    .context("failed to load Codex config")?;
-
-    let layer_mtimes = collect_layer_mtimes(&config_layer_stack).await?;
-    let state = build_config_state_from_layers(&config_layer_stack, codex_home).await?;
-    Ok((state, layer_mtimes))
+    .context("failed to load Codex config")
 }
 
 async fn build_config_state_from_layers(
@@ -95,28 +106,30 @@ async fn build_config_state_from_layers(
     .context("network proxy state construction task failed")?
 }
 
-async fn collect_layer_mtimes(stack: &ConfigLayerStack) -> Result<Vec<LayerMtime>> {
-    let paths = stack
+fn config_layer_paths(stack: &ConfigLayerStack) -> Vec<AbsolutePathBuf> {
+    stack
         .get_layers(
             ConfigLayerStackOrdering::LowestPrecedenceFirst,
             /*include_disabled*/ false,
         )
         .iter()
-        .filter_map(|layer| {
-            match &layer.name {
-                ConfigLayerSource::System { file } => Some(file.clone()),
-                ConfigLayerSource::User { file, .. } => Some(file.clone()),
-                ConfigLayerSource::Project { dot_codex_folder } => {
-                    Some(dot_codex_folder.join(CONFIG_TOML_FILE))
-                }
-                ConfigLayerSource::LegacyManagedConfigTomlFromFile { file } => Some(file.clone()),
-                _ => None,
+        .filter_map(|layer| match &layer.name {
+            ConfigLayerSource::System { file } => Some(file.clone()),
+            ConfigLayerSource::User { file, .. } => Some(file.clone()),
+            ConfigLayerSource::Project { dot_codex_folder } => {
+                Some(dot_codex_folder.join(CONFIG_TOML_FILE))
             }
+            ConfigLayerSource::LegacyManagedConfigTomlFromFile { file } => Some(file.clone()),
+            _ => None,
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+async fn collect_layer_mtimes(stack: &ConfigLayerStack) -> Result<Vec<LayerMtime>> {
+    let paths = config_layer_paths(stack);
     run_blocking_config_probe(move || paths.into_iter().map(LayerMtime::new).collect())
         .await
-        .context("network config metadata capture task failed")
+        .context("network config metadata capture task failed")?
 }
 
 fn enforce_trusted_constraints(
@@ -341,9 +354,19 @@ struct LayerMtime {
 }
 
 impl LayerMtime {
-    fn new(path: AbsolutePathBuf) -> Self {
-        let mtime = path.metadata().and_then(|m| m.modified()).ok();
-        Self { path, mtime }
+    fn new(path: AbsolutePathBuf) -> Result<Self> {
+        let mtime = config_file_mtime(&path).with_context(|| {
+            format!("failed to read network config metadata: {}", path.display())
+        })?;
+        Ok(Self { path, mtime })
+    }
+}
+
+fn config_file_mtime(path: &AbsolutePathBuf) -> std::io::Result<Option<std::time::SystemTime>> {
+    match path.metadata() {
+        Ok(metadata) => metadata.modified().map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -392,15 +415,13 @@ impl MtimeConfigReloader {
 }
 
 fn layer_mtimes_changed(layers: &[LayerMtime]) -> bool {
-    layers.iter().any(|layer| {
-        let metadata = std::fs::metadata(&layer.path).ok();
-        match (metadata.and_then(|m| m.modified().ok()), layer.mtime) {
-            (Some(new_mtime), Some(old_mtime)) => new_mtime != old_mtime,
-            (Some(_), None) => true,
-            (None, Some(_)) => true,
-            (None, None) => false,
-        }
-    })
+    layers
+        .iter()
+        .any(|layer| match config_file_mtime(&layer.path) {
+            Ok(mtime) => mtime != layer.mtime,
+            // Failed metadata is not evidence that the loaded policy is current.
+            Err(_) => true,
+        })
 }
 
 async fn run_blocking_config_probe<T, F>(operation: F) -> Result<T, tokio::task::JoinError>

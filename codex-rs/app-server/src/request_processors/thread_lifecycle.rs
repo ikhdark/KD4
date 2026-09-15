@@ -1307,7 +1307,6 @@ pub(super) async fn handle_pending_thread_resume_request(
         model_provider_id,
         service_tier,
         approval_policy,
-        approvals_reviewer,
         permission_profile,
         active_permission_profile,
         workspace_roots,
@@ -1332,7 +1331,6 @@ pub(super) async fn handle_pending_thread_resume_request(
         runtime_workspace_roots: workspace_roots,
         instruction_sources,
         approval_policy: approval_policy.into(),
-        approvals_reviewer: approvals_reviewer.into(),
         sandbox,
         permission_profile: Some(permission_profile),
         active_permission_profile,
@@ -2313,6 +2311,7 @@ mod tests {
         assert_eq!(skills_watcher.thread_config_registration_count(), 0);
         skills_watcher
             .register_runtime_extra_roots(&[])
+            .await
             .expect("empty runtime roots should not need a watcher");
         assert!(
             !skills_watcher.is_initialized(),
@@ -2320,9 +2319,11 @@ mod tests {
         );
         skills_watcher
             .register_runtime_extra_roots(std::slice::from_ref(&config.cwd))
+            .await
             .expect("runtime root should register");
         skills_watcher
             .register_runtime_extra_roots(std::slice::from_ref(&config.cwd))
+            .await
             .expect("runtime root should re-register");
         assert!(skills_watcher.is_initialized());
         assert_eq!(skills_watcher.initialization_count(), 1);
@@ -2340,6 +2341,7 @@ mod tests {
 
         let error = skills_watcher
             .register_runtime_extra_roots(std::slice::from_ref(&config.cwd))
+            .await
             .expect_err("a missing watcher must not acknowledge runtime skill roots");
 
         assert!(error.contains("injected watcher initialization failure"));

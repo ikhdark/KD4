@@ -23,7 +23,6 @@ use codex_state::DB_METRIC_BACKFILL_DURATION_MS;
 use codex_state::ExtractionOutcome;
 use codex_state::ThreadMetadataBuilder;
 use codex_state::ThreadMetadataRolloutReducer;
-use codex_state::rollout_item_affects_thread_metadata;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::Path;
@@ -225,7 +224,7 @@ async fn cached_extraction_outcome(
 pub(crate) struct RolloutMetadataAccumulator {
     metadata: Option<codex_state::ThreadMetadata>,
     reducer: Option<ThreadMetadataRolloutReducer>,
-    pending_metadata_items: Vec<RolloutItem>,
+    has_metadata_builder: bool,
     parent_thread_id: Option<ThreadId>,
     memory_mode: Option<String>,
     saw_item: bool,
@@ -236,8 +235,22 @@ pub(crate) struct RolloutMetadataAccumulator {
 impl RolloutMetadataAccumulator {
     pub(crate) fn push(&mut self, item: RolloutItem, rollout_path: &Path, default_provider: &str) {
         self.saw_item = true;
-        if codex_state::latest_rollout_recency_at(std::slice::from_ref(&item)).is_some() {
-            self.persisted_recency_at = true;
+        if self.metadata.is_none() {
+            let builder = builder_from_items(&[], rollout_path);
+            self.has_metadata_builder = builder.is_some();
+            // A late SessionMeta may supply the identity for a nonstandard filename.
+            // Until then, fold events into a provisional projection instead of
+            // retaining arbitrarily many user messages and settings snapshots.
+            let builder = builder.unwrap_or_else(|| {
+                ThreadMetadataBuilder::new(
+                    ThreadId::new(),
+                    rollout_path.to_path_buf(),
+                    DateTime::<Utc>::UNIX_EPOCH,
+                    SessionSource::default(),
+                )
+            });
+            self.metadata = Some(builder.build(default_provider));
+            self.reducer = Some(ThreadMetadataRolloutReducer::default());
         }
         if let RolloutItem::SessionMeta(meta_line) = &item {
             if let Some(mode) = meta_line.meta.memory_mode.as_ref() {
@@ -247,32 +260,35 @@ impl RolloutMetadataAccumulator {
                 self.saw_first_session_meta = true;
                 if let Some(builder) = builder_from_session_meta(meta_line, rollout_path) {
                     self.parent_thread_id = builder.parent_thread_id;
-                    let mut projected = builder.build(default_provider);
-                    let mut streaming_reducer = ThreadMetadataRolloutReducer::default();
-                    for pending in self.pending_metadata_items.drain(..) {
-                        streaming_reducer.apply_item(&mut projected, &pending);
+                    let mut canonical = builder.build(default_provider);
+                    if let Some(projected) = self.metadata.take() {
+                        // Before the first SessionMeta, only these non-setting
+                        // fields can change. The reducer retains settings in order.
+                        canonical.title = projected.title;
+                        canonical.preview = projected.preview;
+                        canonical.first_user_message = projected.first_user_message;
+                        canonical.tokens_used = projected.tokens_used;
+                        if self.persisted_recency_at {
+                            canonical.recency_at = projected.recency_at;
+                        }
                     }
-                    streaming_reducer.apply_item(&mut projected, &item);
-                    self.metadata = Some(projected);
-                    self.reducer = Some(streaming_reducer);
-                    return;
+                    self.metadata = Some(canonical);
+                    self.has_metadata_builder = true;
                 }
             }
         }
-
+        if codex_state::latest_rollout_recency_at(std::slice::from_ref(&item)).is_some() {
+            self.persisted_recency_at = true;
+        }
         if let (Some(projected), Some(streaming_reducer)) =
             (self.metadata.as_mut(), self.reducer.as_mut())
         {
             streaming_reducer.apply_item(projected, &item);
-        } else if rollout_item_affects_thread_metadata(&item) {
-            // Before the canonical SessionMeta, retain only the small subset that can affect
-            // SQLite metadata. Large response/tool payloads are discarded immediately.
-            self.pending_metadata_items.push(item);
         }
     }
 
     pub(crate) async fn finish(
-        mut self,
+        self,
         rollout_path: &Path,
         default_provider: &str,
         parse_errors: usize,
@@ -284,26 +300,15 @@ impl RolloutMetadataAccumulator {
             ));
         }
 
-        let mut metadata = match self.metadata {
-            Some(metadata) => metadata,
-            None => {
-                let builder = builder_from_items(&self.pending_metadata_items, rollout_path)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "rollout missing metadata builder: {}",
-                            rollout_path.display()
-                        )
-                    })?;
-                self.parent_thread_id = builder.parent_thread_id;
-                let mut projected = builder.build(default_provider);
-                let mut streaming_reducer = ThreadMetadataRolloutReducer::default();
-                for item in &self.pending_metadata_items {
-                    streaming_reducer.apply_item(&mut projected, item);
-                }
-                self.reducer = Some(streaming_reducer);
-                projected
-            }
-        };
+        let mut metadata = self
+            .metadata
+            .filter(|_| self.has_metadata_builder)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "rollout missing metadata builder: {}",
+                    rollout_path.display()
+                )
+            })?;
         let reducer = self.reducer.ok_or_else(|| {
             anyhow::anyhow!(
                 "rollout metadata projection is missing its reducer: {}",

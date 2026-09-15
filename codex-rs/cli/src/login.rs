@@ -253,8 +253,26 @@ pub fn read_access_token_from_stdin() -> String {
     )
 }
 
+// Support large secret inputs while bounding allocation from pipes without EOF.
+const MAX_SECRET_INPUT_BYTES: u64 = 1024 * 1024;
+
+fn read_secret_input(reader: impl Read) -> std::io::Result<String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_SECRET_INPUT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SECRET_INPUT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("secret input exceeds the {MAX_SECRET_INPUT_BYTES}-byte limit"),
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+}
+
 fn read_stdin_secret(terminal_message: &str, reading_message: &str, empty_message: &str) -> String {
-    let mut stdin = std::io::stdin();
+    let stdin = std::io::stdin();
 
     if stdin.is_terminal() {
         eprintln!("{terminal_message}");
@@ -263,11 +281,13 @@ fn read_stdin_secret(terminal_message: &str, reading_message: &str, empty_messag
 
     eprintln!("{reading_message}");
 
-    let mut buffer = String::new();
-    if let Err(err) = stdin.read_to_string(&mut buffer) {
-        eprintln!("Failed to read stdin: {err}");
-        std::process::exit(1);
-    }
+    let buffer = match read_secret_input(stdin.lock()) {
+        Ok(buffer) => buffer,
+        Err(err) => {
+            eprintln!("Failed to read stdin: {err}");
+            std::process::exit(1);
+        }
+    };
 
     let secret = buffer.trim().to_string();
     if secret.is_empty() {
@@ -503,6 +523,21 @@ fn safe_format_key(key: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn read_secret_input_preserves_input_and_rejects_oversize_without_draining() {
+        use std::io::Read as _;
+
+        assert_eq!(
+            super::read_secret_input(b"normal prompt\n".as_slice()).unwrap(),
+            "normal prompt\n"
+        );
+        let mut input = std::io::repeat(b'x').take(super::MAX_SECRET_INPUT_BYTES + 2);
+        let error = super::read_secret_input(&mut input).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds"));
+        assert_eq!(input.limit(), 1, "must stop after the first excess byte");
+    }
+
     use pretty_assertions::assert_eq;
 
     use super::safe_format_key;

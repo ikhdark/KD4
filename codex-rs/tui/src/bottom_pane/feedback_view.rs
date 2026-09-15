@@ -478,7 +478,6 @@ pub(crate) fn feedback_upload_consent_params(
     app_event_tx: AppEventSender,
     category: FeedbackCategory,
     rollout_path: Option<std::path::PathBuf>,
-    auto_review_rollout_filename: Option<String>,
     include_windows_sandbox_log: bool,
     feedback_diagnostics: &FeedbackDiagnostics,
 ) -> super::SelectionViewParams {
@@ -530,9 +529,6 @@ pub(crate) fn feedback_upload_consent_params(
         && let Some(name) = path.file_name().map(|s| s.to_string_lossy().to_string())
     {
         header_lines.push(Line::from(vec!["  • ".into(), name.into()]).into());
-    }
-    if let Some(filename) = auto_review_rollout_filename {
-        header_lines.push(Line::from(vec!["  • ".into(), filename.into()]).into());
     }
     if !feedback_diagnostics.is_empty() {
         header_lines.push(
@@ -715,7 +711,6 @@ mod tests {
             AppEventSender::new(tx),
             FeedbackCategory::Bug,
             None,
-            None,
             false,
             &diagnostics,
         );
@@ -748,7 +743,6 @@ mod tests {
             tx,
             FeedbackCategory::Bug,
             Some(std::path::PathBuf::from("rollout.jsonl")),
-            Some("auto-review-rollout.jsonl".to_string()),
             /*include_windows_sandbox_log*/ false,
             &FeedbackDiagnostics::default(),
         );
@@ -766,7 +760,6 @@ mod tests {
             tx,
             FeedbackCategory::Bug,
             Some(std::path::PathBuf::from("rollout.jsonl")),
-            Some("auto-review-rollout.jsonl".to_string()),
             /*include_windows_sandbox_log*/ true,
             &FeedbackDiagnostics::default(),
         );

@@ -29,6 +29,115 @@ use tempfile::tempdir;
 use uuid::Uuid;
 
 #[tokio::test]
+async fn legacy_metadata_streams_before_optional_late_session_meta() {
+    for (late_meta, standard_filename) in [(false, true), (true, true), (true, false)] {
+        let dir = tempdir().expect("tempdir");
+        let filename_id = ThreadId::new();
+        let canonical_id = ThreadId::new();
+        let path = dir.path().join(if standard_filename {
+            format!("rollout-2026-01-27T12-34-56-{filename_id}.jsonl")
+        } else {
+            "imported-history.jsonl".to_string()
+        });
+        let mut file = File::create(&path).expect("create rollout");
+        let mut accumulator = RolloutMetadataAccumulator::default();
+        for index in 0..1024 {
+            let item = RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: if index == 0 {
+                    "first retained message".to_string()
+                } else {
+                    "later payload ".repeat(1024)
+                },
+                ..Default::default()
+            }));
+            writeln!(
+                file,
+                "{}",
+                serde_json::to_string(&RolloutLine {
+                    timestamp: "2026-01-27T12:34:56Z".to_string(),
+                    item: item.clone(),
+                })
+                .expect("serialize line")
+            )
+            .expect("write line");
+            accumulator.push(item, &path, "fallback-provider");
+        }
+        // Projection must happen before SessionMeta, including for imported paths.
+        // Retaining the entire prefix until finish would fail this assertion.
+        assert_eq!(
+            accumulator
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.first_user_message.as_deref()),
+            Some("first retained message")
+        );
+        if late_meta {
+            let item = RolloutItem::SessionMeta(SessionMetaLine {
+                meta: SessionMeta {
+                    id: canonical_id,
+                    session_id: canonical_id.into(),
+                    timestamp: "2026-02-01T00:00:00Z".to_string(),
+                    history_mode: ThreadHistoryMode::Paginated,
+                    model_provider: Some("canonical-provider".to_string()),
+                    ..SessionMeta::default()
+                },
+                git: None,
+            });
+            writeln!(
+                file,
+                "{}",
+                serde_json::to_string(&RolloutLine {
+                    timestamp: "2026-02-01T00:00:00Z".to_string(),
+                    item: item.clone(),
+                })
+                .expect("serialize meta")
+            )
+            .expect("write meta");
+            accumulator.push(item, &path, "fallback-provider");
+        }
+        drop(file);
+        let streamed = accumulator
+            .finish(&path, "fallback-provider", 0)
+            .await
+            .expect("streamed extraction");
+        let extracted = extract_metadata_from_rollout(&path, "fallback-provider")
+            .await
+            .expect("normal extraction");
+        assert_eq!(streamed.metadata, extracted.metadata);
+        assert_eq!(
+            extracted.metadata.id,
+            if late_meta { canonical_id } else { filename_id }
+        );
+        assert_eq!(
+            extracted.metadata.first_user_message.as_deref(),
+            Some("first retained message")
+        );
+        assert_eq!(extracted.metadata.title, "first retained message");
+        assert_eq!(
+            extracted.metadata.model_provider,
+            if late_meta {
+                "canonical-provider"
+            } else {
+                "fallback-provider"
+            }
+        );
+        if late_meta {
+            assert_eq!(
+                extracted.metadata.history_mode,
+                ThreadHistoryMode::Paginated
+            );
+            assert_eq!(
+                extracted.metadata.created_at,
+                DateTime::parse_from_rfc3339("2026-02-01T00:00:00Z")
+                    .expect("timestamp")
+                    .with_timezone(&Utc)
+            );
+        }
+        assert_eq!(extracted.parse_errors, 0);
+    }
+}
+
+#[tokio::test]
 async fn extract_metadata_from_rollout_uses_session_meta() {
     let dir = tempdir().expect("tempdir");
     let uuid = Uuid::new_v4();

@@ -44,7 +44,8 @@ async fn wait_for_snapshot(codex_home: &Path) -> Result<PathBuf> {
             anyhow::bail!("timed out waiting for PowerShell snapshot");
         }
 
-        sleep(Duration::from_millis(25)).await;
+        sleep(Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())))
+            .await;
     }
 }
 

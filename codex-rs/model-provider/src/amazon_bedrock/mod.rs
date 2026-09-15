@@ -116,10 +116,6 @@ impl ModelProvider for AmazonBedrockModelProvider {
         }
     }
 
-    fn approval_review_preferred_model(&self) -> &'static str {
-        AMAZON_BEDROCK_GPT_5_4_MODEL_ID
-    }
-
     fn memory_extraction_preferred_model(&self) -> &'static str {
         AMAZON_BEDROCK_GPT_5_4_MODEL_ID
     }
@@ -320,19 +316,6 @@ mod tests {
                 image_generation: false,
                 web_search: false,
             }
-        );
-    }
-
-    #[test]
-    fn approval_review_preferred_model_uses_bedrock_gpt_5_4() {
-        let provider = AmazonBedrockModelProvider::new(
-            ModelProviderInfo::create_amazon_bedrock_provider(/*aws*/ None),
-            /*auth_manager*/ None,
-        );
-
-        assert_eq!(
-            provider.approval_review_preferred_model(),
-            AMAZON_BEDROCK_GPT_5_4_MODEL_ID
         );
     }
 }

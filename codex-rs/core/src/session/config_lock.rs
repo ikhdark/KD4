@@ -117,7 +117,6 @@ fn save_session_resolved_fields(sc: &SessionConfiguration, lock_config: &mut Con
     lock_config.compact_prompt = sc.compact_prompt.clone();
     lock_config.personality = sc.personality;
     lock_config.approval_policy = Some(sc.approval_policy.value());
-    lock_config.approvals_reviewer = Some(sc.approvals_reviewer);
 }
 
 /// Saves values stored on `Config` after higher-level resolution,
@@ -340,7 +339,6 @@ mod tests {
         assert_eq!(lock.compact_prompt, None);
         assert_eq!(lock.personality, None);
         assert_eq!(lock.approval_policy, None);
-        assert_eq!(lock.approvals_reviewer, None);
     }
 
     #[tokio::test]

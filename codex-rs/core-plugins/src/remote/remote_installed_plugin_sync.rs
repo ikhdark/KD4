@@ -202,7 +202,9 @@ async fn sync_remote_installed_plugin_bundles_inner(
     sync_registration: Option<Arc<RemoteInstalledPluginBundleSyncGuard>>,
 ) -> Result<(), RemoteInstalledPluginBundleSyncError> {
     // A completed mutation also invalidates deletion based on this snapshot.
-    let generation = cache_mutation_generation(&codex_home);
+    let snapshot_home = codex_home.clone();
+    let generation =
+        tokio::task::spawn_blocking(move || cache_mutation_generation(&snapshot_home)).await?;
     let auth = ensure_chatgpt_auth(auth)?;
     let global = async {
         let scope = RemotePluginScope::Global;
@@ -345,12 +347,13 @@ async fn sync_remote_installed_plugin_bundles_inner(
                 }
             };
 
-            let mut mutation = mark_remote_plugin_cache_mutation_in_flight_inner(
+            let mut mutation = acquire_remote_plugin_cache_mutation(
                 &codex_home,
                 &marketplace_name,
                 &plugin.name,
                 /*invalidates_snapshot*/ false,
-            );
+            )
+            .await?;
             mutation.sync_registration = sync_registration.clone();
             match crate::remote_bundle::download_and_install_remote_plugin_bundle_with_guard(
                 codex_home.clone(),
@@ -394,17 +397,38 @@ async fn sync_remote_installed_plugin_bundles_inner(
     result.map_err(RemoteInstalledPluginBundleSyncError::CacheRemove)
 }
 
-pub fn mark_remote_plugin_cache_mutation_in_flight(
+pub async fn mark_remote_plugin_cache_mutation_in_flight(
     codex_home: &Path,
     marketplace_name: &str,
     plugin_name: &str,
-) -> RemotePluginCacheMutationGuard {
-    mark_remote_plugin_cache_mutation_in_flight_inner(
+) -> Result<RemotePluginCacheMutationGuard, tokio::task::JoinError> {
+    acquire_remote_plugin_cache_mutation(
         codex_home,
         marketplace_name,
         plugin_name,
         /*invalidates_snapshot*/ true,
     )
+    .await
+}
+
+async fn acquire_remote_plugin_cache_mutation(
+    codex_home: &Path,
+    marketplace_name: &str,
+    plugin_name: &str,
+    invalidates_snapshot: bool,
+) -> Result<RemotePluginCacheMutationGuard, tokio::task::JoinError> {
+    let codex_home = codex_home.to_path_buf();
+    let marketplace_name = marketplace_name.to_string();
+    let plugin_name = plugin_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        mark_remote_plugin_cache_mutation_in_flight_inner(
+            &codex_home,
+            &marketplace_name,
+            &plugin_name,
+            invalidates_snapshot,
+        )
+    })
+    .await
 }
 
 fn mark_remote_plugin_cache_mutation_in_flight_inner(
@@ -446,22 +470,50 @@ impl Drop for RemotePluginCacheMutationGuard {
         let Some(mutations) = REMOTE_PLUGIN_CACHE_MUTATIONS_IN_FLIGHT.get() else {
             return;
         };
-        let mut mutations = match mutations.lock() {
-            Ok(mutations) => mutations,
-            Err(err) => err.into_inner(),
-        };
-        if self.invalidates_snapshot {
-            let generation = mutations
-                .generations
-                .entry(self.key.plugin_cache_root.clone())
-                .or_default();
-            *generation = generation.wrapping_add(1);
+        if let Ok(mut mutations) = mutations.try_lock() {
+            release_remote_plugin_cache_mutation(
+                &mut mutations,
+                &self.key,
+                self.invalidates_snapshot,
+            );
+            return;
         }
-        if let Some(count) = mutations.in_flight.get_mut(&self.key) {
-            *count -= 1;
-            if *count == 0 {
-                mutations.in_flight.remove(&self.key);
-            }
+        // Cleanup holds this lock across filesystem deletion. A cancelled
+        // download must not wait for that I/O on an async executor thread.
+        let key = self.key.clone();
+        let invalidates_snapshot = self.invalidates_snapshot;
+        let registration = self.sync_registration.take();
+        let release = move || {
+            let _registration = registration;
+            let mut mutations = mutations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            release_remote_plugin_cache_mutation(&mut mutations, &key, invalidates_snapshot);
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(release);
+        } else {
+            release();
+        }
+    }
+}
+
+fn release_remote_plugin_cache_mutation(
+    mutations: &mut RemotePluginCacheMutations,
+    key: &RemotePluginCacheMutationKey,
+    invalidates_snapshot: bool,
+) {
+    if invalidates_snapshot {
+        let generation = mutations
+            .generations
+            .entry(key.plugin_cache_root.clone())
+            .or_default();
+        *generation = generation.wrapping_add(1);
+    }
+    if let Some(count) = mutations.in_flight.get_mut(key) {
+        *count -= 1;
+        if *count == 0 {
+            mutations.in_flight.remove(key);
         }
     }
 }
@@ -656,6 +708,68 @@ mod tests {
         check_current_bundle_identity_sync(false, Some("1.2.3"), None, true).await;
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn cache_cleanup_contention_keeps_sync_and_mutation_cancellation_responsive() {
+        let home = tempfile::tempdir().unwrap();
+        let mutation = mark_remote_plugin_cache_mutation_in_flight(
+            home.path(),
+            REMOTE_GLOBAL_MARKETPLACE_NAME,
+            "active",
+        )
+        .await
+        .unwrap();
+        let (locked, ready) = tokio::sync::oneshot::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = REMOTE_PLUGIN_CACHE_MUTATIONS_IN_FLIGHT
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap();
+            locked.send(()).unwrap();
+            resume.recv_timeout(std::time::Duration::from_secs(5))
+        });
+        ready.await.unwrap();
+        let started = std::time::Instant::now();
+        // Cancellation drops a mutation guard while cleanup owns the mutex.
+        drop(mutation);
+        let config = RemotePluginServiceConfig::new(
+            "http://127.0.0.1:1".to_string(),
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        );
+        let sync =
+            sync_remote_installed_plugin_bundles_once(home.path().to_path_buf(), &config, None);
+        let registration = mark_remote_plugin_cache_mutation_in_flight(
+            home.path(),
+            REMOTE_GLOBAL_MARKETPLACE_NAME,
+            "next",
+        );
+        tokio::pin!(sync);
+        tokio::pin!(registration);
+        tokio::select! {
+            _ = &mut sync => panic!("sync must wait for the cleanup snapshot"),
+            _ = &mut registration => panic!("mutation must wait for cleanup exclusion"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        release.send(()).unwrap();
+        assert!(
+            tokio::task::spawn_blocking(move || holder.join().unwrap())
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        assert!(matches!(
+            sync.await,
+            Err(RemoteInstalledPluginBundleSyncError::Catalog(
+                RemotePluginCatalogError::AuthRequired
+            ))
+        ));
+        let registered = registration.await.unwrap();
+        assert_eq!(registered.key.plugin_name, "next");
+        drop(registered);
+    }
+
     #[tokio::test]
     async fn cancelled_waiter_keeps_sync_registered_until_blocking_mutation_finishes() {
         let home = tempfile::tempdir().unwrap();
@@ -666,10 +780,11 @@ mod tests {
             key.clone()
         ));
         let registration = Arc::new(RemoteInstalledPluginBundleSyncGuard(key.clone()));
-        let mut mutation = mark_remote_plugin_cache_mutation_in_flight(
+        let mut mutation = mark_remote_plugin_cache_mutation_in_flight_inner(
             home.path(),
             REMOTE_GLOBAL_MARKETPLACE_NAME,
             "linear",
+            /*invalidates_snapshot*/ true,
         );
         mutation.sync_registration = Some(registration);
         let (started, ready) = tokio::sync::oneshot::channel();
@@ -914,15 +1029,17 @@ mod tests {
             ]);
 
         let snapshot_generation = cache_mutation_generation(codex_home.path());
-        let guard = mark_remote_plugin_cache_mutation_in_flight(
+        let guard = mark_remote_plugin_cache_mutation_in_flight_inner(
             codex_home.path(),
             REMOTE_GLOBAL_MARKETPLACE_NAME,
             "linear",
+            /*invalidates_snapshot*/ true,
         );
-        let second_guard = mark_remote_plugin_cache_mutation_in_flight(
+        let second_guard = mark_remote_plugin_cache_mutation_in_flight_inner(
             codex_home.path(),
             REMOTE_GLOBAL_MARKETPLACE_NAME,
             "linear",
+            /*invalidates_snapshot*/ true,
         );
         let removed = remove_stale_remote_plugin_caches(
             codex_home.path(),

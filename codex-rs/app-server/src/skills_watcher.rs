@@ -96,8 +96,8 @@ impl SkillsWatcher {
         }
     }
 
-    pub(crate) fn register_runtime_extra_roots(
-        &self,
+    pub(crate) async fn register_runtime_extra_roots(
+        self: &Arc<Self>,
         extra_roots: &[AbsolutePathBuf],
     ) -> Result<(), String> {
         let roots = extra_roots
@@ -107,6 +107,13 @@ impl SkillsWatcher {
                 recursive: true,
             })
             .collect::<Vec<_>>();
+        let watcher = Arc::clone(self);
+        tokio::task::spawn_blocking(move || watcher.replace_runtime_extra_roots(roots))
+            .await
+            .map_err(|err| format!("skills roots registration worker failed: {err}"))?
+    }
+
+    fn replace_runtime_extra_roots(&self, roots: Vec<WatchPath>) -> Result<(), String> {
         let registration = if roots.is_empty() {
             WatchRegistration::default()
         } else {
@@ -122,12 +129,14 @@ impl SkillsWatcher {
             .runtime_extra_roots_registration
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = registration;
+        let previous = std::mem::replace(&mut *guard, registration);
+        drop(guard);
+        drop(previous);
         Ok(())
     }
 
     pub(crate) async fn register_thread_config(
-        &self,
+        self: &Arc<Self>,
         config: &Config,
         thread_manager: &ThreadManager,
         environments: &[TurnEnvironmentSelection],
@@ -176,13 +185,18 @@ impl SkillsWatcher {
         if roots.is_empty() {
             return Ok(WatchRegistration::default());
         }
-        let runtime = self
-            .runtime()?
-            .ok_or_else(|| "skills watcher is shut down".to_string())?;
-        runtime
-            .subscriber
-            .register_paths(roots)
-            .map_err(|err| format!("failed to register skills roots: {err}"))
+        let watcher = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let runtime = watcher
+                .runtime()?
+                .ok_or_else(|| "skills watcher is shut down".to_string())?;
+            runtime
+                .subscriber
+                .register_paths(roots)
+                .map_err(|err| format!("failed to register skills roots: {err}"))
+        })
+        .await
+        .map_err(|err| format!("skills registration worker failed: {err}"))?
     }
 
     #[cfg(test)]
@@ -327,6 +341,7 @@ mod tests {
         let watcher = SkillsWatcher::new(Arc::clone(&skills), Arc::clone(&outgoing));
         watcher
             .register_runtime_extra_roots(&[root])
+            .await
             .expect("watch skills");
 
         // Observe real cache invalidation while the outgoing queue remains full.

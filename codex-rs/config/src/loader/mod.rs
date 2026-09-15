@@ -36,7 +36,6 @@ use crate::thread_config::ThreadConfigContext;
 use crate::thread_config::ThreadConfigLoader;
 use codex_file_system::ExecutorFileSystem;
 use codex_git_utils::resolve_root_git_project_for_trust;
-use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::protocol::AskForApproval;
@@ -966,7 +965,6 @@ fn requirements_layers_from_legacy_scheme(
 fn legacy_requirements_to_toml_value(legacy: LegacyManagedConfigToml) -> io::Result<TomlValue> {
     let LegacyManagedConfigToml {
         approval_policy,
-        approvals_reviewer,
         sandbox_mode,
     } = legacy;
     let mut table = toml::map::Map::new();
@@ -974,16 +972,6 @@ fn legacy_requirements_to_toml_value(legacy: LegacyManagedConfigToml) -> io::Res
         table.insert(
             "allowed_approval_policies".to_string(),
             toml_value_from_serializable(vec![approval_policy])?,
-        );
-    }
-    if let Some(approvals_reviewer) = approvals_reviewer {
-        let mut allowed_reviewers = vec![approvals_reviewer];
-        if approvals_reviewer == ApprovalsReviewer::AutoReview {
-            allowed_reviewers.push(ApprovalsReviewer::User);
-        }
-        table.insert(
-            "allowed_approvals_reviewers".to_string(),
-            toml_value_from_serializable(allowed_reviewers)?,
         );
     }
     if let Some(sandbox_mode) = sandbox_mode {
@@ -1602,12 +1590,10 @@ async fn merge_root_checkout_project_hooks(
 ///
 /// If present, re-interpret `managed_config.toml` as a `requirements.toml`
 /// where each specified field is treated as a constraint. Most fields allow
-/// only the specified value. `approvals_reviewer = "auto_review"` also allows
-/// `user` so people can opt out of the auto-reviewer.
+/// only the specified value.
 #[derive(Deserialize, Debug, Clone, Default, PartialEq)]
 struct LegacyManagedConfigToml {
     approval_policy: Option<AskForApproval>,
-    approvals_reviewer: Option<ApprovalsReviewer>,
     sandbox_mode: Option<SandboxMode>,
 }
 
@@ -1660,7 +1646,6 @@ foo = "xyzzy"
     fn legacy_managed_config_backfill_includes_read_only_sandbox_mode() -> io::Result<()> {
         let legacy = LegacyManagedConfigToml {
             approval_policy: None,
-            approvals_reviewer: None,
             sandbox_mode: Some(SandboxMode::WorkspaceWrite),
         };
 
@@ -1672,45 +1657,6 @@ foo = "xyzzy"
                     TomlValue::String("read-only".to_string()),
                     TomlValue::String("workspace-write".to_string()),
                 ]),
-            )]))
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn legacy_managed_config_backfill_allows_user_when_guardian_is_required() -> io::Result<()> {
-        let legacy = LegacyManagedConfigToml {
-            approval_policy: None,
-            approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
-            sandbox_mode: None,
-        };
-
-        assert_eq!(
-            legacy_requirements_to_toml_value(legacy)?,
-            TomlValue::Table(toml::map::Map::from_iter([(
-                "allowed_approvals_reviewers".to_string(),
-                TomlValue::Array(vec![
-                    TomlValue::String("auto_review".to_string()),
-                    TomlValue::String("user".to_string()),
-                ]),
-            )]))
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn legacy_managed_config_backfill_preserves_user_only_approvals_reviewer() -> io::Result<()> {
-        let legacy = LegacyManagedConfigToml {
-            approval_policy: None,
-            approvals_reviewer: Some(ApprovalsReviewer::User),
-            sandbox_mode: None,
-        };
-
-        assert_eq!(
-            legacy_requirements_to_toml_value(legacy)?,
-            TomlValue::Table(toml::map::Map::from_iter([(
-                "allowed_approvals_reviewers".to_string(),
-                TomlValue::Array(vec![TomlValue::String("user".to_string())]),
             )]))
         );
         Ok(())

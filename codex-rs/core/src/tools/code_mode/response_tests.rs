@@ -1006,7 +1006,7 @@ async fn packet_composition_budgets_required_diagnostics_and_preserves_canonical
     );
     assert!(
         service
-            .finish_packet(cell.as_str())
+            .finish_packet(cell.as_str(), false)
             .first_required_terminal
             .is_none()
     );

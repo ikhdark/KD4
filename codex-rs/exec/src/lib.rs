@@ -217,7 +217,6 @@ struct ExecRunArgs {
     cloud_config_bundle: CloudConfigBundleLoader,
     command: Option<ExecCommand>,
     config: Config,
-    resume_approvals_reviewer_override: Option<codex_app_server_protocol::ApprovalsReviewer>,
     dangerously_bypass_approvals_and_sandbox: bool,
     exec_span: tracing::Span,
     images: Vec<PathBuf>,
@@ -430,12 +429,10 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     let overrides = ConfigOverrides {
         model,
         review_model: None,
-        // Default to never ask for approvals in headless mode unless the fully
-        // resolved reviewer is AutoReview.
+        // Default to never ask for approvals in headless mode.
         approval_policy: dangerously_bypass_approvals_and_sandbox.then_some(AskForApproval::Never),
         headless_approval_policy: (!dangerously_bypass_approvals_and_sandbox)
             .then_some(AskForApproval::Never),
-        approvals_reviewer: None,
         sandbox_mode,
         permission_profile: None,
         default_permissions: None,
@@ -466,10 +463,6 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
             .build()
     };
     let config = build_config(overrides).await?;
-    let resume_approvals_reviewer_override = cli_kv_overrides
-        .iter()
-        .any(|(key, _)| key == "approvals_reviewer")
-        .then(|| config.approvals_reviewer.into());
 
     #[allow(clippy::print_stderr)]
     match check_execpolicy_for_warnings(&config.config_layer_stack).await {
@@ -540,7 +533,6 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         cloud_config_bundle: run_cloud_config_bundle,
         command,
         config,
-        resume_approvals_reviewer_override,
         dangerously_bypass_approvals_and_sandbox,
         exec_span: exec_span.clone(),
         images,
@@ -606,7 +598,6 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         cloud_config_bundle,
         command,
         config,
-        resume_approvals_reviewer_override,
         dangerously_bypass_approvals_and_sandbox,
         exec_span,
         images,
@@ -767,11 +758,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             &client,
             ClientRequest::ThreadResume {
                 request_id: request_ids.next(),
-                params: thread_resume_params_from_config(
-                    &config,
-                    thread_id,
-                    resume_approvals_reviewer_override,
-                ),
+                params: thread_resume_params_from_config(&config, thread_id),
             },
             "thread/resume",
         )
@@ -846,7 +833,6 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                         cwd: Some(default_cwd),
                         runtime_workspace_roots: None,
                         approval_policy: Some(default_approval_policy.into()),
-                        approvals_reviewer: None,
                         sandbox_policy: None,
                         permission_profile: None,
                         permissions: None,
@@ -1040,16 +1026,11 @@ fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
     )
 }
 
-fn thread_resume_params_from_config(
-    config: &Config,
-    thread_id: String,
-    approvals_reviewer_override: Option<codex_app_server_protocol::ApprovalsReviewer>,
-) -> ThreadResumeParams {
+fn thread_resume_params_from_config(config: &Config, thread_id: String) -> ThreadResumeParams {
     build_thread_resume_params(
         config,
         thread_id,
         thread_lifecycle_overrides_from_config(config, /*exclude_turns*/ true),
-        approvals_reviewer_override,
     )
 }
 
@@ -1109,7 +1090,6 @@ fn session_configured_from_thread_start_response(
         response.model_provider.clone(),
         response.service_tier.clone(),
         response.approval_policy.to_core(),
-        response.approvals_reviewer.to_core(),
         config.permissions.effective_permission_profile(),
         response.active_permission_profile.clone().map(Into::into),
         response.cwd.clone(),
@@ -1132,7 +1112,6 @@ fn session_configured_from_thread_resume_response(
         response.model_provider.clone(),
         response.service_tier.clone(),
         response.approval_policy.to_core(),
-        response.approvals_reviewer.to_core(),
         config.permissions.effective_permission_profile(),
         response.active_permission_profile.clone().map(Into::into),
         response.cwd.clone(),
@@ -1155,7 +1134,6 @@ fn session_configured_from_thread_response(
     model_provider_id: String,
     service_tier: Option<String>,
     approval_policy: AskForApproval,
-    approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer,
     permission_profile: PermissionProfile,
     active_permission_profile: Option<codex_protocol::models::ActivePermissionProfile>,
     cwd: AbsolutePathBuf,
@@ -1181,7 +1159,6 @@ fn session_configured_from_thread_response(
         model_provider_id,
         service_tier,
         approval_policy,
-        approvals_reviewer,
         permission_profile,
         active_permission_profile,
         cwd,
@@ -1880,6 +1857,23 @@ fn decode_utf16(
     String::from_utf16(&units).map_err(|_| PromptDecodeError::InvalidUtf16 { encoding })
 }
 
+// Allow large piped documents, including UTF-16 input, without unbounded allocation.
+const MAX_PROMPT_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+
+fn read_prompt_input(reader: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_PROMPT_INPUT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_PROMPT_INPUT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("prompt input exceeds the {MAX_PROMPT_INPUT_BYTES}-byte limit"),
+        ));
+    }
+    Ok(bytes)
+}
+
 fn read_prompt_from_stdin(behavior: StdinPromptBehavior) -> Option<String> {
     let stdin_is_terminal = std::io::stdin().is_terminal();
 
@@ -1900,11 +1894,13 @@ fn read_prompt_from_stdin(behavior: StdinPromptBehavior) -> Option<String> {
         }
     }
 
-    let mut bytes = Vec::new();
-    if let Err(e) = std::io::stdin().read_to_end(&mut bytes) {
-        eprintln!("Failed to read prompt from stdin: {e}");
-        std::process::exit(1);
-    }
+    let bytes = match read_prompt_input(std::io::stdin().lock()) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("Failed to read prompt from stdin: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let buffer = match decode_prompt_bytes(&bytes) {
         Ok(s) => s,

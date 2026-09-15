@@ -413,13 +413,9 @@ async fn run_codex_tool_session_inner(
                         break;
                     }
                     EventMsg::Warning(_)
-                    | EventMsg::GuardianWarning(_)
                     | EventMsg::ModelVerification(_)
                     | EventMsg::SafetyBuffering(_)
                     | EventMsg::TurnModerationMetadata(_) => {
-                        continue;
-                    }
-                    EventMsg::GuardianAssessment(_) => {
                         continue;
                     }
                     EventMsg::ElicitationRequest(event) => {

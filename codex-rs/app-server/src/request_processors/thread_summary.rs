@@ -187,7 +187,6 @@ pub(crate) fn thread_settings_from_config_snapshot(
     ThreadSettings {
         cwd: config_snapshot.cwd().clone(),
         approval_policy: config_snapshot.approval_policy.into(),
-        approvals_reviewer: config_snapshot.approvals_reviewer.into(),
         sandbox_policy: thread_response_sandbox_policy(
             &config_snapshot.permission_profile,
             config_snapshot.cwd().as_path(),
@@ -214,7 +213,6 @@ pub(crate) fn thread_settings_from_core_snapshot(
         model_provider_id,
         service_tier,
         approval_policy,
-        approvals_reviewer,
         permission_profile,
         active_permission_profile,
         cwd,
@@ -230,7 +228,6 @@ pub(crate) fn thread_settings_from_core_snapshot(
         permission_profile: Some(permission_profile),
         cwd,
         approval_policy: approval_policy.into(),
-        approvals_reviewer: approvals_reviewer.into(),
         active_permission_profile: thread_response_active_permission_profile(
             active_permission_profile.flatten(),
         ),

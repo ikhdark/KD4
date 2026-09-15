@@ -93,9 +93,11 @@ Do not run additional validation solely for extra confidence.
 
 Prefer the least costly check that proves the affected behavior. Start with focused validation; expand only when required or when observed failures show that broader coverage is needed.
 
-Implementation self-repair is required. Fix caused failures without weakening required invariants or assertions; rerun focused proof. Report unrelated failures without weakening tests. Report pending activation when source changes have not been activated.
+Implementation self-repair is required. Fix caused failures without weakening required invariants or assertions. Report unrelated failures without weakening tests. Report pending activation when source changes have not been activated.
 
 Distinguish failures caused by the change from pre-existing failures, environment or tooling failures, dependency problems, flakes, and concurrent edits. Use the smallest available evidence to establish the cause; do not discard shared work to compare with a base revision or label a failure flaky merely because a retry passed.
+
+When validation or tests report errors, warnings, or failures, let the current run finish and diagnose all reported issues before making any repair edits. Then apply all related fixes in one consolidated batch and rerun each affected test or validation check once. Do not rerun checks that already passed and are unaffected by the repairs.
 
 # Communication and completion
 

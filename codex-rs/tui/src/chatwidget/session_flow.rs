@@ -22,9 +22,7 @@ impl ChatWidget {
         self.thread_id = Some(session.thread_id);
         self.bottom_pane
             .set_queue_submissions(/*queue_submissions*/ false);
-        if previous_thread_id != self.thread_id {
-            self.review.recent_auto_review_denials = RecentAutoReviewDenials::default();
-        }
+        if previous_thread_id != self.thread_id {}
         self.refresh_plan_mode_nudge();
         self.turn_lifecycle.reset_thread();
         self.clear_safety_buffering();
@@ -73,7 +71,6 @@ impl ChatWidget {
                 );
             }
         }
-        self.config.approvals_reviewer = session.approvals_reviewer;
         self.config.personality = session.personality;
         self.status_line_project_root_name_cache = None;
         let forked_from_id = session.forked_from_id;

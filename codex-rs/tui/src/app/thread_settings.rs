@@ -4,7 +4,6 @@ use super::App;
 use crate::app_command::AppCommand;
 use crate::app_server_session::AppServerSession;
 use crate::session_state::ThreadSessionState;
-use codex_app_server_protocol::ApprovalsReviewer as AppServerApprovalsReviewer;
 use codex_app_server_protocol::ThreadSettings;
 use codex_app_server_protocol::ThreadSettingsUpdateParams;
 use codex_protocol::ThreadId;
@@ -100,7 +99,6 @@ impl App {
         let AppCommand::OverrideTurnContext {
             cwd,
             approval_policy,
-            approvals_reviewer,
             permission_profile,
             active_permission_profile,
             windows_sandbox_level: _,
@@ -141,7 +139,6 @@ impl App {
             thread_id: thread_id.to_string(),
             cwd: cwd.clone(),
             approval_policy: *approval_policy,
-            approvals_reviewer: approvals_reviewer.map(AppServerApprovalsReviewer::from),
             permission_profile: if active_permission_profile.is_none() {
                 permission_profile.clone()
             } else {
@@ -204,7 +201,6 @@ fn apply_thread_settings_to_session(session: &mut ThreadSessionState, settings: 
     session.model_provider_id = settings.model_provider.clone();
     session.service_tier = settings.service_tier.clone();
     session.approval_policy = settings.approval_policy;
-    session.approvals_reviewer = settings.approvals_reviewer.to_core();
     session.permission_profile = settings.permission_profile.clone().unwrap_or_else(|| {
         PermissionProfile::from_legacy_sandbox_policy_for_cwd(
             &settings.sandbox_policy.to_core(),
@@ -226,7 +222,6 @@ fn apply_thread_settings_to_session(session: &mut ThreadSessionState, settings: 
 fn thread_settings_update_has_changes(params: &ThreadSettingsUpdateParams) -> bool {
     params.cwd.is_some()
         || params.approval_policy.is_some()
-        || params.approvals_reviewer.is_some()
         || params.sandbox_policy.is_some()
         || params.permission_profile.is_some()
         || params.permissions.is_some()

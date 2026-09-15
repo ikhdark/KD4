@@ -4,6 +4,7 @@ import os
 import json
 import struct
 import subprocess
+from contextlib import chdir, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 import sys
@@ -23,7 +24,336 @@ from codex_package.targets import TARGET_SPECS
 
 
 class SourceBinariesForTargetTest(unittest.TestCase):
+    @contextmanager
+    def package_fixture(self):
+        spec = TARGET_SPECS["x86_64-pc-windows-msvc"]
+        variant = PACKAGE_VARIANTS["codex"]
+        kwargs = dict(
+            cargo="cargo",
+            profile="release",
+            entrypoint_bin=None,
+            code_mode_host_bin=None,
+            codex_command_runner_bin=None,
+            codex_windows_sandbox_setup_bin=None,
+            reuse_existing=True,
+        )
+
+        def compile(cmd, *, cwd, check, env):
+            write_bins_for_cmd(cmd, env=env, spec=spec, profile="release")
+
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            mock.patch.object(cargo_module, "CODEX_RS_ROOT", Path(temp)),
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(
+                cargo_module,
+                "source_tree_fingerprint",
+                return_value=fixed_source_fingerprint(),
+            ) as source,
+            mock.patch.object(
+                cargo_module,
+                "build_recipe_fingerprint",
+                wraps=cargo_module.build_recipe_fingerprint,
+            ) as recipe,
+            mock.patch.object(
+                cargo_module.subprocess, "run", side_effect=compile
+            ) as run,
+        ):
+            yield spec, variant, kwargs, run, source, recipe
+
+    def test_compile_environment_changes_rebuild_through_package_entrypoint(self):
+        for name in (
+            "CODEX_BUILD_COMMIT",
+            "CODEX_BUILD_DIRTY",
+            "CODEX_BUILD_PROFILE",
+            "CODEX_BUILD_TIMESTAMP",
+            "CFLAGS",
+            "CXXFLAGS",
+            "CARGO_INCREMENTAL",
+            "CFLAGS_x86_64_pc_windows_msvc",
+            "BUILD_SCRIPT_CUSTOM_INPUT",
+        ):
+            with self.subTest(name=name), self.package_fixture() as fixture:
+                spec, variant, kwargs, run, _, _ = fixture
+                os.environ[name] = "first"
+                outputs = build_source_binaries(spec, variant, **kwargs)
+                self.assertTrue(outputs.entrypoint_bin.is_file())
+                build_source_binaries(spec, variant, **kwargs)
+                self.assertEqual(run.call_count, 1)
+                os.environ[name] = "second"
+                build_source_binaries(spec, variant, **kwargs)
+                self.assertEqual(run.call_count, 2)
+                env_name = name.upper() if os.name == "nt" else name
+                self.assertEqual(run.call_args.kwargs["env"][env_name], "second")
+                cmd = run.call_args.args[0]
+                self.assertEqual(
+                    [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--bin"],
+                    [
+                        "codex",
+                        "codex-code-mode-host",
+                        "codex-command-runner",
+                        "codex-windows-sandbox-setup",
+                    ],
+                )
+
+    def test_public_reuse_observes_inputs_once_and_build_observes_before_and_after(
+        self,
+    ):
+        with self.package_fixture() as fixture:
+            spec, variant, kwargs, run, source, recipe = fixture
+            compile = run.side_effect
+
+            def compile_after_observation(*args, **kw):
+                self.assertEqual(source.call_count, 1)
+                self.assertEqual(recipe.call_count, 1)
+                compile(*args, **kw)
+
+            run.side_effect = compile_after_observation
+            outputs = build_source_binaries(spec, variant, **kwargs)
+            self.assertTrue(outputs.entrypoint_bin.is_file())
+            self.assertEqual(source.call_count, 2)
+            self.assertEqual(recipe.call_count, 2)
+            source.reset_mock()
+            recipe.reset_mock()
+            self.assertEqual(build_source_binaries(spec, variant, **kwargs), outputs)
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(source.call_count, 1)
+            self.assertEqual(recipe.call_count, 1)
+            # A prior stamp with no remaining outputs must not trigger extra
+            # discovery for reuse before the required build observations.
+            for path in vars(outputs).values():
+                path.unlink()
+            source.reset_mock()
+            recipe.reset_mock()
+            self.assertEqual(build_source_binaries(spec, variant, **kwargs), outputs)
+            self.assertTrue(outputs.entrypoint_bin.is_file())
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(source.call_count, 2)
+            self.assertEqual(recipe.call_count, 2)
+
+    def test_helper_build_cannot_certify_a_changed_reused_entrypoint(self):
+        with self.package_fixture() as fixture:
+            spec, variant, kwargs, run, _, _ = fixture
+            outputs = build_source_binaries(spec, variant, **kwargs)
+            outputs.codex_command_runner_bin.unlink()
+            compile = run.side_effect
+
+            def mutate_entrypoint(*args, **kw):
+                compile(*args, **kw)
+                path = outputs.entrypoint_bin
+                stat = path.stat()
+                contents = bytearray(path.read_bytes())
+                contents[-1] ^= 1
+                path.write_bytes(contents)
+                os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+            run.side_effect = mutate_entrypoint
+            with self.assertRaisesRegex(RuntimeError, "reused output changed"):
+                build_source_binaries(spec, variant, **kwargs)
+            self.assertFalse(
+                source_build_stamp_path(
+                    cargo_package_target_dir(spec, "release")
+                ).exists()
+            )
+            cmd = run.call_args.args[0]
+            self.assertEqual(
+                [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--bin"],
+                ["codex-command-runner"],
+            )
+            run.side_effect = compile
+            build_source_binaries(spec, variant, **kwargs)
+            cmd = run.call_args.args[0]
+            self.assertIn("codex", cmd)
+            self.assertEqual(run.call_count, 3)
+
+    def test_explicit_and_default_output_collisions_fail_before_cargo(self):
+        for hardlink in (False, True):
+            with self.subTest(hardlink=hardlink), self.package_fixture() as fixture:
+                spec, variant, kwargs, run, _, _ = fixture
+                target = cargo_package_target_dir(spec, "release")
+                host = touch_file(
+                    target / spec.target / "release" / "codex-code-mode-host.exe"
+                )
+                entry = host
+                if hardlink:
+                    entry = host.parent / "explicit.exe"
+                    os.link(host, entry)
+                kwargs["entrypoint_bin"] = entry
+                before = entry.read_bytes()
+                with self.assertRaisesRegex(RuntimeError, "distinct executables"):
+                    build_source_binaries(spec, variant, **kwargs)
+                run.assert_not_called()
+                self.assertEqual(entry.read_bytes(), before)
+                self.assertFalse(source_build_stamp_path(target).exists())
+
+    def test_package_preserves_explicit_empty_wrapper_with_sccache_available(self):
+        with self.package_fixture() as fixture:
+            spec, variant, kwargs, run, _, _ = fixture
+            os.environ["RUSTC_WRAPPER"] = ""
+            with mock.patch.object(
+                cargo_module.shutil, "which", return_value="sccache"
+            ):
+                outputs = build_source_binaries(spec, variant, **kwargs)
+            self.assertTrue(outputs.entrypoint_bin.is_file())
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.kwargs["env"]["RUSTC_WRAPPER"], "")
+            self.assertNotIn("SCCACHE_BASEDIR", run.call_args.kwargs["env"])
+
+    def test_unavailable_recipe_evidence_runs_cargo_without_reuse_stamp(self):
+        with self.package_fixture() as fixture:
+            spec, variant, kwargs, run, _, _ = fixture
+            build_source_binaries(spec, variant, **kwargs)
+            with mock.patch.object(
+                cargo_module, "command_identity", return_value={"status": "unavailable"}
+            ):
+                for _ in range(2):
+                    outputs = build_source_binaries(spec, variant, **kwargs)
+                    self.assertTrue(outputs.entrypoint_bin.is_file())
+                    self.assertFalse(
+                        source_build_stamp_path(
+                            cargo_package_target_dir(spec, "release")
+                        ).exists()
+                    )
+            self.assertEqual(run.call_count, 3)
+
+    def test_recipe_change_during_build_fails_current_package(self):
+        with self.package_fixture() as fixture:
+            spec, variant, kwargs, run, _, _ = fixture
+            config = cargo_module.CODEX_RS_ROOT / ".cargo" / "config.toml"
+            config.parent.mkdir()
+            config.write_text("[build]\njobs=1\n")
+            compile = run.side_effect
+
+            def change_config(*args, **kw):
+                compile(*args, **kw)
+                config.write_text("[build]\njobs=2\n")
+
+            run.side_effect = change_config
+            with self.assertRaisesRegex(RuntimeError, "inputs changed during build"):
+                build_source_binaries(spec, variant, **kwargs)
+            self.assertEqual(run.call_count, 1)
+            self.assertFalse(
+                source_build_stamp_path(
+                    cargo_package_target_dir(spec, "release")
+                ).exists()
+            )
+
+    def test_edit_during_build_cannot_stamp_old_outputs_as_current(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            source_root = root / "codex-rs"
+            source_root.mkdir(parents=True)
+            source = source_root / "main.rs"
+            source.write_text("old source", encoding="utf-8")
+            (source_root / ".gitignore").write_text("target/\n", encoding="utf-8")
+            for args in (
+                ["init", "-q"],
+                ["add", "."],
+                [
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-qm",
+                    "fixture",
+                ],
+            ):
+                subprocess.run(
+                    ["git", *args], cwd=root, check=True, capture_output=True
+                )
+            spec = TARGET_SPECS["x86_64-pc-windows-msvc"]
+            variant = PACKAGE_VARIANTS["codex"]
+            consumed = []
+
+            def compile_source(*args, target_dir, **kwargs):
+                consumed.append(source.read_text(encoding="utf-8"))
+                output_dir = target_dir / spec.target / "release"
+                for name in (
+                    "codex",
+                    "codex-code-mode-host",
+                    "codex-command-runner",
+                    "codex-windows-sandbox-setup",
+                ):
+                    path = output_dir / f"{name}.exe"
+                    touch_file(path)
+                    path.write_bytes(path.read_bytes() + consumed[-1].encode())
+                source.write_text("new source", encoding="utf-8")
+
+            with (
+                mock.patch.object(cargo_module, "REPO_ROOT", root),
+                mock.patch.object(cargo_module, "CODEX_RS_ROOT", source_root),
+                mock.patch.dict(
+                    os.environ, {"PATH": os.environ.get("PATH", "")}, clear=True
+                ),
+                mock.patch.object(
+                    cargo_module, "run_cargo_build", side_effect=compile_source
+                ) as build,
+            ):
+                kwargs = {
+                    "cargo": "cargo",
+                    "profile": "release",
+                    "entrypoint_bin": None,
+                    "code_mode_host_bin": None,
+                    "codex_command_runner_bin": None,
+                    "codex_windows_sandbox_setup_bin": None,
+                    "reuse_existing": True,
+                }
+                with self.assertRaisesRegex(
+                    RuntimeError, "inputs changed during build"
+                ):
+                    build_source_binaries(spec, variant, **kwargs)
+                self.assertIsNone(
+                    cargo_module.read_source_build_stamp(
+                        cargo_package_target_dir(spec, "release")
+                    )
+                )
+                outputs = build_source_binaries(spec, variant, **kwargs)
+                build_source_binaries(spec, variant, **kwargs)
+                self.assertEqual(build.call_count, 2)
+                self.assertEqual(consumed, ["old source", "new source"])
+                self.assertTrue(
+                    outputs.entrypoint_bin.read_bytes().endswith(b"new source")
+                )
+
+    def test_external_cargo_config_changes_invalidate_recipe(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cwd = root / "parent" / "repo" / "codex-rs"
+            cwd.mkdir(parents=True)
+            spec = TARGET_SPECS["x86_64-pc-windows-msvc"]
+            for home_env in ({"CARGO_HOME": str(root / "cargo-home")}, {}):
+                with (
+                    self.subTest(env=home_env),
+                    mock.patch.object(cargo_module, "CODEX_RS_ROOT", cwd),
+                    mock.patch.object(Path, "home", return_value=root / "user"),
+                ):
+                    home = Path(home_env.get("CARGO_HOME", root / "user" / ".cargo"))
+                    for config in (
+                        home / "config.toml",
+                        root / "parent" / ".cargo" / "config",
+                    ):
+                        config.parent.mkdir(parents=True, exist_ok=True)
+                        config.write_text(
+                            '[build]\nrustflags=["--cfg=first"]\n', encoding="utf-8"
+                        )
+                        first = cargo_module.build_recipe_fingerprint(
+                            spec=spec, profile="release", build_env=home_env
+                        )
+                        config.write_text(
+                            '[build]\nrustflags=["--cfg=second"]\n', encoding="utf-8"
+                        )
+                        second = cargo_module.build_recipe_fingerprint(
+                            spec=spec, profile="release", build_env=home_env
+                        )
+                        self.assertNotEqual(first, second)
+
     def setUp(self) -> None:
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        home_patch = mock.patch.object(Path, "home", return_value=Path(home.name))
+        home_patch.start()
+        self.addCleanup(home_patch.stop)
         command_identity = mock.patch.object(
             cargo_module,
             "command_identity",
@@ -782,7 +1112,14 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                     profile="release",
                 )
 
-            with mock.patch.object(cargo_module, "CODEX_RS_ROOT", codex_rs):
+            with (
+                mock.patch.object(cargo_module, "CODEX_RS_ROOT", codex_rs),
+                mock.patch.object(
+                    cargo_module,
+                    "source_tree_fingerprint",
+                    return_value={"status": "ok", "digest": "unchanged source"},
+                ),
+            ):
                 with mock.patch.dict(os.environ, {}, clear=True):
                     with mock.patch("subprocess.run", side_effect=fake_run):
                         build_source_binaries(
@@ -1045,6 +1382,65 @@ class SourceBinariesForTargetTest(unittest.TestCase):
 
 
 class SourceEvidenceTest(unittest.TestCase):
+    def test_tool_identity_resolves_supplied_path_relative_to_build_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            parent_tool = touch_file(root / "parent-tools" / "fixture-tool.exe")
+            build_root = root / "build"
+            expected = touch_file(build_root / "tools" / "fixture-tool.exe")
+            expected.chmod(0o755)
+            parent_tool.chmod(0o755)
+            with (
+                chdir(parent_tool.parent),
+                mock.patch.object(cargo_module, "CODEX_RS_ROOT", build_root),
+                mock.patch.dict(os.environ, {"PATH": str(parent_tool.parent)}),
+                mock.patch.object(
+                    cargo_module.subprocess,
+                    "run",
+                    return_value=mock.Mock(stdout="child tool"),
+                ) as run,
+            ):
+                for command in ("fixture-tool.exe", "./tools/fixture-tool.exe"):
+                    with self.subTest(command=command):
+                        env = {"PATH": "tools"}
+                        identity = cargo_module.command_identity(
+                            command, "--version", env=env
+                        )
+                        self.assertEqual(identity["path"], str(expected))
+                        self.assertEqual(identity["version"], "child tool")
+                        self.assertEqual(run.call_args.args[0][0], str(expected))
+                        self.assertEqual(run.call_args.kwargs["env"], env)
+                        self.assertEqual(run.call_args.kwargs["cwd"], build_root)
+
+    def test_tool_identity_timeout_is_unavailable(self):
+        with mock.patch.object(cargo_module, "DISCOVERY_TIMEOUT_SECONDS", 0.1):
+            identity = cargo_module.command_identity(
+                sys.executable, "-c", "import time; time.sleep(30)"
+            )
+        self.assertEqual(identity["status"], "unavailable")
+        self.assertIn("timed out", identity["error"])
+
+    def test_git_timeout_kills_and_reaps_probe_and_disables_source_evidence(self):
+        process = mock.Mock()
+        process.communicate.side_effect = [
+            subprocess.TimeoutExpired("git", cargo_module.DISCOVERY_TIMEOUT_SECONDS),
+            (b"", b""),
+        ]
+        with (
+            mock.patch.object(cargo_module.shutil, "which", return_value="git"),
+            mock.patch.object(cargo_module.subprocess, "Popen", return_value=process),
+        ):
+            self.assertEqual(
+                cargo_module.source_tree_fingerprint(),
+                {"status": "unavailable", "reason": "git-unavailable"},
+            )
+        process.kill.assert_called_once_with()
+        self.assertEqual(process.communicate.call_count, 2)
+        self.assertEqual(
+            process.communicate.call_args_list[0].kwargs,
+            {"timeout": cargo_module.DISCOVERY_TIMEOUT_SECONDS},
+        )
+
     def test_tool_identity_uses_build_directory(self) -> None:
         with mock.patch.object(
             cargo_module.subprocess, "run", return_value=mock.Mock(stdout="cargo test")

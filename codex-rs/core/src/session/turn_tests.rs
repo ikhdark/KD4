@@ -1633,6 +1633,16 @@ async fn workspace_evidence_flushes_distinct_repositories_concurrently() {
         }
     }
 
+    tokio::select! {
+        result = tokio::time::timeout(Duration::from_secs(10), async {
+            while session.services.git_workspace.workspace_evidence_capture_count()
+                - captures_before < 2
+            {
+                tokio::task::yield_now().await;
+            }
+        }) => result.expect("both repository captures start while the first is paused"),
+        _ = &mut flush => panic!("flush completed before the paused capture was released"),
+    }
     assert_eq!(
         session
             .services
@@ -5030,11 +5040,7 @@ async fn pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot_impl() ->
         .expect("test MCP server configuration should be accepted");
     let refresh_config = config.clone();
     session
-        .refresh_mcp_servers_now(
-            turn_context.as_ref(),
-            &refresh_config,
-            Some(session.mcp_elicitation_reviewer()),
-        )
+        .refresh_mcp_servers_now(turn_context.as_ref(), &refresh_config)
         .await;
     assert!(
         session

@@ -1,4 +1,3 @@
-use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::models::PermissionProfile;
@@ -150,7 +149,6 @@ impl<T> std::ops::DerefMut for ConstrainedWithSource<T> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfigRequirements {
     pub approval_policy: ConstrainedWithSource<AskForApproval>,
-    pub approvals_reviewer: ConstrainedWithSource<ApprovalsReviewer>,
     pub permission_profile: ConstrainedWithSource<PermissionProfile>,
     pub windows_sandbox_mode: ConstrainedWithSource<Option<WindowsSandboxModeToml>>,
     pub web_search_mode: ConstrainedWithSource<WebSearchMode>,
@@ -169,18 +167,12 @@ pub struct ConfigRequirements {
     pub network: Option<Sourced<NetworkConstraints>>,
     /// Managed filesystem constraints derived from requirements.
     pub filesystem: Option<Sourced<FilesystemConstraints>>,
-    /// Source for the managed guardian policy config, when one is configured.
-    pub guardian_policy_config_source: Option<RequirementSource>,
 }
 
 impl Default for ConfigRequirements {
     fn default() -> Self {
         Self {
             approval_policy: ConstrainedWithSource::new(
-                Constrained::allow_any_from_default(),
-                /*source*/ None,
-            ),
-            approvals_reviewer: ConstrainedWithSource::new(
                 Constrained::allow_any_from_default(),
                 /*source*/ None,
             ),
@@ -212,7 +204,6 @@ impl Default for ConfigRequirements {
             ),
             network: None,
             filesystem: None,
-            guardian_policy_config_source: None,
         }
     }
 }
@@ -767,7 +758,6 @@ pub(crate) fn merge_app_requirements_descending(
 #[derive(Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct ConfigRequirementsToml {
     pub allowed_approval_policies: Option<Vec<AskForApproval>>,
-    pub allowed_approvals_reviewers: Option<Vec<ApprovalsReviewer>>,
     pub allowed_sandbox_modes: Option<Vec<SandboxModeRequirement>>,
     pub allowed_permission_profiles: Option<BTreeMap<String, bool>>,
     pub default_permissions: Option<String>,
@@ -791,7 +781,6 @@ pub struct ConfigRequirementsToml {
     pub network: Option<NetworkRequirementsToml>,
     pub permissions: Option<PermissionsRequirementsToml>,
     pub models: Option<ModelsRequirementsToml>,
-    pub guardian_policy_config: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -851,7 +840,6 @@ impl<T> std::ops::Deref for Sourced<T> {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConfigRequirementsWithSources {
     pub allowed_approval_policies: Option<Sourced<Vec<AskForApproval>>>,
-    pub allowed_approvals_reviewers: Option<Sourced<Vec<ApprovalsReviewer>>>,
     pub allowed_sandbox_modes: Option<Sourced<Vec<SandboxModeRequirement>>>,
     pub allowed_permission_profiles: Option<Sourced<BTreeMap<String, bool>>>,
     pub default_permissions: Option<Sourced<String>>,
@@ -872,14 +860,12 @@ pub struct ConfigRequirementsWithSources {
     pub network: Option<Sourced<NetworkRequirementsToml>>,
     pub permissions: Option<Sourced<PermissionsRequirementsToml>>,
     pub models: Option<Sourced<ModelsRequirementsToml>>,
-    pub guardian_policy_config: Option<Sourced<String>>,
 }
 
 impl ConfigRequirementsWithSources {
     /// Whether removing source annotations would yield empty requirements.
     pub fn is_empty(&self) -> bool {
         self.allowed_approval_policies.is_none()
-            && self.allowed_approvals_reviewers.is_none()
             && self.allowed_sandbox_modes.is_none()
             && self.allowed_permission_profiles.is_none()
             && self.default_permissions.is_none()
@@ -924,10 +910,6 @@ impl ConfigRequirementsWithSources {
                 .models
                 .as_deref()
                 .is_none_or(ModelsRequirementsToml::is_empty)
-            && self
-                .guardian_policy_config
-                .as_deref()
-                .is_none_or(|value| value.trim().is_empty())
     }
 
     pub fn merge_unset_fields(&mut self, source: RequirementSource, other: ConfigRequirementsToml) {
@@ -949,7 +931,6 @@ impl ConfigRequirementsWithSources {
         // forces this merge logic to be updated.
         let ConfigRequirementsToml {
             allowed_approval_policies: _,
-            allowed_approvals_reviewers: _,
             allowed_sandbox_modes: _,
             allowed_permission_profiles: _,
             default_permissions: _,
@@ -971,24 +952,15 @@ impl ConfigRequirementsWithSources {
             network: _,
             permissions: _,
             models: _,
-            guardian_policy_config: _,
         } = &other;
 
         let mut other = other;
-        if other
-            .guardian_policy_config
-            .as_deref()
-            .is_some_and(|value| value.trim().is_empty())
-        {
-            other.guardian_policy_config = None;
-        }
         fill_missing_take!(
             self,
             other,
             source,
             {
                 allowed_approval_policies,
-                allowed_approvals_reviewers,
                 allowed_sandbox_modes,
                 allowed_permission_profiles,
                 default_permissions,
@@ -1008,7 +980,6 @@ impl ConfigRequirementsWithSources {
                 network,
                 permissions,
                 models,
-                guardian_policy_config,
             }
         );
 
@@ -1024,7 +995,6 @@ impl ConfigRequirementsWithSources {
     pub fn into_toml(self) -> ConfigRequirementsToml {
         let ConfigRequirementsWithSources {
             allowed_approval_policies,
-            allowed_approvals_reviewers,
             allowed_sandbox_modes,
             allowed_permission_profiles,
             default_permissions,
@@ -1045,11 +1015,9 @@ impl ConfigRequirementsWithSources {
             network,
             permissions,
             models,
-            guardian_policy_config,
         } = self;
         ConfigRequirementsToml {
             allowed_approval_policies: allowed_approval_policies.map(|sourced| sourced.value),
-            allowed_approvals_reviewers: allowed_approvals_reviewers.map(|sourced| sourced.value),
             allowed_sandbox_modes: allowed_sandbox_modes.map(|sourced| sourced.value),
             allowed_permission_profiles: allowed_permission_profiles.map(|sourced| sourced.value),
             default_permissions: default_permissions.map(|sourced| sourced.value),
@@ -1071,7 +1039,6 @@ impl ConfigRequirementsWithSources {
             network: network.map(|sourced| sourced.value),
             permissions: permissions.map(|sourced| sourced.value),
             models: models.map(|sourced| sourced.value),
-            guardian_policy_config: guardian_policy_config.map(|sourced| sourced.value),
         }
     }
 }
@@ -1141,7 +1108,6 @@ impl ConfigRequirementsToml {
 
     pub fn is_empty(&self) -> bool {
         self.allowed_approval_policies.is_none()
-            && self.allowed_approvals_reviewers.is_none()
             && self.allowed_sandbox_modes.is_none()
             && self.allowed_permission_profiles.is_none()
             && self.default_permissions.is_none()
@@ -1187,10 +1153,6 @@ impl ConfigRequirementsToml {
                 .models
                 .as_ref()
                 .is_none_or(ModelsRequirementsToml::is_empty)
-            && self
-                .guardian_policy_config
-                .as_deref()
-                .is_none_or(|value| value.trim().is_empty())
     }
 }
 
@@ -1223,7 +1185,6 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
         // not runtime constraints.
         let ConfigRequirementsWithSources {
             allowed_approval_policies,
-            allowed_approvals_reviewers,
             allowed_sandbox_modes,
             allowed_permission_profiles: _,
             default_permissions: _,
@@ -1244,7 +1205,6 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             network,
             permissions,
             models: _,
-            guardian_policy_config,
         } = toml;
 
         if let Some(requirements) = &mcp_servers {
@@ -1284,36 +1244,6 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
                             field_name: "approval_policy",
                             candidate: format!("{candidate:?}"),
                             allowed: format!("{policies:?}"),
-                            requirement_source: requirement_source_for_error.clone(),
-                        })
-                    }
-                })?;
-                ConstrainedWithSource::new(constrained, Some(requirement_source))
-            }
-            None => ConstrainedWithSource::new(
-                Constrained::allow_any_from_default(),
-                /*source*/ None,
-            ),
-        };
-
-        let approvals_reviewer = match allowed_approvals_reviewers {
-            Some(Sourced {
-                value: reviewers,
-                source: requirement_source,
-            }) => {
-                let Some(initial_value) = reviewers.first().copied() else {
-                    return Err(ConstraintError::empty_field("allowed_approvals_reviewers"));
-                };
-
-                let requirement_source_for_error = requirement_source.clone();
-                let constrained = Constrained::new(initial_value, move |candidate| {
-                    if reviewers.contains(candidate) {
-                        Ok(())
-                    } else {
-                        Err(ConstraintError::InvalidValue {
-                            field_name: "approvals_reviewer",
-                            candidate: format!("{candidate:?}"),
-                            allowed: format!("{reviewers:?}"),
                             requirement_source: requirement_source_for_error.clone(),
                         })
                     }
@@ -1523,10 +1453,8 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             let Sourced { value, source } = sourced_permissions;
             Sourced::new(FilesystemConstraints::from(value), source)
         });
-        let guardian_policy_config_source = guardian_policy_config.map(|sourced| sourced.source);
         Ok(ConfigRequirements {
             approval_policy,
-            approvals_reviewer,
             permission_profile,
             windows_sandbox_mode,
             web_search_mode,
@@ -1543,7 +1471,6 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             enforce_residency,
             network,
             filesystem,
-            guardian_policy_config_source,
         })
     }
 }
@@ -1620,7 +1547,6 @@ mod tests {
     fn with_unknown_source(toml: ConfigRequirementsToml) -> ConfigRequirementsWithSources {
         let ConfigRequirementsToml {
             allowed_approval_policies,
-            allowed_approvals_reviewers,
             allowed_sandbox_modes,
             allowed_permission_profiles,
             default_permissions,
@@ -1642,12 +1568,9 @@ mod tests {
             network,
             permissions,
             models,
-            guardian_policy_config,
         } = toml;
         ConfigRequirementsWithSources {
             allowed_approval_policies: allowed_approval_policies
-                .map(|value| Sourced::new(value, RequirementSource::Unknown)),
-            allowed_approvals_reviewers: allowed_approvals_reviewers
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             allowed_sandbox_modes: allowed_sandbox_modes
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
@@ -1678,8 +1601,6 @@ mod tests {
             network: network.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             permissions: permissions.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             models: models.map(|value| Sourced::new(value, RequirementSource::Unknown)),
-            guardian_policy_config: guardian_policy_config
-                .map(|value| Sourced::new(value, RequirementSource::Unknown)),
         }
     }
 
@@ -1861,8 +1782,6 @@ mod tests {
         let source = RequirementSource::LegacyManagedConfigTomlFromMdm;
 
         let allowed_approval_policies = vec![AskForApproval::UnlessTrusted, AskForApproval::Never];
-        let allowed_approvals_reviewers =
-            vec![ApprovalsReviewer::AutoReview, ApprovalsReviewer::User];
         let allowed_sandbox_modes = vec![
             SandboxModeRequirement::WorkspaceWrite,
             SandboxModeRequirement::DangerFullAccess,
@@ -1886,13 +1805,11 @@ mod tests {
         };
         let enforce_residency = ResidencyRequirement::Us;
         let enforce_source = source.clone();
-        let guardian_policy_config = "Use the company-managed guardian policy.".to_string();
 
         // Intentionally constructed without `..Default::default()` so adding a new field to
         // `ConfigRequirementsToml` forces this test to be updated.
         let other = ConfigRequirementsToml {
             allowed_approval_policies: Some(allowed_approval_policies.clone()),
-            allowed_approvals_reviewers: Some(allowed_approvals_reviewers.clone()),
             allowed_sandbox_modes: Some(allowed_sandbox_modes.clone()),
             allowed_permission_profiles: Some(BTreeMap::from([("managed".to_string(), true)])),
             default_permissions: Some("managed".to_string()),
@@ -1914,7 +1831,6 @@ mod tests {
             network: None,
             permissions: None,
             models: Some(models.clone()),
-            guardian_policy_config: Some(guardian_policy_config.clone()),
         };
 
         target.merge_unset_fields(source.clone(), other);
@@ -1925,10 +1841,6 @@ mod tests {
                 allowed_approval_policies: Some(Sourced::new(
                     allowed_approval_policies,
                     source.clone()
-                )),
-                allowed_approvals_reviewers: Some(Sourced::new(
-                    allowed_approvals_reviewers,
-                    source.clone(),
                 )),
                 allowed_sandbox_modes: Some(Sourced::new(allowed_sandbox_modes, source.clone(),)),
                 allowed_permission_profiles: Some(Sourced::new(
@@ -1965,7 +1877,6 @@ mod tests {
                 network: None,
                 permissions: None,
                 models: Some(Sourced::new(models, source.clone())),
-                guardian_policy_config: Some(Sourced::new(guardian_policy_config, source)),
             }
         );
     }
@@ -1992,7 +1903,6 @@ mod tests {
                     vec![AskForApproval::OnRequest],
                     source_location,
                 )),
-                allowed_approvals_reviewers: None,
                 allowed_sandbox_modes: None,
                 allowed_permission_profiles: None,
                 default_permissions: None,
@@ -2013,7 +1923,6 @@ mod tests {
                 network: None,
                 permissions: None,
                 models: None,
-                guardian_policy_config: None,
             }
         );
         Ok(())
@@ -2048,7 +1957,6 @@ mod tests {
                     vec![AskForApproval::Never],
                     existing_source,
                 )),
-                allowed_approvals_reviewers: None,
                 allowed_sandbox_modes: None,
                 allowed_permission_profiles: None,
                 default_permissions: None,
@@ -2069,85 +1977,8 @@ mod tests {
                 network: None,
                 permissions: None,
                 models: None,
-                guardian_policy_config: None,
             }
         );
-        Ok(())
-    }
-
-    #[test]
-    fn merge_unset_fields_ignores_blank_guardian_override() {
-        let mut target = ConfigRequirementsWithSources::default();
-        target.merge_unset_fields(
-            RequirementSource::LegacyManagedConfigTomlFromMdm,
-            ConfigRequirementsToml {
-                guardian_policy_config: Some("   \n\t".to_string()),
-                ..Default::default()
-            },
-        );
-        target.merge_unset_fields(
-            RequirementSource::SystemRequirementsToml {
-                file: system_requirements_toml_file_for_test()
-                    .expect("system requirements.toml path"),
-            },
-            ConfigRequirementsToml {
-                guardian_policy_config: Some("Use the system guardian policy.".to_string()),
-                ..Default::default()
-            },
-        );
-
-        assert_eq!(
-            target.guardian_policy_config,
-            Some(Sourced::new(
-                "Use the system guardian policy.".to_string(),
-                RequirementSource::SystemRequirementsToml {
-                    file: system_requirements_toml_file_for_test()
-                        .expect("system requirements.toml path"),
-                },
-            )),
-        );
-    }
-
-    #[test]
-    fn deserialize_guardian_policy_config() -> Result<()> {
-        let requirements: ConfigRequirementsToml = from_str(
-            r#"
-guardian_policy_config = """
-Use the cloud-managed guardian policy.
-"""
-"#,
-        )?;
-
-        assert_eq!(
-            requirements.guardian_policy_config.as_deref(),
-            Some("Use the cloud-managed guardian policy.\n")
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn blank_guardian_policy_config_is_empty() -> Result<()> {
-        let requirements: ConfigRequirementsToml = from_str(
-            r#"
-guardian_policy_config = """
-
-"""
-"#,
-        )?;
-
-        assert!(requirements.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn allowed_approvals_reviewers_is_not_empty() -> Result<()> {
-        let requirements: ConfigRequirementsToml = from_str(
-            r#"
-allowed_approvals_reviewers = ["user"]
-"#,
-        )?;
-
-        assert!(!requirements.is_empty());
         Ok(())
     }
 
@@ -2487,7 +2318,6 @@ allowed_approvals_reviewers = ["user"]
         let source: ConfigRequirementsToml = from_str(
             r#"
                 allowed_approval_policies = ["on-request"]
-                allowed_approvals_reviewers = ["auto_review"]
                 allowed_sandbox_modes = ["read-only"]
             "#,
         )?;
@@ -2519,17 +2349,6 @@ allowed_approvals_reviewers = ["user"]
                 candidate: "DangerFullAccess".into(),
                 allowed: "[ReadOnly]".into(),
                 requirement_source: source_location.clone(),
-            })
-        );
-        assert_eq!(
-            requirements
-                .approvals_reviewer
-                .can_set(&ApprovalsReviewer::User),
-            Err(ConstraintError::InvalidValue {
-                field_name: "approvals_reviewer",
-                candidate: "User".into(),
-                allowed: "[AutoReview]".into(),
-                requirement_source: source_location,
             })
         );
 
@@ -2574,7 +2393,6 @@ allowed_approvals_reviewers = ["user"]
         let source: ConfigRequirementsToml = from_str(
             r#"
                 allowed_approval_policies = ["on-request"]
-                allowed_approvals_reviewers = ["auto_review"]
                 allowed_sandbox_modes = ["read-only"]
                 allowed_web_search_modes = ["cached"]
                 enforce_residency = "us"
@@ -2590,10 +2408,6 @@ allowed_approvals_reviewers = ["user"]
 
         assert_eq!(
             requirements.approval_policy.source,
-            Some(source_location.clone())
-        );
-        assert_eq!(
-            requirements.approvals_reviewer.source,
             Some(source_location.clone())
         );
         assert_eq!(
@@ -2661,35 +2475,6 @@ allowed_approvals_reviewers = ["user"]
     }
 
     #[test]
-    fn deserialize_allowed_approvals_reviewers() -> Result<()> {
-        for reviewer in ["auto_review", "guardian_subagent"] {
-            let toml_str = format!(r#"allowed_approvals_reviewers = ["{reviewer}", "user"]"#);
-            let config: ConfigRequirementsToml = from_str(&toml_str)?;
-            let requirements: ConfigRequirements = with_unknown_source(config).try_into()?;
-
-            assert_eq!(
-                requirements.approvals_reviewer.value(),
-                ApprovalsReviewer::AutoReview,
-                "currently, there is no way to specify the default value for approvals reviewer in the toml, so it picks the first allowed value"
-            );
-            assert!(
-                requirements
-                    .approvals_reviewer
-                    .can_set(&ApprovalsReviewer::AutoReview)
-                    .is_ok()
-            );
-            assert!(
-                requirements
-                    .approvals_reviewer
-                    .can_set(&ApprovalsReviewer::User)
-                    .is_ok()
-            );
-        }
-
-        Ok(())
-    }
-
-    #[test]
     fn deserialize_allowed_windows_sandbox_implementations() -> Result<()> {
         let toml_str = r#"
             [windows]
@@ -2749,25 +2534,6 @@ allowed_approvals_reviewers = ["user"]
         assert_eq!(
             requirements.windows_sandbox_mode.value(),
             Some(WindowsSandboxModeToml::Elevated)
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn empty_allowed_approvals_reviewers_is_rejected() -> Result<()> {
-        let toml_str = r#"
-            allowed_approvals_reviewers = []
-        "#;
-        let config: ConfigRequirementsToml = from_str(toml_str)?;
-        let err = ConfigRequirements::try_from(with_unknown_source(config))
-            .expect_err("empty approvals reviewer allow-list should be rejected");
-
-        assert_eq!(
-            err,
-            ConstraintError::EmptyField {
-                field_name: "allowed_approvals_reviewers".to_string(),
-            }
         );
 
         Ok(())

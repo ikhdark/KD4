@@ -837,12 +837,17 @@ async fn turn_start_emits_thread_scoped_warning_notification_for_trimmed_skills(
         body_contains(request, "## Skills"),
         "expected outgoing request to include the skills section"
     );
+    for index in 0..32 {
+        let name = format!("test-skill-{index:02}");
+        assert!(
+            body_contains(request, &format!("- {name} —")),
+            "expected skill {name} to remain in the outgoing request body"
+        );
+    }
+    // Ten repetitions fit within the normal 240-character catalog cap, so
+    // their absence proves the context budget shortened the descriptions further.
     assert!(
-        body_contains(request, "- alpha-skill —") && body_contains(request, "- beta-skill —"),
-        "expected skills with shortened descriptions to remain in the outgoing request body"
-    );
-    assert!(
-        !body_contains(request, &"long skill description ".repeat(100)),
+        !body_contains(request, &"long skill description ".repeat(10)),
         "expected oversized skill descriptions to be shortened in the outgoing request body"
     );
 
@@ -1178,6 +1183,7 @@ async fn turn_profile_tracks_blocking_tool_and_follow_up_sampling() -> Result<()
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_managed_config()
+        .with_args(&["-c", "analytics.enabled=true"])
         .build()
         .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
@@ -2555,7 +2561,6 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
             cwd: Some(first_cwd.clone()),
             runtime_workspace_roots: None,
             approval_policy: Some(codex_app_server_protocol::AskForApproval::Never),
-            approvals_reviewer: None,
             sandbox_policy: Some(codex_app_server_protocol::SandboxPolicy::WorkspaceWrite {
                 writable_roots: vec![first_cwd.clone().try_into()?],
                 network_access: false,
@@ -2624,7 +2629,6 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
             cwd: Some(second_cwd.clone()),
             runtime_workspace_roots: None,
             approval_policy: Some(codex_app_server_protocol::AskForApproval::Never),
-            approvals_reviewer: None,
             sandbox_policy: Some(codex_app_server_protocol::SandboxPolicy::DangerFullAccess),
             permission_profile: None,
             permissions: None,

@@ -6,11 +6,6 @@ simple sequence for any ToolRuntime: approval → select sandbox → attempt →
 retry with an escalated sandbox strategy only when a denial is proven safe to
 replay (no re-approval thanks to caching).
 */
-use crate::guardian::guardian_rejection_message;
-use crate::guardian::guardian_timeout_message;
-use crate::guardian::new_guardian_review_id;
-use crate::guardian::review_approval_request;
-use crate::guardian::routes_approval_to_guardian;
 use crate::hook_runtime::run_permission_request_hooks;
 use crate::network_policy_decision::network_approval_context_from_payload;
 use crate::tools::flat_tool_name;
@@ -67,7 +62,6 @@ impl ToolOrchestrator {
     {
         let network_approval = match begin_network_approval(
             &tool_ctx.session,
-            &tool_ctx.turn.sub_id,
             managed_network_active,
             tool.network_approval_spec(req, tool_ctx),
         )
@@ -149,8 +143,6 @@ impl ToolOrchestrator {
         let otel = turn_ctx.session_telemetry.clone();
         let otel_tn = flat_tool_name(&tool_ctx.tool_name).into_owned();
         let otel_ci = &tool_ctx.call_id;
-        let strict_auto_review = tool_ctx.session.strict_auto_review_enabled_for_turn().await;
-        let use_guardian = routes_approval_to_guardian(turn_ctx) || strict_auto_review;
 
         // 1) Approval
         let mut already_approved = false;
@@ -162,48 +154,21 @@ impl ToolOrchestrator {
         });
         match &requirement {
             ExecApprovalRequirement::Skip { .. } => {
-                if strict_auto_review {
-                    let guardian_review_id = Some(new_guardian_review_id());
-                    let approval_ctx = ApprovalCtx {
-                        session: &tool_ctx.session,
-                        turn: &tool_ctx.turn,
-                        call_id: &tool_ctx.call_id,
-                        guardian_review_id: guardian_review_id.clone(),
-                        retry_reason: None,
-                        network_approval_context: None,
-                    };
-                    let decision = Self::request_approval(
-                        tool,
-                        req,
-                        tool_ctx.call_id.as_str(),
-                        approval_ctx,
-                        tool_ctx,
-                        /*evaluate_permission_request_hooks*/ false,
-                        &otel,
-                    )
-                    .await?;
-                    Self::reject_if_not_approved(tool_ctx, guardian_review_id.as_deref(), decision)
-                        .await?;
-                    already_approved = true;
-                } else {
-                    otel.tool_decision(
-                        &otel_tn,
-                        otel_ci,
-                        &ReviewDecision::Approved,
-                        ToolDecisionSource::Config,
-                    );
-                }
+                otel.tool_decision(
+                    &otel_tn,
+                    otel_ci,
+                    &ReviewDecision::Approved,
+                    ToolDecisionSource::Config,
+                );
             }
             ExecApprovalRequirement::Forbidden { reason } => {
                 return Err(ToolError::Denied(reason.clone()));
             }
             ExecApprovalRequirement::NeedsApproval { reason, .. } => {
-                let guardian_review_id = use_guardian.then(new_guardian_review_id);
                 let approval_ctx = ApprovalCtx {
                     session: &tool_ctx.session,
                     turn: &tool_ctx.turn,
                     call_id: &tool_ctx.call_id,
-                    guardian_review_id: guardian_review_id.clone(),
                     retry_reason: reason.clone(),
                     network_approval_context: None,
                 };
@@ -213,13 +178,11 @@ impl ToolOrchestrator {
                     tool_ctx.call_id.as_str(),
                     approval_ctx,
                     tool_ctx,
-                    /*evaluate_permission_request_hooks*/ !strict_auto_review,
                     &otel,
                 )
                 .await?;
 
-                Self::reject_if_not_approved(tool_ctx, guardian_review_id.as_deref(), decision)
-                    .await?;
+                Self::reject_if_not_approved(decision).await?;
                 already_approved = true;
             }
         }
@@ -384,18 +347,14 @@ impl ToolOrchestrator {
                         build_denial_reason_from_output(output.as_ref())
                     };
 
-                // Strict auto-review approval covers the sandboxed attempt only;
-                // retrying without the sandbox requires a fresh guardian review.
-                let bypass_retry_approval = !strict_auto_review
-                    && tool.should_bypass_approval(approval_policy, already_approved)
+                let bypass_retry_approval = tool
+                    .should_bypass_approval(approval_policy, already_approved)
                     && network_approval_context.is_none();
                 if !bypass_retry_approval {
-                    let guardian_review_id = use_guardian.then(new_guardian_review_id);
                     let approval_ctx = ApprovalCtx {
                         session: &tool_ctx.session,
                         turn: &tool_ctx.turn,
                         call_id: &tool_ctx.call_id,
-                        guardian_review_id: guardian_review_id.clone(),
                         retry_reason: Some(retry_reason),
                         network_approval_context: network_approval_context.clone(),
                     };
@@ -407,13 +366,11 @@ impl ToolOrchestrator {
                         &permission_request_run_id,
                         approval_ctx,
                         tool_ctx,
-                        /*evaluate_permission_request_hooks*/ !strict_auto_review,
                         &otel,
                     )
                     .await?;
 
-                    Self::reject_if_not_approved(tool_ctx, guardian_review_id.as_deref(), decision)
-                        .await?;
+                    Self::reject_if_not_approved(decision).await?;
                 }
 
                 let retry_sandbox_requested = !unsandboxed_allowed
@@ -503,22 +460,19 @@ impl ToolOrchestrator {
 
     // PermissionRequest hooks take top precedence for answering approval
     // prompts. If no matching hook returns a decision, fall back to the
-    // normal guardian or user approval path.
+    // normal user approval path.
     async fn request_approval<Rq, Out, T>(
         tool: &mut T,
         req: &Rq,
         permission_request_run_id: &str,
         approval_ctx: ApprovalCtx<'_>,
         tool_ctx: &ToolCtx,
-        evaluate_permission_request_hooks: bool,
         otel: &codex_otel::SessionTelemetry,
     ) -> Result<ReviewDecision, ToolError>
     where
         T: ToolRuntime<Rq, Out>,
     {
-        if evaluate_permission_request_hooks
-            && let Some(permission_request) = tool.permission_request_payload(req)
-        {
+        if let Some(permission_request) = tool.permission_request_payload(req) {
             let tool_name = flat_tool_name(&tool_ctx.tool_name);
             match run_permission_request_hooks(
                 approval_ctx.session,
@@ -552,33 +506,8 @@ impl ToolOrchestrator {
             }
         }
 
-        let otel_source = if approval_ctx.guardian_review_id.is_some() {
-            ToolDecisionSource::AutomatedReviewer
-        } else {
-            ToolDecisionSource::User
-        };
-        let decision = if let Some(review_id) = approval_ctx.guardian_review_id.clone() {
-            match tool.approval_action(req, &approval_ctx) {
-                Ok(action) => {
-                    review_approval_request(
-                        approval_ctx.session,
-                        approval_ctx.turn,
-                        review_id,
-                        action,
-                        approval_ctx.retry_reason.clone(),
-                    )
-                    .await
-                }
-                Err(err) => {
-                    tracing::error!(%err, "failed to build guardian approval action");
-                    return Err(ToolError::Rejected(format!(
-                        "failed to build guardian approval action: {err}"
-                    )));
-                }
-            }
-        } else {
-            tool.start_approval_async(req, approval_ctx).await
-        };
+        let otel_source = ToolDecisionSource::User;
+        let decision = tool.start_approval_async(req, approval_ctx).await;
         let tool_name = flat_tool_name(&tool_ctx.tool_name);
         otel.tool_decision(
             tool_name.as_ref(),
@@ -589,21 +518,12 @@ impl ToolOrchestrator {
         Ok(decision)
     }
 
-    async fn reject_if_not_approved(
-        tool_ctx: &ToolCtx,
-        guardian_review_id: Option<&str>,
-        decision: ReviewDecision,
-    ) -> Result<(), ToolError> {
+    async fn reject_if_not_approved(decision: ReviewDecision) -> Result<(), ToolError> {
         match decision {
             ReviewDecision::Denied | ReviewDecision::Abort => {
-                let reason = if let Some(review_id) = guardian_review_id {
-                    guardian_rejection_message(tool_ctx.session.as_ref(), review_id).await
-                } else {
-                    "rejected by user".to_string()
-                };
+                let reason = "rejected by user".to_string();
                 Err(ToolError::Denied(reason))
             }
-            ReviewDecision::TimedOut => Err(ToolError::Rejected(guardian_timeout_message())),
             ReviewDecision::Approved
             | ReviewDecision::ApprovedExecpolicyAmendment { .. }
             | ReviewDecision::ApprovedForSession => Ok(()),
@@ -657,7 +577,6 @@ mod tests {
     use super::*;
     use crate::session::tests::make_session_and_context;
     use crate::tools::sandboxing::Approvable;
-    use crate::tools::sandboxing::ApprovalAction;
     use crate::tools::sandboxing::ApprovalCtx;
     use crate::tools::sandboxing::ExecApprovalRequirement;
     use crate::tools::sandboxing::Sandboxable;
@@ -709,14 +628,6 @@ mod tests {
         ) -> BoxFuture<'a, ReviewDecision> {
             self.approval_reason = ctx.retry_reason;
             Box::pin(async { ReviewDecision::Denied })
-        }
-
-        fn approval_action(
-            &self,
-            _req: &(),
-            _ctx: &ApprovalCtx<'_>,
-        ) -> std::io::Result<ApprovalAction> {
-            Err(std::io::Error::other("guardian approval should not run"))
         }
     }
 

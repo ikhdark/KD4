@@ -1710,8 +1710,31 @@ async fn spawn_agent_hides_child_until_initial_submission() {
 
 #[tokio::test]
 async fn cancelled_spawn_cleans_hidden_thread_and_releases_path() {
+    cancelled_spawn_retains_capacity_until_termination(MultiAgentVersion::V2).await;
+}
+
+#[tokio::test]
+async fn cancelled_v1_spawn_cleans_hidden_thread_and_releases_path() {
+    cancelled_spawn_retains_capacity_until_termination(MultiAgentVersion::V1).await;
+}
+
+async fn cancelled_spawn_retains_capacity_until_termination(version: MultiAgentVersion) {
     let (home, mut config) = test_config().await;
-    let _ = config.features.enable(Feature::MultiAgentV2);
+    if version == MultiAgentVersion::V2 {
+        config
+            .features
+            .enable(Feature::MultiAgentV2)
+            .expect("enable V2");
+        config.multi_agent_v2.max_concurrent_threads_per_session = 2;
+    } else {
+        config
+            .features
+            .disable(Feature::MultiAgentV2)
+            .expect("disable V2");
+        config.features.enable(Feature::Collab).expect("enable V1");
+        config.agent_max_threads = Some(1);
+    }
+    assert_eq!(config.effective_agent_max_threads(version), Some(1));
     let harness = AgentControlHarness::new_with_config(home, config).await;
     let (parent_thread_id, _parent_thread) = harness.start_thread().await;
     let initial_thread_ids = harness.manager.list_thread_ids().await;
@@ -1723,6 +1746,20 @@ async fn cancelled_spawn_cleans_hidden_thread_and_releases_path() {
         .before_initial_submission
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&barrier));
+    let rollback = Arc::new(AgentControlTestBarrier::default());
+    struct ReleaseRollback(Arc<AgentControlTestBarrier>);
+    impl Drop for ReleaseRollback {
+        fn drop(&mut self) {
+            self.0.release_one();
+        }
+    }
+    let _release_rollback_on_failure = ReleaseRollback(Arc::clone(&rollback));
+    *harness
+        .control
+        .test_hooks
+        .before_spawn_rollback
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&rollback));
     let mut thread_created = harness.manager.subscribe_thread_created();
 
     let spawn_control = harness.control.clone();
@@ -1759,10 +1796,72 @@ async fn cancelled_spawn_cleans_hidden_thread_and_releases_path() {
         .collect::<Vec<_>>();
     assert_eq!(hidden_thread_ids.len(), 1);
     let hidden_thread_id = hidden_thread_ids[0];
+    let hidden_thread = harness
+        .manager
+        .get_thread(hidden_thread_id)
+        .await
+        .expect("hidden child remains loaded");
+    let release_termination =
+        crate::test_support::block_thread_terminal_tasks(hidden_thread.as_ref());
 
     spawn.abort();
     let join_error = spawn.await.expect_err("spawn task should be cancelled");
     assert!(join_error.is_cancelled());
+    timeout(Duration::from_secs(5), rollback.wait_until_reached())
+        .await
+        .expect("cancelled spawn enters rollback");
+    *harness
+        .control
+        .test_hooks
+        .before_initial_submission
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    let replacement_spawn = || {
+        harness.control.spawn_agent_with_metadata(
+            harness.config.clone(),
+            text_input("replacement assignment"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: Some(
+                    AgentPath::try_from("/root/replacement").expect("replacement path"),
+                ),
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent_thread_id),
+                ..Default::default()
+            },
+        )
+    };
+    assert_matches!(
+        timeout(Duration::from_secs(2), replacement_spawn())
+            .await
+            .expect("capacity rejection"),
+        Err(CodexErr::AgentLimitReached { max_threads: 1 })
+    );
+    assert_eq!(
+        harness.manager.list_thread_ids().await.len(),
+        initial_thread_ids.len() + 1
+    );
+    rollback.release_one();
+    timeout(Duration::from_secs(5), async {
+        while !hidden_thread.codex.session.terminal_tasks.is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("rollback requests child shutdown");
+    assert_matches!(
+        timeout(Duration::from_secs(2), replacement_spawn())
+            .await
+            .expect("capacity held during termination"),
+        Err(CodexErr::AgentLimitReached { max_threads: 1 })
+    );
+    release_termination
+        .send(())
+        .expect("release child termination");
     timeout(Duration::from_secs(10), async {
         loop {
             if matches!(
@@ -1788,25 +1887,43 @@ async fn cancelled_spawn_cleans_hidden_thread_and_releases_path() {
         .before_initial_submission
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-    let retry = harness
+    *harness
         .control
-        .spawn_agent_with_metadata(
-            harness.config.clone(),
-            text_input("retry assignment"),
-            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                parent_thread_id,
-                depth: 1,
-                agent_path: Some(agent_path.clone()),
-                agent_nickname: None,
-                agent_role: None,
-            })),
-            SpawnAgentOptions {
-                parent_thread_id: Some(parent_thread_id),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("cancelled spawn should release its path reservation");
+        .test_hooks
+        .before_spawn_rollback
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    let retry = timeout(Duration::from_secs(5), async {
+        loop {
+            let result = harness
+                .control
+                .spawn_agent_with_metadata(
+                    harness.config.clone(),
+                    text_input("retry assignment"),
+                    Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                        parent_thread_id,
+                        depth: 1,
+                        agent_path: Some(agent_path.clone()),
+                        agent_nickname: None,
+                        agent_role: None,
+                    })),
+                    SpawnAgentOptions {
+                        parent_thread_id: Some(parent_thread_id),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            match result {
+                Ok(agent) => break agent,
+                Err(CodexErr::AgentLimitReached { .. }) => tokio::task::yield_now().await,
+                Err(error) => {
+                    panic!("cancelled spawn should release its path reservation: {error}")
+                }
+            }
+        }
+    })
+    .await
+    .expect("termination releases capacity for normal replacement spawn");
     assert_eq!(
         harness.control.state.agent_id_for_path(&agent_path),
         Some(retry.thread_id)
@@ -2684,6 +2801,156 @@ fn spawn_agent_fork_flushes_parent_rollout_before_loading_history() {
                 .submit(Op::Shutdown {})
                 .await
                 .expect("parent shutdown should submit");
+        },
+    );
+}
+
+#[test]
+fn spawn_agent_fork_last_n_turns_excludes_rolled_back_tokens() {
+    run_current_thread_test_with_stack(
+        "spawn_agent_fork_last_n_turns_excludes_rolled_back_tokens",
+        || async {
+            for compact_discarded_turn in [false, true] {
+                let harness = AgentControlHarness::new().await;
+                let (parent_thread_id, parent_thread) = harness.start_thread().await;
+                let large_text = "discarded large parent turn ".repeat(4096);
+                for text in ["surviving first turn", large_text.as_str()] {
+                    parent_thread
+                        .codex
+                        .session
+                        .persist_rollout_items(&[RolloutItem::EventMsg(EventMsg::UserMessage(
+                            codex_protocol::protocol::UserMessageEvent {
+                                message: text.to_string(),
+                                ..Default::default()
+                            },
+                        ))])
+                        .await;
+                    parent_thread
+                        .inject_user_message_without_turn(text.to_string())
+                        .await;
+                }
+                if compact_discarded_turn {
+                    let replacement_history = parent_thread
+                        .codex
+                        .session
+                        .clone_history()
+                        .await
+                        .into_raw_items();
+                    parent_thread
+                        .codex
+                        .session
+                        .persist_rollout_items(&[RolloutItem::Compacted(CompactedItem {
+                            message: String::new(),
+                            replacement_history: Some(replacement_history),
+                            window_number: None,
+                            first_window_id: None,
+                            previous_window_id: None,
+                            window_id: None,
+                        })])
+                        .await;
+                }
+                parent_thread.ensure_rollout_materialized().await;
+                parent_thread
+                    .flush_rollout()
+                    .await
+                    .expect("flush parent history");
+                let rollback_id = parent_thread
+                    .submit(Op::ThreadRollback { num_turns: 1 })
+                    .await
+                    .expect("submit rollback");
+                timeout(Duration::from_secs(10), async {
+                    loop {
+                        let event = parent_thread.next_event().await.expect("rollback event");
+                        if event.id == rollback_id {
+                            match event.msg {
+                                EventMsg::ThreadRolledBack(event) => {
+                                    assert_eq!(event.num_turns, 1);
+                                    break;
+                                }
+                                EventMsg::Error(event) => {
+                                    panic!("rollback failed: {}", event.message)
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                })
+                .await
+                .expect("rollback should finish");
+                parent_thread
+                    .codex
+                    .session
+                    .persist_rollout_items(&[RolloutItem::EventMsg(EventMsg::UserMessage(
+                        codex_protocol::protocol::UserMessageEvent {
+                            message: "surviving current turn".to_string(),
+                            ..Default::default()
+                        },
+                    ))])
+                    .await;
+                parent_thread
+                    .inject_user_message_without_turn("surviving current turn".to_string())
+                    .await;
+                let parent_spawn_call_id = "spawn-after-rollback".to_string();
+                let turn_context = parent_thread.codex.session.new_default_turn().await;
+                parent_thread
+                    .codex
+                    .session
+                    .record_conversation_items(
+                        turn_context.as_ref(),
+                        &[spawn_agent_call(&parent_spawn_call_id)],
+                    )
+                    .await;
+                let mut config = harness.config.clone();
+                config.model_auto_compact_token_limit = Some(1024);
+                let child_id = harness
+                    .control
+                    .spawn_agent_with_metadata(
+                        config,
+                        text_input("child task"),
+                        Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                            parent_thread_id,
+                            depth: 1,
+                            agent_path: None,
+                            agent_nickname: None,
+                            agent_role: None,
+                        })),
+                        SpawnAgentOptions {
+                            fork_parent_spawn_call_id: Some(parent_spawn_call_id),
+                            fork_mode: Some(SpawnAgentForkMode::LastNTurns(2)),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("small surviving history fits the child limit after rollback")
+                    .thread_id;
+                let child = harness
+                    .manager
+                    .get_thread(child_id)
+                    .await
+                    .expect("registered child");
+                let history = child.codex.session.clone_history().await;
+                assert!(history_contains_text(
+                    history.raw_items(),
+                    "surviving first turn"
+                ));
+                assert!(history_contains_text(
+                    history.raw_items(),
+                    "surviving current turn"
+                ));
+                assert!(!history_contains_text(
+                    history.raw_items(),
+                    "discarded large parent turn"
+                ));
+                harness
+                    .control
+                    .shutdown_live_agent(child_id)
+                    .await
+                    .expect("shutdown child");
+                parent_thread
+                    .submit(Op::Shutdown {})
+                    .await
+                    .expect("shutdown parent");
+            }
         },
     );
 }

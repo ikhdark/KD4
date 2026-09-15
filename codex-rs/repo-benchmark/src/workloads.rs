@@ -3,14 +3,21 @@ mod fixtures;
 #[cfg(test)]
 mod tests;
 
-use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use serde::Deserialize;
+use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+use std::process::Stdio;
+use std::time::Duration;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -230,7 +237,16 @@ fn verify_fixture_inner(
     fixture: &PreparedFixture,
     environment: Option<&BTreeMap<String, String>>,
 ) -> Result<VerificationOutcome> {
+    verify_fixture_with_timeout(fixture, environment, Duration::from_secs(120))
+}
+
+fn verify_fixture_with_timeout(
+    fixture: &PreparedFixture,
+    environment: Option<&BTreeMap<String, String>>,
+    timeout: Duration,
+) -> Result<VerificationOutcome> {
     let started = Instant::now();
+    let deadline = started + timeout;
     let stdout_path = fixture.protected_dir.join("verification.stdout.log");
     let stderr_path = fixture.protected_dir.join("verification.stderr.log");
     let outcome = |status, detail| VerificationOutcome {
@@ -305,24 +321,19 @@ fn verify_fixture_inner(
             let detail = fs::read_to_string(&stdout_path).unwrap_or_default();
             return Ok(outcome(result, detail));
         }
-        if started.elapsed() >= Duration::from_secs(120) {
-            #[cfg(windows)]
-            {
-                let mut cleanup = Command::new("taskkill");
-                configure_helper(&mut cleanup, environment);
-                let _ = cleanup
-                    .args(["/PID", &child.id().to_string(), "/T", "/F"])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-            }
-            let _ = child.kill();
-            let _ = child.wait();
+        if Instant::now() >= deadline {
+            codex_app_server_test_client::terminate_owned_process(&mut child)
+                .context("terminate timed-out independent verifier")?;
             return Ok(outcome(
                 VerificationStatus::TimedOut,
-                "independent verification exceeded 120 seconds".into(),
+                format!(
+                    "independent verification exceeded {} seconds",
+                    timeout.as_secs_f64()
+                ),
             ));
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(
+            Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
 }

@@ -5,23 +5,43 @@ pub mod provenance;
 mod tests;
 mod v8;
 
-use crate::schedule::{Mode, ScheduledAttempt, Variant, schedule};
-use crate::workloads::{LiveTask, PreparedFixture, prepare_dependencies_with_env, prepare_fixture};
-use anyhow::{Context, Result, ensure};
-use environment::{BASE_CONFIG, Environment, ProjectConfigComparison, configured_value};
-use provenance::{
-    FileIdentity, command_output, copy_tree, find_repo_root, git, hash_bytes, hash_tree,
-    materialize_commit, read_json, reset_workspace, write_json,
-};
-use serde::{Deserialize, Serialize};
+use crate::schedule::Mode;
+use crate::schedule::ScheduledAttempt;
+use crate::schedule::Variant;
+use crate::schedule::schedule;
+use crate::workloads::LiveTask;
+use crate::workloads::PreparedFixture;
+use crate::workloads::prepare_dependencies_with_env;
+use crate::workloads::prepare_fixture;
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
+use environment::BASE_CONFIG;
+use environment::Environment;
+use environment::ProjectConfigComparison;
+use environment::configured_value;
+use provenance::FileIdentity;
+use provenance::command_output;
+use provenance::copy_tree;
+use provenance::find_repo_root;
+use provenance::git;
+use provenance::hash_bytes;
+use provenance::hash_tree;
+use provenance::materialize_commit;
+use provenance::read_json;
+use provenance::reset_workspace;
+use provenance::write_json;
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
-use std::{
-    collections::BTreeMap,
-    fs,
-    path::{Path, PathBuf},
-    process::Command,
-    time::{Instant, SystemTime, UNIX_EPOCH},
-};
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 pub const MANIFEST_VERSION: u32 = 2;
 
@@ -387,7 +407,8 @@ pub fn prepare(options: PrepareOptions) -> Result<PathBuf> {
         (Variant::ForkOn, feature_overrides(&features, true)?),
         (Variant::Reference, vec![]),
     ]);
-    let project_config_comparison = ProjectConfigComparison::capture(&repo, BASE_CONFIG, &overrides)?;
+    let project_config_comparison =
+        ProjectConfigComparison::capture(&repo, BASE_CONFIG, &overrides)?;
     let shared_inputs = directory.join("frozen/shared");
     snapshot_shared_inputs(&repo, &shared_inputs)?;
     let shared_sha256 = hash_tree(&shared_inputs)?;
@@ -563,6 +584,38 @@ impl Prepared {
             prepared.schedule == schedule(prepared.mode),
             "prepared workload schedule changed"
         );
+        // Loaded manifests are an external boundary. Verify mandatory map entries
+        // before execution can reset the workspace or publish run evidence.
+        for variant in Variant::ALL {
+            ensure!(
+                prepared.overrides.contains_key(&variant),
+                "prepared manifest lacks overrides for {}",
+                variant.name()
+            );
+            let build = prepared
+                .builds
+                .get(&variant)
+                .with_context(|| format!("prepared manifest lacks build for {}", variant.name()))?;
+            ensure!(
+                build.executables.contains_key("codex-app-server"),
+                "prepared manifest lacks codex-app-server executable for {}",
+                variant.name()
+            );
+        }
+        for attempt in &prepared.schedule {
+            let fixture = match attempt.segment {
+                crate::schedule::Segment::Scripted => "scripted",
+                crate::schedule::Segment::RealModel => attempt.workload.as_str(),
+            };
+            ensure!(
+                prepared.fixtures.contains_key(fixture),
+                "prepared manifest lacks fixture {fixture}"
+            );
+        }
+        ensure!(
+            prepared.environment.tools.contains_key("python"),
+            "prepared manifest lacks python tool"
+        );
         Ok(prepared)
     }
     pub fn verify(&self) -> Result<()> {
@@ -611,6 +664,9 @@ impl Prepared {
         Ok(())
     }
     pub fn expected_config(&self, variant: Variant) -> Result<Value> {
-        configured_value(&fs::read_to_string(&self.base_config.path)?, &self.overrides[&variant])
+        configured_value(
+            &fs::read_to_string(&self.base_config.path)?,
+            &self.overrides[&variant],
+        )
     }
 }

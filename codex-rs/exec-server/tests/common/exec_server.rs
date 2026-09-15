@@ -356,7 +356,10 @@ async fn connect_websocket_when_ready(
                             if io_err.kind() == std::io::ErrorKind::ConnectionRefused
                     ) =>
             {
-                sleep(CONNECT_RETRY_INTERVAL).await;
+                sleep(
+                    CONNECT_RETRY_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+                )
+                .await;
             }
             Err(err) => return Err(err.into()),
         }

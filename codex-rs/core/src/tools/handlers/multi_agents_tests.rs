@@ -34,7 +34,6 @@ use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
-use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::config_types::WindowsSandboxLevel;
@@ -833,6 +832,35 @@ async fn multi_agent_v2_spawn_model_override_defaults_to_no_fork() {
 async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start() {
     let (mut session, mut turn) = make_session_and_context().await;
     let mut config = (*turn.config).clone();
+    let workspace = tempfile::tempdir().expect("isolated typed-task workspace");
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(workspace.path())
+            .status()
+            .expect("initialize typed-task repository")
+            .success()
+    );
+    assert!(
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "--quiet",
+                "-m",
+                "Initial test workspace",
+            ])
+            .current_dir(workspace.path())
+            .status()
+            .expect("create typed-task repository HEAD")
+            .success()
+    );
+    config.cwd = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(workspace.path())
+        .expect("absolute typed-task workspace");
     config
         .features
         .enable(Feature::MultiAgentV2)
@@ -863,6 +891,16 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
         "a fresh root should defer typed-task storage until a typed assignment is requested"
     );
     let child_config = config.clone();
+    let environment = turn
+        .environments
+        .primary()
+        .expect("selected test environment");
+    turn.environments.turn_environments = vec![crate::session::turn_context::TurnEnvironment::new(
+        environment.environment_id.clone(),
+        Arc::clone(&environment.environment),
+        codex_utils_path_uri::PathUri::from_abs_path(&config.cwd),
+        environment.shell.clone(),
+    )];
     set_turn_config(&mut turn, config);
     let task_name = format!(
         "typed_worker_{}",
@@ -902,7 +940,12 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
             .handle(spawn_invocation)
             .await
     });
-    before_initial_submission.wait_until_reached().await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        before_initial_submission.wait_until_reached(),
+    )
+    .await
+    .expect("typed spawn should reach initial submission");
     agent_control.set_before_initial_submission_barrier(None);
     let agent_path = AgentPath::root()
         .join(&task_name)
@@ -1498,7 +1541,7 @@ async fn multi_agent_v2_typed_spawn_admits_overlapping_write_claims() {
                 .expect("typed binding should retain the child thread id"),
         )
         .expect("typed binding thread id should parse");
-        agent_control
+        let cleanup = agent_control
             .task_coordinator()
             .store()
             .expect("typed task store should remain available")
@@ -1507,8 +1550,14 @@ async fn multi_agent_v2_typed_spawn_admits_overlapping_write_claims() {
                 assignment_id,
                 "test cleanup".to_string(),
             )
-            .await
-            .expect("test cleanup should release the diagnostic claim");
+            .await;
+        assert!(
+            matches!(
+                cleanup,
+                Ok(_) | Err(codex_agent_task_store::StoreError::AttemptSealed(_))
+            ),
+            "unexpected cleanup failure: {cleanup:?}"
+        );
         assert!(
             agent_control
                 .task_coordinator()
@@ -2455,7 +2504,12 @@ async fn multi_agent_v2_registered_message_batch_preserves_delivery_and_partial_
     );
     cancelled.cancellation_token.cancel();
     let output = dispatch(cancelled).await;
-    assert_eq!(output.success, Some(false));
+    assert_eq!(output.success, None);
+    assert!(
+        serde_json::to_string(&output)
+            .expect("cancelled output")
+            .contains("aborted by user")
+    );
     assert_eq!(
         manager.captured_ops().len(),
         before,
@@ -3575,8 +3629,7 @@ async fn spawn_agent_reapplies_runtime_sandbox_when_role_does_not_override_permi
     turn.approval_policy
         .set(AskForApproval::OnRequest)
         .expect("approval policy should be set");
-    let mut config = (*turn.config).clone();
-    config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+    let config = (*turn.config).clone();
     set_turn_config(&mut turn, config);
     turn.permission_profile = expected_permission_profile.clone();
     assert_ne!(
@@ -3617,7 +3670,6 @@ async fn spawn_agent_reapplies_runtime_sandbox_when_role_does_not_override_permi
         .await;
     assert_eq!(snapshot.sandbox_policy(), expected_sandbox);
     assert_eq!(snapshot.approval_policy, AskForApproval::OnRequest);
-    assert_eq!(snapshot.approvals_reviewer, ApprovalsReviewer::AutoReview);
     assert_eq!(snapshot.permission_profile, expected_permission_profile);
     let child_thread = manager
         .get_thread(agent_id)

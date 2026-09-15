@@ -3,6 +3,31 @@
 # CODEX_SCCACHE_CACHE_SIZE.
 $script:CodexRustSccacheCacheSizeDefault = "80G"
 
+function Get-CodexCargoPackageSpecs {
+    param([string[]]$CommandArgs)
+
+    for ($index = 0; $index -lt $CommandArgs.Count; $index++) {
+        $token = $CommandArgs[$index]
+        if ($token -ceq "--") { break }
+        $spec = $null
+        if ($token -cin @("-p", "--package")) {
+            $index++
+            if ($index -lt $CommandArgs.Count) { $spec = $CommandArgs[$index] }
+            if ($spec -ceq "--") { break }
+        }
+        elseif ($token.StartsWith("--package=", [StringComparison]::Ordinal)) {
+            $spec = $token.Substring(10)
+        }
+        elseif ($token.StartsWith("-p", [StringComparison]::Ordinal)) {
+            $spec = $token.Substring(2)
+            if ($spec.StartsWith("=")) { $spec = $spec.Substring(1) }
+        }
+        if (-not [string]::IsNullOrEmpty($spec) -and -not $spec.StartsWith("-")) {
+            $spec
+        }
+    }
+}
+
 function Get-CodexRustSccacheBaseDir {
     param(
         [string]$RepoRoot

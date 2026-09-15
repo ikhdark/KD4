@@ -25,7 +25,6 @@ use crate::codex_apps_cache::CodexAppsToolsCacheKey;
 use crate::codex_apps_cache::CodexAppsToolsFetchSource;
 use crate::elicitation::ElicitationRequestManager;
 use crate::elicitation::ElicitationRequestRouter;
-use crate::elicitation::ElicitationReviewerHandle;
 use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 use crate::mcp::ToolPluginProvenance;
 use crate::rmcp_client::AsyncManagedClient;
@@ -349,7 +348,6 @@ impl McpConnectionManager {
         tool_plugin_provenance: ToolPluginProvenance,
         auth: Option<&CodexAuth>,
         codex_apps_auth_manager: Option<Arc<AuthManager>>,
-        elicitation_reviewer: Option<ElicitationReviewerHandle>,
         elicitation_lifecycle: Option<crate::ElicitationLifecycle>,
         elicitation_router: ElicitationRequestRouter,
         previous_manager: Option<&McpConnectionManager>,
@@ -394,7 +392,6 @@ impl McpConnectionManager {
             ElicitationRequestManager::new(
                 approval_policy.value(),
                 initial_permission_profile,
-                elicitation_reviewer,
                 elicitation_lifecycle,
                 elicitation_router,
             )
@@ -666,7 +663,6 @@ impl McpConnectionManager {
             elicitation_requests: ElicitationRequestManager::new(
                 approval_policy.value(),
                 permission_profile.clone(),
-                /*reviewer*/ None,
                 /*lifecycle*/ None,
                 ElicitationRequestRouter::default(),
             ),
@@ -707,7 +703,10 @@ impl McpConnectionManager {
                 .clients
                 .get(CODEX_APPS_MCP_SERVER_NAME)
                 .and_then(|client| client.codex_apps_tools_cache_context.as_ref())
-                .map_or(0, crate::codex_apps_cache::CodexAppsToolsCacheContext::content_revision)
+                .map_or(
+                    0,
+                    crate::codex_apps_cache::CodexAppsToolsCacheContext::content_revision,
+                )
     }
 
     pub fn shutdown_started(&self) -> bool {

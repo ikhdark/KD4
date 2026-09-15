@@ -48,6 +48,8 @@ AGENTS.override.md
 .ruff_cache/
 *.tsbuildinfo
 /target/
+# Cargo output from repository-relative target paths run inside codex-rs.
+/codex-rs/codex-rs/target/
 *.pdb
 
 # logs

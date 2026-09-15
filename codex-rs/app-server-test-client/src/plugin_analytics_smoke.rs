@@ -366,7 +366,9 @@ pub(super) fn wait_until_capture_is_ready(path: &Path) -> Result<()> {
                 path.display()
             );
         }
-        thread::sleep(CAPTURE_POLL_INTERVAL);
+        thread::sleep(
+            CAPTURE_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
 }
 
@@ -390,7 +392,9 @@ fn wait_for_plugin_events(path: &Path, plugin_id: &str) -> Result<Vec<Value>> {
                     .collect::<Vec<_>>()
             );
         }
-        thread::sleep(CAPTURE_POLL_INTERVAL);
+        thread::sleep(
+            CAPTURE_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
 }
 
@@ -627,7 +631,7 @@ mod deadline_tests {
                     "modelProvider":MOCK_PROVIDER_ID, "createdAt":0, "updatedAt":0, "status":{"type":"idle"},
                     "cwd":temp.path(), "cliVersion":"test", "source":"exec", "turns":[]},
                 "model":MOCK_MODEL_SLUG, "modelProvider":MOCK_PROVIDER_ID, "cwd":temp.path(),
-                "approvalPolicy":"never", "approvalsReviewer":"user", "sandbox":{"type":"dangerFullAccess"}
+                "approvalPolicy":"never", "sandbox":{"type":"dangerFullAccess"}
             });
             // This is the external peer's wire response; the production client performs its own decode.
             let _: codex_app_server_protocol::ThreadStartResponse =

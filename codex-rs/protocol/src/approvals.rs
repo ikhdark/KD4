@@ -3,9 +3,7 @@ use crate::models::AdditionalPermissionProfile;
 use crate::parse_command::ParsedCommand;
 use crate::protocol::FileChange;
 use crate::protocol::ReviewDecision;
-use crate::request_permissions::RequestPermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -68,136 +66,10 @@ pub enum NetworkPolicyRuleAction {
     Deny,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "lowercase")]
-pub enum GuardianRiskLevel {
-    Low,
-    Medium,
-    High,
-    Critical,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "lowercase")]
-pub enum GuardianUserAuthorization {
-    Unknown,
-    Low,
-    Medium,
-    High,
-}
-
-/// Final allow/deny outcome returned by the guardian reviewer.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "lowercase")]
-pub enum GuardianAssessmentOutcome {
-    Allow,
-    Deny,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "snake_case")]
-pub enum GuardianAssessmentStatus {
-    InProgress,
-    Approved,
-    Denied,
-    TimedOut,
-    Aborted,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "snake_case")]
-pub enum GuardianAssessmentDecisionSource {
-    Agent,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "snake_case")]
-pub enum GuardianCommandSource {
-    Shell,
-    UnifiedExec,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
-#[serde(tag = "type", rename_all = "snake_case")]
-#[ts(tag = "type", rename_all = "snake_case")]
-pub enum GuardianAssessmentAction {
-    Command {
-        source: GuardianCommandSource,
-        command: String,
-        cwd: LegacyAppPathString,
-    },
-    Execve {
-        source: GuardianCommandSource,
-        program: String,
-        argv: Vec<String>,
-        cwd: LegacyAppPathString,
-    },
-    ApplyPatch {
-        cwd: LegacyAppPathString,
-        files: Vec<LegacyAppPathString>,
-    },
-    NetworkAccess {
-        target: String,
-        host: String,
-        protocol: NetworkApprovalProtocol,
-        port: u16,
-    },
-    McpToolCall {
-        server: String,
-        tool_name: String,
-        connector_id: Option<String>,
-        connector_name: Option<String>,
-        tool_title: Option<String>,
-    },
-    RequestPermissions {
-        reason: Option<String>,
-        permissions: RequestPermissionProfile,
-    },
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 pub struct NetworkPolicyAmendment {
     pub host: String,
     pub action: NetworkPolicyRuleAction,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
-pub struct GuardianAssessmentEvent {
-    /// Stable identifier for this guardian review lifecycle.
-    pub id: String,
-    /// Thread item being reviewed, when the review maps to a concrete item.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub target_item_id: Option<String>,
-    /// Turn ID that this assessment belongs to.
-    /// Uses `#[serde(default)]` for backwards compatibility.
-    #[serde(default)]
-    pub turn_id: String,
-    #[serde(default)]
-    #[ts(type = "number")]
-    pub started_at_ms: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional, type = "number")]
-    pub completed_at_ms: Option<i64>,
-    pub status: GuardianAssessmentStatus,
-    /// Coarse risk label. Omitted while the assessment is in progress.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub risk_level: Option<GuardianRiskLevel>,
-    /// How directly the transcript authorizes the reviewed action.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub user_authorization: Option<GuardianUserAuthorization>,
-    /// Human-readable explanation of the final assessment. Omitted while in progress.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub rationale: Option<String>,
-    /// Source that produced the terminal assessment decision.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub decision_source: Option<GuardianAssessmentDecisionSource>,
-    /// Canonical action payload that was reviewed.
-    pub action: GuardianAssessmentAction,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
@@ -452,8 +324,6 @@ pub struct ApplyPatchApprovalRequestEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_utils_absolute_path::test_support::PathBufExt;
-    use codex_utils_absolute_path::test_support::test_path_buf;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -499,26 +369,6 @@ mod tests {
                 "elicitationId": "elicitation-1",
                 "_meta": {"source": "server"},
             })
-        );
-    }
-
-    #[test]
-    fn guardian_assessment_action_deserializes_command_shape() {
-        let action: GuardianAssessmentAction = serde_json::from_value(serde_json::json!({
-            "type": "command",
-            "source": "shell",
-            "command": "rm -rf /tmp/guardian",
-            "cwd": test_path_buf("/tmp"),
-        }))
-        .expect("guardian action");
-
-        assert_eq!(
-            action,
-            GuardianAssessmentAction::Command {
-                source: GuardianCommandSource::Shell,
-                command: "rm -rf /tmp/guardian".to_string(),
-                cwd: test_path_buf("/tmp").abs().into(),
-            }
         );
     }
 }

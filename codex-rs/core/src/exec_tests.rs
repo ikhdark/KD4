@@ -1179,7 +1179,7 @@ fn windows_restricted_token_rejects_split_only_filesystem_policies() {
 }
 
 #[test]
-fn windows_restricted_token_rejects_root_write_read_only_carveouts() {
+fn windows_restricted_token_supports_root_write_read_only_carveouts() {
     let temp_dir = tempfile::TempDir::new().expect("tempdir");
     let docs = temp_dir.path().join("docs");
     std::fs::create_dir_all(&docs).expect("create docs");
@@ -1203,17 +1203,21 @@ fn windows_restricted_token_rejects_root_write_read_only_carveouts() {
         NetworkSandboxPolicy::Restricted,
     );
 
+    let docs = dunce::canonicalize(&docs).expect("canonical docs").abs();
     assert_eq!(
-        unsupported_windows_restricted_token_sandbox_reason(
+        resolve_windows_restricted_token_filesystem_overrides(
             SandboxType::WindowsRestrictedToken,
             &permission_profile,
             &temp_dir.path().abs(),
             WindowsSandboxLevel::RestrictedToken,
         ),
-        Some(
-            "windows unelevated restricted-token sandbox cannot enforce split writable root sets directly; refusing to run unsandboxed"
-                .to_string()
-        )
+        Ok(Some(WindowsSandboxFilesystemOverrides {
+            read_roots_override: None,
+            read_roots_include_platform_defaults: false,
+            write_roots_override: None,
+            additional_deny_read_paths: vec![],
+            additional_deny_write_paths: vec![docs],
+        }))
     );
 }
 
@@ -1577,20 +1581,57 @@ fn windows_elevated_rejects_reopened_writable_descendants() {
     );
 }
 
-#[test]
-fn process_exec_tool_call_uses_platform_sandbox_for_network_only_restrictions() {
-    let expected = codex_sandboxing::get_platform_sandbox(/*windows_sandbox_enabled*/ false)
-        .unwrap_or(SandboxType::None);
-
-    assert_eq!(
-        select_process_exec_tool_sandbox_type(
-            &FileSystemSandboxPolicy::unrestricted(),
-            NetworkSandboxPolicy::Restricted,
-            codex_protocol::config_types::WindowsSandboxLevel::Disabled,
-            /*enforce_managed_network*/ false,
-        ),
-        expected
+#[cfg(windows)]
+#[tokio::test]
+async fn process_exec_tool_call_rejects_unavailable_sandbox_without_spawning() -> Result<()> {
+    let temp_dir = tempfile::TempDir::new()?;
+    let cwd = temp_dir.path().abs();
+    let marker = temp_dir.path().join("unexpected-process.txt");
+    let permission_profile = PermissionProfile::from_runtime_permissions(
+        &FileSystemSandboxPolicy::unrestricted(),
+        NetworkSandboxPolicy::Restricted,
     );
+    let error = process_exec_tool_call(
+        ExecParams {
+            command: vec![
+                "cmd.exe".to_string(),
+                "/d".to_string(),
+                "/c".to_string(),
+                format!("echo unexpected execution > \"{}\"", marker.display()),
+            ],
+            codex_home: cwd.clone(),
+            cwd: cwd.clone(),
+            expiration: ExecExpiration::DefaultTimeout,
+            capture_policy: ExecCapturePolicy::ShellTool,
+            env: std::env::vars().collect(),
+            network: None,
+            network_environment_id: None,
+            sandbox_permissions: SandboxPermissions::UseDefault,
+            windows_sandbox_level: WindowsSandboxLevel::Disabled,
+            windows_sandbox_private_desktop: false,
+            justification: None,
+            arg0: None,
+        },
+        &permission_profile,
+        &cwd,
+        &[],
+        None,
+    )
+    .await
+    .expect_err("network restrictions must not fall back to unsandboxed execution");
+    assert!(
+        matches!(error, CodexErr::Io(ref error) if error.kind() == std::io::ErrorKind::PermissionDenied)
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("no sandbox backend is available")
+    );
+    assert!(
+        !marker.exists(),
+        "rejected execution must not create a file"
+    );
+    Ok(())
 }
 
 #[tokio::test]

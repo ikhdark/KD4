@@ -112,7 +112,6 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_use_current_auth_manager_token(
         ToolPluginProvenance::default(),
         Some(&expected_auth),
         Some(Arc::clone(&auth_manager)),
-        /*elicitation_reviewer*/ None,
         /*elicitation_lifecycle*/ None,
         ElicitationRequestRouter::default(),
         /*previous_manager*/ None,

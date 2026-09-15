@@ -23,12 +23,9 @@ from .v2_all import FileChangePatchUpdatedNotification
 from .v2_all import FsChangedNotification
 from .v2_all import FuzzyFileSearchSessionCompletedNotification
 from .v2_all import FuzzyFileSearchSessionUpdatedNotification
-from .v2_all import GuardianWarningNotification
 from .v2_all import HookCompletedNotification
 from .v2_all import HookStartedNotification
 from .v2_all import ItemCompletedNotification
-from .v2_all import ItemGuardianApprovalReviewCompletedNotification
-from .v2_all import ItemGuardianApprovalReviewStartedNotification
 from .v2_all import ItemStartedNotification
 from .v2_all import McpServerOauthLoginCompletedNotification
 from .v2_all import McpServerStartupCompletedNotification
@@ -86,12 +83,9 @@ GeneratedNotificationPayload: TypeAlias = (
     | FsChangedNotification
     | FuzzyFileSearchSessionCompletedNotification
     | FuzzyFileSearchSessionUpdatedNotification
-    | GuardianWarningNotification
     | HookCompletedNotification
     | HookStartedNotification
     | ItemCompletedNotification
-    | ItemGuardianApprovalReviewCompletedNotification
-    | ItemGuardianApprovalReviewStartedNotification
     | ItemStartedNotification
     | McpServerOauthLoginCompletedNotification
     | McpServerStartupCompletedNotification
@@ -147,12 +141,9 @@ NOTIFICATION_MODELS: dict[str, type[BaseModel]] = {
     "fs/changed": FsChangedNotification,
     "fuzzyFileSearch/sessionCompleted": FuzzyFileSearchSessionCompletedNotification,
     "fuzzyFileSearch/sessionUpdated": FuzzyFileSearchSessionUpdatedNotification,
-    "guardianWarning": GuardianWarningNotification,
     "hook/completed": HookCompletedNotification,
     "hook/started": HookStartedNotification,
     "item/agentMessage/delta": AgentMessageDeltaNotification,
-    "item/autoApprovalReview/completed": ItemGuardianApprovalReviewCompletedNotification,
-    "item/autoApprovalReview/started": ItemGuardianApprovalReviewStartedNotification,
     "item/commandExecution/outputDelta": CommandExecutionOutputDeltaNotification,
     "item/commandExecution/terminalInteraction": TerminalInteractionNotification,
     "item/completed": ItemCompletedNotification,
@@ -205,8 +196,6 @@ DIRECT_TURN_ID_NOTIFICATION_TYPES: tuple[type[BaseModel], ...] = (
     HookCompletedNotification,
     HookStartedNotification,
     ItemCompletedNotification,
-    ItemGuardianApprovalReviewCompletedNotification,
-    ItemGuardianApprovalReviewStartedNotification,
     ItemStartedNotification,
     McpToolCallProgressNotification,
     ModelReroutedNotification,

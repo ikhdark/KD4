@@ -27,29 +27,12 @@ use codex_protocol::protocol::EventMsg;
 use codex_rmcp_client::Elicitation;
 use codex_rmcp_client::ElicitationResponse;
 use codex_rmcp_client::SendElicitation;
-use futures::future::BoxFuture;
 use futures::future::FutureExt;
 use rmcp::model::ElicitationAction;
 use rmcp::model::RequestId;
 use tokio::sync::oneshot;
 
 static NEXT_ELICITATION_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Debug, Clone)]
-pub struct ElicitationReviewRequest {
-    pub server_name: String,
-    pub request_id: RequestId,
-    pub elicitation: Elicitation,
-}
-
-pub trait ElicitationReviewer: Send + Sync {
-    fn review(
-        &self,
-        request: ElicitationReviewRequest,
-    ) -> BoxFuture<'static, Result<Option<ElicitationResponse>>>;
-}
-
-pub type ElicitationReviewerHandle = Arc<dyn ElicitationReviewer>;
 
 /// Holds an owner-provided registration while an MCP elicitation is waiting for a response.
 #[derive(Clone)]
@@ -126,7 +109,6 @@ pub(crate) struct ElicitationRequestManager {
     pub(crate) approval_policy: Arc<StdMutex<AskForApproval>>,
     pub(crate) permission_profile: Arc<StdMutex<PermissionProfile>>,
     auto_deny: Arc<StdMutex<bool>>,
-    reviewer: Option<ElicitationReviewerHandle>,
     lifecycle: Option<ElicitationLifecycle>,
 }
 
@@ -134,7 +116,6 @@ impl ElicitationRequestManager {
     pub(crate) fn new(
         approval_policy: AskForApproval,
         permission_profile: PermissionProfile,
-        reviewer: Option<ElicitationReviewerHandle>,
         lifecycle: Option<ElicitationLifecycle>,
         router: ElicitationRequestRouter,
     ) -> Self {
@@ -143,7 +124,6 @@ impl ElicitationRequestManager {
             approval_policy: Arc::new(StdMutex::new(approval_policy)),
             permission_profile: Arc::new(StdMutex::new(permission_profile)),
             auto_deny: Arc::new(StdMutex::new(false)),
-            reviewer,
             lifecycle,
         }
     }
@@ -183,16 +163,14 @@ impl ElicitationRequestManager {
         let approval_policy = self.approval_policy.clone();
         let permission_profile = self.permission_profile.clone();
         let auto_deny = self.auto_deny.clone();
-        let reviewer = self.reviewer.clone();
         let lifecycle = self.lifecycle.clone();
-        Box::new(move |id, elicitation| {
+        Box::new(move |_id, elicitation| {
             let router = router.clone();
             let tx_event = tx_event.clone();
             let server_name = server_name.clone();
             let approval_policy = approval_policy.clone();
             let permission_profile = permission_profile.clone();
             let auto_deny = auto_deny.clone();
-            let reviewer = reviewer.clone();
             let lifecycle = lifecycle.clone();
             async move {
                 let auto_deny = auto_deny
@@ -234,17 +212,6 @@ impl ElicitationRequestManager {
                         content: None,
                         meta: None,
                     });
-                }
-
-                if let Some(reviewer) = reviewer.as_ref() {
-                    let request = ElicitationReviewRequest {
-                        server_name: server_name.clone(),
-                        request_id: id.clone(),
-                        elicitation: elicitation.clone(),
-                    };
-                    if let Some(response) = reviewer.review(request).await? {
-                        return Ok(response);
-                    }
                 }
 
                 let public_request_id = format!(

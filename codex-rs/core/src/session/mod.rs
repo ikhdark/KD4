@@ -95,7 +95,6 @@ use codex_protocol::approvals::ElicitationRequestEvent;
 use codex_protocol::approvals::ExecPolicyAmendment;
 use codex_protocol::approvals::NetworkPolicyAmendment;
 use codex_protocol::approvals::NetworkPolicyRuleAction;
-use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
@@ -257,7 +256,6 @@ use self::handlers::submission_loop;
 pub(crate) use self::input_queue::InputQueueActivity;
 pub(crate) use self::input_queue::TurnInput;
 pub(crate) use self::input_queue::TurnInputQueue;
-pub(crate) use self::mcp::review_guardian_mcp_elicitation;
 pub(crate) use self::mcp_runtime::McpManagerLifecycle;
 pub use self::mcp_runtime::McpRuntimeSnapshot;
 use self::review::spawn_review_thread;
@@ -495,7 +493,6 @@ fn retarget_previous_turn_settings_for_provider(
 use crate::SkillMetadata;
 use crate::SkillsService;
 use crate::exec_policy::ExecPolicyUpdateError;
-use crate::guardian::GuardianReviewSessionManager;
 use crate::mcp::McpManager;
 use crate::network_policy_decision::execpolicy_network_rule_amendment;
 use crate::rollout::map_session_init_error;
@@ -751,12 +748,7 @@ impl Codex {
         config
             .startup_warnings
             .extend(user_instruction_provider_warnings);
-        let exec_policy = if crate::guardian::is_guardian_reviewer_source(&session_source) {
-            // Guardian review should rely on the built-in shell safety checks,
-            // not on caller-provided exec-policy rules that could shape the
-            // reviewer or silently auto-approve commands.
-            Arc::new(ExecPolicyManager::default())
-        } else if let Some(exec_policy) = &inherited_exec_policy {
+        let exec_policy = if let Some(exec_policy) = &inherited_exec_policy {
             Arc::clone(exec_policy)
         } else {
             Arc::new(
@@ -852,7 +844,6 @@ impl Codex {
             base_instructions,
             compact_prompt: config.compact_prompt.clone(),
             approval_policy: config.permissions.approval_policy.clone(),
-            approvals_reviewer: config.approvals_reviewer,
             permission_profile_state: session_permission_profile_state_from_config(&config)?,
             windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
             environments: TurnEnvironmentSelections::new(
@@ -1656,7 +1647,6 @@ impl Session {
                 service_tier: Some(snapshot.service_tier),
                 developer_instructions: Some(snapshot.developer_instructions),
                 approval_policy: snapshot.approval_policy,
-                approvals_reviewer: snapshot.approvals_reviewer,
                 permission_profile: snapshot.permission_profile,
                 active_permission_profile: Some(snapshot.active_permission_profile),
                 environments: Some(snapshot.environments),
@@ -2413,6 +2403,17 @@ impl Session {
                     .with_user_config(&config_toml_path, user_config)
                     .into();
             }
+            if let Some(value) = config
+                .config_layer_stack
+                .effective_config()
+                .get("tool_suggest")
+                && let Err(err) = value
+                    .clone()
+                    .try_into::<codex_config::types::ToolSuggestConfig>()
+            {
+                warn!("failed to parse tool_suggest while reloading layer: {err}");
+                return;
+            }
             config.tool_suggest =
                 resolve_tool_suggest_config_from_layer_stack(&config.config_layer_stack);
             config
@@ -2920,17 +2921,6 @@ impl Session {
             .map(|turn| Arc::clone(&turn.reasoning_policy_recorder))
     }
 
-    async fn active_turn_context_and_cancellation_token(
-        &self,
-    ) -> Option<(Arc<TurnContext>, CancellationToken)> {
-        let active = self.active_turn.lock().await;
-        let task = active.as_ref()?.task.as_ref()?;
-        Some((
-            Arc::clone(&task.turn_context),
-            task.cancellation_token.child_token(),
-        ))
-    }
-
     pub(crate) async fn record_execpolicy_amendment_message(
         &self,
         sub_id: &str,
@@ -3225,7 +3215,6 @@ impl Session {
                 return Some(RequestPermissionsResponse {
                     permissions: RequestPermissionProfile::default(),
                     scope: PermissionGrantScope::Turn,
-                    strict_auto_review: false,
                 });
             }
             AskForApproval::Granular(granular_config)
@@ -3234,7 +3223,6 @@ impl Session {
                 return Some(RequestPermissionsResponse {
                     permissions: RequestPermissionProfile::default(),
                     scope: PermissionGrantScope::Turn,
-                    strict_auto_review: false,
                 });
             }
             AskForApproval::OnRequest
@@ -3279,97 +3267,8 @@ impl Session {
             return Some(RequestPermissionsResponse {
                 permissions: RequestPermissionProfile::default(),
                 scope: PermissionGrantScope::Turn,
-                strict_auto_review: false,
             });
         };
-
-        if crate::guardian::routes_approval_to_guardian(turn_context.as_ref()) {
-            let originating_turn_state = {
-                let active = self.active_turn.lock().await;
-                if active
-                    .as_ref()
-                    .is_some_and(|active| active_turn_has_other_id(active, &turn_context.sub_id))
-                {
-                    return None;
-                }
-                active.as_ref().map(|active| Arc::clone(&active.turn_state))
-            };
-            let review_id = crate::guardian::new_guardian_review_id();
-            let session = Arc::clone(self);
-            let turn = Arc::clone(turn_context);
-            let request = crate::guardian::GuardianApprovalRequest::RequestPermissions {
-                id: call_id,
-                turn_id: turn_context.sub_id.clone(),
-                reason: args.reason,
-                permissions: requested_permissions.clone(),
-            };
-            let review_rx = crate::guardian::spawn_approval_request_review(
-                session,
-                turn,
-                review_id,
-                request,
-                /*retry_reason*/ None,
-                codex_analytics::GuardianApprovalRequestSource::MainTurn,
-                cancellation_token.as_ref().clone(),
-            );
-            let decision = tokio::select! {
-                biased;
-                _ = cancellation_token.cancelled() => return None,
-                decision = review_rx => decision,
-            };
-            let response = match decision {
-                ReviewDecision::Approved | ReviewDecision::ApprovedExecpolicyAmendment { .. } => {
-                    RequestPermissionsResponse {
-                        permissions: requested_permissions.clone(),
-                        scope: PermissionGrantScope::Turn,
-                        strict_auto_review: false,
-                    }
-                }
-                ReviewDecision::ApprovedForSession => RequestPermissionsResponse {
-                    permissions: requested_permissions.clone(),
-                    scope: PermissionGrantScope::Session,
-                    strict_auto_review: false,
-                },
-                ReviewDecision::NetworkPolicyAmendment {
-                    network_policy_amendment,
-                } => match network_policy_amendment.action {
-                    NetworkPolicyRuleAction::Allow => RequestPermissionsResponse {
-                        permissions: requested_permissions.clone(),
-                        scope: PermissionGrantScope::Turn,
-                        strict_auto_review: false,
-                    },
-                    NetworkPolicyRuleAction::Deny => RequestPermissionsResponse {
-                        permissions: RequestPermissionProfile::default(),
-                        scope: PermissionGrantScope::Turn,
-                        strict_auto_review: false,
-                    },
-                },
-                ReviewDecision::Abort | ReviewDecision::Denied | ReviewDecision::TimedOut => {
-                    RequestPermissionsResponse {
-                        permissions: RequestPermissionProfile::default(),
-                        scope: PermissionGrantScope::Turn,
-                        strict_auto_review: false,
-                    }
-                }
-            };
-            let response = Self::normalize_request_permissions_response(
-                requested_permissions,
-                response,
-                &environment.cwd,
-            );
-            if !self
-                .record_granted_request_permissions_for_turn(
-                    &response,
-                    &approval_scope_id,
-                    originating_turn_state.as_ref(),
-                    &cancellation_token,
-                )
-                .await
-            {
-                return None;
-            }
-            return Some(response);
-        }
 
         let _elicitation = self.services.elicitations.register();
         let (tx_response, rx_response) = oneshot::channel();
@@ -3465,7 +3364,6 @@ impl Session {
             return Some(RequestPermissionsResponse {
                 permissions: RequestPermissionProfile::default(),
                 scope: PermissionGrantScope::Turn,
-                strict_auto_review: false,
             });
         };
         let mut environment = turn_environment.selection();
@@ -3652,14 +3550,6 @@ impl Session {
         response: RequestPermissionsResponse,
         cwd: &PathUri,
     ) -> RequestPermissionsResponse {
-        if response.strict_auto_review && matches!(response.scope, PermissionGrantScope::Session) {
-            return RequestPermissionsResponse {
-                permissions: RequestPermissionProfile::default(),
-                scope: PermissionGrantScope::Turn,
-                strict_auto_review: false,
-            };
-        }
-
         if response.permissions.is_empty() {
             return response;
         }
@@ -3672,7 +3562,6 @@ impl Session {
             )
             .into(),
             scope: response.scope,
-            strict_auto_review: response.strict_auto_review,
         }
     }
 
@@ -3699,9 +3588,6 @@ impl Session {
                     let permissions: UriAdditionalPermissionProfile =
                         response.permissions.clone().into();
                     ts.record_granted_permissions(approval_scope_id, permissions);
-                    if response.strict_auto_review {
-                        ts.enable_strict_auto_review();
-                    }
                 }
             }
             PermissionGrantScope::Session => {
@@ -3730,19 +3616,6 @@ impl Session {
         let active = active.as_ref()?;
         let ts = active.turn_state.lock().await;
         ts.granted_permissions(approval_scope_id)
-    }
-
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "active turn reads must stay consistent with the matching turn state"
-    )]
-    pub(crate) async fn strict_auto_review_enabled_for_turn(&self) -> bool {
-        let active = self.active_turn.lock().await;
-        let Some(active) = active.as_ref() else {
-            return false;
-        };
-        let ts = active.turn_state.lock().await;
-        ts.strict_auto_review_enabled()
     }
 
     pub(crate) async fn granted_session_permissions(
@@ -4855,7 +4728,6 @@ impl Session {
                     &turn_context.permission_profile,
                     turn_context.approval_policy.value(),
                     ApprovalPromptContext::new(
-                        turn_context.config.approvals_reviewer,
                         turn_context
                             .model_info
                             .model_messages
@@ -4876,8 +4748,7 @@ impl Session {
                 .render(),
             );
         }
-        let separate_guardian_developer_message =
-            crate::guardian::is_guardian_reviewer_source(&session_source);
+
         let configured_developer_instructions =
             crate::stable_context::configured_developer_instructions_sections(
                 turn_context
@@ -4885,12 +4756,10 @@ impl Session {
                     .as_deref()
                     .filter(|instructions| !instructions.is_empty()),
             );
-        // Keep the guardian policy prompt out of the aggregated developer bundle so it
-        // stays isolated as its own top-level developer message for guardian subagents.
-        if !separate_guardian_developer_message {
-            developer_sections.extend(configured_developer_instructions.iter().cloned());
-            stable_developer_sections.extend(configured_developer_instructions.iter().cloned());
-        }
+
+        developer_sections.extend(configured_developer_instructions.iter().cloned());
+        stable_developer_sections.extend(configured_developer_instructions.iter().cloned());
+
         // Add developer instructions from collaboration_mode if they exist and are non-empty
         if turn_context.config.include_collaboration_mode_instructions
             && let Some(collab_instructions) =
@@ -5044,16 +4913,7 @@ impl Session {
         {
             items.push(contextual_user_message);
         }
-        // Emit the guardian policy prompt as a separate developer item so the guardian
-        // subagent sees a distinct, easy-to-audit instruction block.
-        if separate_guardian_developer_message
-            && let Some(guardian_developer_message) =
-                crate::context_manager::updates::build_developer_update_item(
-                    configured_developer_instructions.clone(),
-                )
-        {
-            items.push(guardian_developer_message);
-        }
+
         // New context windows and compaction install these items directly into replacement history.
         for item in &mut items {
             crate::stable_context::mark_trusted_stable_context_item(item);
@@ -5072,14 +4932,7 @@ impl Session {
                     crate::context_manager::updates::build_developer_update_item(vec![section])
                 }),
         );
-        if separate_guardian_developer_message
-            && let Some(guardian_developer_message) =
-                crate::context_manager::updates::build_developer_update_item(
-                    configured_developer_instructions,
-                )
-        {
-            stable_items.push(guardian_developer_message);
-        }
+
         if let Some(usage_hint_sections) = multi_agent_v2_usage_hint_sections
             && let Some(usage_hint_message) =
                 crate::context_manager::updates::build_developer_update_item(usage_hint_sections)

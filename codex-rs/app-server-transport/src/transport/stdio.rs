@@ -687,7 +687,10 @@ mod tests {
                         acknowledged = true;
                         break;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    std::thread::sleep(
+                        std::time::Duration::from_millis(10)
+                            .min(ack_deadline.saturating_duration_since(Instant::now())),
+                    );
                 }
             } else {
                 assert!(
@@ -704,7 +707,10 @@ mod tests {
                 if Instant::now() >= deadline {
                     break None;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                std::thread::sleep(
+                    std::time::Duration::from_millis(10)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
             };
             if status.is_none() {
                 let _ = child.kill();

@@ -1,15 +1,22 @@
 use super::builds;
-use super::environment::{BASE_CONFIG, Environment};
+use super::environment::BASE_CONFIG;
+use super::environment::Environment;
 use super::feature_overrides;
-use super::provenance::{
-    self, FileIdentity, git, materialize_commit, read_json, reset_workspace, write_json,
-};
+use super::provenance::FileIdentity;
+use super::provenance::git;
+use super::provenance::materialize_commit;
+use super::provenance::read_json;
+use super::provenance::reset_workspace;
+use super::provenance::write_json;
+use super::provenance::{self};
 use super::resolve_source;
 use crate::schedule::Variant;
-use serde_json::{Value, json};
+use serde_json::Value;
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
 fn repository(parent: &Path, name: &str, contents: &str) -> PathBuf {
     let root = parent.join(name);
@@ -613,7 +620,7 @@ fn base_configuration_contains_exactly_the_approved_settings() {
     let actual = serde_json::to_value(config).unwrap();
     let expected = json!({
         "approval_policy":"never", "sandbox_mode":"danger-full-access", "personality":"pragmatic",
-        "model":"gpt-6-astra", "model_reasoning_effort":"high", "approvals_reviewer":"user",
+        "model":"gpt-6-astra", "model_reasoning_effort":"high",
         "plan_mode_reasoning_effort":"ultra", "model_verbosity":"low", "model_reasoning_summary":"concise",
         "model_auto_compact_token_limit":129000, "model_auto_compact_token_limit_scope":"total"
     });
@@ -635,24 +642,46 @@ fn project_configuration_comparison_records_explicit_differences_per_arm_without
         (Variant::ForkOn, vec!["features.kd4_runtime=true".into()]),
         (Variant::Reference, vec![]),
     ]);
-    assert!(ProjectConfigComparison::capture(temp.path(), BASE_CONFIG, &overrides).unwrap().is_none());
+    assert!(
+        ProjectConfigComparison::capture(temp.path(), BASE_CONFIG, &overrides)
+            .unwrap()
+            .is_none()
+    );
     std::fs::create_dir(temp.path().join(".codex")).unwrap();
     let path = temp.path().join(".codex/config.toml");
     std::fs::write(&path, "approval_policy = 'never'\nmodel = 'private-model-name'\nallow_login_shell = false\n[features]\nkd4_runtime = true\n[reasoning_phase_efforts]\nverify = 'low'\n").unwrap();
-    let comparison = ProjectConfigComparison::capture(temp.path(), BASE_CONFIG, &overrides).unwrap().unwrap();
+    let comparison = ProjectConfigComparison::capture(temp.path(), BASE_CONFIG, &overrides)
+        .unwrap()
+        .unwrap();
     let off = &comparison.by_variant[&Variant::ForkOff];
     assert_eq!(off.changed, ["features.kd4_runtime", "model"]);
-    assert_eq!(off.project_only, ["allow_login_shell", "reasoning_phase_efforts.verify"]);
+    assert_eq!(
+        off.project_only,
+        ["allow_login_shell", "reasoning_phase_efforts.verify"]
+    );
     assert_eq!(off.matching_keys, 1);
     assert!(off.benchmark_only.contains(&"personality".into()));
     assert_eq!(comparison.by_variant[&Variant::ForkOn].changed, ["model"]);
     assert_eq!(comparison.by_variant[&Variant::ForkOn].matching_keys, 2);
-    assert_eq!(comparison.by_variant[&Variant::Reference].project_only, ["allow_login_shell", "features.kd4_runtime", "reasoning_phase_efforts.verify"]);
+    assert_eq!(
+        comparison.by_variant[&Variant::Reference].project_only,
+        [
+            "allow_login_shell",
+            "features.kd4_runtime",
+            "reasoning_phase_efforts.verify"
+        ]
+    );
     let frozen = serde_json::to_string(&comparison).unwrap();
     assert!(!frozen.contains("private-model-name"));
     std::fs::write(&path, "model = 'later-change'\n").unwrap();
     assert_eq!(serde_json::to_string(&comparison).unwrap(), frozen);
-    assert_ne!(ProjectConfigComparison::capture(temp.path(), BASE_CONFIG, &overrides).unwrap().unwrap().sha256, comparison.sha256);
+    assert_ne!(
+        ProjectConfigComparison::capture(temp.path(), BASE_CONFIG, &overrides)
+            .unwrap()
+            .unwrap()
+            .sha256,
+        comparison.sha256
+    );
 }
 
 #[test]
@@ -1075,4 +1104,119 @@ fn reset_restores_executable_bits_even_when_content_is_unchanged() {
             & 0o777,
         0o755
     );
+}
+
+#[test]
+fn loaded_manifest_rejects_missing_execution_inputs_before_side_effects() {
+    use super::MANIFEST_VERSION;
+    use super::Prepared;
+    use crate::schedule::Mode;
+    use crate::schedule::Segment;
+    use crate::schedule::schedule;
+
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let sentinel = workspace.join("preserve.txt");
+    fs::write(&sentinel, "existing workspace").unwrap();
+    let identity = json!({"path": sentinel, "sha256": "unused for structural validation"});
+    let source = json!({"origin":workspace,"selection":"HEAD","revision":"fixture",
+        "tree":"fixture","checkout":workspace,"upstream":false});
+    let build = json!({"revision":"fixture","source":workspace,"targetDirectory":workspace,
+        "settings":{},"lockfile":identity,"cargoConfig":null,
+        "executables":{"codex-app-server":identity},"log":sentinel,"cacheKey":"fixture",
+        "buildElapsedMs":0,"cacheReuseElapsedMs":null});
+    let schedule = schedule(Mode::Fast);
+    let fixtures: BTreeMap<_, _> = schedule
+        .iter()
+        .map(|attempt| {
+            let name = match attempt.segment {
+                Segment::Scripted => "scripted",
+                Segment::RealModel => attempt.workload.as_str(),
+            };
+            (
+                name,
+                json!({"snapshot":workspace,"sha256":"fixture","descriptor":null}),
+            )
+        })
+        .collect();
+    let builds: BTreeMap<_, _> = Variant::ALL
+        .into_iter()
+        .map(|variant| (variant.name(), build.clone()))
+        .collect();
+    let overrides: BTreeMap<_, _> = Variant::ALL
+        .into_iter()
+        .map(|variant| (variant.name(), Vec::<String>::new()))
+        .collect();
+    let manifest = json!({"schemaVersion":MANIFEST_VERSION,"id":"structural-fixture",
+        "directory":temp.path(),"repo":workspace,"mode":"fast","schedule":schedule,
+        "workspace":workspace,"workspaceLock":temp.path().join("workspace.lock"),
+        "additionalRoots":[],"runsDirectory":temp.path().join("runs"),
+        "importDirectory":temp.path().join("accepted"),"fork":source,"reference":source,
+        "builds":builds,"harness":identity,"harnessSources":identity,
+        "environment":{"variables":{},"tools":{"python":{"executable":identity,"version":"fixture"}},"rustToolchain":"fixture"},
+        "baseConfig":identity,"features":[],"featureInventory":identity,"overrides":overrides,
+        "fixtures":fixtures,"sharedInputs":workspace,"sharedSha256":"fixture",
+        "analyzer":identity,"analyzerFiles":[],"preparationMs":0,"budgets":{}});
+    let path = temp.path().join("prepared.json");
+    write_json(&path, &manifest).unwrap();
+    let loaded = Prepared::load(&path).unwrap();
+    assert_eq!(loaded.id, "structural-fixture");
+    assert_eq!(loaded.schedule, crate::schedule::schedule(Mode::Fast));
+
+    let mut omissions = Vec::new();
+    for variant in Variant::ALL {
+        let name = variant.name();
+        omissions.push((
+            "/overrides".to_owned(),
+            name.to_owned(),
+            format!("overrides for {name}"),
+        ));
+        omissions.push((
+            "/builds".to_owned(),
+            name.to_owned(),
+            format!("build for {name}"),
+        ));
+        omissions.push((
+            format!("/builds/{name}/executables"),
+            "codex-app-server".into(),
+            format!("codex-app-server executable for {name}"),
+        ));
+    }
+    for fixture in fixtures.keys() {
+        omissions.push((
+            "/fixtures".into(),
+            (*fixture).to_owned(),
+            format!("fixture {fixture}"),
+        ));
+    }
+    omissions.push((
+        "/environment/tools".into(),
+        "python".into(),
+        "python tool".into(),
+    ));
+    for (mapping, key, expected) in omissions {
+        let mut incomplete = manifest.clone();
+        assert!(
+            incomplete
+                .pointer_mut(&mapping)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove(&key)
+                .is_some()
+        );
+        write_json(&path, &incomplete).unwrap();
+        // execute is the normal run/compare boundary, before lock acquisition,
+        // provenance checks, workspace reset, or evidence publication.
+        let error = crate::runner::execute(&path, None, None).unwrap_err();
+        assert!(
+            format!("{error:#}").contains(&expected),
+            "{mapping}/{key}: {error:#}"
+        );
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "existing workspace");
+        assert!(!temp.path().join("workspace.lock").exists());
+        assert!(!temp.path().join("runs").exists());
+        assert!(!temp.path().join("accepted").exists());
+    }
 }

@@ -338,3 +338,42 @@ prefix_rule(pattern=["powershell.exe"], decision="allow")
         assert!(Arc::ptr_eq(&manager.current(), &original_policy));
     });
 }
+
+#[cfg(windows)]
+#[tokio::test]
+async fn escaped_powershell_cmdlets_preserve_approval_requirements() {
+    for script in ["Remove-`Item sample -Force", "r`m sample -Force"] {
+        let requirement = exec_approval_requirement_for_command(ExecApprovalRequirementScenario {
+            policy_src: None,
+            // Omitting NoProfile exercises the normal raw-wrapper fallback.
+            command: vec!["powershell.exe".into(), "-Command".into(), script.into()],
+            approval_policy: AskForApproval::OnRequest,
+            permission_profile: PermissionProfile::read_only(),
+            sandbox_permissions: SandboxPermissions::UseDefault,
+            prefix_rule: None,
+        })
+        .await;
+        assert!(
+            matches!(requirement, ExecApprovalRequirement::NeedsApproval { .. }),
+            "escaped force deletion must require approval: {script}: {requirement:?}"
+        );
+    }
+
+    let benign = exec_approval_requirement_for_command(ExecApprovalRequirementScenario {
+        policy_src: None,
+        command: vec![
+            "powershell.exe".into(),
+            "-Command".into(),
+            "Get-Chil`dItem -Force".into(),
+        ],
+        approval_policy: AskForApproval::OnRequest,
+        permission_profile: PermissionProfile::read_only(),
+        sandbox_permissions: SandboxPermissions::UseDefault,
+        prefix_rule: None,
+    })
+    .await;
+    assert!(
+        matches!(benign, ExecApprovalRequirement::Skip { .. }),
+        "benign escaped command retains sandbox execution: {benign:?}"
+    );
+}

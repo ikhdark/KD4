@@ -1759,49 +1759,6 @@ async fn build_pure_pending_turn_plan(
         turn_context.originator.clone(),
     );
 
-    if crate::guardian::is_guardian_reviewer_source(&turn_context.session_source) {
-        let (first_router, prepared_context_update) = tokio::join!(
-            built_tools_for_pending_turn(
-                sess.as_ref(),
-                &step_context,
-                &[],
-                planning_generation,
-                cancellation_token
-            ),
-            sess.prepare_context_update(step_context.as_ref()),
-        );
-        let first_router = first_router?;
-        if sess.services.planning_generation() != planning_generation {
-            return Ok(PendingTurnPlanBuild::Stale);
-        }
-        let initial_context = !sess.has_reference_context_item().await;
-        let pending_token_estimate = estimate_pending_tokens(
-            input,
-            &[],
-            prepared_context_update.context_items(),
-            first_router.as_ref(),
-            initial_context,
-        );
-        let projected_prompt_pressure =
-            projected_prompt_pressure(sess, turn_context, pending_token_estimate).await;
-        let warnings = first_router.planning_warnings().to_vec();
-        return Ok(PendingTurnPlanBuild::Ready(Box::new(PendingTurnPlan {
-            planning_generation,
-            step_context,
-            prepared_context_update: Some(prepared_context_update),
-            first_router,
-            injection_items: Vec::new(),
-            explicitly_enabled_connectors: HashSet::new(),
-            projected_prompt_pressure,
-            mcp_dependency_effect: None,
-            warnings,
-            skill_plan: PlannedSkillInjections::default(),
-            tracking,
-            mentioned_apps: Vec::new(),
-            mentioned_plugins: Vec::new(),
-        })));
-    }
-
     // Read-only DAG roots P and E are independent. Extension contributors poll
     // concurrently internally and collect by registration index.
     let plugins_config_input = turn_context.config.plugins_config_input();
@@ -2112,24 +2069,19 @@ async fn stabilize_pending_turn_plan(
         if let Some(effect) = plan.mcp_dependency_effect.as_ref()
             && !mcp_dependency_effect_is_completed(completed_mcp_effect.as_ref(), &effect.id)
         {
-            let outcome = apply_mcp_dependency_effect(
-                sess,
-                turn_context,
-                cancellation_token,
-                effect,
-                Some(sess.mcp_elicitation_reviewer()),
-            )
-            .await
-            .map_err(|err| {
-                if cancellation_token.is_cancelled() {
-                    CodexErr::TurnAborted
-                } else {
-                    planning_failure_with_timing(
-                        turn_context,
-                        format!("effect `{}` failed: {err}", effect.id),
-                    )
-                }
-            })?;
+            let outcome =
+                apply_mcp_dependency_effect(sess, turn_context, cancellation_token, effect)
+                    .await
+                    .map_err(|err| {
+                        if cancellation_token.is_cancelled() {
+                            CodexErr::TurnAborted
+                        } else {
+                            planning_failure_with_timing(
+                                turn_context,
+                                format!("effect `{}` failed: {err}", effect.id),
+                            )
+                        }
+                    })?;
             let expected_inventory_keys = match outcome {
                 McpDependencyEffectOutcome::Skipped => None,
                 McpDependencyEffectOutcome::InventoryChanged {
@@ -2610,7 +2562,6 @@ async fn track_turn_resolved_config_analytics(
                 .as_deref()
                 .and_then(ServiceTier::from_request_value),
             approval_policy: turn_context.approval_policy.value(),
-            approvals_reviewer: turn_context.config.approvals_reviewer,
             sandbox_network_access: turn_context.network_sandbox_policy().is_enabled(),
             collaboration_mode: turn_context.collaboration_mode.mode,
             personality: turn_context.personality,
@@ -3105,9 +3056,7 @@ pub(crate) fn build_prompt(
         parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
         base_instructions,
         output_schema: turn_context.final_output_json_schema.clone(),
-        output_schema_strict: !crate::guardian::is_guardian_reviewer_source(
-            &turn_context.session_source,
-        ),
+        output_schema_strict: true,
     }
 }
 
@@ -3217,7 +3166,6 @@ impl RequestScaffold {
                 &step_context.turn.permission_profile,
                 step_context.turn.approval_policy.value(),
                 ApprovalPromptContext::new(
-                    step_context.turn.config.approvals_reviewer,
                     step_context
                         .turn
                         .model_info
@@ -3543,9 +3491,7 @@ fn build_projected_prompt_from_scaffold(
         parallel_tool_calls: step_context.turn.model_info.supports_parallel_tool_calls,
         base_instructions: scaffold.base_instructions.clone(),
         output_schema: step_context.turn.final_output_json_schema.clone(),
-        output_schema_strict: !crate::guardian::is_guardian_reviewer_source(
-            &step_context.turn.session_source,
-        ),
+        output_schema_strict: true,
     }
 }
 

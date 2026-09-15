@@ -5,11 +5,6 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CargoBinError {
-    #[error("failed to read current directory")]
-    CurrentDir {
-        #[source]
-        source: std::io::Error,
-    },
     #[error("CARGO_BIN_EXE env var {key} resolved to {path:?}, but it does not exist")]
     ResolvedPathDoesNotExist { key: String, path: PathBuf },
     #[error("CARGO_BIN_EXE env var {key} resolved to {path:?}, but an absolute path is required")]
@@ -23,7 +18,6 @@ pub enum CargoBinError {
 }
 
 /// Returns an absolute path to a binary target built for the current Cargo test run.
-#[allow(deprecated)]
 pub fn cargo_bin(name: &str) -> Result<PathBuf, CargoBinError> {
     let env_keys = cargo_bin_env_keys(name);
     for key in &env_keys {
@@ -31,29 +25,29 @@ pub fn cargo_bin(name: &str) -> Result<PathBuf, CargoBinError> {
             return resolve_bin_from_env(key, value);
         }
     }
-    match assert_cmd::Command::cargo_bin(name) {
-        Ok(cmd) => {
-            let mut path = PathBuf::from(cmd.get_program());
-            if !path.is_absolute() {
-                path = std::env::current_dir()
-                    .map_err(|source| CargoBinError::CurrentDir { source })?
-                    .join(path);
-            }
-            if path.exists() {
-                Ok(path)
-            } else {
-                Err(CargoBinError::ResolvedPathDoesNotExist {
-                    key: "assert_cmd::Command::cargo_bin".to_owned(),
-                    path,
-                })
-            }
+    // Cargo puts integration tests in target/<profile>/deps and helper binaries
+    // alongside that directory. assert_cmd's fallback now panics when Cargo did
+    // not export the binary, but callers rely on this Result to try another helper.
+    let fallback = std::env::current_exe().and_then(|mut path| {
+        path.pop();
+        if path.ends_with("deps") {
+            path.pop();
         }
-        Err(err) => Err(CargoBinError::NotFound {
-            name: name.to_owned(),
-            env_keys,
-            fallback: format!("assert_cmd fallback failed: {err}"),
-        }),
-    }
+        path.push(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        if path.is_file() {
+            Ok(path)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("binary does not exist at {}", path.display()),
+            ))
+        }
+    });
+    fallback.map_err(|error| CargoBinError::NotFound {
+        name: name.to_owned(),
+        env_keys,
+        fallback: error.to_string(),
+    })
 }
 
 fn cargo_bin_env_keys(name: &str) -> Vec<String> {
@@ -123,6 +117,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn missing_binary_returns_not_found_instead_of_panicking() {
+        let name = "codex-test-helper-that-does-not-exist-8ba6b5a0";
+        let error = cargo_bin(name).expect_err("missing helper should allow caller fallback");
+        assert!(matches!(error, CargoBinError::NotFound { name: missing, .. } if missing == name));
+    }
+
+    #[test]
     fn relative_environment_path_reports_the_absolute_path_requirement() {
         let error = resolve_bin_from_env("CARGO_BIN_EXE_example", OsString::from("Cargo.toml"))
             .expect_err("relative environment path");
@@ -132,4 +133,3 @@ mod tests {
         assert!(error.to_string().contains("an absolute path is required"));
     }
 }
-

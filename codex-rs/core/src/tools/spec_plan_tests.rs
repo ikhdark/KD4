@@ -1205,28 +1205,6 @@ async fn view_image_registration_requires_image_input_support() {
     .await;
     text_only.assert_visible_lacks(&["view_image"]);
     text_only.assert_registered_lacks(&["view_image"]);
-
-    let guardian_image_capable = probe(|turn| {
-        turn.session_source = SessionSource::SubAgent(SubAgentSource::Other(
-            crate::guardian::GUARDIAN_REVIEWER_NAME.to_string(),
-        ));
-        turn.model_info.input_modalities = vec![InputModality::Text, InputModality::Image];
-    })
-    .await;
-    guardian_image_capable.assert_visible_contains(&["view_image"]);
-    guardian_image_capable.assert_registered_contains(&["view_image"]);
-
-    let guardian_text_only = probe(|turn| {
-        turn.session_source = SessionSource::SubAgent(SubAgentSource::Other(
-            crate::guardian::GUARDIAN_REVIEWER_NAME.to_string(),
-        ));
-        turn.model_info.input_modalities = vec![InputModality::Text];
-    })
-    .await;
-    guardian_text_only.assert_visible_contains(&["exec_command", "write_stdin"]);
-    guardian_text_only.assert_registered_contains(&["exec_command", "write_stdin"]);
-    guardian_text_only.assert_visible_lacks(&["view_image"]);
-    guardian_text_only.assert_registered_lacks(&["view_image"]);
 }
 
 #[tokio::test]

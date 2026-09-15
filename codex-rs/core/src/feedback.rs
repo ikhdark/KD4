@@ -31,7 +31,8 @@ pub(crate) fn emit_feedback_auth_recovery_tags(
         error: auth_error.unwrap_or(""),
         error_code: auth_error_code.unwrap_or(""),
     };
-    feedback_tags!(
+    tracing::info!(
+        target: "feedback_tags",
         auth_recovery_mode = auth_recovery_mode,
         auth_recovery_phase = auth_recovery_phase,
         auth_recovery_outcome = auth_recovery_outcome,

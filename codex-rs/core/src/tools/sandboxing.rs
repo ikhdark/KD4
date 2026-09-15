@@ -134,18 +134,9 @@ pub(crate) struct ApprovalCtx<'a> {
     pub session: &'a Arc<Session>,
     pub turn: &'a Arc<TurnContext>,
     pub call_id: &'a str,
-    /// Guardian review lifecycle ID for this approval, when guardian is reviewing it.
-    ///
-    /// This is separate from `call_id`: `call_id` identifies the tool item under
-    /// review, while this ID identifies the review itself. Keeping both lets
-    /// denial handling, overrides, and app-server notifications refer to the
-    /// review without overloading the tool call ID as a review ID.
-    pub guardian_review_id: Option<String>,
     pub retry_reason: Option<String>,
     pub network_approval_context: Option<NetworkApprovalContext>,
 }
-
-pub(crate) type ApprovalAction = crate::guardian::GuardianApprovalRequest;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PermissionRequestPayload {
@@ -372,7 +363,7 @@ pub(crate) trait Approvable<Req> {
     }
 
     /// Return hook input for approval-time policy hooks when this runtime wants
-    /// hook evaluation to run before guardian or user approval.
+    /// hook evaluation to run before user approval.
     fn permission_request_payload(&self, _req: &Req) -> Option<PermissionRequestPayload> {
         None
     }
@@ -392,8 +383,6 @@ pub(crate) trait Approvable<Req> {
         req: &'a Req,
         ctx: ApprovalCtx<'a>,
     ) -> BoxFuture<'a, ReviewDecision>;
-
-    fn approval_action(&self, req: &Req, ctx: &ApprovalCtx<'_>) -> std::io::Result<ApprovalAction>;
 }
 
 pub(crate) trait Sandboxable {

@@ -814,7 +814,9 @@ mod tests {
         assert_eq!(written, 5);
         let deadline = Instant::now() + Duration::from_secs(1);
         while active.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(5));
+            thread::sleep(
+                Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
 
         assert_eq!(active.load(Ordering::Acquire), 0);

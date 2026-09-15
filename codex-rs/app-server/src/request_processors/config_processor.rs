@@ -330,12 +330,6 @@ fn map_requirements_toml_to_api(requirements: ConfigRequirementsToml) -> ConfigR
                 .map(codex_app_server_protocol::AskForApproval::from)
                 .collect()
         }),
-        allowed_approvals_reviewers: requirements.allowed_approvals_reviewers.map(|reviewers| {
-            reviewers
-                .into_iter()
-                .map(codex_app_server_protocol::ApprovalsReviewer::from)
-                .collect()
-        }),
         allowed_sandbox_modes: requirements.allowed_sandbox_modes.map(|modes| {
             modes
                 .into_iter()

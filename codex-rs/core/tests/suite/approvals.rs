@@ -2,7 +2,6 @@
 
 use anyhow::Context;
 use anyhow::Result;
-use codex_config::types::ApprovalsReviewer;
 use codex_core::CodexThread;
 use codex_core::config::Constrained;
 use codex_core::sandboxing::SandboxPermissions;
@@ -595,7 +594,6 @@ async fn submit_turn(
             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
                 environments: Some(local_selections(test.config.cwd.clone())),
                 approval_policy: Some(approval_policy),
-                approvals_reviewer: Some(ApprovalsReviewer::User),
                 sandbox_policy: Some(sandbox_policy),
                 collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
                     mode: codex_protocol::config_types::ModeKind::Default,
@@ -1778,10 +1776,9 @@ async fn run_scenario(scenario: &ScenarioSpec) -> Result<()> {
 
     let execution_rejected = match &scenario.outcome {
         Outcome::ExecApproval { decision, .. }
-        | Outcome::ExecApprovalWithAmendment { decision, .. } => matches!(
-            decision,
-            ReviewDecision::Denied | ReviewDecision::TimedOut | ReviewDecision::Abort
-        ),
+        | Outcome::ExecApprovalWithAmendment { decision, .. } => {
+            matches!(decision, ReviewDecision::Denied | ReviewDecision::Abort)
+        }
         Outcome::Auto | Outcome::PatchApproval { .. } => false,
     };
     let result = if execution_rejected {

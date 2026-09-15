@@ -5,7 +5,6 @@ from __future__ import annotations
 from .generated.v2_all import (
     Account,
     AccountLoginCompletedNotification,
-    ApprovalsReviewer,
     AskForApproval,
     CancelLoginAccountResponse,
     CancelLoginAccountStatus,
@@ -43,7 +42,6 @@ from .models import InitializeResponse, JsonObject, Notification
 __all__ = [
     "Account",
     "AccountLoginCompletedNotification",
-    "ApprovalsReviewer",
     "AskForApproval",
     "CancelLoginAccountResponse",
     "CancelLoginAccountStatus",

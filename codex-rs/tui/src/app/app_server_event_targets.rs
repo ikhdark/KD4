@@ -93,12 +93,6 @@ pub(super) fn server_notification_thread_target(
         ServerNotification::TurnDiffUpdated(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::TurnPlanUpdated(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::ItemStarted(notification) => Some(notification.thread_id.as_str()),
-        ServerNotification::ItemGuardianApprovalReviewStarted(notification) => {
-            Some(notification.thread_id.as_str())
-        }
-        ServerNotification::ItemGuardianApprovalReviewCompleted(notification) => {
-            Some(notification.thread_id.as_str())
-        }
         ServerNotification::ItemCompleted(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::RawResponseItemCompleted(notification) => {
             Some(notification.thread_id.as_str())
@@ -142,7 +136,6 @@ pub(super) fn server_notification_thread_target(
             Some(notification.thread_id.as_str())
         }
         ServerNotification::Warning(notification) => notification.thread_id.as_deref(),
-        ServerNotification::GuardianWarning(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::McpServerStatusUpdated(notification) => {
             match notification.thread_id.as_deref() {
                 Some(thread_id) => Some(thread_id),
@@ -191,7 +184,6 @@ mod tests {
     use super::server_notification_thread_target;
     use crate::test_support::PathBufExt;
     use crate::test_support::test_path_buf;
-    use codex_app_server_protocol::GuardianWarningNotification;
     use codex_app_server_protocol::McpServerStartupState;
     use codex_app_server_protocol::McpServerStatusUpdatedNotification;
     use codex_app_server_protocol::ServerNotification;
@@ -211,7 +203,6 @@ mod tests {
         ThreadSettings {
             cwd: test_path_buf("/tmp/thread-settings").abs(),
             approval_policy: codex_app_server_protocol::AskForApproval::Never,
-            approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::User,
             sandbox_policy: codex_app_server_protocol::SandboxPolicy::ReadOnly {
                 network_access: false,
             },
@@ -299,19 +290,6 @@ mod tests {
         let thread_id = ThreadId::new();
         let notification = ServerNotification::Warning(WarningNotification {
             thread_id: Some(thread_id.to_string()),
-            message: "warning".to_string(),
-        });
-
-        let target = server_notification_thread_target(&notification);
-
-        assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
-    }
-
-    #[test]
-    fn guardian_warning_notifications_route_to_threads() {
-        let thread_id = ThreadId::new();
-        let notification = ServerNotification::GuardianWarning(GuardianWarningNotification {
-            thread_id: thread_id.to_string(),
             message: "warning".to_string(),
         });
 

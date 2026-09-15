@@ -11,6 +11,9 @@ use crate::rule::NetworkRuleProtocol;
 use crate::rule::normalize_network_rule_host;
 use thiserror::Error;
 
+// Bound memory used while checking existing rules before an append.
+const MAX_POLICY_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 #[derive(Debug, Error)]
 pub enum AmendError {
     #[error("prefix rule requires at least one token")]
@@ -166,11 +169,22 @@ fn append_locked_line(policy_path: &Path, line: &str, deduplicate: bool) -> Resu
             source,
         })?;
     let mut contents = String::new();
-    file.read_to_string(&mut contents)
+    Read::by_ref(&mut file)
+        .take(MAX_POLICY_FILE_BYTES + 1)
+        .read_to_string(&mut contents)
         .map_err(|source| AmendError::ReadPolicyFile {
             path: policy_path.to_path_buf(),
             source,
         })?;
+    if contents.len() as u64 > MAX_POLICY_FILE_BYTES {
+        return Err(AmendError::ReadPolicyFile {
+            path: policy_path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "policy file exceeds the 64 MiB append limit",
+            ),
+        });
+    }
 
     if deduplicate && contents.lines().any(|existing| existing == line) {
         return Ok(());
@@ -198,6 +212,34 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
+
+    #[test]
+    fn oversized_policy_is_rejected_without_appending() {
+        let tmp = tempdir().expect("create temp dir");
+        let policy_path = tmp.path().join("default.rules");
+        let file = std::fs::File::create(&policy_path).expect("create policy");
+        file.set_len(MAX_POLICY_FILE_BYTES + 1)
+            .expect("create oversized policy");
+        drop(file);
+
+        let error = blocking_append_allow_prefix_rule(&policy_path, &["echo".to_string()])
+            .expect_err("oversized policy must reject the append");
+        assert!(matches!(
+            error,
+            AmendError::ReadPolicyFile { source, .. }
+                if source.kind() == std::io::ErrorKind::InvalidData
+                    && source.to_string() == "policy file exceeds the 64 MiB append limit"
+        ));
+        let mut file = std::fs::File::open(&policy_path).expect("read unchanged policy");
+        assert_eq!(
+            file.metadata().expect("metadata").len(),
+            MAX_POLICY_FILE_BYTES + 1
+        );
+        file.seek(SeekFrom::End(-1)).expect("seek last byte");
+        let mut last = [1];
+        file.read_exact(&mut last).expect("read last byte");
+        assert_eq!(last, [0]);
+    }
 
     #[test]
     fn appends_rule_and_creates_directories() {

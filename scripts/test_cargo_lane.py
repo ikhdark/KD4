@@ -35,6 +35,218 @@ def ps_single_quote(value: str | Path) -> str:
 
 
 class CargoLaneTest(unittest.TestCase):
+    def test_reservation_rechecks_cargo_lock_after_active_snapshot(self):
+        lane = self.make_lane("late-cargo")
+        lock_path = lane / "debug" / ".cargo-lock"
+        lock_path.parent.mkdir()
+        lock_path.touch()
+        # Pause at the real entrypoint immediately after its initial snapshot,
+        # then simulate a raw Cargo process opening its profile lock.
+        line = next(
+            i
+            for i, text in enumerate(SCRIPT.read_text().splitlines(), 1)
+            if text.startswith("$candidateLane =")
+        )
+        command = f"""
+$ErrorActionPreference = 'Stop'
+$env:CODEX_CARGO_LANE_DISABLE_BACKGROUND_DELETE = '1'
+$env:CODEX_CARGO_TARGET_MAX_TOTAL_BYTES = '0'
+Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
+    $global:lateCargoLock = [IO.File]::Open({ps_single_quote(lock_path)}, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+}} | Out-Null
+& {ps_single_quote(SCRIPT)} -LanesRoot {ps_single_quote(self.lanes_root)} -Lane late-cargo
+"""
+        result = subprocess.run(
+            [self.shell, "-NoProfile", "-Command", command],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("LANE=late-cargo-2", result.stdout)
+        self.assertFalse((lane / ".lane-active.lock").exists())
+
+    def test_cleanup_preserves_all_payloads_under_busy_cargo_profiles(self):
+        for profile in (Path("debug"), Path("triple") / "release"):
+            with self.subTest(profile=profile):
+                lane = self.make_lane("busy.trash-20260102030405000", size=10)
+                lock_path = lane / profile / ".cargo-lock"
+                lock_path.parent.mkdir(parents=True)
+                held = rust_build_status._try_acquire_binary_file_lock(lock_path)
+                self.assertIsNotNone(held)
+                command = [
+                    self.shell,
+                    "-NoProfile",
+                    "-File",
+                    str(CLEANUP_SCRIPT),
+                    "-LanesRoot",
+                    str(self.lanes_root),
+                    "-MaxPasses",
+                    "1",
+                ]
+                with held:
+                    result = subprocess.run(
+                        command,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        creationflags=CREATE_NO_WINDOW,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual((lane / "payload.bin").read_bytes(), b"x" * 10)
+                result = subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    creationflags=CREATE_NO_WINDOW,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(lane.exists())
+
+    def test_powershell_skips_gc_held_by_python(self):
+        self.mark_lanes_root()
+        lock = rust_build_status._try_acquire_binary_file_lock(
+            self.lanes_root / ".lane-gc.lock"
+        )
+        self.assertIsNotNone(lock)
+        with lock:
+            result = self.run_fake_cargo("-Lane", "unit", "cargo", "check")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("cargo-args:check", result.stdout)
+            self.assertFalse((self.lanes_root / ".gc-stamp").exists())
+
+    def test_auto_lane_ranks_last_used_above_directory_mtime(self):
+        for name, stamp_time, dir_time in (("warm-2", 10, 30), ("warm-3", 20, 1)):
+            lane = self.make_lane(name)
+            stamp = lane / ".lane-last-used"
+            stamp.touch()
+            os.utime(stamp, (stamp_time, stamp_time))
+            os.utime(lane, (dir_time, dir_time))
+        result = self.run_fake_cargo(
+            "-Lane",
+            "auto",
+            "cargo",
+            "check",
+            "-p=warm",
+            extra_env={"CODEX_CARGO_LANE_ACTIVE_NAMES": "warm"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"--target-dir {self.lane_path('warm-3')}", result.stdout)
+
+    def test_real_cargo_profile_locks_protect_selection_and_pruning(self):
+        cargo = shutil.which("cargo")
+        if cargo is None:
+            self.skipTest("Cargo is required")
+        crate = self.temp_root / "crate"
+        crate.mkdir()
+        (crate / "Cargo.toml").write_text(
+            '[package]\nname="lock-probe"\nversion="0.1.0"\nedition="2021"\n'
+            '[lib]\npath="lib.rs"\n',
+            encoding="utf-8",
+        )
+        (crate / "lib.rs").write_text("pub fn probe() {}\n", encoding="utf-8")
+        (crate / "build.rs").write_text(
+            "fn main() {\n"
+            'std::fs::write(std::env::var("PROBE_READY").unwrap(), "ready").unwrap();\n'
+            'let release = std::env::var("PROBE_RELEASE").unwrap();\n'
+            "while !std::path::Path::new(&release).exists() {\n"
+            "std::thread::sleep(std::time::Duration::from_millis(50)); }\n}\n",
+            encoding="utf-8",
+        )
+        self.mark_lanes_root()
+        host = subprocess.run(
+            ["rustc", "-vV"], check=True, capture_output=True, text=True
+        )
+        triple = next(
+            line.removeprefix("host: ")
+            for line in host.stdout.splitlines()
+            if line.startswith("host: ")
+        )
+        for suffix, flags in (
+            (Path("debug"), []),
+            (Path(triple) / "release", ["--target", triple, "--release"]),
+        ):
+            with self.subTest(profile=str(suffix)):
+                lane = self.make_lane("real-cargo")
+                ready = crate / "ready"
+                release = crate / "release"
+                ready.unlink(missing_ok=True)
+                release.unlink(missing_ok=True)
+                env = os.environ.copy()
+                for key in list(env):
+                    if key.startswith("CARGO_") or key in (
+                        "RUSTFLAGS",
+                        "RUSTC_WRAPPER",
+                        "RUSTC_WORKSPACE_WRAPPER",
+                    ):
+                        env.pop(key)
+                env.update(
+                    CARGO_HOME=str(self.temp_root / "cargo-home"),
+                    PROBE_READY=str(ready),
+                    PROBE_RELEASE=str(release),
+                )
+                process = subprocess.Popen(
+                    [cargo, "check", "--offline", "--target-dir", str(lane), *flags],
+                    cwd=crate,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    creationflags=CREATE_NO_WINDOW,
+                )
+                try:
+                    deadline = time.monotonic() + 50
+                    while (
+                        not ready.exists()
+                        and process.poll() is None
+                        and time.monotonic() < deadline
+                    ):
+                        time.sleep(0.05)
+                    self.assertTrue(
+                        ready.exists(), "Cargo did not enter the build script"
+                    )
+                    self.assertTrue((lane / suffix / ".cargo-lock").is_file())
+                    self.assertTrue(rust_build_status.cargo_lock_is_busy(lane))
+                    with rust_build_status.reserve_cargo_lane(
+                        repo_root=self.temp_root,
+                        lane_root=self.lanes_root,
+                        requested_lane="real-cargo",
+                        command=["cargo", "check"],
+                    ) as (name, _):
+                        self.assertEqual(name, "real-cargo-2")
+                    result = self.run_fake_cargo(
+                        "-Lane", "real-cargo", "cargo", "check"
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(self.lane_path("real-cargo-2"), result.stdout)
+                    from unittest import mock
+
+                    with mock.patch.dict(
+                        os.environ, {"CODEX_CARGO_LANES_ROOT": str(self.lanes_root)}
+                    ):
+                        removed = rust_build_status.prune_stale_lanes(
+                            repo_root=self.temp_root,
+                            processes=[],
+                            keep_warm_per_base=0,
+                            max_age_days=None,
+                        )
+                    self.assertNotIn(lane, removed)
+                    self.assertTrue(lane.exists())
+                finally:
+                    release.write_text("release", encoding="utf-8")
+                    try:
+                        stdout, stderr = process.communicate(timeout=20)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        stdout, stderr = process.communicate()
+                self.assertEqual(process.returncode, 0, stdout + stderr)
+                self.assertFalse(rust_build_status.cargo_lock_is_busy(lane))
+
     def test_setup_failure_releases_reservation_in_surviving_host(self):
         command = f"""
 $ErrorActionPreference = 'Stop'
@@ -505,6 +717,21 @@ Write-Output 'reservation released'
         self.assertIn("must not be a reparse point or junction", result.stderr)
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
 
+    def test_lane_runner_rejects_junction_ancestor_before_creating_root(self):
+        external = self.temp_root / "external-parent"
+        external.mkdir()
+        sentinel = external / "keep.txt"
+        sentinel.write_text("keep", encoding="utf-8")
+        junction = self.temp_root / "linked-parent"
+        self.make_junction(junction, external)
+        result = self.run_script(
+            "-Lane", "unit", "cmd.exe", "/c", "echo ok", lanes_root=junction / "lanes"
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must not be a reparse point or junction", result.stderr)
+        self.assertEqual(list(external.iterdir()), [sentinel])
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+
     def test_cleanup_rejects_junction_root(self) -> None:
         external_root = self.temp_root / "external-cleanup-root"
         self.mark_lanes_root(external_root)
@@ -597,7 +824,12 @@ Write-Output 'reservation released'
         lock_name: str = ".cargo-lock",
     ) -> subprocess.Popen[str]:
         lane_path = self.make_lane(lane)
-        lock_path = lane_path / lock_name
+        lock_path = (
+            lane_path / "debug" / lock_name
+            if lock_name == ".cargo-lock"
+            else lane_path / lock_name
+        )
+        lock_path.parent.mkdir(exist_ok=True)
         ready_path = lane_path / f"{lock_name}.ready"
         helper = (
             self.temp_root / f"hold-{lock_name.removeprefix('.').replace('.', '-')}.ps1"
@@ -738,22 +970,27 @@ Write-Output 'reservation released'
 
     def test_auto_lane_uses_package_name_for_stable_cache_affinity(self) -> None:
         package = f"unit-core-{os.getpid()}"
-
-        result = self.run_fake_cargo(
-            "-Lane",
-            "auto",
-            "cargo",
-            "check",
-            "-p",
-            package,
-        )
-
-        self.assertEqual(
-            result.returncode,
-            0,
-            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-        )
-        self.assertIn(f"--target-dir {self.lane_path(package)}", result.stdout)
+        for selection in (
+            ["-p", package],
+            [f"-p{package}"],
+            [f"-p={package}"],
+            ["--package", package],
+            [f"--package={package}"],
+        ):
+            with self.subTest(selection=selection):
+                result = self.run_fake_cargo(
+                    "-Lane",
+                    "auto",
+                    "cargo",
+                    "check",
+                    *selection,
+                )
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+                )
+                self.assertIn(f"--target-dir {self.lane_path(package)}", result.stdout)
 
     def test_mismatched_cargo_target_dir_is_rejected(self) -> None:
         package = f"unit-explicit-target-{os.getpid()}"
@@ -918,10 +1155,11 @@ Write-Output 'reservation released'
         )
         self.assertIn(f"--target-dir {self.lane_path(f'{package}-2')}", result.stdout)
 
-    def test_auto_lane_surfaces_read_only_lock_error(self) -> None:
+    def test_auto_lane_skips_unreadable_cargo_lock(self) -> None:
         package = f"unit-core-readonly-{os.getpid()}"
         lane = self.make_lane(package)
-        lock_path = lane / ".cargo-lock"
+        lock_path = lane / "debug" / ".cargo-lock"
+        lock_path.parent.mkdir(exist_ok=True)
         lock_path.write_text("stale", encoding="utf-8")
         lock_path.chmod(stat.S_IREAD)
         try:
@@ -936,8 +1174,8 @@ Write-Output 'reservation released'
         finally:
             lock_path.chmod(stat.S_IWRITE)
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertNotIn(self.lane_path(f"{package}-2"), result.stdout)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(self.lane_path(f"{package}-2"), result.stdout)
 
     def test_auto_lane_skips_busy_lane_reservation_lock(self) -> None:
         package = f"unit-core-reserved-{os.getpid()}"
@@ -1167,7 +1405,7 @@ Write-Output 'reservation released'
         self.assertIn("wrapper=sccache", result.stdout)
         self.assertIn(str(REPO_ROOT), result.stdout)
         self.assertIn("80G", result.stdout)
-        self.assertIn("incremental=0", result.stdout)
+        self.assertIn("incremental=%CARGO_INCREMENTAL%", result.stdout)
 
     def test_sccache_lane_preserves_explicit_cargo_incremental(self) -> None:
         fake_bin = self.temp_root / "bin"
@@ -1311,6 +1549,47 @@ Write-Output 'reservation released'
         )
         self.assertFalse((self.lanes_root / ".gc-stamp").exists())
         self.assertIn("leaving the GC stamp unchanged", result.stdout + result.stderr)
+        self.assertTrue((self.lanes_root / ".gc-retry").is_file())
+
+    def test_powershell_maintenance_honors_python_lock_and_retry_stamp(self):
+        fake_bin = self.fake_cargo_bin()
+        args_log = self.temp_root / "gc-attempts.txt"
+        (fake_bin / "python.cmd").write_text(
+            '@echo off\r\necho attempt >> "%CODEX_TEST_GC_ARGS_LOG%"\r\nexit /b 7\r\n',
+            encoding="utf-8",
+        )
+        self.mark_lanes_root()
+        env = {
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "CODEX_TEST_GC_ARGS_LOG": str(args_log),
+            "CODEX_CARGO_LANE_GC_INTERVAL_HOURS": "0",
+        }
+
+        def run():
+            result = self.run_script(
+                "-Lane", "unit", "cmd.exe", "/c", "echo ok", extra_env=env
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        handle = rust_build_status._try_acquire_binary_file_lock(
+            self.lanes_root / ".lane-gc.lock"
+        )
+        self.assertIsNotNone(handle)
+        try:
+            run()
+            self.assertFalse(args_log.exists())
+        finally:
+            rust_build_status._release_binary_file_lock(handle)
+            handle.close()
+        retry = self.lanes_root / ".gc-retry"
+        retry.touch()
+        run()
+        self.assertFalse(args_log.exists())
+        os.utime(retry, (1, 1))
+        run()
+        self.assertEqual(args_log.read_text().strip(), "attempt")
+        self.assertGreater(retry.stat().st_mtime, 1)
+        self.assertFalse((self.lanes_root / ".gc-stamp").exists())
 
     def test_gc_size_cap_evicts_oversized_idle_lane(self) -> None:
         oversized = f"unit-size-large-{os.getpid()}"
@@ -1375,7 +1654,7 @@ Write-Output 'reservation released'
         self.assertFalse(oldest_path.exists())
         self.assertTrue(newest_path.exists())
 
-    def test_gc_defaults_lane_and_target_aggregate_caps(self) -> None:
+    def test_gc_defaults_skip_aggregate_caps(self) -> None:
         fake_bin = self.fake_cargo_bin()
         args_log = self.temp_root / "gc-args.txt"
         (fake_bin / "python.cmd").write_text(
@@ -1392,6 +1671,7 @@ Write-Output 'reservation released'
             "echo ok",
             extra_env={
                 "CODEX_CARGO_LANE_GC_INTERVAL_HOURS": "0",
+                "CODEX_CARGO_LANE_MAX_TOTAL_BYTES": "",
                 "CODEX_CARGO_TARGET_MAX_TOTAL_BYTES": "",
                 "CODEX_TEST_GC_ARGS_LOG": str(args_log),
                 "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
@@ -1403,16 +1683,16 @@ Write-Output 'reservation released'
             0,
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
-        self.assertIn(
-            "--max-total-lane-bytes 214748364800",
+        self.assertNotIn(
+            "--max-total-lane-bytes",
             args_log.read_text(encoding="utf-8"),
         )
-        self.assertIn(
-            "--max-total-target-bytes 268435456000",
+        self.assertNotIn(
+            "--max-total-target-bytes",
             args_log.read_text(encoding="utf-8"),
         )
 
-    def test_post_build_gc_bypasses_fresh_hourly_stamp(self) -> None:
+    def test_completed_command_keeps_fresh_hourly_gc_stamp(self) -> None:
         fake_bin = self.fake_cargo_bin()
         args_log = self.temp_root / "post-build-gc-args.txt"
         (fake_bin / "python.cmd").write_text(
@@ -1443,13 +1723,11 @@ Write-Output 'reservation released'
             0,
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
-        self.assertTrue(
+        self.assertFalse(
             args_log.exists(),
-            f"post-build GC was not invoked\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            f"command forced GC despite a fresh stamp\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
-        invocations = args_log.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(invocations), 1)
-        self.assertIn("--max-total-target-bytes 268435456000", invocations[0])
+        self.assertEqual(stamp.read_text(encoding="utf-8"), "fresh\n")
 
     def test_gc_excludes_active_lanes_from_age_pruning(self) -> None:
         active = f"unit-active-old-{os.getpid()}"

@@ -7,8 +7,6 @@ use codex_app_server_protocol::McpServerElicitationAction;
 use codex_app_server_protocol::RequestId as AppServerRequestId;
 use codex_app_server_protocol::ToolRequestUserInputResponse;
 use codex_app_server_protocol::UserInput;
-use codex_config::types::ApprovalsReviewer;
-use codex_protocol::approvals::GuardianAssessmentEvent;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
@@ -34,7 +32,6 @@ pub(crate) enum AppCommand {
         items: Vec<UserInput>,
         cwd: PathBuf,
         approval_policy: AskForApproval,
-        approvals_reviewer: Option<ApprovalsReviewer>,
         active_permission_profile: Option<ActivePermissionProfile>,
         model: String,
         effort: Option<ReasoningEffortConfig>,
@@ -47,7 +44,6 @@ pub(crate) enum AppCommand {
     OverrideTurnContext {
         cwd: Option<PathBuf>,
         approval_policy: Option<AskForApproval>,
-        approvals_reviewer: Option<ApprovalsReviewer>,
         permission_profile: Option<PermissionProfile>,
         active_permission_profile: Option<ActivePermissionProfile>,
         windows_sandbox_level: Option<WindowsSandboxLevel>,
@@ -97,9 +93,6 @@ pub(crate) enum AppCommand {
     BugCreate {
         raw_text: String,
     },
-    ApproveGuardianDeniedAction {
-        event: GuardianAssessmentEvent,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -147,7 +140,6 @@ impl AppCommand {
             items,
             cwd,
             approval_policy,
-            approvals_reviewer: None,
             active_permission_profile,
             model,
             effort,
@@ -163,7 +155,6 @@ impl AppCommand {
     pub(crate) fn override_turn_context(
         cwd: Option<PathBuf>,
         approval_policy: Option<AskForApproval>,
-        approvals_reviewer: Option<ApprovalsReviewer>,
         permission_profile: Option<PermissionProfile>,
         active_permission_profile: Option<ActivePermissionProfile>,
         windows_sandbox_level: Option<WindowsSandboxLevel>,
@@ -177,7 +168,6 @@ impl AppCommand {
         Self::OverrideTurnContext {
             cwd,
             approval_policy,
-            approvals_reviewer,
             permission_profile,
             active_permission_profile,
             windows_sandbox_level,
@@ -255,10 +245,6 @@ impl AppCommand {
 
     pub(crate) fn bug_create(raw_text: String) -> Self {
         Self::BugCreate { raw_text }
-    }
-
-    pub(crate) fn approve_guardian_denied_action(event: GuardianAssessmentEvent) -> Self {
-        Self::ApproveGuardianDeniedAction { event }
     }
 }
 

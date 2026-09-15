@@ -1711,7 +1711,6 @@ impl RequestRouteTelemetry {
 pub struct ModelClient {
     state: Arc<ModelClientState>,
     agent_identity_policy: AgentIdentityAuthPolicy,
-    prompt_cache_key_override: Option<String>,
     http_client_factory: HttpClientFactory,
 }
 
@@ -2112,23 +2111,12 @@ impl ModelClient {
                 request_schema_cache: StdMutex::new(RequestSchemaSerializationCache::default()),
             }),
             agent_identity_policy,
-            prompt_cache_key_override: None,
             http_client_factory,
         }
     }
 
-    pub(crate) fn with_prompt_cache_key_override(
-        mut self,
-        prompt_cache_key_override: Option<String>,
-    ) -> Self {
-        self.prompt_cache_key_override = prompt_cache_key_override;
-        self
-    }
-
     fn prompt_cache_key(&self) -> String {
-        self.prompt_cache_key_override
-            .clone()
-            .unwrap_or_else(|| self.state.thread_id.to_string())
+        self.state.thread_id.to_string()
     }
 
     /// Creates a fresh turn-scoped streaming session.

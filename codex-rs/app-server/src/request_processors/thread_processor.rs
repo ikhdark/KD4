@@ -150,15 +150,6 @@ fn collect_resume_override_mismatches(
             ));
         }
     }
-    if let Some(requested_review_policy) = request.approvals_reviewer.as_ref() {
-        let active_review_policy: codex_app_server_protocol::ApprovalsReviewer =
-            config_snapshot.approvals_reviewer.into();
-        if requested_review_policy != &active_review_policy {
-            mismatch_details.push(format!(
-                "approvals_reviewer requested={requested_review_policy:?} active={active_review_policy:?}"
-            ));
-        }
-    }
     if let Some(requested_permission_profile) = request.permission_profile.as_ref()
         && requested_permission_profile != &config_snapshot.permission_profile
     {
@@ -276,8 +267,6 @@ fn persisted_settings_override_mask(
             || raw_override_contains(request_overrides, "developer_instructions"),
         approval_policy: typesafe_overrides.approval_policy.is_some()
             || raw_override_contains(request_overrides, "approval_policy"),
-        approvals_reviewer: typesafe_overrides.approvals_reviewer.is_some()
-            || raw_override_contains(request_overrides, "approvals_reviewer"),
         permission_profile: permission_override,
         active_permission_profile: permission_override,
         environments: typesafe_overrides.cwd.is_some()
@@ -827,7 +816,6 @@ impl ThreadRequestProcessor {
             cwd,
             runtime_workspace_roots,
             approval_policy,
-            approvals_reviewer,
             sandbox,
             permission_profile,
             permissions,
@@ -861,7 +849,6 @@ impl ThreadRequestProcessor {
             cwd,
             runtime_workspace_roots,
             approval_policy,
-            approvals_reviewer,
             sandbox,
             permission_profile,
             permissions,
@@ -1219,7 +1206,6 @@ impl ThreadRequestProcessor {
             runtime_workspace_roots: config_snapshot.workspace_roots,
             instruction_sources,
             approval_policy: config_snapshot.approval_policy.into(),
-            approvals_reviewer: config_snapshot.approvals_reviewer.into(),
             sandbox,
             permission_profile: Some(permission_profile),
             active_permission_profile,
@@ -1260,7 +1246,6 @@ impl ThreadRequestProcessor {
         cwd: Option<String>,
         runtime_workspace_roots: Option<Vec<AbsolutePathBuf>>,
         approval_policy: Option<codex_app_server_protocol::AskForApproval>,
-        approvals_reviewer: Option<codex_app_server_protocol::ApprovalsReviewer>,
         sandbox: Option<SandboxMode>,
         permission_profile: Option<PermissionProfile>,
         permissions: Option<String>,
@@ -1283,8 +1268,6 @@ impl ThreadRequestProcessor {
             permission_profile,
             approval_policy: approval_policy
                 .map(codex_app_server_protocol::AskForApproval::to_core),
-            approvals_reviewer: approvals_reviewer
-                .map(codex_app_server_protocol::ApprovalsReviewer::to_core),
             sandbox_mode,
             base_instructions,
             developer_instructions,
@@ -1814,26 +1797,6 @@ impl ThreadRequestProcessor {
         .await
         .map_err(|err| internal_error(format!("failed to start shell command: {err}")))?;
         Ok(ThreadShellCommandResponse {})
-    }
-
-    pub(crate) async fn thread_approve_guardian_denied_action(
-        &self,
-        request_id: &ConnectionRequestId,
-        params: ThreadApproveGuardianDeniedActionParams,
-    ) -> Result<ThreadApproveGuardianDeniedActionResponse, JSONRPCErrorError> {
-        let ThreadApproveGuardianDeniedActionParams { thread_id, event } = params;
-        let event = serde_json::from_value(event)
-            .map_err(|err| invalid_request(format!("invalid Guardian denial event: {err}")))?;
-        let (_, thread) = self.load_thread(&thread_id).await?;
-
-        self.submit_core_op(
-            request_id,
-            thread.as_ref(),
-            Op::ApproveGuardianDeniedAction { event },
-        )
-        .await
-        .map_err(|err| internal_error(format!("failed to approve Guardian denial: {err}")))?;
-        Ok(ThreadApproveGuardianDeniedActionResponse {})
     }
 
     async fn refresh_loaded_thread_statuses(&self, threads: &mut [Thread]) {
@@ -2917,7 +2880,6 @@ impl ThreadRequestProcessor {
             cwd,
             runtime_workspace_roots,
             approval_policy,
-            approvals_reviewer,
             sandbox,
             permission_profile,
             permissions,
@@ -2972,7 +2934,6 @@ impl ThreadRequestProcessor {
             cwd,
             runtime_workspace_roots,
             approval_policy,
-            approvals_reviewer,
             sandbox,
             permission_profile,
             permissions,
@@ -3193,7 +3154,6 @@ impl ThreadRequestProcessor {
                     runtime_workspace_roots: config_snapshot.workspace_roots,
                     instruction_sources,
                     approval_policy: session_configured.approval_policy.into(),
-                    approvals_reviewer: session_configured.approvals_reviewer.into(),
                     sandbox,
                     permission_profile: Some(permission_profile),
                     active_permission_profile,
@@ -3753,7 +3713,6 @@ impl ThreadRequestProcessor {
             cwd,
             runtime_workspace_roots,
             approval_policy,
-            approvals_reviewer,
             sandbox,
             permission_profile,
             permissions,
@@ -3823,7 +3782,6 @@ impl ThreadRequestProcessor {
             cwd,
             runtime_workspace_roots,
             approval_policy,
-            approvals_reviewer,
             sandbox,
             permission_profile,
             permissions,
@@ -4023,7 +3981,6 @@ impl ThreadRequestProcessor {
             runtime_workspace_roots: config_snapshot.workspace_roots,
             instruction_sources,
             approval_policy: session_configured.approval_policy.into(),
-            approvals_reviewer: session_configured.approvals_reviewer.into(),
             sandbox,
             permission_profile: Some(permission_profile),
             active_permission_profile,

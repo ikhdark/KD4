@@ -21,7 +21,6 @@ use crate::SessionId;
 use crate::ThreadId;
 use crate::approvals::ElicitationRequestEvent;
 use crate::capabilities::SelectedCapabilityRoot;
-use crate::config_types::ApprovalsReviewer;
 use crate::config_types::CollaborationMode;
 use crate::config_types::ModeKind;
 use crate::config_types::MultiAgentMode;
@@ -81,14 +80,6 @@ pub use crate::approvals::ApplyPatchApprovalRequestEvent;
 pub use crate::approvals::ElicitationAction;
 pub use crate::approvals::ExecApprovalRequestEvent;
 pub use crate::approvals::ExecPolicyAmendment;
-pub use crate::approvals::GuardianAssessmentAction;
-pub use crate::approvals::GuardianAssessmentDecisionSource;
-pub use crate::approvals::GuardianAssessmentEvent;
-pub use crate::approvals::GuardianAssessmentOutcome;
-pub use crate::approvals::GuardianAssessmentStatus;
-pub use crate::approvals::GuardianCommandSource;
-pub use crate::approvals::GuardianRiskLevel;
-pub use crate::approvals::GuardianUserAuthorization;
 pub use crate::approvals::NetworkApprovalContext;
 pub use crate::approvals::NetworkApprovalProtocol;
 pub use crate::approvals::NetworkPolicyAmendment;
@@ -222,9 +213,6 @@ pub struct ThreadSettingsOverrides {
 
     /// Updated command approval policy.
     pub approval_policy: Option<AskForApproval>,
-
-    /// Updated approval reviewer for future approval prompts.
-    pub approvals_reviewer: Option<ApprovalsReviewer>,
 
     /// Updated sandbox policy for tool calls.
     pub sandbox_policy: Option<SandboxPolicy>,
@@ -407,9 +395,6 @@ pub enum Op {
     /// Request a code review from the agent.
     Review { review_request: ReviewRequest },
 
-    /// Record that the user approved one retry of a concrete Guardian-denied action.
-    ApproveGuardianDeniedAction { event: GuardianAssessmentEvent },
-
     /// Request to shut down codex instance.
     Shutdown,
 
@@ -475,23 +460,30 @@ impl FromStr for ThreadHistoryMode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThreadSortKey {
     #[default]
+    #[serde(rename = "CreatedAt")]
     CreatedAt,
+    #[serde(rename = "UpdatedAt")]
     UpdatedAt,
+    #[serde(rename = "RecencyAt")]
     RecencyAt,
 }
 
 /// The direction used to order thread listings.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SortDirection {
+    #[serde(rename = "Asc")]
     Asc,
     #[default]
+    #[serde(rename = "Desc")]
     Desc,
 }
 
 /// Spawn-graph relationship used to filter thread listings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThreadRelationFilter {
+    #[serde(rename = "DirectChildrenOf")]
     DirectChildrenOf(ThreadId),
+    #[serde(rename = "DescendantsOf")]
     DescendantsOf(ThreadId),
 }
 
@@ -654,7 +646,6 @@ impl Op {
             Self::SetThreadMemoryMode { .. } => "set_thread_memory_mode",
             Self::ThreadRollback { .. } => "thread_rollback",
             Self::Review { .. } => "review",
-            Self::ApproveGuardianDeniedAction { .. } => "approve_guardian_denied_action",
             Self::Shutdown => "shutdown",
             Self::RunUserShellCommand { .. } => "run_user_shell_command",
         }
@@ -1107,9 +1098,6 @@ pub enum EventMsg {
     /// indicates the turn continued but the user should still be notified.
     Warning(WarningEvent),
 
-    /// Warning issued by the guardian automatic approval reviewer.
-    GuardianWarning(WarningEvent),
-
     /// Model routing changed from the requested model to a different model.
     ModelReroute(ModelRerouteEvent),
 
@@ -1220,9 +1208,6 @@ pub enum EventMsg {
     ElicitationRequest(ElicitationRequestEvent),
 
     ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent),
-
-    /// Structured lifecycle event for a guardian-reviewed approval request.
-    GuardianAssessment(GuardianAssessmentEvent),
 
     /// Notification advising the user that something they are using has been
     /// deprecated and should be phased out.
@@ -3285,7 +3270,6 @@ pub struct ThreadSettingsSnapshot {
     #[ts(optional)]
     pub developer_instructions: Option<Option<String>>,
     pub approval_policy: AskForApproval,
-    pub approvals_reviewer: ApprovalsReviewer,
     pub permission_profile: PermissionProfile,
     #[serde(
         default,
@@ -3818,9 +3802,13 @@ pub struct ResumedHistory {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub enum InitialHistory {
+    #[serde(rename = "New")]
     New,
+    #[serde(rename = "Cleared")]
     Cleared,
+    #[serde(rename = "Resumed")]
     Resumed(ResumedHistory),
+    #[serde(rename = "Forked")]
     Forked(Vec<RolloutItem>),
 }
 
@@ -4636,8 +4624,6 @@ pub struct TurnContextItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
     pub approval_policy: AskForApproval,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approvals_reviewer: Option<ApprovalsReviewer>,
     pub sandbox_policy: SandboxPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_profile: Option<PermissionProfile>,
@@ -5406,12 +5392,6 @@ pub struct SessionConfiguredEvent {
     /// When to escalate for approval for execution
     pub approval_policy: AskForApproval,
 
-    /// Configures who approval requests are routed to for review once they have
-    /// been escalated. This does not disable separate safety checks such as
-    /// ARC.
-    #[serde(default)]
-    pub approvals_reviewer: ApprovalsReviewer,
-
     /// Canonical effective permissions for commands executed in the session.
     pub permission_profile: PermissionProfile,
 
@@ -5464,8 +5444,6 @@ impl<'de> Deserialize<'de> for SessionConfiguredEvent {
             model_provider_id: String,
             service_tier: Option<String>,
             approval_policy: AskForApproval,
-            #[serde(default)]
-            approvals_reviewer: ApprovalsReviewer,
             // `SessionConfiguredEvent` is persisted into rollout history. Older
             // rollouts only have `sandbox_policy`, so accept it on deserialize
             // and immediately project it into the canonical `permission_profile`.
@@ -5503,7 +5481,6 @@ impl<'de> Deserialize<'de> for SessionConfiguredEvent {
             model_provider_id: wire.model_provider_id,
             service_tier: wire.service_tier,
             approval_policy: wire.approval_policy,
-            approvals_reviewer: wire.approvals_reviewer,
             permission_profile,
             active_permission_profile: wire.active_permission_profile,
             cwd: wire.cwd,
@@ -5634,9 +5611,6 @@ pub enum ReviewDecision {
     #[default]
     Denied,
 
-    /// Automatic approval review timed out before reaching a decision.
-    TimedOut,
-
     /// User has denied this command and the agent should not do anything until
     /// the user's next command.
     Abort,
@@ -5657,7 +5631,6 @@ impl ReviewDecision {
                 NetworkPolicyRuleAction::Deny => "denied_with_network_policy_deny",
             },
             ReviewDecision::Denied => "denied",
-            ReviewDecision::TimedOut => "timed_out",
             ReviewDecision::Abort => "abort",
         }
     }
@@ -7895,7 +7868,6 @@ mod tests {
             current_date: None,
             timezone: None,
             approval_policy: AskForApproval::Never,
-            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             permission_profile: None,
             network: Some(TurnContextNetworkItem {
@@ -7966,7 +7938,6 @@ mod tests {
                 model_provider_id: "openai".to_string(),
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
-                approvals_reviewer: ApprovalsReviewer::User,
                 permission_profile: permission_profile.clone(),
                 active_permission_profile: None,
                 cwd: test_path_buf("/home/user/project").abs(),
@@ -7986,7 +7957,6 @@ mod tests {
                 "model": "codex-mini-latest",
                 "model_provider_id": "openai",
                 "approval_policy": "never",
-                "approvals_reviewer": "user",
                 "permission_profile": permission_profile,
                 "cwd": test_path_buf("/home/user/project"),
                 "reasoning_effort": "medium",
@@ -8005,7 +7975,6 @@ mod tests {
             "model": "codex-mini-latest",
             "model_provider_id": "openai",
             "approval_policy": "never",
-            "approvals_reviewer": "user",
             "sandbox_policy": {
                 "type": "read-only"
             },

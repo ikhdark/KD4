@@ -21,7 +21,6 @@ fn covers_schema_backed_runtime_options() {
     assert!(rendered.contains("- tool_output_token_limit:"));
     assert!(rendered.contains("- background_terminal_max_timeout:"));
     assert!(rendered.contains("- hooks:"));
-    assert!(rendered.contains("- auto_review:"));
     assert!(rendered.contains("- debug:"));
     assert!(rendered.contains("- tools:"));
     assert!(rendered.contains("- reasoning_phase_efforts:"));

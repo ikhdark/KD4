@@ -24,6 +24,7 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::sse;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
+use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
@@ -75,7 +76,7 @@ impl CodeModeElicitationHarness {
         );
     }
 
-    async fn finish(self) {
+    async fn finish(&self) {
         wait_for_event_with_timeout(
             &self.test.codex,
             |event| match event {
@@ -122,6 +123,7 @@ async fn submit_turn(test: &TestCodex, permission_profile: PermissionProfile) ->
             responsesapi_client_metadata: None,
             additional_context: Default::default(),
             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                environments: Some(local_selections(test.config.cwd.clone())),
                 approval_policy: Some(AskForApproval::OnRequest),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -212,6 +214,8 @@ await tools.apply_patch("*** Begin Patch\n*** Add File: code_mode_patch_approval
     .await;
 
     harness.assert_result_held().await;
+    let patched_file = harness.test.config.cwd.join("code_mode_patch_approval.txt");
+    assert!(!patched_file.exists(), "patch must wait for approval");
     harness
         .test
         .codex
@@ -221,6 +225,7 @@ await tools.apply_patch("*** Begin Patch\n*** Add File: code_mode_patch_approval
         })
         .await?;
     harness.finish().await;
+    assert_eq!(std::fs::read_to_string(patched_file)?, "held\n");
     Ok(())
 }
 
@@ -260,7 +265,6 @@ await tools.request_permissions({
             response: RequestPermissionsResponse {
                 permissions: Default::default(),
                 scope: PermissionGrantScope::Turn,
-                strict_auto_review: false,
             },
         })
         .await?;
@@ -330,6 +334,15 @@ await tools.apply_patch("*** Begin Patch\n*** Add File: code_mode_denied_patch.t
         "denied nested tool call must not emit a typed error: {errors:?}"
     );
     assert!(completed.error.is_none());
+    assert!(
+        !harness
+            .test
+            .config
+            .cwd
+            .join("code_mode_denied_patch.txt")
+            .exists(),
+        "denied patch must not create a file"
+    );
 
     let timing = completed
         .timing

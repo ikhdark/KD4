@@ -4,15 +4,23 @@
 use crate::native::NativeAttemptEvidence;
 use crate::prepare::provenance::FileIdentity;
 use crate::workloads::VerificationOutcome;
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
 use codex_app_server_test_client::terminate_owned_process;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
-use std::fs::{self, OpenOptions};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::fs::OpenOptions;
+use std::fs::{self};
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+use std::process::Stdio;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(120);
 const AUDIT_SCHEMA_VERSION: u64 = 20;
@@ -188,7 +196,10 @@ fn analyze_with_timeout(
                         timeout.as_secs()
                     );
                 }
-                thread::sleep(Duration::from_millis(10));
+                thread::sleep(
+                    Duration::from_millis(10)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
             };
             ensure!(
                 status.success(),

@@ -81,15 +81,14 @@ filter = 'package(codex-app-server) & kind(test)'
 test-group = 'app_server_integration'
 
 [[profile.local.overrides]]
-# Use up to four app-server subprocesses locally. The global nextest pool still
-# limits this to the machine's logical CPU count.
+# Serialize app-server subprocess tests locally to avoid resource contention.
 filter = 'package(codex-app-server) & kind(test)'
 test-group = 'app_server_integration_local'
 
 [[profile.fast.overrides]]
 # Nextest resolves per-test overrides from the selected profile and `default`,
 # not from intermediate profiles. Mirror the bounded local concurrency here so
-# fast validation does not fall back to the serialized CI group.
+# fast validation uses the same local group.
 filter = 'package(codex-app-server) & kind(test)'
 test-group = 'app_server_integration_local'
 

@@ -7,6 +7,7 @@ use url::Url;
 
 use crate::command_safety::powershell_parser::PowershellInvocation;
 use crate::command_safety::powershell_parser::parse_powershell_invocation;
+use crate::command_safety::powershell_parser::try_parse_powershell_ast_commands;
 
 pub fn is_dangerous_command_windows(command: &[String]) -> bool {
     // Prefer structured parsing for PowerShell/CMD so we can spot URL-bearing
@@ -36,10 +37,21 @@ fn is_dangerous_powershell(command: &[String]) -> bool {
     if !is_powershell_executable(exe) {
         return false;
     }
-    // Parse the PowerShell invocation to get a flat token list we can scan for
-    // dangerous cmdlets/COM calls plus any URL-looking arguments. This is a
-    // best-effort shlex split of the script text, not a full PS parser.
+    // Backticks have PowerShell escape semantics that shlex cannot preserve.
+    // Use the existing bounded parser for those scripts; an unavailable parse
+    // cannot establish that the escaped command is harmless.
     match parse_powershell_invocation(rest) {
+        PowershellInvocation::InlineCommand { script, .. } if script.contains('`') => {
+            try_parse_powershell_ast_commands(exe, script)
+                .map(|commands| {
+                    commands
+                        .iter()
+                        .any(|words| is_dangerous_powershell_words(words))
+                })
+                .unwrap_or(true)
+        }
+        // Preserve the established best-effort scan for unescaped scripts,
+        // including nested commands that the restricted AST parser does not lower.
         PowershellInvocation::InlineCommand { script, .. } => shlex_split(script)
             .map(|tokens| is_dangerous_powershell_script_tokens(&tokens))
             .unwrap_or(true),
@@ -394,12 +406,7 @@ mod tests {
 
     #[test]
     fn review_regression_structured_arguments_are_not_commands() {
-        let words = |items: &[&str]| {
-            items
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        };
+        let words = |items: &[&str]| items.iter().map(ToString::to_string).collect::<Vec<_>>();
         assert!(!is_dangerous_powershell_words(&words(&[
             "Write-Output",
             "Remove-Item",
@@ -840,6 +847,26 @@ mod tests {
             "powershell",
             "-Command",
             "Get-ChildItem -Force; Remove-Item test"
+        ])));
+    }
+
+    #[test]
+    fn powershell_escaped_force_delete_is_dangerous() {
+        for script in ["Remove-`Item sample -Force", "r`m sample -Force"] {
+            assert!(
+                is_dangerous_command_windows(&vec_str(&["powershell.exe", "-Command", script])),
+                "escaped deletion must remain dangerous: {script}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_escaped_benign_command_is_not_dangerous() {
+        assert!(!is_dangerous_command_windows(&vec_str(&[
+            "powershell.exe",
+            "-Command",
+            "Get-Chil`dItem -Force",
         ])));
     }
 }

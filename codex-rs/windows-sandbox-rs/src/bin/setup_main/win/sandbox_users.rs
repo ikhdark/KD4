@@ -1,3 +1,4 @@
+use anyhow::Context;
 use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -16,6 +17,7 @@ use windows_sys::Win32::Foundation::GENERIC_WRITE;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Foundation::LocalFree;
+use windows_sys::Win32::Foundation::STATUS_OBJECT_NAME_NOT_FOUND;
 use windows_sys::Win32::NetworkManagement::NetManagement::LOCALGROUP_INFO_1;
 use windows_sys::Win32::NetworkManagement::NetManagement::LOCALGROUP_MEMBERS_INFO_3;
 use windows_sys::Win32::NetworkManagement::NetManagement::NERR_Success;
@@ -28,6 +30,16 @@ use windows_sys::Win32::NetworkManagement::NetManagement::UF_SCRIPT;
 use windows_sys::Win32::NetworkManagement::NetManagement::USER_INFO_1;
 use windows_sys::Win32::NetworkManagement::NetManagement::USER_INFO_1003;
 use windows_sys::Win32::NetworkManagement::NetManagement::USER_PRIV_USER;
+use windows_sys::Win32::Security::Authentication::Identity::LSA_OBJECT_ATTRIBUTES;
+use windows_sys::Win32::Security::Authentication::Identity::LSA_UNICODE_STRING;
+use windows_sys::Win32::Security::Authentication::Identity::LsaClose;
+use windows_sys::Win32::Security::Authentication::Identity::LsaFreeMemory;
+use windows_sys::Win32::Security::Authentication::Identity::LsaNtStatusToWinError;
+use windows_sys::Win32::Security::Authentication::Identity::LsaOpenPolicy;
+use windows_sys::Win32::Security::Authentication::Identity::LsaRetrievePrivateData;
+use windows_sys::Win32::Security::Authentication::Identity::LsaStorePrivateData;
+use windows_sys::Win32::Security::Authentication::Identity::POLICY_CREATE_SECRET;
+use windows_sys::Win32::Security::Authentication::Identity::POLICY_GET_PRIVATE_INFORMATION;
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows_sys::Win32::Security::Authorization::SDDL_REVISION_1;
@@ -85,8 +97,8 @@ pub fn provision_sandbox_users(
         log,
         &format!("ensuring sandbox users offline={offline_username} online={online_username}"),
     )?;
-    let offline_password = random_password();
-    let online_password = random_password();
+    let offline_password = shared_sandbox_password(offline_username)?;
+    let online_password = shared_sandbox_password(online_username)?;
     ensure_sandbox_user(offline_username, &offline_password, log)?;
     ensure_sandbox_user(online_username, &online_password, log)?;
     write_secrets(
@@ -97,6 +109,83 @@ pub fn provision_sandbox_users(
         &online_password,
     )?;
     Ok(())
+}
+
+// Full setup holds the machine-wide setup mutex. Keep one protected credential per Windows
+// account, independent of CODEX_HOME: provisioning another home must not invalidate existing
+// homes' saved passwords. LSA private data is available only to the elevated setup helper.
+fn shared_sandbox_password(username: &str) -> Result<String> {
+    fn lsa_string(buffer: &mut [u16]) -> Result<LSA_UNICODE_STRING> {
+        let length = u16::try_from(std::mem::size_of_val(buffer))?;
+        Ok(LSA_UNICODE_STRING {
+            Length: length,
+            MaximumLength: length,
+            Buffer: buffer.as_mut_ptr(),
+        })
+    }
+
+    let mut key_buffer: Vec<u16> = format!("L$CodexSandbox-{}", username.to_ascii_lowercase())
+        .encode_utf16()
+        .collect();
+    let key = lsa_string(&mut key_buffer)?;
+    let attributes = LSA_OBJECT_ATTRIBUTES::default();
+    let mut policy = 0;
+    // SAFETY: The local policy output and zeroed attributes have the API's required layouts.
+    // All counted UTF-16 buffers live through their calls. Retrieved memory and the policy
+    // handle are released on both success and error, after copying the retrieved password.
+    unsafe {
+        let status = LsaOpenPolicy(
+            std::ptr::null(),
+            &attributes,
+            (POLICY_CREATE_SECRET | POLICY_GET_PRIVATE_INFORMATION) as u32,
+            &mut policy,
+        );
+        if status != 0 {
+            anyhow::bail!(
+                "open sandbox credential store failed: {}",
+                LsaNtStatusToWinError(status)
+            );
+        }
+        let result = (|| -> Result<String> {
+            let mut stored = std::ptr::null_mut();
+            let status = LsaRetrievePrivateData(policy, &key, &mut stored);
+            if status == 0 {
+                let password = if (*stored).Length == 0 {
+                    Ok(String::new())
+                } else {
+                    String::from_utf16(std::slice::from_raw_parts(
+                        (*stored).Buffer,
+                        usize::from((*stored).Length) / size_of::<u16>(),
+                    ))
+                };
+                LsaFreeMemory(stored.cast());
+                let password = password.context("invalid sandbox credential encoding")?;
+                anyhow::ensure!(!password.is_empty(), "empty stored sandbox credential");
+                return Ok(password);
+            }
+            if status != STATUS_OBJECT_NAME_NOT_FOUND {
+                anyhow::bail!(
+                    "read sandbox credential failed: {}",
+                    LsaNtStatusToWinError(status)
+                );
+            }
+
+            let password = random_password();
+            let mut password_buffer: Vec<u16> = password.encode_utf16().collect();
+            let secret = lsa_string(&mut password_buffer)?;
+            // Persist before updating the account so interrupted setup reuses the same password.
+            let status = LsaStorePrivateData(policy, &key, &secret);
+            if status != 0 {
+                anyhow::bail!(
+                    "store sandbox credential failed: {}",
+                    LsaNtStatusToWinError(status)
+                );
+            }
+            Ok(password)
+        })();
+        LsaClose(policy);
+        result
+    }
 }
 
 pub fn ensure_sandbox_user(username: &str, password: &str, log: &mut dyn Write) -> Result<()> {

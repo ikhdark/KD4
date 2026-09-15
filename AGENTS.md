@@ -37,7 +37,7 @@
 
 - Never run the full test suite unless specfically told to.
 
-Let each validation run finish before fixing failures. Review the complete results, then fix failures in batches rather than one at a time as they appear.
+When validation or tests report errors, warnings, or failures, let the current run finish and diagnose all reported issues before making any repair edits. Then apply all related fixes in one consolidated batch and rerun each affected test or validation check once. Do not rerun checks that already passed and are unaffected by the repairs.
 
 
 ## Routing and task scope

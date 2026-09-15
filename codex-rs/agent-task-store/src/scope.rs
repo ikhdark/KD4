@@ -27,10 +27,18 @@ pub(crate) fn repository_identity(repo_root: &Path) -> StoreResult<RepositoryIde
     })?;
     let canonical_path = canonical_root.to_string_lossy().into_owned();
     let workspace_identity_input = filesystem_identity_bytes(&canonical_root);
-    let repository_identity_input = git_common_directory(&canonical_root)
-        .and_then(|path| std::fs::canonicalize(path).ok())
-        .map(|path| filesystem_identity_bytes(&path))
-        .unwrap_or_else(|| workspace_identity_input.clone());
+    let repository_identity_input = match git_common_directory(&canonical_root)? {
+        Some(path) => {
+            let path = std::fs::canonicalize(&path).map_err(|error| {
+                StoreError::InvalidScope(format!(
+                    "Git directory {} cannot be canonicalized: {error}",
+                    path.display()
+                ))
+            })?;
+            filesystem_identity_bytes(&path)
+        }
+        None => workspace_identity_input.clone(),
+    };
     Ok(RepositoryIdentity {
         id: format!("{:x}", Sha256::digest(&repository_identity_input)),
         workspace_id: format!("{:x}", Sha256::digest(&workspace_identity_input)),
@@ -69,34 +77,76 @@ pub fn repository_workspace_id(repo_root: &Path) -> StoreResult<String> {
     Ok(repository_identity(repo_root)?.workspace_id)
 }
 
-fn git_common_directory(canonical_root: &Path) -> Option<PathBuf> {
+fn git_common_directory(canonical_root: &Path) -> StoreResult<Option<PathBuf>> {
     let dot_git = canonical_root.join(".git");
-    if dot_git.is_dir() {
-        return Some(dot_git);
+    match std::fs::symlink_metadata(&dot_git) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(StoreError::InvalidScope(format!(
+                "Git metadata {} cannot be inspected: {error}",
+                dot_git.display()
+            )));
+        }
     }
-    let marker = std::fs::read_to_string(&dot_git).ok()?;
+    if dot_git.is_dir() {
+        return Ok(Some(dot_git));
+    }
+    let marker = std::fs::read_to_string(&dot_git).map_err(|error| {
+        StoreError::InvalidScope(format!(
+            "Git metadata {} cannot be read: {error}",
+            dot_git.display()
+        ))
+    })?;
     let git_dir = marker
         .lines()
-        .find_map(|line| line.trim().strip_prefix("gitdir:"))?
-        .trim();
+        .find_map(|line| line.trim().strip_prefix("gitdir:"))
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            StoreError::InvalidScope(format!(
+                "Git metadata {} has no nonempty gitdir",
+                dot_git.display()
+            ))
+        })?;
     let git_dir = Path::new(git_dir);
     let git_dir = if git_dir.is_absolute() {
         git_dir.to_path_buf()
     } else {
         canonical_root.join(git_dir)
     };
-    let common = std::fs::read_to_string(git_dir.join("commondir")).ok();
-    match common {
-        Some(common) => {
-            let common = Path::new(common.trim());
-            Some(if common.is_absolute() {
-                common.to_path_buf()
-            } else {
-                git_dir.join(common)
-            })
+    let common_path = git_dir.join("commondir");
+    match std::fs::symlink_metadata(&common_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Some(git_dir));
         }
-        None => Some(git_dir),
+        Err(error) => {
+            return Err(StoreError::InvalidScope(format!(
+                "Git metadata {} cannot be inspected: {error}",
+                common_path.display()
+            )));
+        }
     }
+    let common = std::fs::read_to_string(&common_path).map_err(|error| {
+        StoreError::InvalidScope(format!(
+            "Git metadata {} cannot be read: {error}",
+            common_path.display()
+        ))
+    })?;
+    let common = common.trim();
+    if common.is_empty() {
+        return Err(StoreError::InvalidScope(format!(
+            "Git metadata {} has an empty commondir",
+            common_path.display()
+        )));
+    }
+    let common = Path::new(common);
+    Ok(Some(if common.is_absolute() {
+        common.to_path_buf()
+    } else {
+        git_dir.join(common)
+    }))
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]

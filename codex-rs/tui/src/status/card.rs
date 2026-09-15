@@ -13,7 +13,6 @@ use codex_app_server_protocol::AskForApproval;
 use codex_model_provider_info::WireApi;
 use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
-use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
@@ -292,7 +291,7 @@ impl StatusHistoryCell {
         let sandbox =
             status_permission_summary(&permission_profile, &config.cwd, workspace_roots.as_slice());
         let workspace_root_suffix = workspace_root_suffix(workspace_roots.as_slice(), &config.cwd);
-        let approval = status_approval_label(approval_policy, config.approvals_reviewer, &approval);
+        let approval = status_approval_label(approval_policy, &approval);
         let permissions = status_permissions_label(
             active_permission_profile.as_ref(),
             &permission_profile,
@@ -672,16 +671,9 @@ fn decorate_workspace_sandbox_label(sandbox: &str, workspace_root_suffix: Option
     }
 }
 
-fn status_approval_label(
-    approval_policy: AskForApproval,
-    approvals_reviewer: ApprovalsReviewer,
-    approval: &str,
-) -> String {
+fn status_approval_label(approval_policy: AskForApproval, approval: &str) -> String {
     if approval_policy == AskForApproval::OnRequest {
-        return match approvals_reviewer {
-            ApprovalsReviewer::AutoReview => "Approve for me".to_string(),
-            ApprovalsReviewer::User => "Ask for approval".to_string(),
-        };
+        return "Ask for approval".to_string();
     }
 
     approval.to_string()

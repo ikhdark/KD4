@@ -39,6 +39,7 @@ use codex_http_client::RouteAwareClientPool;
 use codex_http_client::maybe_build_rustls_client_config_with_custom_ca;
 use codex_login::AuthManager;
 use codex_login::UnauthorizedRecovery;
+use codex_login::default_client::default_headers;
 use codex_state::StateRuntime;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 use futures::SinkExt;
@@ -1418,6 +1419,7 @@ fn build_remote_control_websocket_request(
         )
     })?;
     let headers = request.headers_mut();
+    headers.extend(default_headers());
     set_remote_control_header(headers, "x-codex-server-id", &enrollment.server_id)?;
     set_remote_control_header(
         headers,

@@ -344,6 +344,33 @@ impl Hash for ConfigLayerStackIdentity {
     }
 }
 
+// Keep the allocation alive while its address is used as a cache identity.
+// Otherwise a later executor can reuse the address and inherit stale skills.
+#[derive(Clone)]
+struct FileSystemIdentity(Arc<dyn ExecutorFileSystem>);
+
+impl std::fmt::Debug for FileSystemIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("FileSystemIdentity")
+            .field(&Arc::as_ptr(&self.0))
+            .finish()
+    }
+}
+
+impl PartialEq for FileSystemIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for FileSystemIdentity {}
+
+impl Hash for FileSystemIdentity {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (Arc::as_ptr(&self.0).cast::<()>() as usize).hash(state);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SkillsInputCacheKey {
     config_layer_stack: ConfigLayerStackIdentity,
@@ -351,7 +378,7 @@ struct SkillsInputCacheKey {
     effective_skill_roots: Vec<PluginSkillRoot>,
     bundled_skills_enabled: bool,
     plugin_skill_snapshots_identity: Option<u64>,
-    file_system_identity: usize,
+    file_system_identity: Option<FileSystemIdentity>,
 }
 
 impl SkillsInputCacheKey {
@@ -365,9 +392,7 @@ impl SkillsInputCacheKey {
                 .plugin_skill_snapshots
                 .as_ref()
                 .map(PluginSkillSnapshots::cache_identity),
-            file_system_identity: fs
-                .map(|fs| Arc::as_ptr(fs).cast::<()>() as usize)
-                .unwrap_or_default(),
+            file_system_identity: fs.map(|fs| FileSystemIdentity(Arc::clone(fs))),
         }
     }
 }
@@ -384,7 +409,7 @@ struct SkillsCacheKey {
 struct SkillRootCacheKey {
     path: AbsolutePathBuf,
     scope_rank: u8,
-    file_system_identity: usize,
+    file_system_identity: Option<FileSystemIdentity>,
     plugin_id: Option<String>,
     plugin_namespace: Option<String>,
     plugin_root: Option<AbsolutePathBuf>,
@@ -434,11 +459,8 @@ fn skills_cache_key(
                 SkillRootCacheKey {
                     path: root.path.clone(),
                     scope_rank,
-                    file_system_identity: if isolate_file_system {
-                        Arc::as_ptr(&root.file_system).cast::<()>() as usize
-                    } else {
-                        0
-                    },
+                    file_system_identity: isolate_file_system
+                        .then(|| FileSystemIdentity(Arc::clone(&root.file_system))),
                     plugin_id: root.plugin_id.clone(),
                     plugin_namespace: root.plugin_namespace.clone(),
                     plugin_root: root.plugin_root.clone(),

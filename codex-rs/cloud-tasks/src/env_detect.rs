@@ -1,3 +1,4 @@
+use anyhow::Context;
 use codex_http_client::RouteAwareClientPool;
 use http::HeaderMap;
 use http::header::CONTENT_TYPE;
@@ -85,7 +86,10 @@ pub async fn autodetect_environment_id(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let body = res.text().await.unwrap_or_default();
+    let body = res
+        .text()
+        .await
+        .with_context(|| format!("Failed to read response body from {list_url}"))?;
     crate::append_error_log(format!("env: status={status} content-type={ct}"));
     match serde_json::from_str::<serde_json::Value>(&body) {
         Ok(v) => {
@@ -159,7 +163,10 @@ async fn get_json_with_client<T: serde::de::DeserializeOwned>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let body = res.text().await.unwrap_or_default();
+    let body = res
+        .text()
+        .await
+        .with_context(|| format!("Failed to read response body from {url}"))?;
     crate::append_error_log(format!("env: status={status} content-type={ct}"));
     if !status.is_success() {
         anyhow::bail!("GET {url} failed: {status}; content-type={ct}; body={body}");
@@ -174,6 +181,65 @@ async fn get_json_with_client<T: serde::de::DeserializeOwned>(
 #[allow(clippy::expect_used, clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn environment_requests_preserve_response_body_transport_errors() {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+
+        for autodetect in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind response server");
+            let address = listener.local_addr().expect("server address");
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.expect("accept request");
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        let byte = stream.read_u8().await.expect("read request headers");
+                        request.push(byte);
+                    }
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 16\r\nConnection: close\r\n\r\n[]")
+                        .await
+                        .expect("send deliberately truncated response");
+                    stream.shutdown().await.expect("close response");
+                }
+            });
+            let http = crate::environment_http_clients(&codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ));
+            let base_url = CloudBaseUrl::new(&format!("http://{address}/backend-api"));
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                if autodetect {
+                    autodetect_environment_id(&http, &base_url, &HeaderMap::new(), None)
+                        .await
+                        .map(|_| ())
+                } else {
+                    list_environments(&http, &base_url, &HeaderMap::new())
+                        .await
+                        .map(|_| ())
+                }
+            })
+            .await;
+            server.abort();
+            let _ = server.await;
+            let error = result
+                .expect("environment request must finish")
+                .expect_err("truncated HTTP body must fail");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("Failed to read response body from ")
+            );
+            assert!(
+                error.chain().count() > 1,
+                "preserve the transport cause: {error:#}"
+            );
+            assert!(!format!("{error:#}").contains("Decode error"));
+        }
+    }
 
     #[tokio::test]
     async fn list_environments_reuses_caller_http_client() {

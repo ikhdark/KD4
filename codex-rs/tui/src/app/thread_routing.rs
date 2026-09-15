@@ -116,16 +116,6 @@ impl App {
         store.note_outbound_op(op);
     }
 
-    pub(super) async fn note_active_thread_outbound_op(&mut self, op: &AppCommand) {
-        if !ThreadEventStore::op_can_change_pending_replay_state(op) {
-            return;
-        }
-        let Some(thread_id) = self.active_thread_id else {
-            return;
-        };
-        self.note_thread_outbound_op(thread_id, op).await;
-    }
-
     pub(super) async fn active_turn_id_for_thread(&self, thread_id: ThreadId) -> Option<String> {
         let channel = self.thread_event_channels.get(&thread_id)?;
         let store = channel.store.lock().await;
@@ -438,7 +428,7 @@ impl App {
         thread_id: ThreadId,
         op: AppCommand,
     ) -> Result<()> {
-        crate::session_log::log_outbound_op(&op);
+        crate::session_log::log_outbound_op(&op).await;
 
         if self
             .try_resolve_app_server_request(app_server, thread_id, &op)
@@ -566,7 +556,6 @@ impl App {
                 items,
                 cwd,
                 approval_policy,
-                approvals_reviewer,
                 active_permission_profile,
                 model,
                 effort,
@@ -643,8 +632,6 @@ impl App {
                 }
                 if should_start_turn {
                     let config = self.chat_widget.config_ref();
-                    let approvals_reviewer =
-                        approvals_reviewer.unwrap_or(config.approvals_reviewer);
                     let permissions_override = Self::turn_permissions_override_from_config(
                         config,
                         active_permission_profile.as_ref(),
@@ -658,7 +645,6 @@ impl App {
                             items.to_vec(),
                             cwd.clone(),
                             *approval_policy,
-                            approvals_reviewer,
                             permissions_override,
                             config.permissions.user_visible_workspace_roots(),
                             model.to_string(),
@@ -745,12 +731,6 @@ impl App {
             AppCommand::OverrideTurnContext { .. } => {
                 self.sync_override_turn_context_settings(app_server, thread_id, op)
                     .await;
-                Ok(true)
-            }
-            AppCommand::ApproveGuardianDeniedAction { event } => {
-                app_server
-                    .thread_approve_guardian_denied_action(thread_id, event)
-                    .await?;
                 Ok(true)
             }
             _ => Ok(false),

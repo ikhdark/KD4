@@ -222,6 +222,28 @@ impl Session {
         turn_context: &TurnContext,
         rollout_items: &[RolloutItem],
     ) -> RolloutReconstruction {
+        Self::reconstruct_rollout(
+            rollout_items,
+            turn_context.model_info.truncation_policy.into(),
+        )
+    }
+
+    /// Rebuild the active model history without truncating retained payloads. Fork admission
+    /// must use the same rollback and compaction decisions as the child that will replay it.
+    pub(crate) fn reconstruct_model_history_from_rollout(
+        rollout_items: &[RolloutItem],
+    ) -> Vec<ResponseItem> {
+        Self::reconstruct_rollout(
+            rollout_items,
+            codex_utils_output_truncation::TruncationPolicy::Bytes(usize::MAX),
+        )
+        .history
+    }
+
+    fn reconstruct_rollout(
+        rollout_items: &[RolloutItem],
+        truncation_policy: codex_utils_output_truncation::TruncationPolicy,
+    ) -> RolloutReconstruction {
         // Replay metadata should already match the shape of the future lazy reverse loader, even
         // while history materialization still uses an eager bridge. Scan newest-to-oldest,
         // stopping once a surviving replacement-history checkpoint and the required resume metadata
@@ -557,17 +579,11 @@ impl Session {
             }
             match item {
                 RolloutItem::ResponseItem(response_item) => {
-                    history.record_items(
-                        std::iter::once(response_item),
-                        turn_context.model_info.truncation_policy.into(),
-                    );
+                    history.record_items(std::iter::once(response_item), truncation_policy);
                 }
                 RolloutItem::InterAgentCommunication(communication) => {
                     let response_item = communication.to_model_input_item();
-                    history.record_items(
-                        std::iter::once(&response_item),
-                        turn_context.model_info.truncation_policy.into(),
-                    );
+                    history.record_items(std::iter::once(&response_item), truncation_policy);
                 }
                 RolloutItem::InterAgentCommunicationMetadata { .. } => {}
                 RolloutItem::Compacted(compacted) => {

@@ -49,6 +49,7 @@ use tracing::info_span;
 #[derive(Clone)]
 pub(crate) struct ShellSnapshot {
     config: Option<Arc<ShellSnapshotConfig>>,
+    tasks: tokio_util::task::TaskTracker,
 }
 
 struct ShellSnapshotConfig {
@@ -58,6 +59,7 @@ struct ShellSnapshotConfig {
     state_db: Option<StateDbHandle>,
     environment_variables: HashMap<String, String>,
     remote_environment_policy: ExecEnvPolicy,
+    tasks: tokio_util::task::TaskTracker,
 }
 
 pub(crate) struct ShellSnapshotFile {
@@ -70,6 +72,8 @@ enum ShellSnapshotLocation {
     Remote {
         path: PathUri,
         filesystem: Arc<dyn ExecutorFileSystem>,
+        tasks: tokio_util::task::TaskTracker,
+        runtime: tokio::runtime::Handle,
     },
 }
 
@@ -112,6 +116,7 @@ impl ShellSnapshot {
         environment_variables: HashMap<String, String>,
         shell_environment_policy: ShellEnvironmentPolicy,
     ) -> Self {
+        let tasks = tokio_util::task::TaskTracker::new();
         Self {
             config: Some(Arc::new(ShellSnapshotConfig {
                 codex_home,
@@ -122,12 +127,21 @@ impl ShellSnapshot {
                 remote_environment_policy: exec_env_policy_from_shell_policy(
                     &shell_environment_policy,
                 ),
+                tasks: tasks.clone(),
             })),
+            tasks,
         }
     }
 
     pub(crate) fn disabled() -> Self {
-        Self { config: None }
+        Self {
+            config: None,
+            tasks: tokio_util::task::TaskTracker::new(),
+        }
+    }
+
+    pub(crate) fn tasks(&self) -> tokio_util::task::TaskTracker {
+        self.tasks.clone()
     }
 
     pub(crate) async fn build(
@@ -372,6 +386,8 @@ impl ShellSnapshot {
             location: ShellSnapshotLocation::Remote {
                 path: path.clone(),
                 filesystem,
+                tasks: config.tasks.clone(),
+                runtime: tokio::runtime::Handle::current(),
             },
             contents,
         };
@@ -429,11 +445,18 @@ impl Drop for ShellSnapshotFile {
                     tracing::warn!("Failed to delete shell snapshot at {:?}: {err:?}", path);
                 }
             }
-            ShellSnapshotLocation::Remote { path, filesystem } => {
+            ShellSnapshotLocation::Remote {
+                path,
+                filesystem,
+                tasks,
+                runtime,
+            } => {
                 let path = path.clone();
                 let filesystem = Arc::clone(filesystem);
-                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                    runtime.spawn(async move {
+                // Register before returning from final-owner release. Each sharing
+                // environment drains this tracker after releasing its cached snapshot.
+                tasks.spawn_on(
+                    async move {
                         if let Err(err) = filesystem
                             .remove(
                                 &path,
@@ -449,8 +472,9 @@ impl Drop for ShellSnapshotFile {
                                 "Failed to delete remote shell snapshot at {path}: {err:?}"
                             );
                         }
-                    });
-                }
+                    },
+                    runtime,
+                );
             }
         }
     }

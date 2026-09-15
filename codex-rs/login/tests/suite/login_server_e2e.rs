@@ -796,7 +796,10 @@ fn async_login_startup_keeps_runtime_responsive_and_cleans_cancelled_binding() -
                 {
                     // tiny_http wakes its accept thread on Drop; wait only for
                     // that thread to release the socket, after the bind barrier.
-                    thread::sleep(Duration::from_millis(10));
+                    thread::sleep(
+                        Duration::from_millis(10)
+                            .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                    );
                 }
                 Err(error) => return Err(error.into()),
             }

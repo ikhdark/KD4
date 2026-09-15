@@ -13,7 +13,6 @@ fn thread_settings_for_test(
         thread_settings: codex_app_server_protocol::ThreadSettings {
             cwd: test_path_buf("/tmp/thread-settings").abs(),
             approval_policy: AskForApproval::OnRequest,
-            approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::AutoReview,
             sandbox_policy: codex_app_server_protocol::SandboxPolicy::ReadOnly {
                 network_access: false,
             },
@@ -49,7 +48,6 @@ fn configured_thread_session(thread_id: ThreadId) -> crate::session_state::Threa
         model_provider_id: "openai".to_string(),
         service_tier: None,
         approval_policy: AskForApproval::Never,
-        approvals_reviewer: ApprovalsReviewer::User,
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
         cwd: test_path_buf("/tmp/thread-settings").abs(),
@@ -395,10 +393,6 @@ async fn thread_settings_updated_updates_visible_state_without_transcript() {
     assert_eq!(
         chat.config_ref().permissions.approval_policy.value(),
         AskForApproval::OnRequest.to_core()
-    );
-    assert_eq!(
-        chat.config_ref().approvals_reviewer,
-        ApprovalsReviewer::AutoReview
     );
     assert_eq!(
         chat.config_ref()
@@ -771,27 +765,6 @@ async fn live_app_server_warning_notification_renders_message() {
             "All skill descriptions were removed and 2 additional skills were not included in the model-visible skills list."
         ),
         "expected warning guidance, got {rendered}"
-    );
-}
-
-#[tokio::test]
-async fn live_app_server_guardian_warning_notification_renders_message() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-
-    chat.handle_server_notification(
-        ServerNotification::GuardianWarning(GuardianWarningNotification {
-            thread_id: "thread-1".to_string(),
-            message: "Automatic approval review denied the requested action.".to_string(),
-        }),
-        /*replay_kind*/ None,
-    );
-
-    let cells = drain_insert_history(&mut rx);
-    assert_eq!(cells.len(), 1, "expected one warning history cell");
-    let rendered = lines_to_single_string(&cells[0]);
-    assert!(
-        rendered.contains("Automatic approval review denied the requested action."),
-        "expected guardian warning notification message, got {rendered}"
     );
 }
 

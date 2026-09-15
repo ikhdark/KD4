@@ -18,6 +18,51 @@ use std::time::Duration;
 use std::time::Instant;
 use tempfile::TempDir;
 
+#[tokio::test]
+async fn removing_thread_names_preserves_other_entries_and_cleans_replacement() {
+    let home = TempDir::new().expect("tempdir");
+    let removed = ThreadId::new();
+    let retained = ThreadId::new();
+    append_thread_name(home.path(), removed, "old name")
+        .await
+        .expect("first name");
+    append_thread_name(home.path(), retained, "retained name")
+        .await
+        .expect("other name");
+    append_thread_name(home.path(), removed, "new name")
+        .await
+        .expect("second name");
+    let path = session_index_path(home.path());
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("open index")
+        .write_all(b"malformed but retained\n")
+        .expect("write malformed line");
+    remove_thread_name_entries(home.path(), removed)
+        .await
+        .expect("remove names");
+    let contents = std::fs::read_to_string(path).expect("read replaced index");
+    let lines: Vec<_> = contents.lines().collect();
+    assert_eq!(lines.len(), 2);
+    let retained_entry: SessionIndexEntry = serde_json::from_str(lines[0]).expect("retained entry");
+    assert_eq!(retained_entry.id, retained);
+    assert_eq!(retained_entry.thread_name, "retained name");
+    assert_eq!(lines[1], "malformed but retained");
+    let mut files: Vec<_> = std::fs::read_dir(home.path())
+        .expect("list home")
+        .map(|entry| entry.expect("directory entry").file_name())
+        .collect();
+    files.sort();
+    assert_eq!(
+        files,
+        vec![
+            std::ffi::OsString::from(SESSION_INDEX_FILE),
+            std::ffi::OsString::from(SESSION_INDEX_LOCK_FILE)
+        ]
+    );
+}
+
 const LOCK_HOLDER_CHILD_TEST: &str = "session_index::tests::session_index_lock_holder_child";
 const LOCK_HOLDER_CODEX_HOME_ENV: &str = "CODEX_SESSION_INDEX_LOCK_HOLDER_CODEX_HOME";
 const LOCK_HOLDER_READY_PATH_ENV: &str = "CODEX_SESSION_INDEX_LOCK_HOLDER_READY_PATH";

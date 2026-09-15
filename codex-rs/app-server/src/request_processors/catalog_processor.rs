@@ -539,6 +539,7 @@ impl CatalogRequestProcessor {
         let SkillsExtraRootsSetParams { extra_roots } = params;
         self.skills_watcher
             .register_runtime_extra_roots(&extra_roots)
+            .await
             .map_err(internal_error)?;
         self.thread_manager
             .skills_service()

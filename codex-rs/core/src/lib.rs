@@ -46,7 +46,6 @@ mod exec_policy;
 #[cfg(test)]
 mod git_info_tests;
 mod git_workspace;
-mod guardian;
 mod hook_runtime;
 mod image_preparation;
 mod installation_id;

@@ -1026,7 +1026,10 @@ mod tests {
                     Ok((stream, _)) => break stream,
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         assert!(Instant::now() < deadline, "transport sent no request");
-                        std::thread::sleep(Duration::from_millis(10));
+                        std::thread::sleep(
+                            Duration::from_millis(10)
+                                .min(deadline.saturating_duration_since(Instant::now())),
+                        );
                     }
                     Err(error) => panic!("accept local request: {error}"),
                 }

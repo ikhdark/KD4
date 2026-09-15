@@ -120,7 +120,9 @@ async fn pipes_stdin_and_stdout_through_socket() -> anyhow::Result<()> {
                 );
             }
 
-            thread::sleep(Duration::from_millis(25));
+            thread::sleep(
+                Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())),
+            );
         };
 
         let stdout = stdout_rx

@@ -260,7 +260,13 @@ pub async fn download_and_install_remote_plugin_bundle(
         &codex_home,
         bundle.plugin_id.marketplace_name(),
         bundle.plugin_id.plugin_name(),
-    );
+    )
+    .await
+    .map_err(|error| {
+        RemotePluginBundleInstallError::InvalidBundle(format!(
+            "failed to acquire remote plugin cache mutation: {error}"
+        ))
+    })?;
     download_and_install_remote_plugin_bundle_with_guard(codex_home, bundle, http_clients, mutation)
         .await
 }

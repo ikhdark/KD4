@@ -126,9 +126,11 @@ fn remove_thread_name_entries_blocking(
         if !removed {
             return Ok(());
         }
-        let temp_path = path.with_extension("jsonl.tmp");
-        std::fs::write(&temp_path, remaining)?;
-        std::fs::rename(temp_path, path)
+        let mut temp_file = tempfile::NamedTempFile::new_in(codex_home)?;
+        temp_file.write_all(remaining.as_bytes())?;
+        temp_file.as_file().sync_all()?;
+        temp_file.persist(path).map_err(|error| error.error)?;
+        Ok(())
     })
 }
 

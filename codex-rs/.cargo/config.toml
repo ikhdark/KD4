@@ -2,9 +2,12 @@
 # Bound compiler fanout so local Cargo commands do not saturate the host.
 # CARGO_BUILD_JOBS or Cargo's -j/--jobs flag can opt into a different limit.
 jobs = 8
-# sccache is the shared compiler cache for local builds. Avoid keeping a second,
-# much larger incremental cache unless CARGO_INCREMENTAL explicitly opts back in.
-incremental = false
+# Incremental compilation speeds up local edits to workspace/path crates.
+# sccache can cache eligible dependency compilations, but cannot cache rustc
+# invocations with -C incremental, regardless of where it was configured.
+# This local default also applies to release/package builds. Keep it enabled
+# for repeated local packaging; isolated perf recipes explicitly disable it.
+incremental = true
 
 [env]
 # Bound direct `cargo test` libtest fanout. An existing process environment

@@ -5,8 +5,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::sync::Mutex;
-use std::sync::mpsc;
 use std::thread::JoinHandle;
+use tokio::sync::mpsc;
 
 use crate::app_command::AppCommand;
 use crate::legacy_core::config::Config;
@@ -23,7 +23,7 @@ static LOGGER: LazyLock<SessionLogger> = LazyLock::new(SessionLogger::new);
 const SESSION_LOG_QUEUE_CAPACITY: usize = 256;
 
 struct SessionLogWriter {
-    sender: mpsc::SyncSender<serde_json::Value>,
+    sender: mpsc::Sender<serde_json::Value>,
     worker: JoinHandle<std::io::Result<()>>,
 }
 
@@ -52,7 +52,7 @@ impl SessionLogger {
                 .truncate(!create_new)
                 .write(true)
                 .open(path)?;
-            let (sender, receiver) = mpsc::sync_channel(SESSION_LOG_QUEUE_CAPACITY);
+            let (sender, receiver) = mpsc::channel(SESSION_LOG_QUEUE_CAPACITY);
             let worker = std::thread::Builder::new()
                 .name("codex-session-log".to_string())
                 .spawn(move || Self::write_records(file, receiver))?;
@@ -69,10 +69,10 @@ impl SessionLogger {
 
     fn write_records(
         file: File,
-        receiver: mpsc::Receiver<serde_json::Value>,
+        mut receiver: mpsc::Receiver<serde_json::Value>,
     ) -> std::io::Result<()> {
         let mut file = BufWriter::new(file);
-        for value in receiver {
+        while let Some(value) = receiver.blocking_recv() {
             serde_json::to_writer(&mut file, &value)?;
             file.write_all(b"\n")?;
             file.flush()?;
@@ -80,13 +80,15 @@ impl SessionLogger {
         file.flush()
     }
 
-    fn write_json_line(&self, value: serde_json::Value) {
-        let writer = self
+    async fn write_json_line(&self, value: serde_json::Value) {
+        let sender = self
             .writer
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(writer) = writer.as_ref()
-            && writer.sender.send(value).is_err()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|writer| writer.sender.clone());
+        if let Some(sender) = sender
+            && sender.send(value).await.is_err()
         {
             tracing::warn!("session log writer stopped before accepting a record");
         }
@@ -160,16 +162,18 @@ pub(crate) async fn maybe_init(config: &Config) {
         "model_provider_id": config.model_provider_id,
         "model_provider_name": config.model_provider.name,
     });
-    LOGGER.write_json_line(header);
+    LOGGER.write_json_line(header).await;
 }
 
-pub(crate) fn log_inbound_app_event(event: &AppEvent) {
+pub(crate) async fn log_inbound_app_event(event: &AppEvent) {
     // Log only if enabled
     if !LOGGER.is_enabled() {
         return;
     }
 
-    LOGGER.write_json_line(inbound_app_event_record(event));
+    LOGGER
+        .write_json_line(inbound_app_event_record(event))
+        .await;
 }
 
 fn inbound_app_event_record(event: &AppEvent) -> serde_json::Value {
@@ -257,7 +261,7 @@ fn inbound_app_event_record(event: &AppEvent) -> serde_json::Value {
     }
 }
 
-pub(crate) fn log_outbound_op(op: &AppCommand) {
+pub(crate) async fn log_outbound_op(op: &AppCommand) {
     if !LOGGER.is_enabled() {
         return;
     }
@@ -267,7 +271,7 @@ pub(crate) fn log_outbound_op(op: &AppCommand) {
     if !outbound_op_is_loggable(op) {
         return;
     }
-    write_record("from_tui", "op", op);
+    write_record("from_tui", "op", op).await;
 }
 
 fn outbound_op_is_loggable(op: &AppCommand) -> bool {
@@ -283,13 +287,13 @@ pub(crate) async fn log_session_end() {
         "dir": "meta",
         "kind": "session_end",
     });
-    LOGGER.write_json_line(value);
+    LOGGER.write_json_line(value).await;
     if let Err(error) = LOGGER.shutdown().await {
         tracing::warn!("session log shutdown error: {error}");
     }
 }
 
-fn write_record<T>(dir: &str, kind: &str, obj: &T)
+async fn write_record<T>(dir: &str, kind: &str, obj: &T)
 where
     T: Serialize,
 {
@@ -299,7 +303,7 @@ where
         "kind": kind,
         "payload": obj,
     });
-    LOGGER.write_json_line(value);
+    LOGGER.write_json_line(value).await;
 }
 
 #[cfg(test)]
@@ -347,6 +351,47 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), b"existing session");
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn saturated_session_logger_yields_and_preserves_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let file = File::create(&path).unwrap();
+        let (sender, receiver) = mpsc::channel(1);
+        let (release, resume) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            resume
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(std::io::Error::other)?;
+            SessionLogger::write_records(file, receiver)
+        });
+        let logger = SessionLogger {
+            writer: Mutex::new(Some(SessionLogWriter { sender, worker })),
+        };
+        logger.write_json_line(json!({"sequence": 0})).await;
+        let pending = logger.write_json_line(json!({"sequence": 1}));
+        tokio::pin!(pending);
+        tokio::select! {
+            () = &mut pending => panic!("full log queue must apply backpressure"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+        assert!(
+            logger.is_enabled(),
+            "pending send must not retain the state lock"
+        );
+        release.send(()).unwrap();
+        pending.await;
+        logger.shutdown().await.unwrap();
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            records,
+            vec![json!({"sequence": 0}), json!({"sequence": 1})]
+        );
+    }
+
     #[tokio::test]
     async fn session_logger_shutdown_drains_records_in_order() {
         let directory = tempfile::tempdir().unwrap();
@@ -356,7 +401,9 @@ mod tests {
         // Exceed the queue capacity to cover lossless backpressure as well as
         // escaping and the final records still queued when shutdown starts.
         for sequence in 0..(SESSION_LOG_QUEUE_CAPACITY * 2 + 1) {
-            logger.write_json_line(json!({"sequence": sequence, "text": "first\nsecond"}));
+            logger
+                .write_json_line(json!({"sequence": sequence, "text": "first\nsecond"}))
+                .await;
         }
         logger.shutdown().await.unwrap();
         assert!(!logger.is_enabled());
@@ -369,7 +416,9 @@ mod tests {
             .map(|sequence| json!({"sequence": sequence, "text": "first\nsecond"}))
             .collect();
         assert_eq!(records, expected);
-        logger.write_json_line(json!({"after_shutdown": true}));
+        logger
+            .write_json_line(json!({"after_shutdown": true}))
+            .await;
         logger.shutdown().await.unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), 513);
     }
@@ -387,7 +436,7 @@ mod tests {
                 .is_err()
         );
         assert!(!logger.is_enabled());
-        logger.write_json_line(json!({"not_recorded": true}));
+        logger.write_json_line(json!({"not_recorded": true})).await;
         logger.shutdown().await.unwrap();
         assert_eq!(
             std::fs::read_to_string(occupied).unwrap(),

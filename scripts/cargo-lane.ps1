@@ -163,11 +163,17 @@ function Test-CargoLanesRootReparsePoint {
         [string]$LanesRoot
     )
 
-    if (-not (Test-Path -LiteralPath $LanesRoot)) {
-        return $false
+    $component = $LanesRoot
+    while (-not [string]::IsNullOrEmpty($component)) {
+        if (Test-Path -LiteralPath $component) {
+            $rootItem = Get-Item -LiteralPath $component -Force -ErrorAction Stop
+            if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                return $true
+            }
+        }
+        $component = [IO.Path]::GetDirectoryName($component)
     }
-    $rootItem = Get-Item -LiteralPath $LanesRoot -Force -ErrorAction Stop
-    return ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+    return $false
 }
 
 function Test-CargoLanesRootForPrune {
@@ -241,15 +247,9 @@ function Enable-SccacheEnvironment {
 
     if (-not (Test-Path Env:RUSTC_WRAPPER)) {
         $env:RUSTC_WRAPPER = "sccache"
-        if ([string]::IsNullOrWhiteSpace($env:CARGO_INCREMENTAL)) {
-            $env:CARGO_INCREMENTAL = "0"
-        }
         Set-CodexRustSccacheEnvironment -RepoRoot $RepoRoot
     }
     elseif (Test-SccacheWrapper -Value $env:RUSTC_WRAPPER) {
-        if ([string]::IsNullOrWhiteSpace($env:CARGO_INCREMENTAL)) {
-            $env:CARGO_INCREMENTAL = "0"
-        }
         Set-CodexRustSccacheEnvironment -RepoRoot $RepoRoot
     }
 }
@@ -301,15 +301,10 @@ function Get-AffinityLaneBase {
 
     $signature = ([string]::Join(" ", @($CommandArgs))).Trim()
     $isRelease = $signature -match "(?:^|\s)(?:--release|-r|--profile(?:=|\s+)release)(?:\s|$)"
-    if ($signature -match "(?:^|\s)--package(?:=|\s+)([A-Za-z0-9_.-]+)(?:\s|$)") {
-        $base = ConvertTo-SafeLaneName $Matches[1]
-        if ($isRelease) {
-            return "$base-release"
-        }
-        return $base
-    }
-    if ($signature -match "(?:^|\s)-p\s+([A-Za-z0-9_.-]+)(?:\s|$)") {
-        $base = ConvertTo-SafeLaneName $Matches[1]
+    # Include package selectors inside Cargo watch's --exec/-x command strings.
+    $packages = @(Get-CodexCargoPackageSpecs -CommandArgs ($signature -split "\s+"))
+    if ($packages.Count -gt 0) {
+        $base = ConvertTo-SafeLaneName $packages[0]
         if ($isRelease) {
             return "$base-release"
         }
@@ -375,7 +370,21 @@ function Test-CargoLockBusy {
         [string]$TargetDir
     )
 
-    return Test-ExclusiveLaneFileBusy -TargetDir $TargetDir -LockFileName ".cargo-lock"
+    if (-not (Test-Path -LiteralPath $TargetDir -PathType Container)) {
+        return $false
+    }
+    try {
+        foreach ($child in Get-ChildItem -LiteralPath $TargetDir -Directory -Force -ErrorAction Stop) {
+            if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
+            if (Test-ExclusiveLaneFileBusy -TargetDir $child.FullName -LockFileName ".cargo-lock") { return $true }
+            foreach ($profile in Get-ChildItem -LiteralPath $child.FullName -Directory -Force -ErrorAction Stop) {
+                if (($profile.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
+                if (Test-ExclusiveLaneFileBusy -TargetDir $profile.FullName -LockFileName ".cargo-lock") { return $true }
+            }
+        }
+    }
+    catch { return $true }
+    return $false
 }
 
 function Test-LaneActiveLockBusy {
@@ -579,68 +588,113 @@ function Invoke-CargoLanePrune {
         }
     }
 
-    $maxAgeDays = Get-EnvIntValue -Name "CODEX_CARGO_LANE_MAX_AGE_DAYS" -DefaultValue 7 -MinimumValue 1
-    $maxLaneBytes = Get-EnvInt64Value -Name "CODEX_CARGO_LANE_MAX_LANE_BYTES" -DefaultValue 0 -MinimumValue 0
-    $maxTotalLaneBytes = Get-EnvInt64Value -Name "CODEX_CARGO_LANE_MAX_TOTAL_BYTES" -DefaultValue 214748364800 -MinimumValue 0
-    $maxTotalTargetBytes = Get-EnvInt64Value -Name "CODEX_CARGO_TARGET_MAX_TOTAL_BYTES" -DefaultValue 268435456000 -MinimumValue 0
-    $maxLaneArgs = @()
-    if ($maxLaneBytes -gt 0) {
-        $maxLaneArgs = @("--max-lane-bytes", ([string]$maxLaneBytes))
-    }
-    $maxTotalLaneArgs = @()
-    if ($maxTotalLaneBytes -gt 0) {
-        $maxTotalLaneArgs = @("--max-total-lane-bytes", ([string]$maxTotalLaneBytes))
-    }
-    $maxTotalTargetArgs = @()
-    if ($maxTotalTargetBytes -gt 0) {
-        $maxTotalTargetArgs = @("--max-total-target-bytes", ([string]$maxTotalTargetBytes))
-    }
-
-    $active = [System.Collections.Generic.List[string]]::new()
-    foreach ($name in @($ActiveNames + $ExcludedNames)) {
-        if (-not [string]::IsNullOrWhiteSpace($name)) {
-            [void]$active.Add($name)
-        }
-    }
-
-    $previousActiveNames = $env:CODEX_CARGO_LANE_ACTIVE_NAMES
-    $previousLanesRoot = $env:CODEX_CARGO_LANES_ROOT
-    $env:CODEX_CARGO_LANE_ACTIVE_NAMES = ($active | Select-Object -Unique) -join ";"
-    $env:CODEX_CARGO_LANES_ROOT = $LanesRoot
-    $pruneSucceeded = $false
-    $pruneFailure = $null
+    # Share the Python entrypoint's nonblocking maintenance lock. Keep the
+    # coordination lock free while disk accounting scans the target tree.
+    $gcStream = $null
     try {
-        $scriptPath = Join-Path $RepoRoot "scripts\rust_build_status.py"
-        $python = Get-Command python -ErrorAction SilentlyContinue
-        if ($null -eq $python) {
-            $pruneFailure = "python executable was not found"
+        try {
+            $gcStream = [IO.File]::Open((Join-Path $LanesRoot ".lane-gc.lock"), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
         }
-        else {
-            $global:LASTEXITCODE = $null
-            & $python.Source $scriptPath prune --skip-disk-report --keep-warm-per-base 1 --max-age-days $maxAgeDays @maxLaneArgs @maxTotalLaneArgs @maxTotalTargetArgs | Out-Null
-            $pruneSucceeded = $LASTEXITCODE -eq 0
-            if (-not $pruneSucceeded) {
-                $pruneFailure = "prune command exited with code $LASTEXITCODE"
+        catch [IO.IOException] {
+            if (Test-IsCargoLaneLockContention -Exception $_.Exception) { return }
+            throw
+        }
+        if (-not $Force -and $intervalHours -gt 0 -and (Test-Path -LiteralPath $stampPath -PathType Leaf)) {
+            $stampAge = (Get-Date) - (Get-Item -LiteralPath $stampPath).LastWriteTime
+            if ($stampAge.TotalHours -lt $intervalHours) { return }
+        }
+        $retryStampPath = Join-Path $LanesRoot ".gc-retry"
+        if (-not $Force -and (Test-Path -LiteralPath $retryStampPath -PathType Leaf)) {
+            $retryAge = (Get-Date) - (Get-Item -LiteralPath $retryStampPath).LastWriteTime
+            if ($retryAge.TotalSeconds -lt 60) { return }
+        }
+
+        $maxAgeDays = Get-EnvIntValue -Name "CODEX_CARGO_LANE_MAX_AGE_DAYS" -DefaultValue 7 -MinimumValue 1
+        $maxLaneBytes = Get-EnvInt64Value -Name "CODEX_CARGO_LANE_MAX_LANE_BYTES" -DefaultValue 0 -MinimumValue 0
+        # Recursive disk accounting is opt-in on the build path. Use target-prune
+        # with aggregate limits for explicit disk maintenance.
+        $maxTotalLaneBytes = Get-EnvInt64Value -Name "CODEX_CARGO_LANE_MAX_TOTAL_BYTES" -DefaultValue 0 -MinimumValue 0
+        $maxTotalTargetBytes = Get-EnvInt64Value -Name "CODEX_CARGO_TARGET_MAX_TOTAL_BYTES" -DefaultValue 0 -MinimumValue 0
+        $maxLaneArgs = @()
+        if ($maxLaneBytes -gt 0) {
+            $maxLaneArgs = @("--max-lane-bytes", ([string]$maxLaneBytes))
+        }
+        $maxTotalLaneArgs = @()
+        if ($maxTotalLaneBytes -gt 0) {
+            $maxTotalLaneArgs = @("--max-total-lane-bytes", ([string]$maxTotalLaneBytes))
+        }
+        $maxTotalTargetArgs = @()
+        if ($maxTotalTargetBytes -gt 0) {
+            $maxTotalTargetArgs = @("--max-total-target-bytes", ([string]$maxTotalTargetBytes))
+        }
+
+        $active = [System.Collections.Generic.List[string]]::new()
+        foreach ($name in @($ActiveNames + $ExcludedNames)) {
+            if (-not [string]::IsNullOrWhiteSpace($name)) {
+                [void]$active.Add($name)
             }
         }
-    }
-    catch {
-        $pruneFailure = $_.Exception.Message
+
+        $previousActiveNames = $env:CODEX_CARGO_LANE_ACTIVE_NAMES
+        $previousLanesRoot = $env:CODEX_CARGO_LANES_ROOT
+        $env:CODEX_CARGO_LANE_ACTIVE_NAMES = ($active | Select-Object -Unique) -join ";"
+        $env:CODEX_CARGO_LANES_ROOT = $LanesRoot
+        $pruneSucceeded = $false
+        $pruneFailure = $null
+        try {
+            $scriptPath = Join-Path $RepoRoot "scripts\rust_build_status.py"
+            $python = Get-Command python -ErrorAction SilentlyContinue
+            if ($null -eq $python) {
+                $pruneFailure = "python executable was not found"
+            }
+            else {
+                $global:LASTEXITCODE = $null
+                & $python.Source $scriptPath prune --skip-disk-report --keep-warm-per-base 1 --max-age-days $maxAgeDays @maxLaneArgs @maxTotalLaneArgs @maxTotalTargetArgs | Out-Null
+                $pruneSucceeded = $LASTEXITCODE -eq 0
+                if (-not $pruneSucceeded) {
+                    $pruneFailure = "prune command exited with code $LASTEXITCODE"
+                }
+            }
+        }
+        catch {
+            $pruneFailure = $_.Exception.Message
+        }
+        finally {
+            $env:CODEX_CARGO_LANE_ACTIVE_NAMES = $previousActiveNames
+            $env:CODEX_CARGO_LANES_ROOT = $previousLanesRoot
+        }
+        if ($pruneSucceeded) {
+            [IO.File]::WriteAllText($stampPath, (Get-Date).ToUniversalTime().ToString("o"))
+            if (Test-Path -LiteralPath $retryStampPath) {
+                Remove-Item -LiteralPath $retryStampPath -Force
+            }
+        }
+        else {
+            [IO.File]::WriteAllText($retryStampPath, (Get-Date).ToUniversalTime().ToString("o"))
+            $detail = if ([string]::IsNullOrWhiteSpace($pruneFailure)) { "" } else { " ($pruneFailure)" }
+            Write-Warning "Cargo lane pruning failed$detail; leaving the GC stamp unchanged; maintenance can retry after 60 seconds."
+        }
+        # Pruning may leave a uniquely renamed tree when Windows still has a file
+        # open. Start the deferred worker again after the rename phase.
+        Start-CargoLaneTrashCleanup -LanesRoot $LanesRoot
     }
     finally {
-        $env:CODEX_CARGO_LANE_ACTIVE_NAMES = $previousActiveNames
-        $env:CODEX_CARGO_LANES_ROOT = $previousLanesRoot
+        if ($null -ne $gcStream) { $gcStream.Dispose() }
     }
-    if ($pruneSucceeded) {
-        [IO.File]::WriteAllText($stampPath, (Get-Date).ToUniversalTime().ToString("o"))
+}
+
+function Get-CargoLaneLastUsed {
+    param([System.IO.DirectoryInfo]$Lane)
+
+    $stamp = Join-Path $Lane.FullName ".lane-last-used"
+    if (Test-Path -LiteralPath $stamp -PathType Leaf) {
+        return (Get-Item -LiteralPath $stamp -Force).LastWriteTimeUtc
     }
-    else {
-        $detail = if ([string]::IsNullOrWhiteSpace($pruneFailure)) { "" } else { " ($pruneFailure)" }
-        Write-Warning "Cargo lane pruning failed$detail; leaving the GC stamp unchanged so the next run can retry."
+    $newest = $Lane.LastWriteTimeUtc
+    foreach ($child in Get-ChildItem -LiteralPath $Lane.FullName -Force -ErrorAction SilentlyContinue) {
+        if ($child.LastWriteTimeUtc -gt $newest) { $newest = $child.LastWriteTimeUtc }
     }
-    # Pruning may leave a uniquely renamed tree when Windows still has a file
-    # open. Start the deferred worker again after the rename phase.
-    Start-CargoLaneTrashCleanup -LanesRoot $LanesRoot
+    return $newest
 }
 
 function Resolve-CargoLaneName {
@@ -665,7 +719,7 @@ function Resolve-CargoLaneName {
     if (Test-Path -LiteralPath $LanesRoot -PathType Container) {
         $warmLanes = @(Get-ChildItem -LiteralPath $LanesRoot -Directory -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -eq $baseLane -or $_.Name -match "^$([regex]::Escape($baseLane))-\d+$" } |
-            Sort-Object -Property LastWriteTimeUtc -Descending)
+            Sort-Object -Property @{ Expression = { Get-CargoLaneLastUsed -Lane $_ }; Descending = $true }, Name)
     }
 
     foreach ($lane in $warmLanes) {
@@ -733,6 +787,9 @@ function Acquire-CargoLaneReservation {
             }
             $target = Join-Path $LaneRoot $candidate
             New-Item -ItemType Directory -Force -Path $target | Out-Null
+            # The earlier process/lock snapshot can be stale while waiting for
+            # coordination. Recheck Cargo's profile locks before reservation.
+            if (Test-CargoLockBusy -TargetDir $target) { continue }
             $lockPath = Join-Path $target ".lane-active.lock"
             $stream = $null
             try {
@@ -868,7 +925,6 @@ $activeLaneNames = @(Get-ActiveCargoLaneNames -LanesRoot $cargoLanesRoot)
 $candidateLane = Resolve-CargoLaneName -RequestedLane $requestedLane -CommandArgs $commandArgs -LanesRoot $cargoLanesRoot -ActiveNames $activeLaneNames
 $previousLaneTargetDir = $env:CODEX_CARGO_LANE_TARGET_DIR
 $didPushLocation = $false
-$ranCommand = $false
 $reservation = Acquire-CargoLaneReservation -LaneRoot $cargoLanesRoot -BaseLane $candidateLane -ActiveNames $activeLaneNames
 try {
     $resolvedLane = $reservation.Lane
@@ -945,7 +1001,6 @@ try {
     $program = $commandArgs[0]
     $arguments = @($commandArgs | Select-Object -Skip 1)
     $global:LASTEXITCODE = $null
-    $ranCommand = $true
     & $program @arguments
     if ($null -eq $LASTEXITCODE) {
         if ($?) {
@@ -964,18 +1019,8 @@ finally {
         if ($null -ne $reservation -and $null -ne $reservation.Stream) {
             $reservation.Stream.Dispose()
         }
-        try {
-            # The pre-build GC is hourly-throttled, but a single build burst can
-            # add hundreds of GiB. Re-check after the build and keep the lane
-            # that just completed while pruning older inactive lanes.
-            if ($ranCommand) {
-                $postBuildActiveLaneNames = @(Get-ActiveCargoLaneNames -LanesRoot $cargoLanesRoot)
-                Invoke-CargoLanePrune -RepoRoot $repoRoot -LanesRoot $cargoLanesRoot -ActiveNames $postBuildActiveLaneNames -ExcludedNames @($resolvedLane) -Force
-            }
-        }
-        catch {
-            Write-Warning "Post-build Cargo lane pruning failed unexpectedly ($($_.Exception.Message)); continuing without pruning."
-        }
+        # Keep routine cleanup hourly-throttled; use target-prune when an
+        # unusually large build requires immediate disk-budget enforcement.
         if ($didPushLocation) { Pop-Location }
     }
 }

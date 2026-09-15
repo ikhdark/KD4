@@ -701,7 +701,7 @@ async fn run_owned_patch(
             tokio::pin!(execution);
             let cancelled = req.cancellation_token.cancelled();
             tokio::pin!(cancelled);
-            // Approval/hooks/guardian waits remain cancellable. Once run() enters
+            // Approval/hook waits remain cancellable. Once run() enters
             // mutation evidence or filesystem work, drive it through finalization.
             // Check again after polling: an attempt can finish and enter a retry
             // approval in the same poll, which must not strand a cancelled task.

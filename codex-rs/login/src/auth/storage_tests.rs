@@ -314,6 +314,52 @@ fn ephemeral_storage_save_load_delete_is_in_memory_only() -> anyhow::Result<()> 
     Ok(())
 }
 
+#[test]
+fn ephemeral_transaction_keeps_prepared_canonical_identity() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    let canonical_home = home.path().canonicalize()?;
+    let alias = home.path().join(".");
+    let mut auth = AuthDotJson {
+        auth_mode: Some(AuthMode::ApiKey),
+        openai_api_key: Some("original".to_owned()),
+        tokens: None,
+        last_refresh: None,
+        agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
+    };
+    super::super::save_auth(
+        &alias,
+        &auth,
+        AuthCredentialsStoreMode::Ephemeral,
+        AuthKeyringBackendKind::default(),
+    )?;
+    let storage = create_auth_storage(
+        alias.clone(),
+        AuthCredentialsStoreMode::Ephemeral,
+        AuthKeyringBackendKind::default(),
+    );
+    let transaction = storage.lock()?;
+    // A later filesystem lookup would now fall back to the noncanonical alias.
+    std::fs::remove_dir(home.path())?;
+    assert!(alias.canonicalize().is_err());
+    assert_eq!(storage.load()?, Some(auth.clone()));
+    auth.openai_api_key = Some("updated".to_owned());
+    storage.save(&auth)?;
+    drop(transaction);
+    assert_eq!(
+        super::super::load_auth_dot_json(
+            &canonical_home,
+            AuthCredentialsStoreMode::Ephemeral,
+            AuthKeyringBackendKind::default(),
+        )?,
+        Some(auth)
+    );
+    assert!(storage.delete()?);
+    assert!(!get_auth_file(home.path()).exists());
+    Ok(())
+}
+
 fn seed_secrets_backend_and_fallback_auth_file_for_delete(
     mock_keyring: &MockKeyringStore,
     codex_home: &Path,
@@ -947,5 +993,45 @@ fn credential_debug_output_redacts_each_secret_owner() -> anyhow::Result<()> {
         serde_json::to_value(record)?["agent_private_key"],
         "private-secret"
     );
+    Ok(())
+}
+
+#[test]
+fn file_storage_load_rejects_oversized_valid_json_without_mutation() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let path = get_auth_file(codex_home.path());
+    let mut file = File::create(&path)?;
+    // A valid JSON object followed by whitespace: an unbounded parser would accept it.
+    std::io::Write::write_all(&mut file, b"{}")?;
+    std::io::copy(
+        &mut std::io::repeat(b' ').take(MAX_AUTH_FILE_BYTES - 1),
+        &mut file,
+    )?;
+    drop(file);
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let error = storage.load().expect_err("oversized auth must not load");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("auth.json exceeds"));
+    assert_eq!(std::fs::metadata(&path)?.len(), MAX_AUTH_FILE_BYTES + 1);
+    let mut prefix = [0; 2];
+    File::open(&path)?.read_exact(&mut prefix)?;
+    assert_eq!(&prefix, b"{}");
+    Ok(())
+}
+
+#[test]
+fn file_storage_save_rejects_oversized_auth_without_replacing_credentials() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let original: AuthDotJson = serde_json::from_str("{}")?;
+    storage.save(&original)?;
+    let mut oversized = original.clone();
+    oversized.openai_api_key = Some("x".repeat(MAX_AUTH_FILE_BYTES as usize));
+    let error = storage
+        .save(&oversized)
+        .expect_err("unreadable auth must not be saved");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("auth.json exceeds"));
+    assert_eq!(storage.load()?, Some(original));
     Ok(())
 }

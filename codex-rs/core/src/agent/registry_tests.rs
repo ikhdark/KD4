@@ -414,6 +414,58 @@ fn closing_parent_rejects_new_and_in_flight_spawn_commits() {
 }
 
 #[test]
+fn rejected_borrowed_commit_retains_admission_until_cleanup_releases_it() {
+    let registry = Arc::new(AgentRegistry::default());
+    let parent_thread_id = ThreadId::new();
+    let child_thread_id = ThreadId::new();
+    let path = agent_path("/root/pending");
+    let mut reservation = registry.reserve_spawn_slot(Some(1)).expect("first slot");
+    reservation.reserve_agent_path(&path).expect("first path");
+    reservation
+        .reserve_parent_thread(parent_thread_id)
+        .expect("parent open");
+    let closing = registry.begin_closing_agent_tree(parent_thread_id);
+    let error = reservation
+        .try_commit(AgentMetadata {
+            agent_id: Some(child_thread_id),
+            agent_path: Some(path.clone()),
+            ..Default::default()
+        })
+        .expect_err("closing parent rejects registration");
+    assert!(error.to_string().contains("is closing"));
+    drop(closing);
+    assert!(
+        registry
+            .agent_metadata_for_thread(child_thread_id)
+            .is_none()
+    );
+    assert!(
+        registry.reserve_spawn_slot(Some(1)).is_err(),
+        "live rejected child retains count"
+    );
+    let mut probe = registry.reserve_spawn_slot(None).expect("unlimited probe");
+    assert!(
+        probe.reserve_agent_path(&path).is_err(),
+        "live rejected child retains path"
+    );
+    assert!(
+        probe.reserve_parent_thread(parent_thread_id).is_err(),
+        "closing parent remains closed while child cleanup is pending"
+    );
+    drop(probe);
+    drop(reservation);
+    let mut replacement = registry
+        .reserve_spawn_slot(Some(1))
+        .expect("terminated child releases count");
+    replacement
+        .reserve_agent_path(&path)
+        .expect("terminated child releases path");
+    replacement
+        .reserve_parent_thread(parent_thread_id)
+        .expect("cleanup releases closing admission");
+}
+
+#[test]
 fn commit_without_thread_id_releases_capacity() {
     let registry = Arc::new(AgentRegistry::default());
     let error = registry

@@ -444,7 +444,10 @@ mod setup_ownership_tests {
                 std::time::Instant::now() < deadline,
                 "successful native setup must persist its mode after cancellation"
             );
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(
+                std::time::Duration::from_millis(10)
+                    .min(deadline.saturating_duration_since(std::time::Instant::now())),
+            );
         };
         let config: toml::Value = toml::from_str(&config).unwrap();
         assert_eq!(config["windows"]["sandbox"].as_str(), Some("unelevated"));

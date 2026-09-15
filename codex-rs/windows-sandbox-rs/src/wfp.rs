@@ -1,7 +1,6 @@
 mod filter_specs;
 
 use crate::to_wide;
-use crate::token::LocalSid;
 use crate::winutil::resolve_sid;
 use crate::winutil::string_from_sid_bytes;
 use anyhow::Result;
@@ -58,10 +57,8 @@ use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransac
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionCommit0;
 use windows_sys::Win32::Networking::WinSock::IPPROTO_TCP;
 use windows_sys::Win32::Networking::WinSock::IPPROTO_UDP;
-use windows_sys::Win32::Security::Authorization::BuildSecurityDescriptorW;
-use windows_sys::Win32::Security::Authorization::BuildTrusteeWithSidW;
-use windows_sys::Win32::Security::Authorization::EXPLICIT_ACCESS_W;
-use windows_sys::Win32::Security::Authorization::GRANT_ACCESS;
+use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+use windows_sys::Win32::Security::Authorization::SDDL_REVISION_1;
 use windows_sys::Win32::Security::PSECURITY_DESCRIPTOR;
 use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_DEFAULT;
 use windows_sys::Win32::System::Threading::INFINITE;
@@ -302,40 +299,30 @@ struct UserMatchCondition {
 
 impl UserMatchCondition {
     fn for_account(account: &str) -> Result<Self> {
-        // Resolve through the same account lookup used during provisioning. Name-form ACL
-        // trustees invoke the installed security providers, which may reject this local
-        // account even though Windows has already resolved its SID successfully.
+        // Build a self-relative descriptor directly from the resolved numeric SID.
+        // This preserves the single account/match-filter ACE without invoking
+        // security providers to translate an ACL trustee.
         let sid_bytes = resolve_sid(account)?;
         let sid_string = string_from_sid_bytes(&sid_bytes).map_err(anyhow::Error::msg)?;
-        let sid = LocalSid::from_string(&sid_string)?;
-        // SAFETY: EXPLICIT_ACCESS_W contains integers and nullable pointers; zero is a valid
-        // representation before its access mask and trustee are initialized below.
-        let mut access: EXPLICIT_ACCESS_W = unsafe { zeroed() };
-        access.grfAccessPermissions = FWP_ACTRL_MATCH_FILTER;
-        access.grfAccessMode = GRANT_ACCESS;
-        // SAFETY: access.Trustee is writable, and sid owns a valid native SID allocation
-        // that remains live until descriptor construction has copied the access entry.
-        unsafe { BuildTrusteeWithSidW(&mut access.Trustee, sid.as_ptr()) };
+        let sddl = to_wide(OsStr::new(&format!(
+            "D:(A;;0x{FWP_ACTRL_MATCH_FILTER:x};;;{sid_string})"
+        )));
 
         let mut security_descriptor: PSECURITY_DESCRIPTOR = null_mut();
         let mut security_descriptor_len = 0;
-        // SAFETY: The single access record borrows the still-live SID; the descriptor
-        // pointer and length are writable outputs, and UserMatchCondition owns the
-        // successful allocation.
+        // SAFETY: sddl is null-terminated and the descriptor pointer and length
+        // are writable outputs. UserMatchCondition owns the successful allocation.
         let result = unsafe {
-            BuildSecurityDescriptorW(
-                null(),
-                null(),
-                1,
-                &access,
-                0,
-                null(),
-                null_mut(),
-                &mut security_descriptor_len,
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
                 &mut security_descriptor,
+                &mut security_descriptor_len,
             )
         };
-        ensure_success(result, "BuildSecurityDescriptorW")?;
+        if result == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
 
         Ok(Self {
             security_descriptor,
@@ -652,7 +639,7 @@ mod tests {
         use windows_sys::Win32::Security::GetSecurityDescriptorDacl;
 
         let condition = super::UserMatchCondition::for_account("SYSTEM")?;
-        let expected_sid = super::LocalSid::from_string("S-1-5-18")?;
+        let expected_sid = crate::token::LocalSid::from_string("S-1-5-18")?;
         let mut present = 0;
         let mut defaulted = 0;
         let mut acl = std::ptr::null_mut();

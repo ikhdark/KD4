@@ -6,14 +6,6 @@ use std::time::Instant;
 use crate::config::Config;
 use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
-use crate::connectors;
-use crate::guardian::GuardianApprovalRequest;
-use crate::guardian::GuardianMcpAnnotations;
-use crate::guardian::guardian_rejection_message;
-use crate::guardian::guardian_timeout_message;
-use crate::guardian::new_guardian_review_id;
-use crate::guardian::review_approval_request;
-use crate::guardian::routes_approval_to_guardian_with_reviewer;
 use crate::hook_runtime::run_permission_request_hooks;
 use crate::mcp_openai_file::rewrite_mcp_tool_arguments_for_openai_files;
 use crate::mcp_tool_approval_templates::RenderedMcpToolApprovalParam;
@@ -29,7 +21,6 @@ use codex_analytics::InvocationType;
 use codex_analytics::build_track_events_context;
 use codex_config::ConfigLayerSource;
 use codex_config::types::AppToolApproval;
-use codex_config::types::ApprovalsReviewer;
 use codex_connectors::AppToolPolicy;
 use codex_connectors::AppToolPolicyEvaluator;
 use codex_connectors::AppToolPolicyInput;
@@ -1217,7 +1208,6 @@ pub(crate) struct McpToolApprovalMetadata {
     link_id: Option<String>,
     connector_name: Option<String>,
     connector_description: Option<String>,
-    connected_account_email: Option<String>,
     plugin_id: Option<String>,
     tool_title: Option<String>,
     tool_description: Option<String>,
@@ -1231,7 +1221,6 @@ const MCP_TOOL_OPENAI_OUTPUT_TEMPLATE_META_KEY: &str = "openai/outputTemplate";
 const MCP_TOOL_UI_RESOURCE_URI_META_KEY: &str = "ui/resourceUri";
 const MCP_TOOL_LINK_ID_META_KEY: &str = "link_id";
 const MCP_TOOL_PLUGIN_ID_META_KEY: &str = "plugin_id";
-const MCP_TOOL_CONNECTED_ACCOUNT_EMAIL_META_KEY: &str = "connected_account_email";
 const MCP_TOOL_TEMPLATE_ID_META_KEY: &str = "template_id";
 const MCP_TOOL_RESOURCE_URI_META_KEY: &str = "resource_uri";
 
@@ -1344,19 +1333,8 @@ struct McpToolApprovalElicitationRequest<'a> {
 pub(crate) const MCP_TOOL_APPROVAL_QUESTION_ID_PREFIX: &str = "mcp_tool_call_approval";
 pub(crate) const MCP_TOOL_APPROVAL_ACCEPT: &str = "Allow";
 pub(crate) const MCP_TOOL_APPROVAL_ACCEPT_FOR_SESSION: &str = "Allow for this session";
-// Internal-only token used when guardian auto-reviews delegated MCP approvals on the
-// RequestUserInput compatibility path. That legacy MCP prompt has allow/cancel labels but no
-// real "Decline" answer, so this lets guardian denials round-trip distinctly from user cancel.
-// This is not a user-facing option.
-pub(crate) const MCP_TOOL_APPROVAL_DECLINE_SYNTHETIC: &str = "__codex_mcp_decline__";
 const MCP_TOOL_APPROVAL_ACCEPT_AND_REMEMBER: &str = "Allow and don't ask me again";
 const MCP_TOOL_APPROVAL_CANCEL: &str = "Cancel";
-
-pub(crate) fn is_mcp_tool_approval_question_id(question_id: &str) -> bool {
-    question_id
-        .strip_prefix(MCP_TOOL_APPROVAL_QUESTION_ID_PREFIX)
-        .is_some_and(|suffix| suffix.starts_with('_'))
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct McpToolApprovalKey {
@@ -1388,7 +1366,7 @@ async fn maybe_request_mcp_tool_approval(
 ) -> Option<McpToolApprovalDecision> {
     let turn_context = &step_context.turn;
     let manager = step_context.mcp.manager();
-    let approvals_reviewer = mcp_approvals_reviewer(turn_context, &invocation.server, metadata);
+
     if mcp_permission_prompt_is_auto_approved(
         turn_context.approval_policy.value(),
         &turn_context.permission_profile(),
@@ -1445,28 +1423,6 @@ async fn maybe_request_mcp_tool_approval(
         .config
         .features
         .enabled(Feature::ToolCallMcpElicitation);
-
-    if routes_approval_to_guardian_with_reviewer(turn_context, approvals_reviewer) {
-        let review_id = new_guardian_review_id();
-        let decision = review_approval_request(
-            sess,
-            turn_context,
-            review_id.clone(),
-            build_guardian_mcp_tool_review_request(call_id, invocation, metadata),
-            /*retry_reason*/ None,
-        )
-        .await;
-        let decision = mcp_tool_approval_decision_from_guardian(sess, &review_id, decision).await;
-        apply_mcp_tool_approval_decision(
-            sess,
-            turn_context,
-            &decision,
-            session_approval_key,
-            persistent_approval_key,
-        )
-        .await;
-        return Some(decision);
-    }
 
     let prompt_options = mcp_tool_approval_prompt_options(
         session_approval_key.as_ref(),
@@ -1559,18 +1515,6 @@ async fn maybe_request_mcp_tool_approval(
     Some(decision)
 }
 
-pub(crate) fn mcp_approvals_reviewer(
-    turn_context: &TurnContext,
-    server_name: &str,
-    metadata: Option<&McpToolApprovalMetadata>,
-) -> ApprovalsReviewer {
-    connectors::mcp_approvals_reviewer(
-        turn_context.config.as_ref(),
-        server_name,
-        metadata.and_then(|metadata| metadata.connector_id.as_deref()),
-    )
-}
-
 fn session_mcp_tool_approval_key(
     invocation: &McpInvocation,
     metadata: Option<&McpToolApprovalMetadata>,
@@ -1600,65 +1544,6 @@ fn persistent_mcp_tool_approval_key(
     session_mcp_tool_approval_key(invocation, metadata, approval_mode)
 }
 
-pub(crate) fn build_guardian_mcp_tool_review_request(
-    call_id: &str,
-    invocation: &McpInvocation,
-    metadata: Option<&McpToolApprovalMetadata>,
-) -> GuardianApprovalRequest {
-    GuardianApprovalRequest::McpToolCall {
-        id: call_id.to_string(),
-        server: invocation.server.clone(),
-        tool_name: invocation.tool.clone(),
-        arguments: invocation.arguments.clone(),
-        connector_id: metadata.and_then(|metadata| metadata.connector_id.clone()),
-        connector_name: metadata.and_then(|metadata| metadata.connector_name.clone()),
-        connector_description: metadata.and_then(|metadata| metadata.connector_description.clone()),
-        connected_account_email: (invocation.server == CODEX_APPS_MCP_SERVER_NAME)
-            .then(|| metadata.and_then(|metadata| metadata.connected_account_email.clone()))
-            .flatten(),
-        tool_title: metadata.and_then(|metadata| metadata.tool_title.clone()),
-        tool_description: metadata.and_then(|metadata| metadata.tool_description.clone()),
-        annotations: metadata
-            .and_then(|metadata| metadata.annotations.as_ref())
-            .map(|annotations| GuardianMcpAnnotations {
-                destructive_hint: annotations.destructive_hint,
-                open_world_hint: annotations.open_world_hint,
-                read_only_hint: annotations.read_only_hint,
-            }),
-    }
-}
-
-async fn mcp_tool_approval_decision_from_guardian(
-    sess: &Session,
-    review_id: &str,
-    decision: ReviewDecision,
-) -> McpToolApprovalDecision {
-    match decision {
-        ReviewDecision::Approved
-        | ReviewDecision::ApprovedExecpolicyAmendment { .. }
-        | ReviewDecision::NetworkPolicyAmendment { .. } => McpToolApprovalDecision::Accept,
-        ReviewDecision::ApprovedForSession => McpToolApprovalDecision::AcceptForSession,
-        ReviewDecision::Denied => McpToolApprovalDecision::Decline {
-            message: Some(guardian_rejection_message(sess, review_id).await),
-        },
-        ReviewDecision::TimedOut => McpToolApprovalDecision::Decline {
-            message: Some(guardian_timeout_message()),
-        },
-        ReviewDecision::Abort => McpToolApprovalDecision::Decline { message: None },
-    }
-}
-
-pub(crate) async fn lookup_mcp_tool_metadata(
-    _sess: &Session,
-    _turn_context: &TurnContext,
-    manager: &McpConnectionManager,
-    server: &str,
-    tool_name: &str,
-) -> Option<McpToolApprovalMetadata> {
-    let tool_info = manager.tool_info(server, tool_name).await?;
-    Some(mcp_tool_metadata_from_tool_info(manager, &tool_info).await)
-}
-
 async fn mcp_tool_metadata_from_tool_info(
     manager: &McpConnectionManager,
     tool_info: &ToolInfo,
@@ -1678,17 +1563,6 @@ async fn mcp_tool_metadata_from_tool_info(
         .and_then(|meta| meta.get(MCP_TOOL_CODEX_APPS_META_KEY))
         .and_then(serde_json::Value::as_object)
         .cloned();
-    let connected_account_email = if server == CODEX_APPS_MCP_SERVER_NAME {
-        codex_apps_meta
-            .as_ref()
-            .and_then(|meta| meta.get(MCP_TOOL_CONNECTED_ACCOUNT_EMAIL_META_KEY))
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|email| !email.is_empty())
-            .map(str::to_string)
-    } else {
-        None
-    };
 
     McpToolApprovalMetadata {
         annotations: tool_info.tool.annotations.clone(),
@@ -1702,7 +1576,6 @@ async fn mcp_tool_metadata_from_tool_info(
             .map(str::to_string),
         connector_name: tool_info.connector_name.clone(),
         connector_description,
-        connected_account_email,
         plugin_id,
         tool_title: tool_info.tool.title.clone(),
         tool_description: tool_info
@@ -2044,11 +1917,6 @@ fn parse_mcp_tool_approval_response(
     };
     if answers
         .iter()
-        .any(|answer| answer == MCP_TOOL_APPROVAL_DECLINE_SYNTHETIC)
-    {
-        McpToolApprovalDecision::Decline { message: None }
-    } else if answers
-        .iter()
         .any(|answer| answer == MCP_TOOL_APPROVAL_ACCEPT_FOR_SESSION)
     {
         McpToolApprovalDecision::AcceptForSession
@@ -2297,10 +2165,9 @@ fn project_mcp_tool_approval_config_folder(
                 .config
                 .as_table()
                 .and_then(|table| table.get("mcp_servers"))
-                .cloned()
-                .and_then(|value| {
-                    HashMap::<String, codex_config::types::McpServerConfig>::deserialize(value).ok()
-                })?;
+                // A project can override only tool approval policy while the
+                // transport configuration comes from a lower-precedence layer.
+                .and_then(toml::Value::as_table)?;
             if servers.contains_key(server) {
                 layer.config_folder()
             } else {

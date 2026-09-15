@@ -13,7 +13,6 @@ pub use crate::mcp_types::McpServerToolConfig;
 pub use crate::mcp_types::McpServerTransportConfig;
 pub use crate::mcp_types::RawMcpServerConfig;
 pub use codex_protocol::config_types::AltScreenMode;
-pub use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::EnvironmentVariablePattern;
 pub use codex_protocol::config_types::ModeKind;
 pub use codex_protocol::config_types::OtelHttpProtocol;
@@ -394,10 +393,6 @@ pub struct AppsDefaultConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 
-    /// Reviewer for approval prompts unless overridden by per-app settings.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approvals_reviewer: Option<ApprovalsReviewer>,
-
     /// Whether tools with `destructive_hint = true` are allowed by default.
     #[serde(
         default = "default_enabled",
@@ -421,7 +416,6 @@ impl Default for AppsDefaultConfig {
     fn default() -> Self {
         Self {
             enabled: default_enabled(),
-            approvals_reviewer: None,
             destructive_enabled: default_enabled(),
             open_world_enabled: default_enabled(),
             default_tools_approval_mode: None,
@@ -459,10 +453,6 @@ pub struct AppConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 
-    /// Reviewer for approval prompts from this app, overriding the thread default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approvals_reviewer: Option<ApprovalsReviewer>,
-
     /// Whether tools with `destructive_hint = true` are allowed for this app.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destructive_enabled: Option<bool>,
@@ -488,7 +478,6 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             enabled: default_enabled(),
-            approvals_reviewer: None,
             destructive_enabled: None,
             open_world_enabled: None,
             default_tools_approval_mode: None,

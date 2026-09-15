@@ -1166,16 +1166,22 @@ async fn code_mode_tool_history_pressure_preserves_recoverable_results() -> Resu
         })
         .build(&server)
         .await?;
-    let mut events = vec![ev_response_created("recovery-pressure")];
-    for index in 0..80 {
-        events.push(ev_custom_tool_call(
-            &format!("recoverable-{index:03}"),
-            "exec",
-            &format!("text('recovery-{index:03}\\n' + 'evidence\\n'.repeat(1000));"),
-        ));
+    let mut batches = Vec::new();
+    // Each response stays within the eight-cell admission limit so every call
+    // completes before the next batch adds pressure to the retained history.
+    for batch in 0..10 {
+        let response_id = format!("recovery-pressure-{batch}");
+        let mut events = vec![ev_response_created(&response_id)];
+        for index in batch * 8..(batch + 1) * 8 {
+            events.push(ev_custom_tool_call(
+                &format!("recoverable-{index:03}"),
+                "exec",
+                &format!("text('recovery-{index:03}\\n' + 'evidence\\n'.repeat(1000));"),
+            ));
+        }
+        events.push(ev_completed(&response_id));
+        batches.push(responses::mount_sse_once(&server, sse(events)).await);
     }
-    events.push(ev_completed("recovery-pressure"));
-    let first = responses::mount_sse_once(&server, sse(events)).await;
     let projected = responses::mount_sse_once(
         &server,
         sse(vec![
@@ -1185,7 +1191,9 @@ async fn code_mode_tool_history_pressure_preserves_recoverable_results() -> Resu
     )
     .await;
     test.submit_turn("Collect all requested results.").await?;
-    assert_eq!(first.requests().len(), 1);
+    for batch in batches {
+        assert_eq!(batch.requests().len(), 1);
+    }
     let request = projected.single_request();
     let body = request.body_json();
     let input = body["input"].as_array().unwrap();
@@ -1265,12 +1273,23 @@ async fn code_mode_tool_history_pressure_preserves_recoverable_results() -> Resu
     test.submit_turn("Recover the retained result.").await?;
     let output = custom_tool_output_last_non_empty_text(&recovered.single_request(), "recover-pin")
         .expect("registered recovery tool must return the stored output");
-    let output: String = serde_json::from_str(&output)?;
-    assert!(
-        output.contains(&format!("recovery-{index:03}\n")),
-        "{output}"
+    // Byte recovery includes the serialized completion header and only a prefix
+    // of the payload, so it is not a complete JSON string. Check the variable
+    // header separately, then compare every recovered payload byte.
+    assert_eq!(output.len(), 256);
+    let (header, payload) = output
+        .split_once(r"\nOutput:\n\n")
+        .expect("recovered artifact must include its completion header");
+    assert_regex_match(
+        r#"\A"Script completed with cell ID \d+\\nWall time \d+(?:\.\d+)? seconds\z"#,
+        header,
     );
-    assert!(output.contains("evidence\n"), "{output}");
+    let expected = serde_json::to_string(&format!(
+        "recovery-{index:03}\n{}",
+        "evidence\n".repeat(1000)
+    ))?;
+    assert!(!payload.is_empty(), "recovery must include payload bytes");
+    assert_eq!(payload, &expected[1..1 + payload.len()]);
     Ok(())
 }
 

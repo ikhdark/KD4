@@ -153,12 +153,8 @@ def test_async_codex_initializes_only_once_under_concurrency() -> None:
     ("approval_mode", "approval_settings"),
     [
         (ApprovalMode.deny_all, {"approvalPolicy": "never"}),
-        (
-            ApprovalMode.auto_review,
-            {"approvalPolicy": "on-request", "approvalsReviewer": "auto_review"},
-        ),
     ],
-    ids=["deny-all", "auto-review"],
+    ids=["deny-all"],
 )
 @pytest.mark.parametrize(
     ("sandbox", "thread_sandbox", "turn_sandbox"),
@@ -204,16 +200,14 @@ def test_public_presets_reach_thread_and_turn_requests(
         params = [request["params"] for request in requests if request["method"] == method]
         assert len(params) == 1, method
         assert {
-            key: value
-            for key, value in params[0].items()
-            if key in {"approvalPolicy", "approvalsReviewer", sandbox_key}
+            key: value for key, value in params[0].items() if key in {"approvalPolicy", sandbox_key}
         } == {**approval_settings, sandbox_key: expected_sandbox}
 
 
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
-        ({"approval_mode": "allow_all"}, "deny_all, auto_review"),
+        ({"approval_mode": "allow_all"}, "deny_all"),
         ({"sandbox": "workspace"}, r"Sandbox\.workspace_write"),
     ],
     ids=["unknown-approval-mode", "raw-sandbox-string"],

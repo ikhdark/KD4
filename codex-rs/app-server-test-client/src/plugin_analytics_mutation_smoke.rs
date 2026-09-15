@@ -484,7 +484,7 @@ fn wait_for_remote_plugin_event(
         if Instant::now() >= deadline {
             bail!("timed out waiting for `{event_type}` for remote plugin `{remote_plugin_id}`");
         }
-        thread::sleep(POLL_INTERVAL);
+        thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
     }
 }
 

@@ -385,7 +385,6 @@ struct ThreadSettingsBuildParams {
     environments: Option<TurnEnvironmentSelections>,
     runtime_workspace_roots: Option<Vec<AbsolutePathBuf>>,
     approval_policy: Option<codex_app_server_protocol::AskForApproval>,
-    approvals_reviewer: Option<codex_app_server_protocol::ApprovalsReviewer>,
     sandbox_policy: Option<codex_app_server_protocol::SandboxPolicy>,
     permission_profile: Option<PermissionProfile>,
     permissions: Option<String>,
@@ -678,7 +677,6 @@ impl TurnRequestProcessor {
             "modelProviderId": snapshot.model_provider_id,
             "serviceTier": snapshot.service_tier,
             "approvalPolicy": format!("{:?}", snapshot.approval_policy),
-            "approvalsReviewer": format!("{:?}", snapshot.approvals_reviewer),
             "permissionProfile": format!("{:?}", snapshot.permission_profile),
             "activePermissionProfile": format!("{:?}", snapshot.active_permission_profile),
             "windowsSandboxLevel": format!("{:?}", snapshot.windows_sandbox_level),
@@ -755,7 +753,6 @@ impl TurnRequestProcessor {
                     environments,
                     runtime_workspace_roots: params.runtime_workspace_roots,
                     approval_policy: params.approval_policy,
-                    approvals_reviewer: params.approvals_reviewer,
                     sandbox_policy: params.sandbox_policy,
                     permission_profile: params.permission_profile,
                     permissions: params.permissions,
@@ -934,7 +931,6 @@ impl TurnRequestProcessor {
             environments,
             runtime_workspace_roots,
             approval_policy,
-            approvals_reviewer,
             sandbox_policy,
             permission_profile: inline_permission_profile,
             permissions,
@@ -970,7 +966,6 @@ impl TurnRequestProcessor {
         let has_any_overrides = has_environment_override
             || runtime_workspace_roots_request.is_some()
             || approval_policy.is_some()
-            || approvals_reviewer.is_some()
             || sandbox_policy.is_some()
             || inline_permission_profile.is_some()
             || permissions.is_some()
@@ -985,8 +980,6 @@ impl TurnRequestProcessor {
             runtime_workspace_roots_request.map(resolve_runtime_workspace_roots);
         let approval_policy =
             approval_policy.map(codex_app_server_protocol::AskForApproval::to_core);
-        let approvals_reviewer =
-            approvals_reviewer.map(codex_app_server_protocol::ApprovalsReviewer::to_core);
         let sandbox_policy = if inline_permission_profile.is_some() {
             None
         } else {
@@ -1048,7 +1041,6 @@ impl TurnRequestProcessor {
                     environments: environments.clone(),
                     workspace_roots: runtime_workspace_roots.clone(),
                     approval_policy,
-                    approvals_reviewer,
                     sandbox_policy: sandbox_policy.clone(),
                     permission_profile: permission_profile.clone(),
                     active_permission_profile: active_permission_profile.clone(),
@@ -1072,7 +1064,6 @@ impl TurnRequestProcessor {
             workspace_roots: runtime_workspace_roots,
             profile_workspace_roots,
             approval_policy,
-            approvals_reviewer,
             sandbox_policy,
             permission_profile,
             active_permission_profile,
@@ -1104,7 +1095,6 @@ impl TurnRequestProcessor {
                     environments,
                     runtime_workspace_roots: None,
                     approval_policy: params.approval_policy,
-                    approvals_reviewer: params.approvals_reviewer,
                     sandbox_policy: params.sandbox_policy,
                     permission_profile: params.permission_profile,
                     permissions: params.permissions,

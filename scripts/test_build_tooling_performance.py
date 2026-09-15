@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 
 import os
+import json
+import sys
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 from scripts.build_tooling_test_support import REPO_ROOT
+from scripts.build_tooling_test_support import load_toml
 from scripts.build_tooling_test_support import powershell
 from scripts.build_tooling_test_support import ps_single_quote
 from scripts.build_tooling_test_support import pwsh_only
@@ -16,7 +19,7 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 class BuildToolingPerformanceTest(unittest.TestCase):
-    def test_perf_env_no_sccache_leaves_incremental_and_uses_lane(self) -> None:
+    def test_perf_env_no_sccache_disables_incremental_and_uses_lane(self) -> None:
         shell = pwsh_only()
         if shell is None:
             self.skipTest("pwsh is not available")
@@ -60,11 +63,88 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
         self.assertIn("rustPerfEnv:", result.stdout)
-        self.assertIn("cargoIncremental=keep", result.stdout)
+        self.assertIn("cargoIncremental=0", result.stdout)
         self.assertIn("rustcWrapper=<empty>", result.stdout)
         self.assertIn("sccacheBaseDir=<unset>", result.stdout)
         self.assertIn("cargoTargetDir=", result.stdout)
         self.assertIn("perf-nextest-nosccache", result.stdout)
+
+    def test_no_sccache_isolates_child_and_restores_workspace_wrapper(self):
+        shell = pwsh_only()
+        if shell is None:
+            self.skipTest("pwsh is not available")
+        script = REPO_ROOT / "scripts" / "invoke-rust-perf-env.ps1"
+        names = [
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_INCREMENTAL",
+            "SCCACHE_BASEDIR",
+            "SCCACHE_CACHE_SIZE",
+        ]
+        for workspace_wrapper in (None, "", "sccache"):
+            for exit_code in (0, 7):
+                with self.subTest(wrapper=workspace_wrapper, exit_code=exit_code):
+                    env = os.environ.copy()
+                    env.update(dict.fromkeys(names, "inherited"))
+                    # Set this inside PowerShell to preserve absent versus empty.
+                    setup = (
+                        "Remove-Item Env:RUSTC_WORKSPACE_WRAPPER -ErrorAction SilentlyContinue"
+                        if workspace_wrapper is None
+                        else "$env:RUSTC_WORKSPACE_WRAPPER = "
+                        + ps_single_quote(workspace_wrapper)
+                    )
+                    child = (
+                        "import json,os,sys; print('CHILD='+json.dumps({k:os.environ.get(k) "
+                        "for k in "
+                        + repr(names)
+                        + "})); sys.exit("
+                        + str(exit_code)
+                        + ")"
+                    )
+                    entries = "; ".join(
+                        name + "=[Environment]::GetEnvironmentVariable('" + name + "')"
+                        for name in names
+                    )
+                    command = (
+                        setup
+                        + "; & "
+                        + ps_single_quote(script)
+                        + " -NoSccache -ProgramArgs @("
+                        + ps_single_quote(sys.executable)
+                        + ", '-c', "
+                        + ps_single_quote(child)
+                        + "); $childExit = $LASTEXITCODE; 'RESTORED=' + (@{"
+                        + entries
+                        + "} | ConvertTo-Json -Compress); exit $childExit"
+                    )
+                    result = subprocess.run(
+                        [shell, "-NoProfile", "-Command", command],
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        creationflags=CREATE_NO_WINDOW,
+                    )
+                    self.assertEqual(result.returncode, exit_code, result.stderr)
+                    proofs = {
+                        line.split("=", 1)[0]: json.loads(line.split("=", 1)[1])
+                        for line in result.stdout.splitlines()
+                        if line.startswith(("CHILD=", "RESTORED="))
+                    }
+                    self.assertEqual(
+                        proofs["CHILD"],
+                        {
+                            "RUSTC_WRAPPER": "",
+                            "RUSTC_WORKSPACE_WRAPPER": "",
+                            "CARGO_INCREMENTAL": "0",
+                            "SCCACHE_BASEDIR": None,
+                            "SCCACHE_CACHE_SIZE": None,
+                        },
+                    )
+                    expected = dict.fromkeys(names, "inherited")
+                    expected["RUSTC_WORKSPACE_WRAPPER"] = workspace_wrapper
+                    self.assertEqual(proofs["RESTORED"], expected)
+                    self.assertIn("rustcWorkspaceWrapper=<empty>", result.stdout)
 
     def test_perf_env_rejects_explicit_target_outside_reserved_lane(self) -> None:
         shell = pwsh_only()
@@ -715,7 +795,25 @@ class BuildToolingPerformanceTest(unittest.TestCase):
         self.assertIn("app-server-schema-protocol-check:", justfile)
         self.assertIn("app-server-schema-check:", justfile)
         self.assertIn('app-server-schema-regenerate owner experimental="":', justfile)
-        self.assertIn("cargo nextest run -p codex-app-server-protocol -E", justfile)
+        schema_recipe = justfile.split("\napp-server-schema-protocol-check:\n", 1)[
+            1
+        ].split("\n\n", 1)[0]
+        self.assertEqual(
+            schema_recipe.strip(), "just core-gate app-server-schema-fixtures"
+        )
+        manifest = load_toml(REPO_ROOT / "codex-rs" / ".config" / "kd4-rust-tests.toml")
+        steps = manifest["gates"]["app-server-schema-fixtures"]["steps"]
+        self.assertEqual(len(steps), 1)
+        target = manifest["targets"][steps[0]["target"]]
+        self.assertEqual(target["package"], "codex-app-server-protocol")
+        self.assertEqual(target["test"], "schema_fixtures")
+        self.assertEqual(
+            set(steps[0]["tests"]),
+            {
+                "typescript_schema_fixtures_match_generated",
+                "json_schema_fixtures_match_generated",
+            },
+        )
 
     def test_agents_root_only_instruction_layout_and_budget_are_explicit(
         self,

@@ -31,6 +31,73 @@ use crate::append_rollout_item_to_path;
 use crate::search_rollout_matches;
 
 #[tokio::test]
+async fn archive_waits_for_compression_and_moves_its_final_representation() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let uuid = Uuid::from_u128(909);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let path = rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
+    write_rollout(&path, thread_id, "message survives archive")?;
+    set_old_mtime(&path)?;
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let compression_path = path.clone();
+    let compression_task = tokio::task::spawn_blocking(move || {
+        worker::compress_rollout_if_cold_blocking_paused(&compression_path, reached_tx, resume_rx)
+    });
+    reached_rx.await?;
+    let move_path = path.clone();
+    let archived_dir = home.path().join(crate::ARCHIVED_SESSIONS_SUBDIR);
+    let mut archive_task =
+        tokio::spawn(async move { move_rollout_to_directory(&move_path, &archived_dir).await });
+    let waited = tokio::time::timeout(Duration::from_millis(100), &mut archive_task)
+        .await
+        .is_err();
+    // Always release the blocking worker, including when the assertion would fail.
+    resume_tx.send(())?;
+    compression_task.await??;
+    assert!(
+        waited,
+        "archive must wait for compression's exclusive representation lock"
+    );
+    let archived_path = archive_task.await??;
+    assert!(!path.exists());
+    assert!(!compressed_rollout_path(&path).exists());
+    assert!(archived_path.to_string_lossy().ends_with(".jsonl.zst"));
+    let (items, loaded_id, parse_errors) =
+        RolloutRecorder::load_rollout_items(&archived_path).await?;
+    assert_eq!(loaded_id, Some(thread_id));
+    assert_eq!(parse_errors, 0);
+    assert_eq!(items.len(), 2);
+    assert!(
+        matches!(&items[1], RolloutItem::EventMsg(EventMsg::UserMessage(event)) if event.message == "message survives archive")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn archive_can_move_rollout_before_live_append_handle_closes() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let uuid = Uuid::from_u128(910);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let path = rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
+    write_rollout(&path, thread_id, "live thread")?;
+    let (_, append_guard) = lock_rollout_for_append_blocking(&path)?;
+    let archive = tokio::time::timeout(
+        Duration::from_secs(2),
+        move_rollout_to_directory(&path, &home.path().join(crate::ARCHIVED_SESSIONS_SUBDIR)),
+    )
+    .await;
+    drop(append_guard);
+    let archived_path = archive??;
+    assert!(!path.exists());
+    assert!(archived_path.exists());
+    let (_, loaded_id, parse_errors) = RolloutRecorder::load_rollout_items(&archived_path).await?;
+    assert_eq!(loaded_id, Some(thread_id));
+    assert_eq!(parse_errors, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn load_rollout_items_reads_compressed_rollout() -> anyhow::Result<()> {
     let home = TempDir::new()?;
     let uuid = Uuid::from_u128(1);

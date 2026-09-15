@@ -1360,10 +1360,11 @@ fn symlink_points_to_directory(source: &Path) -> io::Result<bool> {
 }
 
 fn system_time_to_unix_ms(time: SystemTime) -> i64 {
-    time.duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
-        .unwrap_or(0)
+    let millis = match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis() as i128,
+        Err(error) => -(error.duration().as_millis() as i128),
+    };
+    millis.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
 #[cfg(test)]
@@ -1374,6 +1375,25 @@ mod path_uri_tests;
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[tokio::test]
+    async fn metadata_preserves_file_times_before_unix_epoch() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("historical-file");
+        let file = std::fs::File::create(&path)?;
+        let modified = UNIX_EPOCH - std::time::Duration::from_millis(1_234);
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))?;
+        assert_eq!(file.metadata()?.modified()?, modified);
+        let uri = PathUri::from(AbsolutePathBuf::from_absolute_path(path)?);
+
+        let metadata = LocalFileSystem::unsandboxed()
+            .get_metadata(&uri, None)
+            .await?;
+
+        assert!(metadata.is_file);
+        assert_eq!(metadata.modified_at_ms, -1_234);
+        Ok(())
+    }
 
     #[test]
     fn symlink_points_to_directory_handles_dangling_directory_symlinks() -> io::Result<()> {

@@ -41,6 +41,11 @@ impl App {
         app_server: &mut AppServerSession,
         event: AppEvent,
     ) -> Result<AppRunControl> {
+        // Record consumed events in order, with asynchronous backpressure.
+        // Commands are recorded at their submission boundary.
+        if !matches!(event, AppEvent::CodexOp(_)) {
+            crate::session_log::log_inbound_app_event(&event).await;
+        }
         match event {
             AppEvent::NewSession => {
                 self.start_fresh_session_with_summary_hint(
@@ -453,17 +458,6 @@ impl App {
             } => {
                 self.lookup_message_history_entry(thread_id, offset, log_id)
                     .await?;
-            }
-            AppEvent::ApproveRecentAutoReviewDenial { thread_id, id } => {
-                if let Some(event) = self.chat_widget.recent_auto_review_denial(thread_id, &id) {
-                    let op = AppCommand::approve_guardian_denied_action(event);
-                    match self.submit_thread_op(app_server, thread_id, op).await {
-                        Ok(()) => self.chat_widget.complete_recent_auto_review_denial(&id),
-                        Err(err) => self.chat_widget.add_error_message(format!(
-                            "Failed to submit auto-review approval: {err:#}"
-                        )),
-                    }
-                }
             }
             AppEvent::SubmitThreadOp { thread_id, op } => {
                 self.submit_thread_op(app_server, thread_id, op).await?;
@@ -1090,14 +1084,12 @@ impl App {
             AppEvent::CheckWorldWritablePermissionMode {
                 preset,
                 label,
-                approvals_reviewer,
                 profile_selection,
             } => {
                 self.chat_widget
                     .apply_permission_mode_after_world_writable_scan(
                         preset,
                         label,
-                        approvals_reviewer,
                         profile_selection,
                     )
                     .await;
@@ -1422,7 +1414,6 @@ impl App {
                                     AppCommand::override_turn_context(
                                         /*cwd*/ None,
                                         /*approval_policy*/ None,
-                                        /*approvals_reviewer*/ None,
                                         /*permission_profile*/ None,
                                         /*active_permission_profile*/ None,
                                         Some(windows_sandbox_level),
@@ -1449,7 +1440,6 @@ impl App {
                                     AppCommand::override_turn_context(
                                         /*cwd*/ None,
                                         /*approval_policy*/ None,
-                                        /*approvals_reviewer*/ None,
                                         /*permission_profile*/ None,
                                         /*active_permission_profile*/ None,
                                         Some(windows_sandbox_level),
@@ -1477,7 +1467,6 @@ impl App {
                                     AppCommand::override_turn_context(
                                         /*cwd*/ None,
                                         Some(AskForApproval::from(preset.approval)),
-                                        Some(self.config.approvals_reviewer),
                                         Some(preset.permission_profile.clone()),
                                         Some(preset.active_permission_profile.clone()),
                                         Some(windows_sandbox_level),
@@ -1713,28 +1702,6 @@ impl App {
             AppEvent::SelectPermissionProfile(selection) => {
                 if self.apply_permission_profile_selection(selection).await {
                     self.chat_widget.submit_initial_user_message_if_pending();
-                }
-            }
-            AppEvent::UpdateApprovalsReviewer(policy) => {
-                self.config.approvals_reviewer = policy;
-                self.chat_widget.set_approvals_reviewer(policy);
-                self.sync_active_thread_permission_settings_to_cached_session()
-                    .await;
-                if let Err(err) = crate::config_update::write_config_batch(
-                    app_server.request_handle(),
-                    vec![crate::config_update::replace_config_value(
-                        "approvals_reviewer",
-                        serde_json::json!(policy.to_string()),
-                    )],
-                )
-                .await
-                {
-                    tracing::error!(
-                        error = %err,
-                        "failed to persist approvals reviewer update"
-                    );
-                    self.chat_widget
-                        .add_error_message(format!("Failed to save approvals reviewer: {err}"));
                 }
             }
             AppEvent::UpdateFeatureFlags { updates } => {
@@ -2421,7 +2388,6 @@ impl App {
 mod tests {
     use super::*;
     use crate::approval_presets::builtin_approval_presets;
-    use codex_config::types::ApprovalsReviewer;
 
     #[test]
     fn windows_sandbox_setup_params_preserve_pending_permission_selection() {
@@ -2449,7 +2415,6 @@ mod tests {
         let selection = PermissionProfileSelection {
             profile_id: "managed-default".to_string(),
             approval_policy: Some(AskForApproval::OnRequest),
-            approvals_reviewer: Some(ApprovalsReviewer::User),
             display_label: "Managed default".to_string(),
         };
         let named = windows_sandbox_setup_params(

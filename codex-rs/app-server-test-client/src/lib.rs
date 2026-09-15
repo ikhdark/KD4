@@ -2639,7 +2639,10 @@ impl Drop for CodexClient {
                 break;
             }
 
-            thread::sleep(APP_SERVER_GRACEFUL_SHUTDOWN_POLL_INTERVAL);
+            thread::sleep(
+                APP_SERVER_GRACEFUL_SHUTDOWN_POLL_INTERVAL
+                    .min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
 
         let _ = child.kill();

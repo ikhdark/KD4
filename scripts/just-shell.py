@@ -123,7 +123,7 @@ def rust_tool_env(
     if not env.get(CARGO_GIT_CLI_ENV_VAR):
         updates[CARGO_GIT_CLI_ENV_VAR] = "true"
     rustc_wrapper = env.get("RUSTC_WRAPPER")
-    if not rustc_wrapper:
+    if rustc_wrapper is None:
         sccache = which("sccache")
         if sccache:
             updates["RUSTC_WRAPPER"] = sccache

@@ -47,7 +47,6 @@ fn model_with_shell_type(shell_type: ConfigShellToolType) -> ModelInfo {
         used_fallback_model_metadata: false,
         supports_search_tool: false,
         use_responses_lite: false,
-        auto_review_model_override: None,
         tool_mode: None,
         multi_agent_version: None,
     }

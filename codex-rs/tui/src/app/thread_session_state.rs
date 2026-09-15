@@ -38,7 +38,6 @@ impl App {
         };
 
         let approval_policy = AskForApproval::from(self.config.permissions.approval_policy.value());
-        let approvals_reviewer = self.config.approvals_reviewer;
         let permission_profile = self
             .chat_widget
             .config_ref()
@@ -52,7 +51,6 @@ impl App {
             .active_permission_profile();
         let update_session = |session: &mut ThreadSessionState| {
             session.approval_policy = approval_policy;
-            session.approvals_reviewer = approvals_reviewer;
             session.permission_profile = permission_profile.clone();
             session.active_permission_profile = active_permission_profile.clone();
         };
@@ -98,7 +96,6 @@ impl App {
                 approval_policy: AskForApproval::from(
                     self.config.permissions.approval_policy.value(),
                 ),
-                approvals_reviewer: self.config.approvals_reviewer,
                 permission_profile: permission_profile.clone(),
                 active_permission_profile: active_permission_profile.clone(),
                 cwd: thread.cwd.clone(),
@@ -165,7 +162,6 @@ mod tests {
     use crate::test_support::PathBufExt;
     use crate::test_support::test_path_buf;
     use codex_app_server_protocol::AskForApproval;
-    use codex_config::types::ApprovalsReviewer;
     use codex_protocol::config_types::ServiceTier;
     use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
     use codex_protocol::models::ManagedFileSystemPermissions;
@@ -188,7 +184,6 @@ mod tests {
             model_provider_id: "test-provider".to_string(),
             service_tier: None,
             approval_policy: AskForApproval::Never,
-            approvals_reviewer: ApprovalsReviewer::User,
             permission_profile: PermissionProfile::read_only(),
             active_permission_profile: None,
             cwd: cwd.abs(),
@@ -240,7 +235,6 @@ mod tests {
             .insert(side_thread_id, SideThreadState::new(main_thread_id));
         app.config.permissions.approval_policy =
             codex_config::Constrained::allow_any(AskForApproval::OnRequest.to_core());
-        app.config.approvals_reviewer = ApprovalsReviewer::AutoReview;
         let expected_permission_profile = PermissionProfile::workspace_write();
         let expected_active_permission_profile =
             ActivePermissionProfile::new(BUILT_IN_PERMISSION_PROFILE_WORKSPACE);
@@ -261,7 +255,6 @@ mod tests {
 
         let expected_main_session = ThreadSessionState {
             approval_policy: AskForApproval::OnRequest,
-            approvals_reviewer: ApprovalsReviewer::AutoReview,
             permission_profile: expected_permission_profile,
             active_permission_profile: Some(expected_active_permission_profile),
             ..main_session

@@ -412,69 +412,6 @@ async fn load_rollout_items_ignores_unknown_fork_source_history_mode() -> std::i
 }
 
 #[tokio::test]
-async fn load_rollout_items_preserves_legacy_guardian_assessment_lines() -> std::io::Result<()> {
-    let home = TempDir::new().expect("temp dir");
-    let rollout_path = home.path().join("rollout.jsonl");
-    let mut file = File::create(&rollout_path)?;
-    let thread_id = ThreadId::new();
-    let ts = "2025-01-03T12:00:00Z";
-
-    writeln!(
-        file,
-        "{}",
-        serde_json::json!({
-            "timestamp": ts,
-            "type": "session_meta",
-            "payload": {
-                "session_id": thread_id,
-                "id": thread_id,
-                "timestamp": ts,
-                "cwd": ".",
-                "originator": "test_originator",
-                "cli_version": "test_version",
-                "source": "cli",
-                "model_provider": "test-provider",
-            },
-        })
-    )?;
-    writeln!(
-        file,
-        "{}",
-        serde_json::json!({
-            "timestamp": ts,
-            "type": "event_msg",
-            "payload": {
-                "type": "guardian_assessment",
-                "id": "guardian-1",
-                "turn_id": "turn-1",
-                "status": "in_progress",
-                "action": {
-                    "type": "command",
-                    "source": "shell",
-                    "command": "rm -rf /tmp/guardian",
-                    "cwd": r"C:\tmp",
-                },
-            },
-        })
-    )?;
-
-    let (items, loaded_thread_id, parse_errors) =
-        RolloutRecorder::load_rollout_items(&rollout_path).await?;
-
-    assert_eq!(loaded_thread_id, Some(thread_id));
-    assert_eq!(parse_errors, 0);
-    assert_eq!(items.len(), 2);
-    let RolloutItem::EventMsg(EventMsg::GuardianAssessment(assessment)) = &items[1] else {
-        panic!("expected guardian assessment rollout item");
-    };
-    assert_eq!(assessment.id, "guardian-1");
-    assert_eq!(assessment.turn_id, "turn-1");
-    assert_eq!(assessment.started_at_ms, 0);
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn load_rollout_items_filters_legacy_ghost_snapshots_from_compaction_history()
 -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
@@ -2060,7 +1997,6 @@ async fn resume_candidate_matches_cwd_reads_latest_turn_context() -> std::io::Re
             current_date: None,
             timezone: None,
             approval_policy: AskForApproval::Never,
-            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             permission_profile: None,
             network: None,
@@ -2115,7 +2051,6 @@ async fn list_threads_filters_and_projects_latest_persisted_cwd() -> std::io::Re
             current_date: None,
             timezone: None,
             approval_policy: AskForApproval::Never,
-            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             permission_profile: None,
             network: None,
@@ -2172,7 +2107,6 @@ async fn find_latest_thread_path_filters_on_latest_turn_context_cwd() -> std::io
             current_date: None,
             timezone: None,
             approval_policy: AskForApproval::Never,
-            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             permission_profile: None,
             network: None,

@@ -43,7 +43,7 @@ async fn missing_and_zero_intervals_throttle_pending_polls() -> anyhow::Result<(
         opts.issuer = issuer.uri();
         let code = request_device_code(&opts).await?;
         assert_eq!(code.interval, if interval == Some("1") { 1 } else { 5 });
-        let client = create_raw_auth_client(&opts.issuer, &opts.auth_route_config)?;
+        let client = create_raw_auth_client_async(&opts.issuer, &opts.auth_route_config).await?;
         let result = poll_for_token_until(
             &client,
             &format!("{}/api/accounts", issuer.uri()),

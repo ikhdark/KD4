@@ -107,6 +107,20 @@ function Get-SafeTrashDirectory {
                 $probe.Dispose()
             }
         }
+        # Cargo holds profile/.cargo-lock or target/profile/.cargo-lock.
+        # Keep this bounded to two levels and never traverse junctions.
+        foreach ($child in Get-ChildItem -LiteralPath $item.FullName -Directory -Force -ErrorAction Stop) {
+            if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $null }
+            $profiles = @($child) + @(Get-ChildItem -LiteralPath $child.FullName -Directory -Force -ErrorAction Stop)
+            foreach ($profile in $profiles) {
+                if (($profile.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $null }
+                $cargoLock = Join-Path $profile.FullName ".cargo-lock"
+                if (Test-Path -LiteralPath $cargoLock) {
+                    $probe = [IO.File]::Open($cargoLock, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+                    $probe.Dispose()
+                }
+            }
+        }
         return $item
     }
     catch [System.Management.Automation.ItemNotFoundException] {

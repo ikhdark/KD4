@@ -6,7 +6,6 @@
 //! to their resume or fork boundary, then remove fields covered by explicit
 //! request overrides before applying the result.
 
-use crate::config_types::ApprovalsReviewer;
 use crate::config_types::CollaborationMode;
 use crate::config_types::Personality;
 use crate::config_types::ReasoningSummary;
@@ -36,7 +35,6 @@ pub struct PersistedThreadSettings {
     pub service_tier: Option<Option<String>>,
     pub developer_instructions: Option<Option<String>>,
     pub approval_policy: Option<AskForApproval>,
-    pub approvals_reviewer: Option<ApprovalsReviewer>,
     pub permission_profile: Option<PermissionProfile>,
     pub active_permission_profile: Option<Option<ActivePermissionProfile>>,
     pub environments: Option<TurnEnvironmentSelections>,
@@ -68,9 +66,6 @@ impl PersistedThreadSettings {
         }
         if mask.approval_policy {
             self.approval_policy = None;
-        }
-        if mask.approvals_reviewer {
-            self.approvals_reviewer = None;
         }
         if mask.permission_profile {
             self.permission_profile = None;
@@ -116,7 +111,6 @@ pub struct PersistedThreadSettingsOverrideMask {
     pub service_tier: bool,
     pub developer_instructions: bool,
     pub approval_policy: bool,
-    pub approvals_reviewer: bool,
     pub permission_profile: bool,
     pub active_permission_profile: bool,
     pub environments: bool,
@@ -200,9 +194,6 @@ impl PersistedThreadSettingsReducer {
         self.settings.model = Some(turn_context.model.clone());
         self.settings.reasoning_effort = Some(turn_context.effort.clone());
         self.settings.approval_policy = Some(turn_context.approval_policy);
-        if let Some(approvals_reviewer) = turn_context.approvals_reviewer {
-            self.settings.approvals_reviewer = Some(approvals_reviewer);
-        }
         self.settings.permission_profile = Some(turn_context.permission_profile());
         self.settings.sandbox_policy = Some(turn_context.sandbox_policy.clone());
         if !self.saw_authoritative_environments {
@@ -236,7 +227,6 @@ impl PersistedThreadSettingsReducer {
             self.settings.developer_instructions = Some(developer_instructions.clone());
         }
         self.settings.approval_policy = Some(snapshot.approval_policy);
-        self.settings.approvals_reviewer = Some(snapshot.approvals_reviewer);
         self.settings.permission_profile = Some(snapshot.permission_profile.clone());
         if let Some(active_permission_profile) = snapshot.active_permission_profile.as_ref() {
             self.settings.active_permission_profile = Some(active_permission_profile.clone());
@@ -329,7 +319,6 @@ mod tests {
             service_tier: Some(Some("flex".to_string())),
             developer_instructions: Some(Some("persisted developer instructions".to_string())),
             approval_policy: AskForApproval::Never,
-            approvals_reviewer: ApprovalsReviewer::AutoReview,
             permission_profile: PermissionProfile::workspace_write(),
             active_permission_profile: Some(None),
             environments: Some(TurnEnvironmentSelections::new(
@@ -363,7 +352,6 @@ mod tests {
             current_date: None,
             timezone: None,
             approval_policy: AskForApproval::OnRequest,
-            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             permission_profile: Some(PermissionProfile::read_only()),
             network: None,
@@ -476,7 +464,6 @@ mod tests {
             "model": "old-model",
             "model_provider_id": "old-provider",
             "approval_policy": "never",
-            "approvals_reviewer": "user",
             "permission_profile": PermissionProfile::read_only(),
             "cwd": cwd,
             "collaboration_mode": collaboration_mode("old-model", None),
@@ -544,7 +531,6 @@ mod tests {
             "service_tier": null,
             "developer_instructions": null,
             "approval_policy": "never",
-            "approvals_reviewer": "user",
             "permission_profile": PermissionProfile::read_only(),
             "active_permission_profile": null,
             "cwd": cwd,

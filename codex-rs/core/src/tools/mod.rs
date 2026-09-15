@@ -77,10 +77,6 @@ pub(crate) fn flat_tool_name(tool_name: &ToolName) -> Cow<'_, str> {
 }
 
 fn effective_tool_mode(turn_context: &TurnContext) -> ToolMode {
-    if crate::guardian::is_guardian_reviewer_source(&turn_context.session_source) {
-        return ToolMode::Direct;
-    }
-
     turn_context.model_info.tool_mode.unwrap_or_else(|| {
         if turn_context.config.features.enabled(Feature::CodeModeOnly) {
             ToolMode::CodeModeOnly

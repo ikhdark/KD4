@@ -110,14 +110,6 @@
       "additionalProperties": false,
       "description": "Config values for a single app/connector.",
       "properties": {
-        "approvals_reviewer": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/ApprovalsReviewer"
-            }
-          ],
-          "description": "Reviewer for approval prompts from this app, overriding the thread default."
-        },
         "default_tools_approval_mode": {
           "allOf": [
             {
@@ -189,15 +181,6 @@
       "description": "Tool settings for a single app.",
       "type": "object"
     },
-    "ApprovalsReviewer": {
-      "description": "Configures who approval requests are routed to for review. Examples include sandbox escapes, blocked network access, MCP approval prompts, and ARC escalations. Defaults to `user`. `auto_review` uses a carefully prompted subagent to gather relevant context and apply a risk-based decision framework before approving or denying the request. The legacy value `guardian_subagent` is accepted for compatibility.",
-      "enum": [
-        "user",
-        "auto_review",
-        "guardian_subagent"
-      ],
-      "type": "string"
-    },
     "AppsConfigToml": {
       "additionalProperties": {
         "$ref": "#/definitions/AppConfig"
@@ -219,14 +202,6 @@
       "additionalProperties": false,
       "description": "Default settings that apply to all apps.",
       "properties": {
-        "approvals_reviewer": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/ApprovalsReviewer"
-            }
-          ],
-          "description": "Reviewer for approval prompts unless overridden by per-app settings."
-        },
         "default_tools_approval_mode": {
           "allOf": [
             {
@@ -341,15 +316,6 @@
           "type": "string"
         }
       ]
-    },
-    "AutoReviewToml": {
-      "properties": {
-        "policy": {
-          "description": "Additional policy instructions inserted into the guardian prompt.",
-          "type": "string"
-        }
-      },
-      "type": "object"
     },
     "BundledSkillsConfig": {
       "additionalProperties": false,
@@ -4000,14 +3966,6 @@
       ],
       "description": "Default approval policy for executing commands."
     },
-    "approvals_reviewer": {
-      "allOf": [
-        {
-          "$ref": "#/definitions/ApprovalsReviewer"
-        }
-      ],
-      "description": "Configures who approval requests are routed to for review once they have been escalated. This does not disable separate safety checks such as ARC."
-    },
     "apps": {
       "allOf": [
         {
@@ -4020,15 +3978,6 @@
     "apps_mcp_product_sku": {
       "description": "Optional product SKU forwarded on host-owned Codex Apps MCP requests.",
       "type": "string"
-    },
-    "auto_review": {
-      "allOf": [
-        {
-          "$ref": "#/definitions/AutoReviewToml"
-        }
-      ],
-      "default": null,
-      "description": "Optional policy instructions for the guardian auto-reviewer."
     },
     "background_terminal_max_timeout": {
       "description": "Maximum poll window for background terminal output (`write_stdin`), in milliseconds. Default: `60000` (1 minute).",
@@ -4173,9 +4122,6 @@
           "type": "boolean"
         },
         "goals": {
-          "type": "boolean"
-        },
-        "guardian_approval": {
           "type": "boolean"
         },
         "hooks": {

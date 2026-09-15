@@ -485,12 +485,6 @@ impl Session {
             Arc::clone(&turn_context.tool_call_acceptance),
         );
 
-        self.services
-            .guardian_rejection_circuit_breaker
-            .lock()
-            .await
-            .clear_turn(&turn_context.sub_id);
-
         turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
         let reservation_is_current = self
             .input_queue
@@ -1356,11 +1350,7 @@ impl Session {
             )
             .await;
         }
-        self.services
-            .guardian_rejection_circuit_breaker
-            .lock()
-            .await
-            .clear_turn(&turn_context.sub_id);
+
         if let Err(err) = self.flush_rollout().await {
             warn!("failed to flush rollout after emitting terminal turn event: {err}");
         }
@@ -1442,11 +1432,7 @@ impl Session {
         self.input_queue
             .clear_pending_for_turn_state(finalization.turn_state.as_ref())
             .await;
-        self.services
-            .guardian_rejection_circuit_breaker
-            .lock()
-            .await
-            .clear_turn(&turn_context.sub_id);
+
         let _ = self.flush_rollout().await;
         if cleared_active_turn {
             self.emit_thread_idle_lifecycle_if_idle().await;

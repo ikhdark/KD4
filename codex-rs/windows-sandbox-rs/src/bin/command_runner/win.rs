@@ -970,7 +970,9 @@ mod tests {
     fn wait_for_path(path: &std::path::Path, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         while !path.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(25));
+            std::thread::sleep(
+                Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
         path.exists()
     }

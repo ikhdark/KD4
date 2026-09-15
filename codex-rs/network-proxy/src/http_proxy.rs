@@ -863,9 +863,8 @@ fn remove_hop_by_hop_request_headers(headers: &mut HeaderMap) {
     let connection_headers = headers
         .get_all(header::CONNECTION)
         .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .filter_map(|token| HeaderName::from_bytes(token.trim().as_bytes()).ok())
+        .flat_map(|value| value.as_bytes().split(|byte| *byte == b','))
+        .filter_map(|token| HeaderName::from_bytes(token.trim_ascii()).ok())
         .collect::<Vec<_>>();
     headers.remove(header::CONNECTION);
     for name in connection_headers {
@@ -1083,6 +1082,7 @@ mod tests {
                 assert!(request.starts_with("get /probe "));
                 assert!(!request.contains("x-hop"));
                 assert!(!request.contains("x-second-hop"));
+                assert!(!request.contains("x-third-hop"));
                 stream
                     .write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nproof",
@@ -1108,8 +1108,13 @@ mod tests {
                 .header("host", target.to_string())
                 .header("connection", "x-hop")
                 .header("connection", "x-second-hop")
+                .header(
+                    "connection",
+                    HeaderValue::from_bytes(b"x-third-hop, \xff").unwrap(),
+                )
                 .header("x-hop", "private")
                 .header("x-second-hop", "private")
+                .header("x-third-hop", "private")
                 .body(Body::empty())
                 .unwrap();
             req.extensions_mut().insert(state);

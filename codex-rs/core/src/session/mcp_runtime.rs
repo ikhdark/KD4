@@ -293,7 +293,7 @@ mod tests {
                 json!({"lifecycle": {"url": format!("{}/mcp", server.uri())}}),
             )?)?;
         session
-            .refresh_mcp_servers_now(&turn_context, &configured, None)
+            .refresh_mcp_servers_now(&turn_context, &configured)
             .await;
         let old_runtime = session.services.latest_mcp_runtime();
         // A raw manager observer does not own a runtime lease. Keeping it alive
@@ -311,7 +311,7 @@ mod tests {
         let mut removed = configured.clone();
         removed.mcp_servers.set(HashMap::new())?;
         session
-            .refresh_mcp_servers_now(&turn_context, &removed, None)
+            .refresh_mcp_servers_now(&turn_context, &removed)
             .await;
         let replacement = session.services.latest_mcp_runtime();
         assert!(!Arc::ptr_eq(&old_runtime, &replacement));

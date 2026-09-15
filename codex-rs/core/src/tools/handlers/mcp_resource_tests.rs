@@ -133,7 +133,6 @@ async fn step_context_with_blocked_mcp_server(
         ToolPluginProvenance::default(),
         /*auth*/ None,
         /*codex_apps_auth_manager*/ None,
-        /*elicitation_reviewer*/ None,
         /*elicitation_lifecycle*/ None,
         ElicitationRequestRouter::default(),
         /*previous_manager*/ None,

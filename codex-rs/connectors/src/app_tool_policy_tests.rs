@@ -854,7 +854,6 @@ fn defaults(
 ) -> AppsDefaultConfig {
     AppsDefaultConfig {
         enabled,
-        approvals_reviewer: None,
         destructive_enabled,
         open_world_enabled,
         default_tools_approval_mode: None,

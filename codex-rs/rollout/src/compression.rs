@@ -73,6 +73,41 @@ pub(crate) struct RolloutAppendLock {
     _file: File,
 }
 
+/// Moves the current physical rollout representation while excluding compression.
+/// A shared lock permits archiving before the live append handle is shut down.
+pub async fn move_rollout_to_directory(path: &Path, directory: &Path) -> io::Result<PathBuf> {
+    let path = path.to_path_buf();
+    let directory = directory.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let plain_path = plain_rollout_path(&path);
+        let lock_file = open_rollout_lock_file(&plain_path)?;
+        lock_file.lock_shared()?;
+        // The path resolved by discovery may have been compressed while we waited.
+        let compressed_path = path::compressed_rollout_path(&plain_path);
+        let source = if plain_path.is_file() {
+            // A failed materialization cleanup can leave a stale compressed sibling.
+            // Remove it before moving the authoritative plain representation.
+            match std::fs::remove_file(&compressed_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            plain_path
+        } else {
+            compressed_path
+        };
+        let file_name = source.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "rollout path has no file name")
+        })?;
+        std::fs::create_dir_all(&directory)?;
+        let destination = directory.join(file_name);
+        std::fs::rename(source, &destination)?;
+        Ok(destination)
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
 /// Exclusive per-rollout lock held only while an append transaction can mutate the plain file.
 pub(crate) struct RolloutWriteLock {
     _file: File,

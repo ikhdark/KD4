@@ -133,7 +133,7 @@ class Codex:
     def thread_start(
         self,
         *,
-        approval_mode: ApprovalMode = ApprovalMode.auto_review,
+        approval_mode: ApprovalMode = ApprovalMode.deny_all,
         base_instructions: str | None = None,
         config: JsonObject | None = None,
         cwd: str | None = None,
@@ -149,10 +149,9 @@ class Codex:
         thread_source: ThreadSource | None = None,
     ) -> Thread:
         """Create a new Codex conversation thread."""
-        approval_policy, approvals_reviewer = _approval_mode_settings(approval_mode)
+        approval_policy = _approval_mode_settings(approval_mode)
         params = ThreadStartParams(
             approval_policy=approval_policy,
-            approvals_reviewer=approvals_reviewer,
             base_instructions=base_instructions,
             config=config,
             cwd=cwd,
@@ -215,11 +214,10 @@ class Codex:
         service_tier: str | None = None,
     ) -> Thread:
         """Resume an existing conversation thread by ID."""
-        approval_policy, approvals_reviewer = _approval_mode_override_settings(approval_mode)
+        approval_policy = _approval_mode_override_settings(approval_mode)
         params = ThreadResumeParams(
             thread_id=thread_id,
             approval_policy=approval_policy,
-            approvals_reviewer=approvals_reviewer,
             base_instructions=base_instructions,
             config=config,
             cwd=cwd,
@@ -251,11 +249,10 @@ class Codex:
         thread_source: ThreadSource | None = None,
     ) -> Thread:
         """Create a new thread from an existing thread."""
-        approval_policy, approvals_reviewer = _approval_mode_override_settings(approval_mode)
+        approval_policy = _approval_mode_override_settings(approval_mode)
         params = ThreadForkParams(
             thread_id=thread_id,
             approval_policy=approval_policy,
-            approvals_reviewer=approvals_reviewer,
             base_instructions=base_instructions,
             config=config,
             cwd=cwd,
@@ -375,7 +372,7 @@ class AsyncCodex:
     async def thread_start(
         self,
         *,
-        approval_mode: ApprovalMode = ApprovalMode.auto_review,
+        approval_mode: ApprovalMode = ApprovalMode.deny_all,
         base_instructions: str | None = None,
         config: JsonObject | None = None,
         cwd: str | None = None,
@@ -392,10 +389,9 @@ class AsyncCodex:
     ) -> AsyncThread:
         """Create a new Codex conversation thread."""
         await self._ensure_initialized()
-        approval_policy, approvals_reviewer = _approval_mode_settings(approval_mode)
+        approval_policy = _approval_mode_settings(approval_mode)
         params = ThreadStartParams(
             approval_policy=approval_policy,
-            approvals_reviewer=approvals_reviewer,
             base_instructions=base_instructions,
             config=config,
             cwd=cwd,
@@ -460,11 +456,10 @@ class AsyncCodex:
     ) -> AsyncThread:
         """Resume an existing conversation thread by ID."""
         await self._ensure_initialized()
-        approval_policy, approvals_reviewer = _approval_mode_override_settings(approval_mode)
+        approval_policy = _approval_mode_override_settings(approval_mode)
         params = ThreadResumeParams(
             thread_id=thread_id,
             approval_policy=approval_policy,
-            approvals_reviewer=approvals_reviewer,
             base_instructions=base_instructions,
             config=config,
             cwd=cwd,
@@ -497,11 +492,10 @@ class AsyncCodex:
     ) -> AsyncThread:
         """Create a new thread from an existing thread."""
         await self._ensure_initialized()
-        approval_policy, approvals_reviewer = _approval_mode_override_settings(approval_mode)
+        approval_policy = _approval_mode_override_settings(approval_mode)
         params = ThreadForkParams(
             thread_id=thread_id,
             approval_policy=approval_policy,
-            approvals_reviewer=approvals_reviewer,
             base_instructions=base_instructions,
             config=config,
             cwd=cwd,
@@ -593,12 +587,11 @@ class Thread:
     ) -> TurnHandle:
         """Start a turn and return a handle for streaming or control."""
         wire_input = _to_wire_input(_normalize_run_input(input))
-        approval_policy, approvals_reviewer = _approval_mode_override_settings(approval_mode)
+        approval_policy = _approval_mode_override_settings(approval_mode)
         params = TurnStartParams(
             thread_id=self.id,
             input=wire_input,
             approval_policy=approval_policy,
-            approvals_reviewer=approvals_reviewer,
             cwd=cwd,
             effort=effort,
             model=model,
@@ -684,12 +677,11 @@ class AsyncThread:
         """Start a turn and return a handle for streaming or control."""
         await self._codex._ensure_initialized()
         wire_input = _to_wire_input(_normalize_run_input(input))
-        approval_policy, approvals_reviewer = _approval_mode_override_settings(approval_mode)
+        approval_policy = _approval_mode_override_settings(approval_mode)
         params = TurnStartParams(
             thread_id=self.id,
             input=wire_input,
             approval_policy=approval_policy,
-            approvals_reviewer=approvals_reviewer,
             cwd=cwd,
             effort=effort,
             model=model,

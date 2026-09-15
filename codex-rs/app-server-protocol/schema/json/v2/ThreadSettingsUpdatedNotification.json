@@ -25,15 +25,6 @@
       ],
       "type": "object"
     },
-    "ApprovalsReviewer": {
-      "description": "Configures who approval requests are routed to for review. Examples include sandbox escapes, blocked network access, MCP approval prompts, and ARC escalations. Defaults to `user`. `auto_review` uses a carefully prompted subagent to gather relevant context and apply a risk-based decision framework before approving or denying the request. The legacy value `guardian_subagent` is accepted for compatibility.",
-      "enum": [
-        "user",
-        "auto_review",
-        "guardian_subagent"
-      ],
-      "type": "string"
-    },
     "AskForApproval": {
       "oneOf": [
         {
@@ -627,9 +618,6 @@
         "approvalPolicy": {
           "$ref": "#/definitions/AskForApproval"
         },
-        "approvalsReviewer": {
-          "$ref": "#/definitions/ApprovalsReviewer"
-        },
         "collaborationMode": {
           "$ref": "#/definitions/CollaborationMode"
         },
@@ -684,7 +672,6 @@
       },
       "required": [
         "approvalPolicy",
-        "approvalsReviewer",
         "collaborationMode",
         "cwd",
         "model",

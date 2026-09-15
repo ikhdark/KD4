@@ -119,30 +119,6 @@ fn thread_sources_round_trip_as_scalar_labels() {
 }
 
 #[test]
-fn approvals_reviewer_serializes_auto_review_and_accepts_legacy_guardian_subagent() {
-    assert_eq!(
-        serde_json::to_string(&ApprovalsReviewer::User).expect("serialize reviewer"),
-        "\"user\""
-    );
-    assert_eq!(
-        serde_json::to_string(&ApprovalsReviewer::AutoReview).expect("serialize reviewer"),
-        "\"auto_review\""
-    );
-
-    for value in ["user", "auto_review", "guardian_subagent"] {
-        let json = format!("\"{value}\"");
-        let reviewer: ApprovalsReviewer =
-            serde_json::from_str(&json).expect("deserialize reviewer");
-        let expected = if value == "user" {
-            ApprovalsReviewer::User
-        } else {
-            ApprovalsReviewer::AutoReview
-        };
-        assert_eq!(expected, reviewer);
-    }
-}
-
-#[test]
 fn turn_defaults_legacy_missing_items_view_to_full() {
     let turn: Turn = serde_json::from_value(json!({
         "id": "turn_123",
@@ -231,7 +207,6 @@ fn thread_resume_response_round_trips_initial_turns_page() {
         runtime_workspace_roots: Vec::new(),
         instruction_sources: Vec::new(),
         approval_policy: AskForApproval::OnRequest,
-        approvals_reviewer: ApprovalsReviewer::User,
         sandbox: SandboxPolicy::DangerFullAccess,
         permission_profile: None,
         active_permission_profile: None,
@@ -856,18 +831,6 @@ fn permissions_request_approval_response_defaults_scope_to_turn() {
     .expect("response should deserialize");
 
     assert_eq!(response.scope, PermissionGrantScope::Turn);
-    assert_eq!(response.strict_auto_review, None);
-}
-
-#[test]
-fn permissions_request_approval_response_accepts_strict_auto_review() {
-    let response = serde_json::from_value::<PermissionsRequestApprovalResponse>(json!({
-        "permissions": {},
-        "strictAutoReview": true,
-    }))
-    .expect("response should deserialize");
-
-    assert_eq!(response.strict_auto_review, Some(true));
 }
 
 #[test]
@@ -1850,7 +1813,6 @@ fn config_granular_approval_policy_is_marked_experimental() {
             request_permissions: false,
             mcp_elicitations: true,
         }),
-        approvals_reviewer: None,
         sandbox_mode: None,
         sandbox_workspace_write: None,
         forced_chatgpt_workspace_id: None,
@@ -1874,39 +1836,6 @@ fn config_granular_approval_policy_is_marked_experimental() {
 }
 
 #[test]
-fn config_approvals_reviewer_is_marked_experimental() {
-    let reason = crate::experimental_api::ExperimentalApi::experimental_reason(&Config {
-        model: None,
-        review_model: None,
-        model_context_window: None,
-        model_auto_compact_token_limit: None,
-        model_auto_compact_token_limit_scope: None,
-        model_provider: None,
-        approval_policy: None,
-        approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
-        sandbox_mode: None,
-        sandbox_workspace_write: None,
-        forced_chatgpt_workspace_id: None,
-        forced_login_method: None,
-        web_search: None,
-        tools: None,
-        instructions: None,
-        developer_instructions: None,
-        compact_prompt: None,
-        model_reasoning_effort: None,
-        model_reasoning_summary: None,
-        model_verbosity: None,
-        service_tier: None,
-        analytics: None,
-        apps: None,
-        desktop: None,
-        additional: HashMap::new(),
-    });
-
-    assert_eq!(reason, Some("config/read.approvalsReviewer"));
-}
-
-#[test]
 fn config_requirements_granular_allowed_approval_policy_is_marked_experimental() {
     let reason =
         crate::experimental_api::ExperimentalApi::experimental_reason(&ConfigRequirements {
@@ -1917,7 +1846,6 @@ fn config_requirements_granular_allowed_approval_policy_is_marked_experimental()
                 request_permissions: false,
                 mcp_elicitations: false,
             }]),
-            allowed_approvals_reviewers: None,
             allowed_sandbox_modes: None,
             allowed_windows_sandbox_implementations: None,
             allowed_permission_profiles: None,
@@ -2562,51 +2490,6 @@ fn sandbox_policy_rejects_legacy_workspace_write_restricted_read_access_field() 
     }))
     .expect_err("workspace-write policy should reject removed restricted readOnlyAccess field");
     assert!(err.to_string().contains("workspaceWrite.readOnlyAccess"));
-}
-
-#[test]
-fn automatic_approval_review_deserializes_aborted_status() {
-    let review: GuardianApprovalReview = serde_json::from_value(json!({
-        "status": "aborted",
-        "riskLevel": null,
-        "userAuthorization": null,
-        "rationale": null
-    }))
-    .expect("aborted automatic review should deserialize");
-    assert_eq!(
-        review,
-        GuardianApprovalReview {
-            status: GuardianApprovalReviewStatus::Aborted,
-            risk_level: None,
-            user_authorization: None,
-            rationale: None,
-        }
-    );
-}
-
-#[test]
-fn guardian_approval_review_action_round_trips_command_shape() {
-    let value = json!({
-        "type": "command",
-        "source": "shell",
-        "command": "rm -rf /tmp/example.sqlite",
-        "cwd": absolute_path_string("tmp"),
-    });
-    let action: GuardianApprovalReviewAction =
-        serde_json::from_value(value.clone()).expect("guardian review action");
-
-    assert_eq!(
-        action,
-        GuardianApprovalReviewAction::Command {
-            source: GuardianCommandSource::Shell,
-            command: "rm -rf /tmp/example.sqlite".to_string(),
-            cwd: absolute_path("tmp").into(),
-        }
-    );
-    assert_eq!(
-        serde_json::to_value(&action).expect("serialize guardian review action"),
-        value
-    );
 }
 
 #[test]
@@ -4256,7 +4139,6 @@ fn thread_lifecycle_responses_default_missing_optional_fields() {
         "serviceTier": null,
         "cwd": absolute_path_string("tmp"),
         "approvalPolicy": "on-request",
-        "approvalsReviewer": "user",
         "sandbox": { "type": "dangerFullAccess" },
         "reasoningEffort": null
     });
@@ -4364,7 +4246,6 @@ fn turn_start_params_preserve_explicit_null_service_tier() {
         cwd: None,
         runtime_workspace_roots: None,
         approval_policy: None,
-        approvals_reviewer: None,
         sandbox_policy: None,
         permission_profile: None,
         permissions: None,

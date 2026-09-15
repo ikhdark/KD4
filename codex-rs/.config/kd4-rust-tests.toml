@@ -2,8 +2,8 @@
 #
 # `scripts/rust_test_runner.py` is the only supported consumer. The runner
 # parses this file strictly: unknown tables and unknown keys are errors, and
-# every package, test target, and helper binary named here is validated against
-# `cargo metadata --no-deps` before anything is built or run.
+# selected targets and helpers are validated against `cargo metadata --no-deps`
+# before execution. `check-manifest` validates every declaration.
 #
 # Target selection is immutable once a name is chosen: callers pick a target or
 # gate by name and may only narrow it with filtering options. Package and test
@@ -165,6 +165,7 @@ tests = [
 
 [[gates.adaptive-reasoning-contract.steps]]
 target = "core_lib"
+helpers = []
 filter = "test(load_config_defaults_phase_tracking_to_compatibility_efforts) | test(load_config_preserves_explicit_reasoning_phase_effort_overrides) | test(load_config_preserves_all_explicit_reasoning_phase_effort_overrides) | test(reachable_changed_continuation_uses_the_lowest_supported_explicit_override) | test(reachable_changed_continuation_defaults_to_low_even_when_turn_is_high) | test(request_policy_rejects_host_terminal_completion) | test(protocol_terminal_continuation_is_marked_for_host_elision_only_when_unchanged) | test(global_effort_survives_unoverridden_decision_bearing_phases)"
 tests = [
   "config::tests::load_config_defaults_phase_tracking_to_compatibility_efforts",
@@ -182,6 +183,7 @@ description = "Config schema fixture parity without regenerating generated outpu
 
 [[gates.config-schema-protocol.steps]]
 target = "core_lib"
+helpers = []
 filter = "test(config_schema_matches_fixture) | test(config_schema_hides_unsupported_inline_mcp_bearer_token)"
 tests = [
   "config::schema::tests::config_schema_hides_unsupported_inline_mcp_bearer_token",
@@ -193,6 +195,7 @@ description = "codex-core leg of the Windows sandbox process-tree gate."
 
 [[gates.windows-sandbox-core-exec.steps]]
 target = "core_lib"
+helpers = ["codex", "codex-code-mode-host", "test_stdio_server", "codex-windows-sandbox-setup", "codex-command-runner"]
 filter = "test(direct_exec_cancellation_terminates_windows_descendants)"
 tests = ["exec::tests::direct_exec_cancellation_terminates_windows_descendants"]
 
@@ -201,6 +204,7 @@ description = "Library regressions that used to exit silently when test_stdio_se
 
 [[gates.core-stdio-helper-regressions.steps]]
 target = "core_lib"
+helpers = ["codex", "codex-code-mode-host", "test_stdio_server", "codex-windows-sandbox-setup", "codex-command-runner"]
 filter = "test(pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot) | test(requested_mcp_servers_are_refreshed_before_install_completion)"
 tests = [
   "session::turn::tests::pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot",
@@ -307,6 +311,7 @@ helpers = []
 description = "Known delta reuse preserves force-fresh command execution."
 [[gates.capability-known-delta-store.steps]]
 target = "core_lib"
+helpers = ["codex", "codex-code-mode-host", "test_stdio_server", "codex-windows-sandbox-setup", "codex-command-runner"]
 tests = ["tools::handlers::unified_exec::tests::known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_launches"]
 
 [gates.capability-deferred-executor]
@@ -392,3 +397,222 @@ tests = [
   "tools::command_execution::tests::rg_pattern_file_changes_invalidate_cached_misses",
 ]
 helpers = []
+
+[targets.app_server_protocol_lib]
+package = "codex-app-server-protocol"
+lib = true
+helpers = []
+
+[targets.app_server_lib]
+package = "codex-app-server"
+lib = true
+helpers = []
+
+[targets.app_server_schema_fixtures]
+package = "codex-app-server-protocol"
+test = "schema_fixtures"
+helpers = []
+
+[targets.tui_lib]
+package = "codex-tui"
+lib = true
+helpers = []
+
+[targets.pty_lib]
+package = "codex-utils-pty"
+lib = true
+helpers = []
+
+[targets.windows_sandbox_lib]
+package = "codex-windows-sandbox"
+lib = true
+helpers = []
+
+[targets.windows_command_runner_bin]
+package = "codex-windows-sandbox"
+bin = "codex-command-runner"
+helpers = []
+
+[gates.app-server-command-exec]
+description = "Exact test contract for the app-server-command-exec recipe."
+
+[[gates.app-server-command-exec.steps]]
+target = "app_server_protocol_lib"
+tests = [
+  "protocol::v2::tests::command_exec_params_round_trips_disable_output_cap",
+  "protocol::v2::tests::command_exec_output_delta_round_trips",
+]
+
+[[gates.app-server-command-exec.steps]]
+target = "app_server_initialize"
+tests = [
+  "suite::v2::command_exec::command_exec_non_streaming_respects_output_cap",
+]
+
+[gates.app-server-process-exec]
+description = "Exact test contract for the app-server-process-exec recipe."
+
+[[gates.app-server-process-exec.steps]]
+target = "app_server_protocol_lib"
+tests = [
+  "protocol::v2::tests::process_notifications_round_trip",
+]
+
+[[gates.app-server-process-exec.steps]]
+target = "app_server_initialize"
+tests = [
+  "suite::v2::process_exec::process_spawn_reports_buffered_output_cap_reached",
+]
+
+[gates.app-server-thread-status]
+description = "Exact test contract for the app-server-thread-status recipe."
+
+[[gates.app-server-thread-status.steps]]
+target = "app_server_lib"
+tests = [
+  "thread_status::tests::stale_guards_cannot_clear_requests_from_a_new_lifecycle",
+  "thread_status::tests::stale_guard_drop_does_not_reload_removed_or_shutdown_thread",
+]
+
+[gates.app-server-schema-fixtures]
+description = "Exact test contract for the app-server-schema-fixtures recipe."
+
+[[gates.app-server-schema-fixtures.steps]]
+target = "app_server_schema_fixtures"
+tests = [
+  "typescript_schema_fixtures_match_generated",
+  "json_schema_fixtures_match_generated",
+]
+
+[gates.windows-process]
+description = "Exact test contract for the windows-process recipe."
+
+[[gates.windows-process.steps]]
+target = "pty_lib"
+tests = [
+  "tests::windows_tests::terminate_kills_descendants_for_best_effort_pipe_and_atomic_conpty",
+  "tests::windows_tests::normal_exit_preserves_descendants_for_pipe_and_conpty",
+  "tests::windows_tests::conpty_delivers_input_to_foreground_children",
+  "tests::windows_tests::conpty_ctrl_c_interrupts_powershell_foreground_child",
+  "tests::windows_tests::required_process_test_prerequisites_report_unverified_coverage",
+]
+
+[[gates.windows-process.steps]]
+target = "windows_sandbox_lib"
+tests = [
+  "unified_exec::tests::legacy_capture_cancellation_terminates_descendants_without_timeout",
+  "windows_impl::tests::process_wait_failure_is_not_treated_as_exit",
+]
+
+[[gates.windows-process.steps]]
+target = "windows_command_runner_bin"
+tests = [
+  "win::tests::controlling_ipc_eof_terminates_process_tree",
+  "win::tests::invalid_process_wait_is_not_treated_as_exit",
+]
+
+[gates.tui-large-widget]
+description = "Exact test contract for the tui-large-widget recipe."
+
+[[gates.tui-large-widget.steps]]
+target = "tui_lib"
+tests = [
+  "bottom_pane::chat_composer::tests::footer_collapse_snapshots",
+  "bottom_pane::chat_composer::tests::handle_paste_large_uses_placeholder_and_replaces_on_submit",
+  "resume_picker::tests::picker_reload_storm_coalesces_before_rpc_and_results_apply_backpressure",
+  "resume_picker::tests::jumping_to_end_keeps_only_fitting_rows_above_selection",
+  "resume_picker::tests::measured_row_heights_match_rendering_at_footer_wrap_boundaries",
+  "resume_picker::tests::footer_wrap_accounts_for_the_gap_between_fields",
+  "resume_picker::tests::appended_pages_filter_new_rows_and_deduplicate_by_thread_id",
+  "resume_picker::tests::reopening_a_failed_preview_requests_it_again",
+  "resume_picker::tests::footer_hints_show_active_searchable_bindings",
+  "resume_picker::tests::row_display_preview_prefers_thread_name",
+  "resume_picker::tests::local_picker_thread_list_params_include_cwd_filter",
+  "resume_picker::tests::row_search_matches_metadata_fields",
+  "resume_picker::tests::relative_time_formats_zero_seconds_as_now",
+  "resume_picker::tests::long_relative_time_uses_words",
+  "resume_picker::tests::expanded_session_details_include_metadata",
+  "resume_picker::tests::footer_prioritizes_active_sort_timestamp",
+  "resume_picker::tests::footer_marks_missing_branch",
+  "resume_picker::tests::footer_branch_expands_when_line_has_room",
+  "resume_picker::tests::footer_cwd_truncates_to_responsive_column",
+  "resume_picker::tests::footer_omits_cwd_when_hidden",
+  "resume_picker::tests::remote_thread_list_params_omit_provider_filter",
+  "resume_picker::tests::remote_thread_list_params_can_include_non_interactive_sources",
+  "resume_picker::tests::remote_picker_sends_cwd_filter_without_local_post_filtering",
+  "resume_picker::tests::remote_picker_does_not_filter_rows_by_local_cwd",
+  "resume_picker::tests::resume_table_snapshot",
+  "resume_picker::tests::resume_search_error_snapshot",
+  "resume_picker::tests::hint_line_switches_esc_label_for_search_mode",
+  "resume_picker::tests::hint_line_labels_cancel_keys_as_exit_for_existing_session_resume_picker",
+  "resume_picker::tests::hint_line_switches_density_label",
+  "resume_picker::tests::hint_line_compacts_on_narrow_width",
+  "resume_picker::tests::hint_line_snapshot_uses_distributed_wide_footer",
+  "resume_picker::tests::hint_line_snapshot_uses_compact_footer",
+  "resume_picker::tests::hint_line_prioritizes_keybinds_when_very_narrow",
+  "resume_picker::tests::hint_line_shows_loading_transcript_mode",
+  "resume_picker::tests::picker_footer_percent_reports_scroll_progress",
+  "resume_picker::tests::picker_footer_progress_label_shows_position_total_and_percent",
+  "resume_picker::tests::picker_footer_progress_label_uses_known_count_when_more_pages_exist",
+  "resume_picker::tests::picker_footer_progress_label_freezes_percent_while_loading",
+  "resume_picker::tests::picker_footer_percent_is_complete_when_not_scrollable",
+  "resume_picker::tests::ctrl_o_toggles_density_without_typing_into_search",
+  "resume_picker::tests::ctrl_t_requests_selected_session_transcript",
+  "resume_picker::tests::transcript_loading_consumes_picker_input",
+  "resume_picker::tests::transcript_loading_still_allows_ctrl_c_exit",
+  "resume_picker::tests::transcript_loading_overlay_snapshot",
+  "resume_picker::tests::raw_ctrl_t_requests_selected_session_transcript",
+  "resume_picker::tests::ctrl_t_on_row_without_thread_id_shows_inline_error",
+  "resume_picker::tests::loaded_transcript_waits_for_loading_frame_before_opening_overlay",
+  "resume_picker::tests::cached_transcript_still_shows_loading_frame_before_opening_overlay",
+  "resume_picker::tests::ctrl_o_persists_density_preference",
+  "resume_picker::tests::ctrl_o_keeps_toggled_density_when_persistence_fails",
+  "resume_picker::tests::raw_ctrl_o_toggles_density_without_typing_into_search",
+  "resume_picker::tests::space_appends_to_search_query",
+  "resume_picker::tests::ctrl_e_toggles_selected_session_expansion",
+  "resume_picker::tests::raw_ctrl_e_toggles_selected_session_expansion",
+  "resume_picker::tests::search_line_renders_sort_and_filter_tabs",
+  "resume_picker::tests::oversized_search_query_preserves_visible_search_and_toolbar",
+  "resume_picker::tests::search_line_compacts_toolbar_on_narrow_width",
+  "resume_picker::tests::dense_session_snapshot_omits_cwd_in_cwd_filter",
+  "resume_picker::tests::dense_session_snapshot_includes_cwd_in_all_filter",
+  "resume_picker::tests::dense_session_snapshot_auto_hides_cwd_when_narrow",
+  "resume_picker::tests::dense_session_snapshot_forces_cwd_when_narrow",
+  "resume_picker::tests::dense_session_snapshot_drops_metadata_when_narrow",
+  "resume_picker::tests::dense_session_line_prefers_thread_name_over_preview",
+  "resume_picker::tests::dense_selected_summary_line_uses_full_width_selection_style",
+  "resume_picker::tests::dense_session_snapshot_uses_no_blank_lines_between_rows",
+  "resume_picker::tests::expanded_session_snapshot",
+  "resume_picker::tests::narrow_session_snapshot",
+  "resume_picker::tests::session_list_more_indicators_snapshot",
+  "resume_picker::tests::density_toggle_clears_stale_more_indicator",
+  "resume_picker::tests::pageless_scrolling_deduplicates_and_keeps_order",
+  "resume_picker::tests::ensure_minimum_rows_prefetches_when_underfilled",
+  "resume_picker::tests::ensure_minimum_rows_does_not_prefetch_when_comfortable_cards_fill_view",
+  "resume_picker::tests::ensure_minimum_rows_still_prefetches_when_dense_rows_underfill_view",
+  "resume_picker::tests::list_viewport_width_matches_rendered_list_inset",
+  "resume_picker::tests::toggle_sort_key_reloads_with_new_sort",
+  "resume_picker::tests::default_filter_focus_arrows_reload_with_new_filter",
+  "resume_picker::tests::all_filter_can_switch_back_to_cwd_when_cwd_candidate_exists",
+  "resume_picker::tests::filter_stays_all_when_no_cwd_candidate_exists",
+  "resume_picker::tests::page_navigation_uses_view_rows",
+  "resume_picker::tests::page_and_jump_navigation_use_list_keymap",
+  "resume_picker::tests::ctrl_c_exits_even_when_cancel_is_remapped_to_ctrl_c",
+  "resume_picker::tests::end_jumps_to_last_known_row_and_starts_loading_more",
+  "resume_picker::tests::enter_on_row_without_resolvable_thread_id_shows_inline_error",
+  "resume_picker::tests::enter_on_pathless_thread_uses_thread_id",
+  "resume_picker::tests::app_server_row_keeps_pathless_threads",
+  "resume_picker::tests::thread_to_transcript_cells_renders_core_message_types",
+  "resume_picker::tests::thread_to_transcript_cells_hides_raw_reasoning_when_not_enabled",
+  "resume_picker::tests::thread_to_transcript_cells_shows_raw_reasoning_over_summary_when_enabled",
+  "resume_picker::tests::moving_to_last_card_scrolls_when_cards_exceed_viewport",
+  "resume_picker::tests::up_from_bottom_keeps_viewport_stable_when_card_remains_visible",
+  "resume_picker::tests::up_scrolls_only_after_crossing_top_edge",
+  "resume_picker::tests::list_reports_more_rows_above_and_below",
+  "resume_picker::tests::set_query_loads_until_match_and_respects_scan_cap",
+  "resume_picker::tests::paste_appends_to_existing_query",
+  "resume_picker::tests::whitespace_only_paste_is_ignored",
+  "resume_picker::tests::paste_uses_existing_search_loading_path",
+  "resume_picker::tests::esc_with_empty_query_starts_fresh",
+  "resume_picker::tests::esc_with_query_clears_search_and_preserves_selected_result",
+]

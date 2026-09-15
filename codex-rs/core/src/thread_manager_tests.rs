@@ -40,6 +40,73 @@ use wiremock::MockServer;
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
 
+#[test]
+fn cancelled_start_discards_persistence_while_parallel_setup_is_pending() {
+    run_thread_manager_test_with_stack("cancelled-start-persistence", || async {
+        let temp_dir = tempdir().expect("temporary thread workspace");
+        let mut config = test_config().await;
+        config.codex_home = temp_dir.path().join("codex-home").abs();
+        config.cwd = config.codex_home.clone();
+        std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+        let manager = ThreadManager::with_models_provider_and_home_for_tests(
+            CodexAuth::from_api_key("dummy"),
+            config.model_provider.clone(),
+            config.codex_home.to_path_buf(),
+            Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+            Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        );
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *crate::session::session::SESSION_INIT_PERSISTENCE_TEST_HOOK
+            .lock()
+            .expect("startup hook lock") =
+            Some(crate::session::session::SessionInitPersistenceTestHook {
+                codex_home: config.codex_home.to_path_buf(),
+                ready: ready_tx,
+                release: release_rx,
+            });
+        let mut startup = Box::pin(manager.start_thread(config));
+        let thread_id = tokio::select! {
+            ready = ready_rx => ready.expect("persistence initialized"),
+            _ = &mut startup => panic!("startup must wait for parallel setup"),
+            _ = tokio::time::sleep(Duration::from_secs(10)) => panic!("startup did not initialize persistence"),
+        };
+        let store = manager
+            .state
+            .thread_store
+            .as_any()
+            .downcast_ref::<LocalThreadStore>()
+            .expect("local thread store");
+        let path = store
+            .live_rollout_path(thread_id)
+            .await
+            .expect("live writer registered");
+        assert!(!path.exists(), "startup has not materialized its rollout");
+        // Dropping the normal request future must release its writer even though
+        // the manager and runtime remain alive and another join branch is pending.
+        drop(startup);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match store.live_rollout_path(thread_id).await {
+                    Err(ThreadStoreError::ThreadNotFound { thread_id: missing }) => {
+                        assert_eq!(missing, thread_id);
+                        break;
+                    }
+                    Ok(_) => tokio::task::yield_now().await,
+                    Err(error) => panic!("unexpected live writer lookup error: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("cancelled startup must discard its writer");
+        assert!(
+            !path.exists(),
+            "cancellation must not persist queued session metadata"
+        );
+        assert!(manager.state.threads.read().await.is_empty());
+    });
+}
+
 #[tokio::test]
 async fn test_constructors_preserve_injected_user_instructions_at_thread_start() {
     struct SuppliedInstructions(codex_extension_api::UserInstructions);
@@ -71,7 +138,10 @@ async fn test_constructors_preserve_injected_user_instructions_at_thread_start()
         config.model_provider.clone(),
         Arc::new(SuppliedInstructions(expected.clone())),
     );
-    let started = manager.start_thread(config).await.expect("start root thread");
+    let started = manager
+        .start_thread(config)
+        .await
+        .expect("start root thread");
     assert_eq!(
         started.thread.codex.session.user_instructions().await,
         Some(expected)

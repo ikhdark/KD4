@@ -28,7 +28,6 @@ use codex_app_server_protocol::FileChangeApprovalDecision;
 use codex_app_server_protocol::FileChangeRequestApprovalParams;
 use codex_app_server_protocol::FileChangeRequestApprovalResponse;
 use codex_app_server_protocol::GrantedPermissionProfile as V2GrantedPermissionProfile;
-use codex_app_server_protocol::GuardianWarningNotification;
 use codex_app_server_protocol::HookCompletedNotification;
 use codex_app_server_protocol::HookStartedNotification;
 use codex_app_server_protocol::ItemCompletedNotification;
@@ -77,9 +76,7 @@ use codex_app_server_protocol::TurnStartedNotification;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::TurnTiming;
 use codex_app_server_protocol::WarningNotification;
-use codex_app_server_protocol::build_item_from_guardian_event;
 use codex_app_server_protocol::command_display_string;
-use codex_app_server_protocol::guardian_auto_approval_review_notification;
 use codex_app_server_protocol::item_event_to_server_notification;
 use codex_core::CodexThread;
 use codex_core::ThreadManager;
@@ -265,93 +262,6 @@ pub(crate) async fn apply_bespoke_event_handling(
             outgoing
                 .send_server_notification(ServerNotification::Warning(notification))
                 .await;
-        }
-        EventMsg::GuardianWarning(warning_event) => {
-            let notification = GuardianWarningNotification {
-                thread_id: conversation_id.to_string(),
-                message: warning_event.message,
-            };
-            outgoing
-                .send_server_notification(ServerNotification::GuardianWarning(notification))
-                .await;
-        }
-        EventMsg::GuardianAssessment(assessment) => {
-            let pending_command_execution = match build_item_from_guardian_event(
-                &assessment,
-                CommandExecutionStatus::InProgress,
-            ) {
-                Some(ThreadItem::CommandExecution {
-                    id,
-                    command,
-                    cwd,
-                    command_actions,
-                    ..
-                }) => Some((
-                    id,
-                    CommandExecutionCompletionItem {
-                        command,
-                        cwd,
-                        command_actions,
-                    },
-                )),
-                Some(_) | None => None,
-            };
-            let assessment_turn_id = if assessment.turn_id.is_empty() {
-                event_turn_id.clone()
-            } else {
-                assessment.turn_id.clone()
-            };
-            if assessment.status == codex_protocol::protocol::GuardianAssessmentStatus::InProgress
-                && let Some((target_item_id, completion_item)) = pending_command_execution.as_ref()
-            {
-                start_command_execution_item(
-                    &conversation_id,
-                    assessment_turn_id.clone(),
-                    target_item_id.clone(),
-                    completion_item.command.clone(),
-                    completion_item.cwd.clone(),
-                    completion_item.command_actions.clone(),
-                    CommandExecutionSource::Agent,
-                    &outgoing,
-                    &thread_state,
-                )
-                .await;
-            }
-            let notification = guardian_auto_approval_review_notification(
-                &conversation_id,
-                &event_turn_id,
-                &assessment,
-            );
-            outgoing.send_server_notification(notification).await;
-            let completion_status = match assessment.status {
-                codex_protocol::protocol::GuardianAssessmentStatus::Denied
-                | codex_protocol::protocol::GuardianAssessmentStatus::Aborted => {
-                    Some(CommandExecutionStatus::Declined)
-                }
-                codex_protocol::protocol::GuardianAssessmentStatus::TimedOut => {
-                    Some(CommandExecutionStatus::Failed)
-                }
-                codex_protocol::protocol::GuardianAssessmentStatus::InProgress
-                | codex_protocol::protocol::GuardianAssessmentStatus::Approved => None,
-            };
-            if let Some(completion_status) = completion_status
-                && let Some((target_item_id, completion_item)) = pending_command_execution
-            {
-                complete_command_execution_item(
-                    &conversation_id,
-                    assessment_turn_id,
-                    target_item_id,
-                    completion_item.command,
-                    completion_item.cwd,
-                    /*process_id*/ None,
-                    CommandExecutionSource::Agent,
-                    completion_item.command_actions,
-                    completion_status,
-                    &outgoing,
-                    &thread_state,
-                )
-                .await;
-            }
         }
         EventMsg::ModelReroute(event) => {
             let notification = ModelReroutedNotification {
@@ -851,7 +761,7 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::ViewImageToolCall(_) => {}
         EventMsg::ItemStarted(event) => {
             let should_emit = match &event.item {
-                // Approval and guardian flows can emit the command start notification before core
+                // Approval flows can emit the command start notification before core
                 // emits the canonical item. Reuse the same set to suppress that duplicate.
                 CoreTurnItem::CommandExecution(item) => thread_state
                     .lock()
@@ -1790,7 +1700,6 @@ fn request_permissions_response_from_client_result(
             return Ok(Some(CoreRequestPermissionsResponse {
                 permissions: Default::default(),
                 scope: CorePermissionGrantScope::Turn,
-                strict_auto_review: false,
             }));
         }
         Err(err) => {
@@ -1798,7 +1707,6 @@ fn request_permissions_response_from_client_result(
             return Ok(Some(CoreRequestPermissionsResponse {
                 permissions: Default::default(),
                 scope: CorePermissionGrantScope::Turn,
-                strict_auto_review: false,
             }));
         }
     };
@@ -1809,23 +1717,8 @@ fn request_permissions_response_from_client_result(
             PermissionsRequestApprovalResponse {
                 permissions: V2GrantedPermissionProfile::default(),
                 scope: codex_app_server_protocol::PermissionGrantScope::Turn,
-                strict_auto_review: None,
             }
         });
-    let strict_auto_review = response.strict_auto_review.unwrap_or(false);
-    if strict_auto_review
-        && matches!(
-            response.scope,
-            codex_app_server_protocol::PermissionGrantScope::Session
-        )
-    {
-        error!("strict auto review is only supported for turn-scoped permission grants");
-        return Ok(Some(CoreRequestPermissionsResponse {
-            permissions: Default::default(),
-            scope: CorePermissionGrantScope::Turn,
-            strict_auto_review: false,
-        }));
-    }
     let granted_permissions = response.permissions.into_core_with_cwd(cwd)?;
     let permissions = if granted_permissions.is_empty() {
         CoreRequestPermissionProfile::default()
@@ -1836,7 +1729,6 @@ fn request_permissions_response_from_client_result(
     Ok(Some(CoreRequestPermissionsResponse {
         permissions,
         scope: response.scope.to_core(),
-        strict_auto_review,
     }))
 }
 
@@ -2056,8 +1948,6 @@ mod tests {
     use anyhow::anyhow;
     use anyhow::bail;
     use chrono::Utc;
-    use codex_app_server_protocol::AutoReviewDecisionSource;
-    use codex_app_server_protocol::GuardianApprovalReviewStatus;
     use codex_app_server_protocol::JSONRPCErrorError;
     use codex_app_server_protocol::ServerRequest;
     use codex_app_server_protocol::TurnPlanStepStatus;
@@ -2080,8 +1970,6 @@ mod tests {
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::CreditsSnapshot;
     use codex_protocol::protocol::EventMsg;
-    use codex_protocol::protocol::GuardianAssessmentEvent;
-    use codex_protocol::protocol::GuardianAssessmentStatus;
     use codex_protocol::protocol::ItemCompletedEvent;
     use codex_protocol::protocol::ItemStartedEvent;
     use codex_protocol::protocol::RateLimitSnapshot;
@@ -2353,229 +2241,6 @@ mod tests {
         }
     }
 
-    fn guardian_command_assessment(
-        id: &str,
-        turn_id: &str,
-        status: GuardianAssessmentStatus,
-    ) -> GuardianAssessmentEvent {
-        let (risk_level, user_authorization, rationale) = match status {
-            GuardianAssessmentStatus::InProgress => (None, None, None),
-            GuardianAssessmentStatus::Approved => (
-                Some(codex_protocol::protocol::GuardianRiskLevel::Low),
-                Some(codex_protocol::protocol::GuardianUserAuthorization::High),
-                Some("looks safe".to_string()),
-            ),
-            GuardianAssessmentStatus::Denied => (
-                Some(codex_protocol::protocol::GuardianRiskLevel::High),
-                Some(codex_protocol::protocol::GuardianUserAuthorization::Low),
-                Some("too risky".to_string()),
-            ),
-            GuardianAssessmentStatus::TimedOut => {
-                (None, None, Some("review timed out".to_string()))
-            }
-            GuardianAssessmentStatus::Aborted => (None, None, None),
-        };
-        GuardianAssessmentEvent {
-            id: format!("review-{id}"),
-            target_item_id: Some(id.to_string()),
-            turn_id: turn_id.to_string(),
-            started_at_ms: 1_000,
-            completed_at_ms: (!matches!(status, GuardianAssessmentStatus::InProgress))
-                .then_some(1_042),
-            status,
-            risk_level,
-            user_authorization,
-            rationale,
-            decision_source: if matches!(status, GuardianAssessmentStatus::InProgress) {
-                None
-            } else {
-                Some(codex_protocol::protocol::GuardianAssessmentDecisionSource::Agent)
-            },
-            action: serde_json::from_value(json!({
-                "type": "command",
-                "source": "shell",
-                "command": format!("rm -f /tmp/{id}.sqlite"),
-                "cwd": test_path_buf("/tmp"),
-            }))
-            .expect("guardian action"),
-        }
-    }
-
-    struct GuardianAssessmentTestContext {
-        conversation_id: ThreadId,
-        conversation: Arc<CodexThread>,
-        thread_manager: Arc<ThreadManager>,
-        outgoing: ThreadScopedOutgoingMessageSender,
-        thread_state: Arc<Mutex<ThreadState>>,
-        thread_watch_manager: ThreadWatchManager,
-    }
-
-    impl GuardianAssessmentTestContext {
-        async fn apply_guardian_assessment_event(&self, assessment: GuardianAssessmentEvent) {
-            let event_turn_id = assessment.turn_id.clone();
-            apply_bespoke_event_handling(
-                Event {
-                    id: event_turn_id,
-                    msg: EventMsg::GuardianAssessment(assessment),
-                },
-                self.conversation_id,
-                self.conversation.clone(),
-                self.thread_manager.clone(),
-                self.outgoing.clone(),
-                self.thread_state.clone(),
-                self.thread_watch_manager.clone(),
-                Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1)),
-                "test-provider".to_string(),
-            )
-            .await;
-        }
-    }
-
-    #[test]
-    fn guardian_assessment_started_uses_event_turn_id_fallback() {
-        let conversation_id = ThreadId::new();
-        let action = codex_protocol::protocol::GuardianAssessmentAction::Command {
-            source: codex_protocol::protocol::GuardianCommandSource::Shell,
-            command: "rm -rf /tmp/example.sqlite".to_string(),
-            cwd: test_path_buf("/tmp").abs().into(),
-        };
-        let notification = guardian_auto_approval_review_notification(
-            &conversation_id,
-            "turn-from-event",
-            &GuardianAssessmentEvent {
-                id: "review-1".to_string(),
-                target_item_id: Some("item-1".to_string()),
-                turn_id: String::new(),
-                started_at_ms: 1_000,
-                completed_at_ms: None,
-                status: codex_protocol::protocol::GuardianAssessmentStatus::InProgress,
-                risk_level: None,
-                user_authorization: None,
-                rationale: None,
-                decision_source: None,
-                action: action.clone(),
-            },
-        );
-
-        match notification {
-            ServerNotification::ItemGuardianApprovalReviewStarted(payload) => {
-                assert_eq!(payload.thread_id, conversation_id.to_string());
-                assert_eq!(payload.turn_id, "turn-from-event");
-                assert_eq!(payload.started_at_ms, 1_000);
-                assert_eq!(payload.review_id, "review-1");
-                assert_eq!(payload.target_item_id.as_deref(), Some("item-1"));
-                assert_eq!(
-                    payload.review.status,
-                    GuardianApprovalReviewStatus::InProgress
-                );
-                assert_eq!(payload.review.risk_level, None);
-                assert_eq!(payload.review.user_authorization, None);
-                assert_eq!(payload.review.rationale, None);
-                assert_eq!(payload.action, action.into());
-            }
-            other => panic!("unexpected notification: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn guardian_assessment_completed_emits_review_payload() {
-        let conversation_id = ThreadId::new();
-        let action = codex_protocol::protocol::GuardianAssessmentAction::Command {
-            source: codex_protocol::protocol::GuardianCommandSource::Shell,
-            command: "rm -rf /tmp/example.sqlite".to_string(),
-            cwd: test_path_buf("/tmp").abs().into(),
-        };
-        let notification = guardian_auto_approval_review_notification(
-            &conversation_id,
-            "turn-from-event",
-            &GuardianAssessmentEvent {
-                id: "review-2".to_string(),
-                target_item_id: Some("item-2".to_string()),
-                turn_id: "turn-from-assessment".to_string(),
-                started_at_ms: 1_000,
-                completed_at_ms: Some(1_042),
-                status: codex_protocol::protocol::GuardianAssessmentStatus::Denied,
-                risk_level: Some(codex_protocol::protocol::GuardianRiskLevel::High),
-                user_authorization: Some(codex_protocol::protocol::GuardianUserAuthorization::Low),
-                rationale: Some("too risky".to_string()),
-                decision_source: Some(
-                    codex_protocol::protocol::GuardianAssessmentDecisionSource::Agent,
-                ),
-                action: action.clone(),
-            },
-        );
-
-        match notification {
-            ServerNotification::ItemGuardianApprovalReviewCompleted(payload) => {
-                assert_eq!(payload.thread_id, conversation_id.to_string());
-                assert_eq!(payload.turn_id, "turn-from-assessment");
-                assert_eq!(payload.started_at_ms, 1_000);
-                assert_eq!(payload.completed_at_ms, 1_042);
-                assert_eq!(payload.review_id, "review-2");
-                assert_eq!(payload.target_item_id.as_deref(), Some("item-2"));
-                assert_eq!(payload.decision_source, AutoReviewDecisionSource::Agent);
-                assert_eq!(payload.review.status, GuardianApprovalReviewStatus::Denied);
-                assert_eq!(
-                    payload.review.risk_level,
-                    Some(codex_app_server_protocol::GuardianRiskLevel::High)
-                );
-                assert_eq!(
-                    payload.review.user_authorization,
-                    Some(codex_app_server_protocol::GuardianUserAuthorization::Low)
-                );
-                assert_eq!(payload.review.rationale.as_deref(), Some("too risky"));
-                assert_eq!(payload.action, action.into());
-            }
-            other => panic!("unexpected notification: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn guardian_assessment_aborted_emits_completed_review_payload() {
-        let conversation_id = ThreadId::new();
-        let action = codex_protocol::protocol::GuardianAssessmentAction::NetworkAccess {
-            target: "api.openai.com:443".to_string(),
-            host: "api.openai.com".to_string(),
-            protocol: codex_protocol::protocol::NetworkApprovalProtocol::Https,
-            port: 443,
-        };
-        let notification = guardian_auto_approval_review_notification(
-            &conversation_id,
-            "turn-from-event",
-            &GuardianAssessmentEvent {
-                id: "review-3".to_string(),
-                target_item_id: None,
-                turn_id: "turn-from-assessment".to_string(),
-                started_at_ms: 1_000,
-                completed_at_ms: Some(1_042),
-                status: codex_protocol::protocol::GuardianAssessmentStatus::Aborted,
-                risk_level: None,
-                user_authorization: None,
-                rationale: None,
-                decision_source: Some(
-                    codex_protocol::protocol::GuardianAssessmentDecisionSource::Agent,
-                ),
-                action: action.clone(),
-            },
-        );
-
-        match notification {
-            ServerNotification::ItemGuardianApprovalReviewCompleted(payload) => {
-                assert_eq!(payload.thread_id, conversation_id.to_string());
-                assert_eq!(payload.turn_id, "turn-from-assessment");
-                assert_eq!(payload.review_id, "review-3");
-                assert_eq!(payload.target_item_id, None);
-                assert_eq!(payload.decision_source, AutoReviewDecisionSource::Agent);
-                assert_eq!(payload.review.status, GuardianApprovalReviewStatus::Aborted);
-                assert_eq!(payload.review.risk_level, None);
-                assert_eq!(payload.review.user_authorization, None);
-                assert_eq!(payload.review.rationale, None);
-                assert_eq!(payload.action, action.into());
-            }
-            other => panic!("unexpected notification: {other:?}"),
-        }
-    }
-
     #[tokio::test]
     async fn command_execution_started_helper_emits_once() -> Result<()> {
         let conversation_id = ThreadId::new();
@@ -2730,215 +2395,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn guardian_command_execution_notifications_wrap_review_lifecycle() -> Result<()> {
-        let codex_home = TempDir::new()?;
-        let mut config = load_default_config_for_test(&codex_home).await;
-        config.model_catalog = Some(codex_models_manager::bundled_models_response()?);
-        // Build the thread models manager from this fixture catalog, not the
-        // shared OpenAI manager, which otherwise refreshes through ChatGPT.
-        config.model_provider_id = "event-test".to_string();
-        let thread_manager = Arc::new(
-            codex_core::test_support::thread_manager_with_models_provider_and_home(
-                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
-                config.model_provider.clone(),
-                config.codex_home.to_path_buf(),
-                Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
-            ),
-        );
-        let codex_core::NewThread {
-            thread_id: conversation_id,
-            thread: conversation,
-            ..
-        } = thread_manager.start_thread(config.clone()).await?;
-        let thread_state = new_thread_state();
-        let thread_watch_manager = ThreadWatchManager::new();
-        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(
-            tx,
-            codex_analytics::AnalyticsEventsClient::disabled(),
-        ));
-        let outgoing = ThreadScopedOutgoingMessageSender::new(
-            outgoing,
-            vec![ConnectionId(1)],
-            conversation_id,
-        );
-        let guardian_context = GuardianAssessmentTestContext {
-            conversation_id,
-            conversation: conversation.clone(),
-            thread_manager: thread_manager.clone(),
-            outgoing: outgoing.clone(),
-            thread_state: thread_state.clone(),
-            thread_watch_manager: thread_watch_manager.clone(),
-        };
-
-        guardian_context
-            .apply_guardian_assessment_event(guardian_command_assessment(
-                "cmd-guardian-approved",
-                "turn-guardian-approved",
-                GuardianAssessmentStatus::InProgress,
-            ))
-            .await;
-        let first = recv_broadcast_message(&mut rx).await?;
-        match first {
-            OutgoingMessage::AppServerNotification(ServerNotification::ItemStarted(payload)) => {
-                assert_eq!(payload.turn_id, "turn-guardian-approved");
-                let ThreadItem::CommandExecution { id, status, .. } = payload.item else {
-                    bail!("expected command execution item");
-                };
-                assert_eq!(id, "cmd-guardian-approved");
-                assert_eq!(status, CommandExecutionStatus::InProgress);
-            }
-            other => bail!("unexpected message: {other:?}"),
-        }
-        let second = recv_broadcast_message(&mut rx).await?;
-        match second {
-            OutgoingMessage::AppServerNotification(
-                ServerNotification::ItemGuardianApprovalReviewStarted(payload),
-            ) => {
-                assert_eq!(payload.review_id, "review-cmd-guardian-approved");
-                assert_eq!(
-                    payload.target_item_id.as_deref(),
-                    Some("cmd-guardian-approved")
-                );
-                assert_eq!(
-                    payload.review.status,
-                    GuardianApprovalReviewStatus::InProgress
-                );
-            }
-            other => bail!("unexpected message: {other:?}"),
-        }
-
-        guardian_context
-            .apply_guardian_assessment_event(guardian_command_assessment(
-                "cmd-guardian-approved",
-                "turn-guardian-approved",
-                GuardianAssessmentStatus::Approved,
-            ))
-            .await;
-        let third = recv_broadcast_message(&mut rx).await?;
-        match third {
-            OutgoingMessage::AppServerNotification(
-                ServerNotification::ItemGuardianApprovalReviewCompleted(payload),
-            ) => {
-                assert_eq!(payload.review_id, "review-cmd-guardian-approved");
-                assert_eq!(
-                    payload.target_item_id.as_deref(),
-                    Some("cmd-guardian-approved")
-                );
-                assert_eq!(payload.decision_source, AutoReviewDecisionSource::Agent);
-                assert_eq!(
-                    payload.review.status,
-                    GuardianApprovalReviewStatus::Approved
-                );
-            }
-            other => bail!("unexpected message: {other:?}"),
-        }
-        assert!(
-            rx.try_recv().is_err(),
-            "approved review should not complete the command item"
-        );
-
-        guardian_context
-            .apply_guardian_assessment_event(guardian_command_assessment(
-                "cmd-guardian-denied",
-                "turn-guardian-denied",
-                GuardianAssessmentStatus::InProgress,
-            ))
-            .await;
-        let fourth = recv_broadcast_message(&mut rx).await?;
-        match fourth {
-            OutgoingMessage::AppServerNotification(ServerNotification::ItemStarted(payload)) => {
-                assert_eq!(payload.turn_id, "turn-guardian-denied");
-                let ThreadItem::CommandExecution { id, status, .. } = payload.item else {
-                    bail!("expected command execution item");
-                };
-                assert_eq!(id, "cmd-guardian-denied");
-                assert_eq!(status, CommandExecutionStatus::InProgress);
-            }
-            other => bail!("unexpected message: {other:?}"),
-        }
-        let fifth = recv_broadcast_message(&mut rx).await?;
-        match fifth {
-            OutgoingMessage::AppServerNotification(
-                ServerNotification::ItemGuardianApprovalReviewStarted(payload),
-            ) => {
-                assert_eq!(payload.review_id, "review-cmd-guardian-denied");
-                assert_eq!(
-                    payload.target_item_id.as_deref(),
-                    Some("cmd-guardian-denied")
-                );
-                assert_eq!(
-                    payload.review.status,
-                    GuardianApprovalReviewStatus::InProgress
-                );
-            }
-            other => bail!("unexpected message: {other:?}"),
-        }
-
-        guardian_context
-            .apply_guardian_assessment_event(guardian_command_assessment(
-                "cmd-guardian-denied",
-                "turn-guardian-denied",
-                GuardianAssessmentStatus::Denied,
-            ))
-            .await;
-        let sixth = recv_broadcast_message(&mut rx).await?;
-        match sixth {
-            OutgoingMessage::AppServerNotification(
-                ServerNotification::ItemGuardianApprovalReviewCompleted(payload),
-            ) => {
-                assert_eq!(payload.review_id, "review-cmd-guardian-denied");
-                assert_eq!(
-                    payload.target_item_id.as_deref(),
-                    Some("cmd-guardian-denied")
-                );
-                assert_eq!(payload.decision_source, AutoReviewDecisionSource::Agent);
-                assert_eq!(payload.review.status, GuardianApprovalReviewStatus::Denied);
-            }
-            other => bail!("unexpected message: {other:?}"),
-        }
-        let seventh = recv_broadcast_message(&mut rx).await?;
-        match seventh {
-            OutgoingMessage::AppServerNotification(ServerNotification::ItemCompleted(payload)) => {
-                let ThreadItem::CommandExecution { id, status, .. } = payload.item else {
-                    bail!("expected command execution completion");
-                };
-                assert_eq!(id, "cmd-guardian-denied");
-                assert_eq!(status, CommandExecutionStatus::Declined);
-            }
-            other => bail!("unexpected message: {other:?}"),
-        }
-
-        let mut missing_target = guardian_command_assessment(
-            "cmd-guardian-missing-target",
-            "turn-guardian-missing-target",
-            GuardianAssessmentStatus::InProgress,
-        );
-        missing_target.target_item_id = None;
-        guardian_context
-            .apply_guardian_assessment_event(missing_target)
-            .await;
-        let eighth = recv_broadcast_message(&mut rx).await?;
-        match eighth {
-            OutgoingMessage::AppServerNotification(
-                ServerNotification::ItemGuardianApprovalReviewStarted(payload),
-            ) => {
-                assert_eq!(payload.review_id, "review-cmd-guardian-missing-target");
-                assert_eq!(payload.target_item_id, None);
-                assert_eq!(
-                    payload.review.status,
-                    GuardianApprovalReviewStatus::InProgress
-                );
-            }
-            other => bail!("unexpected message: {other:?}"),
-        }
-
-        assert!(rx.try_recv().is_err(), "no extra messages expected");
-        conversation.shutdown_and_wait().await?;
-        Ok(())
-    }
-
     #[test]
     fn file_change_accept_for_session_maps_to_approved_for_session() {
         let decision =
@@ -3074,7 +2530,6 @@ mod tests {
                 CoreRequestPermissionsResponse {
                     permissions: expected_permissions,
                     scope: CorePermissionGrantScope::Turn,
-                    strict_auto_review: false,
                 }
             );
         }
@@ -3098,63 +2553,8 @@ mod tests {
             CoreRequestPermissionsResponse {
                 permissions: CoreRequestPermissionProfile::default(),
                 scope: CorePermissionGrantScope::Session,
-                strict_auto_review: false,
             }
         );
-    }
-
-    #[test]
-    fn request_permissions_response_rejects_session_scoped_strict_auto_review() {
-        let response = request_permissions_response_from_client_result(
-            CoreRequestPermissionProfile::default(),
-            Ok(Ok(serde_json::json!({
-                "scope": "session",
-                "strictAutoReview": true,
-                "permissions": {
-                    "network": {
-                        "enabled": true,
-                    },
-                },
-            }))),
-            &native_path_uri(&std::env::current_dir().expect("current dir")),
-        )
-        .expect("paths should localize")
-        .expect("response should be accepted");
-
-        assert_eq!(
-            response,
-            CoreRequestPermissionsResponse {
-                permissions: CoreRequestPermissionProfile::default(),
-                scope: CorePermissionGrantScope::Turn,
-                strict_auto_review: false,
-            }
-        );
-    }
-
-    #[test]
-    fn request_permissions_response_preserves_turn_scoped_strict_auto_review() {
-        let response = request_permissions_response_from_client_result(
-            CoreRequestPermissionProfile {
-                network: Some(codex_protocol::models::NetworkPermissions {
-                    enabled: Some(true),
-                }),
-                ..Default::default()
-            },
-            Ok(Ok(serde_json::json!({
-                "strictAutoReview": true,
-                "permissions": {
-                    "network": {
-                        "enabled": true,
-                    },
-                },
-            }))),
-            &native_path_uri(&std::env::current_dir().expect("current dir")),
-        )
-        .expect("paths should localize")
-        .expect("response should be accepted");
-
-        assert_eq!(response.scope, CorePermissionGrantScope::Turn);
-        assert!(response.strict_auto_review);
     }
 
     #[test]

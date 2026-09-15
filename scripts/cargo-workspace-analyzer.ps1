@@ -1,4 +1,5 @@
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "common-rust-env.ps1")
 # Windows PowerShell's parameter binder treats a forwarded `--` as an
 # ambiguous empty parameter. Consume our selector and keep Cargo's tokens raw.
 $analyzerIndex = if ($args.Count -gt 0 -and $args[0] -eq "-Analyzer") { 1 } else { 0 }
@@ -66,11 +67,10 @@ for ($index = 0; $index -lt $forwarded.Count - 1; $index++) {
 }
 $hasAllFeatures = $forwarded -contains "--all-features"
 $hasExplicitPackage =
-    ($forwarded -contains "-p") -or
-    ($forwarded -contains "--package") -or
+    @(Get-CodexCargoPackageSpecs -CommandArgs $forwarded).Count -gt 0 -or
     ($forwarded -contains "--manifest-path") -or
     @($forwarded | Where-Object {
-        $_.StartsWith("--package=") -or $_.StartsWith("--manifest-path=")
+        $_.StartsWith("--manifest-path=")
     }).Count -gt 0
 
 if ($Analyzer -eq "clippy") {
@@ -79,16 +79,10 @@ if ($Analyzer -eq "clippy") {
     $isWorkspace = $forwarded -contains "--workspace"
 } else {
     $lane = "rust-dead-code-matrix"
-    if (Test-Path Env:CARGO_ENCODED_RUSTFLAGS) {
-        $env:CARGO_ENCODED_RUSTFLAGS = (@($env:CARGO_ENCODED_RUSTFLAGS, "-Ddead_code") | Where-Object { $_ -ne "" }) -join [char]0x1f
-    }
-    elseif ([string]::IsNullOrWhiteSpace($env:RUSTFLAGS)) {
-        $env:RUSTFLAGS = "-Ddead_code"
-    }
-    else {
-        $env:RUSTFLAGS = "$($env:RUSTFLAGS) -Ddead_code"
-    }
-    $cargoArgs = @("check")
+    # Clippy forwards compiler arguments to all selected workspace targets,
+    # preserving Cargo's effective target/build/environment rustflags.
+    $compilerArgs = @("--", "-A", "clippy::all", "-Ddead_code") + @($compilerArgs | Select-Object -Skip 1)
+    $cargoArgs = @("clippy")
     if (-not $hasExplicitPackage) {
         $cargoArgs += "--workspace"
     }
@@ -129,7 +123,7 @@ $packageForwarded = Remove-WorkspaceFeatureArgs -Args $forwarded
 if ($Analyzer -eq "clippy") {
     $packageArgs = @("clippy", "--tests")
 } else {
-    $packageArgs = @("check", "--all-targets")
+    $packageArgs = @("clippy", "--all-targets")
 }
 $packageArgs += @("--package", $v8SandboxPackage)
 $packageArgs += $packageForwarded

@@ -112,6 +112,8 @@ pub async fn diff_since_latest_init(root: &Path) -> anyhow::Result<GitBaselineDi
         let repo = gix::open(&root).with_context(|| format!("open git repo {}", root.display()))?;
         let head_entries = head_file_entries(&repo)?;
         let current_entries = current_file_entries(&repo, &root)?;
+        #[cfg(test)]
+        tests::after_current_entry_capture(&root);
         let changes = diff_entries(&head_entries, &current_entries);
         let unified_diff =
             render_unified_diff(&repo, &root, &head_entries, &current_entries, &changes)?;
@@ -391,7 +393,7 @@ fn render_change_diff(
         .transpose()
         .with_context(|| format!("read HEAD content for {}", change.path))?;
     let new_bytes = new_entry
-        .map(|_| read_current_file_bytes(root, &change.path))
+        .map(|entry| read_current_file_bytes(repo, root, &change.path, entry))
         .transpose()
         .with_context(|| format!("read current content for {}", change.path))?;
 
@@ -444,17 +446,38 @@ fn read_head_blob(repo: &gix::Repository, entry: &GitBaselineFileEntry) -> anyho
     Ok(blob.take_data())
 }
 
-fn read_current_file_bytes(root: &Path, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+fn read_current_file_bytes(
+    repo: &gix::Repository,
+    root: &Path,
+    relative_path: &str,
+    expected: &GitBaselineFileEntry,
+) -> anyhow::Result<Vec<u8>> {
     let path = root.join(relative_path);
     let metadata =
         fs::symlink_metadata(&path).with_context(|| format!("stat {}", path.display()))?;
-    if metadata.file_type().is_symlink() {
+    let (bytes, mode) = if metadata.file_type().is_symlink() {
         let target =
             fs::read_link(&path).with_context(|| format!("read symlink {}", path.display()))?;
-        Ok(path_to_bytes(&target))
+        (path_to_bytes(&target), EntryKind::Link.into())
+    } else if metadata.is_file() {
+        (
+            fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+            file_mode(&path, EntryKind::Blob)?,
+        )
     } else {
-        fs::read(&path).with_context(|| format!("read {}", path.display()))
-    }
+        anyhow::bail!(
+            "{} changed while reading the diff; retry the diff",
+            path.display()
+        );
+    };
+    // Status and rendered content must describe the same captured file version.
+    // Reject a concurrent edit instead of returning a mixed snapshot.
+    anyhow::ensure!(
+        mode == expected.mode && blob_oid(repo, &bytes)? == expected.oid,
+        "{} changed while reading the diff; retry the diff",
+        path.display()
+    );
+    Ok(bytes)
 }
 
 fn mode_label(mode: EntryMode) -> &'static str {
@@ -503,6 +526,81 @@ mod tests {
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
+
+    struct SnapshotEdit {
+        root: PathBuf,
+        path: PathBuf,
+        contents: Vec<u8>,
+    }
+
+    static SNAPSHOT_EDITS: std::sync::Mutex<Vec<SnapshotEdit>> = std::sync::Mutex::new(Vec::new());
+
+    struct SnapshotEditGuard(PathBuf);
+
+    impl Drop for SnapshotEditGuard {
+        fn drop(&mut self) {
+            SNAPSHOT_EDITS
+                .lock()
+                .expect("snapshot edit lock")
+                .retain(|edit| edit.root != self.0);
+        }
+    }
+
+    pub(super) fn after_current_entry_capture(root: &Path) {
+        let edit = {
+            let mut edits = SNAPSHOT_EDITS.lock().expect("snapshot edit lock");
+            edits
+                .iter()
+                .position(|edit| edit.root == root)
+                .map(|index| edits.remove(index))
+        };
+        if let Some(edit) = edit {
+            fs::write(edit.path, edit.contents).expect("edit captured fixture");
+        }
+    }
+
+    #[tokio::test]
+    async fn diff_rejects_file_changed_after_status_capture() {
+        let home = TempDir::new().expect("tempdir");
+        let root = home.path().join("repo");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("MEMORY.md");
+        fs::write(&path, "baseline\n").expect("write baseline");
+        reset_git_repository(&root).await.expect("reset baseline");
+        fs::write(&path, "captured edit\n").expect("write edit");
+        let _edit_guard = SnapshotEditGuard(root.clone());
+        SNAPSHOT_EDITS
+            .lock()
+            .expect("snapshot edit lock")
+            .push(SnapshotEdit {
+                root: root.clone(),
+                path: path.clone(),
+                contents: b"baseline\n".to_vec(),
+            });
+
+        let error = diff_since_latest_init(&root)
+            .await
+            .expect_err("must reject status/content from different versions");
+        assert!(format!("{error:#}").contains("changed while reading the diff"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "baseline\n");
+        let unchanged = diff_since_latest_init(&root)
+            .await
+            .expect("stable baseline");
+        assert!(
+            !unchanged.has_changes(),
+            "failed diff must preserve baseline"
+        );
+        assert!(unchanged.unified_diff.is_empty());
+
+        fs::write(&path, "later edit\n").expect("write stable edit");
+        let changed = diff_since_latest_init(&root)
+            .await
+            .expect("stable edit diff");
+        assert_eq!(changed.changes.len(), 1);
+        assert_eq!(changed.changes[0].status, GitBaselineChangeStatus::Modified);
+        assert!(changed.unified_diff.contains("-baseline\n"));
+        assert!(changed.unified_diff.contains("+later edit\n"));
+    }
 
     #[test]
     fn codex_signature_uses_current_utc_time() {

@@ -24,6 +24,48 @@ fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
     std::os::windows::fs::symlink_dir(target, link)
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn event_reconciliation_wait_does_not_block_runtime_progress() {
+    let directory = tempfile::tempdir().expect("temporary watched directory");
+    let changed_path = directory.path().join("changed.txt");
+    let watcher = Arc::new(FileWatcher::noop());
+    let (subscriber, mut events) = watcher.add_subscriber();
+    let _registration = subscriber.register_path(directory.path().to_path_buf(), true);
+    let (raw_tx, raw_rx) = mpsc::channel(1);
+    watcher.spawn_event_loop_for_test(raw_rx);
+
+    let state = Arc::clone(&watcher.state);
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _guard = state.write().expect("watch state lock");
+        locked_tx.send(()).expect("signal held lock");
+        // Bound the deliberately stalled worker even if the runtime regresses.
+        release_rx.recv_timeout(Duration::from_secs(2)).is_ok()
+    });
+    locked_rx.await.expect("lock acquired");
+    raw_tx
+        .send(Ok(notify_event(
+            EventKind::Modify(ModifyKind::Any),
+            vec![changed_path.clone()],
+        )))
+        .await
+        .expect("enqueue filesystem event");
+
+    sleep(Duration::from_millis(20)).await;
+    let _ = release_tx.send(());
+    assert!(
+        holder.join().expect("lock holder completed"),
+        "runtime must release the worker before its watchdog expires"
+    );
+    let event = timeout(Duration::from_secs(2), events.recv())
+        .await
+        .expect("reconciled event should arrive")
+        .expect("watcher remains open");
+    assert_eq!(event.paths, vec![changed_path]);
+    assert!(!event.rescan_required);
+}
+
 #[tokio::test(start_paused = true)]
 async fn throttled_receiver_emits_the_leading_event_without_advancing_time() {
     let (tx, rx) = watch_channel();

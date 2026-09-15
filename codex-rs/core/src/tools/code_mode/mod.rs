@@ -414,7 +414,7 @@ impl CodeModeService {
         );
     }
 
-    fn finish_packet(&self, cell_id: &str) -> CodeModePacketReceipt {
+    fn finish_packet(&self, cell_id: &str, retain_terminal: bool) -> CodeModePacketReceipt {
         let mut admission = self
             .packet_admission
             .lock()
@@ -428,6 +428,9 @@ impl CodeModeService {
                 // Live output and steering can cross outstanding child calls.
                 // Drain response data, but keep registration order for the cell.
                 metrics.next_nested_ordinal = next_nested_ordinal;
+                if retain_terminal {
+                    metrics.first_required_terminal = packet.first_required_terminal.clone();
+                }
                 packet
             })
             .unwrap_or_default();
@@ -532,11 +535,13 @@ pub(super) fn handle_runtime_response(
     let original_image_detail_supported = can_request_original_image_detail(&exec.turn.model_info);
 
     let cell_id = runtime_response_cell_id(&response);
-    let packet = exec
-        .session
-        .services
-        .code_mode_service
-        .finish_packet(cell_id);
+    let packet = exec.session.services.code_mode_service.finish_packet(
+        cell_id,
+        matches!(
+            &response,
+            RuntimeResponse::Yielded { .. } | RuntimeResponse::ExplicitYield { .. }
+        ),
+    );
     tracing::info!(
         target: "codex.code_mode.packet",
         cell_id,
@@ -756,6 +761,9 @@ fn format_runtime_response(
         &response,
         RuntimeResponse::Yielded { .. } | RuntimeResponse::ExplicitYield { .. }
     );
+    // A yielded cell still owns its work. Publish required failures with its
+    // terminal response, even if a nested call finishes just after yielding.
+    let required_terminal = if yielded { None } else { required_terminal };
     let (mut content_items, mut outcome, mut success, script_error) = match response {
         RuntimeResponse::Yielded { content_items, .. }
         | RuntimeResponse::ExplicitYield { content_items, .. } => {
@@ -1723,7 +1731,7 @@ mod tests {
         let packet = session
             .services
             .code_mode_service
-            .finish_packet(cell_id.as_str());
+            .finish_packet(cell_id.as_str(), false);
         assert_eq!(packet.nested_call_count, 1);
         let terminal = packet
             .first_required_terminal
@@ -1768,7 +1776,7 @@ mod tests {
         .await
         .expect("printing patch-shaped data must reach ordinary shell dispatch");
         assert!(result.to_string().contains("*** Begin Patch"));
-        let packet = service.finish_packet(cell_id.as_str());
+        let packet = service.finish_packet(cell_id.as_str(), false);
         assert_eq!(packet.nested_call_count, 1);
         assert!(packet.first_required_terminal.is_none());
         service.finish_cell_dispatch(&cell_id);
@@ -1811,17 +1819,17 @@ mod tests {
         let service = test_service();
         let cell = CellId::new("cell".to_string());
         service.record_packet_call(&cell, true, 128, Vec::new());
-        let first = service.finish_packet("cell");
+        let first = service.finish_packet("cell", false);
         assert_eq!(first.nested_call_count, 1);
         assert_eq!(first.batchable_observation_count, 1);
         assert_eq!(first.result_bytes, 128);
-        let drained = service.finish_packet("cell");
+        let drained = service.finish_packet("cell", false);
         assert_eq!(drained.nested_call_count, 0);
         assert_eq!(drained.result_bytes, 0);
         for _ in 0..6 {
             service.record_packet_call(&cell, true, 128, Vec::new());
         }
-        let batched = service.finish_packet("cell");
+        let batched = service.finish_packet("cell", false);
         assert_eq!(batched.nested_call_count, 6);
         assert_eq!(batched.result_bytes, 768);
     }
@@ -1837,13 +1845,13 @@ mod tests {
         service.record_packet_call(&cell, false, 32, feedback.clone());
         assert_eq!(
             service
-                .finish_packet("feedback-cell")
+                .finish_packet("feedback-cell", false)
                 .post_tool_use_feedback,
             feedback
         );
         assert!(
             service
-                .finish_packet("feedback-cell")
+                .finish_packet("feedback-cell", false)
                 .post_tool_use_feedback
                 .is_empty()
         );
@@ -1883,7 +1891,7 @@ mod tests {
         );
 
         let terminal = service
-            .finish_packet("terminal-cell")
+            .finish_packet("terminal-cell", false)
             .first_required_terminal
             .expect("the first registered terminal nested call must be retained");
         assert_eq!(terminal.ordinal, first);

@@ -152,7 +152,6 @@ mod tests {
     fn local_policy_preserves_approval_messages() {
         let approvals = ApprovalMessages {
             on_request: Some("request approval".to_string()),
-            on_request_auto_review: Some("auto-review approval".to_string()),
         };
         let mut model = crate::model_info::model_info_from_slug("gpt-5.6-sol");
         model.base_instructions = "remote prompt".to_string();

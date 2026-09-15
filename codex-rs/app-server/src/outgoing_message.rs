@@ -1935,7 +1935,6 @@ mod tests {
     use codex_app_server_protocol::DynamicToolCallParams;
     use codex_app_server_protocol::ExecCommandApprovalParams;
     use codex_app_server_protocol::FileChangeRequestApprovalParams;
-    use codex_app_server_protocol::GuardianWarningNotification;
     use codex_app_server_protocol::ModelRerouteReason;
     use codex_app_server_protocol::ModelReroutedNotification;
     use codex_app_server_protocol::ModelVerification;
@@ -2144,28 +2143,6 @@ mod tests {
                 "params": {
                     "summary": "Config error: using defaults",
                     "details": "error loading config: bad config",
-                },
-            }),
-            serde_json::to_value(jsonrpc_notification)
-                .expect("ensure the notification serializes correctly"),
-            "ensure the notification serializes correctly"
-        );
-    }
-
-    #[test]
-    fn verify_guardian_warning_notification_serialization() {
-        let notification = ServerNotification::GuardianWarning(GuardianWarningNotification {
-            thread_id: "thread-1".to_string(),
-            message: "Automatic approval review denied the requested action.".to_string(),
-        });
-
-        let jsonrpc_notification = OutgoingMessage::AppServerNotification(notification);
-        assert_eq!(
-            json!({
-                "method": "guardianWarning",
-                "params": {
-                    "threadId": "thread-1",
-                    "message": "Automatic approval review denied the requested action.",
                 },
             }),
             serde_json::to_value(jsonrpc_notification)
@@ -3667,45 +3644,63 @@ mod tests {
         tokio::time::pause();
         for shutdown in [false, true] {
             let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(1);
-            let outgoing = OutgoingMessageSender::new(
-                tx,
-                codex_analytics::AnalyticsEventsClient::disabled(),
-            );
+            let outgoing =
+                OutgoingMessageSender::new(tx, codex_analytics::AnalyticsEventsClient::disabled());
             let original = ConnectionId(71);
             let replayed = ConnectionId(72);
             for connection_id in [original, replayed] {
-                outgoing.connection_opened(connection_id, Arc::new(AtomicBool::new(true))).await;
+                outgoing
+                    .connection_opened(connection_id, Arc::new(AtomicBool::new(true)))
+                    .await;
             }
             let thread_id = ThreadId::new();
-            let (request_id, result) = outgoing.send_request_to_connections(
-                Some(&[original]),
-                ServerRequestPayload::DynamicToolCall(DynamicToolCallParams {
-                    thread_id: thread_id.to_string(),
-                    turn_id: "turn-replay-bounded".to_string(),
-                    call_id: "call-replay-bounded".to_string(),
-                    namespace: None,
-                    tool: "test_tool".to_string(),
-                    arguments: json!({}),
-                }),
-                Some(thread_id),
-            ).await.expect("request admitted");
-            let mut replay = Box::pin(outgoing.replay_requests_to_connection_for_thread(replayed, thread_id, true));
+            let (request_id, result) = outgoing
+                .send_request_to_connections(
+                    Some(&[original]),
+                    ServerRequestPayload::DynamicToolCall(DynamicToolCallParams {
+                        thread_id: thread_id.to_string(),
+                        turn_id: "turn-replay-bounded".to_string(),
+                        call_id: "call-replay-bounded".to_string(),
+                        namespace: None,
+                        tool: "test_tool".to_string(),
+                        arguments: json!({}),
+                    }),
+                    Some(thread_id),
+                )
+                .await
+                .expect("request admitted");
+            let mut replay = Box::pin(
+                outgoing.replay_requests_to_connection_for_thread(replayed, thread_id, true),
+            );
             assert!(futures::poll!(replay.as_mut()).is_pending());
             if shutdown {
                 outgoing.delivery_shutdown.cancel();
-                timeout(Duration::from_millis(1), replay).await.expect("shutdown releases replay immediately");
+                timeout(Duration::from_millis(1), replay)
+                    .await
+                    .expect("shutdown releases replay immediately");
             } else {
                 timeout(RESOURCE_DELIVERY_TIMEOUT + Duration::from_millis(1), replay)
-                    .await.expect("replay has its own delivery deadline");
+                    .await
+                    .expect("replay has its own delivery deadline");
             }
             assert!(matches!(rx.recv().await,
                 Some(OutgoingEnvelope::ToConnection { connection_id, .. }) if connection_id == original));
-            assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
-            outgoing.notify_client_response(replayed, request_id.clone(), json!({"stale": true})).await;
+            assert!(matches!(
+                rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            outgoing
+                .notify_client_response(replayed, request_id.clone(), json!({"stale": true}))
+                .await;
             assert_eq!(outgoing.pending_callback_count().await, 1);
             let expected = json!({"contentItems": [], "success": true});
-            outgoing.notify_client_response(original, request_id, expected.clone()).await;
-            assert_eq!(result.await.expect("original callback remains live"), Ok(expected));
+            outgoing
+                .notify_client_response(original, request_id, expected.clone())
+                .await;
+            assert_eq!(
+                result.await.expect("original callback remains live"),
+                Ok(expected)
+            );
         }
     }
 

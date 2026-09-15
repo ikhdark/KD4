@@ -53,8 +53,6 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SkillsListParams;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::Thread;
-use codex_app_server_protocol::ThreadApproveGuardianDeniedActionParams;
-use codex_app_server_protocol::ThreadApproveGuardianDeniedActionResponse;
 use codex_app_server_protocol::ThreadArchiveParams;
 use codex_app_server_protocol::ThreadArchiveResponse;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanParams;
@@ -118,7 +116,6 @@ use codex_app_server_protocol::WindowsSandboxSetupStartParams;
 use codex_app_server_protocol::WindowsSandboxSetupStartResponse;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::ThreadId;
-use codex_protocol::approvals::GuardianAssessmentEvent;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::PermissionProfile;
@@ -847,7 +844,6 @@ impl AppServerSession {
         items: Vec<UserInput>,
         cwd: PathBuf,
         approval_policy: AskForApproval,
-        approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer,
         permissions_override: TurnPermissionsOverride,
         workspace_roots: &[AbsolutePathBuf],
         model: String,
@@ -875,7 +871,6 @@ impl AppServerSession {
                     cwd: Some(cwd),
                     runtime_workspace_roots: Some(workspace_roots.to_vec()),
                     approval_policy: Some(approval_policy),
-                    approvals_reviewer: Some(approvals_reviewer.into()),
                     sandbox_policy,
                     permission_profile,
                     permissions,
@@ -1109,27 +1104,6 @@ impl AppServerSession {
             })
             .await
             .wrap_err("thread/shellCommand failed in TUI")?;
-        Ok(())
-    }
-
-    pub(crate) async fn thread_approve_guardian_denied_action(
-        &mut self,
-        thread_id: ThreadId,
-        event: &GuardianAssessmentEvent,
-    ) -> Result<()> {
-        let request_id = self.next_request_id();
-        let _: ThreadApproveGuardianDeniedActionResponse = self
-            .client
-            .request_typed(ClientRequest::ThreadApproveGuardianDeniedAction {
-                request_id,
-                params: ThreadApproveGuardianDeniedActionParams {
-                    thread_id: thread_id.to_string(),
-                    event: serde_json::to_value(event)
-                        .wrap_err("failed to serialize Auto Review denial event")?,
-                },
-            })
-            .await
-            .wrap_err("thread/approveGuardianDeniedAction failed in TUI")?;
         Ok(())
     }
 
@@ -1430,12 +1404,7 @@ fn thread_resume_params_from_config(
         remote_cwd_override,
         with_terminal_visualization_instructions(&config, /*control_instructions*/ None),
     );
-    build_thread_resume_params(
-        &config,
-        thread_id.to_string(),
-        overrides,
-        /*approvals_reviewer_override*/ None,
-    )
+    build_thread_resume_params(&config, thread_id.to_string(), overrides)
 }
 
 fn thread_fork_params_from_config(
@@ -1550,7 +1519,6 @@ async fn thread_session_state_from_thread_start_response(
         response.model_provider.clone(),
         response.service_tier.clone(),
         response.approval_policy,
-        response.approvals_reviewer.to_core(),
         permission_profile,
         response.active_permission_profile.clone().map(Into::into),
         response.cwd.clone(),
@@ -1594,7 +1562,6 @@ async fn thread_session_state_from_thread_resume_response(
         response.model_provider.clone(),
         response.service_tier.clone(),
         response.approval_policy,
-        response.approvals_reviewer.to_core(),
         permission_profile,
         response.active_permission_profile.clone().map(Into::into),
         response.cwd.clone(),
@@ -1628,7 +1595,6 @@ async fn thread_session_state_from_thread_fork_response(
         response.model_provider.clone(),
         response.service_tier.clone(),
         response.approval_policy,
-        response.approvals_reviewer.to_core(),
         permission_profile,
         response.active_permission_profile.clone().map(Into::into),
         response.cwd.clone(),
@@ -1684,7 +1650,6 @@ async fn thread_session_state_from_thread_response(
     model_provider_id: String,
     service_tier: Option<String>,
     approval_policy: AskForApproval,
-    approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer,
     permission_profile: PermissionProfile,
     active_permission_profile: Option<ActivePermissionProfile>,
     cwd: AbsolutePathBuf,
@@ -1712,7 +1677,6 @@ async fn thread_session_state_from_thread_response(
         model_provider_id,
         service_tier,
         approval_policy,
-        approvals_reviewer,
         permission_profile,
         active_permission_profile,
         cwd,
@@ -2251,7 +2215,6 @@ mod tests {
         config.bypass_hook_trust = true;
         config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
         let thread_id = ThreadId::new();
-        let expected_reviewer = Some(config.approvals_reviewer.into());
 
         let start = thread_start_params_from_config(
             &config,
@@ -2276,9 +2239,6 @@ mod tests {
         assert_eq!(start.service_tier, expected_service_tier);
         assert_eq!(resume.service_tier, expected_service_tier);
         assert_eq!(fork.service_tier, expected_service_tier);
-        assert_eq!(start.approvals_reviewer, expected_reviewer);
-        assert_eq!(resume.approvals_reviewer, None);
-        assert_eq!(fork.approvals_reviewer, expected_reviewer);
         let string = |value: &str| serde_json::Value::String(value.to_string());
         let expected_config = HashMap::from([
             ("model_reasoning_effort".to_string(), string("high")),
@@ -2484,7 +2444,6 @@ mod tests {
                 &test_path_buf("/tmp/project/AGENTS.md").abs(),
             )],
             approval_policy: codex_app_server_protocol::AskForApproval::Never,
-            approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::User,
             sandbox: read_only_profile
                 .to_legacy_sandbox_policy(test_path_buf("/tmp/project").as_path())
                 .expect("read-only profile must be legacy-compatible")
@@ -2646,7 +2605,6 @@ mod tests {
             "openai".to_string(),
             /*service_tier*/ None,
             AskForApproval::Never,
-            codex_protocol::config_types::ApprovalsReviewer::User,
             PermissionProfile::read_only(),
             /*active_permission_profile*/ None,
             test_path_buf("/tmp/project").abs(),
@@ -2681,7 +2639,6 @@ mod tests {
             "openai".to_string(),
             /*service_tier*/ None,
             AskForApproval::Never,
-            codex_protocol::config_types::ApprovalsReviewer::User,
             PermissionProfile::read_only(),
             /*active_permission_profile*/ None,
             test_path_buf("/tmp/project").abs(),
@@ -2831,7 +2788,6 @@ mod tests {
             runtime_workspace_roots: vec![cwd.clone(), extra.clone()],
             instruction_sources: Vec::new(),
             approval_policy: AskForApproval::OnRequest,
-            approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::User,
             sandbox: codex_app_server_protocol::SandboxPolicy::WorkspaceWrite {
                 writable_roots: vec![extra.clone()],
                 network_access: false,
@@ -3207,7 +3163,6 @@ mod tests {
                 }],
                 cwd.to_path_buf(),
                 AskForApproval::OnRequest,
-                codex_protocol::config_types::ApprovalsReviewer::User,
                 override_,
                 &workspace_roots,
                 "remote-permission-model".into(),
@@ -3263,7 +3218,6 @@ mod tests {
                 serde_json::json!([{"type":"text","text":"check permission wire contract","text_elements":[]} ])
             );
             assert_eq!(params["approvalPolicy"], "on-request");
-            assert_eq!(params["approvalsReviewer"], "user");
             assert_eq!(params["model"], "remote-permission-model");
         }
         assert_eq!(turn_params[0]["permissionProfile"], expected_profile);

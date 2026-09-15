@@ -162,6 +162,24 @@ impl MessageProcessor {
 
     pub(crate) async fn process_request(&mut self, request: JsonRpcRequest<ClientRequest>) {
         let request_id = request.id.clone();
+        if self
+            .running_requests_id_to_codex_uuid
+            .lock()
+            .await
+            .contains_key(&request_id)
+        {
+            self.outgoing
+                .send_error(
+                    request_id,
+                    ErrorData::new(
+                        ErrorCode::INVALID_REQUEST,
+                        "A request with this ID is still running.",
+                        None,
+                    ),
+                )
+                .await;
+            return;
+        }
         let client_request = request.request;
 
         match client_request {
@@ -729,6 +747,72 @@ mod tests {
             assert_eq!(response.result["protocolVersion"], "2025-03-26");
             assert_eq!(processor.outgoing.supports_form_elicitation(), expected);
             processor.shutdown().await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_request_id_preserves_running_request_cancellation() -> anyhow::Result<()> {
+        for duplicate_name in ["codex", "codex-reply"] {
+            let (_home, mut processor, mut rx) = test_processor().await?;
+            let request = |name| {
+                serde_json::from_value(json!({
+                    "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                    "params":{"name":name, "arguments":{"prompt":"must not start"}}
+                }))
+            };
+            processor.process_request(request("codex")?).await;
+            let original_cancellation = processor
+                .running_requests_id_to_codex_uuid
+                .lock()
+                .await
+                .get(&RequestId::Number(1))
+                .expect("normal request admission registers its cancellation owner")
+                .cancellation
+                .clone();
+            processor.process_request(request(duplicate_name)?).await;
+            let Some(crate::outgoing_message::OutgoingMessage::Error(error)) = rx.recv().await
+            else {
+                panic!("duplicate admission must fail before starting a worker");
+            };
+            assert_eq!(error.id, Some(RequestId::Number(1)));
+            assert_eq!(error.error.code, ErrorCode::INVALID_REQUEST);
+            assert_eq!(
+                error.error.message,
+                "A request with this ID is still running."
+            );
+            assert!(!original_cancellation.is_cancelled());
+            processor
+                .process_notification(serde_json::from_value(json!({
+                    "jsonrpc":"2.0", "method":"notifications/cancelled", "params":{"requestId":1}
+                }))?)
+                .await;
+            assert!(
+                original_cancellation.is_cancelled(),
+                "cancellation must still reach the first admitted request"
+            );
+            let response = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await?;
+            let Some(crate::outgoing_message::OutgoingMessage::Response(response)) = response
+            else {
+                panic!("only the cancelled original request should publish a result");
+            };
+            assert_eq!(response.result["isError"], true);
+            assert_eq!(
+                response.result["content"][0]["text"],
+                "Codex request cancelled during startup."
+            );
+            processor.shutdown().await;
+            assert!(
+                processor
+                    .running_requests_id_to_codex_uuid
+                    .lock()
+                    .await
+                    .is_empty()
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "the rejected request must not start another worker"
+            );
         }
         Ok(())
     }

@@ -357,6 +357,19 @@ pub(crate) fn create_raw_auth_client(
         .build_client_without_request_logging(endpoint, ClientRouteClass::Auth)
 }
 
+/// Reads custom CA files and builds the transport away from the async runtime.
+pub(crate) async fn create_raw_auth_client_async(
+    endpoint: &str,
+    auth_route_config: &AuthRouteConfig,
+) -> std::io::Result<HttpClient> {
+    let endpoint = endpoint.to_owned();
+    let auth_route_config = auth_route_config.clone();
+    tokio::task::spawn_blocking(move || create_raw_auth_client(&endpoint, &auth_route_config))
+        .await
+        .map_err(std::io::Error::other)?
+        .map_err(Into::into)
+}
+
 /// Builds the default Codex HTTP client wrapper for an auth endpoint.
 pub(crate) async fn create_default_auth_client(
     endpoint: &str,

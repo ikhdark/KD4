@@ -129,20 +129,6 @@ fn render_debug_config_lines(
         ));
     }
 
-    if let Some(reviewers) = requirements_toml.allowed_approvals_reviewers.as_ref() {
-        let value = join_or_empty(
-            reviewers
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-        );
-        requirement_lines.push(requirement_line(
-            "allowed_approvals_reviewers",
-            value,
-            requirements.approvals_reviewer.source.as_ref(),
-        ));
-    }
-
     if let Some(modes) = requirements_toml.allowed_sandbox_modes.as_ref() {
         let value = join_or_empty(
             modes
@@ -204,14 +190,6 @@ fn render_debug_config_lines(
                 .allow_remote_control
                 .as_ref()
                 .map(|sourced| &sourced.source),
-        ));
-    }
-
-    if requirements_toml.guardian_policy_config.is_some() {
-        requirement_lines.push(requirement_line(
-            "guardian_policy_config",
-            "configured".to_string(),
-            requirements.guardian_policy_config_source.as_ref(),
         ));
     }
 
@@ -596,7 +574,6 @@ mod tests {
     use codex_config::Sourced;
     use codex_config::WebSearchModeRequirement;
     use codex_config::sandbox_mode_requirement_for_permission_profile;
-    use codex_protocol::config_types::ApprovalsReviewer;
     use codex_protocol::config_types::WebSearchMode;
     use codex_protocol::models::PermissionProfile;
     use codex_utils_absolute_path::AbsolutePathBuf;
@@ -706,10 +683,6 @@ trust_level = "untrusted"
                 Constrained::allow_any(AskForApproval::OnRequest.to_core()),
                 Some(RequirementSource::LegacyManagedConfigTomlFromMdm),
             ),
-            approvals_reviewer: ConstrainedWithSource::new(
-                Constrained::allow_any(ApprovalsReviewer::AutoReview),
-                Some(RequirementSource::LegacyManagedConfigTomlFromMdm),
-            ),
             permission_profile: ConstrainedWithSource::new(
                 Constrained::allow_any(PermissionProfile::read_only()),
                 Some(RequirementSource::SystemRequirementsToml {
@@ -749,7 +722,7 @@ trust_level = "untrusted"
             )),
             feature_requirements: Some(Sourced::new(
                 FeatureRequirementsToml {
-                    entries: BTreeMap::from([("guardian_approval".to_string(), true)]),
+                    entries: BTreeMap::from([("code_mode".to_string(), true)]),
                 },
                 RequirementSource::LegacyManagedConfigTomlFromMdm,
             )),
@@ -774,13 +747,11 @@ trust_level = "untrusted"
                     file: requirements_file.clone(),
                 },
             )),
-            guardian_policy_config_source: Some(RequirementSource::LegacyManagedConfigTomlFromMdm),
             ..ConfigRequirements::default()
         };
 
         let requirements_toml = ConfigRequirementsToml {
             allowed_approval_policies: Some(vec![AskForApproval::OnRequest.to_core()]),
-            allowed_approvals_reviewers: Some(vec![ApprovalsReviewer::AutoReview]),
             allowed_sandbox_modes: Some(vec![SandboxModeRequirement::ReadOnly]),
             allowed_permission_profiles: None,
             default_permissions: None,
@@ -791,9 +762,8 @@ trust_level = "untrusted"
             allow_remote_control: Some(false),
             computer_use: None,
             windows: None,
-            guardian_policy_config: Some("Use the managed guardian policy.".to_string()),
             feature_requirements: Some(FeatureRequirementsToml {
-                entries: BTreeMap::from([("guardian_approval".to_string(), true)]),
+                entries: BTreeMap::from([("code_mode".to_string(), true)]),
             }),
             hooks: None,
             mcp_servers: Some(BTreeMap::from([(
@@ -834,9 +804,6 @@ trust_level = "untrusted"
         assert!(rendered.contains(&format!(
             "allowed_approval_policies: on-request (source: {requirements_source})"
         )));
-        assert!(rendered.contains(
-            "allowed_approvals_reviewers: auto_review (source: MDM managed_config.toml (legacy))"
-        ));
         assert!(
             rendered.contains(
                 format!(
@@ -859,10 +826,7 @@ trust_level = "untrusted"
             "allow_remote_control: false (source: {requirements_source})"
         )));
         assert!(rendered.contains(&format!(
-            "guardian_policy_config: configured (source: {requirements_source})"
-        )));
-        assert!(rendered.contains(&format!(
-            "features: guardian_approval=true (source: {requirements_source})"
+            "features: code_mode=true (source: {requirements_source})"
         )));
         assert!(rendered.contains("mcp_servers: docs (source: MDM managed_config.toml (legacy))"));
         assert!(rendered.contains(&format!(
@@ -956,29 +920,6 @@ trust_level = "untrusted"
         );
         assert!(!rendered.contains("danger-full-access"));
         assert!(!rendered.contains("external-sandbox"));
-    }
-
-    #[test]
-    fn debug_config_output_lists_approvals_reviewer_as_requirement() {
-        let requirements = ConfigRequirements {
-            approvals_reviewer: ConstrainedWithSource::new(
-                Constrained::allow_any(ApprovalsReviewer::AutoReview),
-                Some(RequirementSource::LegacyManagedConfigTomlFromMdm),
-            ),
-            ..ConfigRequirements::default()
-        };
-        let requirements_toml = ConfigRequirementsToml {
-            allowed_approvals_reviewers: Some(vec![ApprovalsReviewer::AutoReview]),
-            ..ConfigRequirementsToml::default()
-        };
-        let stack = ConfigLayerStack::new(Vec::new(), requirements, requirements_toml)
-            .expect("config layer stack");
-
-        let rendered = render_stack_to_text(&stack);
-        assert!(rendered.contains(
-            "allowed_approvals_reviewers: auto_review (source: MDM managed_config.toml (legacy))"
-        ));
-        assert!(!rendered.contains("Requirements:\n  <none>"));
     }
 
     #[test]
@@ -1122,7 +1063,6 @@ approval_policy = "never"
 
         let requirements_toml = ConfigRequirementsToml {
             allowed_approval_policies: None,
-            allowed_approvals_reviewers: None,
             allowed_sandbox_modes: None,
             allowed_permission_profiles: None,
             default_permissions: None,
@@ -1133,7 +1073,6 @@ approval_policy = "never"
             allow_remote_control: None,
             computer_use: None,
             windows: None,
-            guardian_policy_config: None,
             feature_requirements: None,
             hooks: None,
             mcp_servers: None,

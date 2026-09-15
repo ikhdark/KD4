@@ -378,7 +378,10 @@ fn accept_with_timeout(listener: TcpListener, timeout: Duration) -> io::Result<T
                         "timed out waiting for TLS test client",
                     ));
                 }
-                thread::sleep(Duration::from_millis(10));
+                thread::sleep(
+                    Duration::from_millis(10)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
             }
             Err(error) => return Err(error),
         }

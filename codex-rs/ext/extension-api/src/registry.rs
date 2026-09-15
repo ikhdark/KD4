@@ -1,11 +1,7 @@
 use std::sync::Arc;
 
-use codex_protocol::protocol::ReviewDecision;
-
-use crate::ApprovalReviewContributor;
 use crate::ConfigContributor;
 use crate::ContextContributor;
-use crate::ExtensionData;
 use crate::ExtensionEventSink;
 use crate::McpServerContributor;
 use crate::NoopExtensionEventSink;
@@ -30,7 +26,6 @@ pub struct ExtensionRegistryBuilder<C: Sync> {
     tool_contributors: Vec<Arc<dyn ToolContributor>>,
     tool_lifecycle_contributors: Vec<Arc<dyn ToolLifecycleContributor>>,
     turn_item_contributors: Vec<Arc<dyn TurnItemContributor>>,
-    approval_review_contributors: Vec<Arc<dyn ApprovalReviewContributor>>,
 }
 
 impl<C: Sync> Default for ExtensionRegistryBuilder<C> {
@@ -41,7 +36,6 @@ impl<C: Sync> Default for ExtensionRegistryBuilder<C> {
             turn_lifecycle_contributors: Vec::new(),
             config_contributors: Vec::new(),
             token_usage_contributors: Vec::new(),
-            approval_review_contributors: Vec::new(),
             context_contributors: Vec::new(),
             mcp_server_contributors: Vec::new(),
             turn_input_contributors: Vec::new(),
@@ -69,11 +63,6 @@ impl<C: Sync> ExtensionRegistryBuilder<C> {
     /// Returns the host event sink to pass into extension constructors.
     pub fn event_sink(&self) -> Arc<dyn ExtensionEventSink> {
         Arc::clone(&self.event_sink)
-    }
-
-    /// Registers one approval-review contributor.
-    pub fn approval_review_contributor(&mut self, contributor: Arc<dyn ApprovalReviewContributor>) {
-        self.approval_review_contributors.push(contributor);
     }
 
     /// Registers one thread-lifecycle contributor.
@@ -137,7 +126,6 @@ impl<C: Sync> ExtensionRegistryBuilder<C> {
             turn_lifecycle_contributors: self.turn_lifecycle_contributors,
             config_contributors: self.config_contributors,
             token_usage_contributors: self.token_usage_contributors,
-            approval_review_contributors: self.approval_review_contributors,
             context_contributors: self.context_contributors,
             mcp_server_contributors: self.mcp_server_contributors,
             turn_input_contributors: self.turn_input_contributors,
@@ -161,7 +149,6 @@ pub struct ExtensionRegistry<C: Sync> {
     tool_contributors: Vec<Arc<dyn ToolContributor>>,
     tool_lifecycle_contributors: Vec<Arc<dyn ToolLifecycleContributor>>,
     turn_item_contributors: Vec<Arc<dyn TurnItemContributor>>,
-    approval_review_contributors: Vec<Arc<dyn ApprovalReviewContributor>>,
 }
 
 impl<C: Sync> ExtensionRegistry<C> {
@@ -188,26 +175,6 @@ impl<C: Sync> ExtensionRegistry<C> {
     /// Returns the registered token-usage contributors.
     pub fn token_usage_contributors(&self) -> &[Arc<dyn TokenUsageContributor>] {
         &self.token_usage_contributors
-    }
-
-    /// Claims the first rendered approval-review prompt accepted by an installed contributor.
-    /// Hosts call this before falling back to Guardian review.
-    pub async fn approval_review(
-        &self,
-        session_store: &ExtensionData,
-        thread_store: &ExtensionData,
-        prompt: &str,
-    ) -> Option<ReviewDecision> {
-        for contributor in &self.approval_review_contributors {
-            if let Some(decision) = contributor
-                .contribute(session_store, thread_store, prompt)
-                .await
-            {
-                return Some(decision);
-            }
-        }
-
-        None
     }
 
     /// Returns the registered prompt contributors.

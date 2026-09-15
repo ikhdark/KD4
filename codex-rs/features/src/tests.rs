@@ -81,13 +81,12 @@ fn user_settable_registry_excludes_internal_features_and_legacy_aliases() {
 }
 
 #[test]
-fn managed_requirement_alias_resolves_only_through_requirement_lookup() {
-    assert_eq!(
-        feature_requirement_for_key("auto_review"),
-        Some(Feature::GuardianApproval)
-    );
-    assert_eq!(user_settable_feature_for_key("auto_review"), None);
-    assert_eq!(feature_for_key("auto_review"), None);
+fn removed_approval_reviewer_features_are_unknown() {
+    for key in ["auto_review", "guardian_approval"] {
+        assert_eq!(feature_requirement_for_key(key), None, "{key}");
+        assert_eq!(user_settable_feature_for_key(key), None, "{key}");
+        assert_eq!(feature_for_key(key), None, "{key}");
+    }
 }
 
 #[test]
@@ -205,7 +204,6 @@ fn completed_runtime_mechanisms_are_stable_and_enabled_by_default() {
     for (feature, key) in [
         (Feature::Kd4Runtime, "kd4_runtime"),
         (Feature::CodeModeHost, "code_mode_host"),
-        (Feature::GuardianApproval, "guardian_approval"),
         (Feature::ToolSuggest, "tool_suggest"),
         (Feature::SecretAuthStorage, "secret_auth_storage"),
         (Feature::UnifiedExec, "unified_exec"),
