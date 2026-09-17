@@ -20,6 +20,7 @@ use crate::tools::handlers::ListMcpResourceTemplatesHandler;
 use crate::tools::handlers::ListMcpResourcesHandler;
 use crate::tools::handlers::McpHandler;
 use crate::tools::handlers::PlanHandler;
+use crate::tools::handlers::ReadFileHandler;
 use crate::tools::handlers::ReadMcpResourceHandler;
 use crate::tools::handlers::ReadToolOutputHandler;
 use crate::tools::handlers::RequestPermissionsHandler;
@@ -182,7 +183,6 @@ struct CoreToolPlanContext<'a> {
     extension_tool_executors: &'a [Arc<dyn ToolExecutor<ExtensionToolCall>>],
     dynamic_tools: &'a [DynamicToolSpec],
     tool_search_handler_cache: &'a ToolSearchHandlerCache,
-    default_agent_type_description: &'a str,
     wait_agent_timeouts: WaitAgentTimeoutOptions,
     exposure_identity: &'a ToolExposureIdentity,
 }
@@ -219,8 +219,6 @@ fn build_tool_specs_and_registry(
         dynamic_tools,
         exposure_identity,
     } = params;
-    let default_agent_type_description =
-        crate::agent::role::spawn_tool_spec::build(&std::collections::BTreeMap::new());
     let context = CoreToolPlanContext {
         step_context,
         mcp_tools: mcp_tools.as_deref(),
@@ -229,7 +227,6 @@ fn build_tool_specs_and_registry(
         extension_tool_executors: &extension_tool_executors,
         dynamic_tools,
         tool_search_handler_cache,
-        default_agent_type_description: &default_agent_type_description,
         wait_agent_timeouts: wait_agent_timeout_options(turn_context),
         exposure_identity: &exposure_identity,
     };
@@ -636,17 +633,8 @@ fn wait_agent_timeout_options(turn_context: &TurnContext) -> WaitAgentTimeoutOpt
     }
 }
 
-fn agent_type_description(
-    turn_context: &TurnContext,
-    default_agent_type_description: &str,
-) -> String {
-    let agent_type_description =
-        crate::agent::role::spawn_tool_spec::build(&turn_context.config.agent_roles);
-    if agent_type_description.is_empty() {
-        default_agent_type_description.to_string()
-    } else {
-        agent_type_description
-    }
+fn agent_type_description(turn_context: &TurnContext) -> String {
+    crate::agent::role::spawn_tool_spec::build(&turn_context.config.agent_roles)
 }
 
 fn is_hidden_by_code_mode_only(
@@ -975,6 +963,9 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     let features = turn_context.config.features.get();
     let environment_mode = tool_environment_mode(context.step_context);
     planned_tools.add_with_authorization_class(ReadToolOutputHandler, TypedToolClass::ReadSearch);
+    if !context.step_context.environments.starting.is_empty() {
+        planned_tools.add_with_authorization_class(ReadFileHandler, TypedToolClass::ReadSearch);
+    }
 
     if turn_context.collaboration_mode.mode != ModeKind::Plan {
         planned_tools.add_with_authorization_class(PlanHandler, TypedToolClass::OwnTask);
@@ -1106,8 +1097,7 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
                 ToolExposure::Direct
             };
             let tool_namespace = active_collaboration_namespace(turn_context, agent_surface_stage);
-            let agent_type_description =
-                agent_type_description(turn_context, context.default_agent_type_description);
+            let agent_type_description = agent_type_description(turn_context);
             if can_spawn {
                 planned_tools.add_arc_with_exposure_and_authorization_class(
                     multi_agent_v2_handler(
@@ -1198,8 +1188,7 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
                 );
             }
         } else {
-            let agent_type_description =
-                agent_type_description(turn_context, context.default_agent_type_description);
+            let agent_type_description = agent_type_description(turn_context);
             let exposure = if search_tool_enabled(turn_context) {
                 ToolExposure::Deferred
             } else {

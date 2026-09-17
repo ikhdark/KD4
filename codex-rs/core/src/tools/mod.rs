@@ -112,6 +112,7 @@ pub fn format_exec_output_for_model(
             command_text: None,
         },
     )
+    .map(Cow::Owned)
     .unwrap_or(raw_content);
 
     let total_lines = content.lines().count();
@@ -150,11 +151,14 @@ pub(crate) fn project_exec_output_for_model_with_budget(
         &raw_content,
         truncation_policy,
     );
-    let raw_envelope = format!(
-        "Exit code: {}\nWall time: {duration_seconds} seconds\nOutput:\n{raw_content}",
+    let envelope_header = format!(
+        "Exit code: {}\nWall time: {duration_seconds} seconds\nOutput:\n",
         exec_output.exit_code
     );
-    let summarized = (approx_token_count(&raw_envelope) > limits.applied_limit)
+    let content_limit = limits
+        .applied_limit
+        .saturating_sub(approx_token_count(&envelope_header));
+    let summarized = (approx_token_count(&raw_content) > content_limit)
         .then(|| {
             summarize_shell_output_for_model(
                 &raw_content,
@@ -162,7 +166,7 @@ pub(crate) fn project_exec_output_for_model_with_budget(
                 exec_output.timed_out,
                 ShellOutputSummaryOptions {
                     enabled: true,
-                    applied_token_limit: Some(limits.applied_limit),
+                    applied_token_limit: Some(content_limit),
                     command_text,
                 },
             )
@@ -267,15 +271,15 @@ fn resolve_exec_output_limits(
 }
 
 /// Extracts exec output content and prepends a timeout message if the command timed out.
-fn build_content_with_timeout(exec_output: &ExecToolCallOutput) -> String {
+fn build_content_with_timeout(exec_output: &ExecToolCallOutput) -> Cow<'_, str> {
     if exec_output.timed_out {
-        format!(
+        Cow::Owned(format!(
             "command timed out after {} milliseconds\n{}",
             exec_output.duration.as_millis(),
             exec_output.aggregated_output.text
-        )
+        ))
     } else {
-        exec_output.aggregated_output.text.clone()
+        Cow::Borrowed(&exec_output.aggregated_output.text)
     }
 }
 

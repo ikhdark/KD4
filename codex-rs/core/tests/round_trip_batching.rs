@@ -547,6 +547,12 @@ async fn root_production_request_contains_bounded_orchestration_guidance() -> an
     assert!(guidance.contains("substantive judgment about the next action"));
     assert!(guidance.contains("existing wait or session path"));
     assert!(
+        guidance
+            .contains("Reuse passing validation if relevant inputs and environment are unchanged")
+    );
+    assert!(guidance.contains("Use owner-required checks; when required and coverage permits, scope clippy to changed packages."));
+    assert!(!guidance.contains("no cargo check before clippy"));
+    assert!(
         codex_utils_output_truncation::approx_token_count(&guidance) <= 256,
         "registered orchestration guidance exceeded its per-request token budget"
     );

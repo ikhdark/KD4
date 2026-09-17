@@ -117,6 +117,7 @@ pub(crate) fn should_keep_compacted_history_item(item: &ResponseItem) -> bool {
 }
 
 fn bounded_remote_compacted_history(items: Vec<ResponseItem>) -> Vec<ResponseItem> {
+    let receipt_index = tool_receipt_index(&items);
     let mut retained_indices = HashSet::new();
     let mut replacements = HashMap::new();
     let mut remaining_tokens = REMOTE_COMPACTION_TOOL_RECEIPT_MAX_TOKENS;
@@ -132,7 +133,8 @@ fn bounded_remote_compacted_history(items: Vec<ResponseItem>) -> Vec<ResponseIte
                 retained_indices.insert(index);
             }
             item if should_keep_compacted_history_item(item) => {
-                let Some(group) = complete_tool_receipt_indices(&items, index) else {
+                let Some(group) = complete_tool_receipt_indices(&items, &receipt_index, index)
+                else {
                     continue;
                 };
                 let search_receipt = remote_tool_search_receipt_group(&items, &group, true);
@@ -202,28 +204,36 @@ enum ToolReceiptKind {
     Search,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
 enum ToolReceiptSide {
     Call,
     Output,
 }
 
-fn complete_tool_receipt_indices(items: &[ResponseItem], index: usize) -> Option<Vec<usize>> {
+type ToolReceiptIndex<'a> = HashMap<(ToolReceiptKind, ToolReceiptSide, &'a str), usize>;
+
+fn tool_receipt_index(items: &[ResponseItem]) -> ToolReceiptIndex<'_> {
+    let mut index = HashMap::new();
+    for (position, item) in items.iter().enumerate() {
+        if let Some(identity) = tool_receipt_identity(item) {
+            // Retain the first occurrence, matching the previous counterpart lookup.
+            index.entry(identity).or_insert(position);
+        }
+    }
+    index
+}
+
+fn complete_tool_receipt_indices(
+    items: &[ResponseItem],
+    receipt_index: &ToolReceiptIndex<'_>,
+    index: usize,
+) -> Option<Vec<usize>> {
     let (kind, side, call_id) = tool_receipt_identity(&items[index])?;
     let counterpart_side = match side {
         ToolReceiptSide::Call => ToolReceiptSide::Output,
         ToolReceiptSide::Output => ToolReceiptSide::Call,
     };
-    let counterpart = items
-        .iter()
-        .enumerate()
-        .find_map(|(candidate_index, item)| {
-            let (candidate_kind, candidate_side, candidate_call_id) = tool_receipt_identity(item)?;
-            (candidate_kind == kind
-                && candidate_side == counterpart_side
-                && candidate_call_id == call_id)
-                .then_some(candidate_index)
-        })?;
+    let counterpart = *receipt_index.get(&(kind, counterpart_side, call_id))?;
     let mut group = vec![index, counterpart];
     group.sort_unstable();
     group.dedup();

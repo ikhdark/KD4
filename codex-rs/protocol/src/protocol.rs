@@ -2025,6 +2025,14 @@ pub struct SamplingGenerationId(pub String);
 pub enum ToolLifecycleBoundary {
     #[default]
     RequestCreated,
+    ResourceResolutionStart,
+    ResourceResolutionEnd,
+    DiffTrackerWaitStart,
+    DiffTrackerWaitEnd,
+    WorkspaceGateWaitStart,
+    WorkspaceGateWaitEnd,
+    EvidenceTrackerWaitStart,
+    EvidenceTrackerWaitEnd,
     Admitted,
     HandlerStart,
     ProcessSpawn,

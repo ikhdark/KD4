@@ -448,8 +448,8 @@ where
                                 Ok(()) => {}
                                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
                                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                    warn!("websocket control queue full while replying to ping; closing connection");
-                                    break;
+                                    // A queued flush already drains the automatic pong.
+                                    // Coalesce redundant requests while the writer is busy.
                                 }
                             }
                         }
@@ -485,6 +485,82 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::task::Context;
     use std::task::Poll;
+
+    #[tokio::test]
+    async fn ping_with_full_control_queue_keeps_forwarding_messages() {
+        let (events_tx, mut events_rx) = mpsc::channel(1);
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        assert!(control_tx.try_send(WebSocketControl::Flush).is_ok());
+        let frames = futures::stream::iter([
+            Ok::<_, std::io::Error>(TungsteniteWebSocketMessage::Ping(Vec::new().into())),
+            Ok(TungsteniteWebSocketMessage::Text(
+                r#"{"id":17,"result":{"ok":true}}"#.into(),
+            )),
+        ])
+        .chain(futures::stream::pending());
+        let disconnect = CancellationToken::new();
+        let inbound = run_websocket_inbound_loop(
+            frames,
+            events_tx,
+            writer_tx,
+            control_tx,
+            ConnectionId(7),
+            disconnect.clone(),
+        );
+        tokio::pin!(inbound);
+        assert!(futures::poll!(&mut inbound).is_pending());
+        match events_rx.try_recv().unwrap() {
+            TransportEvent::IncomingMessage {
+                connection_id,
+                message,
+            } => {
+                assert_eq!(connection_id, ConnectionId(7));
+                assert_eq!(
+                    serde_json::to_value(message).unwrap(),
+                    serde_json::json!({"id":17,"result":{"ok":true}})
+                );
+            }
+            event => panic!("expected message after ping: {event:?}"),
+        }
+        assert!(matches!(control_rx.try_recv(), Ok(WebSocketControl::Flush)));
+        assert!(matches!(
+            control_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        disconnect.cancel();
+        assert!(!timeout(Duration::from_secs(1), inbound).await.unwrap());
+        assert!(events_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ping_with_closed_control_queue_stops_forwarding_messages() {
+        let (events_tx, mut events_rx) = mpsc::channel(1);
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let (control_tx, control_rx) = mpsc::channel(1);
+        drop(control_rx);
+        let frames = futures::stream::iter([
+            Ok::<_, std::io::Error>(TungsteniteWebSocketMessage::Ping(Vec::new().into())),
+            Ok(TungsteniteWebSocketMessage::Text(
+                r#"{"id":17,"result":{"ok":true}}"#.into(),
+            )),
+        ]);
+        assert!(
+            !run_websocket_inbound_loop(
+                frames,
+                events_tx,
+                writer_tx,
+                control_tx,
+                ConnectionId(7),
+                CancellationToken::new(),
+            )
+            .await
+        );
+        assert!(matches!(
+            events_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
 
     #[tokio::test]
     async fn tcp_listener_shutdown_awaits_established_connection() {

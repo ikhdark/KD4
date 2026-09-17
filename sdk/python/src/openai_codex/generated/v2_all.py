@@ -4665,6 +4665,14 @@ class Tool(BaseModel):
 
 class ToolLifecycleBoundary(Enum):
     request_created = "request_created"
+    resource_resolution_start = "resource_resolution_start"
+    resource_resolution_end = "resource_resolution_end"
+    diff_tracker_wait_start = "diff_tracker_wait_start"
+    diff_tracker_wait_end = "diff_tracker_wait_end"
+    workspace_gate_wait_start = "workspace_gate_wait_start"
+    workspace_gate_wait_end = "workspace_gate_wait_end"
+    evidence_tracker_wait_start = "evidence_tracker_wait_start"
+    evidence_tracker_wait_end = "evidence_tracker_wait_end"
     admitted = "admitted"
     handler_start = "handler_start"
     process_spawn = "process_spawn"

@@ -116,18 +116,18 @@ fn instruction_fragments(request: &responses::ResponsesRequest) -> Vec<String> {
 
 fn expected_instruction_fragment(cwd: &AbsolutePathBuf, contents: &str) -> String {
     let cwd = PathUri::from_abs_path(cwd).inferred_native_path_string();
-    format!("# AGENTS.md instructions for {cwd}\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>")
+    format!("# AGENTS.md instructions for {cwd}\n\n<AGENTS_MD_OBSERVATION>\n{FRESH_PROVENANCE}\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>")
 }
 
 fn expected_provider_only_instruction_fragment(contents: &str) -> String {
     format!(
-        "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{FRESH_PROVENANCE}\n\n{contents}\n</INSTRUCTIONS>"
+        "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\n{FRESH_PROVENANCE}\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>"
     )
 }
 
 fn expected_provider_only_replacement_fragment(contents: &str) -> String {
     format!(
-        "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\n{FRESH_PROVENANCE}\n\n{contents}\n</INSTRUCTIONS>"
+        "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\n{FRESH_PROVENANCE}\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\n{contents}\n</INSTRUCTIONS>"
     )
 }
 
@@ -153,7 +153,7 @@ fn assert_single_fresh_instruction_fragment_contains(
     let fragments = instruction_fragments(request);
     assert_eq!(fragments.len(), 1, "expected one AGENTS.md fragment");
     assert!(
-        fragments[0].contains(FRESH_PROVENANCE),
+        fragments[0].contains(&format!("<AGENTS_MD_OBSERVATION>\n{FRESH_PROVENANCE}\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>")),
         "expected fresh direct-read provenance: {}",
         fragments[0]
     );
@@ -162,6 +162,8 @@ fn assert_single_fresh_instruction_fragment_contains(
         "expected AGENTS.md contents {expected_contents:?}: {}",
         fragments[0]
     );
+    let body = fragments[0].split_once("<INSTRUCTIONS>\n").unwrap().1;
+    assert!(!body.contains(FRESH_PROVENANCE));
 }
 
 async fn submit_thread_turn(thread: &Arc<codex_core::CodexThread>, prompt: &str) -> Result<()> {
@@ -700,11 +702,11 @@ async fn fresh_thread_composes_global_before_project_and_reports_sources() -> Re
         PathUri::from_abs_path(&project_source).inferred_native_path_string()
     );
     let expected_contents = format!(
-        "{FRESH_PROVENANCE}\n\n{GLOBAL_INSTRUCTIONS}\n\n{PROJECT_SEPARATOR}\n\n{project_source_header}\n\n{PROJECT_INSTRUCTIONS}"
+        "{GLOBAL_INSTRUCTIONS}\n\n{PROJECT_SEPARATOR}\n\n{project_source_header}\n\n{PROJECT_INSTRUCTIONS}"
     );
     let expected_fragment = expected_instruction_fragment(&test.config.cwd, &expected_contents);
     let replacement_contents = format!(
-        "These AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\n{FRESH_PROVENANCE}\n\n{GLOBAL_INSTRUCTIONS}\n\n{PROJECT_SEPARATOR}\n\n{project_source_header}\n\n{NEW_PROJECT_INSTRUCTIONS}"
+        "These AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\n{GLOBAL_INSTRUCTIONS}\n\n{PROJECT_SEPARATOR}\n\n{project_source_header}\n\n{NEW_PROJECT_INSTRUCTIONS}"
     );
     let replacement_fragment =
         expected_instruction_fragment(&test.config.cwd, &replacement_contents);

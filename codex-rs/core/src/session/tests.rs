@@ -1701,6 +1701,12 @@ async fn start_managed_network_proxy_applies_execpolicy_network_rules() -> anyho
         Decision::Allow,
         /*justification*/ None,
     )?;
+    exec_policy.add_network_rule(
+        "denied.example.com",
+        NetworkRuleProtocol::Https,
+        Decision::Forbidden,
+        /*justification*/ None,
+    )?;
 
     let (started_proxy, _) = Session::start_managed_network_proxy(
         &spec,
@@ -1719,11 +1725,15 @@ async fn start_managed_network_proxy_applies_execpolicy_network_rules() -> anyho
         current_cfg.allowed_domains(),
         Some(vec!["example.com".to_string()])
     );
+    assert_eq!(
+        current_cfg.denied_domains(),
+        Some(vec!["denied.example.com".to_string()])
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn start_managed_network_proxy_ignores_invalid_execpolicy_network_rules() -> anyhow::Result<()>
+async fn start_managed_network_proxy_rejects_invalid_execpolicy_network_rules() -> anyhow::Result<()>
 {
     let codex_home = tempfile::tempdir()?;
     let permission_profile = PermissionProfile::workspace_write();
@@ -1749,7 +1759,14 @@ async fn start_managed_network_proxy_ignores_invalid_execpolicy_network_rules() 
         /*justification*/ None,
     )?;
 
-    let (started_proxy, _) = Session::start_managed_network_proxy(
+    // A conflicting allow must not cause the merge to discard this valid deny.
+    exec_policy.add_network_rule(
+        "managed.example.com",
+        NetworkRuleProtocol::Https,
+        Decision::Forbidden,
+        /*justification*/ None,
+    )?;
+    let error = Session::start_managed_network_proxy(
         &spec,
         codex_home.path(),
         &exec_policy,
@@ -1759,12 +1776,17 @@ async fn start_managed_network_proxy_ignores_invalid_execpolicy_network_rules() 
         /*managed_network_requirements_enabled*/ false,
         crate::config::NetworkProxyAuditMetadata::default(),
     )
-    .await?;
-
-    let current_cfg = started_proxy.proxy().current_cfg().await?;
+    .await
+    .err()
+    .expect("invalid merged policy must prevent proxy startup");
     assert_eq!(
-        current_cfg.allowed_domains(),
-        Some(vec!["managed.example.com".to_string()])
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("failed to apply execpolicy network rules")
     );
     Ok(())
 }
@@ -8079,6 +8101,91 @@ async fn request_permissions_is_auto_denied_when_granular_policy_blocks_tool_req
 }
 
 #[tokio::test]
+async fn mailbox_submission_reports_overflow_and_allows_retry() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    session.input_queue = super::input_queue::InputQueue::with_mailbox_limits(1, 4);
+    let session = Arc::new(session);
+    let (tx_sub, rx_sub) = async_channel::bounded(4);
+    let (_tx_event, rx_event) = async_channel::unbounded();
+    let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
+    let loop_handle = tokio::spawn(submission_loop(
+        Arc::clone(&session),
+        Arc::clone(&turn_context.config),
+        rx_sub,
+    ));
+    let codex = Codex {
+        tx_sub,
+        rx_event,
+        agent_status,
+        session: Arc::clone(&session),
+        session_loop_termination: session_loop_termination_from_handle(loop_handle),
+    };
+    let mut first = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("worker path"),
+        AgentPath::root(),
+        Vec::new(),
+        "first".to_string(),
+        /*trigger_turn*/ false,
+    );
+    first.id = Some(codex_protocol::ResponseItemId::from_server(
+        "first".to_string(),
+    ));
+    let mut retry = first.clone();
+    retry.id = Some(codex_protocol::ResponseItemId::from_server(
+        "retry".to_string(),
+    ));
+    retry.content = "retry".to_string();
+    for communication in [first.clone(), first.clone()] {
+        tokio::time::timeout(
+            StdDuration::from_secs(5),
+            codex.submit(Op::InterAgentCommunication { communication }),
+        )
+        .await
+        .expect("mailbox admission timed out")
+        .expect("accepted or duplicate message should succeed");
+    }
+    let (activity, _) = session.input_queue.subscribe_activity(None).await;
+    let error = tokio::time::timeout(
+        StdDuration::from_secs(5),
+        codex.submit(Op::InterAgentCommunication {
+            communication: retry.clone(),
+        }),
+    )
+    .await
+    .expect("overflow admission timed out")
+    .expect_err("full mailbox must report rejection to the sender");
+    assert!(
+        matches!(error, CodexErr::InvalidRequest(message) if message.contains("session mailbox is full"))
+    );
+    assert!(!activity.has_changed().expect("queue still open"));
+    assert!(session.active_turn.lock().await.is_none());
+    assert_eq!(
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn)
+            .await,
+        vec![TurnInput::InterAgentCommunication(first)],
+    );
+    tokio::time::timeout(
+        StdDuration::from_secs(5),
+        codex.submit(Op::InterAgentCommunication {
+            communication: retry.clone(),
+        }),
+    )
+    .await
+    .expect("retry admission timed out")
+    .expect("rejected message should be retryable after capacity is freed");
+    assert_eq!(
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn)
+            .await,
+        vec![TurnInput::InterAgentCommunication(retry)],
+    );
+    codex.shutdown_and_wait().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn submit_with_id_captures_current_span_trace_context() {
     let (session, _turn_context) = make_session_and_context().await;
     let (tx_sub, rx_sub) = async_channel::bounded(1);
@@ -8121,7 +8228,7 @@ async fn submit_with_id_captures_current_span_trace_context() {
     .instrument(request_span)
     .await;
 
-    let submitted = rx_sub.recv().await.expect("submission");
+    let submitted = rx_sub.recv().await.expect("submission").submission;
     assert_eq!(submitted.trace, Some(expected_trace));
 }
 
@@ -8915,8 +9022,8 @@ async fn shutdown_and_wait_allows_multiple_waiters() {
     let (_tx_event, rx_event) = async_channel::unbounded();
     let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
     let session_loop_handle = tokio::spawn(async move {
-        let shutdown: Submission = rx_sub.recv().await.expect("shutdown submission");
-        assert_eq!(shutdown.op, Op::Shutdown);
+        let shutdown: QueuedSubmission = rx_sub.recv().await.expect("shutdown submission");
+        assert_eq!(shutdown.submission.op, Op::Shutdown);
         tokio::time::sleep(StdDuration::from_millis(50)).await;
     });
     let codex = Arc::new(Codex {
@@ -9554,6 +9661,66 @@ pub(crate) async fn make_session_and_context_with_rx() -> (
     async_channel::Receiver<Event>,
 ) {
     make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await
+}
+
+#[tokio::test]
+async fn resolve_elicitation_reports_failed_delivery_without_exposing_form_content() {
+    for receiver_open in [true, false] {
+        let (session, _turn, events) = make_session_and_context_with_rx().await;
+        let active = ActiveTurn::default();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        active.turn_state.lock().await.insert_pending_elicitation(
+            "calendar".to_string(),
+            rmcp::model::NumberOrString::String("prompt-1".into()),
+            sender,
+        );
+        *session.active_turn.lock().await = Some(active);
+        let receiver = if receiver_open {
+            Some(receiver)
+        } else {
+            drop(receiver);
+            None
+        };
+
+        handlers::resolve_elicitation(
+            &session,
+            "reply-1".to_string(),
+            "calendar".to_string(),
+            codex_protocol::mcp::RequestId::String("prompt-1".to_string()),
+            codex_protocol::approvals::ElicitationAction::Accept,
+            Some(json!({"secret": "private-form-value"})),
+            Some(json!({"trace": "reply-metadata"})),
+        )
+        .await;
+
+        if let Some(receiver) = receiver {
+            assert_eq!(
+                receiver.await.expect("response delivered to the server"),
+                codex_rmcp_client::ElicitationResponse {
+                    action: codex_rmcp_client::ElicitationAction::Accept,
+                    content: Some(json!({"secret": "private-form-value"})),
+                    meta: Some(json!({"trace": "reply-metadata"})),
+                }
+            );
+        } else {
+            let event = events
+                .try_recv()
+                .expect("client receives failed reply warning");
+            assert_eq!(event.id, "reply-1");
+            let EventMsg::Warning(warning) = event.msg else {
+                panic!("expected a warning without terminating the active turn");
+            };
+            assert_eq!(
+                warning.message,
+                "Failed to deliver your response to MCP server `calendar` for elicitation request `prompt-1`. The request may have expired or the server may have disconnected."
+            );
+        }
+        assert!(session.active_turn.lock().await.is_some());
+        assert!(
+            events.try_recv().is_err(),
+            "no turn failure or spurious warning"
+        );
+    }
 }
 
 #[tokio::test]
@@ -15640,7 +15807,8 @@ async fn thread_idle_lifecycle_waits_for_trigger_turn_mailbox_work() {
             "pending trigger".to_string(),
             /*trigger_turn*/ true,
         ))
-        .await;
+        .await
+        .expect("mailbox admission");
 
     session.emit_thread_idle_lifecycle_if_idle().await;
 
@@ -15658,7 +15826,8 @@ async fn shutdown_latch_prevents_pending_mailbox_turn_restart() {
             "pending during shutdown".to_string(),
             /*trigger_turn*/ true,
         ))
-        .await;
+        .await
+        .expect("mailbox admission");
 
     sess.begin_shutdown().await;
     sess.maybe_start_turn_for_pending_work().await;
@@ -15678,7 +15847,8 @@ async fn orchestration_audit_pending_mailbox_start_reserves_only_inside_shared_s
             "pending behind another admitted start".to_string(),
             /*trigger_turn*/ true,
         ))
-        .await;
+        .await
+        .expect("mailbox admission");
 
     let admission = sess
         .task_start_gate
@@ -15782,7 +15952,8 @@ async fn try_start_turn_if_idle_rejects_pending_trigger_turn_without_injecting()
             "pending trigger".to_string(),
             /*trigger_turn*/ true,
         ))
-        .await;
+        .await
+        .expect("mailbox admission");
 
     let item = user_message("synthetic idle input");
     let err = sess
@@ -16235,6 +16406,7 @@ async fn steer_input_commits_effects_only_after_queue_admission() {
             sess.input_queue
                 .enqueue_mailbox_communication(communication.clone())
                 .await
+                .expect("mailbox admission")
         );
         let (mut activity, _) = sess.input_queue.subscribe_activity(Some(&turn_state)).await;
         assert!(!activity.has_changed().unwrap());
@@ -16504,7 +16676,8 @@ async fn queue_only_mailbox_mail_waits_for_next_turn_after_answer_boundary() {
         .await;
     sess.input_queue
         .enqueue_mailbox_communication(communication.clone())
-        .await;
+        .await
+        .expect("mailbox admission");
 
     assert!(
         !sess.input_queue.has_pending_input(&sess.active_turn).await,
@@ -16547,7 +16720,8 @@ async fn trigger_turn_mailbox_mail_waits_for_next_turn_after_answer_boundary() {
             "late trigger update".to_string(),
             /*trigger_turn*/ true,
         ))
-        .await;
+        .await
+        .expect("mailbox admission");
 
     assert!(
         !sess.input_queue.has_pending_input(&sess.active_turn).await,
@@ -16584,7 +16758,8 @@ async fn steered_input_reopens_mailbox_delivery_for_current_turn() {
         .await;
     sess.input_queue
         .enqueue_mailbox_communication(communication.clone())
-        .await;
+        .await
+        .expect("mailbox admission");
     sess.steer_input(
         vec![UserInput::Text {
             text: "follow up".to_string(),
@@ -16614,6 +16789,52 @@ async fn steered_input_reopens_mailbox_delivery_for_current_turn() {
 }
 
 #[tokio::test]
+async fn internal_context_does_not_prevent_mailbox_deferral() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let communication = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("worker path should parse"),
+        AgentPath::root(),
+        Vec::new(),
+        "queued child update".to_string(),
+        /*trigger_turn*/ false,
+    );
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await;
+    sess.inject_internal_no_new_turn(vec![ResponseItem::Other], Some(&tc))
+        .await
+        .expect("internal context should be admitted");
+    sess.input_queue
+        .enqueue_mailbox_communication(communication.clone())
+        .await
+        .expect("mailbox admission");
+
+    sess.input_queue
+        .defer_mailbox_delivery_to_next_turn(&sess.active_turn, &tc.sub_id)
+        .await;
+
+    assert!(!sess.input_queue.has_pending_input(&sess.active_turn).await);
+    assert_eq!(
+        sess.input_queue.get_pending_input(&sess.active_turn).await,
+        vec![TurnInput::InternalResponseItem(ResponseItem::Other)],
+    );
+    assert!(sess.input_queue.has_pending_mailbox_items().await);
+    sess.input_queue
+        .accept_mailbox_delivery_for_current_turn(&sess.active_turn, &tc.sub_id)
+        .await;
+    assert_eq!(
+        sess.input_queue.get_pending_input(&sess.active_turn).await,
+        vec![TurnInput::InterAgentCommunication(communication)],
+    );
+}
+
+#[tokio::test]
 async fn stale_defer_mailbox_delivery_does_not_override_steered_input() {
     let (sess, tc, _rx) = make_session_and_context_with_rx().await;
     let communication = InterAgentCommunication::new(
@@ -16638,7 +16859,8 @@ async fn stale_defer_mailbox_delivery_does_not_override_steered_input() {
         .await;
     sess.input_queue
         .enqueue_mailbox_communication(communication.clone())
-        .await;
+        .await
+        .expect("mailbox admission");
     sess.steer_input(
         vec![UserInput::Text {
             text: "follow up".to_string(),
@@ -16696,7 +16918,8 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
         .await;
     sess.input_queue
         .enqueue_mailbox_communication(communication.clone())
-        .await;
+        .await
+        .expect("mailbox admission");
 
     let item = ResponseItem::FunctionCall {
         id: None,

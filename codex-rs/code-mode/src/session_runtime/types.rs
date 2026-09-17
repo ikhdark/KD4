@@ -176,7 +176,7 @@ impl fmt::Display for Error {
                 write!(formatter, "exec cell {cell_id} is already terminating")
             }
             Self::ClosedCell(cell_id) => {
-                write!(formatter, "exec cell {cell_id} closed unexpectedly")
+                write!(formatter, "exec cell {cell_id} is closed")
             }
             Self::Runtime(error_text) => formatter.write_str(error_text),
         }

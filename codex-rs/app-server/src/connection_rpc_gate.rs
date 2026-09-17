@@ -172,7 +172,16 @@ impl ConnectionRpcGate {
         for abort_handle in abort_handles {
             abort_handle.abort();
         }
-        let _ = timeout(CONNECTION_RPC_ABORT_JOIN_GRACE, self.tasks.wait()).await;
+        if timeout(CONNECTION_RPC_ABORT_JOIN_GRACE, self.tasks.wait())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                remaining_tasks = self.tasks.len(),
+                aborted_tasks,
+                "connection RPC tasks did not stop within the abort join grace period"
+            );
+        }
         aborted_tasks
     }
 

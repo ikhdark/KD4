@@ -1435,6 +1435,58 @@ async fn cancelling_a_waiter_preserves_live_capture_and_last_waiter_releases_it(
 }
 
 #[tokio::test]
+async fn source_path_batch_establishes_one_watch_and_preserves_path_scopes() {
+    let root = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let first = root.path().join("first.rs");
+    let second = root.path().join("second.rs");
+    std::fs::write(&first, "first").unwrap();
+    std::fs::write(&second, "second").unwrap();
+    let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
+    let observations = cache
+        .begin_source_path_change_observations(
+            root.path(),
+            &[
+                (first, false),
+                (second, false),
+                (outside.path().to_path_buf(), true),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(observations.len(), 2);
+    assert_eq!(
+        observations[0].registration_generation,
+        observations[1].registration_generation
+    );
+    assert_eq!(
+        cache
+            .repository_retention
+            .lock()
+            .unwrap()
+            .source_watch_registrations
+            .len(),
+        1
+    );
+    assert!(
+        observations
+            .iter()
+            .all(|observation| cache.source_path_change_observation_is_current(observation))
+    );
+    cache
+        .note_host_workspace_mutation_paths(root.path(), &["first.rs".to_string()])
+        .await;
+    assert!(!cache.source_path_change_observation_is_current(&observations[0]));
+    assert!(cache.source_path_change_observation_is_current(&observations[1]));
+    cache.note_host_workspace_mutation();
+    assert!(
+        observations
+            .iter()
+            .all(|observation| !cache.source_path_change_observation_is_current(observation))
+    );
+}
+
+#[tokio::test]
 async fn source_path_observation_ignores_unrelated_changes_and_fails_open() {
     let root = TempDir::new().expect("source observation root");
     let source = root.path().join("src").join("lib.rs");

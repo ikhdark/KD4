@@ -452,6 +452,234 @@ async fn unified_exec_persists_across_requests() -> anyhow::Result<()> {
 
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn command_dispatch_reuses_workspace_baseline_without_ledger_recapture() -> anyhow::Result<()>
+{
+    for nested in [false, true] {
+        let fixture = tempfile::tempdir()?;
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(fixture.path())
+                .status()?
+                .success()
+        );
+        std::fs::write(
+            fixture.path().join("evidence.txt"),
+            "workspace-baseline-output",
+        )?;
+        let (mut session, mut turn) = make_session_and_context().await;
+        turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
+        let mut config = (*turn.config).clone();
+        config.cwd = AbsolutePathBuf::from_absolute_path(fixture.path())?;
+        config
+            .features
+            .enable(codex_features::Feature::UnifiedExec)?;
+        config
+            .features
+            .enable(codex_features::Feature::Kd4Runtime)?;
+        config.permissions.approval_policy =
+            crate::config::Constrained::allow_any(codex_protocol::protocol::AskForApproval::Never);
+        session.services.command_execution =
+            crate::tools::command_execution::CommandExecutionLedger::load_or_new(
+                config.codex_home.to_path_buf(),
+                "baseline-test".to_string(),
+                fixture.path(),
+            )
+            .await;
+        turn.config = Arc::new(config);
+        let session = Arc::new(session);
+        let step = crate::session::step_context::StepContext::for_test(Arc::new(turn));
+        let router = Arc::new(crate::tools::router::ToolRouter::from_context(
+            step.as_ref(),
+            crate::tools::router::ToolRouterParams {
+                tool_suggest_candidates: None,
+                deferred_mcp_tools: None,
+                mcp_tools: None,
+                extension_tool_executors: Vec::new(),
+                dynamic_tools: &[],
+                exposure_identity: Default::default(),
+            },
+            &Default::default(),
+        ));
+        assert!(step.set_tool_router(router).is_ok());
+        let runtime = crate::tools::parallel::ToolCallRuntime::new(
+            Arc::clone(&session),
+            step,
+            Arc::new(tokio::sync::Mutex::new(
+                crate::turn_diff_tracker::TurnDiffTracker::new(),
+            )),
+        );
+        let call = crate::tools::router::ToolCall {
+            tool_name: codex_tools::ToolName::plain("exec_command"),
+            call_id: "baseline-read".to_string(),
+            payload: crate::tools::context::ToolPayload::Function {
+                arguments: serde_json::json!({
+                    "cmd": "Get-Content 'evidence.txt'", "workdir": fixture.path(),
+                    "yield_time_ms": 1000, "tty": false,
+                })
+                .to_string(),
+            },
+        };
+        let response = if nested {
+            runtime
+                .handle_tool_call_with_source(
+                    call,
+                    crate::tools::context::ToolCallSource::CodeMode {
+                        cell_id: "cell-1".to_string(),
+                        parent_call_id: Some("outer".to_string()),
+                        runtime_tool_call_id: "nested-read".to_string(),
+                    },
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await?
+                .response()
+        } else {
+            runtime
+                .handle_tool_call(call, tokio_util::sync::CancellationToken::new())
+                .await?
+        };
+        let codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } = response
+        else {
+            panic!("expected command output: {response:?}");
+        };
+        let text = output.body.to_text().expect("model-visible command output");
+        assert!(text.starts_with("Process exited with code 0;"), "{text}");
+        assert!(text.contains("workspace-baseline-output"), "{text}");
+        assert!(
+            session
+                .services
+                .command_execution
+                .current_workspace_identity_hash(
+                    codex_exec_server::LOCAL_ENVIRONMENT_ID,
+                    fixture.path(),
+                )
+                .await
+                .is_some(),
+            "dispatch must initialize the ledger identity"
+        );
+        assert_eq!(
+            session
+                .services
+                .command_execution
+                .workspace_identity_capture_count(),
+            0,
+            "direct and nested execution must use dispatch's snapshot"
+        );
+        assert!(session.list_background_terminals().await.is_empty());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validation_wait_delivers_exit_after_progress_and_preserves_deadline() -> anyhow::Result<()>
+{
+    let (session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(codex_features::Feature::UnifiedExec)?;
+    config.permissions.approval_policy =
+        crate::config::Constrained::allow_any(codex_protocol::protocol::AskForApproval::Never);
+    turn.config = Arc::new(config);
+    let session = Arc::new(session);
+    let step = crate::session::step_context::StepContext::for_test(Arc::new(turn));
+    let router = Arc::new(crate::tools::router::ToolRouter::from_context(
+        step.as_ref(),
+        crate::tools::router::ToolRouterParams {
+            tool_suggest_candidates: None,
+            deferred_mcp_tools: None,
+            mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: &[],
+            exposure_identity: Default::default(),
+        },
+        &Default::default(),
+    ));
+    assert!(step.set_tool_router(router).is_ok());
+    let runtime = crate::tools::parallel::ToolCallRuntime::new(
+        Arc::clone(&session),
+        step,
+        Arc::new(tokio::sync::Mutex::new(
+            crate::turn_diff_tracker::TurnDiffTracker::new(),
+        )),
+    );
+    let fixture = tempfile::tempdir()?;
+    let script = fixture.path().join("test_wait.py");
+    for (case, delay, passes) in [
+        ("argv", 0.7, true),
+        ("compound", 0.7, true),
+        ("failure", 0.7, false),
+        ("deadline", 30.0, true),
+    ] {
+        std::fs::write(
+            &script,
+            format!(
+                "import time, unittest\nclass WaitTest(unittest.TestCase):\n    def test_result(self):\n        print('VALIDATION_STARTED', flush=True)\n        time.sleep({delay})\n        self.assertEqual({}, True)\n        print('VALIDATION_FINISHED', flush=True)\n",
+                if passes { "True" } else { "False" },
+            ),
+        )?;
+        let mut arguments = if case == "compound" {
+            serde_json::json!({"cmd": "Get-Content test_wait.py; python -u -m unittest -q", "shell": "powershell.exe"})
+        } else {
+            serde_json::json!({"kind": "argv", "program": "python", "args": ["-u", "-m", "unittest", "-q"]})
+        };
+        arguments["workdir"] = serde_json::json!(fixture.path());
+        arguments["yield_time_ms"] = serde_json::json!(3000);
+        arguments["tty"] = serde_json::json!(false);
+        arguments["force_fresh"] = serde_json::json!(true);
+        let response = runtime
+            .clone()
+            .handle_tool_call(
+                crate::tools::router::ToolCall {
+                    tool_name: codex_tools::ToolName::plain("exec_command"),
+                    call_id: format!("validation-wait-{case}"),
+                    payload: crate::tools::context::ToolPayload::Function {
+                        arguments: arguments.to_string(),
+                    },
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await?;
+        let codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } = response
+        else {
+            panic!("expected command output: {response:?}");
+        };
+        let text = output.body.to_text().expect("model-visible output");
+        assert!(text.contains("VALIDATION_STARTED"), "{case}: {text}");
+        if case == "deadline" {
+            let terminals = session.list_background_terminals().await;
+            assert_eq!(terminals.len(), 1, "{text}");
+            let process_id = terminals[0].process_id.parse::<u32>()?;
+            assert!(session.terminate_background_terminal(process_id).await);
+            assert!(
+                text.starts_with("Process running with session ID"),
+                "{text}"
+            );
+            assert!(!text.contains("VALIDATION_FINISHED"), "{text}");
+        } else {
+            let exit_code = if passes { 0 } else { 1 };
+            assert!(
+                text.starts_with(&format!("Process exited with code {exit_code};")),
+                "{case}: {text}"
+            );
+            assert!(
+                !text.contains("Process running with session ID"),
+                "{case}: {text}"
+            );
+            assert!(
+                text.contains(if passes { "OK" } else { "FAILED (failures=1)" }),
+                "{case}: {text}"
+            );
+            assert!(session.list_background_terminals().await.is_empty());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multi_unified_exec_sessions() -> anyhow::Result<()> {
     let (session, mut turn) = make_session_and_context().await;
     turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;

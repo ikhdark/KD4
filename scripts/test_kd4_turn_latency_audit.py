@@ -357,6 +357,8 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
             "toolOutputCanonicalTokenCount": 2**32 + 100,
             "toolOutputModelTokenCount": 2**32 + 50,
             "toolOutputRecoveryCallCount": 3, "toolOutputRecoveryRetruncationCount": 0,
+            "toolOutputArtifactCreationCount": 2, "toolOutputArtifactReuseCount": 1,
+            "toolOutputOmittedSectionCount": 2**32 + 5, "attributableRecoveryGenerationCount": 2,
         })
         report = self.audit_commands([("cat src/client.ts", ""), ("rg Widget src/client.ts", "")] * 35, timing=timing)
         self.assertEqual(len(report["sourceDiscovery"]["events"]), 64)
@@ -375,6 +377,8 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
             "toolOutputCanonicalTokenCount": 2**32 + 100,
             "toolOutputModelTokenCount": 2**32 + 50,
             "toolOutputRecoveryCallCount": 3, "toolOutputRecoveryRetruncationCount": 0,
+            "toolOutputArtifactCreationCount": 2, "toolOutputArtifactReuseCount": 1,
+            "toolOutputOmittedSectionCount": 2**32 + 5, "attributableRecoveryGenerationCount": 2,
             "totalTokens": 235,
         })
         self.assertEqual(vector["unavailableReasons"], {})
@@ -382,6 +386,14 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
             key: value for key, value in vector.items() if key != "measurementNote"
         })
         self.assertNotIn("client.ts", json.dumps(vector))
+        meta = vector["evidenceMeta"]
+        self.assertEqual(meta["schemaVersion"], 1)
+        self.assertEqual(meta["payloadCompleteness"], "complete")
+        self.assertTrue(meta["evidenceBearing"])
+        self.assertTrue(meta["approximate"])
+        self.assertFalse(meta["truncated"])
+        self.assertRegex(meta["snapshot"], r"^sha256:[0-9a-f]{64}$")
+        self.assertIsNone(vector["configuration"]["sha256"])
         bounded = kd4_turn_latency_audit.bounded_summary(report)
         captured = report["runnerDiagnostics"]["capturedRequests"]
         self.assertIn("measurementNote", captured)
@@ -428,6 +440,21 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
                         self.assertEqual(report["coverage"]["terminalTurnsWithoutStart"], 2)
                         self.assertEqual(kd4_turn_latency_audit.bounded_summary(report)["coverage"]["terminalTurnsWithoutStart"], 2)
 
+    def test_directory_rollouts_scope_reused_turn_ids_to_their_session(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name, count in (("parent", 2), ("child", 3)):
+                timing = _timing()
+                timing["counters"].update(executedValidationCount=count, saturationCount=0)
+                lines = [_meta(str(root)), _event({"type": "task_started", "turn_id": "same"}),
+                         _event({"type": "task_complete", "turn_id": "same", "timing": timing})]
+                (root / f"{name}.jsonl").write_text("\n".join(lines), encoding="utf-8")
+            report = kd4_turn_latency_audit.analyze_session_path(root, root)
+            self.assertEqual(report["coverage"]["uniqueTerminalTurns"], 2)
+            self.assertEqual(report["coverage"]["duplicateTimedTerminalEvents"], 0)
+            self.assertEqual(report["behaviorMetrics"]["metrics"]["executedValidationCount"], 5)
+            self.assertEqual(report["runnerDiagnostics"]["coverage"]["nativeTimingProfiles"], 2)
+
     def test_behavior_counter_maxima_are_unavailable_even_without_saturation_flag(self):
         for key, maximum in (
             ("provenLoopActivationCount", 2**32 - 1),
@@ -436,6 +463,10 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
             ("toolOutputModelTokenCount", 2**64 - 1),
             ("toolOutputRecoveryCallCount", 2**32 - 1),
             ("toolOutputRecoveryRetruncationCount", 2**32 - 1),
+            ("toolOutputArtifactCreationCount", 2**32 - 1),
+            ("toolOutputArtifactReuseCount", 2**32 - 1),
+            ("toolOutputOmittedSectionCount", 2**64 - 1),
+            ("attributableRecoveryGenerationCount", 2**32 - 1),
         ):
             for value in (0, maximum - 1, maximum):
                 with self.subTest(key=key, value=value):
@@ -452,6 +483,8 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         expected = {
             "toolOutputCanonicalTokenCount": 1000, "toolOutputModelTokenCount": 200,
             "toolOutputRecoveryCallCount": 2, "toolOutputRecoveryRetruncationCount": 1,
+            "toolOutputArtifactCreationCount": 3, "toolOutputArtifactReuseCount": 4,
+            "toolOutputOmittedSectionCount": 5, "attributableRecoveryGenerationCount": 1,
         }
         for key in expected:
             for invalid in (None, -1, True, "2"):
@@ -494,6 +527,9 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertEqual(vector["unavailableReasons"]["totalTokens"], "incomplete_token_coverage")
         vector = kd4_turn_latency_audit.analyze_session_path(None, Path.cwd())["behaviorMetrics"]
         self.assertTrue(all(value is None for value in vector["metrics"].values()))
+        self.assertEqual(vector["evidenceMeta"]["payloadCompleteness"], "unknown")
+        self.assertFalse(vector["evidenceMeta"]["evidenceBearing"])
+        self.assertIsNone(vector["evidenceMeta"]["snapshot"])
 
     def test_discovery_relative_paths_and_redacted_queries_preserve_search_identity(self):
         commands = [

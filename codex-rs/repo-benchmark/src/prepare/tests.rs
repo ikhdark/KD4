@@ -342,11 +342,10 @@ fn selected_reference_head_can_come_from_an_unrelated_repository() {
     let fork_head = git(&fork, &["rev-parse", "HEAD"]).unwrap();
     let candidate_head = git(&candidate, &["rev-parse", "HEAD"]).unwrap();
     assert_ne!(fork_head, candidate_head);
-    let reference = resolve_source(
-        &candidate,
-        "HEAD",
+    let reference = super::resolve_reference(
+        &fork,
+        Some(&candidate),
         temp.path().join("prepared/reference"),
-        false,
     )
     .unwrap();
     assert_eq!(reference.revision, candidate_head);
@@ -364,32 +363,93 @@ fn selected_reference_head_can_come_from_an_unrelated_repository() {
 }
 
 #[test]
-fn upstream_source_metadata_keeps_stable_reference_variant_name() {
+fn upstream_reference_advances_only_for_a_new_stable_release() {
     let temp = tempfile::tempdir().unwrap();
     let repo = repository(temp.path(), "fork", "upstream revision\n");
     let upstream_head = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+    git(&repo, &["tag", "rust-v0.9.0"]).unwrap();
+    git(&repo, &["tag", "rust-v0.10.0"]).unwrap();
     git(
         &repo,
         &["update-ref", "refs/remotes/upstream/main", &upstream_head],
     )
     .unwrap();
-    let reference =
-        resolve_source(&repo, "upstream/main", temp.path().join("reference"), true).unwrap();
+    let reference = super::resolve_reference(&repo, None, temp.path().join("reference")).unwrap();
     assert_eq!(reference.revision, upstream_head);
-    assert_eq!(reference.selection, "upstream/main");
+    assert_eq!(reference.selection, "refs/tags/rust-v0.10.0");
     assert!(reference.upstream);
     assert_eq!(Variant::Reference.name(), "reference");
     assert_eq!(
         serde_json::to_value(Variant::Reference).unwrap(),
         json!("reference")
     );
-    let error = resolve_source(
+    fs::write(repo.join("tracked.txt"), "unreleased upstream changes\n").unwrap();
+    git(&repo, &["add", "tracked.txt"]).unwrap();
+    git(
         &repo,
-        "refs/remotes/missing/main",
-        temp.path().join("missing"),
-        true,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "unreleased",
+        ],
     )
-    .unwrap_err();
+    .unwrap();
+    git(&repo, &["update-ref", "refs/remotes/upstream/main", "HEAD"]).unwrap();
+    for tag in [
+        "rust-v0.11.0-alpha.1",
+        "rust-v9.0.0-beta.1",
+        "rust-v99.0.0+build",
+        "rust-vv99.0.0",
+        "rust-v99.0",
+        "rust-v099.0.0",
+    ] {
+        git(&repo, &["tag", tag]).unwrap();
+    }
+    let repeated = super::resolve_reference(&repo, None, temp.path().join("repeat")).unwrap();
+    assert_eq!(repeated.revision, upstream_head);
+    assert_eq!(repeated.selection, reference.selection);
+    assert!(!repeated.checkout.exists());
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "tag",
+            "-a",
+            "rust-v0.11.0",
+            "-m",
+            "stable release",
+        ],
+    )
+    .unwrap();
+    let updated = super::resolve_reference(&repo, None, temp.path().join("updated")).unwrap();
+    assert_eq!(updated.selection, "refs/tags/rust-v0.11.0");
+    assert_eq!(
+        updated.revision,
+        git(&repo, &["rev-parse", "HEAD"]).unwrap()
+    );
+    assert_ne!(updated.revision, reference.revision);
+    assert!(!updated.checkout.exists());
+}
+
+#[test]
+fn upstream_reference_requires_a_stable_release_without_falling_back_to_main() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = repository(temp.path(), "fork", "unreleased\n");
+    git(&repo, &["update-ref", "refs/remotes/upstream/main", "HEAD"]).unwrap();
+    git(&repo, &["tag", "rust-v0.11.0-alpha.1"]).unwrap();
+    let error = super::resolve_reference(&repo, None, temp.path().join("missing")).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("no local stable upstream release tag")
+    );
     assert!(error.to_string().contains("no automatic fetch"));
     assert!(!temp.path().join("missing").exists());
 }
@@ -621,8 +681,7 @@ fn base_configuration_contains_exactly_the_approved_settings() {
     let expected = json!({
         "approval_policy":"never", "sandbox_mode":"danger-full-access", "personality":"pragmatic",
         "model":"gpt-6-astra", "model_reasoning_effort":"high",
-        "plan_mode_reasoning_effort":"ultra", "model_verbosity":"low", "model_reasoning_summary":"concise",
-        "model_auto_compact_token_limit":129000, "model_auto_compact_token_limit_scope":"total"
+        "plan_mode_reasoning_effort":"ultra", "model_verbosity":"low", "model_reasoning_summary":"concise"
     });
     assert_eq!(
         actual, expected,
@@ -920,6 +979,32 @@ fn reused_build_reports_lookup_time_without_replacing_original_build_time() {
         record_bytes,
         "reusing a build must preserve its original timing record"
     );
+    // A new preparation has a different source path but the same released inputs.
+    // No Cargo tool is provided: entering the build path would fail this test.
+    let next_source = temp.path().join("next-preparation/source");
+    fs::create_dir_all(next_source.join("codex-rs")).unwrap();
+    for name in ["Cargo.lock", "rust-toolchain.toml"] {
+        fs::copy(
+            source.join("codex-rs").join(name),
+            next_source.join("codex-rs").join(name),
+        )
+        .unwrap();
+    }
+    let next = builds::build(
+        &next_source,
+        "pinned-revision",
+        &target_root,
+        &environment,
+        &requested,
+    )
+    .unwrap();
+    assert_eq!(next.cache_key, original.cache_key);
+    assert_eq!(
+        next.executables["codex-app-server"].path,
+        fs::canonicalize(&artifact).unwrap()
+    );
+    assert!(next.cache_reuse_elapsed_ms.is_some());
+    assert_eq!(fs::read(&record).unwrap(), record_bytes);
     fs::write(
         source.join("codex-rs/rust-toolchain.toml"),
         "[toolchain]\nchannel = 'different-toolchain'\n",
@@ -1126,7 +1211,7 @@ fn loaded_manifest_rejects_missing_execution_inputs_before_side_effects() {
         "settings":{},"lockfile":identity,"cargoConfig":null,
         "executables":{"codex-app-server":identity},"log":sentinel,"cacheKey":"fixture",
         "buildElapsedMs":0,"cacheReuseElapsedMs":null});
-    let schedule = schedule(Mode::Fast);
+    let schedule = schedule(Mode::Fast, false);
     let fixtures: BTreeMap<_, _> = schedule
         .iter()
         .map(|attempt| {
@@ -1162,7 +1247,80 @@ fn loaded_manifest_rejects_missing_execution_inputs_before_side_effects() {
     write_json(&path, &manifest).unwrap();
     let loaded = Prepared::load(&path).unwrap();
     assert_eq!(loaded.id, "structural-fixture");
-    assert_eq!(loaded.schedule, crate::schedule::schedule(Mode::Fast));
+    assert_eq!(
+        loaded.schedule,
+        crate::schedule::schedule(Mode::Fast, false)
+    );
+
+    assert!(!loaded.fork_only_on);
+    // Omitted selection preserves an older manifest's three variants and gets
+    // as far as checking the fixture's synthetic artifact identity, without
+    // starting execution.
+    let error = crate::cli::run(vec![
+        "compare".into(),
+        "--prepared".into(),
+        path.to_string_lossy().into_owned(),
+    ])
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("changed prepared artifact"),
+        "{error:#}"
+    );
+    let error = crate::cli::run(vec![
+        "compare".into(),
+        "--prepared".into(),
+        path.to_string_lossy().into_owned(),
+        "--fork-only-on".into(),
+    ])
+    .unwrap_err();
+    assert!(error.to_string().contains("variant selection differs"));
+    assert!(!temp.path().join("runs").exists());
+
+    let mut only_on = manifest.clone();
+    only_on["forkOnlyOn"] = json!(true);
+    only_on["schedule"] = json!(crate::schedule::schedule(Mode::Fast, true));
+    for mapping in ["builds", "overrides"] {
+        only_on[mapping].as_object_mut().unwrap().remove("fork_off");
+    }
+    write_json(&path, &only_on).unwrap();
+    let selected = Prepared::load(&path).unwrap();
+    assert!(selected.fork_only_on);
+    let error = crate::cli::run(vec![
+        "compare".into(),
+        "--prepared".into(),
+        path.to_string_lossy().into_owned(),
+        "--all-variants".into(),
+    ])
+    .unwrap_err();
+    assert!(error.to_string().contains("variant selection differs"));
+    assert!(!temp.path().join("runs").exists());
+    assert_eq!(selected.schedule.len(), 86);
+    assert_eq!(
+        selected.builds.keys().copied().collect::<Vec<_>>(),
+        [Variant::ForkOn, Variant::Reference]
+    );
+    for (field, value, expected) in [
+        (
+            "schedule",
+            manifest["schedule"].clone(),
+            "workload schedule changed",
+        ),
+        ("builds", manifest["builds"].clone(), "contains fork_off"),
+        (
+            "overrides",
+            manifest["overrides"].clone(),
+            "contains fork_off",
+        ),
+    ] {
+        let mut invalid = only_on.clone();
+        invalid[field] = value;
+        write_json(&path, &invalid).unwrap();
+        let error = crate::runner::execute(&path, None, None).unwrap_err();
+        assert!(error.to_string().contains(expected), "{error:#}");
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "existing workspace");
+        assert!(!temp.path().join("workspace.lock").exists());
+        assert!(!temp.path().join("runs").exists());
+    }
 
     let mut omissions = Vec::new();
     for variant in Variant::ALL {

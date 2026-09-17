@@ -2,7 +2,8 @@ use regex::Regex;
 use std::borrow::Cow;
 use std::sync::LazyLock;
 
-static OPENAI_KEY_REGEX: LazyLock<Regex> = LazyLock::new(|| compile_regex(r"sk-[A-Za-z0-9]{20,}"));
+static OPENAI_KEY_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| compile_regex(r"sk-(?:(?:proj|svcacct)-)?[A-Za-z0-9_-]{20,}"));
 static AWS_ACCESS_KEY_ID_REGEX: LazyLock<Regex> =
     LazyLock::new(|| compile_regex(r"\bAKIA[0-9A-Z]{16}\b"));
 static BEARER_TOKEN_REGEX: LazyLock<Regex> =
@@ -52,6 +53,24 @@ fn compile_regex(pattern: &str) -> Regex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redacts_project_and_service_account_keys_in_free_text() {
+        for key in [
+            "sk-proj-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_",
+            "sk-svcacct-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH",
+            "sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH",
+        ] {
+            assert_eq!(
+                redact_secrets(format!("copied ({key}), then continued")),
+                "copied ([REDACTED_SECRET]), then continued"
+            );
+        }
+        assert_eq!(
+            redact_secrets("sk-proj-short and ordinary text".to_string()),
+            "sk-proj-short and ordinary text"
+        );
+    }
 
     #[test]
     fn redacts_complete_quoted_and_bearer_values_without_consuming_delimiters() {

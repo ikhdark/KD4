@@ -328,6 +328,13 @@ async fn probe(configure_turn: impl FnOnce(&mut TurnContext)) -> ToolPlanProbe {
 }
 
 #[tokio::test]
+async fn read_file_is_visible_and_registered_for_text_models() {
+    let plan = probe(|turn| turn.model_info.input_modalities = vec![InputModality::Text]).await;
+    plan.assert_visible_contains(&["read_file"]);
+    plan.assert_registered_contains(&["read_file"]);
+}
+
+#[tokio::test]
 async fn update_plan_is_not_exposed_or_registered_in_plan_mode() {
     let default_mode = probe(|_| {}).await;
     default_mode.assert_visible_contains(&["update_plan"]);

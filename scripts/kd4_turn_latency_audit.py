@@ -1131,6 +1131,8 @@ def _behavior_metrics(report: dict[str, Any], records: list[dict[str, Any]]) -> 
         "userInputWaitCount", "mcpElicitationWaitCount",
         "toolOutputCanonicalTokenCount", "toolOutputModelTokenCount",
         "toolOutputRecoveryCallCount", "toolOutputRecoveryRetruncationCount",
+        "toolOutputArtifactCreationCount", "toolOutputArtifactReuseCount",
+        "toolOutputOmittedSectionCount", "attributableRecoveryGenerationCount",
     ):
         reason = None
         if not complete_timing:
@@ -1143,7 +1145,7 @@ def _behavior_metrics(report: dict[str, Any], records: list[dict[str, Any]]) -> 
             reason = "saturated_counters"
         # Some runtime counters saturate directly without incrementing the
         # profile's saturationCount. Their maximum is only a lower bound.
-        elif any(counter[key] >= (2 ** (64 if key.endswith(("Ns", "TokenCount")) else 32) - 1) for counter in counters):
+        elif any(counter[key] >= (2 ** (64 if key.endswith(("Ns", "TokenCount")) or key == "toolOutputOmittedSectionCount" else 32) - 1) for counter in counters):
             reason = "saturated_counters"
         metrics[key] = sum(counter[key] for counter in counters) if reason is None else None
         if reason:
@@ -1154,6 +1156,26 @@ def _behavior_metrics(report: dict[str, Any], records: list[dict[str, Any]]) -> 
         unavailable["totalTokens"] = "token_analysis_disabled" if not report["tokenAnalysisEnabled"] else "incomplete_token_coverage"
     return {
         "behaviorSchemaVersion": BEHAVIOR_SCHEMA_VERSION,
+        "evidenceMeta": {
+            "schemaVersion": 1,
+            "producer": "kd4_turn_latency_audit",
+            "operation": "behavior_metrics",
+            "evidenceBearing": any(value is not None for value in metrics.values()),
+            "payloadCompleteness": "complete" if not unavailable else "partial" if any(value is not None for value in metrics.values()) else "unknown",
+            "truncated": False,
+            "approximate": True,
+            "limitations": [
+                "Discovery recognizes call text heuristically; unmatched calls may contain discovery.",
+                "Counters cover captured complete turns; child-thread coverage and task quality are unknown.",
+                "Output tokens are estimates; recovery generations establish sequence, not causality.",
+            ],
+            "snapshot": "sha256:" + hashlib.sha256(json.dumps(
+                [(row["sha256"], row["byteLength"]) for row in coverage["snapshots"]],
+                separators=(",", ":"),
+            ).encode()).hexdigest() if coverage["snapshots"] else None,
+        },
+        "discoveryClassifierVersion": 1,
+        "configuration": report["runnerDiagnostics"]["configuration"],
         "metrics": metrics,
         "unavailableReasons": unavailable,
         "measurementNote": (
@@ -1414,6 +1436,8 @@ def analyze_session_path(source: Path | None, repo_root: Path, *, include_tokens
                             }
                         )
                 turn_id = payload.get("turn_id")
+                if turn_id and len(files) > 1:
+                    turn_id = json.dumps([str(file), str(turn_id)], separators=(",", ":"))
                 if payload_type == "task_started" and turn_id:
                     turn_id = str(turn_id)
                     active_turn_id = turn_id
@@ -1450,6 +1474,7 @@ def analyze_session_path(source: Path | None, repo_root: Path, *, include_tokens
                 record = _terminal_record(
                     file, line_number, item.get("timestamp"), cwd, payload
                 )
+                record["turn_id"] = turn_id
                 terminal_lifecycle_counts[record["lifecycle"]] += 1
                 timing = record["timing"]
                 if not isinstance(timing, dict):
@@ -2143,29 +2168,18 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
             bounded_population.pop(key, None)
         if name == "all":
             bounded_population.pop("toolRelay", None)
-        else:
-            bounded_population = {
-                key: bounded_population[key]
-                for key in (
-                    "turns",
-                    "statusCounts",
-                    "machineDurationNs",
-                    "modelOnlyNs",
-                    "toolOnlyNs",
-                    "orchestrationNs",
-                    "interactiveOnlyWaitNs",
-                    "interactiveWaitUnionNs",
-                    "modelToolRatio",
-                    "decisionLatency",
-                    "tokens",
-                    "observationalNonprogressLatency",
-                    "observationalNonprogressTokens",
-                    "waitOnlyGenerationCount",
-                    "internallyDrainedWaitCount",
-                    "provenLoopActivationCount",
-                )
-                if key in bounded_population
-            }
+        # Apply the same display budget to the all-turns population.
+        bounded_population = {
+            key: bounded_population[key]
+            for key in (
+                "turns", "statusCounts", "machineDurationNs", "modelOnlyNs",
+                "toolOnlyNs", "orchestrationNs", "interactiveOnlyWaitNs",
+                "interactiveWaitUnionNs", "modelToolRatio", "modelShare", "decisionLatency",
+                "tokens", "observationalNonprogressLatency", "observationalNonprogressTokens",
+                "waitOnlyGenerationCount", "internallyDrainedWaitCount", "provenLoopActivationCount",
+            )
+            if key in bounded_population
+        }
         bounded_populations[name] = bounded_population
     first_useful = report["firstUsefulActionAnalysis"]
     canonical_actions = first_useful["canonical"]
@@ -2298,7 +2312,7 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
     runner = report.get("runnerDiagnostics", {})
     result["runnerDiagnostics"] = {key: runner.get(key) for key in (
         "schemaVersion", "attemptId", "status", "elapsedMs", "coverage", "logicalGenerations",
-        "physicalRequests", "directToolCount", "nestedToolCount", "cacheHitRate", "lastProgress", "toolDispatch", "requestRetention")}
+        "physicalRequests", "directToolCount", "nestedToolCount", "cacheHitRate", "lastProgress", "toolDispatch", "requestRetention", "configuration")}
     activity = runner.get("toolActivity", {})
     result["runnerDiagnostics"]["toolActivity"] = {key: value for key, value in activity.items() if key not in ("turns", "measurementNote")}
     result["runnerDiagnostics"]["toolActivity"]["omittedTurns"] = len(activity.get("turns", []))
@@ -2307,6 +2321,11 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
         result["runnerDiagnostics"][key] = rows[:8]
         result["runnerDiagnostics"]["omitted" + key[0].upper() + key[1:]] = max(0, len(rows) - 8)
     result = compact_tokens(result)
+    # Retain nonzero and unavailable phases; full JSON keeps the phase vocabulary.
+    relay = result["toolRelay"]
+    phases = relay.get("phaseTotalsMs", {})
+    relay["phaseTotalsMs"] = {key: value for key, value in phases.items() if value != 0}
+    relay["omittedZeroPhases"] = sum(value == 0 for value in phases.values())
     # Preserve the explicit available/null distinction for request volume.
     result["runnerDiagnostics"]["capturedRequests"] = compact_tokens(runner.get("capturedRequests"))
     if "startupTiming" in report:

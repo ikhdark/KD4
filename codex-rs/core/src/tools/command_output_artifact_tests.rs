@@ -784,6 +784,63 @@ async fn artifact_recovery_search_returns_batched_exact_selectors_and_continuati
 
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
+async fn artifact_recovery_search_preserves_nonoverlapping_utf8_byte_offsets() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let canonical = CanonicalToolResult::text("éaaaaa\néaaa\n");
+    let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
+    let artifact_id = artifact.artifact_id().expect("canonical artifact ID");
+    let indexed = read_tool_output_selectors(
+        temp.path(),
+        "thread",
+        &artifact_id,
+        vec![ToolOutputSelector::Search {
+            query: "aa".to_string(),
+            start_byte: 0,
+            max_results: 2,
+            context_lines: 0,
+        }],
+    )
+    .await
+    .expect("search canonical artifact");
+    let result = &indexed.results[0];
+    assert_eq!(result.status, ToolOutputSelectorStatus::Ok);
+    let value = result.value.as_ref().expect("search results");
+    assert_eq!(value["total_matches"], 3);
+    assert_eq!(value["matches_returned"], 2);
+    assert_eq!(
+        value["matches"],
+        serde_json::json!([
+            {"line": 1, "end_line": 1, "start_byte": 2, "end_byte": 4},
+            {"line": 1, "end_line": 1, "start_byte": 4, "end_byte": 6},
+        ]),
+    );
+    assert_eq!(value["hydrated_ranges"][0]["text"], "éaaaaa\n");
+    let continuation = result.continuation.clone().expect("search continuation");
+    assert!(matches!(
+        continuation,
+        ToolOutputSelector::Search { start_byte: 6, .. }
+    ));
+
+    let resumed =
+        read_tool_output_selectors(temp.path(), "thread", &artifact_id, vec![continuation])
+            .await
+            .expect("resume search");
+    let result = &resumed.results[0];
+    assert!(result.complete);
+    assert_eq!(result.continuation, None);
+    let value = result.value.as_ref().expect("resumed search results");
+    assert_eq!(value["total_matches"], 1);
+    assert_eq!(
+        value["matches"],
+        serde_json::json!([
+            {"line": 2, "end_line": 2, "start_byte": 10, "end_byte": 12},
+        ]),
+    );
+    assert_eq!(value["hydrated_ranges"][0]["text"], "éaaa\n");
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn artifact_recovery_search_page_fits_its_ceiling_and_advances() {
     let temp = tempfile::tempdir().expect("tempdir");
     let canonical = CanonicalToolResult::text(
@@ -1767,6 +1824,23 @@ async fn indexed_retention_scans_only_at_configured_boundaries() {
     assert_eq!(at_127.logical_mutations, 127);
     assert_eq!(at_131.logical_mutations, 131);
     assert_eq!(at_131.evictions, 3);
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn inline_streaming_output_creates_no_artifact() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = Arc::new(Mutex::new(RawOutputArtifact::pending(
+        temp.path(),
+        "thread",
+    )));
+    let mut writer = RawOutputArtifactWriter::open(Some(&state))
+        .await
+        .expect("writer");
+    writer.write_chunk(Some(&state), b"small output\n").await;
+    writer.finish(Some(&state)).await;
+    assert!(state.lock().await.is_pending());
+    assert!(!temp.path().join("tool-output").exists());
 }
 
 #[tokio::test]

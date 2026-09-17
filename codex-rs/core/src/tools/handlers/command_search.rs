@@ -3,8 +3,11 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use sha2::Digest;
@@ -74,7 +77,6 @@ pub(crate) fn classify_rg_search_with_repository(
     let mut search_identities = Vec::new();
     let mut all_targets = Vec::new();
     let mut explicit_input_files = Vec::new();
-    let mut owner_scopes = Vec::new();
     let mut repository_wide = false;
     for (argv, roles) in &rg_commands {
         let path_indices = &roles.path_indices;
@@ -98,10 +100,7 @@ pub(crate) fn classify_rg_search_with_repository(
         targets.sort_unstable();
         targets.dedup();
         for target in &targets {
-            match repository_owner_scope(target, &repository_root) {
-                Some(owner_scope) => owner_scopes.push(owner_scope),
-                None => repository_wide = true,
-            }
+            repository_wide |= target == &repository_root || !target.starts_with(&repository_root);
         }
         all_targets.extend(targets.iter().cloned());
         explicit_input_files.extend(roles.input_files.iter().map(|value| {
@@ -121,9 +120,6 @@ pub(crate) fn classify_rg_search_with_repository(
     }
     all_targets.sort_unstable();
     all_targets.dedup();
-    owner_scopes.sort_unstable();
-    owner_scopes.dedup();
-    repository_wide |= owner_scopes.len() > 1;
     let scope_identity = path_scope_identity(&all_targets);
     let parent_scope_identity = parent_scope_identity(&all_targets, &repository_root);
     let state_paths = search_state_paths(&all_targets, &explicit_input_files, &repository_root);
@@ -154,6 +150,8 @@ pub(crate) fn classify_rg_search_with_repository(
 // This optional cache must not turn a cheap search into an unbounded filesystem scan.
 const SEARCH_SNAPSHOT_MAX_ENTRIES: usize = 512;
 const SEARCH_SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(10);
+static SEARCH_SNAPSHOT_WORKERS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(2)));
 
 struct SearchSnapshotBudget {
     remaining: usize,
@@ -177,17 +175,46 @@ impl SearchSnapshotBudget {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn observe_rg_search_scope_state(search: &mut RgSearchNarrowing) {
-    observe_rg_search_scope_state_with(search, capture_search_scope_state).await;
+    // Direct identity tests isolate admission; production shares the bounded pool.
+    observe_rg_search_scope_state_with(
+        search,
+        false,
+        Arc::new(Semaphore::new(1)),
+        capture_search_scope_state,
+    )
+    .await;
+}
+
+pub(crate) async fn observe_rg_search_scope_state_with_freshness(
+    search: &mut RgSearchNarrowing,
+    force_fresh: bool,
+) {
+    observe_rg_search_scope_state_with(
+        search,
+        force_fresh,
+        Arc::clone(&SEARCH_SNAPSHOT_WORKERS),
+        capture_search_scope_state,
+    )
+    .await;
 }
 
 async fn observe_rg_search_scope_state_with(
     search: &mut RgSearchNarrowing,
+    force_fresh: bool,
+    workers: Arc<Semaphore>,
     mut capture: impl FnMut(&[PathBuf], &mut SearchSnapshotBudget) -> Option<String> + Send + 'static,
 ) {
-    if !search.can_record_miss {
+    search.scope_state_identity = None;
+    if force_fresh || !search.can_record_miss {
         return;
     }
+    // Cache preparation is optional: never queue behind a slow scan. Keep the
+    // permit on the worker until it actually exits, including after a timeout.
+    let Ok(permit) = workers.try_acquire_owned() else {
+        return;
+    };
     let state_paths = search.state_paths.clone();
     let cancellation = CancellationToken::new();
     let _cancel_on_drop = cancellation.clone().drop_guard();
@@ -197,6 +224,7 @@ async fn observe_rg_search_scope_state_with(
         cancellation,
     };
     let observation = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let first = capture(&state_paths, &mut budget)?;
         // Each traversal must be able to inspect the same scope. Retain the
         // shared deadline and cancellation so the optional cache stays bounded.
@@ -220,7 +248,25 @@ fn search_state_paths(
 ) -> Vec<PathBuf> {
     let mut paths = targets.to_vec();
     paths.extend(explicit_input_files.iter().cloned());
-    paths.push(repository_root.join(".git").join("info").join("exclude"));
+    let git_entry = repository_root.join(".git");
+    // A linked worktree's .git file names its private metadata directory;
+    // info/exclude belongs to the shared directory named by commondir.
+    let git_dir = if git_entry.is_file() {
+        paths.push(git_entry.clone());
+        std::fs::read_to_string(&git_entry)
+            .ok()
+            .and_then(|text| text.trim().strip_prefix("gitdir: ").map(str::to_owned))
+            .map(|path| repository_root.join(path))
+            .unwrap_or_else(|| git_entry.clone())
+    } else {
+        git_entry
+    };
+    let common_dir_file = git_dir.join("commondir");
+    paths.push(common_dir_file.clone());
+    let common_dir = std::fs::read_to_string(common_dir_file)
+        .map(|path| git_dir.join(path.trim()))
+        .unwrap_or(git_dir);
+    paths.push(common_dir.join("info").join("exclude"));
     for target in targets {
         let mut ancestor = if target.is_dir() {
             Some(target.as_path())
@@ -462,18 +508,6 @@ fn rg_query_identity(argv: &[String], path_indices: &[usize]) -> String {
         .join("\u{1e}")
 }
 
-fn repository_owner_scope(target: &Path, repository_root: &Path) -> Option<PathBuf> {
-    let relative = target.strip_prefix(repository_root).ok()?;
-    let mut components = relative.components();
-    let first = components.next()?.as_os_str();
-    if first.eq_ignore_ascii_case("codex-rs") {
-        let second = components.next()?.as_os_str();
-        Some(repository_root.join(first).join(second))
-    } else {
-        Some(repository_root.join(first))
-    }
-}
-
 fn path_scope_identity(targets: &[PathBuf]) -> String {
     targets
         .iter()
@@ -498,7 +532,12 @@ fn parent_scope_identity(targets: &[PathBuf], repository_root: &Path) -> Option<
 fn normalized_search_path(path: &Path) -> PathBuf {
     #[cfg(test)]
     SEARCH_PATH_NORMALIZATION_COUNT.with(|count| count.set(count.get() + 1));
-    std::fs::canonicalize(path).unwrap_or_else(|_| {
+    // A target that does not exist yet falls back to lexical normalization, so
+    // canonicalization must not add a `\\?\` verbatim prefix the fallback lacks.
+    // Breadth compares these paths against the repository root, and the two
+    // spellings never share a prefix: a not-yet-created path inside the
+    // repository would otherwise be misread as a repository-wide search.
+    dunce::canonicalize(path).unwrap_or_else(|_| {
         let mut normalized = PathBuf::new();
         for component in path.components() {
             match component {
@@ -632,6 +671,161 @@ impl<'a> RgArgumentRoles<'a> {
 mod deadline_tests {
     use super::*;
 
+    #[test]
+    fn linked_worktree_snapshot_tracks_shared_exclude_and_gitdir_redirects() {
+        let fixture = tempfile::tempdir().unwrap();
+        let main_git = fixture.path().join("main/.git");
+        let worktree_git = main_git.join("worktrees/linked");
+        let linked = fixture.path().join("linked");
+        std::fs::create_dir_all(main_git.join("info")).unwrap();
+        std::fs::create_dir_all(&worktree_git).unwrap();
+        std::fs::create_dir_all(linked.join("src")).unwrap();
+        std::fs::write(linked.join("src/file.txt"), "needle").unwrap();
+        std::fs::write(
+            linked.join(".git"),
+            "gitdir: ../main/.git/worktrees/linked\n",
+        )
+        .unwrap();
+        std::fs::write(worktree_git.join("commondir"), "../..\n").unwrap();
+        let exclude = main_git.join("info/exclude");
+        std::fs::write(&exclude, "file.txt\n").unwrap();
+        let snapshot = || {
+            let search = classify_rg_search_narrowing(
+                &["rg".into(), "needle".into(), "src".into()],
+                None,
+                &linked,
+                &linked,
+            )
+            .unwrap()
+            .unwrap();
+            capture_search_scope_state(
+                &search.state_paths,
+                &mut SearchSnapshotBudget {
+                    remaining: SEARCH_SNAPSHOT_MAX_ENTRIES,
+                    deadline: Instant::now() + Duration::from_secs(10),
+                    cancellation: CancellationToken::new(),
+                },
+            )
+            .expect("small linked worktree has complete scope evidence")
+        };
+        let before = snapshot();
+        std::fs::write(&exclude, "another-file.txt\n").unwrap();
+        assert_ne!(
+            before,
+            snapshot(),
+            "the shared exclude changes search results"
+        );
+        let before_redirect = snapshot();
+        std::fs::write(worktree_git.join("commondir"), "../../alternate\n").unwrap();
+        assert_ne!(
+            before_redirect,
+            snapshot(),
+            "metadata redirects are dependencies too"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicitly_fresh_search_skips_scope_capture() {
+        let command = vec!["rg".to_string(), "needle".to_string(), "src".to_string()];
+        let mut search = classify_rg_search_narrowing(
+            &command,
+            None,
+            Path::new("workspace"),
+            Path::new("workspace"),
+        )
+        .unwrap()
+        .unwrap();
+        search.scope_state_identity = Some("old evidence".to_string());
+        let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_captures = Arc::clone(&captures);
+        observe_rg_search_scope_state_with(
+            &mut search,
+            true,
+            Arc::new(Semaphore::new(1)),
+            move |_, _| {
+                captures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some("unexpected scan".to_string())
+            },
+        )
+        .await;
+        assert_eq!(search.scope_state_identity, None);
+        assert_eq!(
+            observed_captures.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(search.breadth, RgSearchBreadth::Narrow);
+    }
+
+    #[tokio::test]
+    async fn timed_out_worker_keeps_admission_until_it_exits() {
+        let command = vec!["rg".to_string(), "needle".to_string(), "src".to_string()];
+        let mut search = classify_rg_search_narrowing(
+            &command,
+            None,
+            Path::new("workspace"),
+            Path::new("workspace"),
+        )
+        .unwrap()
+        .unwrap();
+        let mut next_search = search.clone();
+        let workers = Arc::new(Semaphore::new(1));
+        let scan_workers = Arc::clone(&workers);
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let mut started = Some(started);
+        let observation = tokio::spawn(async move {
+            observe_rg_search_scope_state_with(
+                &mut search,
+                false,
+                scan_workers,
+                move |_, budget| {
+                    if let Some(started) = started.take() {
+                        let _ = started.send(());
+                        blocked.recv().unwrap();
+                    }
+                    budget.check().ok()?;
+                    Some("late evidence".to_string())
+                },
+            )
+            .await;
+            search
+        });
+        ready.await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), observation).await;
+        let available_while_blocked = workers.available_permits();
+        let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_captures = Arc::clone(&captures);
+        let second = tokio::time::timeout(
+            Duration::from_secs(1),
+            observe_rg_search_scope_state_with(
+                &mut next_search,
+                false,
+                Arc::clone(&workers),
+                move |_, _| {
+                    captures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Some("unexpected scan".to_string())
+                },
+            ),
+        )
+        .await;
+        // Release blocked I/O before any assertions, even if admission regresses.
+        let _ = release.send(());
+        assert_eq!(result.unwrap().unwrap().scope_state_identity, None);
+        assert_eq!(available_while_blocked, 0);
+        second.expect("saturated admission must skip optional work without waiting");
+        assert_eq!(
+            observed_captures.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(next_search.scope_state_identity, None);
+        let permit = tokio::time::timeout(Duration::from_secs(1), workers.acquire())
+            .await
+            .expect("worker exit must release admission")
+            .unwrap();
+        drop(permit);
+        assert_eq!(workers.available_permits(), 1);
+    }
+
     #[tokio::test]
     async fn stable_scope_can_use_the_full_entry_budget_in_both_captures() {
         let command = vec!["rg".to_string(), "needle".to_string(), "src".to_string()];
@@ -644,12 +838,17 @@ mod deadline_tests {
         .unwrap()
         .unwrap();
 
-        observe_rg_search_scope_state_with(&mut search, |_, budget| {
-            for _ in 0..SEARCH_SNAPSHOT_MAX_ENTRIES {
-                budget.check().ok()?;
-            }
-            Some("stable scope".to_string())
-        })
+        observe_rg_search_scope_state_with(
+            &mut search,
+            false,
+            Arc::new(Semaphore::new(1)),
+            |_, budget| {
+                for _ in 0..SEARCH_SNAPSHOT_MAX_ENTRIES {
+                    budget.check().ok()?;
+                }
+                Some("stable scope".to_string())
+            },
+        )
         .await;
 
         assert_eq!(search.scope_state_identity.as_deref(), Some("stable scope"));
@@ -668,11 +867,16 @@ mod deadline_tests {
         .unwrap();
         let captures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed_captures = std::sync::Arc::clone(&captures);
-        observe_rg_search_scope_state_with(&mut search, move |_, budget| {
-            budget.check().ok()?;
-            let capture_number = captures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Some(format!("scope revision {capture_number}"))
-        })
+        observe_rg_search_scope_state_with(
+            &mut search,
+            false,
+            Arc::new(Semaphore::new(1)),
+            move |_, budget| {
+                budget.check().ok()?;
+                let capture_number = captures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(format!("scope revision {capture_number}"))
+            },
+        )
         .await;
 
         assert_eq!(
@@ -700,17 +904,22 @@ mod deadline_tests {
         let mut started = Some(started);
         let mut finished = Some(finished);
         let observation = tokio::spawn(async move {
-            observe_rg_search_scope_state_with(&mut search, move |_, budget| {
-                if let Some(started) = started.take() {
-                    let _ = started.send(());
-                    blocked.recv().unwrap();
-                    let _ = finished
-                        .take()
-                        .unwrap()
-                        .send(budget.cancellation.is_cancelled());
-                }
-                Some("late evidence".to_string())
-            })
+            observe_rg_search_scope_state_with(
+                &mut search,
+                false,
+                Arc::new(Semaphore::new(1)),
+                move |_, budget| {
+                    if let Some(started) = started.take() {
+                        let _ = started.send(());
+                        blocked.recv().unwrap();
+                        let _ = finished
+                            .take()
+                            .unwrap()
+                            .send(budget.cancellation.is_cancelled());
+                    }
+                    Some("late evidence".to_string())
+                },
+            )
             .await;
             search
         });

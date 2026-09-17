@@ -574,6 +574,12 @@ async fn duplicate_mcp_servers_resolve_after_auth_dependent_app_routing() {
     write_auth_projection_plugin_with_server(codex_home.path(), "alpha", "shared", Some("shared"));
     write_auth_projection_plugin_with_server(codex_home.path(), "beta", "shared", None);
     write_file(
+        &codex_home
+            .path()
+            .join("plugins/cache/test/beta/local/.mcp.json"),
+        r#"{"mcpServers":{"shared":{"type":"stdio","command":"shared-server"},"unique":{"type":"stdio","command":"unique-server"}}}"#,
+    );
+    write_file(
         &codex_home.path().join(CONFIG_TOML_FILE),
         r#"[features]
 plugins = true
@@ -613,8 +619,19 @@ enabled = true
         assert_eq!(owners, vec![expected_owner]);
         assert_eq!(
             sorted_effective_mcp_server_names(&outcome),
-            vec!["shared".to_string()]
+            vec!["shared".to_string(), "unique".to_string()]
         );
+        let expected_warnings = if auth_mode == AuthMode::ApiKey {
+            vec!["Plugin `beta@test` cannot provide MCP server `shared` because plugin `alpha@test` already provides that name. Other plugin capabilities remain available.".to_string()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(outcome.load_warnings(), expected_warnings);
+        assert_eq!(
+            manager.plugins_for_config(&config).await.load_warnings(),
+            expected_warnings
+        );
+        assert!(outcome.plugins().iter().all(LoadedPlugin::is_active));
     }
 }
 
@@ -6717,10 +6734,26 @@ fn async_marketplace_listing_yields_and_preserves_catalog_results() {
         worker.await.unwrap();
         let outcome = listing.await.unwrap();
         assert!(outcome.errors.is_empty());
-        assert_eq!(outcome.marketplaces.len(), 1);
+        // The personal marketplace is discovered from the OS home directory,
+        // not from this temporary codex home, so it may also be listed here.
+        // The subject is that the curated catalog survives the yield intact.
+        let names = outcome
+            .marketplaces
+            .iter()
+            .map(|marketplace| marketplace.name.clone())
+            .collect::<Vec<_>>();
+        let curated = outcome
+            .marketplaces
+            .iter()
+            .find(|marketplace| marketplace.name == OPENAI_CURATED_MARKETPLACE_NAME)
+            .unwrap_or_else(|| panic!("curated marketplace missing from {names:?}"));
         assert_eq!(
-            outcome.marketplaces[0].plugins[0].id,
-            "slack@openai-curated"
+            curated
+                .plugins
+                .iter()
+                .map(|plugin| plugin.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["slack@openai-curated"]
         );
     });
 }

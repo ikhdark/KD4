@@ -49,6 +49,34 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use tempfile::tempdir;
 
+#[test]
+fn collection_error_preserves_operation_and_root_cause() {
+    let error = McpServerCollectionError::new(
+        "files".to_string(),
+        format!(
+            "list resources:\n{}\tpermission denied (os error 5)",
+            "路径".repeat(200)
+        ),
+    );
+    assert_eq!(error.server, "files");
+    assert!(error.message.starts_with("list resources: "));
+    assert!(error.message.ends_with(" permission denied (os error 5)"));
+    assert!(error.message.contains(" … "));
+    assert_eq!(
+        error.message.chars().count(),
+        MAX_MCP_SERVER_COLLECTION_ERROR_CHARS
+    );
+    assert_eq!(sanitize_server_collection_error(" \n\t"), "request failed");
+    assert_eq!(
+        sanitize_server_collection_error("short\n error"),
+        "short error"
+    );
+    assert_eq!(
+        sanitize_server_collection_error("x".repeat(240)),
+        "x".repeat(240)
+    );
+}
+
 fn create_test_tool(server_name: &str, tool_name: &str) -> ToolInfo {
     ToolInfo {
         server_name: server_name.to_string(),

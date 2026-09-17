@@ -58,14 +58,7 @@ impl AgentsMdState {
         freshness: AgentsMdFreshness,
     ) -> Self {
         Self {
-            instructions: instructions.map(|mut instructions| {
-                instructions.text = format!(
-                    "{}\n\n{}",
-                    freshness.model_visible_description(),
-                    instructions.text
-                );
-                instructions
-            }),
+            instructions,
             freshness,
         }
     }
@@ -79,7 +72,12 @@ impl WorldStateSection for AgentsMdState {
         match &self.instructions {
             Some(instructions) => AgentsMdSnapshot {
                 directory: instructions.directory.clone(),
-                text: Some(instructions.text.clone()),
+                // Preserve the persisted format used by existing rollout baselines.
+                text: Some(format!(
+                    "{}\n\n{}",
+                    self.freshness.model_visible_description(),
+                    instructions.text
+                )),
                 freshness: self.freshness,
             },
             None => AgentsMdSnapshot {
@@ -111,13 +109,13 @@ impl WorldStateSection for AgentsMdState {
             && let Some(current_body) = instruction_body(&current)
             && instruction_body(previous) == Some(current_body)
         {
-            return Some(Box::new(UserInstructions {
+            let instructions = UserInstructions {
                 directory: current.directory,
-                text: format!(
-                    "AGENTS.md observation update: {}\nThe previously provided instruction body is unchanged.",
-                    current.freshness.model_visible_description(),
-                ),
-            }));
+                text: "The previously provided instruction body is unchanged.".to_string(),
+            };
+            return Some(Box::new(instructions.with_observation(
+                current.freshness.model_visible_description(),
+            )));
         }
 
         let previous_may_contain_instructions = match previous {
@@ -133,14 +131,13 @@ impl WorldStateSection for AgentsMdState {
             (Some(instructions), false) => instructions.clone(),
             (None, true) => UserInstructions {
                 directory: None,
-                text: format!(
-                    "{}\n\n{REMOVAL_NOTICE}",
-                    self.freshness.model_visible_description()
-                ),
+                text: REMOVAL_NOTICE.to_string(),
             },
             (None, false) => return None,
         };
-        Some(Box::new(instructions))
+        Some(Box::new(instructions.with_observation(
+            self.freshness.model_visible_description(),
+        )))
     }
 }
 

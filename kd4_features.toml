@@ -1,5 +1,7 @@
 schema_version = 2
 fork = "KD4"
+# Feature comparison baseline. This is independent of the later upstream mirror
+# audit pinned in SOURCEMAP.md; it does not select the checkout or sync revision.
 upstream_commit = "9e552e9d15ba52bed7077d5357f3e18e330f8f38"
 status_semantics = "implementation_lifecycle"
 

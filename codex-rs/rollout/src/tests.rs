@@ -1894,3 +1894,124 @@ async fn created_time_continuation_and_ascending_start_cross_scan_cap() {
     assert_eq!(page.items[0].thread_id, Some(thread_id_from_uuid(oldest)));
     assert!(page.num_scanned_files <= 2);
 }
+
+#[tokio::test]
+async fn filesystem_listing_reaches_threads_beyond_the_former_scan_cap() {
+    use crate::list::ThreadListConfig;
+    use crate::list::ThreadListLayout;
+    use crate::list::get_threads_in_root;
+    use crate::list::get_threads_in_root_ascending;
+
+    let temp = TempDir::new().unwrap();
+    let recent = temp.path().join("sessions/2026/01/01");
+    fs::create_dir_all(&recent).unwrap();
+    // Empty rollouts cannot produce list items. The matching sessions must still
+    // be reachable after these candidates, including on the initial page.
+    for index in 0..10_000 {
+        fs::write(
+            recent.join(format!(
+                "rollout-2026-01-01T00-00-00-{}.jsonl",
+                Uuid::from_u128(index)
+            )),
+            b"",
+        )
+        .unwrap();
+    }
+    let ids = [Uuid::from_u128(10_001), Uuid::from_u128(10_002)];
+    for (index, id) in ids.iter().enumerate() {
+        write_session_file(
+            temp.path(),
+            &format!("2025-01-0{}T00-00-00", index + 1),
+            *id,
+            1,
+            Some(SessionSource::Cli),
+        )
+        .unwrap();
+    }
+
+    let nested = temp.path().join("sessions");
+    // Exercise both the active-session layout and the flat archive layout with
+    // the same independently expected ordering and exclusive cursor boundary.
+    let flat = temp.path().join("archived_sessions");
+    fs::create_dir_all(&flat).unwrap();
+    for day in [recent, nested.join("2025/01/01"), nested.join("2025/01/02")] {
+        for entry in fs::read_dir(day).unwrap() {
+            let entry = entry.unwrap();
+            fs::hard_link(entry.path(), flat.join(entry.file_name())).unwrap();
+        }
+    }
+    for (root, layout) in [
+        (nested, ThreadListLayout::NestedByDate),
+        (flat, ThreadListLayout::Flat),
+    ] {
+        for sort_key in [
+            ThreadSortKey::CreatedAt,
+            ThreadSortKey::UpdatedAt,
+            ThreadSortKey::RecencyAt,
+        ] {
+            for ascending in [false, true] {
+                let expected = if ascending { ids } else { [ids[1], ids[0]] };
+                let mut cursor = None;
+                for (index, expected_id) in expected.into_iter().enumerate() {
+                    let config = ThreadListConfig {
+                        allowed_sources: &[],
+                        model_providers: None,
+                        cwd_filters: None,
+                        default_provider: TEST_PROVIDER,
+                        layout,
+                    };
+                    let page = if ascending {
+                        get_threads_in_root_ascending(
+                            root.clone(),
+                            1,
+                            cursor.as_ref(),
+                            sort_key,
+                            config,
+                        )
+                        .await
+                    } else {
+                        get_threads_in_root(root.clone(), 1, cursor.as_ref(), sort_key, config)
+                            .await
+                    }
+                    .unwrap();
+                    assert_eq!(page.items.len(), 1, "{layout:?} {sort_key:?} {ascending}");
+                    assert_eq!(
+                        page.items[0].thread_id,
+                        Some(thread_id_from_uuid(expected_id))
+                    );
+                    assert!(!page.reached_scan_cap);
+                    if index == 0 {
+                        assert!(page.next_cursor.is_some());
+                    }
+                    cursor = page.next_cursor;
+                }
+                // Created/updated traversal may offer one final empty page if
+                // invalid candidates follow the last matching item.
+                if let Some(cursor) = cursor {
+                    let config = ThreadListConfig {
+                        allowed_sources: &[],
+                        model_providers: None,
+                        cwd_filters: None,
+                        default_provider: TEST_PROVIDER,
+                        layout,
+                    };
+                    let page = if ascending {
+                        get_threads_in_root_ascending(
+                            root.clone(),
+                            1,
+                            Some(&cursor),
+                            sort_key,
+                            config,
+                        )
+                        .await
+                    } else {
+                        get_threads_in_root(root.clone(), 1, Some(&cursor), sort_key, config).await
+                    }
+                    .unwrap();
+                    assert!(page.items.is_empty());
+                    assert!(page.next_cursor.is_none());
+                }
+            }
+        }
+    }
+}

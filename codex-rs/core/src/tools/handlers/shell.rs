@@ -308,6 +308,18 @@ impl ToolOutput for LegacyShellToolOutput {
             && !diagnostics.is_empty()
         {
             const VALIDATION_DIAGNOSTICS_ID: &str = "validation:diagnostics";
+            let range = validation_diagnostic_range(VALIDATION_DIAGNOSTICS_ID, canonical_output);
+            let diagnostics = range.as_ref().map_or_else(
+                || diagnostics.to_string(),
+                |range| {
+                    diagnostics
+                        .lines()
+                        .skip(range.start_line - 1)
+                        .take(range.end_line - range.start_line + 1)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                },
+            );
             metadata.fragments.insert(
                 1,
                 ToolOutputProjectionFragment::new(
@@ -316,9 +328,7 @@ impl ToolOutput for LegacyShellToolOutput {
                 )
                 .with_id(VALIDATION_DIAGNOSTICS_ID),
             );
-            if let Some(range) =
-                validation_diagnostic_range(VALIDATION_DIAGNOSTICS_ID, canonical_output)
-            {
+            if let Some(range) = range {
                 metadata.predetermined_ranges.push(range);
             }
         }
@@ -384,19 +394,50 @@ fn validation_diagnostic_range(
     const MAX_DIAGNOSTIC_BYTES: usize = 12 * 1024;
     const MAX_DIAGNOSTIC_LINES: usize = 200;
 
-    if id.is_empty() || canonical_output.is_empty() || canonical_output.len() > MAX_DIAGNOSTIC_BYTES
-    {
+    if id.is_empty() || canonical_output.is_empty() {
         return None;
     }
     let text = std::str::from_utf8(canonical_output).ok()?;
-    let line_count = text.lines().count();
-    if line_count == 0 || line_count > MAX_DIAGNOSTIC_LINES {
+    let lines = text.lines().collect::<Vec<_>>();
+    let start =
+        if canonical_output.len() <= MAX_DIAGNOSTIC_BYTES && lines.len() <= MAX_DIAGNOSTIC_LINES {
+            0
+        } else {
+            // Recover a bounded, exact range around the first compiler/test failure
+            // even when the complete output is too large to keep inline.
+            lines
+                .iter()
+                .position(|line| {
+                    let line = line.trim_start();
+                    line.starts_with("error:")
+                        || line.starts_with("error[")
+                        || line.starts_with("error ")
+                        || line.starts_with("fatal:")
+                        || line.starts_with("FAIL [")
+                        || line.contains(" panicked at ")
+                })
+                .unwrap_or_else(|| lines.len().saturating_sub(MAX_DIAGNOSTIC_LINES))
+        };
+    let mut bytes = 0_usize;
+    let count = lines
+        .iter()
+        .skip(start)
+        .take(MAX_DIAGNOSTIC_LINES)
+        .enumerate()
+        .take_while(|(index, line)| {
+            bytes = bytes
+                .saturating_add(line.len())
+                .saturating_add(usize::from(*index > 0));
+            bytes <= MAX_DIAGNOSTIC_BYTES
+        })
+        .count();
+    if count == 0 {
         return None;
     }
     Some(ToolOutputProjectionRange {
         id: id.to_string(),
-        start_line: 1,
-        end_line: line_count,
+        start_line: start + 1,
+        end_line: start + count,
     })
 }
 
@@ -998,6 +1039,9 @@ async fn run_exec_like_with_exit_code_inner(
         )
     });
     let raw_output_artifact = if !known_delta_hit
+        && model_projection
+            .as_ref()
+            .is_some_and(|projection| projection.reduced)
         && let (Some(_attempt_key), Some(output)) = (&attempt_key, execution_output)
     {
         Some(

@@ -157,8 +157,8 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
 }
 
 impl ExecCommandArgs {
-    pub(crate) fn command_invocation(&self) -> Result<CommandInvocation, String> {
-        Ok(self.command.clone())
+    pub(crate) fn command_invocation(&self) -> CommandInvocation {
+        self.command.clone()
     }
 
     pub(crate) fn replace_command_invocation(&mut self, invocation: &CommandInvocation) {
@@ -238,7 +238,7 @@ pub(crate) fn get_command(
         Some(use_login_shell) => use_login_shell,
         None => allow_login_shell,
     };
-    let invocation = args.command_invocation()?;
+    let invocation = args.command_invocation();
 
     if invocation.is_powershell_script() {
         let powershell = match args.shell.as_ref() {

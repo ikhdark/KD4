@@ -187,10 +187,10 @@ assert.throws(() => renderReport('x,9007199254740991\ny,1'), Error);
 '''
 
 
-def rust_verify(root, protected):
+def rust_verify(root, protected, build_root):
     oracle = protected / 'oracle.rs'
     oracle.write_text(RUST_CASES.replace('__SOURCE__', json.dumps(str(root / 'src/lib.rs'))), encoding='utf-8')
-    executable = protected / ('oracle.exe' if os.name == 'nt' else 'oracle')
+    executable = build_root / ('oracle.exe' if os.name == 'nt' else 'oracle')
     run(['rustc', '--edition=2021', '--test', str(oracle), '-o', str(executable)], protected)
     run([str(executable), "--format", "pretty", "--test-threads=1"], protected, test_kind="rust",
         expected_names=("expected_durations", "rejects_invalid_durations"))
@@ -408,9 +408,18 @@ def main():
         path = root / name
         require(path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() != initial,
                 f'regression tests were not added: {name}')
-    verify_original_tests(fixture, root, protected)
-    {'rust_bugfix': rust_verify, 'typescript_feature': typescript_verify,
-     'kd4_python_refactor': python_verify}[fixture['task']](root, protected)
+    if fixture['task'] == 'rust_bugfix':
+        # MSVC cannot reliably link artifacts beneath deeply nested evidence
+        # paths. Keep protected sources/logs, but build in a short owned directory.
+        with tempfile.TemporaryDirectory(prefix='rb-') as directory:
+            build_root = Path(directory)
+            os.environ['CARGO_TARGET_DIR'] = str(build_root / 'target')
+            verify_original_tests(fixture, root, protected)
+            rust_verify(root, protected, build_root)
+    else:
+        verify_original_tests(fixture, root, protected)
+        {'typescript_feature': typescript_verify,
+         'kd4_python_refactor': python_verify}[fixture['task']](root, protected)
     require(workspace_hashes(root) == current_workspace,
             'focused tests changed final source or task inputs during independent verification')
     print('Independent behavior, requested change, and regression mutation verification passed.', flush=True)

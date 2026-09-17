@@ -206,6 +206,25 @@ text(output.output);
 
     let requests = responses.requests();
     assert_eq!(requests.len(), 2);
+    let next_input = requests[1].body_json()["input"].clone();
+    let notice = next_input
+        .as_array()
+        .expect("model input")
+        .iter()
+        .find_map(|item| {
+            if item["role"] != "developer" {
+                return None;
+            }
+            item["content"]
+                .as_array()?
+                .iter()
+                .filter_map(|part| part["text"].as_str())
+                .find(|text| text.contains("PreToolUse hook changed the input"))
+        })
+        .expect("the model should be told that a hook rewrote the call");
+    assert!(notice.contains("The tool will receive this input"));
+    assert!(notice.contains("rewritten-result"));
+    assert!(!notice.contains("original-result"));
     let output_item = requests[1].custom_tool_call_output(call_id);
     let output = code_mode_custom_tool_output_text(&output_item);
     let hook_log = fs::read_to_string(test.codex_home_path().join("pre_tool_use_hook_log.jsonl"))

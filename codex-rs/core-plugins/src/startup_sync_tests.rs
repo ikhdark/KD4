@@ -37,11 +37,18 @@ fn plugin_command_output_snapshot_does_not_move_writer_cursor() {
         b"firstsecond"
     );
     writer.set_len(COMMAND_MAX_OUTPUT_BYTES + 1).unwrap();
+    let error = read_captured_output(&capture, true)
+        .unwrap_err()
+        .to_string();
+    // The refusal reports the observed size and the limit it broke.
+    assert!(error.contains("exceeding"), "{error}");
     assert!(
-        read_captured_output(&capture, true)
-            .unwrap_err()
-            .to_string()
-            .contains("exceeds")
+        error.contains(&(COMMAND_MAX_OUTPUT_BYTES + 1).to_string()),
+        "{error}"
+    );
+    assert!(
+        error.contains(&COMMAND_MAX_OUTPUT_BYTES.to_string()),
+        "{error}"
     );
     assert_eq!(
         read_captured_output(&capture, false).unwrap().len() as u64,
@@ -110,7 +117,13 @@ fn plugin_command_rejects_excessive_output() {
         Duration::from_secs(10),
     )
     .unwrap_err();
-    assert!(error.contains("exceeds"), "{error}");
+    // The refusal names the stream that broke the limit and the limit itself.
+    assert!(error.contains("exceeding"), "{error}");
+    assert!(error.contains("stdout"), "{error}");
+    assert!(
+        error.contains(&COMMAND_MAX_OUTPUT_BYTES.to_string()),
+        "{error}"
+    );
     assert!(started.elapsed() < Duration::from_secs(15));
 }
 

@@ -1070,6 +1070,24 @@ async fn emit_exec_end(
             }),
         )
         .await;
+    // A command mutation the tracker cannot represent exactly clears the turn
+    // diff. Publish that reason next to the command that caused it rather than
+    // waiting for the end of the turn; the one-shot latch keeps the turn-end
+    // emission from repeating it.
+    let invalidation_warning = match ctx.turn_diff_tracker {
+        Some(tracker) => tracker.lock().await.take_invalidation_warning(),
+        None => None,
+    };
+    if let Some(message) = invalidation_warning {
+        ctx.session
+            .send_event(
+                ctx.turn,
+                EventMsg::Warning(codex_protocol::protocol::WarningEvent {
+                    message: message.to_string(),
+                }),
+            )
+            .await;
+    }
     // The external command already ran. Publish its terminal item and account for
     // its mutation before propagating the durability barrier failure.
     persistence_result
@@ -1201,9 +1219,9 @@ async fn emit_patch_end(
             },
             _ => HashMap::new(),
         };
-        let unified_diff = {
+        let (unified_diff, invalidation_warning) = {
             let mut guard = tracker.lock().await;
-            match tracker_update {
+            let unified_diff = match tracker_update {
                 TurnDiffTrackerUpdate::Track {
                     environment_id,
                     delta,
@@ -1220,8 +1238,19 @@ async fn emit_patch_end(
                     guard.take_unified_diff_if_changed()
                 }
                 TurnDiffTrackerUpdate::None => None,
-            }
+            };
+            (unified_diff, guard.take_invalidation_warning())
         };
+        if let Some(message) = invalidation_warning {
+            ctx.session
+                .send_event(
+                    ctx.turn,
+                    EventMsg::Warning(codex_protocol::protocol::WarningEvent {
+                        message: message.to_string(),
+                    }),
+                )
+                .await;
+        }
         if let Some(unified_diff) = unified_diff {
             ctx.session
                 .send_event(ctx.turn, EventMsg::TurnDiff(TurnDiffEvent { unified_diff }))
@@ -2338,6 +2367,19 @@ mod tests {
             vec![""],
             "the consumer must stop displaying the now-unknown prior diff"
         );
+        let warnings = events
+            .iter()
+            .filter_map(|event| match &event.msg {
+                EventMsg::Warning(event) => Some(event.message.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            warnings,
+            vec![
+                "The turn diff is unavailable after a workspace mutation that could not be tracked exactly. A cleared diff does not mean there are no changes."
+            ]
+        );
         assert_eq!(
             std::fs::read(dir.path().join("a.txt"))
                 .expect("invalidation preserves the actual file"),
@@ -2505,6 +2547,13 @@ mod tests {
                 matches!(diff.msg, EventMsg::TurnDiff(TurnDiffEvent { unified_diff })
                 if unified_diff.contains("changed.txt") && unified_diff.contains("+after"))
             );
+        } else {
+            let warning = events.next().expect("unknown command diff warning");
+            assert!(matches!(warning.msg, EventMsg::Warning(event)
+                if event.message.contains("The turn diff is unavailable")
+                    && event.message.contains("does not mean there are no changes")));
+            // Published exactly once: the turn-end emission must not repeat it.
+            assert_eq!(tracker.lock().await.take_invalidation_warning(), None);
         }
         assert!(
             events.next().is_none(),

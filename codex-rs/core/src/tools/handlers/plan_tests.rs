@@ -30,6 +30,31 @@ fn plan_arguments(step: &str, status: StepStatus) -> String {
     serde_json::to_string(&plan_update_args(step, status)).expect("serialize plan arguments")
 }
 
+fn assert_plan_output_schema(response: &serde_json::Value) {
+    let definition =
+        codex_tools::tool_spec_to_code_mode_tool_definition(&create_update_plan_tool())
+            .expect("plan tool definition");
+    assert!(definition.description.contains("no_progress: boolean"));
+    let ToolSpec::Function(spec) = create_update_plan_tool() else {
+        panic!("plan uses a function spec");
+    };
+    let validator = jsonschema::validator_for(spec.output_schema.as_ref().expect("output schema"))
+        .expect("valid plan output schema");
+    assert!(
+        validator.is_valid(response),
+        "invalid plan output: {response}"
+    );
+    for (pointer, invalid) in [
+        ("/effect", serde_json::json!("unknown")),
+        ("/no_progress", serde_json::json!("false")),
+        ("/current_plan/plan/0/status", serde_json::json!("done")),
+    ] {
+        let mut malformed = response.clone();
+        *malformed.pointer_mut(pointer).expect("response field") = invalid;
+        assert!(!validator.is_valid(&malformed), "accepted {malformed}");
+    }
+}
+
 #[test]
 fn plan_output_signals_governor_state() {
     let output = PlanToolOutput {
@@ -230,6 +255,13 @@ async fn plan_updates_use_session_checklist_store_and_preserve_governor_effects(
         .await
         .expect("stored checklist");
     assert_eq!(current.plan[0].status, StepStatus::Completed);
+    for (output, payload) in [
+        (&initial, &initial_payload),
+        (&completed, &completed_payload),
+        (&repeated, &completed_payload),
+    ] {
+        assert_plan_output_schema(&output.code_mode_result(payload));
+    }
 }
 
 #[tokio::test]
@@ -356,6 +388,9 @@ async fn registered_plan_output_restores_after_history_serialization() {
     let ResponseInputItem::FunctionCallOutput { call_id, output } = response else {
         panic!("plan response must be a function output");
     };
+    let value = serde_json::from_str(&output.body.to_text().expect("plan output text"))
+        .expect("plan output JSON");
+    assert_plan_output_schema(&value);
     let history = vec![
         codex_protocol::models::ResponseItem::FunctionCall {
             id: None,

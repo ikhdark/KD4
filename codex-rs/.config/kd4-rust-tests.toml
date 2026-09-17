@@ -145,10 +145,10 @@ helpers = []
 # ---------------------------------------------------------------------------
 # Named gates
 #
-# Each gate is an ordered list of steps. A step names a target, an optional
-# nextest filterset, and the exact set of test IDs the step must select. The
-# runner fails when the listed IDs and the declared IDs are not equal, so a
-# renamed or deleted test can never silently drop out of a gate.
+# Each gate is an ordered list of steps with authoritative exact test IDs.
+# The runner derives exact nextest filters and requires every declared test to
+# report PASS exactly once. No discovery build is needed for normal execution;
+# `check-gates` explicitly verifies discovery without running tests or helpers.
 # ---------------------------------------------------------------------------
 
 [gates.adaptive-reasoning-contract]
@@ -156,7 +156,6 @@ description = "Raw config tables, resolved defaults, and reachable sampling poli
 
 [[gates.adaptive-reasoning-contract.steps]]
 target = "config_lib"
-filter = "test(reasoning_phase_efforts_distinguish_absent_empty_partial_and_full_tables) | test(empty_higher_reasoning_phase_table_preserves_lower_entries) | test(partial_higher_reasoning_phase_table_merges_per_field)"
 tests = [
   "config_toml::tests::reasoning_phase_efforts_distinguish_absent_empty_partial_and_full_tables",
   "merge::tests::empty_higher_reasoning_phase_table_preserves_lower_entries",
@@ -166,7 +165,6 @@ tests = [
 [[gates.adaptive-reasoning-contract.steps]]
 target = "core_lib"
 helpers = []
-filter = "test(load_config_defaults_phase_tracking_to_compatibility_efforts) | test(load_config_preserves_explicit_reasoning_phase_effort_overrides) | test(load_config_preserves_all_explicit_reasoning_phase_effort_overrides) | test(reachable_changed_continuation_uses_the_lowest_supported_explicit_override) | test(reachable_changed_continuation_defaults_to_low_even_when_turn_is_high) | test(request_policy_rejects_host_terminal_completion) | test(protocol_terminal_continuation_is_marked_for_host_elision_only_when_unchanged) | test(global_effort_survives_unoverridden_decision_bearing_phases)"
 tests = [
   "config::tests::load_config_defaults_phase_tracking_to_compatibility_efforts",
   "config::tests::load_config_preserves_all_explicit_reasoning_phase_effort_overrides",
@@ -184,7 +182,6 @@ description = "Config schema fixture parity without regenerating generated outpu
 [[gates.config-schema-protocol.steps]]
 target = "core_lib"
 helpers = []
-filter = "test(config_schema_matches_fixture) | test(config_schema_hides_unsupported_inline_mcp_bearer_token)"
 tests = [
   "config::schema::tests::config_schema_hides_unsupported_inline_mcp_bearer_token",
   "config::schema::tests::config_schema_matches_fixture",
@@ -195,8 +192,8 @@ description = "codex-core leg of the Windows sandbox process-tree gate."
 
 [[gates.windows-sandbox-core-exec.steps]]
 target = "core_lib"
-helpers = ["codex", "codex-code-mode-host", "test_stdio_server", "codex-windows-sandbox-setup", "codex-command-runner"]
-filter = "test(direct_exec_cancellation_terminates_windows_descendants)"
+# Direct PowerShell execution with WindowsSandboxLevel::Disabled.
+helpers = []
 tests = ["exec::tests::direct_exec_cancellation_terminates_windows_descendants"]
 
 [gates.core-stdio-helper-regressions]
@@ -204,8 +201,8 @@ description = "Library regressions that used to exit silently when test_stdio_se
 
 [[gates.core-stdio-helper-regressions.steps]]
 target = "core_lib"
-helpers = ["codex", "codex-code-mode-host", "test_stdio_server", "codex-windows-sandbox-setup", "codex-command-runner"]
-filter = "test(pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot) | test(requested_mcp_servers_are_refreshed_before_install_completion)"
+# The session fixture uses in-process code mode; only MCP runs out of process.
+helpers = ["test_stdio_server"]
 tests = [
   "session::turn::tests::pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot",
   "tools::handlers::request_plugin_install::tests::requested_mcp_servers_are_refreshed_before_install_completion",
@@ -216,7 +213,6 @@ description = "Streamable HTTP MCP round trips that require test_streamable_http
 
 [[gates.rmcp-streamable-http.steps]]
 target = "core_code_mode_mcp"
-filter = "test(streamable_http_tool_call_round_trip) | test(streamable_http_configured_auth_precedes_chatgpt_auth) | test(streamable_http_with_oauth_round_trip)"
 tests = [
   "suite::rmcp_client::streamable_http_configured_auth_precedes_chatgpt_auth",
   "suite::rmcp_client::streamable_http_tool_call_round_trip",
@@ -311,7 +307,8 @@ helpers = []
 description = "Known delta reuse preserves force-fresh command execution."
 [[gates.capability-known-delta-store.steps]]
 target = "core_lib"
-helpers = ["codex", "codex-code-mode-host", "test_stdio_server", "codex-windows-sandbox-setup", "codex-command-runner"]
+# The fixture runs git directly and uses in-process code mode.
+helpers = []
 tests = ["tools::handlers::unified_exec::tests::known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_launches"]
 
 [gates.capability-deferred-executor]
@@ -345,7 +342,8 @@ description = "Addressable full raw command output streamed before bounded trans
 [[gates.capability-command-output-artifacts.steps]]
 target = "core_lib"
 tests = ["tools::handlers::unified_exec::tests::foreground_output_artifact_retains_bytes_beyond_transcript_cap"]
-helpers = ["codex", "codex-code-mode-host", "codex-windows-sandbox-setup", "codex-command-runner"]
+# The fixture runs Python directly and uses in-process code mode.
+helpers = []
 
 [gates.capability-preferred-powershell-host]
 description = "Explicit PowerShell paths win, otherwise pwsh is preferred with Windows PowerShell compatibility fallback."
@@ -615,4 +613,58 @@ tests = [
   "resume_picker::tests::paste_uses_existing_search_loading_path",
   "resume_picker::tests::esc_with_empty_query_starts_fresh",
   "resume_picker::tests::esc_with_query_clears_search_and_preserves_selected_result",
+]
+
+[gates.verified-findings-followup]
+description = "Focused regressions for reviewed catalog, watch, history, schema, and output findings."
+[[gates.verified-findings-followup.steps]]
+target = "core_lib"
+helpers = []
+tests = [
+  "tools::shell_output_summary::tests::small_output_is_unchanged",
+  "tools::shell_output_summary::tests::oversized_diagnostic_and_distinct_middle_failure_preserve_final_status",
+  "tools::shell_output_summary::tests::unretained_distinct_diagnostics_are_counted",
+  "tools::shell_output_summary::tests::ordinary_try_prose_does_not_displace_diagnostics",
+  "tools::shell_output_summary::tests::oversized_first_line_reserves_room_for_the_tail",
+  "tools::shell_output_summary::tests::summary_reports_gap_sizes_and_source_line_counts",
+  "tools::shell_output_summary::tests::summary_does_not_end_with_a_gap_when_the_following_line_cannot_fit",
+  "tools::shell_output_summary::tests::source_prose_about_passed_does_not_displace_test_status",
+  "tools::shell_output_summary::tests::incidental_words_do_not_displace_validation_status_or_warnings",
+  "tools::shell_output_summary::tests::selected_errors_do_not_spend_the_final_status_quota",
+  "tools::shell_output_summary::tests::large_success_output_keeps_head_tail_and_warning_lines",
+  "tools::shell_output_summary::tests::large_success_output_preserves_source_order",
+  "tools::shell_output_summary::tests::failed_output_keeps_exact_error_lines",
+  "tools::shell_output_summary::tests::critical_error_survives_earlier_warning_flood",
+  "tools::shell_output_summary::tests::benign_keywords_do_not_hide_the_first_real_error",
+  "tools::shell_output_summary::tests::over_truncation_failure_focus_keeps_late_root_cause_after_early_error_flood",
+  "tools::shell_output_summary::tests::validation_output_keeps_failure_status_and_tail",
+  "tools::shell_output_summary::tests::early_failed_suite_survives_later_passing_suites",
+  "tools::shell_output_summary::tests::validation_output_keeps_the_authoritative_final_status",
+  "tools::shell_output_summary::tests::nextest_failures_and_summary_survive_a_passing_test_flood",
+  "tools::shell_output_summary::tests::passing_validation_retains_status_with_a_short_tail",
+  "tools::shell_output_summary::tests::applied_budget_summarizes_output_below_the_default_threshold",
+  "tools::shell_output_summary::tests::disabled_summarizer_returns_unchanged_signal",
+  "tools::shell_output_summary::tests::oversized_single_line_retains_bounded_head_and_tail",
+  "tools::shell_output_summary::tests::tiny_single_line_budget_stops_before_split_utf8_character",
+  "tools::shell_output_summary::tests::validation_summary_keeps_typescript_and_npm_errors_outside_tail",
+  "tools::shell_output_summary::tests::summary_declines_output_that_would_grow",
+  "tools::shell_output_summary::optimization_tests::selection_storage_is_bounded_for_large_logs",
+  "tools::shell_output_summary::optimization_tests::line_classification_reuses_normalization_without_retaining_previous_signals",
+  "tools::shell_output_summary::optimization_tests::selection_flags_emit_each_index_once_in_source_order",
+  "context_manager::history::tests::prepared_prompt_truncation_releases_large_discarded_storage",
+  "context_manager::history::tests::tool_search_compaction_preserves_metadata_and_nested_identities",
+  "context_manager::history::tests::idless_token_estimates_are_cached_and_invalidated_on_rewrite",
+  "context_manager::history::tests::prepared_token_estimates_cache_existing_items_and_only_measure_appends",
+  "context_manager::history::tests::total_token_usage_caches_raw_items_without_reusing_projected_estimates",
+  "context_manager::history::tests::prepared_prompt_index_preserves_compacted_search_tail_during_runtime_append",
+  "context_manager::history::tests::prepared_prompt_index_uses_materialized_items_and_respects_truncation",
+  "context_manager::history::tests::prepared_prompt_index_walks_deep_unmaterialized_chains",
+  "tools::handlers::tool_search::tests::exact_name_search_recovers_a_definition_that_exceeds_the_result_budget",
+  "tools::handlers::tool_search::tests::audit_tool_search_contract_compaction_preserves_strictness_and_output_schema",
+  "tools::handlers::tool_search::tests::token_backfire_oversized_exact_match_stays_activatable",
+  "git_workspace::tests::source_path_batch_establishes_one_watch_and_preserves_path_scopes",
+  "git_workspace::tests::source_path_observation_ignores_unrelated_changes_and_fails_open",
+  "git_workspace::tests::recursive_source_path_observation_detects_descendant_changes",
+  "session::step_context::snapshot_deadline_tests::unstable_catalog_does_not_stall_sampling_or_advertise_partial_tools",
+  "session::step_context::snapshot_deadline_tests::stable_catalog_keeps_its_identity_and_resource_capability",
 ]

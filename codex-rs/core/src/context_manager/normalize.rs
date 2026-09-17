@@ -139,11 +139,6 @@ fn collect_missing_call_outputs(
             _ => {}
         }
     }
-    drop((
-        function_output_ids,
-        tool_search_output_ids,
-        custom_tool_output_ids,
-    ));
     missing_outputs_to_insert
 }
 
@@ -163,77 +158,82 @@ fn synthetic_output_id(prefix: &str, item_id: Option<&str>) -> Option<ResponseIt
 }
 
 pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItem>) {
-    let function_call_ids: HashSet<String> = items
-        .iter()
-        .filter_map(|i| match i {
-            ResponseItem::FunctionCall { call_id, .. } => Some(call_id.clone()),
-            _ => None,
-        })
-        .collect();
-
-    let tool_search_call_ids: HashSet<String> = items
-        .iter()
-        .filter_map(|i| match i {
+    let mut function_call_ids = HashSet::new();
+    let mut tool_search_call_ids = HashSet::new();
+    let mut custom_tool_call_ids = HashSet::new();
+    for item in items.iter() {
+        match item {
+            ResponseItem::FunctionCall { call_id, .. }
+            | ResponseItem::LocalShellCall {
+                call_id: Some(call_id),
+                ..
+            } => {
+                function_call_ids.insert(call_id.as_str());
+            }
             ResponseItem::ToolSearchCall {
                 call_id: Some(call_id),
                 ..
-            } => Some(call_id.clone()),
-            _ => None,
-        })
-        .collect();
+            } => {
+                tool_search_call_ids.insert(call_id.as_str());
+            }
+            ResponseItem::CustomToolCall { call_id, .. } => {
+                custom_tool_call_ids.insert(call_id.as_str());
+            }
+            _ => {}
+        }
+    }
 
-    let local_shell_call_ids: HashSet<String> = items
+    // Find the orphan positions while IDs can still borrow from the history.
+    // Retaining by position then avoids cloning every call ID before mutation.
+    let orphan_indexes: Vec<usize> = items
         .iter()
-        .filter_map(|i| match i {
-            ResponseItem::LocalShellCall {
-                call_id: Some(call_id),
-                ..
-            } => Some(call_id.clone()),
-            _ => None,
+        .enumerate()
+        .filter_map(|(index, item)| {
+            let keep = match item {
+                ResponseItem::FunctionCallOutput { call_id, .. } => {
+                    let has_match = function_call_ids.contains(call_id.as_str());
+                    if !has_match {
+                        error_or_panic(format!(
+                            "Orphan function call output for call id: {call_id}"
+                        ));
+                    }
+                    has_match
+                }
+                ResponseItem::CustomToolCallOutput { call_id, .. } => {
+                    let has_match = custom_tool_call_ids.contains(call_id.as_str());
+                    if !has_match {
+                        error_or_panic(format!(
+                            "Orphan custom tool call output for call id: {call_id}"
+                        ));
+                    }
+                    has_match
+                }
+                ResponseItem::ToolSearchOutput { execution, .. } if execution == "server" => true,
+                ResponseItem::ToolSearchOutput {
+                    call_id: Some(call_id),
+                    ..
+                } => {
+                    let has_match = tool_search_call_ids.contains(call_id.as_str());
+                    if !has_match {
+                        error_or_panic(format!("Orphan tool search output for call id: {call_id}"));
+                    }
+                    has_match
+                }
+                ResponseItem::ToolSearchOutput { call_id: None, .. } => true,
+                _ => true,
+            };
+            (!keep).then_some(index)
         })
         .collect();
-
-    let custom_tool_call_ids: HashSet<String> = items
-        .iter()
-        .filter_map(|i| match i {
-            ResponseItem::CustomToolCall { call_id, .. } => Some(call_id.clone()),
-            _ => None,
-        })
-        .collect();
-
-    items.retain(|item| match item {
-        ResponseItem::FunctionCallOutput { call_id, .. } => {
-            let has_match =
-                function_call_ids.contains(call_id) || local_shell_call_ids.contains(call_id);
-            if !has_match {
-                error_or_panic(format!(
-                    "Orphan function call output for call id: {call_id}"
-                ));
-            }
-            has_match
+    let mut orphan_indexes = orphan_indexes.into_iter().peekable();
+    let mut index = 0;
+    items.retain(|_| {
+        let keep = orphan_indexes.peek() != Some(&index);
+        if !keep {
+            orphan_indexes.next();
         }
-        ResponseItem::CustomToolCallOutput { call_id, .. } => {
-            let has_match = custom_tool_call_ids.contains(call_id);
-            if !has_match {
-                error_or_panic(format!(
-                    "Orphan custom tool call output for call id: {call_id}"
-                ));
-            }
-            has_match
-        }
-        ResponseItem::ToolSearchOutput { execution, .. } if execution == "server" => true,
-        ResponseItem::ToolSearchOutput {
-            call_id: Some(call_id),
-            ..
-        } => {
-            let has_match = tool_search_call_ids.contains(call_id);
-            if !has_match {
-                error_or_panic(format!("Orphan tool search output for call id: {call_id}"));
-            }
-            has_match
-        }
-        ResponseItem::ToolSearchOutput { call_id: None, .. } => true,
-        _ => true,
+        index += 1;
+        keep
     });
 }
 

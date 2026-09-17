@@ -22,6 +22,27 @@ pub(crate) struct McpToolSnapshot {
     pub(crate) resources_available: bool,
 }
 
+const MCP_SNAPSHOT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+async fn bounded_mcp_snapshot(
+    capture: impl std::future::Future<Output = McpToolSnapshot>,
+) -> McpToolSnapshot {
+    match tokio::time::timeout(MCP_SNAPSHOT_DEADLINE, capture).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            tracing::warn!("MCP catalog did not stabilize before the sampling deadline");
+            // Advertise no MCP capabilities when a coherent catalog is unavailable.
+            // This distinct identity prevents reuse of a router from a real catalog.
+            // The next step gets a new capture attempt.
+            McpToolSnapshot {
+                revision: u64::MAX,
+                tools: Arc::new(Vec::new()),
+                resources_available: false,
+            }
+        }
+    }
+}
+
 /// Request-scoped state that may change between model sampling requests.
 pub(crate) struct StepContext {
     pub(crate) turn: Arc<TurnContext>,
@@ -93,21 +114,24 @@ impl StepContext {
 
     pub(crate) async fn mcp_tool_snapshot(&self) -> &McpToolSnapshot {
         self.mcp_tool_snapshot
-            .get_or_init(|| async {
-                loop {
-                    let revision = self.mcp.manager().tool_catalog_revision();
-                    let (tools, resources_available) = tokio::join!(
-                        self.mcp.manager().list_all_tools_snapshot(),
-                        self.mcp.manager().has_ready_server_with_resources(),
-                    );
-                    if revision == self.mcp.manager().tool_catalog_revision() {
-                        return McpToolSnapshot {
-                            revision,
-                            tools,
-                            resources_available,
-                        };
+            .get_or_init(|| {
+                bounded_mcp_snapshot(async {
+                    loop {
+                        let revision = self.mcp.manager().tool_catalog_revision();
+                        let (tools, resources_available) = tokio::join!(
+                            self.mcp.manager().list_all_tools_snapshot(),
+                            self.mcp.manager().has_ready_server_with_resources(),
+                        );
+                        if revision == self.mcp.manager().tool_catalog_revision() {
+                            return McpToolSnapshot {
+                                revision,
+                                tools,
+                                resources_available,
+                            };
+                        }
+                        tokio::task::yield_now().await;
                     }
-                }
+                })
             })
             .await
     }
@@ -148,5 +172,47 @@ impl StepContext {
                 resources_available,
             })
             .expect("test MCP tool snapshot should be unset");
+    }
+}
+
+#[cfg(test)]
+mod snapshot_deadline_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn unstable_catalog_does_not_stall_sampling_or_advertise_partial_tools() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct CaptureGuard(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for CaptureGuard {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let guard = CaptureGuard(Arc::clone(&dropped));
+        let start = tokio::time::Instant::now();
+        let snapshot = bounded_mcp_snapshot(async move {
+            let _guard = guard;
+            std::future::pending::<McpToolSnapshot>().await
+        })
+        .await;
+        assert_eq!(start.elapsed(), MCP_SNAPSHOT_DEADLINE);
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(snapshot.tools.is_empty());
+        assert!(!snapshot.resources_available);
+        assert_eq!(snapshot.revision, u64::MAX);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stable_catalog_keeps_its_identity_and_resource_capability() {
+        let snapshot = bounded_mcp_snapshot(async {
+            McpToolSnapshot {
+                revision: 17,
+                tools: Arc::new(Vec::new()),
+                resources_available: true,
+            }
+        })
+        .await;
+        assert_eq!(snapshot.revision, 17);
+        assert!(snapshot.resources_available);
     }
 }

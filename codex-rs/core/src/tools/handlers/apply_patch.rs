@@ -497,6 +497,8 @@ impl ApplyPatchHandler {
             /*additional_permissions*/ None,
             turn_environment.cwd(),
         );
+        let workspace_operation_permit =
+            acquire_patch_workspace(turn_environment.cwd(), &cancellation_token).await?;
         match codex_apply_patch::verify_apply_patch_args(
             args,
             turn_environment.cwd(),
@@ -506,25 +508,6 @@ impl ApplyPatchHandler {
         .await
         {
             codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
-                let _workspace_operation_permit = if let Ok(native_cwd) =
-                    turn_environment.cwd().to_abs_path()
-                {
-                    let workspace_root =
-                        get_git_repo_root(&native_cwd).unwrap_or_else(|| native_cwd.to_path_buf());
-                    Some(tokio::select! {
-                        biased;
-                        _ = cancellation_token.cancelled() => {
-                            return Err(FunctionCallError::RespondToModel(
-                                "apply_patch cancelled while waiting for the workspace".to_string(),
-                            ));
-                        }
-                        permit = crate::workspace_operation_gate::acquire_workspace_operation(
-                            &workspace_root,
-                        ) => permit,
-                    })
-                } else {
-                    None
-                };
                 let (file_paths, effective_additional_permissions, file_system_sandbox_policy) =
                     effective_patch_permissions(
                         session.as_ref(),
@@ -542,7 +525,6 @@ impl ApplyPatchHandler {
                 let invocation =
                     apply_patch::apply_patch(turn.as_ref(), &file_system_sandbox_policy, changes)
                         .await;
-                drop(_workspace_operation_permit);
                 match invocation {
                     InternalApplyPatchInvocation::Output(item) => {
                         let content = item?;
@@ -574,8 +556,14 @@ impl ApplyPatchHandler {
                             call_id: call_id.clone(),
                             tool_name: tool_name.clone(),
                         };
-                        let content =
-                            run_owned_patch(req, tool_ctx, Some(tracker), emitter).await?;
+                        let content = run_owned_patch(
+                            req,
+                            tool_ctx,
+                            Some(tracker),
+                            emitter,
+                            workspace_operation_permit,
+                        )
+                        .await?;
                         Ok(boxed_tool_output(ApplyPatchToolOutput::from_text(content)))
                     }
                 }
@@ -665,6 +653,25 @@ impl CoreToolRuntime for ApplyPatchHandler {
     }
 }
 
+async fn acquire_patch_workspace(
+    cwd: &PathUri,
+    cancellation_token: &tokio_util::sync::CancellationToken,
+) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, FunctionCallError> {
+    let Ok(native_cwd) = cwd.to_abs_path() else {
+        return Ok(None);
+    };
+    let workspace_root = get_git_repo_root(&native_cwd).unwrap_or_else(|| native_cwd.to_path_buf());
+    tokio::select! {
+        biased;
+        _ = cancellation_token.cancelled() => Err(FunctionCallError::RespondToModel(
+            "apply_patch cancelled while waiting for the workspace".to_string(),
+        )),
+        permit = crate::workspace_operation_gate::acquire_workspace_operation(&workspace_root) => {
+            Ok(Some(permit))
+        }
+    }
+}
+
 // An admitted patch owns its filesystem operations, mutation evidence and diff
 // publication until they settle, even if the dispatch waiter is force-aborted.
 async fn run_owned_patch(
@@ -672,6 +679,7 @@ async fn run_owned_patch(
     tool_ctx: ToolCtx,
     tracker: Option<SharedTurnDiffTracker>,
     emitter: ToolEmitter,
+    workspace_operation_permit: Option<tokio::sync::OwnedMutexGuard<()>>,
 ) -> Result<String, FunctionCallError> {
     let terminal_tasks = tool_ctx.session.terminal_tasks.clone();
     let timing = crate::tools::tool_dispatch_trace::active_tool_dispatch_timing();
@@ -688,7 +696,8 @@ async fn run_owned_patch(
             .await
             .map_err(|error| FunctionCallError::Fatal(error.to_string()))?;
         let mut orchestrator = ToolOrchestrator::new();
-        let mut runtime = ApplyPatchRuntime::new();
+        let mut runtime =
+            ApplyPatchRuntime::with_workspace_operation_permit(workspace_operation_permit);
         let mutation_in_progress = runtime.mutation_in_progress();
         let out = {
             let execution = orchestrator.run(
@@ -805,6 +814,14 @@ pub(crate) async fn intercept_apply_patch(
     if is_validation {
         return Ok(None);
     }
+    // Identify patch commands without reading files so ordinary shell calls do not
+    // wait for the patch gate. Verification below must run while holding the permit.
+    let workspace_operation_permit =
+        if let Some(patch_cwd) = codex_apply_patch::apply_patch_command_cwd(command, cwd) {
+            acquire_patch_workspace(&patch_cwd, &cancellation_token).await?
+        } else {
+            None
+        };
     let sandbox = turn.file_system_sandbox_context(/*additional_permissions*/ None, cwd);
     match codex_apply_patch::maybe_parse_apply_patch_verified_for_environment(
         command,
@@ -816,23 +833,6 @@ pub(crate) async fn intercept_apply_patch(
     .await
     {
         codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
-            let _workspace_operation_permit = if let Ok(native_cwd) = cwd.to_abs_path() {
-                let workspace_root =
-                    get_git_repo_root(&native_cwd).unwrap_or_else(|| native_cwd.to_path_buf());
-                Some(tokio::select! {
-                    biased;
-                    _ = cancellation_token.cancelled() => {
-                        return Err(FunctionCallError::RespondToModel(
-                            "apply_patch cancelled while waiting for the workspace".to_string(),
-                        ).into());
-                    }
-                    permit = crate::workspace_operation_gate::acquire_workspace_operation(
-                        &workspace_root,
-                    ) => permit,
-                })
-            } else {
-                None
-            };
             let (approval_keys, effective_additional_permissions, file_system_sandbox_policy) =
                 effective_patch_permissions(
                     session.as_ref(),
@@ -849,7 +849,6 @@ pub(crate) async fn intercept_apply_patch(
                 })?;
             let invocation =
                 apply_patch::apply_patch(turn.as_ref(), &file_system_sandbox_policy, changes).await;
-            drop(_workspace_operation_permit);
             match invocation {
                 InternalApplyPatchInvocation::Output(item) => {
                     let content = item?;
@@ -881,7 +880,14 @@ pub(crate) async fn intercept_apply_patch(
                         call_id: call_id.to_string(),
                         tool_name: ToolName::plain(tool_name),
                     };
-                    let content = run_owned_patch(req, tool_ctx, tracker.cloned(), emitter).await?;
+                    let content = run_owned_patch(
+                        req,
+                        tool_ctx,
+                        tracker.cloned(),
+                        emitter,
+                        workspace_operation_permit,
+                    )
+                    .await?;
                     Ok(Some(FunctionToolOutput::from_text(content, Some(true))))
                 }
             }

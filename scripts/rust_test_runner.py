@@ -6,13 +6,16 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import json
+import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -382,6 +385,42 @@ CAPTURE_STDOUT = "stdout"
 CAPTURE_BOTH = "both"
 
 
+def _output_lines(result: subprocess.CompletedProcess[str], stream: str) -> Iterable[str]:
+    path = getattr(result, f"{stream}_path", None)
+    if path is not None:
+        with path.open(encoding="utf-8", errors="replace") as output:
+            while line := output.readline(1_048_576):
+                if len(line) == 1_048_576 and not line.endswith("\n"):
+                    # An oversized diagnostic is in the artifact; it cannot be
+                    # a trustworthy test status or a small helper-artifact record.
+                    while line and not line.endswith("\n"):
+                        line = output.readline(1_048_576)
+                    continue
+                yield line
+    else:
+        yield from (getattr(result, stream) or "").splitlines()
+
+
+def _stdout_text(result: subprocess.CompletedProcess[str]) -> str:
+    # JSON inventory/metadata is control data, not an unbounded diagnostic log.
+    path = getattr(result, "stdout_path", None)
+    return path.read_text(encoding="utf-8", errors="replace") if path else result.stdout
+
+
+def _stop_process_tree(process: subprocess.Popen) -> None:
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        )
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    process.wait()
+
+
 def _default_executor(
     args: Sequence[str],
     *,
@@ -389,15 +428,48 @@ def _default_executor(
     env: Mapping[str, str],
     capture: str,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        list(args),
-        cwd=cwd,
-        env=dict(env),
-        text=True,
-        stdout=subprocess.PIPE if capture != CAPTURE_NONE else None,
-        stderr=subprocess.PIPE if capture == CAPTURE_BOTH else None,
-        check=False,
-    )
+    timeout_value = env.get("CODEX_RUST_TEST_TIMEOUT_SECS")
+    try:
+        timeout = float(timeout_value) if timeout_value is not None else None
+        if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
+            raise ValueError
+    except ValueError as exc:
+        raise RunnerError("command timeout must be a finite positive number of seconds") from exc
+    paths: dict[str, Path] = {}
+    with ExitStack() as stack:
+        streams = {}
+        for name, enabled in (("stdout", capture != CAPTURE_NONE), ("stderr", capture == CAPTURE_BOTH)):
+            if not enabled:
+                streams[name] = None
+                continue
+            log_dir = Path(env.get("CODEX_RUST_TEST_LOG_DIR", tempfile.gettempdir()))
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log = stack.enter_context(tempfile.NamedTemporaryFile(
+                prefix=f"rust-test-{name}-", suffix=".log", dir=log_dir, delete=False,
+            ))
+            paths[name] = Path(log.name)
+            streams[name] = log
+        process = subprocess.Popen(
+            list(args), cwd=cwd, env=dict(env), **streams,
+            start_new_session=os.name != "nt",
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+        )
+        try:
+            returncode = process.wait(timeout=timeout)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
+            _stop_process_tree(process)
+            outcome = "cancelled" if isinstance(exc, KeyboardInterrupt) else "timed_out"
+            logs = "\n".join(f"Full {name}: {path}" for name, path in paths.items())
+            raise RunnerError(f"command {outcome}: {subprocess.list2cmdline(list(args))}\n{logs}", outcome=outcome) from exc
+    tails = {}
+    for name, path in paths.items():
+        with path.open("rb") as output:
+            output.seek(max(0, path.stat().st_size - MAX_FAILURE_STREAM_CHARS * 4))
+            tails[name] = output.read().decode("utf-8", errors="replace").replace("\r\n", "\n")[-MAX_FAILURE_STREAM_CHARS:]
+    result = subprocess.CompletedProcess(list(args), returncode, tails.get("stdout"), tails.get("stderr"))
+    for name, path in paths.items():
+        setattr(result, f"{name}_path", path)
+    return result
 
 
 def current_platform() -> str:
@@ -419,6 +491,7 @@ class RustTestRunner:
         executor: Executor = _default_executor,
         profile: str | None = None,
         no_fail_fast: bool = False,
+        command_timeout_seconds: float | None = None,
         env: Mapping[str, str] | None = None,
         cwd: Path = CODEX_RS_ROOT,
     ) -> None:
@@ -430,6 +503,11 @@ class RustTestRunner:
         self.cwd = cwd
         self.no_fail_fast = no_fail_fast
         self.base_env = dict(os.environ if env is None else env)
+        self.base_env["CODEX_RUST_TEST_LOG_DIR"] = str(self.target_dir / "test-runner-logs")
+        if command_timeout_seconds is not None:
+            if not math.isfinite(command_timeout_seconds) or command_timeout_seconds <= 0:
+                raise RunnerError("command timeout must be a finite positive number of seconds")
+            self.base_env["CODEX_RUST_TEST_TIMEOUT_SECS"] = str(command_timeout_seconds)
         # Ordinary acceptance must never update its expected outputs implicitly.
         self.base_env["INSTA_UPDATE"] = "no"
         self.base_env.setdefault("RUST_MIN_STACK", RUST_MIN_STACK_BYTES)
@@ -578,13 +656,17 @@ class RustTestRunner:
             capture=CAPTURE_NONE,
         )
 
-    def check_gates(self, names: Sequence[str]) -> None:
+    def check_gates(
+        self, names: Sequence[str], *, include_generated: bool = True
+    ) -> None:
         """Verify declared filter/ID parity without running tests or helpers."""
         if not names:
             raise RunnerError("at least one gate is required")
         # Generated exact filters can share discovery. Explicit filters must
         # prove their own contract: another step must not hide over-selection.
-        discovery_steps = self._group_gate_steps(names, exact_only=True)
+        discovery_steps = (
+            self._group_gate_steps(names, exact_only=True) if include_generated else []
+        )
         discovery_steps.extend(
             step
             for name in dict.fromkeys(names)
@@ -625,8 +707,10 @@ class RustTestRunner:
         if not names:
             raise RunnerError("at least one gate is required")
         grouped = self._group_gate_steps(names)
-        if discover:
-            self.check_gates(names)
+        # Exact generated selections are proved by completed results below.
+        # Explicit filters must always prove parity before batching: execution
+        # of the declared IDs alone cannot detect an over-broad source filter.
+        self.check_gates(names, include_generated=discover)
 
         env = self._build_helper_environment(
             self._active_helper_names(
@@ -644,27 +728,41 @@ class RustTestRunner:
                     capture=CAPTURE_BOTH,
                 )
             except RunnerError as error:
+                if error.outcome in {"cancelled", "timed_out"}:
+                    raise
                 failures.append(error)
                 continue
-            output = (result.stdout or "") + "\n" + (result.stderr or "")
             # Require completed per-test results from this execution, not just
             # a successful exit or discovery. Suppress summary repetitions and
             # unrelated filtered-out skips, and disallow retries for this proof.
-            passed = re.findall(
-                r"(?m)^\s*PASS\s+\[[^]\r\n]+\]\s+\S+\s+(\S+)\s*$", output
-            )
-            if len(passed) != len(step.tests) or set(passed) != set(step.tests):
+            passed: dict[str, int] = {}
+            unexpected = False
+            skipped = False
+            zero_tests = False
+            expected = set(step.tests)
+            for stream in ("stdout", "stderr"):
+                for line in _output_lines(result, stream):
+                    match = re.fullmatch(r"\s*PASS\s+\[[^]\r\n]+\]\s+\S+\s+(\S+)\s*", line)
+                    if match:
+                        test = match.group(1)
+                        if test in expected:
+                            passed[test] = min(2, passed.get(test, 0) + 1)
+                        else:
+                            unexpected = True
+                    skipped |= re.match(r"\s*SKIP\s+\[", line) is not None
+                    zero_tests |= re.search(r"\b0 tests run\b", line) is not None
+            if unexpected or set(passed) != expected or any(count != 1 for count in passed.values()):
                 if not quiet:
-                    print(output, end="" if output.endswith("\n") else "\n")
+                    print(self._failure_detail(result))
                 outcome = "not_executed"
-                if re.search(r"(?m)^\s*SKIP\s+\[", output):
+                if skipped:
                     outcome = "skipped"
-                elif re.search(r"\b0 tests run\b", output):
+                elif zero_tests:
                     outcome = "zero_tests"
                 failures.append(
                     RunnerError(
                         f"gate {step.target!r} did not report every required test passed exactly once: "
-                        f"expected={sorted(step.tests)}, passed={sorted(passed)}",
+                        f"expected={sorted(step.tests)}, passed={passed}, unexpected={unexpected}",
                         outcome=outcome,
                     )
                 )
@@ -912,7 +1010,7 @@ class RustTestRunner:
         result = self._checked(
             self._list_command(target, args), env=self.base_env, capture=CAPTURE_STDOUT
         )
-        tests = parse_nextest_list(result.stdout)
+        tests = parse_nextest_list(_stdout_text(result))
         if not tests:
             raise RunnerError(
                 f"named target {target.name!r} selected zero tests with args {args!r}",
@@ -928,7 +1026,7 @@ class RustTestRunner:
         result = self._checked(command, env=env, capture=CAPTURE_STDOUT)
         helper_dirs: list[str] = []
         for helper in helpers:
-            executable = self._helper_artifact(helper, result.stdout)
+            executable = self._helper_artifact(helper, _output_lines(result, "stdout"))
             if str(executable.parent) not in helper_dirs:
                 helper_dirs.append(str(executable.parent))
             dashed = f"CARGO_BIN_EXE_{helper.binary}"
@@ -948,10 +1046,10 @@ class RustTestRunner:
         env["PATH"] = os.pathsep.join([*helper_dirs, env.get("PATH", "")])
         return env
 
-    def _helper_artifact(self, helper: Helper, output: str) -> Path:
+    def _helper_artifact(self, helper: Helper, output: str | Iterable[str]) -> Path:
         expected_package_id = self.metadata.package_id(helper.package)
         executables: list[Path] = []
-        for line in output.splitlines():
+        for line in output.splitlines() if isinstance(output, str) else output:
             try:
                 message = json.loads(line)
             except json.JSONDecodeError:
@@ -1019,6 +1117,10 @@ class RustTestRunner:
             if output
         ]
         full_detail = "\n".join(f"{name}:\n{output}" for name, output in streams)
+        paths = [f"Full {name}: {path}" for name in ("stdout", "stderr")
+                 if (path := getattr(result, f"{name}_path", None)) is not None]
+        if paths:
+            return full_detail + "\n" + "\n".join(paths)
         if all(len(output) <= MAX_FAILURE_STREAM_CHARS for _, output in streams):
             return full_detail
 
@@ -1281,21 +1383,29 @@ def guard_generic_recipe_args(
 
 
 def load_metadata(
-    executor: Executor = _default_executor, *, cwd: Path = CODEX_RS_ROOT
+    executor: Executor = _default_executor, *, cwd: Path = CODEX_RS_ROOT,
+    command_timeout_seconds: float | None = None,
 ) -> MetadataIndex:
+    env = dict(os.environ)
+    if command_timeout_seconds is not None:
+        if not math.isfinite(command_timeout_seconds) or command_timeout_seconds <= 0:
+            raise RunnerError("command timeout must be a finite positive number")
+        env["CODEX_RUST_TEST_TIMEOUT_SECS"] = str(command_timeout_seconds)
     result = executor(
         ["cargo", "metadata", "--no-deps", "--format-version", "1"],
         cwd=cwd,
-        env=os.environ,
+        env=env,
         capture=CAPTURE_BOTH,
     )
+    log_paths = "\n".join(f"Full {name}: {path}" for name in ("stdout", "stderr")
+                          if (path := getattr(result, f"{name}_path", None)) is not None)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
-        raise RunnerError(f"cargo metadata --no-deps failed:\n{detail}")
+        raise RunnerError(f"cargo metadata --no-deps failed:\n{detail}\n{log_paths}")
     try:
-        payload = json.loads(result.stdout)
+        payload = json.loads(_stdout_text(result))
     except json.JSONDecodeError as exc:
-        raise RunnerError(f"cargo metadata returned invalid JSON: {exc}") from exc
+        raise RunnerError(f"cargo metadata returned invalid JSON: {exc}\n{log_paths}") from exc
     return MetadataIndex.from_json(payload)
 
 
@@ -1324,6 +1434,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_options = argparse.ArgumentParser(add_help=False)
     run_options.add_argument("--profile")
     run_options.add_argument("--no-fail-fast", action="store_true")
+    run_options.add_argument("--command-timeout-seconds", type=float,
+                             help="Deadline for each child command, including process-tree cleanup; unlimited by default.")
     run_options.add_argument("--target-dir", default=argparse.SUPPRESS)
 
     subparsers.add_parser("check-manifest")
@@ -1412,13 +1524,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             for name in manifest.gates:
                 print(f"gate\t{name}")
             return 0
-        metadata = load_metadata()
+        timeout = getattr(args, "command_timeout_seconds", None)
+        metadata = load_metadata(command_timeout_seconds=timeout) if timeout is not None else load_metadata()
         runner = RustTestRunner(
             manifest,
             metadata,
             target_dir=_resolve_target_dir(args.target_dir, metadata),
             profile=getattr(args, "profile", None),
             no_fail_fast=no_fail_fast,
+            command_timeout_seconds=getattr(args, "command_timeout_seconds", None),
         )
         if args.command == "check-manifest":
             metadata.validate_manifest(manifest)

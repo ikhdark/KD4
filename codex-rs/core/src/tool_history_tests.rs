@@ -1450,6 +1450,41 @@ fn token_efficiency_compact_v2_receipt_retains_integrity_and_accepts_legacy_v1()
 }
 
 #[test]
+fn tool_history_receipt_does_not_replace_output_when_only_an_empty_digest_fits() {
+    // This call ID leaves exactly enough envelope space for an empty digest.
+    // Such a receipt would fail the consumer's nonempty-digest validation.
+    let call_id = "c".repeat(576);
+    let bounded = bounded_output();
+    let canonical: Arc<[ResponseItem]> = Arc::from([text_output(&call_id, bounded.clone())]);
+    let tracked = candidate(&call_id, bounded);
+    assert!(tracked.admission_receipt().is_none());
+    let mut state = ToolHistoryState::default();
+    state.register(tracked);
+    assert!(state.mark_consumed(
+        &canonical,
+        ModelGenerationId {
+            turn_id: "turn-1".to_string(),
+            ordinal: 1,
+        },
+    ));
+
+    let projection = state.project(Arc::clone(&canonical));
+    assert!(projection.substitutions.is_empty());
+    let (projected_call_id, output) =
+        textual_output_identity(&projection.items[0]).expect("artifact recovery output");
+    let pin: serde_json::Value = serde_json::from_str(output).expect("artifact pin JSON");
+    assert_eq!(projected_call_id, call_id);
+    assert_eq!(pin["kind"], "tool_history_artifact_pin");
+    assert_eq!(pin["artifact_id"], "artifact-1");
+}
+
+#[test]
+fn tool_history_receipt_requires_nonempty_model_output() {
+    let tracked = candidate("empty-output", String::new());
+    assert!(tracked.admission_receipt().is_none());
+}
+
+#[test]
 fn tool_history_receipt_requires_consumed_complete_matching_bounded_output() {
     let call_id = "call-1";
     let bounded = "small bounded output".to_string();
@@ -1895,6 +1930,8 @@ fn tool_history_admission_keeps_in_budget_consumed_output_below_savings_threshol
     let projection = state.project(Arc::clone(&canonical));
 
     assert_eq!(projection.items, canonical);
+    assert!(Arc::ptr_eq(&projection.items, &canonical));
+    assert!(Arc::ptr_eq(&projection.unreplaced_items, &canonical));
     assert!(projection.substitutions.is_empty());
 }
 
@@ -3441,4 +3478,24 @@ async fn checkpoint_ignores_old_journal_after_crash_but_replays_new_records() {
         restored.non_workspace_code_mode_calls,
         BTreeSet::from(["current".to_string()])
     );
+}
+#[test]
+fn workspace_dependencies_preserve_powershell_parser_host() {
+    let script = "Get-Content 'src/foo.rs'";
+    for executable in [
+        "pwsh.exe",
+        "powershell.exe",
+        "C:/Program Files/PowerShell/7/pwsh.exe",
+    ] {
+        let arguments = serde_json::json!({"cmd": script, "shell": executable});
+        let (command, shell_type) = dependency_search_command(&arguments).expect("script command");
+        assert_eq!(command, vec![executable, "-Command", script]);
+        assert_eq!(shell_type, Some(crate::shell::ShellType::PowerShell));
+    }
+    let shell = crate::shell::default_user_shell();
+    if shell.shell_type == crate::shell::ShellType::PowerShell {
+        let (command, _) = dependency_search_command(&serde_json::json!({"cmd": script}))
+            .expect("default shell command");
+        assert_eq!(command[0], shell.shell_path.to_string_lossy());
+    }
 }

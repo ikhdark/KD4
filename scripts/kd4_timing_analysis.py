@@ -8,7 +8,9 @@ Nanosecond unions and exclusive ownership are distinct from summed diagnostics.
 from __future__ import annotations
 
 import collections
+import hashlib
 import json
+import math
 import re
 import shlex
 from collections.abc import Callable, Iterable
@@ -1159,20 +1161,36 @@ def _native_usage(usage: Any) -> dict[str, Any] | None:
     return counts
 
 
-def _is_rg_no_match(command: Any, exit_code: Any, item: dict[str, Any]) -> bool:
-    # Restrict this exception to a single rg process with no error output.
-    # Compound shell commands may return another process's exit code.
-    if type(exit_code) is not int or exit_code != 1 or not isinstance(command, str):
+def _is_single_rg_command(command: Any) -> bool:
+    # Compound shell commands cannot attribute their exit status or duration to rg.
+    if not isinstance(command, str):
         return False
-    if any(char in command for char in "|&;<>`$()\n\r") or item.get("error"):
-        return False
-    if any(item.get(key) for key in ("output", "aggregatedOutput", "stderr")):
+    if any(char in command for char in "|&;<>`$()\n\r"):
         return False
     try:
         words = shlex.split(command, posix=False)
     except ValueError:
         return False
     return bool(words and words[0].strip('"\'').replace("\\", "/").rsplit("/", 1)[-1].lower() in ("rg", "rg.exe"))
+
+
+def _is_rg_no_match(command: Any, exit_code: Any, item: dict[str, Any]) -> bool:
+    return (type(exit_code) is int and exit_code == 1
+            and _is_single_rg_command(command) and not item.get("error")
+            and not any(item.get(key) for key in ("output", "aggregatedOutput", "stderr")))
+
+
+def _observed_duration_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    durations = [row["durationMs"] for row in rows if row.get("durationMs") is not None]
+    observed_total = sum(durations) if durations else None
+    return {
+        "observedCount": len(rows), "measuredCount": len(durations),
+        "missingOrInvalidCount": len(rows) - len(durations),
+        "observedTotalMs": observed_total,
+        "totalMs": observed_total if len(durations) == len(rows) else None,
+        "minMs": min(durations) if durations else None,
+        "maxMs": max(durations) if durations else None,
+    }
 
 
 def _captured_request_metrics(evidence: dict[str, Any]) -> dict[str, Any]:
@@ -1229,6 +1247,15 @@ def _observed_tool_activity(calls: Iterable[dict[str, Any]], *, terminal_observe
         "available": bool(rows) or terminal_observed,
         "scope": "observed_native_items",
         **counts(rows),
+        "durations": {
+            "byKind": {kind: _observed_duration_summary(items)
+                       for kind in _NATIVE_TOOL_ITEM_TYPES
+                       if (items := [row for row in rows if row["itemType"] == kind])},
+            "rgSearch": _observed_duration_summary([
+                row for row in rows if row["itemType"] == "commandExecution"
+                and _is_single_rg_command(row.get("command"))
+            ]),
+        },
         "turns": [{"threadId": thread_id, "turnId": turn_id, **counts(items)}
                   for (thread_id, turn_id), items in turns.items()],
         "measurementNote": (
@@ -1236,7 +1263,10 @@ def _observed_tool_activity(calls: Iterable[dict[str, Any]], *, terminal_observe
             "Completed means a terminal item notification, including failed or interrupted work. "
             "Counts include observed child threads but do not establish complete child coverage, "
             "model decisions, nested dispatch counts, or edit correctness. Durations require both "
-            "observed start and completion and measure notification latency, not exclusive execution."
+            "observed start and completion and measure notification latency, not exclusive execution. "
+            "Duration totals sum intervals, including overlaps and failed work; partial totals stay "
+            "unavailable while observedTotalMs retains measured intervals. rgSearch recognizes only "
+            "single rg commands, including no-match outcomes; compound commands remain unattributed."
         ),
     }
 
@@ -1253,12 +1283,12 @@ def analyze_runner_evidence(evidence: dict[str, Any], *, include_tokens: bool = 
     events = evidence.get("events", [])
     if not isinstance(events, list) or any(not isinstance(row, dict) for row in events):
         raise ValueError("runner evidence events must be objects")
-    profiles: dict[str, dict[str, Any]] = {}
+    profiles: dict[tuple[str | None, str], dict[str, Any]] = {}
     pending: dict[tuple[str | None, str, str], dict[str, Any]] = {}
     calls: dict[tuple[str | None, str, str], dict[str, Any]] = {}
     failures: list[dict[str, Any]] = []
     symptoms: list[dict[str, Any]] = []
-    terminal: dict[str, str] = {}
+    terminal: dict[tuple[str | None, str], str] = {}
     usage_by_thread: dict[str, dict[str, Any]] = {}
     sampling_count = 0
     last_progress = None
@@ -1284,22 +1314,23 @@ def analyze_runner_evidence(evidence: dict[str, Any], *, include_tokens: bool = 
             previous_event = location
         turn = params.get("turn", {})
         turn = turn if isinstance(turn, dict) else {}
-        thread_id = params.get("threadId", params.get("thread_id"))
+        thread_id = params.get("threadId", params.get("thread_id", row.get("file")))
         thread_id = thread_id if isinstance(thread_id, str) else None
         active_turn = str(params.get("turnId", params.get("turn_id", turn.get("id", active_turn_by_thread.get(thread_id, "unknown")))))
         active_turn_by_thread[thread_id] = active_turn
+        turn_key = (thread_id, active_turn)
         payload_type = params.get("type", "")
         if method == "sampling_boundary":
             sampling_count += 1
         if method in ("turn/completed", "turn.completed") or payload_type in ("task_complete", "turn_aborted"):
             default_status = "aborted" if payload_type == "turn_aborted" else "failed" if turn.get("error") is not None else "completed"
             status = str(turn.get("status") or default_status)
-            terminal[active_turn] = status
+            terminal[turn_key] = status
             if status not in ("completed", "complete"):
                 failures.append({"kind": "turn_" + status, **location, "evidence": turn.get("error")})
         timing = params.get("timing", turn.get("timing"))
         if isinstance(timing, dict):
-            profiles[active_turn] = {"timing": timing, "turn_id": active_turn, "status": terminal.get(active_turn, "unfinished"), "eventIndex": index}
+            profiles[turn_key] = {"timing": timing, "turn_id": active_turn, "thread_id": thread_id, "status": terminal.get(turn_key, "unfinished"), "eventIndex": index}
         if include_tokens and method == "thread/tokenUsage/updated":
             usage = params.get("tokenUsage", {})
             if isinstance(usage, dict):
@@ -1377,23 +1408,31 @@ def analyze_runner_evidence(evidence: dict[str, Any], *, include_tokens: bool = 
     verifier = evidence.get("verifier")
     if isinstance(verifier, dict) and verifier.get("status") not in (None, "passed", "correct"):
         failures.append({"kind": "verification_" + str(verifier["status"]), "source": "verifier", "evidence": verifier})
+    # Preserve legacy labels for unique turn IDs; qualify all labels when threads
+    # reuse an ID so compatibility fields cannot silently overwrite a thread.
+    turn_keys = set(profiles) | set(terminal)
+    qualify_turns = len({turn_id for _, turn_id in turn_keys}) != len(turn_keys)
+    def turn_label(key: tuple[str | None, str]) -> str:
+        return json.dumps(key, separators=(",", ":")) if qualify_turns else key[1]
+
     valid_profiles = [record for record in profiles.values() if timing_profile_valid(record["timing"]) and record["timing"].get("classificationComplete") is True]
-    runtime = _population_report(valid_profiles, include_tokens=include_tokens) if valid_profiles else None
+    runtime_profiles = [dict(record, turn_id=turn_label((record["thread_id"], record["turn_id"]))) for record in valid_profiles]
+    runtime = _population_report(runtime_profiles, include_tokens=include_tokens) if runtime_profiles else None
     if runtime is not None:
-        runtime["population"] = {"scope": "valid complete timing profiles only", "turnIds": [record["turn_id"] for record in valid_profiles]}
-    requests = [dict(request, _turnId=record["turn_id"], _eventIndex=record["eventIndex"]) for record in profiles.values() for request in _selected_requests(record["timing"])]
+        runtime["population"] = {"scope": "valid complete timing profiles only; summed across threads, not task elapsed time", "turnIds": [turn_label((record["thread_id"], record["turn_id"])) for record in valid_profiles]}
+    requests = [dict(request, _turnId=record["turn_id"], _threadId=record["thread_id"], _turnKey=key, _eventIndex=record["eventIndex"]) for key, record in profiles.items() for request in _selected_requests(record["timing"])]
     generations = []
     for request in requests:
         classification = classify_model_request(request, classification_complete=False, prior_successful_test=None, linked_commands=[])
         generations.append({
-            "turnId": request["_turnId"], "generationIndex": request.get("generationIndex"),
+            "turnId": request["_turnId"], "threadId": request["_threadId"], "generationIndex": request.get("generationIndex"),
             "eventIndex": request["_eventIndex"], "phase": request.get("phase"),
             "effort": request.get("reasoningEffort"), "purpose": request.get("generationPurpose"),
             "reason": request.get("generationReason"), "attemptKind": request.get("attemptKind"),
             "classification": classification, "modelStreamWaitNs": request.get("modelStreamWaitNs"),
             "dispatchMs": request.get("dispatchMs"), "completedMs": request.get("completedMs"),
             "physicalAttemptIds": request.get("physicalAttemptIds", []),
-            "toolCallIds": [call.get("callId") for call in profiles[request["_turnId"]]["timing"].get("toolCalls", []) if isinstance(call, dict) and call.get("generationIndex") == request.get("generationIndex")],
+            "toolCallIds": [call.get("callId") for call in profiles[request["_turnKey"]]["timing"].get("toolCalls", []) if isinstance(call, dict) and call.get("generationIndex") == request.get("generationIndex")],
             "tokens": _token_report([request]) if include_tokens else disabled_tokens(),
         })
     retry_evidence = [row for row in generations if set(row["classification"]["tags"]) & {"retry", "recovery"}]
@@ -1408,14 +1447,14 @@ def analyze_runner_evidence(evidence: dict[str, Any], *, include_tokens: bool = 
     # usage. Account every captured request, including profiles rejected above.
     totals = _token_report(requests) if include_tokens and requests else disabled_tokens() if not include_tokens else None
     retention = _request_retention(record["timing"] for record in profiles.values())
-    usage_turns = {request["_turnId"] for request in requests} if include_tokens else set()
-    missing_usage_turns = sorted(set(terminal) - usage_turns) if include_tokens else []
+    usage_turns = {request["_turnKey"] for request in requests} if include_tokens else set()
+    missing_usage_turns = sorted(turn_label(key) for key in set(terminal) - usage_turns) if include_tokens else []
     usage_coverage = {
         "requestRetention": retention,
         "requestProfileTurns": len(usage_turns),
         "terminalTurns": len(terminal),
         "missingTerminalTurnIds": missing_usage_turns,
-        "unfinishedProfileTurnIds": sorted(set(profiles) - set(terminal)),
+        "unfinishedProfileTurnIds": sorted(turn_label(key) for key in set(profiles) - set(terminal)),
         "timingValidityRequired": False,
     } if include_tokens else None
     if include_tokens and totals is not None:
@@ -1425,7 +1464,7 @@ def analyze_runner_evidence(evidence: dict[str, Any], *, include_tokens: bool = 
         totals["complete"] = bool(totals["complete"] and terminal and not missing_usage_turns and not usage_coverage["unfinishedProfileTurnIds"] and retention["complete"] is not False)
         if not totals["complete"]:
             _invalidate_token_totals(totals)
-    native_tools = {(record["turn_id"], call.get("callId")): call for record in profiles.values() for call in record["timing"].get("toolCalls", []) if isinstance(call, dict) and call.get("callId")}
+    native_tools = {(record["thread_id"], record["turn_id"], call.get("callId")): call for record in profiles.values() for call in record["timing"].get("toolCalls", []) if isinstance(call, dict) and call.get("callId")}
     nested = sum(bool(call.get("parentCallId")) for call in native_tools.values()) if native_tools else None
     dispatch = _tool_dispatch_counts(
         native_tools.values(), sum(max(0, int(record["timing"].get("toolCallTimingOverflow", 0))) for record in profiles.values()),
@@ -1454,7 +1493,9 @@ def analyze_runner_evidence(evidence: dict[str, Any], *, include_tokens: bool = 
         totals = {"available": False, "complete": False, "promptCategories": None, "providerTotals": None}
     for call in calls.values():
         start, end = call.get("startedMs"), call.get("completedMs")
-        call["durationMs"] = end - start if type(start) in (int, float) and type(end) in (int, float) and end >= start else None
+        call["durationMs"] = (end - start if type(start) in (int, float)
+                              and type(end) in (int, float) and math.isfinite(start)
+                              and math.isfinite(end) and 0 <= start <= end else None)
     cache_hit_rate = None
     if include_tokens and totals and totals.get("complete") is True and all(
         request["tokenUsage"]["cachedInputTokens"] <= request["tokenUsage"]["inputTokens"]
@@ -1463,8 +1504,15 @@ def analyze_runner_evidence(evidence: dict[str, Any], *, include_tokens: bool = 
         input_tokens, cached_tokens = totals.get("inputTokens"), totals.get("cachedInputTokens")
         if type(input_tokens) is int and type(cached_tokens) is int and 0 <= cached_tokens <= input_tokens and input_tokens > 0:
             cache_hit_rate = cached_tokens / input_tokens
+    config_response = evidence.get("effectiveConfig")
+    config = config_response.get("config") if isinstance(config_response, dict) else None
+    configuration = {
+        "sha256": hashlib.sha256(json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest() if isinstance(config, dict) else None,
+        "scope": "captured config/read effective config; excludes layer provenance and later thread overrides",
+    }
     return {
         "schemaVersion": 1, "attemptId": evidence.get("attemptId"),
+        "configuration": configuration,
         "status": evidence.get("status", next((status for status in terminal.values() if status not in ("completed", "complete")), "completed" if terminal else "unfinished")),
         "elapsedMs": evidence.get("elapsedMs"), "units": {"eventTime": "milliseconds", "runtimeTime": "nanoseconds", "tokens": "tokens"},
         "coverage": {"events": len(events), "nativeTimingProfiles": len(profiles), "validCompleteTimingProfiles": len(valid_profiles), "terminalTurns": len(terminal), "tokenAnalysisEnabled": include_tokens},
@@ -1478,11 +1526,11 @@ def analyze_runner_evidence(evidence: dict[str, Any], *, include_tokens: bool = 
         "directToolCount": len(native_tools) - nested if native_tools else len(calls), "nestedToolCount": nested,
         "toolCountCoverage": "retained_native_timing" if native_tools else "observed_native_items",
         "tools": list(calls.values()), "pendingTools": list(pending.values()),
-        "nativeToolCalls": [{"turnId": turn_id, **{key: value for key, value in call.items() if include_tokens or "token" not in key.lower()}} for (turn_id, _), call in native_tools.items()],
+        "nativeToolCalls": [{"threadId": thread_id, "turnId": turn_id, **{key: value for key, value in call.items() if include_tokens or "token" not in key.lower()}} for (thread_id, turn_id, _), call in native_tools.items()],
         "longestEventGaps": sorted(event_gaps, key=lambda row: row["durationMs"], reverse=True)[:8],
         "omittedEventGaps": max(0, len(event_gaps) - 8),
         "firstOutputMs": first_output, "firstToolMs": first_tool,
-        "lastProgress": last_progress, "terminalTurns": terminal,
+        "lastProgress": last_progress, "terminalTurns": {turn_label(key): value for key, value in terminal.items()},
         "failures": failures, "symptoms": symptoms, "retryEvidence": retry_evidence,
         "generations": generations, "runtime": runtime,
         "requestClassification": _classification_summary(row["classification"] for row in generations),

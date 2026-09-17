@@ -336,8 +336,8 @@ impl ToolHistoryPersistenceQueue {
                                 )));
                             }
                             Err(err) => {
-                                // The journal is already durable; failure of
-                                // optional compaction does not undo that commit.
+                                // The journal append is complete; optional
+                                // compaction failure leaves terminal checkpointing responsible for durability.
                                 tracing::warn!(
                                     "failed to compact completed-tool history journal: {err}"
                                 );
@@ -1558,6 +1558,12 @@ impl Session {
                     .await
                     .context("default shell discovery task failed")?
             };
+            if default_shell.shell_type == shell::ShellType::PowerShell {
+                let executable = default_shell.shell_path.to_string_lossy().into_owned();
+                drop(tokio::task::spawn_blocking(move || {
+                    codex_shell_command::prewarm_powershell_parser(&executable);
+                }));
+            }
             let shell_snapshot = if config.features.enabled(Feature::ShellSnapshot) {
                 ShellSnapshot::new(
                     config.codex_home.clone(),
@@ -1725,6 +1731,17 @@ impl Session {
                     (None, None)
                 };
 
+            let plugin_outcome = plugins_manager
+                .plugins_for_config(&config.plugins_config_input())
+                .await;
+            for warning in plugin_outcome.load_warnings() {
+                post_session_configured_events.push(Event {
+                    id: INITIAL_SUBMIT_ID.to_owned(),
+                    msg: EventMsg::Warning(WarningEvent {
+                        message: warning.clone(),
+                    }),
+                });
+            }
             let hooks = build_hooks_for_config(
                 &config,
                 plugins_manager.as_ref(),

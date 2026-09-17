@@ -22,6 +22,12 @@ Current goal and exact user constraints, including prohibitions and out-of-scope
 
 ## Current state
 
+First preserve verified repository context needed for the next action: the
+repository root, relevant owner and symbol paths, focused build/test commands,
+and affected caller or consumer relationships. Keep source snapshot or freshness
+qualifications attached to these facts. Retain useful facts from ownership slices
+instead of only their artifact identifiers; do not invent missing topology.
+
 The latest implementation and worktree state needed to resume safely.
 Name files already edited, partial changes, and any active ownership or handoffs.
 Preserve the remaining predicted change surface: owners, files, and affected contracts.

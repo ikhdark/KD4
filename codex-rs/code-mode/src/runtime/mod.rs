@@ -31,6 +31,8 @@ use crate::v8_init::ensure_v8_initialized;
 const EXIT_SENTINEL: &str = "__codex_code_mode_exit__";
 const RUNTIME_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const MAX_BUFFERED_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_ERROR_TEXT_BYTES: usize = 16 * 1024;
+const ERROR_TRUNCATION_SUFFIX: &str = "\n[code mode error truncated]";
 const OUTPUT_LIMIT_MESSAGE: &str =
     "Code mode output was truncated because the cell buffered more than 64 MiB.";
 
@@ -635,7 +637,17 @@ fn send_result(
 ) {
     let _ = event_tx.send(RuntimeEvent::Result {
         stored_value_writes,
-        error_text,
+        error_text: error_text.map(|mut text| {
+            if text.len() > MAX_ERROR_TEXT_BYTES {
+                let mut end = MAX_ERROR_TEXT_BYTES - ERROR_TRUNCATION_SUFFIX.len();
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+                text.push_str(ERROR_TRUNCATION_SUFFIX);
+            }
+            text
+        }),
     });
 }
 

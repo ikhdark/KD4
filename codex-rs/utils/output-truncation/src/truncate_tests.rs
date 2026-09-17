@@ -483,6 +483,7 @@ fn fork_validation_routes_receive_the_diagnostic_budget() {
         "just source-owners-check",
         "just --justfile codex-rs/justfile fmt-check",
         "just --justfile 'C:/repo with spaces/justfile' config-schema-check",
+        "just --justfile 'C:/repo with spaces/justfile' config-schema-protocol-check",
         "just -q -f codex-rs/justfile -- app-server-schema-check",
         "just --justfile=codex-rs/justfile fmt-check",
         "python scripts/rust_test_runner.py run-target core_lib -E test(parser)",

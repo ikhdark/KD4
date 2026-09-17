@@ -66,7 +66,13 @@ fn verifier_must_live_outside_editable_tree() {
 
 #[test]
 fn rust_oracle_accepts_correct_parser_and_rejects_overflow_bug() {
-    let (_temp, fixture) = setup(LiveTask::RustBugfix);
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    // Match real runs whose protected Cargo object paths exceed MAX_PATH.
+    let protected = temp.path().join("verification-".repeat(14));
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&protected).unwrap();
+    let fixture = prepare_fixture(LiveTask::RustBugfix, &workspace, &protected).unwrap();
     fs::write(fixture.workspace.join("src/lib.rs"), CORRECT_RUST).unwrap();
     fs::write(fixture.workspace.join("tests/regression.rs"), "use duration_fixture::parse_duration;\n#[test] fn single_duration() { assert_eq!(parse_duration(\"12s\"), Ok(12000)); }\n#[test] fn regression() { assert_eq!(parse_duration(\"2m15s\"), Ok(135000)); assert!(parse_duration(\"1s 1s\").is_err()); assert!(parse_duration(\"18446744073709551616ms\").is_err()); }\n").unwrap();
     let result = verify_fixture(&fixture).unwrap();

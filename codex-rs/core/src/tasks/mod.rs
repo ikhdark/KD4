@@ -71,6 +71,7 @@ const GRACEFUL_INTERRUPTION_MARGIN: Duration = Duration::from_millis(250);
 const GRACEFUL_INTERRUPTION_TIMEOUT: Duration =
     crate::tools::parallel::TOOL_RUNTIME_CLEANUP_DEADLINE
         .saturating_add(GRACEFUL_INTERRUPTION_MARGIN);
+const FORCED_INTERRUPTION_TIMEOUT: Duration = Duration::from_secs(1);
 const TASK_COMPACT_METRIC: &str = "codex.task.compact";
 
 #[derive(Clone, Debug, Default)]
@@ -315,6 +316,18 @@ async fn wait_for_worker_done(task: &RunningTask) {
     }
 }
 
+async fn abort_worker_and_wait(task: &RunningTask) {
+    task.worker_abort_handle.abort();
+    if tokio::time::timeout(FORCED_INTERRUPTION_TIMEOUT, wait_for_worker_done(task))
+        .await
+        .is_err()
+    {
+        // Tokio cannot interrupt synchronous code. Tool admission is already
+        // sealed, so this worker must not hold terminal publication hostage.
+        warn!(turn_id = %task.turn_context.sub_id, "turn worker has not stopped after forced cancellation");
+    }
+}
+
 async fn drain_auxiliary_tasks(tasks: &mut tokio::task::JoinSet<()>) {
     while let Some(result) = tasks.join_next().await {
         if let Err(err) = result
@@ -325,17 +338,22 @@ async fn drain_auxiliary_tasks(tasks: &mut tokio::task::JoinSet<()>) {
     }
 }
 
-async fn quiesce_turn_auxiliary_tasks(task: &mut RunningTask) {
+async fn quiesce_turn_auxiliary_tasks(task: &mut RunningTask, deadline: tokio::time::Instant) {
     task.auxiliary_cancellation_token.cancel();
-    if tokio::time::timeout(
-        GRACEFUL_INTERRUPTION_TIMEOUT,
-        drain_auxiliary_tasks(&mut task.auxiliary_tasks),
-    )
-    .await
-    .is_err()
+    if tokio::time::timeout_at(deadline, drain_auxiliary_tasks(&mut task.auxiliary_tasks))
+        .await
+        .is_err()
     {
         task.auxiliary_tasks.abort_all();
-        drain_auxiliary_tasks(&mut task.auxiliary_tasks).await;
+        if tokio::time::timeout(
+            FORCED_INTERRUPTION_TIMEOUT,
+            drain_auxiliary_tasks(&mut task.auxiliary_tasks),
+        )
+        .await
+        .is_err()
+        {
+            warn!(turn_id = %task.turn_context.sub_id, "turn auxiliary tasks have not stopped after forced cancellation");
+        }
     }
 }
 
@@ -1135,15 +1153,18 @@ impl Session {
             finalization.task.cancellation_token.cancel();
         }
 
-        quiesce_turn_auxiliary_tasks(&mut finalization.task).await;
+        // Auxiliary work and the sampling worker receive cancellation together
+        // and share one grace period, rather than each delaying interruption.
+        let interruption_deadline = tokio::time::Instant::now() + GRACEFUL_INTERRUPTION_TIMEOUT;
+        quiesce_turn_auxiliary_tasks(&mut finalization.task, interruption_deadline).await;
         self.services
             .command_execution
             .finish_turn_before_terminal(&turn_context.sub_id)
             .await;
 
         if requires_abort_cleanup {
-            if tokio::time::timeout(
-                GRACEFUL_INTERRUPTION_TIMEOUT,
+            if tokio::time::timeout_at(
+                interruption_deadline,
                 wait_for_worker_done(&finalization.task),
             )
             .await
@@ -1154,9 +1175,8 @@ impl Session {
                     turn_context.sub_id,
                     GRACEFUL_INTERRUPTION_TIMEOUT.as_millis()
                 );
-                finalization.task.worker_abort_handle.abort();
+                abort_worker_and_wait(&finalization.task).await;
             }
-            wait_for_worker_done(&finalization.task).await;
             Arc::clone(&finalization.task.task)
                 .abort(Arc::clone(self), Arc::clone(&turn_context))
                 .await;
@@ -1182,6 +1202,9 @@ impl Session {
                 turn_id = %turn_context.sub_id,
                 "failed to persist missing tool outputs before terminal event: {err}"
             );
+        }
+        if let Err(err) = self.flush_tool_history_persistence().await {
+            warn!(turn_id = %turn_context.sub_id, "failed to checkpoint tool history before terminal event: {err}");
         }
         turn_context.turn_timing_state.begin_finalization();
 
@@ -1374,8 +1397,7 @@ impl Session {
     ) {
         let turn_context = Arc::clone(&finalization.task.turn_context);
         finalization.task.cancellation_token.cancel();
-        finalization.task.worker_abort_handle.abort();
-        wait_for_worker_done(&finalization.task).await;
+        abort_worker_and_wait(&finalization.task).await;
         self.services
             .command_execution
             .finish_turn(&turn_context.sub_id)

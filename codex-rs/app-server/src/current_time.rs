@@ -192,8 +192,12 @@ async fn request_current_time(
     let response: CurrentTimeReadResponse =
         serde_json::from_value(result).context("invalid current-time response")?;
 
-    DateTime::from_timestamp(response.current_time_at, 0)
-        .ok_or_else(|| anyhow!("current-time response is outside the supported range"))
+    DateTime::from_timestamp(response.current_time_at, 0).ok_or_else(|| {
+        anyhow!(
+            "current-time response is outside the supported range: currentTimeAt={} (expected Unix seconds)",
+            response.current_time_at
+        )
+    })
 }
 
 fn require_single_current_time_connection(connection_ids: &[ConnectionId]) -> Result<ConnectionId> {

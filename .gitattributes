@@ -7,3 +7,4 @@ codex-rs/utils/sleep-inhibitor/src/iokit_bindings.rs text eol=lf linguist-genera
 codex-rs/app-server-protocol/schema/** linguist-generated
 codex-rs/hooks/schema/generated/** linguist-generated
 codex-rs/core/config.schema.json linguist-generated
+sdk/python/src/openai_codex/generated/** linguist-generated

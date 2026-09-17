@@ -477,7 +477,12 @@ async fn command_output_with_timeout(
     match timeout(duration, command.output()).await {
         Ok(Ok(output)) => Ok(output),
         Ok(Err(err)) => Err(err.to_string()),
-        Err(_) => Err(format!("timed out after {} ms", duration.as_millis())),
+        Err(_) => Err(format!(
+            "{:?} {:?} timed out after {} ms",
+            command.as_std().get_program(),
+            command.as_std().get_args().collect::<Vec<_>>(),
+            duration.as_millis()
+        )),
     }
 }
 

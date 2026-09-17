@@ -40,11 +40,30 @@ async function main() {
 
   function findCodexExecutable() {
     let vendorRoot;
+    let resolvedPlatformPackage = false;
     try {
       const packageJsonPath = require.resolve(
         `${platformPackage}/package.json`,
       );
+      const dependency = packageJson.optionalDependencies?.[platformPackage];
+      // The release builder pins aliases such as npm:@openai/codex@<version>.
+      const expectedVersion =
+        typeof dependency === "string" && dependency.startsWith("npm:")
+          ? dependency.slice(dependency.lastIndexOf("@") + 1)
+          : dependency;
+      const installedVersion = require(packageJsonPath).version;
+      if (typeof expectedVersion !== "string" || !expectedVersion) {
+        throw new Error(
+          `Invalid native dependency metadata for ${platformPackage}. Reinstall this KD4 package from the same fork release artifact.`,
+        );
+      }
+      if (installedVersion !== expectedVersion) {
+        throw new Error(
+          `Native package version mismatch for ${platformPackage}: expected ${expectedVersion}, found ${installedVersion ?? "no version"}. Reinstall this KD4 package from the same fork release artifact.`,
+        );
+      }
       vendorRoot = path.join(path.dirname(packageJsonPath), "vendor");
+      resolvedPlatformPackage = true;
     } catch (error) {
       if (error.code !== "MODULE_NOT_FOUND") {
         throw error;
@@ -62,8 +81,11 @@ async function main() {
       return codexExecutable;
     }
 
+    const reason = resolvedPlatformPackage
+      ? `Optional dependency ${platformPackage} is installed but its native executable is missing: ${codexExecutable}.`
+      : `Missing optional dependency ${platformPackage}.`;
     throw new Error(
-      `Missing optional dependency ${platformPackage}. Reinstall this KD4 package from the same fork release artifact.`,
+      `${reason} Reinstall this KD4 package from the same fork release artifact.`,
     );
   }
 
@@ -172,11 +194,19 @@ async function main() {
   // exiting immediately; once the child has been signaled we simply wait for
   // its exit event which will in turn terminate the parent (see below).
   const forwardSignal = (signal) => {
+    let detail = "the child process may still be running";
     try {
-      child.kill(signal);
-    } catch {
-      /* ignore */
+      if (child.kill(signal)) {
+        return;
+      }
+    } catch (error) {
+      detail = error.message ?? String(error);
     }
+    // A failed kill does not guarantee an exit event. Restore the requested
+    // termination behavior instead of leaving the launcher waiting forever.
+    // eslint-disable-next-line no-console
+    console.error(`Unable to forward ${signal} to Codex: ${detail}.`);
+    exitForSignal(signal);
   };
 
   const forwardedSignals = ["SIGINT", "SIGTERM"];
@@ -191,6 +221,16 @@ async function main() {
     for (const [signal, handler] of signalHandlers) {
       process.off(signal, handler);
     }
+  };
+
+  const exitForSignal = (signal) => {
+    removeSignalHandlers();
+    // Windows does not preserve POSIX signal exit status when signaling self.
+    if (platform === "win32") {
+      const signalNumber = constants.signals[signal];
+      process.exit(signalNumber === undefined ? 1 : 128 + signalNumber);
+    }
+    process.kill(process.pid, signal);
   };
 
   // When the child exits, mirror its termination reason in the parent so that
@@ -217,13 +257,7 @@ async function main() {
   }
 
   if (childResult.type === "signal") {
-    // Windows does not preserve POSIX signal exit status when signaling self.
-    if (platform === "win32") {
-      const signalNumber = constants.signals[childResult.signal];
-      process.exit(signalNumber === undefined ? 1 : 128 + signalNumber);
-    }
-    // On POSIX, preserve signal termination for the invoking shell.
-    process.kill(process.pid, childResult.signal);
+    exitForSignal(childResult.signal);
   } else {
     process.exit(childResult.exitCode);
   }

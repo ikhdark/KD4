@@ -2,6 +2,8 @@
 
 Prefer sandboxed additional permissions over fully unsandboxed execution.
 
+Do not evade the approval flow by switching tools or techniques, or by delegating to another agent.
+
 ## Preferred request mode
 
 When you need extra sandboxed permissions for one command, use:
@@ -28,6 +30,4 @@ Propose only narrowly scoped reusable prefixes. Never provide `prefix_rule` for 
 
 ## Command segmentation reminder
 
-The command string is split into independent command segments at shell control operators, including pipes (`|`), logical operators (`&&`, `||`), command separators (`;`), and subshell boundaries (`(...)`, `$()`).
-
-Each segment is evaluated independently for sandbox restrictions and approval requirements.
+Segmentation follows the active shell. Simple PowerShell `-NoProfile` commands can match the invoked command's prefix. PowerShell `&` invokes commands; `-and`/`-or` and cmd.exe `^` are not POSIX separators. Unsupported syntax may require approval for the whole invocation.

@@ -65,6 +65,10 @@ impl ClientSegmentReassembler {
         let Some(metadata) = ClientSegmentMetadata::from_envelope(&envelope) else {
             warn!(
                 client_id = envelope.client_id.0.as_str(),
+                stream_id = ?envelope.stream_id,
+                segment_id,
+                segment_count,
+                message_size_bytes,
                 "dropping segmented remote-control client envelope without seq_id"
             );
             return ClientSegmentObservation::Dropped;
@@ -72,6 +76,10 @@ impl ClientSegmentReassembler {
         let Some(stream_id) = envelope.stream_id.clone() else {
             warn!(
                 client_id = envelope.client_id.0.as_str(),
+                seq_id = metadata.seq_id,
+                segment_id,
+                segment_count,
+                message_size_bytes,
                 "dropping segmented remote-control client envelope without stream_id"
             );
             return ClientSegmentObservation::Dropped;
@@ -79,15 +87,32 @@ impl ClientSegmentReassembler {
         if self.should_ignore_chunk(&envelope.client_id, &stream_id, metadata.seq_id, segment_id) {
             return ClientSegmentObservation::Dropped;
         }
-        if segment_count == 0
-            || segment_count > REMOTE_CONTROL_SEGMENT_COUNT_MAX
-            || segment_id >= segment_count
-            || message_size_bytes == 0
-            || message_size_bytes > REMOTE_CONTROL_REASSEMBLED_MAX_BYTES
-            || message_chunk_base64.is_empty()
-        {
+        let invalid_reason = if segment_count == 0 {
+            Some("segment count is zero")
+        } else if segment_count > REMOTE_CONTROL_SEGMENT_COUNT_MAX {
+            Some("segment count exceeds limit")
+        } else if segment_id >= segment_count {
+            Some("segment id is outside segment count")
+        } else if message_size_bytes == 0 {
+            Some("message size is zero")
+        } else if message_size_bytes > REMOTE_CONTROL_REASSEMBLED_MAX_BYTES {
+            Some("message size exceeds limit")
+        } else if message_chunk_base64.is_empty() {
+            Some("segment payload is empty")
+        } else {
+            None
+        };
+        if let Some(reason) = invalid_reason {
             warn!(
                 client_id = envelope.client_id.0.as_str(),
+                stream_id = ?stream_id,
+                seq_id = metadata.seq_id,
+                segment_id,
+                segment_count,
+                message_size_bytes,
+                max_segment_count = REMOTE_CONTROL_SEGMENT_COUNT_MAX,
+                max_message_size_bytes = REMOTE_CONTROL_REASSEMBLED_MAX_BYTES,
+                reason,
                 "dropping invalid segmented remote-control client envelope"
             );
             self.remove_assembly(&envelope.client_id, &stream_id);

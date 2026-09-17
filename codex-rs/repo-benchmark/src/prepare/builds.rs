@@ -135,6 +135,7 @@ pub fn build(
         ensure!(previous.cache_key == key, "build cache provenance mismatch");
         previous.verify()?;
         previous.cache_reuse_elapsed_ms = Some(started.elapsed().as_millis() as u64);
+        eprintln!("Reusing verified native build at {revision}; Cargo build skipped");
         return Ok(previous);
     }
     let log = target_directory.join("build.log");

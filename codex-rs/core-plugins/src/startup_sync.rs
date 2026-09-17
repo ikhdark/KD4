@@ -876,16 +876,15 @@ pub(crate) fn run_git_command_with_timeout(
         .map_err(|err| format!("failed to contain {context}: {err}"))?;
     let start = std::time::Instant::now();
     let status = loop {
-        for capture in [&stdout, &stderr] {
-            if capture
+        for (stream, capture) in [("stdout", &stdout), ("stderr", &stderr)] {
+            let extent = capture
                 .as_file()
                 .metadata()
-                .map_err(|err| format!("failed to inspect {context} output: {err}"))?
-                .len()
-                > COMMAND_MAX_OUTPUT_BYTES
-            {
+                .map_err(|err| format!("failed to inspect {context} {stream}: {err}"))?
+                .len();
+            if extent > COMMAND_MAX_OUTPUT_BYTES {
                 return Err(format!(
-                    "{context} output exceeds {COMMAND_MAX_OUTPUT_BYTES} bytes"
+                    "{context} {stream} output is {extent} bytes, exceeding the {COMMAND_MAX_OUTPUT_BYTES}-byte limit"
                 ));
             }
         }
@@ -914,9 +913,9 @@ pub(crate) fn run_git_command_with_timeout(
     let output = Output {
         status,
         stdout: read_captured_output(&stdout, status.success())
-            .map_err(|err| format!("failed to read {context} output: {err}"))?,
+            .map_err(|err| format!("failed to read {context} stdout: {err}"))?,
         stderr: read_captured_output(&stderr, status.success())
-            .map_err(|err| format!("failed to read {context} output: {err}"))?,
+            .map_err(|err| format!("failed to read {context} stderr: {err}"))?,
     };
     if output.status.success() {
         #[cfg(windows)]
@@ -944,9 +943,9 @@ fn read_captured_output(
 
     let extent = file.as_file().metadata()?.len();
     if require_complete && extent > COMMAND_MAX_OUTPUT_BYTES {
-        return Err(std::io::Error::other(
-            "command output exceeds capture limit",
-        ));
+        return Err(std::io::Error::other(format!(
+            "command output is {extent} bytes, exceeding the {COMMAND_MAX_OUTPUT_BYTES}-byte limit"
+        )));
     }
     // Reopening provides an independent cursor on both Windows and Unix.
     // Read only this extent even if a successful helper continues writing.

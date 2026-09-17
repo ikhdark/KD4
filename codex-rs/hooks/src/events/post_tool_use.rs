@@ -403,13 +403,23 @@ mod tests {
 
     #[test]
     fn unsupported_updated_mcp_tool_output_fails_open() {
+        for updated_output in [serde_json::json!({"ok": true}), serde_json::Value::Null] {
+            assert_unsupported_updated_mcp_tool_output(updated_output);
+        }
+    }
+
+    fn assert_unsupported_updated_mcp_tool_output(updated_output: serde_json::Value) {
+        let stdout = serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "updatedMCPToolOutput": updated_output,
+                "additionalContext": "Must not inject context from unsupported output"
+            }
+        })
+        .to_string();
         let parsed = parse_completed(
             &handler(),
-            run_result(
-                Some(0),
-                r#"{"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedMCPToolOutput":{"ok":true}}}"#,
-                "",
-            ),
+            run_result(Some(0), &stdout, ""),
             Some("turn-1".to_string()),
         );
 

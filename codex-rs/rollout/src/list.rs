@@ -41,7 +41,7 @@ pub struct ThreadsPage {
     pub next_cursor: Option<Cursor>,
     /// Total number of files touched while scanning this request.
     pub num_scanned_files: usize,
-    /// True if a hard scan cap was hit; consider resuming with `next_cursor`.
+    /// Compatibility field. Filesystem discovery no longer truncates at a scan cap.
     pub reached_scan_cap: bool,
 }
 
@@ -110,8 +110,10 @@ struct HeadTailSummary {
     recency_at: Option<String>,
 }
 
-/// Hard cap to bound worst‑case work per request.
-const MAX_SCAN_FILES: usize = 10000;
+// Filesystem fallback listing must consider every candidate: truncating before
+// sorting or filtering can hide threads permanently, even across cursor pages.
+// Created-time traversal stops once the page is full; other sorts enumerate
+// candidates to establish their order. Individual summary reads remain bounded.
 const HEAD_RECORD_LIMIT: usize = 10;
 const USER_EVENT_SCAN_LIMIT: usize = 200;
 
@@ -206,7 +208,6 @@ trait RolloutFileVisitor {
         ts: OffsetDateTime,
         id: Uuid,
         path: PathBuf,
-        scanned: usize,
     ) -> impl std::future::Future<Output = ControlFlow<()>> + Send;
 }
 
@@ -224,17 +225,7 @@ struct FilesByCreatedAtVisitor<'a> {
 }
 
 impl<'a> RolloutFileVisitor for FilesByCreatedAtVisitor<'a> {
-    async fn visit(
-        &mut self,
-        ts: OffsetDateTime,
-        id: Uuid,
-        path: PathBuf,
-        scanned: usize,
-    ) -> ControlFlow<()> {
-        if scanned >= MAX_SCAN_FILES && self.items.len() >= self.page_size {
-            self.more_matches_available = true;
-            return ControlFlow::Break(());
-        }
+    async fn visit(&mut self, ts: OffsetDateTime, id: Uuid, path: PathBuf) -> ControlFlow<()> {
         if self.anchor_state.should_skip(ts, id) {
             return ControlFlow::Continue(());
         }
@@ -269,13 +260,7 @@ struct FilesByUpdatedAtVisitor<'a> {
 }
 
 impl<'a> RolloutFileVisitor for FilesByUpdatedAtVisitor<'a> {
-    async fn visit(
-        &mut self,
-        _ts: OffsetDateTime,
-        id: Uuid,
-        path: PathBuf,
-        _scanned: usize,
-    ) -> ControlFlow<()> {
+    async fn visit(&mut self, _ts: OffsetDateTime, id: Uuid, path: PathBuf) -> ControlFlow<()> {
         let updated_at = file_modified_time(&path).await.unwrap_or(None);
         self.candidates.push(ThreadCandidate {
             path,
@@ -513,7 +498,6 @@ async fn get_threads_in_root_by_summary(
             collect_flat_files_by_updated_at(&root, &mut scanned_files).await?
         }
     };
-    let reached_scan_cap = scanned_files >= MAX_SCAN_FILES;
     let anchor = cursor.map(|cursor| {
         (
             cursor.timestamp(),
@@ -565,7 +549,7 @@ async fn get_threads_in_root_by_summary(
         keyed_items.reverse();
     }
 
-    let more_matches_available = keyed_items.len() > page_size || reached_scan_cap;
+    let more_matches_available = keyed_items.len() > page_size;
     keyed_items.truncate(page_size);
     let items = keyed_items
         .into_iter()
@@ -579,7 +563,7 @@ async fn get_threads_in_root_by_summary(
         items,
         next_cursor,
         num_scanned_files: scanned_files,
-        reached_scan_cap,
+        reached_scan_cap: false,
     })
 }
 
@@ -716,11 +700,6 @@ async fn traverse_directories_for_paths_created(
     .await?;
     more_matches_available = visitor.more_matches_available;
 
-    let reached_scan_cap = scanned_files >= MAX_SCAN_FILES;
-    if reached_scan_cap && !items.is_empty() {
-        more_matches_available = true;
-    }
-
     let next = if more_matches_available {
         build_next_cursor(&items, ThreadSortKey::CreatedAt)
     } else {
@@ -730,7 +709,7 @@ async fn traverse_directories_for_paths_created(
         items,
         next_cursor: next,
         num_scanned_files: scanned_files,
-        reached_scan_cap,
+        reached_scan_cap: false,
     })
 }
 
@@ -738,7 +717,7 @@ async fn traverse_directories_for_paths_created(
 /// file mtime (updated_at) and apply pagination/filtering in that order.
 ///
 /// Because updated_at is not encoded in filenames, this path must scan all
-/// files up to the scan cap, then sort and filter by the anchor cursor.
+/// file metadata, then sort and filter by the anchor cursor.
 ///
 /// NOTE: This can be optimized in the future if we store additional state on disk
 /// to cache updated_at timestamps.
@@ -787,11 +766,6 @@ async fn traverse_directories_for_paths_updated(
         }
     }
 
-    let reached_scan_cap = scanned_files >= MAX_SCAN_FILES;
-    if reached_scan_cap && !items.is_empty() {
-        more_matches_available = true;
-    }
-
     let next = if more_matches_available {
         build_next_cursor(&items, ThreadSortKey::UpdatedAt)
     } else {
@@ -801,7 +775,7 @@ async fn traverse_directories_for_paths_updated(
         items,
         next_cursor: next,
         num_scanned_files: scanned_files,
-        reached_scan_cap,
+        reached_scan_cap: false,
     })
 }
 
@@ -853,11 +827,6 @@ async fn traverse_flat_paths_created(
         }
     }
 
-    let reached_scan_cap = scanned_files >= MAX_SCAN_FILES;
-    if reached_scan_cap && !items.is_empty() {
-        more_matches_available = true;
-    }
-
     let next = if more_matches_available {
         build_next_cursor(&items, ThreadSortKey::CreatedAt)
     } else {
@@ -867,7 +836,7 @@ async fn traverse_flat_paths_created(
         items,
         next_cursor: next,
         num_scanned_files: scanned_files,
-        reached_scan_cap,
+        reached_scan_cap: false,
     })
 }
 
@@ -916,11 +885,6 @@ async fn traverse_flat_paths_updated(
         }
     }
 
-    let reached_scan_cap = scanned_files >= MAX_SCAN_FILES;
-    if reached_scan_cap && !items.is_empty() {
-        more_matches_available = true;
-    }
-
     let next = if more_matches_available {
         build_next_cursor(&items, ThreadSortKey::UpdatedAt)
     } else {
@@ -930,7 +894,7 @@ async fn traverse_flat_paths_updated(
         items,
         next_cursor: next,
         num_scanned_files: scanned_files,
-        reached_scan_cap,
+        reached_scan_cap: false,
     })
 }
 
@@ -1152,9 +1116,6 @@ async fn collect_flat_rollout_files(
     let mut dir = tokio::fs::read_dir(root).await?;
     let mut collected = Vec::new();
     while let Some(entry) = dir.next_entry().await? {
-        if *scanned_files >= MAX_SCAN_FILES {
-            break;
-        }
         if !entry
             .file_type()
             .await
@@ -1171,9 +1132,6 @@ async fn collect_flat_rollout_files(
             continue;
         };
         *scanned_files += 1;
-        if *scanned_files > MAX_SCAN_FILES {
-            break;
-        }
         collected.push((ts, id, rollout_file.into_path()));
     }
     collected.sort_by_key(|(ts, sid, _path)| (Reverse(*ts), Reverse(*sid)));
@@ -1238,9 +1196,6 @@ async fn collect_flat_files_by_updated_at(
     let mut candidates = Vec::new();
     let mut dir = tokio::fs::read_dir(root).await?;
     while let Some(entry) = dir.next_entry().await? {
-        if *scanned_files >= MAX_SCAN_FILES {
-            break;
-        }
         if !entry
             .file_type()
             .await
@@ -1257,9 +1212,6 @@ async fn collect_flat_files_by_updated_at(
             continue;
         };
         *scanned_files += 1;
-        if *scanned_files > MAX_SCAN_FILES {
-            break;
-        }
         let updated_at = file_modified_time(rollout_file.path())
             .await
             .unwrap_or(None);
@@ -1312,25 +1264,16 @@ async fn walk_rollout_files(
     }
 
     'outer: for (_year, year_path) in year_dirs.iter() {
-        if *scanned_files >= MAX_SCAN_FILES {
-            break;
-        }
         let mut month_dirs = collect_dirs_desc(year_path, |s| s.parse::<u8>().ok()).await?;
         if ascending {
             month_dirs.reverse();
         }
         for (_month, month_path) in month_dirs.iter() {
-            if *scanned_files >= MAX_SCAN_FILES {
-                break 'outer;
-            }
             let mut day_dirs = collect_dirs_desc(month_path, |s| s.parse::<u8>().ok()).await?;
             if ascending {
                 day_dirs.reverse();
             }
             for (_day, day_path) in day_dirs.iter() {
-                if *scanned_files >= MAX_SCAN_FILES {
-                    break 'outer;
-                }
                 let mut day_files = collect_rollout_day_files(day_path).await?;
                 if ascending {
                     day_files.reverse();
@@ -1340,12 +1283,7 @@ async fn walk_rollout_files(
                         continue;
                     }
                     *scanned_files += 1;
-                    if *scanned_files > MAX_SCAN_FILES {
-                        break 'outer;
-                    }
-                    if let ControlFlow::Break(()) =
-                        visitor.visit(ts, id, path, *scanned_files).await
-                    {
+                    if let ControlFlow::Break(()) = visitor.visit(ts, id, path).await {
                         break 'outer;
                     }
                 }

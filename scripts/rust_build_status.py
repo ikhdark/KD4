@@ -987,15 +987,58 @@ def _cargo_command_with_target_dir(
     if subcommand == "watch":
         index = subcommand_index + 1
         has_exec = False
+        value_options = {
+            "-d",
+            "--delay",
+            "--env-file",
+            "-E",
+            "--env",
+            "--features",
+            "-i",
+            "--ignore",
+            "-B",
+            "-L",
+            "--use-shell",
+            "-w",
+            "--watch",
+            "-C",
+            "--workdir",
+        }
         while index < len(result):
             argument = result[index]
+            # Clap also accepts -qxcheck and -qscommand. Split flag prefixes
+            # before inspecting the value-taking option, preserving the flags.
+            if argument.startswith("-") and not argument.startswith("--"):
+                short = argument[1:]
+                flags = len(short) - len(short.lstrip("cqNhV"))
+                if flags and short[flags : flags + 1] in {
+                    "x",
+                    "s",
+                    "d",
+                    "i",
+                    "E",
+                    "B",
+                    "L",
+                    "w",
+                    "C",
+                }:
+                    result[index : index + 1] = [
+                        "-" + short[:flags],
+                        "-" + short[flags:],
+                    ]
+                    index += 1
+                    argument = result[index]
             if argument == "--":
                 if index + 1 < len(result):
                     raise ValueError(
                         "Cargo watch positional commands cannot enforce a reserved target; use --exec/-x"
                     )
                 break
-            if argument in {"-s", "--shell"} or argument.startswith("--shell="):
+            if (
+                argument.startswith("-s")
+                or argument == "--shell"
+                or argument.startswith("--shell=")
+            ):
                 raise ValueError(
                     "Cargo watch --shell/-s is not allowed inside a reserved lane; use --exec/-x so --target-dir can be enforced"
                 )
@@ -1012,6 +1055,19 @@ def _cargo_command_with_target_dir(
                     argument.removeprefix("--exec="), target_dir
                 )
                 has_exec = True
+            elif argument.startswith("-x"):
+                result[index] = "-x" + _cargo_watch_exec_with_target_dir(
+                    argument[2:].removeprefix("="), target_dir
+                )
+                has_exec = True
+            elif argument in value_options:
+                if index + 1 >= len(result):
+                    raise ValueError(f"Cargo watch {argument} requires a value")
+                index += 1
+            elif not argument.startswith("-"):
+                raise ValueError(
+                    "Cargo watch positional commands cannot enforce a reserved target; use --exec/-x"
+                )
             index += 1
         if not has_exec:
             result[index:index] = [
@@ -1208,48 +1264,87 @@ def run_in_cargo_lane(
     command: Sequence[str],
     lane_root: Path | None = None,
     lock_timeout_seconds: float = 30.0,
+    timing_path: Path | None = None,
 ) -> int:
     if not command:
         raise ValueError("run-lane requires a command after --")
-    with reserve_cargo_lane(
-        repo_root=repo_root,
-        requested_lane=requested_lane,
-        command=command,
-        lane_root=lane_root,
-        lock_timeout_seconds=lock_timeout_seconds,
-    ) as (resolved_lane, target_dir):
-        if requested_lane != "auto" and resolved_lane != requested_lane:
-            print(
-                f"warning: requested Cargo lane {requested_lane!r} is busy; "
-                f"using {resolved_lane!r}",
-                file=sys.stderr,
+    # Open exclusively before any child work: a bad path must not launch a build
+    # or overwrite an earlier measurement. Reporting never changes the child exit.
+    stream = timing_path.open("x", encoding="utf-8") if timing_path else None
+    phases = dict.fromkeys(("reservation", "setup", "maintenance", "command", "release"))
+    record = {
+        "schemaVersion": 1, "startedUnixMs": time.time_ns() // 1_000_000,
+        "requestedLane": requested_lane, "resolvedLane": None, "targetDir": None,
+        "command": list(command), "exitCode": None, "status": "error",
+        "phaseDurationsMs": phases,
+    }
+    phase = "reservation"
+    started = previous = time.perf_counter_ns()
+
+    def next_phase(name: str | None) -> None:
+        nonlocal phase, previous
+        now = time.perf_counter_ns()
+        if phase is not None:
+            phases[phase] = (now - previous) / 1_000_000
+        phase, previous = name, now
+
+    try:
+        with reserve_cargo_lane(
+            repo_root=repo_root,
+            requested_lane=requested_lane,
+            command=command,
+            lane_root=lane_root,
+            lock_timeout_seconds=lock_timeout_seconds,
+        ) as (resolved_lane, target_dir):
+            next_phase("setup")
+            record.update(resolvedLane=resolved_lane, targetDir=str(target_dir))
+            if requested_lane != "auto" and resolved_lane != requested_lane:
+                print(
+                    f"warning: requested Cargo lane {requested_lane!r} is busy; "
+                    f"using {resolved_lane!r}",
+                    file=sys.stderr,
+                )
+            child_env = os.environ.copy()
+            # Keep the lane out of Cargo's environment so its absolute path does
+            # not fragment compiler-cache keys. Nested recipes consume CODEX's value.
+            child_env.pop("CARGO_TARGET_DIR", None)
+            child_env.pop("CODEX_CARGO_LANE_TARGET_DIR", None)
+            direct_command = _direct_reserved_lane_command(
+                command, child_env, repo_root=repo_root, target_dir=target_dir
             )
-        child_env = os.environ.copy()
-        # Keep the lane out of Cargo's environment so the absolute path does
-        # not fragment compiler-cache keys. Direct Cargo commands receive an
-        # explicit --target-dir; nested just recipes consume the CODEX value.
-        child_env.pop("CARGO_TARGET_DIR", None)
-        child_env.pop("CODEX_CARGO_LANE_TARGET_DIR", None)
-        direct_command = _direct_reserved_lane_command(
-            command, child_env, repo_root=repo_root, target_dir=target_dir
-        )
-        if direct_command is None:
-            child_env["CODEX_CARGO_LANE_TARGET_DIR"] = str(target_dir)
-        child_command = _cargo_command_with_target_dir(
-            direct_command if direct_command is not None else command,
-            target_dir,
-        )
-        if not Path(child_command[0]).parent.name:
-            resolved_program = shutil.which(
-                child_command[0],
-                path=child_env.get("PATH"),
+            if direct_command is None:
+                child_env["CODEX_CARGO_LANE_TARGET_DIR"] = str(target_dir)
+            child_command = _cargo_command_with_target_dir(
+                direct_command if direct_command is not None else command,
+                target_dir,
             )
-            if resolved_program is not None:
-                child_command[0] = resolved_program
-        maintain_cargo_lanes(repo_root, target_dir.parent)
-        # Keep routine maintenance hourly-throttled. Explicit target-prune can
-        # enforce disk budgets immediately after an unusually large build.
-        return subprocess.run(child_command, env=child_env, check=False).returncode
+            if not Path(child_command[0]).parent.name:
+                resolved_program = shutil.which(child_command[0], path=child_env.get("PATH"))
+                if resolved_program is not None:
+                    child_command[0] = resolved_program
+            next_phase("maintenance")
+            maintain_cargo_lanes(repo_root, target_dir.parent)
+            next_phase("command")
+            try:
+                exit_code = subprocess.run(child_command, env=child_env, check=False).returncode
+                record.update(exitCode=exit_code, status="completed" if exit_code == 0 else "failed")
+                return exit_code
+            finally:
+                next_phase("release")
+    except BaseException as error:
+        record.update(status="interrupted" if isinstance(error, KeyboardInterrupt) else "error",
+                      errorType=type(error).__name__)
+        raise
+    finally:
+        next_phase(None)
+        record["totalMs"] = (previous - started) / 1_000_000
+        if stream is not None:
+            try:
+                with stream:
+                    json.dump(record, stream, indent=2)
+                    stream.write("\n")
+            except OSError as error:
+                print(f"warning: Cargo lane timing could not be saved: {error}", file=sys.stderr)
 
 
 def is_protected_target_dir_name(name: str) -> bool:
@@ -1849,6 +1944,8 @@ def main(argv: list[str] | None = None) -> int:
     run_lane_parser.add_argument("--lane", required=True)
     run_lane_parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     run_lane_parser.add_argument("--lanes-root", type=Path)
+    run_lane_parser.add_argument("--timing-json", type=Path,
+                                 help="Write phase durations to a new JSON file (never overwrite).")
     run_lane_parser.add_argument(
         "--lock-timeout-seconds",
         type=positive_float,
@@ -1924,6 +2021,7 @@ def main(argv: list[str] | None = None) -> int:
                 command=command_args,
                 lane_root=args.lanes_root,
                 lock_timeout_seconds=args.lock_timeout_seconds,
+                timing_path=args.timing_json,
             )
         else:
             parser.error(f"unknown command {args.command}")

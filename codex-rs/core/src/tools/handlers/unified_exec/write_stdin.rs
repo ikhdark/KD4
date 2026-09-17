@@ -9,13 +9,10 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolExecutor;
-use crate::tools::tool_dispatch_trace;
 use crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS;
 use crate::unified_exec::WriteStdinRequest;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TerminalInteractionEvent;
-use codex_protocol::protocol::ToolLifecycleTimerWait;
-use codex_protocol::protocol::ToolLifecycleWakeReason;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use serde::Deserialize;
@@ -82,7 +79,6 @@ impl WriteStdinHandler {
         validate_independent_review_stdin(&turn.session_source, &args.chars)
             .map_err(|message| FunctionCallError::RespondToModel(message.to_string()))?;
         let yield_time_ms = owner_wait_yield_time_ms(&args.chars, args.yield_time_ms);
-        let deadline_at_ms = tool_dispatch_trace::lifecycle_deadline_after_ms(yield_time_ms);
         let response = session
             .services
             .unified_exec_manager
@@ -94,21 +90,6 @@ impl WriteStdinHandler {
                 truncation_policy: turn.model_info.truncation_policy.into(),
             })
             .await;
-        let wake_reason = match &response {
-            Ok(response) if response.process_id.is_some() => ToolLifecycleWakeReason::Timeout,
-            Ok(_) | Err(crate::unified_exec::UnifiedExecError::ToolHistoryPersistence { .. }) => {
-                ToolLifecycleWakeReason::Completed
-            }
-            Err(_) => ToolLifecycleWakeReason::Cancelled,
-        };
-        tool_dispatch_trace::record_timer_wait(ToolLifecycleTimerWait {
-            wait_kind: "write_stdin_yield".to_string(),
-            requested_timeout_ms: args.yield_time_ms,
-            effective_timeout_ms: Some(yield_time_ms),
-            deadline_at_ms,
-            wake_reason,
-            sequence: 0,
-        });
         if let Err(crate::unified_exec::UnifiedExecError::ToolHistoryPersistence {
             event_call_id: Some(call_id),
             ..

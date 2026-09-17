@@ -238,6 +238,12 @@ pub(crate) mod spawn_tool_spec {
 
     /// Builds the spawn-agent tool description text from built-in and configured roles.
     pub(crate) fn build(user_defined_agent_roles: &BTreeMap<String, AgentRoleConfig>) -> String {
+        static BUILT_IN_DESCRIPTION: LazyLock<String> =
+            LazyLock::new(|| build_from_configs(built_in::configs(), &BTreeMap::new()));
+        if user_defined_agent_roles.is_empty() {
+            return BUILT_IN_DESCRIPTION.clone();
+        }
+        // Configured roles can read mutable files; only the embedded roles are cached.
         let built_in_roles = built_in::configs();
         build_from_configs(built_in_roles, user_defined_agent_roles)
     }

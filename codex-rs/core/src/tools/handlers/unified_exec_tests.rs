@@ -51,7 +51,7 @@ fn exec_command_boundary_normalizes_unambiguous_legacy_forms() {
     for (arguments, expected) in cases {
         let decoded: ExecCommandArgs =
             parse_arguments(&arguments.to_string()).expect("legacy boundary form should decode");
-        assert_eq!(decoded.command_invocation().unwrap(), expected);
+        assert_eq!(decoded.command_invocation(), expected);
     }
 }
 
@@ -484,6 +484,54 @@ fn terminal_powershell_failure_keeps_recovery_advisory_out_of_raw_output() {
         !code_mode["output"]
             .as_str()
             .expect("code-mode output should be text")
+            .contains("retry with `kind: \"powershell_script\"`")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn terminal_powershell_nonterminating_error_exposes_recovery_hint_after_success() {
+    let result = std::process::Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$ErrorView = 'NormalView'; Get-Item -LiteralPath . extra; Write-Output done",
+        ])
+        .output()
+        .expect("run PowerShell non-terminating error scenario");
+    assert_eq!(result.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&result.stdout).contains("done"));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("PositionalParameterNotFound"));
+    let raw_output = [result.stdout, result.stderr].concat();
+    let mut output = ExecCommandToolOutput {
+        validation: None,
+        event_call_id: "call-nonterminating-error".to_string(),
+        chunk_id: "chunk-nonterminating-error".to_string(),
+        wall_time: std::time::Duration::ZERO,
+        raw_output: raw_output.clone(),
+        truncation_policy: TEST_TRUNCATION_POLICY,
+        max_output_tokens: None,
+        process_id: None,
+        exit_code: Some(0),
+        process_exited: true,
+        search_no_match: false,
+        original_token_count: None,
+        hook_command: None,
+        raw_output_artifact: None,
+        raw_output_reduction_notice: None,
+        repair_notice: None,
+    };
+    attach_powershell_failure_advisory(&mut output, ShellType::PowerShell, false);
+    assert_eq!(output.exit_code, Some(0));
+    assert_eq!(output.raw_output, raw_output);
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    assert!(
+        output.code_mode_result(&payload)["repair"]
+            .as_str()
+            .expect("visible hint")
             .contains("retry with `kind: \"powershell_script\"`")
     );
 }
@@ -1433,7 +1481,10 @@ async fn read_only_preflight_repair_executes_and_releases_process_id() {
             .as_str()
             .is_some_and(|repair| repair.contains("known_flag_typo"))
     );
-    assert!(code_mode["raw_output_artifact_id"].is_string());
+    // `rg --version` stays under the lazy artifact threshold, so no artifact is
+    // materialized and the output is retained inline instead.
+    assert!(code_mode["raw_output_artifact_id"].is_null());
+    assert!(code_mode.to_string().contains("ripgrep"));
 
     let process_id = session
         .services

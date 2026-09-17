@@ -100,7 +100,11 @@ const UNIFIED_EXEC_ENV: [(&str, &str); 10] = [
 ];
 
 #[cfg(windows)]
-const UNIFIED_EXEC_PAGER: &str = "more.com";
+// `more.com` interprets text and rewrites line endings. Copy the byte stream so
+// pager-using commands preserve the same output as the Unix `cat` default.
+// Encode `[Console]::OpenStandardInput().CopyTo([Console]::OpenStandardOutput())`
+// as UTF-16LE Base64 to avoid different quoting rules in cmd.exe and Git's sh.
+const UNIFIED_EXEC_PAGER: &str = "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand WwBDAG8AbgBzAG8AbABlAF0AOgA6AE8AcABlAG4AUwB0AGEAbgBkAGEAcgBkAEkAbgBwAHUAdAAoACkALgBDAG8AcAB5AFQAbwAoAFsAQwBvAG4AcwBvAGwAZQBdADoAOgBPAHAAZQBuAFMAdABhAG4AZABhAHIAZABPAHUAdABwAHUAdAAoACkAKQA=";
 #[cfg(not(windows))]
 const UNIFIED_EXEC_PAGER: &str = "cat";
 const NETWORK_ACCESS_DENIED_MESSAGE: &str =
@@ -108,6 +112,22 @@ const NETWORK_ACCESS_DENIED_MESSAGE: &str =
 const LATE_NETWORK_DENIAL_GRACE_PERIOD: Duration = Duration::from_millis(100);
 const INITIAL_OUTPUT_QUIET_PERIOD: Duration = Duration::from_millis(250);
 const INTERRUPT: &str = "\u{3}";
+
+struct CollectedOutput {
+    bytes: Vec<u8>,
+    wake_reason: ToolLifecycleWakeReason,
+}
+
+// Record the manager's actual deadline, including failures before collection.
+struct WriteStdinWait(ToolLifecycleTimerWait);
+
+impl Drop for WriteStdinWait {
+    fn drop(&mut self) {
+        if let Some(timing) = active_tool_dispatch_timing() {
+            timing.record_timer_wait(self.0.clone());
+        }
+    }
+}
 
 /// Test-only override for deterministic unified exec process IDs.
 ///
@@ -1249,7 +1269,15 @@ impl UnifiedExecProcessManager {
             ..
         } = process.output_handles();
         let deadline = start + Duration::from_millis(yield_time_ms);
-        let collected = Self::collect_initial_output_until_deadline(
+        // Build/test progress is not a result. Keep noninteractive validation
+        // attached until it exits or the caller's requested wait expires, so a
+        // brief compilation pause does not cost another model round trip.
+        let quiet_period = if !request.tty && request.validation_launch.is_some() {
+            None
+        } else {
+            Some(INITIAL_OUTPUT_QUIET_PERIOD)
+        };
+        let collected = Self::collect_output_until_deadline_with_quiet_yield(
             &output_buffer,
             &output_notify,
             &output_closed,
@@ -1257,8 +1285,11 @@ impl UnifiedExecProcessManager {
             &cancellation_token,
             Some(context.session.subscribe_elicitation_pause_state()),
             deadline,
+            quiet_period,
+            &mut None,
         )
-        .await;
+        .await
+        .bytes;
         if cancellation_token.is_cancelled() || process.has_exited() {
             mark_exec_process_exited();
         }
@@ -1537,10 +1568,34 @@ impl UnifiedExecProcessManager {
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let process_id = request.process_id;
 
-        // Different terminal sessions can be polled concurrently, but reads and
-        // writes against one terminal must not overlap because they share a
-        // draining output buffer and process lifecycle.
-        let _interaction_guard = locked_process.interaction_lock().lock_owned().await;
+        // Register polls before joining the FIFO lock queue. A writer first
+        // joins that queue, then wakes registered polls; no notification can be
+        // lost between acquiring the lock and starting output collection.
+        let interaction_requested = locked_process.interaction_requested();
+        let mut handoff = request.input.is_empty().then(|| {
+            let mut notified = Box::pin(Arc::clone(&interaction_requested).notified_owned());
+            notified.as_mut().enable();
+            notified
+        });
+        let queue_started_at = Instant::now();
+        let lock = locked_process.interaction_lock().lock_owned();
+        tokio::pin!(lock);
+        let _interaction_guard = if request.input.is_empty() {
+            lock.await
+        } else {
+            match futures::poll!(&mut lock) {
+                std::task::Poll::Ready(guard) => guard,
+                std::task::Poll::Pending => {
+                    interaction_requested.notify_waiters();
+                    lock.await
+                }
+            }
+        };
+        tracing::debug!(
+            process_id,
+            interaction_queue_wait_ms = queue_started_at.elapsed().as_millis(),
+            "unified exec interaction admitted"
+        );
 
         let PreparedProcessHandles {
             process,
@@ -1576,6 +1631,15 @@ impl UnifiedExecProcessManager {
         // Failure cleanup confirms termination under its separate deadline.
         let start = Instant::now();
         let deadline = start + Duration::from_millis(yield_time_ms);
+        let mut wait = WriteStdinWait(ToolLifecycleTimerWait {
+            wait_kind: "write_stdin_yield".to_string(),
+            requested_timeout_ms: Some(request.yield_time_ms),
+            effective_timeout_ms: Some(yield_time_ms),
+            deadline_at_ms: active_tool_dispatch_timing()
+                .and_then(|timing| timing.deadline_after_ms(yield_time_ms)),
+            wake_reason: ToolLifecycleWakeReason::Cancelled,
+            sequence: 0,
+        });
 
         if !request.input.is_empty() {
             if !tty {
@@ -1625,32 +1689,23 @@ impl UnifiedExecProcessManager {
             }
         }
 
-        let collected = if request.input.is_empty() {
-            // Empty stdin is an owner wait, not a fixed-cadence poll. Hold one
-            // event-driven observation until meaningful output, exit, or the
-            // owner deadline instead of waking every five seconds.
-            Self::collect_output_until_progress_or_deadline(
-                &output_buffer,
-                &output_notify,
-                &output_closed,
-                &output_closed_notify,
-                &cancellation_token,
-                pause_state,
-                deadline,
-            )
-            .await
-        } else {
-            Self::collect_output_until_deadline(
-                &output_buffer,
-                &output_notify,
-                &output_closed,
-                &output_closed_notify,
-                &cancellation_token,
-                pause_state,
-                deadline,
-            )
-            .await
-        };
+        let collected = Self::collect_output_until_deadline_with_quiet_yield(
+            &output_buffer,
+            &output_notify,
+            &output_closed,
+            &output_closed_notify,
+            &cancellation_token,
+            pause_state,
+            deadline,
+            request
+                .input
+                .is_empty()
+                .then_some(INITIAL_OUTPUT_QUIET_PERIOD),
+            &mut handoff,
+        )
+        .await;
+        wait.0.wake_reason = collected.wake_reason;
+        let collected = collected.bytes;
         let wall_time = Instant::now().saturating_duration_since(start);
 
         let chunk_id = generate_chunk_id();
@@ -1747,15 +1802,21 @@ impl UnifiedExecProcessManager {
         Ok(response.with_prepared_reduction_notice().await)
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "Check process identity and drained output atomically before removing its store entry"
-    )]
     async fn refresh_process_state(
         &self,
         process_id: u32,
         expected_process: &Arc<UnifiedExecProcess>,
     ) -> ProcessStatus {
+        // Once output is closed under the producer's buffer lock, it cannot
+        // gain more bytes. Inspect that terminal state before taking the global
+        // store lock, then verify the process identity before removing it.
+        let drained = if expected_process.has_exited() && expected_process.output_is_closed() {
+            let handles = expected_process.output_handles();
+            let buffer = handles.output_buffer.lock().await;
+            expected_process.output_is_closed() && !buffer.has_unreported_output()
+        } else {
+            false
+        };
         let mut store = self.process_store.lock().await;
         let Some(entry) = store.processes.get_mut(&process_id) else {
             return ProcessStatus::Unknown;
@@ -1767,16 +1828,7 @@ impl UnifiedExecProcessManager {
         let exit_code = entry.process.exit_code();
         let process_id = entry.process_id;
 
-        if entry.process.has_exited()
-            && entry.process.output_is_closed()
-            && !entry
-                .process
-                .output_handles()
-                .output_buffer
-                .lock()
-                .await
-                .has_unreported_output()
-        {
+        if drained {
             let Some(entry) = store.remove(process_id) else {
                 return ProcessStatus::Unknown;
             };
@@ -2373,6 +2425,10 @@ impl UnifiedExecProcessManager {
             })
     }
 
+    /// Collection without an early quiet yield. Production always supplies a
+    /// quiet-yield bound; this shape is retained for tests that drive the
+    /// deadline directly.
+    #[cfg(test)]
     pub(super) async fn collect_output_until_deadline(
         output_buffer: &OutputBuffer,
         output_notify: &Arc<Notify>,
@@ -2391,10 +2447,13 @@ impl UnifiedExecProcessManager {
             pause_state,
             deadline,
             None,
+            &mut None,
         )
         .await
+        .bytes
     }
 
+    #[cfg(test)]
     async fn collect_output_until_progress_or_deadline(
         output_buffer: &OutputBuffer,
         output_notify: &Arc<Notify>,
@@ -2413,10 +2472,13 @@ impl UnifiedExecProcessManager {
             pause_state,
             deadline,
             Some(INITIAL_OUTPUT_QUIET_PERIOD),
+            &mut None,
         )
         .await
+        .bytes
     }
 
+    #[cfg(test)]
     async fn collect_initial_output_until_deadline(
         output_buffer: &OutputBuffer,
         output_notify: &Arc<Notify>,
@@ -2435,8 +2497,10 @@ impl UnifiedExecProcessManager {
             pause_state,
             deadline,
             Some(INITIAL_OUTPUT_QUIET_PERIOD),
+            &mut None,
         )
         .await
+        .bytes
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2449,7 +2513,8 @@ impl UnifiedExecProcessManager {
         mut pause_state: Option<watch::Receiver<bool>>,
         mut deadline: Instant,
         quiet_period: Option<Duration>,
-    ) -> Vec<u8> {
+        handoff: &mut Option<std::pin::Pin<Box<tokio::sync::futures::OwnedNotified>>>,
+    ) -> CollectedOutput {
         // Draining frees producer capacity, so the entire collection window needs
         // its own bound. Raw output is still captured by the process artifact writer.
         let mut collected = HeadTailBuffer::default();
@@ -2460,14 +2525,17 @@ impl UnifiedExecProcessManager {
         // Silence alone is not progress. Honor the requested deadline until
         // meaningful output starts the shorter quiet-period deadline.
         let mut early_yield_deadline = None;
-        loop {
-            Self::extend_deadlines_while_paused(
-                &mut pause_state,
-                &mut deadline,
-                &mut post_exit_deadline,
-                &mut early_yield_deadline,
-            )
-            .await;
+        let wake_reason = loop {
+            tokio::select! {
+                biased;
+                _ = Self::wait_for_interaction(handoff) => break ToolLifecycleWakeReason::Retry,
+                _ = Self::extend_deadlines_while_paused(
+                    &mut pause_state,
+                    &mut deadline,
+                    &mut post_exit_deadline,
+                    &mut early_yield_deadline,
+                ) => {}
+            }
             // Register before inspecting the buffer. `notify_waiters` does not
             // retain a permit, so registering after an empty drain would leave
             // a race where output can arrive between the drain and the first
@@ -2492,7 +2560,7 @@ impl UnifiedExecProcessManager {
             if !output_arrived {
                 exit_signal_received |= cancellation_token.is_cancelled();
                 if exit_signal_received && output_was_closed {
-                    break;
+                    break ToolLifecycleWakeReason::Completed;
                 }
                 let effective_deadline = if exit_signal_received {
                     deadline
@@ -2503,7 +2571,11 @@ impl UnifiedExecProcessManager {
                 };
                 let remaining = effective_deadline.saturating_duration_since(Instant::now());
                 if remaining == Duration::ZERO {
-                    break;
+                    break if effective_deadline < deadline {
+                        ToolLifecycleWakeReason::Completed
+                    } else {
+                        ToolLifecycleWakeReason::Timeout
+                    };
                 }
 
                 if exit_signal_received {
@@ -2514,7 +2586,7 @@ impl UnifiedExecProcessManager {
                     });
                     let close_wait_remaining = close_wait_deadline.saturating_duration_since(now);
                     if close_wait_remaining == Duration::ZERO {
-                        break;
+                        break ToolLifecycleWakeReason::Timeout;
                     }
                     if wait_attempt > 0
                         && let Some(timing) = tool_dispatch_timing.as_ref()
@@ -2537,6 +2609,7 @@ impl UnifiedExecProcessManager {
                         );
                     }
                     let wake_reason = tokio::select! {
+                        _ = Self::wait_for_interaction(handoff) => break ToolLifecycleWakeReason::Retry,
                         _ = &mut output_notified => ToolLifecycleWakeReason::Completed,
                         _ = &mut closed => ToolLifecycleWakeReason::Completed,
                         _ = tokio::time::sleep(close_wait_remaining) => ToolLifecycleWakeReason::Timeout,
@@ -2553,7 +2626,7 @@ impl UnifiedExecProcessManager {
                         });
                     }
                     if wake_reason == ToolLifecycleWakeReason::Timeout {
-                        break;
+                        break wake_reason;
                     }
                     continue;
                 }
@@ -2580,6 +2653,7 @@ impl UnifiedExecProcessManager {
                     );
                 }
                 let wake_reason = tokio::select! {
+                        _ = Self::wait_for_interaction(handoff) => break ToolLifecycleWakeReason::Retry,
                     _ = &mut output_notified => ToolLifecycleWakeReason::Completed,
                     _ = &mut exit_notified => {
                         exit_signal_received = true;
@@ -2599,7 +2673,11 @@ impl UnifiedExecProcessManager {
                     });
                 }
                 if wake_reason == ToolLifecycleWakeReason::Timeout {
-                    break;
+                    break if effective_deadline < deadline {
+                        ToolLifecycleWakeReason::Completed
+                    } else {
+                        wake_reason
+                    };
                 }
                 continue;
             }
@@ -2624,16 +2702,33 @@ impl UnifiedExecProcessManager {
                     .unwrap_or(deadline)
             };
             if Instant::now() >= effective_deadline {
-                break;
+                break if effective_deadline < deadline {
+                    ToolLifecycleWakeReason::Completed
+                } else {
+                    ToolLifecycleWakeReason::Timeout
+                };
             }
-        }
+        };
 
         let mut output = collected
             .to_bytes_with_omission_marker(&omitted_output_marker(collected.omitted_bytes()));
         if collected.lagged_chunks() > 0 {
             output.extend_from_slice(&lagged_output_marker(collected.lagged_chunks()));
         }
-        output
+        CollectedOutput {
+            bytes: output,
+            wake_reason,
+        }
+    }
+
+    async fn wait_for_interaction(
+        handoff: &mut Option<std::pin::Pin<Box<tokio::sync::futures::OwnedNotified>>>,
+    ) {
+        if let Some(notified) = handoff.as_mut() {
+            notified.await;
+        } else {
+            std::future::pending::<()>().await;
+        }
     }
 
     async fn extend_deadlines_while_paused(

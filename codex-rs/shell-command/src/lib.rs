@@ -9,6 +9,7 @@ pub mod powershell;
 
 pub use command_safety::is_dangerous_command;
 pub use command_safety::is_safe_command;
+pub use command_safety::prewarm_powershell_parser;
 
 /// Escapes text that will be placed between PowerShell single quotes.
 pub fn escape_powershell_single_quoted(input: &str) -> String {

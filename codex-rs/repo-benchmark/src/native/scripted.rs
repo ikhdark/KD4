@@ -21,6 +21,11 @@ use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 
+const EXCLUSIVE_FILE: &str = "repo-benchmark-exclusive.txt";
+const EXCLUSIVE_START: &str =
+    "*** Begin Patch\n*** Add File: repo-benchmark-exclusive.txt\n+started\n*** End Patch";
+const EXCLUSIVE_FINISH: &str = "*** Begin Patch\n*** Update File: repo-benchmark-exclusive.txt\n@@\n-started\n+completed\n*** End Patch";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScriptedScenario {
@@ -130,6 +135,7 @@ struct State {
     started_process: Option<CancellationProcess>,
     exclusive_final_pending: bool,
     exclusive_final_call: Option<String>,
+    exclusive_read_call: Option<String>,
     adaptations: Vec<String>,
     requests: File,
 }
@@ -148,6 +154,7 @@ impl ScriptedProvider {
             started_process: None,
             exclusive_final_pending: false,
             exclusive_final_call: None,
+            exclusive_read_call: None,
             adaptations: vec![],
             requests: OpenOptions::new()
                 .create_new(true)
@@ -168,7 +175,7 @@ impl ScriptedProvider {
             writeln!(state.requests, "{recorded}")?;
             state.requests.flush()?;
             if state.scenario.cancel_first() && state.turn == 0 && state.step > 0 {
-                state.retained_session = session_id(&tool_outputs(&request));
+                state.retained_session = session_id(&tool_outputs(&request, None));
                 drop(state);
                 let (lock, ready) = &*handler_cancellation;
                 let outcome = ready
@@ -224,6 +231,7 @@ impl ScriptedProvider {
         state.observed_tool_output = false;
         state.exclusive_final_pending = false;
         state.exclusive_final_call = None;
+        state.exclusive_read_call = None;
         Ok(())
     }
 
@@ -319,6 +327,11 @@ impl ScriptedProvider {
             if content != marker(turn, index) {
                 bail!("scripted tool marker has incorrect contents: {content:?}");
             }
+        }
+        if state.scenario == ScriptedScenario::ExclusiveTools
+            && fs::read_to_string(cwd.join(EXCLUSIVE_FILE))? != "completed\n"
+        {
+            bail!("exclusive mutation did not persist its completed state");
         }
         if state.scenario == ScriptedScenario::ContextChangeInvalidation && turn == 2 {
             let content = fs::read_to_string(cwd.join("repo-benchmark-context.txt"))?;
@@ -437,10 +450,12 @@ impl State {
                             .collect::<Vec<_>>()
                             .join(",")
                     )
-                } else if self.scenario == ScriptedScenario::ExclusiveTools {
+                } else if self.scenario == ScriptedScenario::ExclusiveTools && self.step == 1 {
                     format!(
-                        "const results = await Promise.all([tools.update_plan({{plan:[{{step:'Run independently verified command',status:'in_progress'}}]}}), tools.exec_command({})]); for (const result of results) text(result); text(await tools.update_plan({{plan:[{{step:'Run independently verified command',status:'completed'}}]}}));",
-                        args[0]
+                        "const results = await Promise.all([tools.apply_patch({}), tools.exec_command({})]); for (const result of results) text(result); text(await tools.apply_patch({}));",
+                        json!(EXCLUSIVE_START),
+                        args[0],
+                        json!(EXCLUSIVE_FINISH)
                     )
                 } else {
                     format!("text(await tools.exec_command({}));", args[0])
@@ -460,13 +475,13 @@ impl State {
             self.record_adaptation("reference has no advertised code-mode exec; equivalent logical commands use direct native tools");
         }
         let mut calls = Vec::new();
-        if self.scenario == ScriptedScenario::ExclusiveTools {
+        if self.scenario == ScriptedScenario::ExclusiveTools && self.step == 1 {
             self.exclusive_final_pending = true;
-            let update = tools
+            let patch = tools
                 .iter()
-                .find(|tool| tool.name == "update_plan")
-                .context("exclusive workload requires native update_plan")?;
-            calls.push(update.call(&format!("plan-{}",self.serial), json!({"plan":[{"step":"Run independently verified command","status":"in_progress"}]})));
+                .find(|tool| tool.name == "apply_patch" && tool.custom)
+                .context("exclusive workload requires native apply_patch")?;
+            calls.push(patch.call(&format!("patch-{}", self.serial), json!(EXCLUSIVE_START)));
         }
         for (index, cmd) in commands.iter().enumerate() {
             let args = match direct.name.as_str() {
@@ -488,7 +503,7 @@ impl State {
     }
 
     fn continue_calls(&mut self, request: &Value) -> Result<Vec<Value>> {
-        let output = tool_outputs(request);
+        let output = tool_outputs(request, self.exclusive_read_call.as_deref());
         if output.is_empty() {
             bail!("native continuation omitted all model-visible tool results");
         }
@@ -524,7 +539,10 @@ impl State {
                 Value::String(format!("text(await tools.write_stdin({args}));")),
             )]);
         }
-        if !complete {
+        let verify_exclusive = self.scenario == ScriptedScenario::ExclusiveTools
+            && self.step == 1
+            && !self.exclusive_final_pending;
+        if !complete && !verify_exclusive {
             bail!(
                 "native tool results do not contain the expected scenario marker(s): {expected:?}; received {output}"
             );
@@ -532,13 +550,13 @@ impl State {
         if self.exclusive_final_pending {
             self.exclusive_final_pending = false;
             let tools = advertised_tools(request);
-            let update = tools
+            let patch = tools
                 .iter()
-                .find(|tool| tool.name == "update_plan")
-                .context("exclusive workload requires native update_plan for final completion")?;
-            let id = format!("plan-completed-{}", self.serial);
+                .find(|tool| tool.name == "apply_patch" && tool.custom)
+                .context("exclusive workload requires native apply_patch for final completion")?;
+            let id = format!("patch-completed-{}", self.serial);
             self.exclusive_final_call = Some(id.clone());
-            return Ok(vec![update.call(&id,json!({"plan":[{"step":"Run independently verified command","status":"completed"}]}))]);
+            return Ok(vec![patch.call(&id, json!(EXCLUSIVE_FINISH))]);
         }
         if let Some(id) = &self.exclusive_final_call {
             if !request["input"]
@@ -546,13 +564,33 @@ impl State {
                 .into_iter()
                 .flatten()
                 .any(|item| {
-                    item["type"] == "function_call_output"
+                    item["type"] == "custom_tool_call_output"
                         && item["call_id"] == *id
-                        && item["output"].to_string().contains("Plan updated")
+                        && item["output"]
+                            .to_string()
+                            .contains("Success. Updated the following files:")
                 })
             {
-                bail!("native exclusive continuation omitted the final plan-update success result");
+                bail!("native exclusive continuation omitted the final patch success result");
             }
+        }
+        if verify_exclusive {
+            // A mutation can invalidate the combined code-mode result. Read the
+            // actual effects in a separate, mutation-free call on every variant.
+            self.exclusive_final_call = None;
+            self.step = 2;
+            let command = format!(
+                "[Console]::Out.Write([System.IO.File]::ReadAllText('{}')); [Console]::Out.Write([System.IO.File]::ReadAllText('{EXCLUSIVE_FILE}'))",
+                marker_file(self.turn, 0)
+            );
+            let calls = self.command_calls(request, &[command], false)?;
+            self.exclusive_read_call = Some(
+                calls[0]["call_id"]
+                    .as_str()
+                    .context("exclusive read omitted call id")?
+                    .to_owned(),
+            );
+            return Ok(calls);
         }
         if matches!(
             self.scenario,
@@ -595,7 +633,7 @@ impl CancellationProcess {
         // Compare creation time as well as PID: a reused PID is not the child
         // whose cancellation is under test. The probe itself is deadline bound.
         let script = format!(
-            "$ErrorActionPreference = 'Stop'; $p = Get-Process -Id {} -ErrorAction SilentlyContinue; if ($null -ne $p -and $p.StartTime.ToUniversalTime().Ticks -eq {}) {{ [Console]::Out.Write('running') }} else {{ [Console]::Out.Write('gone') }}",
+            "$ErrorActionPreference = 'Stop'; $p = Get-Process -Id {} -ErrorAction SilentlyContinue; if ($null -ne $p -and -not $p.HasExited -and $p.StartTime.ToUniversalTime().Ticks -eq {}) {{ [Console]::Out.Write('running') }} else {{ [Console]::Out.Write('gone') }}",
             self.pid, self.start_time_utc_ticks
         );
         let mut command = Command::new("powershell.exe");
@@ -708,10 +746,18 @@ fn advertised_tools(request: &Value) -> Vec<Tool> {
     if let Some(items) = request["tools"].as_array() {
         collect(items, None, &mut tools);
     }
+    // Responses Lite carries the same tool declarations inside input items.
+    for item in request["input"].as_array().into_iter().flatten() {
+        if item["type"] == "additional_tools" {
+            if let Some(items) = item["tools"].as_array() {
+                collect(items, None, &mut tools);
+            }
+        }
+    }
     tools
 }
 
-fn tool_outputs(request: &Value) -> String {
+fn tool_outputs(request: &Value, call_id: Option<&str>) -> String {
     request["input"]
         .as_array()
         .into_iter()
@@ -722,6 +768,7 @@ fn tool_outputs(request: &Value) -> String {
                 Some("function_call_output" | "custom_tool_call_output" | "tool_search_output")
             )
         })
+        .filter(|item| call_id.is_none_or(|id| item["call_id"] == id))
         .map(|item| item.get("output").unwrap_or(&Value::Null).to_string())
         .collect::<Vec<_>>()
         .join("\n")
@@ -1039,14 +1086,14 @@ mod tests {
     }
 
     #[test]
-    fn exclusive_direct_adaptation_executes_the_same_final_plan_update() {
+    fn exclusive_direct_adaptation_requires_final_patch_effect() {
         let temp = tempfile::tempdir().unwrap();
         let provider =
             ScriptedProvider::start(ScriptedScenario::ExclusiveTools, temp.path()).unwrap();
-        let tools = json!([{"type":"function","name":"exec_command"},{"type":"function","name":"update_plan"}]);
+        let tools = json!([{"type":"function","name":"exec_command"},{"type":"custom","name":"apply_patch"}]);
         let first = post(&provider, &json!({"tools":tools,"input":[]}));
-        assert_eq!(first.matches("\"name\":\"update_plan\"").count(), 1);
-        assert!(first.contains("in_progress"));
+        assert_eq!(first.matches("\"name\":\"apply_patch\"").count(), 1);
+        assert!(first.contains("*** Add File: repo-benchmark-exclusive.txt\\n+started"));
         let completed_tool = json!({"type":"function_call_output","output":marker(0,0)});
         let second = post(&provider, &json!({"tools":tools,"input":[completed_tool]}));
         let item = second
@@ -1055,22 +1102,143 @@ mod tests {
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .find_map(|event| event.get("item").cloned())
             .unwrap();
-        assert_eq!(item["name"], "update_plan");
-        let args: Value = serde_json::from_str(item["arguments"].as_str().unwrap()).unwrap();
-        assert_eq!(args["plan"][0]["status"], "completed");
+        assert_eq!(item["name"], "apply_patch");
+        assert_eq!(item["type"], "custom_tool_call");
+        assert_eq!(
+            item["input"],
+            "*** Begin Patch\n*** Update File: repo-benchmark-exclusive.txt\n@@\n-started\n+completed\n*** End Patch"
+        );
         assert!(
             provider.verify_turn(temp.path(), 0).is_err(),
-            "completion requires the final plan update result"
+            "completion requires the final patch result"
         );
         let missing = post(&provider, &json!({"tools":tools,"input":[completed_tool]}));
-        assert!(missing.contains("omitted the final plan-update success result"));
+        assert!(missing.contains("omitted the final patch success result"));
+        let rejected = post(
+            &provider,
+            &json!({"tools":tools,"input":[completed_tool,{"type":"custom_tool_call_output","call_id":item["call_id"],"output":"Failed to update repo-benchmark-exclusive.txt"}]}),
+        );
+        assert!(rejected.contains("omitted the final patch success result"));
+        let read = post(
+            &provider,
+            &json!({"tools":tools,"input":[completed_tool,{"type":"custom_tool_call_output","call_id":item["call_id"],"output":"Success. Updated the following files:\nM repo-benchmark-exclusive.txt"}]}),
+        );
+        assert!(read.contains("\"name\":\"exec_command\""));
+        assert!(read.contains("ReadAllText('repo-benchmark-exclusive.txt')"));
+        assert!(!read.contains("WriteAllText"));
+        assert!(!read.contains("\"name\":\"apply_patch\""));
+        assert!(provider.verify_turn(temp.path(), 0).is_err());
+        let read_item = read
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find_map(|event| event.get("item").cloned())
+            .unwrap();
+        let stale = post(&provider, &json!({"tools":tools,"input":[completed_tool]}));
+        assert!(stale.contains("omitted all model-visible tool results"));
         let last = post(
             &provider,
-            &json!({"tools":tools,"input":[completed_tool,{"type":"function_call_output","call_id":item["call_id"],"output":"Plan updated"}]}),
+            &json!({"tools":tools,"input":[completed_tool,{
+                "type":"function_call_output","call_id":read_item["call_id"],"output":format!("{}completed\n", marker(0,0))
+            }]}),
         );
         assert!(last.contains("Verified scripted tool output"));
         fs::write(temp.path().join(marker_file(0, 0)), marker(0, 0)).unwrap();
+        assert!(provider.verify_turn(temp.path(), 0).is_err());
+        fs::write(
+            temp.path().join("repo-benchmark-exclusive.txt"),
+            "started\n",
+        )
+        .unwrap();
+        assert!(provider.verify_turn(temp.path(), 0).is_err());
+        fs::write(
+            temp.path().join("repo-benchmark-exclusive.txt"),
+            "completed\n",
+        )
+        .unwrap();
         provider.verify_turn(temp.path(), 0).unwrap();
+    }
+
+    #[test]
+    fn exclusive_code_mode_uses_common_patch_tools_and_verifies_effect() {
+        for stale in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let provider =
+                ScriptedProvider::start(ScriptedScenario::ExclusiveTools, temp.path()).unwrap();
+            let declarations = json!({"type":"additional_tools","tools":[{"type":"namespace","name":"functions","tools":[{"type":"custom","name":"exec"}]}]});
+            let first = post(&provider, &json!({"input":[declarations]}));
+            let item = first
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .find_map(|event| event.get("item").cloned())
+                .unwrap();
+            assert_eq!(item["name"], "exec");
+            assert_eq!(item["namespace"], "functions");
+            let code = item["input"].as_str().unwrap();
+            assert!(code.starts_with("const results = await Promise.all([tools.apply_patch("));
+            assert!(code.contains("*** Add File: repo-benchmark-exclusive.txt\\n+started"));
+            assert!(code.contains("tools.exec_command("));
+            assert!(code.contains("text(await tools.apply_patch("));
+            assert!(code.contains(
+                "*** Update File: repo-benchmark-exclusive.txt\\n@@\\n-started\\n+completed"
+            ));
+            let output = if stale {
+                json!([{"type":"input_text","text":json!({"stale_workspace_evidence":true,"valid_for_current_workspace":false,"reason_code":"source_dependency_changed","rerun":{"force_fresh":true}}).to_string()}])
+            } else {
+                json!(marker(0, 0))
+            };
+            let read = post(
+                &provider,
+                &json!({"input":[declarations,{
+                    "type":"custom_tool_call_output","call_id":item["call_id"],"output":output
+                }]}),
+            );
+            assert!(
+                read.contains("ReadAllText('repo-benchmark-exclusive.txt')"),
+                "{read}"
+            );
+            assert!(read.contains("ReadAllText('repo-benchmark-marker-0-0.txt')"));
+            assert!(!read.contains("tools.apply_patch"));
+            assert!(!read.contains("WriteAllText"));
+            assert!(provider.verify_turn(temp.path(), 0).is_err());
+            let read_item = read
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .find_map(|event| event.get("item").cloned())
+                .unwrap();
+            let missing = post(
+                &provider,
+                &json!({"input":[declarations,{
+                    "type":"custom_tool_call_output","call_id":item["call_id"],"output":marker(0,0)
+                },{
+                    "type":"custom_tool_call_output","call_id":read_item["call_id"],"output":"read failed"
+                }]}),
+            );
+            assert!(missing.contains("do not contain the expected scenario marker"));
+            let last = post(
+                &provider,
+                &json!({"input":[declarations,{
+                    "type":"custom_tool_call_output","call_id":read_item["call_id"],"output":format!("{}completed\n", marker(0,0))
+                }]}),
+            );
+            assert!(last.contains("Verified scripted tool output"));
+            fs::write(temp.path().join(marker_file(0, 0)), marker(0, 0)).unwrap();
+            assert!(provider.verify_turn(temp.path(), 0).is_err());
+            fs::write(
+                temp.path().join("repo-benchmark-exclusive.txt"),
+                "started\n",
+            )
+            .unwrap();
+            assert!(provider.verify_turn(temp.path(), 0).is_err());
+            fs::write(
+                temp.path().join("repo-benchmark-exclusive.txt"),
+                "completed\n",
+            )
+            .unwrap();
+            provider.verify_turn(temp.path(), 0).unwrap();
+        }
     }
 
     #[test]
@@ -1101,6 +1269,53 @@ mod tests {
         );
         assert!(retained.starts_with("HTTP/1.1 200 OK"));
         provider.verify_turn(temp.path(), 1).unwrap();
+    }
+
+    #[test]
+    fn provider_exercises_in_band_code_mode_tools() {
+        for namespaced in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let provider =
+                ScriptedProvider::start(ScriptedScenario::DirectTools, temp.path()).unwrap();
+            provider.begin_turn(0).unwrap();
+            let mut tools = json!([{"type":"custom","name":"exec"}]);
+            if namespaced {
+                tools = json!([{"type":"namespace","name":"functions","tools":tools}]);
+            }
+            let declarations = json!({"type":"additional_tools","role":"developer","tools":tools});
+            let first = post(&provider, &json!({"input":[declarations]}));
+            assert!(first.starts_with("HTTP/1.1 200 OK"), "{first}");
+            let call: Value = first
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                .find(|event| event["type"] == "response.output_item.done")
+                .unwrap()["item"]
+                .clone();
+            assert_eq!(call["type"], "custom_tool_call");
+            assert_eq!(call["name"], "exec");
+            assert_eq!(
+                call.get("namespace"),
+                namespaced.then_some(&json!("functions"))
+            );
+            assert!(
+                call["input"]
+                    .as_str()
+                    .unwrap()
+                    .contains("tools.exec_command(")
+            );
+            assert!(call["input"].as_str().unwrap().contains(&marker(0, 0)));
+            let second = post(
+                &provider,
+                &json!({"input":[declarations,{
+                    "type":"custom_tool_call_output","call_id":call["call_id"],"output":marker(0,0)
+                }]}),
+            );
+            assert!(second.starts_with("HTTP/1.1 200 OK"), "{second}");
+            assert!(provider.verify_turn(temp.path(), 0).is_err());
+            fs::write(temp.path().join(marker_file(0, 0)), marker(0, 0)).unwrap();
+            provider.verify_turn(temp.path(), 0).unwrap();
+        }
     }
 
     #[test]

@@ -39,6 +39,7 @@ use crate::tool_history::SourceDependencyV1;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::turn_timing::TurnTimingState;
 use crate::validation_admission::ValidationClassification;
+use crate::validation_admission::ValidationOperation;
 use crate::validation_admission::classify_validation;
 
 pub(crate) type SamplingReasoningPhase = ReasoningPolicyPhase;
@@ -299,6 +300,8 @@ struct SamplingToolOutcome {
     canonical_artifact_required: bool,
     nested_in_code_mode: bool,
     wraps_nested_terminal: bool,
+    executed_cargo_test_targets: BTreeSet<String>,
+    tests_executed: bool,
 }
 
 impl SamplingToolOutcome {
@@ -326,6 +329,8 @@ impl SamplingToolOutcome {
                 .and_then(|signal| signal.get("nested_ordinal"))
                 .and_then(Value::as_u64)
                 .is_some(),
+            executed_cargo_test_targets: BTreeSet::new(),
+            tests_executed: false,
         }
     }
 
@@ -548,11 +553,12 @@ impl DeterministicDispatchLedger {
 struct SamplingRequestSignalState {
     outcomes: Vec<SamplingToolOutcome>,
     structured_actions: BTreeMap<u64, StructuredActionIdentity>,
-    recovery_action_identities: BTreeMap<u64, String>,
+    recovery_action_identities: BTreeMap<u64, RecoveryActionIdentity>,
     evidence_items: BTreeMap<u64, String>,
     successful_replay_responses: BTreeMap<u64, ResponseInputItem>,
     validation_ordinals: BTreeSet<u64>,
     validation_proof_ordinals: BTreeSet<u64>,
+    test_validation_ordinals: BTreeSet<u64>,
     validation_mutation_revision: Option<u64>,
     final_verification_ordinals: BTreeSet<u64>,
     mutation_ordinals: BTreeSet<u64>,
@@ -573,6 +579,36 @@ struct SamplingRequestSignalState {
     authoritative_wait_observations: Vec<AuthoritativeWaitObservation>,
     child_runtime_ms: u64,
     child_runtime_sample_count: usize,
+}
+
+impl SamplingRequestSignalState {
+    fn accumulate_code_mode_source_dependencies(
+        &mut self,
+        cell_id: &str,
+        source_dependencies: Option<BTreeSet<SourceDependencyV1>>,
+    ) {
+        let Some(source_dependencies) = source_dependencies else {
+            return;
+        };
+        match self
+            .code_mode_source_dependencies
+            .entry(cell_id.to_string())
+        {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(source_dependencies);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let accumulated = entry.get_mut();
+                if accumulated.is_empty() || source_dependencies.is_empty() {
+                    // Empty means an observation could not be scoped. Preserve
+                    // that fail-closed state for the whole cell.
+                    accumulated.clear();
+                } else {
+                    accumulated.extend(source_dependencies);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -647,7 +683,7 @@ impl SamplingRequestSignalCollector {
         let action_identity = deterministic_action_identity(tool_name, &canonical);
         let structured_action =
             structured_action_identity_from_canonical(tool_name, payload, &canonical);
-        let (validation, validation_proof) =
+        let (validation, validation_proof, test_execution) =
             validation_status_from_arguments(tool_name, &canonical.value);
         let final_verification = final_diff_status_from_arguments(tool_name, &canonical.value);
         let mutation = is_mutation_tool(tool_name);
@@ -729,6 +765,9 @@ impl SamplingRequestSignalCollector {
         }
         if validation_proof {
             state.validation_proof_ordinals.insert(ordinal);
+        }
+        if test_execution {
+            state.test_validation_ordinals.insert(ordinal);
         }
         if final_verification {
             state.final_verification_ordinals.insert(ordinal);
@@ -897,10 +936,16 @@ impl SamplingRequestSignalCollector {
         }
         outcome.canonical_artifact_required = canonical_artifact_required;
         outcome.nested_in_code_mode = true;
+        let output = result
+            .get("output")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        outcome.executed_cargo_test_targets = executed_cargo_test_targets(output);
+        outcome.tests_executed = output_proves_test_execution(output);
         let canonical = canonical_tool_action(payload);
         let structured_action =
             structured_action_identity_from_canonical(tool_name, payload, &canonical);
-        let (validation, validation_proof) =
+        let (validation, validation_proof, test_execution) =
             validation_status_from_arguments(tool_name, &canonical.value);
         let final_verification = final_diff_status_from_arguments(tool_name, &canonical.value);
         let mutation = is_mutation_tool(tool_name);
@@ -925,25 +970,16 @@ impl SamplingRequestSignalCollector {
         if validation_proof {
             state.validation_proof_ordinals.insert(ordinal);
         }
+        if test_execution {
+            state.test_validation_ordinals.insert(ordinal);
+        }
         if final_verification {
             state.final_verification_ordinals.insert(ordinal);
         }
         if mutation {
             state.mutation_ordinals.insert(ordinal);
         }
-        if let Some(source_dependencies) = source_dependencies {
-            let accumulated = state
-                .code_mode_source_dependencies
-                .entry(cell_id.to_string())
-                .or_insert_with(|| source_dependencies.clone());
-            if accumulated.is_empty() || source_dependencies.is_empty() {
-                // Empty means a workspace-observing nested tool could not be
-                // scoped. Preserve that fail-closed state for the whole cell.
-                accumulated.clear();
-            } else {
-                accumulated.extend(source_dependencies);
-            }
-        }
+        state.accumulate_code_mode_source_dependencies(cell_id, source_dependencies);
         state.outcomes.push(outcome);
         if let Some(structured_action) = structured_action {
             state.structured_actions.insert(ordinal, structured_action);
@@ -954,7 +990,7 @@ impl SamplingRequestSignalCollector {
         if let Some(evidence_identity) = evidence_identity {
             state.evidence_items.insert(ordinal, evidence_identity);
         }
-        if tool_name.namespace.is_some() || tool_name.name != "wait" {
+        if !is_wait_tool(tool_name) {
             return;
         }
         if let Some(observation) = authoritative_wait_observation(
@@ -999,7 +1035,7 @@ impl SamplingRequestSignalCollector {
             .and_then(|(payload, canonical)| {
                 structured_action_identity_from_canonical(tool_name, payload, canonical)
             });
-        let (validation, validation_proof) = canonical
+        let (validation, validation_proof, test_execution) = canonical
             .as_ref()
             .map(|canonical| validation_status_from_arguments(tool_name, &canonical.value))
             .unwrap_or_default();
@@ -1023,23 +1059,16 @@ impl SamplingRequestSignalCollector {
         if validation_proof {
             state.validation_proof_ordinals.insert(ordinal);
         }
+        if test_execution {
+            state.test_validation_ordinals.insert(ordinal);
+        }
         if final_verification {
             state.final_verification_ordinals.insert(ordinal);
         }
         if mutation {
             state.mutation_ordinals.insert(ordinal);
         }
-        if let Some(source_dependencies) = source_dependencies {
-            let accumulated = state
-                .code_mode_source_dependencies
-                .entry(cell_id.to_string())
-                .or_insert_with(|| source_dependencies.clone());
-            if accumulated.is_empty() || source_dependencies.is_empty() {
-                accumulated.clear();
-            } else {
-                accumulated.extend(source_dependencies);
-            }
-        }
+        state.accumulate_code_mode_source_dependencies(cell_id, source_dependencies);
         state.outcomes.push(outcome);
         if let Some(structured_action) = structured_action {
             state.structured_actions.insert(ordinal, structured_action);
@@ -1104,6 +1133,9 @@ impl SamplingRequestSignalCollector {
         let plan = sampling_plan(signal.as_ref());
         let mut outcome =
             SamplingToolOutcome::from_signal(ordinal, outcome_context, plan, signal.as_ref());
+        let output = response_output_text(response).unwrap_or_default();
+        outcome.executed_cargo_test_targets = executed_cargo_test_targets(&output);
+        outcome.tests_executed = output_proves_test_execution(&output);
         if outcome.is_failure_evidence() && outcome.failure_fingerprint.is_none() {
             outcome.failure_fingerprint = response_failure_fingerprint(response);
         }
@@ -1129,6 +1161,7 @@ impl SamplingRequestSignalCollector {
             || state.validation_proof_ordinals.contains(&ordinal)
             || state.final_verification_ordinals.contains(&ordinal);
         if outcome.kind == SamplingToolOutcomeKind::Success
+            && (!state.test_validation_ordinals.contains(&ordinal) || outcome.tests_executed)
             && replayable
             && response_has_replayable_call_id(response)
             && response_replay_text_size(response)
@@ -1358,11 +1391,17 @@ impl SamplingRequestSignalCollector {
         let residual_tool_continuation = !state.deterministic_continuation_receipts.is_empty();
         let mut ordered = ordered;
         ordered.sort_by_key(|(ordinal, _, _)| *ordinal);
-        let action_evidence = ordered
+        let mut action_evidence = ordered
             .iter()
             .map(|(_, action, evidence)| format!("{}:{evidence}", action.identity))
-            .collect::<Vec<_>>()
-            .join("|");
+            .collect::<Vec<_>>();
+        // Reordering the same broad reads does not establish progress. Keep
+        // each result bound to its action and preserve duplicate observations.
+        // Other tool passes can contain operations whose order is meaningful.
+        if all_broad_source {
+            action_evidence.sort_unstable();
+        }
+        let action_evidence = action_evidence.join("|");
         let semantic_evidence = semantic_evidence_only.then(|| {
             let mut identities = ordered
                 .iter()
@@ -1489,7 +1528,7 @@ impl SamplingRequestSignalCollector {
 
     fn update_unresolved_failures(
         &self,
-        unresolved: &mut BTreeSet<Option<String>>,
+        unresolved: &mut BTreeSet<Option<RecoveryActionIdentity>>,
         fresh_validation: bool,
     ) {
         let state = self
@@ -1505,11 +1544,25 @@ impl SamplingRequestSignalCollector {
                 unresolved.insert(identity);
             } else if outcome.kind == SamplingToolOutcomeKind::Success
                 && identity.is_some()
+                && (!state.test_validation_ordinals.contains(&outcome.ordinal)
+                    || outcome.tests_executed)
                 && (!state.validation_ordinals.contains(&outcome.ordinal) || fresh_validation)
             {
-                // Only a successful retry of the same action establishes recovery.
-                // Unknown failures and different validation targets remain open.
-                unresolved.remove(&identity);
+                // A broader Cargo run can recover a focused failure only when
+                // it actually ran that target under the same invocation context.
+                // Unknown failures and unrelated validations remain open.
+                unresolved.retain(|failed| {
+                    failed != &identity
+                        && !failed.as_ref().zip(identity.as_ref()).is_some_and(
+                            |(failed, recovered)| {
+                                fresh_validation
+                                    && recovered.covers_cargo_failure(
+                                        failed,
+                                        &outcome.executed_cargo_test_targets,
+                                    )
+                            },
+                        )
+                });
             }
         }
     }
@@ -1571,6 +1624,9 @@ impl SamplingRequestSignalCollector {
                 .outcomes
                 .iter()
                 .any(|outcome| outcome.unfinished_mutation_obligation)
+            || state.outcomes.iter().any(|outcome| {
+                state.test_validation_ordinals.contains(&outcome.ordinal) && !outcome.tests_executed
+            })
             || state.saw_canonical_artifact_requirement
             || state.saw_coordination
             || state.suppressed_blocked_wait
@@ -1695,6 +1751,7 @@ impl SamplingRequestSignalCollector {
             .push(outcome);
     }
 
+    #[cfg(test)]
     fn snapshot(&self) -> Vec<SamplingToolOutcome> {
         self.state
             .lock()
@@ -1772,20 +1829,7 @@ fn sampling_unfinished_mutation_obligation(signal: Option<&Value>) -> bool {
 }
 
 fn sampling_failure_fingerprint(signal: Option<&Value>) -> Option<String> {
-    signal
-        .and_then(|value| {
-            value
-                .get("failure_signature")
-                .and_then(Value::as_str)
-                .or_else(|| {
-                    value
-                        .get("failure")
-                        .and_then(|failure| failure.get("fingerprint"))
-                        .and_then(Value::as_str)
-                })
-        })
-        .filter(|fingerprint| !fingerprint.is_empty())
-        .map(str::to_owned)
+    signal.and_then(value_failure_signature)
 }
 
 fn sampling_failure_is_terminal(signal: Option<&Value>) -> bool {
@@ -1885,20 +1929,188 @@ fn structured_action_identity_from_canonical(
     Some(StructuredActionIdentity { identity, class })
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct RecoveryActionIdentity {
+    exact: String,
+    cargo_test: Option<CargoTestRecoveryScope>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct CargoTestRecoveryScope {
+    context: String,
+    target: Option<String>,
+}
+
+impl RecoveryActionIdentity {
+    fn covers_cargo_failure(&self, failed: &Self, executed_targets: &BTreeSet<String>) -> bool {
+        let Some((recovered, failed)) = self.cargo_test.as_ref().zip(failed.cargo_test.as_ref())
+        else {
+            return false;
+        };
+        recovered.context == failed.context
+            && recovered.target.is_none()
+            && failed
+                .target
+                .as_ref()
+                .is_some_and(|target| executed_targets.contains(&target.replace('-', "_")))
+    }
+}
+
+fn cargo_test_recovery_scope(
+    tool_name: &ToolName,
+    arguments: &Value,
+) -> Option<CargoTestRecoveryScope> {
+    let (program, args) = match command_invocation(tool_name, arguments)? {
+        CommandInvocation::Argv { program, args } => (program, args),
+        CommandInvocation::Script(script) | CommandInvocation::PowerShellScript(script) => {
+            // Only a literal single command can establish equivalent execution.
+            if !script
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || " _-.".contains(c))
+            {
+                return None;
+            }
+            let mut words = script.split_whitespace();
+            (
+                words.next()?.to_string(),
+                words.map(str::to_string).collect(),
+            )
+        }
+    };
+    if !matches!(program.as_str(), "cargo" | "cargo.exe") || args.first()?.as_str() != "test" {
+        return None;
+    }
+    let mut target = None;
+    let mut base_args = Vec::new();
+    let mut args = args.iter().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--test" if target.is_none() => {
+                let name = args.next()?;
+                if name.is_empty()
+                    || !name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "_-".contains(c))
+                {
+                    return None;
+                }
+                target = Some(name.clone());
+            }
+            "--offline" | "--locked" | "--frozen" => base_args.push(arg.clone()),
+            "--jobs" | "-j" => {
+                base_args.push(arg.clone());
+                let jobs = args.next()?;
+                jobs.parse::<u32>().ok()?;
+                base_args.push(jobs.clone());
+            }
+            // Filters, features, package/target selection, harness options and
+            // custom Cargo configurations need stronger coverage evidence.
+            _ => return None,
+        }
+    }
+    let mut context = arguments.clone();
+    let fields = context.as_object_mut()?;
+    for field in [
+        "cmd",
+        "command",
+        "kind",
+        "program",
+        "args",
+        "script_body",
+        "force_fresh",
+        "yield_time_ms",
+        "max_output_tokens",
+    ] {
+        fields.remove(field);
+    }
+    Some(CargoTestRecoveryScope {
+        context: serialized_evidence_identity(&(tool_name, program, base_args, context))?,
+        target,
+    })
+}
+
+fn output_proves_test_execution(text: &str) -> bool {
+    let parsed = serde_json::from_str::<Value>(text).ok();
+    let text = parsed
+        .as_ref()
+        .and_then(|value| value.get("output"))
+        .and_then(Value::as_str)
+        .unwrap_or(text);
+    text.lines().any(|line| {
+        let line = line.trim();
+        // Shell summaries retain source line numbers. Interpret the original
+        // runner's status, not arbitrary numbers elsewhere in the output.
+        let line = line
+            .split_once(':')
+            .filter(|(prefix, _)| {
+                !prefix.is_empty() && prefix.bytes().all(|byte| byte.is_ascii_digit())
+            })
+            .map_or(line, |(_, line)| line.trim());
+        let positive = |value: &str| value.parse::<usize>().is_ok_and(|count| count > 0);
+        if let Some(rest) = line.strip_prefix("Ran ") {
+            let mut words = rest.split_whitespace();
+            return words.next().is_some_and(positive)
+                && matches!(words.next(), Some("test" | "tests"));
+        }
+        if let Some(rest) = line.strip_prefix("# pass ") {
+            return positive(rest.trim());
+        }
+        let summary = line
+            .strip_prefix("test result: ok. ")
+            .or_else(|| line.strip_prefix("Tests:").map(str::trim))
+            .or_else(|| line.contains(" tests run:").then_some(line))
+            .or_else(|| {
+                let pytest = line.trim_matches('=').trim();
+                (pytest.ends_with('s') && pytest.contains(" passed") && pytest.contains(" in "))
+                    .then_some(pytest)
+            });
+        summary.is_some_and(|summary| {
+            let words = summary.split_whitespace().collect::<Vec<_>>();
+            words
+                .windows(2)
+                .any(|pair| positive(pair[0]) && pair[1].trim_matches([';', ',']) == "passed")
+        })
+    })
+}
+
+fn executed_cargo_test_targets(text: &str) -> BTreeSet<String> {
+    let parsed = serde_json::from_str::<Value>(text).ok();
+    let text = parsed
+        .as_ref()
+        .and_then(|value| value.get("output"))
+        .and_then(Value::as_str)
+        .unwrap_or(text);
+    text.lines()
+        .filter_map(|line| {
+            let running = line.trim().strip_prefix("Running ")?;
+            let (_, executable) = running.rsplit_once('(')?;
+            let executable = executable.strip_suffix(')')?.rsplit(['/', '\\']).next()?;
+            let executable = executable.strip_suffix(".exe").unwrap_or(executable);
+            let (target, hash) = executable.rsplit_once('-')?;
+            (hash.len() >= 8 && hash.chars().all(|c| c.is_ascii_hexdigit()))
+                .then(|| target.to_string())
+        })
+        .collect()
+}
+
 fn recovery_action_identity(
     tool_name: &ToolName,
     canonical: &CanonicalToolAction,
-) -> Option<String> {
+) -> Option<RecoveryActionIdentity> {
     // A forced execution is still a retry of the same action. Replay eligibility
     // is separate from whether its successful result resolves a prior failure.
-    if canonical.kind == "function" && canonical.value.get("force_fresh").is_some() {
+    let exact = if canonical.kind == "function" && canonical.value.get("force_fresh").is_some() {
         let mut arguments = canonical.value.clone();
         arguments.as_object_mut()?.remove("force_fresh");
         let identity_payload = serde_json::to_string(&arguments).ok()?;
         serialized_evidence_identity(&(tool_name, identity_payload))
     } else {
         serialized_evidence_identity(&(tool_name, canonical.identity_payload.as_deref()?))
-    }
+    }?;
+    Some(RecoveryActionIdentity {
+        exact,
+        cargo_test: cargo_test_recovery_scope(tool_name, &canonical.value),
+    })
 }
 
 struct Sha256Writer(Sha256);
@@ -2178,21 +2390,27 @@ fn command_invocation(tool_name: &ToolName, arguments: &Value) -> Option<Command
     .ok()
 }
 
-fn validation_invocation_status(tool_name: &ToolName, payload: &ToolPayload) -> (bool, bool) {
+fn validation_invocation_status(tool_name: &ToolName, payload: &ToolPayload) -> (bool, bool, bool) {
     validation_status_from_arguments(tool_name, &canonical_tool_action(payload).value)
 }
 
-fn validation_status_from_arguments(tool_name: &ToolName, arguments: &Value) -> (bool, bool) {
+fn validation_status_from_arguments(tool_name: &ToolName, arguments: &Value) -> (bool, bool, bool) {
     let Some(invocation) = command_invocation(tool_name, arguments) else {
-        return (false, false);
+        return (false, false, false);
     };
     match classify_validation(&invocation) {
         ValidationClassification::Validation {
             leaves,
             exit_code_is_authoritative,
             ..
-        } if !leaves.is_empty() => (true, exit_code_is_authoritative),
-        _ => (false, false),
+        } if !leaves.is_empty() => (
+            true,
+            exit_code_is_authoritative,
+            leaves
+                .iter()
+                .any(|leaf| leaf.operation == ValidationOperation::Test),
+        ),
+        _ => (false, false, false),
     }
 }
 
@@ -2436,7 +2654,7 @@ pub(crate) struct SamplingReasoningGovernor {
     turn_efficiency_guard: Option<TurnEfficiencyGuardHandle>,
     turn_efficiency_tool_calls: usize,
     turn_efficiency_child_runtime_ms: u64,
-    unresolved_failures: BTreeSet<Option<String>>,
+    unresolved_failures: BTreeSet<Option<RecoveryActionIdentity>>,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -2676,7 +2894,9 @@ impl SamplingReasoningGovernor {
             && self
                 .plan
                 .as_ref()
-                .is_some_and(|plan| !plan.plan.is_empty() && !plan_is_unfinished(plan))
+                .map_or(settled.mutation_revision > 0, |plan| {
+                    !plan.plan.is_empty() && !plan_is_unfinished(plan)
+                })
             && (settled.mutation_revision == baselines.mutation_revision
                 || validation.observed_mutation_before_validation)
         {
@@ -3083,13 +3303,36 @@ impl SamplingReasoningGovernor {
         collector: &SamplingRequestSignalCollector,
         settled: &SamplingRequestSettledState,
     ) {
-        let outcomes = collector.snapshot();
-        let latest_plan = outcomes
-            .iter()
-            .filter(|outcome| outcome.kind == SamplingToolOutcomeKind::Success)
-            .filter_map(|outcome| outcome.plan.as_ref().map(|plan| (outcome.ordinal, plan)))
-            .max_by_key(|(ordinal, _)| *ordinal)
-            .map(|(_, plan)| plan.clone());
+        let (latest_plan, first_failure, unfinished_mutation_obligation, generic_success) = {
+            let state = collector
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let outcomes = &state.outcomes;
+            let latest_plan = outcomes
+                .iter()
+                .filter(|outcome| outcome.kind == SamplingToolOutcomeKind::Success)
+                .filter_map(|outcome| outcome.plan.as_ref().map(|plan| (outcome.ordinal, plan)))
+                .max_by_key(|(ordinal, _)| *ordinal)
+                .map(|(_, plan)| plan.clone());
+            let first_failure = outcomes
+                .iter()
+                .filter_map(|outcome| {
+                    outcome_failure_trigger(outcome.kind, outcome.skip_disposition)
+                        .map(|trigger| (outcome.ordinal, outcome.kind, trigger))
+                })
+                .min_by_key(|(ordinal, _, _)| *ordinal)
+                .map(|(_, kind, trigger)| (kind, trigger));
+            (
+                latest_plan,
+                first_failure,
+                outcomes.iter().any(|outcome| {
+                    outcome.kind == SamplingToolOutcomeKind::Success
+                        && outcome.unfinished_mutation_obligation
+                }),
+                outcomes.iter().any(SamplingToolOutcome::is_generic_success),
+            )
+        };
         let changed_plan = latest_plan.filter(|plan| {
             self.plan
                 .as_ref()
@@ -3138,16 +3381,9 @@ impl SamplingReasoningGovernor {
             return;
         }
         let saw_validation = collector.saw_validation();
-        if let Some((failure, tool_trigger)) = outcomes
-            .iter()
-            .filter_map(|outcome| {
-                outcome_failure_trigger(outcome.kind, outcome.skip_disposition)
-                    .map(|trigger| (outcome, trigger))
-            })
-            .min_by_key(|(outcome, _)| outcome.ordinal)
-        {
+        if let Some((failure_kind, tool_trigger)) = first_failure {
             let trigger = if saw_validation {
-                if failure.kind == SamplingToolOutcomeKind::Timeout {
+                if failure_kind == SamplingToolOutcomeKind::Timeout {
                     ReasoningPolicyTrigger::ValidationTimedOut
                 } else {
                     ReasoningPolicyTrigger::ValidationFailed
@@ -3182,17 +3418,14 @@ impl SamplingReasoningGovernor {
             self.transition_to(phase_for_plan(plan), ReasoningPolicyTrigger::PlanUpdated);
             return;
         }
-        if outcomes.iter().any(|outcome| {
-            outcome.kind == SamplingToolOutcomeKind::Success
-                && outcome.unfinished_mutation_obligation
-        }) {
+        if unfinished_mutation_obligation {
             self.transition_to(
                 SamplingReasoningPhase::Implement,
                 ReasoningPolicyTrigger::PlanUpdated,
             );
             return;
         }
-        if outcomes.iter().any(SamplingToolOutcome::is_generic_success) {
+        if generic_success {
             let next_phase = match self.phase {
                 SamplingReasoningPhase::Orient => SamplingReasoningPhase::Inspect,
                 SamplingReasoningPhase::Inspect => SamplingReasoningPhase::Inspect,
@@ -3626,11 +3859,25 @@ mod tests {
             &validation_proof_payload(),
             "validation",
         );
-        collector.push(SamplingToolOutcome::plain(
+        // Route through the response path so output-derived test proof is
+        // recorded, but keep the caller's outcome kind: a validation timeout
+        // and a validation failure select different recovery triggers.
+        collector.record_response_result(
             registration.ordinal,
-            outcome,
+            ToolOutputOutcomeContext::new(match outcome {
+                SamplingToolOutcomeKind::Success => ToolOutputOutcome::Success,
+                SamplingToolOutcomeKind::Yielded => ToolOutputOutcome::Yielded,
+                SamplingToolOutcomeKind::Timeout => ToolOutputOutcome::TimedOut,
+                SamplingToolOutcomeKind::Skipped => ToolOutputOutcome::Skipped,
+                SamplingToolOutcomeKind::Failure
+                | SamplingToolOutcomeKind::Blocked
+                | SamplingToolOutcomeKind::Unknown
+                | SamplingToolOutcomeKind::RecoverableCancellation => ToolOutputOutcome::Failure,
+            }),
             None,
-        ));
+            &runner_tool_response("validation", "Ran 1 test in 0.001s\nOK"),
+            false,
+        );
         collector.record_validation_workspace_revision(
             &ToolName::plain("exec_command"),
             &validation_proof_payload(),
@@ -3653,7 +3900,11 @@ mod tests {
             registration.ordinal,
             ToolOutputOutcomeContext::new(outcome),
             None,
-            &successful_tool_response(call_id, r#"{"status":"complete"}"#),
+            &if validation_invocation_status(&tool_name, &payload).2 {
+                runner_tool_response(call_id, "Ran 1 test in 0.001s\nOK")
+            } else {
+                successful_tool_response(call_id, r#"{"status":"complete"}"#)
+            },
             false,
         );
     }
@@ -5216,7 +5467,12 @@ mod tests {
                 source_dependencies: None,
                 outcome_context: ToolOutputOutcomeContext::new(outcome),
                 signal: None,
-                result: &json!({"exit_code": if outcome == ToolOutputOutcome::Success { 0 } else { 1 }}),
+                // The runner output proves the tests ran; this case isolates the
+                // outcome, not the execution evidence.
+                result: &json!({
+                    "exit_code": if outcome == ToolOutputOutcome::Success { 0 } else { 1 },
+                    "output": "Ran 1 test in 0.001s\nOK",
+                }),
                 canonical_artifact_required: false,
             });
             governor.settle(&baselines, &collector, &settled_state);
@@ -5513,6 +5769,69 @@ mod tests {
     }
 
     #[test]
+    fn validation_requires_executed_tests_but_not_counts_for_checks() {
+        for nested in [false, true] {
+            for (command, output, expected) in [
+                (
+                    "cargo test missing_filter",
+                    "test result: ok. 0 passed; 0 failed; 12 filtered out",
+                    false,
+                ),
+                (
+                    "cargo test regression",
+                    "test result: ok. 1 passed; 0 failed; 11 filtered out",
+                    true,
+                ),
+                ("python -m unittest", "Ran 0 tests in 0.001s\nOK", false),
+                ("python -m unittest", "Ran 2 tests in 0.001s\nOK", true),
+                ("cargo test", "process completed successfully", false),
+                ("cargo check", "Finished dev profile", true),
+            ] {
+                let mut governor = SamplingReasoningGovernor::new(Some(&config()));
+                settle_plan(&mut governor, plan(&[StepStatus::Completed]));
+                // The completed plan already selects Finalize, so observe the
+                // transition from a phase only a counted validation can leave.
+                governor.phase = SamplingReasoningPhase::Inspect;
+                let baselines = governor.baselines(0);
+                let collector = governor.collector(&baselines);
+                let tool = ToolName::plain("exec_command");
+                let payload = ToolPayload::Function {
+                    arguments: json!({"cmd": command}).to_string(),
+                };
+                collector.record_validation_workspace_revision(&tool, &payload, 0);
+                if nested {
+                    collector.record_code_mode_result(CodeModeToolResult {
+                        cell_id: "validation",
+                        tool_name: &tool,
+                        payload: &payload,
+                        source_dependencies: None,
+                        outcome_context: ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+                        signal: None,
+                        result: &json!({"output": output}),
+                        canonical_artifact_required: false,
+                    });
+                } else {
+                    let registration =
+                        collector.register_deterministic_tool_call(&tool, &payload, "validation");
+                    collector.record_response_result(
+                        registration.ordinal,
+                        ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+                        None,
+                        &runner_tool_response("validation", output),
+                        false,
+                    );
+                }
+                governor.settle(&baselines, &collector, &settled(0));
+                assert_eq!(
+                    governor.phase() == Some(SamplingReasoningPhase::Finalize),
+                    expected,
+                    "{command}: {output}; nested={nested}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn unrelated_validation_does_not_resolve_a_failed_target() {
         let mut governor = SamplingReasoningGovernor::new(Some(&config()));
         settle_plan(&mut governor, plan(&[StepStatus::Completed]));
@@ -5714,6 +6033,124 @@ mod tests {
                 .continuation,
             ContinuationDisposition::TerminalCompletionRequired
         );
+    }
+
+    #[test]
+    fn cargo_validation_recovery_requires_matching_context_and_executed_target() {
+        for nested in [false, true] {
+            for scenario in [
+                "covered",
+                "other target",
+                "missing output",
+                "other cwd",
+                "filtered",
+                "stale",
+                "failed",
+                "yielded",
+            ] {
+                let mut governor = SamplingReasoningGovernor::new(Some(&config()));
+                let failed_baselines = governor.baselines(0);
+                let failed = governor.collector(&failed_baselines);
+                record_invocation_result(
+                    &failed,
+                    ToolName::plain("exec_command"),
+                    ToolPayload::Function {
+                        arguments: json!({"cmd": "cargo test --offline --locked --jobs 6 --test regression", "workdir": "/repo"}).to_string(),
+                    },
+                    "failed-focused-test",
+                    ToolOutputOutcome::Failure,
+                );
+                governor.settle(&failed_baselines, &failed, &settled(0));
+                assert_eq!(governor.phase(), Some(SamplingReasoningPhase::Diagnose));
+
+                // A real edit advances the revision; no plan is required for
+                // this small fix, but baseline tests alone must not end a task.
+                let baselines = governor.baselines(1);
+                let collector = governor.collector(&baselines);
+                let mut args = vec!["test", "--offline", "--locked", "--jobs", "6"];
+                if scenario == "filtered" {
+                    args.push("some_filter");
+                }
+                let payload = ToolPayload::Function {
+                    arguments: json!({"kind": "argv", "program": "cargo", "args": args,
+                        "workdir": if scenario == "other cwd" { "/other" } else { "/repo" },
+                        "force_fresh": true, "yield_time_ms": 1000, "max_output_tokens": 3000})
+                    .to_string(),
+                };
+                let target = if scenario == "other target" {
+                    "unrelated"
+                } else {
+                    "regression"
+                };
+                let output = if scenario == "missing output" {
+                    String::new()
+                } else {
+                    format!(
+                        "     Running tests/{target}.rs (target\\debug\\deps\\{target}-0123456789abcdef.exe)\ntest result: ok. 4 passed; 0 failed\n"
+                    )
+                };
+                let outcome = match scenario {
+                    "failed" => ToolOutputOutcome::Failure,
+                    "yielded" => ToolOutputOutcome::Yielded,
+                    _ => ToolOutputOutcome::Success,
+                };
+                collector.record_validation_workspace_revision(
+                    &ToolName::plain("exec_command"),
+                    &payload,
+                    if scenario == "stale" { 0 } else { 1 },
+                );
+                if nested {
+                    collector.record_code_mode_result(CodeModeToolResult {
+                        cell_id: "recovery",
+                        tool_name: &ToolName::plain("exec_command"),
+                        payload: &payload,
+                        source_dependencies: None,
+                        outcome_context: ToolOutputOutcomeContext::new(outcome),
+                        signal: None,
+                        result: &json!({"output": output}),
+                        canonical_artifact_required: false,
+                    });
+                } else {
+                    let registration = collector.register_deterministic_tool_call(
+                        &ToolName::plain("exec_command"),
+                        &payload,
+                        "recovery",
+                    );
+                    collector.record_response_result(
+                        registration.ordinal,
+                        ToolOutputOutcomeContext::new(outcome),
+                        None,
+                        &ResponseInputItem::FunctionCallOutput {
+                            call_id: "recovery".to_string(),
+                            output: codex_protocol::models::FunctionCallOutputPayload::from_text(
+                                output,
+                            ),
+                        },
+                        false,
+                    );
+                }
+                governor.settle(&baselines, &collector, &settled(1));
+                let completed = scenario == "covered";
+                assert_eq!(
+                    governor.unresolved_failures.is_empty(),
+                    completed,
+                    "{scenario}, nested={nested}"
+                );
+                assert_eq!(
+                    governor.phase() == Some(SamplingReasoningPhase::Finalize),
+                    completed,
+                    "{scenario}, nested={nested}"
+                );
+                assert_eq!(
+                    governor
+                        .evaluate_convergence(&baselines, &collector, &settled(1))
+                        .continuation
+                        == ContinuationDisposition::TerminalCompletionRequired,
+                    completed,
+                    "{scenario}, nested={nested}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -6257,6 +6694,7 @@ mod tests {
     fn validation_completion_requires_confirmed_work_and_current_workspace() {
         for scenario in [
             "no plan",
+            "no plan after edit",
             "empty plan",
             "new input",
             "stale validation",
@@ -6264,7 +6702,7 @@ mod tests {
             "complete",
         ] {
             let mut governor = SamplingReasoningGovernor::new(None);
-            if scenario != "no plan" {
+            if !scenario.starts_with("no plan") {
                 settle_plan(
                     &mut governor,
                     if scenario == "empty plan" {
@@ -6274,10 +6712,16 @@ mod tests {
                     },
                 );
             }
-            let baselines = governor.baselines(0);
+            let revision = u64::from(scenario == "no plan after edit");
+            let baselines = governor.baselines(revision);
             let collector =
                 recorded_validation_collector(&governor, &baselines, ToolOutputOutcome::Success);
-            let settled_state = settled(0);
+            let settled_state = settled(revision);
+            collector.record_validation_workspace_revision(
+                &ToolName::plain("exec_command"),
+                &validation_proof_payload(),
+                revision,
+            );
             if scenario == "stale validation" {
                 collector.record_validation_workspace_revision(
                     &ToolName::plain("exec_command"),
@@ -6297,7 +6741,7 @@ mod tests {
                     .evaluate_convergence(&baselines, &collector, &settled_state)
                     .continuation
                     == ContinuationDisposition::TerminalCompletionRequired,
-                scenario == "complete",
+                matches!(scenario, "complete" | "no plan after edit"),
                 "{scenario}"
             );
         }
@@ -6327,9 +6771,11 @@ mod tests {
         assert_eq!(
             collector
                 .code_mode_source_dependencies("cell-scoped")
-                .expect("scoped cell dependencies")
-                .len(),
-            2
+                .expect("scoped cell dependencies"),
+            BTreeSet::from([
+                SourceDependencyV1::new(std::path::Path::new("/repo/src/foo.rs"), false),
+                SourceDependencyV1::new(std::path::Path::new("/repo/src/bar.rs"), false),
+            ])
         );
 
         collector.record_code_mode_result(CodeModeToolResult {
@@ -6875,6 +7321,18 @@ mod tests {
         }
     }
 
+    /// A test runner's output reaches the model as text, not wrapped in a JSON
+    /// envelope. Test-execution proof is read from that text, so validation
+    /// responses must carry it the way the real tool does.
+    fn runner_tool_response(call_id: &str, output: &str) -> ResponseInputItem {
+        ResponseInputItem::FunctionCallOutput {
+            call_id: call_id.to_string(),
+            output: codex_protocol::models::FunctionCallOutputPayload::from_text(
+                output.to_string(),
+            ),
+        }
+    }
+
     fn read_only_pass_collector(
         governor: &SamplingReasoningGovernor,
         baselines: &SamplingRequestBaselines,
@@ -7225,6 +7683,90 @@ mod tests {
             let decision = governor.evaluate_convergence(&baselines, &collector, &settled);
             assert_eq!(decision.directive.is_some(), generation > 0);
         }
+    }
+
+    #[test]
+    fn reordered_broad_reads_converge_without_merging_changed_results() {
+        fn collect(
+            governor: &SamplingReasoningGovernor,
+            baselines: &SamplingRequestBaselines,
+            tool: &str,
+            calls: &[(&str, &str)],
+        ) -> SamplingRequestSignalCollector {
+            let collector = governor.collector(baselines);
+            for (index, (artifact, evidence)) in calls.iter().enumerate() {
+                let call_id = format!("call-{index}");
+                let registration = collector.register_deterministic_tool_call(
+                    &ToolName::plain(tool),
+                    &ToolPayload::Function {
+                        arguments: json!({"artifact_id": artifact}).to_string(),
+                    },
+                    &call_id,
+                );
+                collector.record_response_result(
+                    registration.ordinal,
+                    ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+                    None,
+                    &successful_tool_response(&call_id, evidence),
+                    false,
+                );
+            }
+            collector
+        }
+
+        let mut governor = SamplingReasoningGovernor::new(None);
+        let (baselines, settled) = unchanged_state(&governor);
+        let calls = [("artifact-a", "evidence-a"), ("artifact-b", "evidence-b")];
+        let first = collect(&governor, &baselines, "read_tool_output", &calls);
+        let first_key = first.deterministic_cycle_key().expect("complete read pass");
+        assert!(
+            governor
+                .evaluate_convergence(&baselines, &first, &settled)
+                .directive
+                .is_none()
+        );
+
+        let reversed = collect(
+            &governor,
+            &baselines,
+            "read_tool_output",
+            &[calls[1], calls[0]],
+        );
+        assert_eq!(
+            reversed.deterministic_cycle_key().as_ref(),
+            Some(&first_key)
+        );
+        assert!(
+            governor
+                .evaluate_convergence(&baselines, &reversed, &settled)
+                .directive
+                .is_some()
+        );
+
+        for changed in [
+            vec![("artifact-a", "changed"), calls[1]],
+            vec![("artifact-a", "evidence-b"), ("artifact-b", "evidence-a")],
+            vec![calls[0], calls[1], calls[0]],
+            vec![("artifact-c", "evidence-a"), calls[1]],
+        ] {
+            let collector = collect(&governor, &baselines, "read_tool_output", &changed);
+            assert_ne!(
+                collector
+                    .deterministic_cycle_key()
+                    .expect("complete changed pass"),
+                first_key
+            );
+        }
+
+        // Other actions may have effects that depend on their order.
+        let ordered = collect(&governor, &baselines, "other_tool", &calls);
+        let reversed = collect(&governor, &baselines, "other_tool", &[calls[1], calls[0]]);
+        assert_ne!(
+            ordered.deterministic_cycle_key().expect("complete actions"),
+            reversed
+                .deterministic_cycle_key()
+                .expect("complete actions")
+        );
     }
 
     #[test]

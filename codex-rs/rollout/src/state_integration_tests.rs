@@ -109,11 +109,12 @@ async fn try_init_times_out_waiting_for_stuck_startup_backfill() -> anyhow::Resu
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn startup_backfill_timeout_covers_in_flight_work() {
     let home = TempDir::new().expect("temp dir");
+    let started = tokio::time::Instant::now();
     let result = tokio::time::timeout(
-        STARTUP_BACKFILL_WAIT_TIMEOUT + std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(31),
         wait_for_backfill_gate_with_timeout(
             home.path(),
             std::future::pending::<anyhow::Result<()>>(),
@@ -121,6 +122,7 @@ async fn startup_backfill_timeout_covers_in_flight_work() {
     )
     .await
     .expect("backfill gate should enforce its own timeout");
+    assert_eq!(started.elapsed(), std::time::Duration::from_secs(30));
     let err = result.expect_err("pending backfill work should time out");
     assert!(
         err.to_string()

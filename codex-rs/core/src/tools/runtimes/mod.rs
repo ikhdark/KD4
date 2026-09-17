@@ -95,7 +95,8 @@ pub(crate) async fn prepare_shell_command(input: ShellCommandPreparation<'_>) ->
         input.windows_sandbox_level,
         input.enforce_managed_network,
     );
-    if input.shell_type != &ShellType::PowerShell {
+    if input.shell_type != &ShellType::PowerShell || extract_powershell_command(&command).is_none()
+    {
         return command;
     }
 

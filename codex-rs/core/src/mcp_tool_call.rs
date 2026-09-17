@@ -561,10 +561,10 @@ fn mcp_tool_call_span(
     fields: McpToolCallSpanFields<'_>,
 ) -> Span {
     let transport = match fields.server_origin {
-        Some("stdio") => "stdio",
-        Some("in_process") => "in_process",
-        Some(_) => "streamable_http",
-        None => "",
+        Some("stdio") => Some("stdio"),
+        Some("in_process") => Some("in_process"),
+        Some(_) => Some("streamable_http"),
+        None => None,
     };
     let span = tracing::info_span!(
         "mcp.tools.call",
@@ -572,10 +572,10 @@ fn mcp_tool_call_span(
         rpc.system = "jsonrpc",
         rpc.method = "tools/call",
         mcp.server.name = fields.server_name,
-        mcp.server.origin = fields.server_origin.unwrap_or(""),
+        mcp.server.origin = fields.server_origin,
         mcp.transport = transport,
-        mcp.connector.id = fields.connector_id.unwrap_or(""),
-        mcp.connector.name = fields.connector_name.unwrap_or(""),
+        mcp.connector.id = fields.connector_id,
+        mcp.connector.name = fields.connector_name,
         tool.name = fields.tool_name,
         tool.call_id = fields.call_id,
         conversation.id = %session.thread_id,
@@ -797,14 +797,16 @@ async fn maybe_request_codex_apps_auth_elicitation(
         return result;
     }
 
-    refresh_codex_apps_after_connector_auth(manager).await;
-    auth_elicitation_completed_result(&plan.auth_failure, result.meta)
-}
-
-async fn refresh_codex_apps_after_connector_auth(manager: &McpConnectionManager) {
     if let Err(err) = manager.hard_refresh_codex_apps_tools_cache().await {
         tracing::warn!("failed to refresh Codex Apps tools after connector auth: {err:#}");
+        let mut failure = CallToolResult::from_error_text(format!(
+            "Authentication for {} was requested and accepted, but refreshing its tools failed: {err:#}. The available tool list may be stale.",
+            plan.auth_failure.connector_name,
+        ));
+        failure.meta = result.meta;
+        return failure;
     }
+    auth_elicitation_completed_result(&plan.auth_failure, result.meta)
 }
 
 async fn augment_mcp_tool_request_meta_with_sandbox_state(
@@ -2016,6 +2018,16 @@ async fn maybe_persist_mcp_tool_approval(
             tool_name,
             "failed to persist MCP tool approval"
         );
+        sess.send_event(
+            turn_context,
+            codex_protocol::protocol::EventMsg::Warning(codex_protocol::protocol::WarningEvent {
+                message: format!(
+                    "Could not save approval for MCP tool `{}/{}`: {err}. Approval applies only to this session.",
+                    key.server, key.tool_name,
+                ),
+            }),
+        )
+        .await;
         remember_mcp_tool_approval(sess, key).await;
         return;
     }

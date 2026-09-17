@@ -3,6 +3,7 @@ use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
+use serde_json::json;
 use std::collections::BTreeMap;
 
 pub const REQUEST_USER_INPUT_TOOL_NAME: &str = "request_user_input";
@@ -91,7 +92,29 @@ pub fn create_request_user_input_tool(description: String) -> ToolSpec {
             Some(vec!["questions".to_string()]),
             Some(false.into()),
         ),
-        output_schema: None,
+        output_schema: Some(json!({
+            "type": "object",
+            "properties": {
+                "answers": {
+                    "type": "object",
+                    "description": "Answers keyed by question id. Missing answers are not user approval.",
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                            "answers": { "type": "array", "items": { "type": "string" } }
+                        },
+                        "required": ["answers"],
+                        "additionalProperties": false
+                    }
+                },
+                "interrupted": {
+                    "type": "boolean",
+                    "description": "Whether the request was interrupted before normal completion."
+                }
+            },
+            "required": ["answers", "interrupted"],
+            "additionalProperties": false
+        })),
     })
 }
 

@@ -496,8 +496,9 @@ def execute_runtime_verification(
                     None, metadata, cwd=cwd
                 ),
             )
-            # Exact selectors and the same execution's outcomes supply proof;
-            # feature verification must not add a preliminary test discovery run.
+            # Exact selectors and the same execution's outcomes supply proof.
+            # The runner still validates any explicitly declared filters before
+            # batching; generated exact selectors need no preliminary discovery.
             completed = runner.run_gates(gates, quiet=quiet, discover=False)
         except (rust_test_runner.RunnerError, OSError) as exc:
             for feature in rust_features:

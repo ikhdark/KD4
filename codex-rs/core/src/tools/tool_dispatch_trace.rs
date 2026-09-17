@@ -551,17 +551,6 @@ pub(crate) fn mark_exec_process_exited() {
     let _ = ACTIVE_TOOL_DISPATCH_TIMING.try_with(|timing| timing.mark_exec_process_exited());
 }
 
-pub(crate) fn record_timer_wait(wait: ToolLifecycleTimerWait) {
-    let _ = ACTIVE_TOOL_DISPATCH_TIMING.try_with(|timing| timing.record_timer_wait(wait));
-}
-
-pub(crate) fn lifecycle_deadline_after_ms(timeout_ms: u64) -> Option<u64> {
-    ACTIVE_TOOL_DISPATCH_TIMING
-        .try_with(|timing| timing.deadline_after_ms(timeout_ms))
-        .ok()
-        .flatten()
-}
-
 pub(crate) fn record_exec_cleanup_state(
     background_process_expected: bool,
     running_process_after_cleanup: bool,

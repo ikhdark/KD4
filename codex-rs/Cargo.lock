@@ -2564,6 +2564,7 @@ dependencies = [
  "libc",
  "lru 0.16.4",
  "maplit",
+ "memchr",
  "opentelemetry",
  "opentelemetry_sdk",
  "predicates",

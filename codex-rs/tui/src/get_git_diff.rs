@@ -22,7 +22,8 @@ use sha1::Digest;
 use sha1::Sha1;
 
 const DIFF_COMMAND_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
-const DISABLE_HOOKS_CONFIG: &str = "core.hooksPath=NUL";
+// Git for Windows also accepts /dev/null; NUL is an ordinary directory on a remote Unix host.
+const DISABLE_HOOKS_CONFIG: &str = "core.hooksPath=/dev/null";
 const EXECUTABLE_FILTER_CONFIG_PATTERN: &str = r"^filter\..*\.(clean|process)$";
 const MAX_UNTRACKED_FILE_DIFFS: usize = 50;
 const MAX_UNTRACKED_FILE_BYTES: u64 = 1024 * 1024;
@@ -296,7 +297,17 @@ fn render_local_untracked_file(
     Ok((bytes <= remaining_budget).then_some((diff, bytes)))
 }
 
-fn untracked_file_mode(_metadata: &fs::Metadata) -> &'static str {
+fn untracked_file_mode(metadata: &fs::Metadata) -> &'static str {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Git records the owner's executable bit, not group/other permissions.
+        if metadata.permissions().mode() & 0o100 != 0 {
+            return "100755";
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = metadata;
     "100644"
 }
 
@@ -1551,6 +1562,28 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn local_untracked_renderer_matches_git_executable_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tempdir = tempfile::tempdir().expect("create temp directory");
+        let cwd = tempdir.path();
+        let path = "script.sh";
+        fs::write(cwd.join(path), b"#!/bin/sh\nexit 0\n").expect("write script");
+        for (mode, expected) in [(0o744, "100755"), (0o655, "100644"), (0o644, "100644")] {
+            fs::set_permissions(cwd.join(path), fs::Permissions::from_mode(mode))
+                .expect("set script permissions");
+            let rendered =
+                render_local_untracked_file(cwd, Path::new(path), MAX_UNTRACKED_TOTAL_BYTES)
+                    .expect("render script")
+                    .expect("script within budget")
+                    .0;
+            assert!(rendered.contains(&format!("new file mode {expected}")));
+            assert_eq!(rendered, git_untracked_new_file_diff(cwd, path));
+        }
+    }
+
     #[tokio::test]
     async fn local_untracked_files_do_not_launch_per_file_git_diffs() {
         let tempdir = tempfile::tempdir().expect("create temp directory");
@@ -1560,6 +1593,19 @@ mod tests {
             .collect::<Vec<_>>();
         for file in &files {
             fs::write(cwd.join(file), format!("{file}\n")).expect("write local untracked file");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for (index, file) in files.iter().enumerate() {
+                let mode = match index {
+                    0 => 0o744,
+                    1 => 0o655,
+                    _ => 0o644,
+                };
+                fs::set_permissions(cwd.join(file), fs::Permissions::from_mode(mode))
+                    .expect("set fixture mode");
+            }
         }
         let untracked_output = files
             .iter()
@@ -1636,6 +1682,23 @@ mod tests {
         assert!(result.0);
         assert_eq!(runner.commands().len(), 5);
         assert_eq!(result.1.matches("diff --git").count(), 32);
+        #[cfg(unix)]
+        {
+            assert_eq!(result.1.matches("new file mode 100755").count(), 1);
+            assert_eq!(result.1.matches("new file mode 100644").count(), 31);
+        }
+        let commands = runner.commands();
+        let diff_commands = commands
+            .iter()
+            .filter(|command| command.argv.iter().any(|arg| arg == "diff"))
+            .collect::<Vec<_>>();
+        assert_eq!(diff_commands.len(), 1);
+        assert!(
+            diff_commands[0]
+                .argv
+                .windows(2)
+                .any(|args| args == ["-c", "core.hooksPath=/dev/null"])
+        );
     }
 
     #[test]

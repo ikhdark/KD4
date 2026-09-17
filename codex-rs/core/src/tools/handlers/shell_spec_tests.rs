@@ -138,7 +138,7 @@ fn exec_command_tool_matches_expected_spec() {
     });
 
     let description = format!(
-        "Runs a command, returning output or a session ID for ongoing interaction. For commands needing no shell interpretation, you may use program and args (kind: argv). Use kind: powershell_script with script_body for PowerShell semantics. Keep pipelines, redirections, and shell expansion in script form.{}",
+        "Runs a command, returning output or a session ID for ongoing interaction. Resume a returned session_id with write_stdin; do not restart the command while it is live or its effects are uncertain. For commands needing no shell interpretation, you may use program and args (kind: argv). Use kind: powershell_script with script_body for PowerShell semantics. Keep pipelines, redirections, and shell expansion in script form.{}",
         exec_command_guidance_description()
     );
 
@@ -211,7 +211,7 @@ fn exec_command_tool_matches_expected_spec() {
         (
             "max_output_tokens".to_string(),
             bounded_integer(format!(
-                "Output token budget. {}; larger requests may be capped by policy.",
+                "Output token budget. {}; larger requests may be capped by policy. Zero requests a zero-token text budget; status metadata may still be returned.",
                 codex_utils_output_truncation::adaptive_output_budget_description()
             ), 0, usize::MAX as u64),
         ),
@@ -333,7 +333,7 @@ fn write_stdin_tool_matches_expected_spec() {
         (
             "max_output_tokens".to_string(),
             bounded_integer(format!(
-                "Output token budget. {}; larger requests may be capped by policy.",
+                "Output token budget. {}; larger requests may be capped by policy. Zero requests a zero-token text budget; status metadata may still be returned.",
                 codex_utils_output_truncation::adaptive_output_budget_description()
             ), 0, usize::MAX as u64),
         ),
@@ -344,7 +344,7 @@ fn write_stdin_tool_matches_expected_spec() {
         ToolSpec::Function(ResponsesApiTool {
             name: "write_stdin".to_string(),
             description:
-                "Writes characters to an existing unified exec session and returns recent output."
+                "Writes characters to an existing unified exec session and returns recent output. Use only a session_id returned by exec_command or its shell_command compatibility route. Stop when no session_id is returned. Poll again only for an identified pending transition; do not restart the command while it is live or its effects are uncertain."
                     .to_string(),
             strict: false,
             defer_loading: None,
@@ -392,7 +392,11 @@ fn request_permissions_tool_includes_full_permission_schema() {
                 Some(vec!["permissions".to_string()]),
                 Some(false.into())
             ),
-            output_schema: None,
+            // The caller must read which permissions were actually granted, so
+            // the response shape is published with the tool.
+            output_schema: Some(
+                codex_protocol::request_permissions::RequestPermissionsResponse::output_schema()
+            ),
         })
     );
 }
@@ -404,7 +408,7 @@ fn shell_command_tool_matches_expected_spec() {
         exec_permission_approvals_enabled: false,
     });
 
-    let description = "Runs a command in the user's default shell and returns its output. Use syntax supported by that shell. For commands needing no shell interpretation, you may use program and args (kind: argv). Use kind: powershell_script with script_body for PowerShell semantics.".to_string()
+    let description = "Runs a command in the user's default shell and returns its output. The native route returns text with command status and output, or structured validation evidence, without a resumable session_id. Its output budget is policy-controlled; max_output_tokens is not accepted. Use syntax supported by that shell. For commands needing no shell interpretation, you may use program and args (kind: argv). Use kind: powershell_script with script_body for PowerShell semantics.".to_string()
         + &shell_command_guidance_description();
 
     let mut properties = BTreeMap::from([
@@ -454,7 +458,7 @@ fn shell_command_tool_matches_expected_spec() {
         (
             "timeout_ms".to_string(),
             bounded_integer(
-                "Maximum command runtime. Defaults to 10000 ms.".to_string(),
+                "Maximum command runtime. Defaults to 10000 ms. Zero sets an immediate deadline; it does not disable the timeout.".to_string(),
                 0,
                 u64::MAX,
             ),

@@ -1139,7 +1139,7 @@ evidence = [{ path = "codex-rs/repo-benchmark/src/workloads/tests.rs", symbol = 
 [[owners.invariants]]
 id = "one-benchmark-two-sequential-segments"
 kind = "semantic"
-statement = "Repo Benchmark alone schedules and compares fork_off, fork_on and reference through native runtimes. Scripted execution precedes real-model execution; fast/full differ only in selected live tasks, finite budgets are ceilings, and performance has no pass/fail verdict."
+statement = "Repo Benchmark alone schedules and compares fork_off, fork_on and reference through native runtimes; --fork-only-on freezes a two-variant selection of fork_on and reference throughout preparation, execution and reports. Scripted execution precedes real-model execution; fast/full differ only in selected live tasks, finite budgets are ceilings, and performance has no pass/fail verdict."
 evidence = [{ path = "codex-rs/repo-benchmark/src/runner.rs", symbol = "execute" }, { path = "codex-rs/repo-benchmark/src/schedule.rs", symbol = "schedule" }, { path = "codex-rs/repo-benchmark/src/statistics.rs", symbol = "summarize" }]
 tests = ["codex-rs/repo-benchmark/src/schedule.rs", "codex-rs/repo-benchmark/src/statistics.rs"]
 

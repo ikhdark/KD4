@@ -19,7 +19,7 @@ fn rg_argument_roles_preserve_flag_like_patterns_and_dependencies() {
     )
     .unwrap();
     std::fs::write(root.join("patterns.txt"), "--files\n").unwrap();
-    let scope = std::fs::canonicalize(root.join("src")).unwrap();
+    let scope = dunce::canonicalize(root.join("src")).unwrap();
     for args in [
         vec!["rg", "--", "--files", "src"],
         vec!["rg", "--", "--help", "src"],
@@ -51,7 +51,7 @@ fn rg_argument_roles_preserve_flag_like_patterns_and_dependencies() {
             assert!(
                 search
                     .state_paths
-                    .contains(&std::fs::canonicalize(root.join("patterns.txt")).unwrap())
+                    .contains(&dunce::canonicalize(root.join("patterns.txt")).unwrap())
             );
         }
         let actual = std::process::Command::new("rg")
@@ -104,7 +104,7 @@ fn rg_supported_executables_share_scope_and_dependency_classification() {
             .expect(program);
         assert_eq!(
             search.scope_identity,
-            std::fs::canonicalize(root.join("src"))
+            dunce::canonicalize(root.join("src"))
                 .unwrap()
                 .to_string_lossy()
         );
@@ -122,7 +122,7 @@ fn search_operands_respect_option_values_and_terminators() {
     use crate::tools::handlers::command_search::rg_search_path_operands;
 
     let temp = tempfile::tempdir().unwrap();
-    let root = &std::fs::canonicalize(temp.path()).unwrap();
+    let root = &dunce::canonicalize(temp.path()).unwrap();
     std::fs::create_dir(root.join("src")).unwrap();
     for args in [
         vec!["rg", "--", "-error", "src"],
@@ -162,7 +162,7 @@ fn search_executable_aliases_have_consistent_dependency_extraction() {
     use crate::tools::handlers::command_search::rg_search_path_operands;
 
     let temp = tempfile::tempdir().unwrap();
-    let root = &std::fs::canonicalize(temp.path()).unwrap();
+    let root = &dunce::canonicalize(temp.path()).unwrap();
     for program in ["rg", "rga", "ripgrep", "RIPGREP.EXE"] {
         let command = strings(&[program, "needle", "src"]);
         assert_eq!(
@@ -280,8 +280,31 @@ fn classifies_repository_wide_and_owner_scoped_rg() {
         classify_rg_search_narrowing(&strings(&["rg", "needle", "codex-rs"]), None, root, root,)
             .expect("classification")
             .map(|search| search.breadth),
-        Some(RgSearchBreadth::Broad)
+        Some(RgSearchBreadth::Narrow)
     );
+    // `packages/*` does not exist, so it exercises the lexical fallback: a
+    // target inside the repository stays narrow whether or not it can be
+    // canonicalized.
+    for targets in [
+        vec!["codex-rs/core", "codex-rs/file-search"],
+        vec!["packages/alpha", "packages/beta"],
+        vec!["scripts", "docs"],
+    ] {
+        let mut command = strings(&["rg", "needle"]);
+        command.extend(targets.into_iter().map(str::to_string));
+        let search = classify_rg_search_narrowing(&command, None, root, root)
+            .unwrap()
+            .unwrap();
+        assert_eq!(search.breadth, RgSearchBreadth::Narrow);
+        assert!(search.can_record_miss);
+    }
+    for target in ["..", "."] {
+        let search =
+            classify_rg_search_narrowing(&strings(&["rg", "needle", target]), None, root, root)
+                .unwrap()
+                .unwrap();
+        assert_eq!(search.breadth, RgSearchBreadth::Broad);
+    }
     assert_eq!(
         classify_rg_search_narrowing(&strings(&["rg", "needle", "scripts"]), None, root, root,)
             .expect("classification")
@@ -398,21 +421,33 @@ fn classifies_repository_wide_and_owner_scoped_rg() {
 }
 
 #[test]
-fn classifies_cross_owner_and_outside_repository_targets_as_broad() {
+fn classifies_repository_root_and_outside_repository_targets_as_broad() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
         .expect("codex-core is nested under the repository root");
 
+    // Breadth records whether a search covered the whole repository, so only a
+    // target at or above the root is broad. Several directories inside the root
+    // still leave the rest of the repository unsearched.
     for command in [
-        strings(&["rg", "needle", ".codex", "scripts", "docs", "packages"]),
-        strings(&["rg", "needle", "codex-rs/core", "codex-rs/protocol"]),
         strings(&["rg", "needle", ".."]),
+        strings(&["rg", "needle", "."]),
+        strings(&["rg", "needle", "codex-rs/core", ".."]),
     ] {
         let search = classify_rg_search_narrowing(&command, None, root, root)
             .expect("classification")
             .expect("rg search");
-        assert_eq!(search.breadth, RgSearchBreadth::Broad);
+        assert_eq!(search.breadth, RgSearchBreadth::Broad, "{command:?}");
+    }
+    for command in [
+        strings(&["rg", "needle", ".codex", "scripts", "docs", "packages"]),
+        strings(&["rg", "needle", "codex-rs/core", "codex-rs/protocol"]),
+    ] {
+        let search = classify_rg_search_narrowing(&command, None, root, root)
+            .expect("classification")
+            .expect("rg search");
+        assert_eq!(search.breadth, RgSearchBreadth::Narrow, "{command:?}");
     }
 }
 
@@ -625,6 +660,60 @@ fn normalizes_direct_argv_git_status_without_reporting_a_repair() {
     );
     assert!(!outcome.repaired());
     assert_eq!(outcome.repair_notice, None);
+}
+
+#[test]
+fn git_status_normalization_preserves_global_options_and_is_idempotent() {
+    for args in [
+        strings(&["-C", "work tree", "status", "--short"]),
+        strings(&["--git-dir=repo.git", "--work-tree", "work tree", "status"]),
+        strings(&["-Cstatus", "-c", "color.ui=false", "status", "--porcelain"]),
+    ] {
+        let invocation = CommandInvocation::Argv {
+            program: "git".to_string(),
+            args: args.clone(),
+        };
+        let outcome = preflight_invocation_with_equivalent_repair(
+            &invocation,
+            &invocation.to_direct_argv().unwrap(),
+            None,
+        )
+        .unwrap();
+        let mut expected = vec!["--no-optional-locks".to_string()];
+        expected.extend(args);
+        assert_eq!(
+            outcome.invocation,
+            CommandInvocation::Argv {
+                program: "git".to_string(),
+                args: expected
+            }
+        );
+        assert!(!outcome.repaired());
+        let repeated = preflight_invocation_with_equivalent_repair(
+            &outcome.invocation,
+            &outcome.invocation.to_direct_argv().unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(repeated.invocation, outcome.invocation);
+    }
+    for args in [
+        strings(&["-C", "status", "branch", "new"]),
+        strings(&["--git-dir", "status"]),
+        strings(&["branch", "status"]),
+    ] {
+        let invocation = CommandInvocation::Argv {
+            program: "git".to_string(),
+            args,
+        };
+        let outcome = preflight_invocation_with_equivalent_repair(
+            &invocation,
+            &invocation.to_direct_argv().unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcome.invocation, invocation);
+    }
 }
 
 #[test]
@@ -878,6 +967,42 @@ fn rejects_bare_rg_path_globs_but_preserves_patterns_and_glob_options() {
             Ok(())
         );
     }
+}
+
+#[test]
+fn rg_glob_preflight_uses_search_argument_roles() {
+    for args in [
+        vec!["rg", "-e", "needle", "*.rs"],
+        vec!["rg", "--regexp=needle", "*.rs"],
+        vec!["rg", "-nfpatterns.txt", "*.rs"],
+        vec!["ripgrep.exe", "needle", "*.rs"],
+    ] {
+        let issue = preflight_command_issue(&strings(&args), None)
+            .expect_err("wildcard path operands require --glob in direct argv");
+        assert_eq!(issue.code, CommandPreflightIssueCode::RgLiteralGlobPath);
+        assert!(issue.detail.contains("*.rs"), "{args:?}");
+    }
+    for args in [
+        vec!["rg", "-ng", "*.rs", "f*o", "src"],
+        vec!["rg", "--glob", "--files", "f*o", "src"],
+        vec!["rg", "-e", "f*o", "src"],
+        vec!["rg", "--help", "*.rs"],
+    ] {
+        assert_eq!(preflight_command(&strings(&args), None), Ok(()), "{args:?}");
+    }
+    assert_eq!(
+        preflight_command(
+            &strings(&["pwsh", "-Command", "rg -ng '*.rs' 'f*o' src"]),
+            Some(ShellType::PowerShell),
+        ),
+        Ok(()),
+    );
+    let issue = preflight_command_issue(
+        &strings(&["pwsh", "-Command", "rg -e needle '*.rs'"]),
+        Some(ShellType::PowerShell),
+    )
+    .expect_err("PowerShell passes wildcard operands literally too");
+    assert_eq!(issue.code, CommandPreflightIssueCode::RgLiteralGlobPath);
 }
 
 #[test]

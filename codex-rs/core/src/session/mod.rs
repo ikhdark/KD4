@@ -51,6 +51,7 @@ use crate::skills::SkillRenderSideEffects;
 use crate::skills_load_input_from_config;
 use crate::turn_metadata::TurnMetadataState;
 use crate::turn_timing::now_unix_timestamp_ms;
+use anyhow::Context;
 use async_channel::Receiver;
 use async_channel::Sender;
 use chrono::Local;
@@ -584,7 +585,7 @@ use codex_utils_stream_parser::ProposedPlanSegment;
 /// The high-level interface to the Codex system.
 /// It operates as a queue pair where you send submissions and receive events.
 pub struct Codex {
-    pub(crate) tx_sub: Sender<Submission>,
+    pub(crate) tx_sub: Sender<QueuedSubmission>,
     pub(crate) rx_event: Receiver<Event>,
     // Last known status of the agent.
     pub(crate) agent_status: watch::Receiver<AgentStatus>,
@@ -595,6 +596,13 @@ pub struct Codex {
 }
 
 pub(crate) type SessionLoopTermination = Shared<BoxFuture<'static, ()>>;
+
+/// Internal acknowledgement stays out of the public submission protocol.
+#[derive(Debug)]
+pub(crate) struct QueuedSubmission {
+    pub(crate) submission: Submission,
+    pub(crate) mailbox_admission: Option<oneshot::Sender<CodexResult<()>>>,
+}
 
 /// Wrapper returned by [`Codex::spawn`] containing the spawned [`Codex`] and
 /// the unique session id.
@@ -764,10 +772,12 @@ impl Codex {
         } else {
             codex_models_manager::manager::RefreshStrategy::OnlineIfUncached
         };
-        if should_prefetch_models_before_default(config.model.is_some(), refresh_strategy) {
-            let _ = models_manager
+        if should_prefetch_models_before_default(config.model.is_some(), refresh_strategy)
+            && let Err(error) = models_manager
                 .list_models(refresh_strategy, config.http_client_factory())
-                .await;
+                .await
+        {
+            warn!(%error, "failed to prefetch model metadata before resolving the session model");
         }
         let model = models_manager
             .get_default_model(
@@ -961,14 +971,42 @@ impl Codex {
 
     /// Use sparingly: prefer `submit()` so Codex is responsible for generating
     /// unique IDs for each submission.
-    pub async fn submit_with_id(&self, mut sub: Submission) -> CodexResult<()> {
+    pub async fn submit_with_id(&self, sub: Submission) -> CodexResult<()> {
+        Self::await_mailbox_admission(self.enqueue_submission(sub).await?).await
+    }
+
+    pub(crate) async fn enqueue_submission(
+        &self,
+        mut sub: Submission,
+    ) -> CodexResult<Option<oneshot::Receiver<CodexResult<()>>>> {
         if sub.trace.is_none() {
             sub.trace = current_span_w3c_trace_context();
         }
+        let (mailbox_admission, admission_rx) =
+            if matches!(&sub.op, Op::InterAgentCommunication { .. }) {
+                let (tx, rx) = oneshot::channel();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
         self.tx_sub
-            .send(sub)
+            .send(QueuedSubmission {
+                submission: sub,
+                mailbox_admission,
+            })
             .await
             .map_err(|_| CodexErr::InternalAgentDied)?;
+        Ok(admission_rx)
+    }
+
+    pub(crate) async fn await_mailbox_admission(
+        admission_rx: Option<oneshot::Receiver<CodexResult<()>>>,
+    ) -> CodexResult<()> {
+        if let Some(admission_rx) = admission_rx {
+            admission_rx
+                .await
+                .map_err(|_| CodexErr::InternalAgentDied)??;
+        }
         Ok(())
     }
 
@@ -1444,13 +1482,7 @@ impl Session {
     ) -> anyhow::Result<(StartedNetworkProxy, SessionNetworkProxyRuntime)> {
         let spec = spec
             .with_exec_policy_network_rules(exec_policy)
-            .map_err(|err| {
-                tracing::warn!(
-                    "failed to apply execpolicy network rules to managed proxy; continuing with configured network policy: {err}"
-                );
-                err
-            })
-            .unwrap_or_else(|_| spec.clone());
+            .context("failed to apply execpolicy network rules to managed proxy")?;
         let network_proxy = spec
             .start_proxy(
                 codex_home,
@@ -1586,11 +1618,7 @@ impl Session {
         batch: &Arc<crate::tools::parallel::WorkspaceEvidenceGenerationBatch>,
         tracker: &crate::tools::context::SharedTurnDiffTracker,
     ) -> CodexResult<crate::tools::parallel::WorkspaceEvidenceGenerationFlush> {
-        self.durable_history_commits_in_flight
-            .fetch_add(1, Ordering::AcqRel);
-        let in_flight = DurableHistoryCommitInFlight {
-            session: Arc::clone(self),
-        };
+        let in_flight = self.retain_tool_dispatch_commit();
         let session = Arc::clone(self);
         let turn_context = Arc::clone(turn_context);
         let batch = Arc::clone(batch);
@@ -1906,7 +1934,8 @@ impl Session {
                     state.set_token_info(Some(info));
                 }
 
-                // If persisting, persist all rollout items as-is (the store filters).
+                // Persist the fork history with any missing item IDs assigned above
+                // (the store filters which rollout items are retained).
                 if !rollout_items.is_empty() {
                     self.persist_rollout_items(&rollout_items).await;
                 }
@@ -5137,15 +5166,6 @@ impl Session {
             CodexErr::Fatal(format!("completed-tool history I/O gate closed: {error}"))
         })?;
         Ok((reconciliation_permit, io_permit))
-    }
-
-    pub(crate) async fn drain_tool_history_persistence(&self) -> CodexResult<()> {
-        self.tool_history_persistence
-            .drain()
-            .await
-            .map_err(|error| {
-                CodexErr::Fatal(format!("completed-tool history is not durable: {error}"))
-            })
     }
 
     pub(crate) fn check_tool_history_persistence(&self) -> CodexResult<()> {

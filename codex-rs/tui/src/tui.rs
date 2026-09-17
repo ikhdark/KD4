@@ -959,7 +959,7 @@ impl Tui {
             if let Err(error) =
                 crate::insert_history::insert_history_hyperlink_lines_with_wrap_policy(
                     terminal,
-                    batch.lines.clone(),
+                    &batch.lines,
                     batch.wrap_policy,
                 )
             {

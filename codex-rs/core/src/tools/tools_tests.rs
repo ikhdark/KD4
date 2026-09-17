@@ -3,6 +3,38 @@ use codex_protocol::exec_output::StreamOutput;
 use codex_utils_output_truncation::approx_token_count;
 
 #[test]
+fn output_projection_borrows_normal_content_and_preserves_timeout_notice() {
+    let mut output = ExecToolCallOutput {
+        aggregated_output: StreamOutput::new("unchanged diagnostic".to_string()),
+        duration: std::time::Duration::from_millis(250),
+        ..ExecToolCallOutput::default()
+    };
+    let content = build_content_with_timeout(&output);
+    assert!(matches!(content, Cow::Borrowed(_)));
+    assert!(std::ptr::eq(
+        content.as_ptr(),
+        output.aggregated_output.text.as_ptr()
+    ));
+    let projected = project_exec_output_for_model_with_budget(
+        &output,
+        TruncationPolicy::Tokens(1000),
+        Some(1000),
+        None,
+    );
+    assert_eq!(
+        projected.text,
+        "Exit code: 0\nWall time: 0.3 seconds\nOutput:\nunchanged diagnostic"
+    );
+    assert!(!projected.reduced);
+    output.timed_out = true;
+    assert_eq!(
+        build_content_with_timeout(&output),
+        "command timed out after 250 milliseconds\nunchanged diagnostic"
+    );
+    assert!(matches!(build_content_with_timeout(&output), Cow::Owned(_)));
+}
+
+#[test]
 fn shell_projection_uses_shared_success_default_and_reports_reduction() {
     let body = "x".repeat(20_000);
     let output = ExecToolCallOutput {

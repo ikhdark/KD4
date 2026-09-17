@@ -24,27 +24,21 @@ fn unexpected_status(status: StatusCode) -> CodexErr {
 }
 
 #[test]
-fn every_response_request_retries_transport_timeouts() {
-    let retry_decisions = [
-        ResponsesStreamRequest::Sampling,
-        ResponsesStreamRequest::LocalCompaction,
-        ResponsesStreamRequest::RemoteCompactionV2,
-    ]
-    .map(|request| should_retry_response_stream(request, &CodexErr::RequestTimeout));
-
-    assert_eq!(retry_decisions, [true, true, true]);
+fn response_stream_retries_transport_timeouts() {
+    assert!(should_retry_response_stream(&CodexErr::RequestTimeout));
 }
 
 #[test]
 fn sampling_stream_error_keeps_its_outer_retry() {
-    assert!(should_retry_response_stream(
-        ResponsesStreamRequest::Sampling,
-        &CodexErr::Stream("disconnected".to_string(), None)
-    ));
+    assert!(should_retry_response_stream(&CodexErr::Stream(
+        "disconnected".to_string(),
+        None
+    )));
 }
 
 #[test]
 fn transport_fallback_requires_a_transport_class_error() {
+    assert!(should_switch_fallback_transport(&connection_failed()));
     assert!(should_switch_fallback_transport(&CodexErr::RequestTimeout));
     assert!(should_switch_fallback_transport(
         &CodexErr::ResponseStreamFailed(codex_protocol::error::ResponseStreamFailed {
@@ -64,20 +58,12 @@ fn transport_fallback_requires_a_transport_class_error() {
 
 #[test]
 fn unauthorized_status_skips_every_outer_response_retry() {
-    for request in [
-        ResponsesStreamRequest::Sampling,
-        ResponsesStreamRequest::LocalCompaction,
-        ResponsesStreamRequest::RemoteCompactionV2,
-    ] {
-        assert!(!should_retry_response_stream(
-            request,
-            &unexpected_status(StatusCode::UNAUTHORIZED),
-        ));
-        assert!(should_retry_response_stream(
-            request,
-            &unexpected_status(StatusCode::BAD_GATEWAY),
-        ));
-    }
+    assert!(!should_retry_response_stream(&unexpected_status(
+        StatusCode::UNAUTHORIZED
+    )));
+    assert!(should_retry_response_stream(&unexpected_status(
+        StatusCode::BAD_GATEWAY
+    )));
 }
 
 #[test]
@@ -90,10 +76,7 @@ fn deterministic_4xx_do_not_retry_or_fallback() {
         StatusCode::UNPROCESSABLE_ENTITY,
     ] {
         let error = unexpected_status(status);
-        assert!(
-            !should_retry_response_stream(ResponsesStreamRequest::Sampling, &error),
-            "status {status}"
-        );
+        assert!(!should_retry_response_stream(&error), "status {status}");
         assert!(!should_switch_fallback_transport(&error), "status {status}");
     }
 }
@@ -111,13 +94,7 @@ fn region_restricted_status_skips_every_outer_response_retry() {
         identity_error_code: None,
     });
 
-    for request in [
-        ResponsesStreamRequest::Sampling,
-        ResponsesStreamRequest::LocalCompaction,
-        ResponsesStreamRequest::RemoteCompactionV2,
-    ] {
-        assert!(!should_retry_response_stream(request, &error));
-    }
+    assert!(!should_retry_response_stream(&error));
 }
 
 #[tokio::test]
@@ -177,16 +154,32 @@ fn server_requested_retry_delay_below_the_ceiling_is_preserved() {
     assert_eq!(response_stream_retry_delay(&err, 1), requested_delay);
 }
 
-#[test]
-fn websocket_http_fallback_does_not_reset_the_retry_budget() {
-    let mut retries = 0;
-
-    exhaust_retry_budget_for_http_fallback(&mut retries, 5);
-
-    assert_eq!(retries, 5);
+#[tokio::test]
+async fn exhausted_retry_budget_without_fallback_returns_the_error() {
+    let (session, turn_context, events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    assert!(!session.services.model_client.responses_websocket_enabled());
+    let mut client_session = session.services.model_client.new_session();
+    let mut retry_state = ResponsesStreamRetryState {
+        retries: 5,
+        ..Default::default()
+    };
+    let result = handle_retryable_response_stream_error(
+        &mut retry_state,
+        5,
+        CodexErr::RequestTimeout,
+        &mut client_session,
+        &session,
+        &turn_context,
+        ResponsesStreamRequest::Sampling,
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(matches!(result, Err(CodexErr::RequestTimeout)));
+    assert_eq!(retry_state.retries, 5);
     assert!(
-        retries >= 5,
-        "a failed HTTPS probe must not open a new retry window"
+        events.try_recv().is_err(),
+        "exhaustion must not schedule or announce another retry"
     );
 }
 

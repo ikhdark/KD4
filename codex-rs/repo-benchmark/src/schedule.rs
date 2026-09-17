@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 pub const SCRIPTED_LIMIT_MS: u64 = 30 * 60 * 1000;
-pub const ATTEMPT_LIMIT_MS: u64 = 10 * 60 * 1000;
+// Implementation plus focused validation can exceed the old ten-minute cap.
+pub const ATTEMPT_LIMIT_MS: u64 = 20 * 60 * 1000;
 // The native app-server boundary starts a fresh process for every attempt.
 // Repeating the old in-process warmup/iteration matrix cannot warm later
 // processes and exceeded the scripted budget. Freeze three independent
@@ -21,8 +22,10 @@ pub enum Mode {
 impl Mode {
     pub fn live_limit_ms(self) -> u64 {
         (match self {
-            Self::Fast => 30,
-            Self::Full => 90,
+            // Cover all three variants at the per-attempt cap, with 25%
+            // headroom for deadline overshoot and native teardown scheduling.
+            Self::Fast => 75,
+            Self::Full => 225,
         }) * 60
             * 1000
     }
@@ -44,6 +47,11 @@ pub enum Variant {
 
 impl Variant {
     pub const ALL: [Self; 3] = [Self::ForkOff, Self::ForkOn, Self::Reference];
+    pub fn selected(fork_only_on: bool) -> impl Iterator<Item = Self> {
+        Self::ALL
+            .into_iter()
+            .filter(move |variant| !fork_only_on || *variant != Self::ForkOff)
+    }
     pub fn name(self) -> &'static str {
         match self {
             Self::ForkOff => "fork_off",
@@ -103,7 +111,7 @@ fn order(index: usize) -> [Variant; 3] {
     ][index % 6]
 }
 
-pub fn schedule(mode: Mode) -> Vec<ScheduledAttempt> {
+pub fn schedule(mode: Mode, fork_only_on: bool) -> Vec<ScheduledAttempt> {
     let mut attempts = Vec::new();
     for cluster in 0..CLUSTERS {
         for repetition in 0..ITERATIONS {
@@ -147,6 +155,7 @@ pub fn schedule(mode: Mode) -> Vec<ScheduledAttempt> {
             });
         }
     }
+    attempts.retain(|attempt| !fork_only_on || attempt.variant != Variant::ForkOff);
     attempts
 }
 
@@ -176,8 +185,8 @@ mod tests {
     use super::*;
     #[test]
     fn modes_only_change_live_selection() {
-        let fast = schedule(Mode::Fast);
-        let full = schedule(Mode::Full);
+        let fast = schedule(Mode::Fast, false);
+        let full = schedule(Mode::Full, false);
         let scripted = |v: Vec<ScheduledAttempt>| {
             v.into_iter()
                 .filter(|s| s.segment == Segment::Scripted)
@@ -197,12 +206,19 @@ mod tests {
             Variant::ALL
         );
         assert_eq!(live(full).len(), 9);
-        assert_eq!(Mode::Fast.live_limit_ms(), 1_800_000);
-        assert_eq!(Mode::Full.live_limit_ms(), 5_400_000);
+        assert_eq!(Mode::Fast.live_limit_ms(), 4_500_000);
+        assert_eq!(Mode::Full.live_limit_ms(), 13_500_000);
+        for mode in [Mode::Fast, Mode::Full] {
+            let attempts = schedule(mode, false)
+                .iter()
+                .filter(|attempt| attempt.segment == Segment::RealModel)
+                .count() as u64;
+            assert!(mode.live_limit_ms() >= attempts * ATTEMPT_LIMIT_MS);
+        }
     }
     #[test]
     fn every_native_scenario_has_three_independent_measurements_without_warmups() {
-        let schedule = schedule(Mode::Fast);
+        let schedule = schedule(Mode::Fast, false);
         let scripted: Vec<_> = schedule
             .iter()
             .filter(|attempt| attempt.segment == Segment::Scripted)
@@ -259,7 +275,7 @@ mod tests {
     }
     #[test]
     fn each_variant_occupies_every_native_execution_position_per_workload() {
-        let schedule = schedule(Mode::Fast);
+        let schedule = schedule(Mode::Fast, false);
         for workload in SCRIPTED_WORKLOADS {
             let groups: Vec<_> = (0..3)
                 .map(|cluster| {
@@ -284,6 +300,27 @@ mod tests {
                         .collect(),
                     "{workload} position {position}"
                 );
+            }
+        }
+    }
+    #[test]
+    fn fork_only_on_preserves_original_measurement_ids_and_pairing() {
+        for mode in [Mode::Fast, Mode::Full] {
+            let selected = schedule(mode, true);
+            let expected: Vec<_> = schedule(mode, false)
+                .into_iter()
+                .filter(|attempt| attempt.variant != Variant::ForkOff)
+                .collect();
+            assert_eq!(selected, expected);
+            for workload in SCRIPTED_WORKLOADS {
+                for variant in [Variant::ForkOn, Variant::Reference] {
+                    let clusters: Vec<_> = selected
+                        .iter()
+                        .filter(|a| a.workload == workload && a.variant == variant)
+                        .map(|a| a.cluster)
+                        .collect();
+                    assert_eq!(clusters, [0, 1, 2]);
+                }
             }
         }
     }

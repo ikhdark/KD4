@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -13,6 +15,53 @@ from scripts import kd4_model_attempt_analysis
 
 
 class Kd4PerfSnapshotTest(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows tree termination")
+    def test_tree_cleanup_failure_aborts_remaining_measurements(self) -> None:
+        scenario = kd4_perf_snapshot.Scenario(
+            "timeout", (sys.executable,), Path.cwd(), 2, "test"
+        )
+        process = mock.MagicMock()
+        process.__enter__.return_value = process
+        process.pid = 12345
+        process.wait.side_effect = [subprocess.TimeoutExpired(scenario.command, 1), 0]
+        with (
+            mock.patch.object(subprocess, "Popen", return_value=process) as launch,
+            mock.patch.object(subprocess, "run", side_effect=OSError("cleanup failed")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "remaining measurements aborted"):
+                kd4_perf_snapshot.measure_scenario(scenario, timeout_seconds=1)
+        self.assertEqual(launch.call_count, 1)
+        process.kill.assert_called_once_with()
+
+    def test_timeout_stops_descendants_before_another_measurement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / "late-write"
+            child = (
+                "import pathlib, sys, time; "
+                "print('descendant-ready', flush=True); time.sleep(3); "
+                "pathlib.Path(sys.argv[1]).write_text('leaked')"
+            )
+            parent = (
+                "import subprocess, sys, time; "
+                "subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]]); "
+                "time.sleep(30)"
+            )
+            scenario = kd4_perf_snapshot.Scenario(
+                "timeout",
+                (sys.executable, "-c", parent, child, str(marker)),
+                Path.cwd(),
+                2,
+                "test",
+            )
+            result = kd4_perf_snapshot.measure_scenario(scenario, timeout_seconds=1)
+            # The descendant exits on its own even if cleanup is broken, so the
+            # regression cannot leave a persistent process behind.
+            time.sleep(3)
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.samples, ())
+            self.assertIn("descendant-ready", result.reason or "")
+            self.assertFalse(marker.exists(), "timed-out descendant kept running")
+
     def test_default_installed_scenario_matches_publisher_bin_directory(self) -> None:
         with (
             mock.patch.dict(kd4_perf_snapshot.os.environ, {}, clear=True),
@@ -49,7 +98,7 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
         )
         with (
             mock.patch.object(tempfile, "TemporaryFile", side_effect=capture),
-            mock.patch.object(subprocess, "run", side_effect=run),
+            mock.patch.object(kd4_perf_snapshot, "_run_scenario", side_effect=run),
             mock.patch.object(
                 kd4_perf_snapshot, "_output_size_and_tail", side_effect=tail
             ),
@@ -163,7 +212,7 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
             kwargs["stderr"].write(stderr)  # type: ignore[union-attr]
             return subprocess.CompletedProcess(command, 7)
 
-        with mock.patch.object(kd4_perf_snapshot.subprocess, "run", side_effect=run):
+        with mock.patch.object(kd4_perf_snapshot, "_run_scenario", side_effect=run):
             result = kd4_perf_snapshot.measure_scenario(scenario)
 
         self.assertEqual(result.samples[0].stdout_bytes, len(stdout))
@@ -421,6 +470,12 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
         self.assertEqual(retry_row["decision_latency_us"], 700.0)
         self.assertIn("dispatch-to-first-actionable-output", analysis["interpretation"])
         human = kd4_model_attempt_analysis.render(analysis)
+        self.assertEqual(
+            analysis["quantileMethod"],
+            "linear interpolation at (n - 1) * p on sorted samples",
+        )
+        self.assertIn(analysis["quantileMethod"], human)
+        self.assertIn(analysis["sampleLimitations"], human)
         self.assertIn("tokens p50/p95", human)
         self.assertIn("spearman=", human)
         self.assertIn("reconciliation:", human)
@@ -431,6 +486,17 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
             1.0,
         )
         self.assertIsNone(kd4_model_attempt_analysis.spearman([1.0, 1.0], [2.0, 3.0]))
+
+    def test_model_attempt_percentiles_describe_observed_samples(self) -> None:
+        self.assertEqual(kd4_model_attempt_analysis.percentile([10, 30], 0.95), 29)
+        self.assertEqual(
+            kd4_model_attempt_analysis._distribution([7]),
+            {"count": 1, "p50": 7, "p95": 7},
+        )
+        self.assertEqual(
+            kd4_model_attempt_analysis._distribution([]),
+            {"count": 0, "p50": None, "p95": None},
+        )
 
     def test_model_attempt_jsonl_loader_and_parser_flags(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -486,7 +552,9 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
                             "\n".join(json.dumps(value) for value in values),
                             encoding="utf-8",
                         )
-                        records, exclusions = kd4_model_attempt_analysis.load_jsonl([path])
+                        records, exclusions = kd4_model_attempt_analysis.load_jsonl(
+                            [path]
+                        )
                     self.assertEqual(len(records), 1)
                     self.assertEqual(records[0]["attempt_id"], "outer")
                     self.assertEqual(records[0]["outcome"], "success")

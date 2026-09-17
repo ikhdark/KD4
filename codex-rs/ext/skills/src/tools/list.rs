@@ -48,6 +48,7 @@ struct ListedSkill {
 struct ListResponse {
     skills: Vec<ListedSkill>,
     warnings: Vec<String>,
+    warnings_omitted: usize,
     next_cursor: Option<String>,
 }
 
@@ -85,8 +86,9 @@ impl ToolExecutor<ToolCall> for ListTool {
                 .filter(|entry| entry.enabled && entry.authority == authority)
                 .filter_map(listed_skill)
                 .collect();
-            let warnings = bounded_warnings(catalog.warnings);
-            let fingerprint = super::read::value_fingerprint(&(&skills, &warnings));
+            let (warnings, warnings_omitted) = bounded_warnings(catalog.warnings);
+            let fingerprint =
+                super::read::value_fingerprint(&(&skills, &warnings, warnings_omitted));
             let start = match args.cursor.as_deref() {
                 None => 0,
                 Some(cursor) => {
@@ -103,7 +105,14 @@ impl ToolExecutor<ToolCall> for ListTool {
                         .ok_or_else(invalid_cursor)?
                 }
             };
-            let response = page_response(skills, warnings, start, fingerprint, budget)?;
+            let response = page_response(
+                skills,
+                warnings,
+                warnings_omitted,
+                start,
+                fingerprint,
+                budget,
+            )?;
 
             external_json_output(&response)
         })
@@ -117,6 +126,7 @@ fn invalid_cursor() -> FunctionCallError {
 fn page_response(
     skills: Vec<ListedSkill>,
     warnings: Vec<String>,
+    warnings_omitted: usize,
     start: usize,
     fingerprint: u64,
     budget: usize,
@@ -125,11 +135,13 @@ fn page_response(
     let mut response = ListResponse {
         skills: Vec::new(),
         warnings,
+        warnings_omitted,
         next_cursor: None,
     };
     // Make room for complete handles before including advisory warnings.
     while super::read::serialized_len(&response)? > budget && !response.warnings.is_empty() {
         response.warnings.pop();
+        response.warnings_omitted += 1;
     }
     for (index, skill) in skills.into_iter().enumerate().skip(start) {
         let next_cursor = (index + 1 < count).then(|| format!("{fingerprint:016x}:{}", index + 1));
@@ -149,6 +161,7 @@ fn page_response(
             while super::read::serialized_len(&response)? > budget && !response.warnings.is_empty()
             {
                 response.warnings.pop();
+                response.warnings_omitted += 1;
             }
             if super::read::serialized_len(&response)? > budget {
                 return Err(FunctionCallError::RespondToModel("skills.list response budget leaves no room for a complete skill; increase the output budget".to_string()));
@@ -186,13 +199,19 @@ fn listed_skill(entry: SkillCatalogEntry) -> Option<ListedSkill> {
     })
 }
 
-fn bounded_warnings(warnings: Vec<String>) -> Vec<String> {
-    warnings
+fn bounded_warnings(warnings: Vec<String>) -> (Vec<String>, usize) {
+    let omitted = warnings.len().saturating_sub(MAX_WARNINGS);
+    let warnings = warnings
         .into_iter()
         .take(MAX_WARNINGS)
         .map(|warning| {
-            let (warning, _) = truncate_utf8_to_bytes(&warning, MAX_WARNING_BYTES);
-            warning
+            if warning.len() <= MAX_WARNING_BYTES {
+                warning
+            } else {
+                let (prefix, _) = truncate_utf8_to_bytes(&warning, MAX_WARNING_BYTES - 3);
+                format!("{prefix}...")
+            }
         })
-        .collect()
+        .collect();
+    (warnings, omitted)
 }

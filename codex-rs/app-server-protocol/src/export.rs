@@ -156,9 +156,14 @@ pub fn generate_ts_with_options(
             }
 
             for worker in workers {
-                worker
-                    .join()
-                    .map_err(|_| anyhow!("TypeScript header worker panicked"))??;
+                worker.join().map_err(|payload| {
+                    let message = payload
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| payload.downcast_ref::<&str>().copied())
+                        .unwrap_or("non-string panic payload");
+                    anyhow!("TypeScript header worker panicked: {message}")
+                })??;
             }
 
             Ok(())

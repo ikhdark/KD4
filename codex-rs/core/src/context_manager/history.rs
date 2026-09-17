@@ -126,17 +126,39 @@ impl PreparedPromptItems {
         if len == self.0.len {
             return self.clone();
         }
-        Self(Arc::new(PreparedPromptItemsInner {
+        // Keep cheap views for small cuts, but do not pin a large discarded
+        // tail for the lifetime of a much smaller prompt. Copy only survivors.
+        if self.0.len.saturating_sub(len) >= 256 && len <= self.0.len / 4 {
+            let mut chunks = Vec::new();
+            self.collect_prefix_chunks(len, &mut chunks);
+            let mut retained = Vec::with_capacity(len);
+            for (chunk, count) in chunks {
+                retained.extend_from_slice(&chunk[..count]);
+            }
+            return Self::from_shared(retained.into());
+        }
+        let prefix = Self(Arc::new(PreparedPromptItemsInner {
             len,
             source: PreparedPromptItemsSource::Prefix {
                 source: self.clone(),
             },
             flattened: OnceLock::new(),
-        }))
+        }));
+        // Small tail adjustments should stay lazy. A substantially smaller
+        // retained prefix should release the obsolete suffix and its ancestors.
+        if len == 0 || (len <= self.0.len / 4 && self.0.len - len >= 64) {
+            Self::from_shared(prefix.shared())
+        } else {
+            prefix
+        }
     }
 
     fn shared(&self) -> Arc<[ResponseItem]> {
-        Arc::clone(self.0.flattened.get_or_init(|| {
+        Arc::clone(self.flattened())
+    }
+
+    fn flattened(&self) -> &Arc<[ResponseItem]> {
+        self.0.flattened.get_or_init(|| {
             let mut chunks = Vec::new();
             self.collect_prefix_chunks(self.0.len, &mut chunks);
 
@@ -145,7 +167,7 @@ impl PreparedPromptItems {
                 flattened.extend_from_slice(&chunk[..len]);
             }
             flattened.into()
-        }))
+        })
     }
 
     fn collect_prefix_chunks(&self, len: usize, chunks: &mut Vec<(Arc<[ResponseItem]>, usize)>) {
@@ -201,11 +223,7 @@ impl PreparedPromptItems {
     }
 
     fn as_slice(&self) -> &[ResponseItem] {
-        let _ = self.shared();
-        let Some(flattened) = self.0.flattened.get() else {
-            unreachable!("shared prompt items must be materialized");
-        };
-        flattened.as_ref()
+        self.flattened().as_ref()
     }
 
     fn shares_storage_with(&self, other: &Self) -> bool {
@@ -386,14 +404,31 @@ pub(crate) fn compact_acknowledged_tool_search_outputs(
 }
 
 fn compact_tool_search_output(item: &ResponseItem) -> ResponseItem {
-    let mut item = item.clone();
-    if let ResponseItem::ToolSearchOutput { tools, .. } = &mut item {
-        *tools = tools
-            .iter()
-            .map(compact_tool_search_tool_identity)
-            .collect();
+    if let ResponseItem::ToolSearchOutput {
+        id,
+        call_id,
+        status,
+        execution,
+        tools,
+        omitted_result_count,
+        internal_chat_message_metadata_passthrough,
+    } = item
+    {
+        return ResponseItem::ToolSearchOutput {
+            id: id.clone(),
+            call_id: call_id.clone(),
+            status: status.clone(),
+            execution: execution.clone(),
+            tools: tools
+                .iter()
+                .map(compact_tool_search_tool_identity)
+                .collect(),
+            omitted_result_count: *omitted_result_count,
+            internal_chat_message_metadata_passthrough: internal_chat_message_metadata_passthrough
+                .clone(),
+        };
     }
-    item
+    item.clone()
 }
 
 fn compact_tool_search_tool_identity(tool: &serde_json::Value) -> serde_json::Value {
@@ -514,7 +549,7 @@ pub(crate) struct ContextManager {
     tool_history: Arc<ToolHistoryState>,
     prepared_history: Arc<StdMutex<Option<PreparedHistoryCacheEntry>>>,
     item_token_estimates:
-        Arc<StdMutex<HashMap<ItemTokenEstimateCacheNamespace, HashMap<String, i64>>>>,
+        Arc<StdMutex<HashMap<ItemTokenEstimateCacheNamespace, HashMap<usize, i64>>>>,
     token_info: Option<TokenUsageInfo>,
     /// Reference context snapshot used for diffing and producing model-visible
     /// settings update items.
@@ -731,18 +766,18 @@ impl ContextManager {
             .prepared_history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
+            .as_mut()
             .filter(|entry| {
                 weak_ptr_eq_arc(&entry.source_items, &self.items)
                     && entry.projection_revision == self.projection_revision
                     && entry.prepared.policy == policy
             })
             .map(|entry| {
-                let mut prepared = entry.prepared.clone();
-                prepared.stable_context_manifest = prepared
+                entry.prepared.stable_context_manifest = entry
+                    .prepared
                     .stable_context_manifest
                     .with_local_reused(/*local_reused*/ true);
-                prepared
+                entry.prepared.clone()
             })
         {
             return prepared;
@@ -1003,7 +1038,7 @@ impl ContextManager {
             items,
             base_instructions,
             pending_user_boundary,
-            policy,
+            Some(policy),
         )
     }
 
@@ -1012,7 +1047,7 @@ impl ContextManager {
         items: &[ResponseItem],
         base_instructions: &BaseInstructions,
         pending_user_boundary: bool,
-        policy: PreparedHistoryPolicy,
+        policy: Option<PreparedHistoryPolicy>,
     ) -> Option<i64> {
         let base_tokens =
             i64::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i64::MAX);
@@ -1023,7 +1058,7 @@ impl ContextManager {
             .iter()
             .enumerate()
             .filter(|(index, item)| !is_resolved_reasoning(*index, item, last_instruction_boundary))
-            .map(|(_, item)| self.estimate_item_token_count_cached(item, policy))
+            .map(|(index, item)| self.estimate_item_token_count_cached(index, item, policy))
             .fold(0i64, i64::saturating_add);
 
         Some(base_tokens.saturating_add(items_tokens))
@@ -1031,19 +1066,22 @@ impl ContextManager {
 
     fn estimate_item_token_count_cached(
         &self,
+        index: usize,
         item: &ResponseItem,
-        policy: PreparedHistoryPolicy,
+        policy: Option<PreparedHistoryPolicy>,
     ) -> i64 {
-        let Some(item_id) = item.id() else {
-            return estimate_item_token_count(item);
-        };
-        let projection_kind = 1;
-        let policy_version = policy.version;
-        let supports_images = policy.supports_images;
-        let stable_context_target = match policy.stable_context_target {
-            StableContextTarget::Sampling => 1,
-            StableContextTarget::FailOpen => 0,
-        };
+        // Positions are stable within a projection revision, including items
+        // without protocol IDs. Rewrites invalidate the namespace; safe appends
+        // carry only unchanged prefix entries forward.
+        // Raw history and prepared projections may share item IDs but contain
+        // different content, so their estimates must use separate namespaces.
+        let projection_kind = u8::from(policy.is_some());
+        let policy_version = policy.map_or(0, |policy| policy.version);
+        let supports_images = policy.is_some_and(|policy| policy.supports_images);
+        let stable_context_target =
+            u8::from(policy.is_some_and(|policy| {
+                policy.stable_context_target == StableContextTarget::Sampling
+            }));
         let namespace = ItemTokenEstimateCacheNamespace {
             history_version: self.history_version,
             projection_revision: self.projection_revision,
@@ -1052,23 +1090,28 @@ impl ContextManager {
             supports_images,
             stable_context_target,
         };
-        let mut estimates = self
+        let estimates = self
             .item_token_estimates
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(estimate) = estimates
             .get(&namespace)
-            .and_then(|items| items.get(item_id.as_str()))
+            .and_then(|items| items.get(&index))
             .copied()
         {
             return estimate;
         }
 
+        drop(estimates);
         let estimate = estimate_item_token_count(item);
+        let mut estimates = self
+            .item_token_estimates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         estimates
             .entry(namespace)
             .or_default()
-            .insert(item_id.to_string(), estimate);
+            .insert(index, estimate);
         estimate
     }
 
@@ -1280,11 +1323,14 @@ impl ContextManager {
                 },
             );
         if local_tail_contains_instruction_boundary {
-            return Self::estimate_items_token_count_with_base_instructions(
-                self.raw_items(),
-                base_instructions,
-            )
-            .unwrap_or(0);
+            return self
+                .estimate_cached_items_token_count(
+                    self.raw_items(),
+                    base_instructions,
+                    /*pending_user_boundary*/ false,
+                    /*policy*/ None,
+                )
+                .unwrap_or(0);
         }
 
         let last_tokens = self
@@ -1292,9 +1338,17 @@ impl ContextManager {
             .as_ref()
             .map(|info| info.last_token_usage.total_tokens)
             .unwrap_or(0);
+        let tail_start = self.items.len() - items_after_last_model_generated.len();
         let items_after_last_model_generated_tokens = items_after_last_model_generated
             .iter()
-            .map(estimate_item_token_count)
+            .enumerate()
+            .map(|(index, item)| {
+                self.estimate_item_token_count_cached(
+                    tail_start + index,
+                    item,
+                    /*policy*/ None,
+                )
+            })
             .fold(0i64, i64::saturating_add);
         let earlier_reasoning_tokens = if server_reasoning_included {
             0
@@ -1485,25 +1539,29 @@ fn project_update_plan_history(items: &mut Vec<ResponseItem>) {
         .iter()
         .map(|(_, call_id)| call_id.as_str())
         .collect::<BTreeSet<_>>();
-    let mut projected = Vec::with_capacity(items.len());
-    for (index, item) in items.drain(..).enumerate() {
+    let mut index = 0;
+    let mut retained = 0;
+    let mut insertion_index = 0;
+    items.retain(|item| {
         if index == *latest_call_index {
-            projected.push(projected_call.clone());
-            projected.push(projected_output.clone());
+            insertion_index = retained;
         }
         let belongs_to_update_plan = matches!(
-            &item,
+            item,
             ResponseItem::FunctionCall { name, .. } if name == "update_plan"
         ) || matches!(
-            &item,
+            item,
             ResponseItem::FunctionCallOutput { call_id, .. }
                 if update_call_ids.contains(call_id.as_str())
         );
-        if !belongs_to_update_plan {
-            projected.push(item);
-        }
-    }
-    *items = projected;
+        index += 1;
+        retained += usize::from(!belongs_to_update_plan);
+        !belongs_to_update_plan
+    });
+    items.splice(
+        insertion_index..insertion_index,
+        [projected_call, projected_output],
+    );
 }
 
 fn prepared_append_can_be_completed(items: &[ResponseItem], supports_images: bool) -> bool {

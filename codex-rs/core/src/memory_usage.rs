@@ -86,7 +86,7 @@ fn shell_script_for_invocation(invocation: &ToolInvocation) -> Option<String> {
             }),
         (None, "exec_command") => serde_json::from_str::<ExecCommandArgs>(arguments)
             .ok()
-            .and_then(|params| params.command_invocation().ok())
+            .map(|params| params.command_invocation())
             .map(|command| command.display_command()),
         (Some(_), _) | (None, _) => None,
     }

@@ -107,8 +107,11 @@ async fn registered_input_request(
     turn: Arc<crate::session::turn_context::TurnContext>,
     call_id: &str,
 ) -> Result<crate::tools::registry::AnyToolResult, FunctionCallError> {
-    use crate::tools::context::{ToolCallSource, ToolDispatchState};
-    use crate::tools::router::{ToolCall, ToolRouter, ToolRouterParams};
+    use crate::tools::context::ToolCallSource;
+    use crate::tools::context::ToolDispatchState;
+    use crate::tools::router::ToolCall;
+    use crate::tools::router::ToolRouter;
+    use crate::tools::router::ToolRouterParams;
     let invocation = request_invocation(Arc::clone(&session), Arc::clone(&turn));
     let step = StepContext::for_test(turn);
     let router = ToolRouter::from_context(
@@ -146,8 +149,11 @@ async fn registered_input_request(
 
 #[tokio::test]
 async fn registered_user_input_drop_retires_sender_before_and_after_event_delivery() {
-    use crate::state::{ActiveTurn, TurnTerminalCoordinator};
-    use codex_protocol::protocol::{Event, EventMsg, WarningEvent};
+    use crate::state::ActiveTurn;
+    use crate::state::TurnTerminalCoordinator;
+    use codex_protocol::protocol::Event;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::WarningEvent;
     use std::time::Duration;
     for blocked in [true, false] {
         let (session, turn, events_tx, events) =
@@ -224,8 +230,82 @@ async fn registered_user_input_drop_retires_sender_before_and_after_event_delive
 }
 
 #[tokio::test]
+async fn registered_user_input_output_schema_covers_answers_empty_and_interrupted() {
+    use crate::state::ActiveTurn;
+    use crate::state::TurnTerminalCoordinator;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::request_user_input::RequestUserInputResponse;
+    use std::time::Duration;
+
+    let spec = super::create_request_user_input_tool(String::new());
+    let definition = codex_tools::tool_spec_to_code_mode_tool_definition(&spec)
+        .expect("user input tool definition");
+    assert!(definition.description.contains("interrupted: boolean"));
+    let codex_tools::ToolSpec::Function(spec) = spec else {
+        panic!("user input uses a function spec");
+    };
+    let validator = jsonschema::validator_for(spec.output_schema.as_ref().expect("output schema"))
+        .expect("valid user input output schema");
+    for expected in [
+        json!({"answers":{"pick_one":{"answers":["B"]}},"interrupted":false}),
+        json!({"answers":{},"interrupted":false}),
+        json!({"answers":{},"interrupted":true}),
+    ] {
+        let (session, turn, events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        *session.active_turn.lock().await = Some(ActiveTurn {
+            terminal: Some(TurnTerminalCoordinator::new(turn.sub_id.clone())),
+            ..Default::default()
+        });
+        let mut request = Box::pin(registered_input_request(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "input-schema",
+        ));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                tokio::select! {
+                    result = &mut request => panic!("request completed before reply: {:?}", result.err()),
+                    event = events.recv() => {
+                        if let EventMsg::RequestUserInput(event) = event.unwrap().msg {
+                            assert_eq!(event.call_id, "input-schema");
+                            break;
+                        }
+                    }
+                }
+            }
+        }).await.expect("registered request event");
+        session
+            .notify_user_input_response(
+                &turn.sub_id,
+                serde_json::from_value::<RequestUserInputResponse>(expected.clone()).unwrap(),
+            )
+            .await;
+        let result = tokio::time::timeout(Duration::from_secs(3), request)
+            .await
+            .expect("reply completes request")
+            .expect("registered user input output");
+        let actual = result.result.code_mode_result(&result.payload);
+        assert_eq!(actual, expected);
+        assert!(
+            validator.is_valid(&actual),
+            "invalid user input output: {actual}"
+        );
+        let mut malformed = actual;
+        malformed["interrupted"] = json!("false");
+        assert!(!validator.is_valid(&malformed));
+        session.terminal_tasks.close();
+        tokio::time::timeout(Duration::from_secs(3), session.terminal_tasks.wait())
+            .await
+            .expect("input cleanup");
+    }
+    assert!(!validator.is_valid(&json!({"answers":{"pick_one":["B"]},"interrupted":false})));
+}
+
+#[tokio::test]
 async fn registered_user_input_rejects_stale_turn_and_preserves_live_replacement() {
-    use crate::state::{ActiveTurn, TurnTerminalCoordinator};
+    use crate::state::ActiveTurn;
+    use crate::state::TurnTerminalCoordinator;
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::request_user_input::RequestUserInputResponse;
     use std::time::Duration;

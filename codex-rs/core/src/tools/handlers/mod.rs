@@ -21,6 +21,7 @@ pub(crate) mod multi_agents_spec;
 pub(crate) mod multi_agents_v2;
 mod plan;
 pub(crate) mod plan_spec;
+mod read_file;
 mod read_tool_output;
 pub(crate) mod read_tool_output_spec;
 mod request_permissions;
@@ -79,6 +80,7 @@ pub use mcp_resource::ListMcpResourceTemplatesHandler;
 pub use mcp_resource::ListMcpResourcesHandler;
 pub use mcp_resource::ReadMcpResourceHandler;
 pub use plan::PlanHandler;
+pub(crate) use read_file::ReadFileHandler;
 pub use read_tool_output::ReadToolOutputHandler;
 #[cfg(test)]
 pub(crate) use read_tool_output::execute_recovery_transaction;

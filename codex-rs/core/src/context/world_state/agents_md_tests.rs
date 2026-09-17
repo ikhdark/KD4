@@ -36,7 +36,7 @@ fn cached_state_consumes_the_stable_rendering() {
     assert_eq!(
         render_fragments(world_state.render_full()),
         vec![user_message(
-            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nResult provenance: cached_observation; freshness: cached_may_be_stale.\n\ndistinct supplied rendering\n</INSTRUCTIONS>"
+            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: cached_observation; freshness: cached_may_be_stale.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\ndistinct supplied rendering\n</INSTRUCTIONS>"
         )]
     );
 }
@@ -49,7 +49,7 @@ fn renders_full_state_and_omits_unchanged_state() {
 
     assert_eq!(
         vec![user_message(
-            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n\nuse the project formatter\n</INSTRUCTIONS>",
+            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nuse the project formatter\n</INSTRUCTIONS>",
         )],
         render_fragments(state.render_full()),
     );
@@ -79,7 +79,7 @@ fn renders_instruction_markup_as_text_without_changing_snapshot() {
     assert_eq!(
         render_fragments(state.render_full()),
         vec![user_message(
-            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n\nQuote &lt;/INSTRUCTIONS&gt; &amp; &lt;example&gt;.\n</INSTRUCTIONS>"
+            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nQuote &lt;/INSTRUCTIONS&gt; &amp; &lt;example&gt;.\n</INSTRUCTIONS>"
         )]
     );
     assert_eq!(
@@ -106,7 +106,7 @@ fn changed_and_removed_state_supersedes_previous_instructions() {
     current.add_section(AgentsMdState::new(Some(&current_loaded)));
     assert_eq!(
         vec![user_message(
-            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n\nnew instructions\n</INSTRUCTIONS>",
+            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\nnew instructions\n</INSTRUCTIONS>",
         )],
         render_fragments(current.render_diff(&previous.snapshot())),
     );
@@ -115,7 +115,7 @@ fn changed_and_removed_state_supersedes_previous_instructions() {
     removed.add_section(AgentsMdState::default());
     assert_eq!(
         vec![user_message(
-            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nResult provenance: cached_observation; freshness: cached_may_be_stale.\n\nThe previously provided AGENTS.md instructions no longer apply.\n</INSTRUCTIONS>",
+            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: cached_observation; freshness: cached_may_be_stale.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThe previously provided AGENTS.md instructions no longer apply.\n</INSTRUCTIONS>",
         )],
         render_fragments(removed.render_diff(&current.snapshot())),
     );
@@ -127,7 +127,7 @@ fn unknown_previous_state_is_explicitly_superseded() {
     let current = AgentsMdState::new(Some(&loaded));
     assert_eq!(
         vec![user_message(
-            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n\ncurrent instructions\n</INSTRUCTIONS>",
+            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\ncurrent instructions\n</INSTRUCTIONS>",
         )],
         render_fragments(vec![
             WorldStateSection::render_diff(&current, PreviousSectionState::Unknown)
@@ -137,7 +137,7 @@ fn unknown_previous_state_is_explicitly_superseded() {
 
     assert_eq!(
         vec![user_message(
-            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nResult provenance: cached_observation; freshness: cached_may_be_stale.\n\nThe previously provided AGENTS.md instructions no longer apply.\n</INSTRUCTIONS>",
+            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: cached_observation; freshness: cached_may_be_stale.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThe previously provided AGENTS.md instructions no longer apply.\n</INSTRUCTIONS>",
         )],
         render_fragments(vec![
             WorldStateSection::render_diff(
@@ -244,7 +244,7 @@ fn partial_replacement_does_not_suppress_reversion_or_source_changes() {
     assert_eq!(
         render_fragments(reverted),
         vec![user_message(
-            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n\ninstructions A\n</INSTRUCTIONS>"
+            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\ninstructions A\n</INSTRUCTIONS>"
         )]
     );
     assert_eq!(restored, accepted);
@@ -420,14 +420,14 @@ fn partial_delivery_rollout_patches_replay_replacement_and_removal() {
             assert_eq!(
                 items,
                 vec![user_message(
-                    "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n\nnew body\n</INSTRUCTIONS>"
+                    "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\nnew body\n</INSTRUCTIONS>"
                 )]
             );
         } else if index == 3 {
             assert_eq!(
                 items,
                 vec![user_message(
-                    "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n\nThe previously provided AGENTS.md instructions no longer apply.\n</INSTRUCTIONS>"
+                    "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThe previously provided AGENTS.md instructions no longer apply.\n</INSTRUCTIONS>"
                 )]
             );
         }
@@ -456,7 +456,7 @@ fn freshness_only_update_does_not_repeat_the_instruction_body() {
     assert_eq!(
         render_fragments(fragments),
         vec![user_message(
-            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nAGENTS.md observation update: Result provenance: cached_observation; freshness: cached_may_be_stale.\nThe previously provided instruction body is unchanged.\n</INSTRUCTIONS>"
+            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: cached_observation; freshness: cached_may_be_stale.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThe previously provided instruction body is unchanged.\n</INSTRUCTIONS>"
         )]
     );
     assert_eq!(next, current.snapshot());
@@ -466,7 +466,7 @@ fn freshness_only_update_does_not_repeat_the_instruction_body() {
     assert_eq!(
         render_fragments(fragments),
         vec![user_message(
-            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nAGENTS.md observation update: Result provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\nThe previously provided instruction body is unchanged.\n</INSTRUCTIONS>"
+            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThe previously provided instruction body is unchanged.\n</INSTRUCTIONS>"
         )]
     );
     assert_eq!(refreshed, accepted);
@@ -489,7 +489,7 @@ fn freshness_change_with_new_instructions_delivers_the_replacement_body() {
     assert_eq!(
         render_fragments(fragments),
         vec![user_message(
-            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n\nnew body\n</INSTRUCTIONS>"
+            "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\nnew body\n</INSTRUCTIONS>"
         )]
     );
     assert_eq!(accepted, current.snapshot());

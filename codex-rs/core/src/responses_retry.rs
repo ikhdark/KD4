@@ -60,7 +60,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
     request: ResponsesStreamRequest,
     cancellation_token: &CancellationToken,
 ) -> Result<(), CodexErr> {
-    if !should_retry_response_stream(request, &err) {
+    if !should_retry_response_stream(&err) {
         return Err(err);
     }
 
@@ -177,8 +177,7 @@ async fn wait_for_retry_delay(
     }
 }
 
-fn should_retry_response_stream(request: ResponsesStreamRequest, err: &CodexErr) -> bool {
-    let _ = request;
+fn should_retry_response_stream(err: &CodexErr) -> bool {
     err.is_retryable()
         && !matches!(
             err,

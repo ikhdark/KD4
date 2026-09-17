@@ -187,7 +187,8 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         directory: directory.clone(),
         repo,
         mode: Mode::Fast,
-        schedule: schedule(Mode::Fast),
+        fork_only_on: false,
+        schedule: schedule(Mode::Fast, false),
         workspace,
         workspace_lock: directory.join("workspace.lock"),
         additional_roots: vec![],
@@ -210,7 +211,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             .into_iter()
             .map(|variant| (variant, vec![]))
             .collect(),
-        fixtures: schedule(Mode::Fast)
+        fixtures: schedule(Mode::Fast, false)
             .into_iter()
             .map(|scheduled| {
                 let name = match scheduled.segment {
@@ -232,8 +233,120 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         analyzer: analyzer_files[0].clone(),
         analyzer_files,
         preparation_ms: 0,
-        budgets: json!({}),
+        budgets: json!({"scriptedMs":1_800_000,"realModelMs":1_800_000,"attemptMs":600_000}),
     }
+}
+
+#[test]
+fn fork_only_on_default_preserves_selection_and_unrun_pairs_in_reports_and_reanalysis() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut prepared = prepared_peer(temp.path(), false);
+
+    let options = crate::cli::parse(vec![]).unwrap();
+    prepared.fork_only_on = options.fork_only_on;
+    prepared.schedule = schedule(options.mode, options.fork_only_on);
+    prepared.builds.remove(&Variant::ForkOff);
+    prepared.overrides.remove(&Variant::ForkOff);
+    prepared.features = vec![
+        json!({"id":"runtime", "config_keys":["features.kd4_runtime"], "benchmark_on":true, "benchmark_control":{"kind":"runtime"}}),
+    ];
+    prepared.overrides.insert(
+        Variant::ForkOn,
+        crate::prepare::feature_overrides(&prepared.features, true).unwrap(),
+    );
+    let project = temp.path().join("project");
+    fs::create_dir_all(project.join(".codex")).unwrap();
+    fs::write(project.join(".codex/config.toml"), BASE_CONFIG).unwrap();
+    prepared.project_config_comparison =
+        crate::prepare::environment::ProjectConfigComparison::capture(
+            &project,
+            BASE_CONFIG,
+            &prepared.overrides,
+        )
+        .unwrap();
+    let manifest = prepared.directory.join("prepared.json");
+    write_json(&manifest, &prepared).unwrap();
+    let prepared = Prepared::load(&manifest).unwrap();
+    let attempts: Vec<_> = prepared
+        .schedule
+        .iter()
+        .map(|scheduled| {
+            let mut value = attempt(
+                &prepared,
+                scheduled.segment == Segment::RealModel,
+                &scheduled.id,
+            );
+            value.scheduled = scheduled.clone();
+            value
+        })
+        .collect();
+    let result = RunResult {
+        schema_version: 1,
+        id: "only-on".into(),
+        prepared_manifest: manifest.clone(),
+        prepared_manifest_sha256: hash_file(&manifest).unwrap(),
+        directory: prepared.runs_directory.clone(),
+        mode: options.mode,
+        original_run: None,
+        attempts,
+        scripted_execution_ms: 0,
+        real_model_execution_ms: 0,
+        finished: true,
+    };
+    let path = result.directory.join("result.json");
+    fs::create_dir_all(&result.directory).unwrap();
+    write_json(&path, &result).unwrap();
+    crate::reports::write(&prepared, &result).unwrap();
+    for report_path in [
+        result.directory.join("report.json"),
+        analysis_only(&path).unwrap().with_file_name("report.json"),
+    ] {
+        let report: Value = read_json(&report_path).unwrap();
+        assert_eq!(report["completion"]["scheduled"], 86);
+        assert_eq!(report["completion"]["completed"], 0);
+        assert_eq!(report["completion"]["unrun"], 86);
+        assert_eq!(report["prepared"]["forkOnlyOn"], true);
+        let comparisons = report["comparisons"].as_array().unwrap();
+        assert!(!comparisons.is_empty());
+        assert!(comparisons.iter().all(|c| c["kind"] == "overall"
+            && c["baseline"] == "reference"
+            && c["candidate"] == "fork_on"));
+        let elapsed = comparisons
+            .iter()
+            .find(|c| c["workload"] == "long_history_initial" && c["metric"] == "elapsed_ms")
+            .unwrap();
+        assert!(elapsed["pairs"].as_array().unwrap().is_empty());
+        assert_eq!(elapsed["scheduledPairSlots"], 3);
+        assert_eq!(elapsed["excludedPairRate"], 1.0);
+        assert_eq!(
+            report["featureCoverage"][0]["configuredByVariant"]["fork_on"],
+            true
+        );
+        assert_eq!(
+            report["featureCoverage"][0]["ablationStatus"],
+            "not_ablated"
+        );
+        for mapping in [
+            &report["prepared"]["builds"],
+            &report["prepared"]["overrides"],
+            &report["prepared"]["projectConfigComparison"]["byVariant"],
+            &report["featureCoverage"][0]["configuredByVariant"],
+        ] {
+            assert!(mapping.get("fork_off").is_none());
+        }
+        let markdown = fs::read_to_string(report_path.with_file_name("report.md")).unwrap();
+        assert!(markdown.contains("Configured fork_on / reference"));
+        assert!(!markdown.contains("fork_off"));
+    }
+    assert!(
+        !fs::read_dir(&prepared.runs_directory)
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("fork_off"))
+    );
 }
 
 #[test]
@@ -815,7 +928,11 @@ fn reports_compare_versioned_behavior_from_all_frozen_audit_sessions() {
                             "toolOutputCanonicalTokenCount":count * 1000,
                             "toolOutputModelTokenCount":count * 100,
                             "toolOutputRecoveryCallCount":count,
-                            "toolOutputRecoveryRetruncationCount":session
+                            "toolOutputRecoveryRetruncationCount":session,
+                            "toolOutputArtifactCreationCount":count,
+                            "toolOutputArtifactReuseCount":session,
+                            "toolOutputOmittedSectionCount":count * 10,
+                            "attributableRecoveryGenerationCount":session
                         }
                     }
                 }),
@@ -935,6 +1052,10 @@ fn reports_compare_versioned_behavior_from_all_frozen_audit_sessions() {
         ),
         ("behavior_tool_output_model_tokens", 500.0, 300.0, "tokens"),
         ("behavior_tool_output_recovery_calls", 5.0, 3.0, "count"),
+        ("behavior_tool_output_artifact_creations", 5.0, 3.0, "count"),
+        ("behavior_tool_output_artifact_reuses", 1.0, 1.0, "count"),
+        ("behavior_tool_output_omitted_sections", 50.0, 30.0, "count"),
+        ("behavior_recovery_generations", 1.0, 1.0, "count"),
         (
             "behavior_tool_output_recovery_retruncations",
             1.0,

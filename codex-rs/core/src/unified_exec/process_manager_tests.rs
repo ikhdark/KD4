@@ -15,6 +15,200 @@ use pretty_assertions::assert_eq;
 use tokio::time::Duration;
 use tokio::time::Instant;
 
+#[tokio::test(start_paused = true)]
+async fn input_handoff_preserves_poll_bytes_and_reports_actual_wait() {
+    use crate::tools::tool_dispatch_trace::{ToolDispatchTiming, scope_tool_dispatch_timing};
+    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let manager = &session.services.unified_exec_manager;
+    let process = crate::unified_exec::process_tests::remote_process(
+        codex_exec_server::WriteStatus::Accepted,
+        None,
+    )
+    .await;
+    crate::unified_exec::process_tests::store_process_for_test(
+        manager,
+        &session,
+        &turn,
+        1000,
+        Arc::clone(&process),
+    )
+    .await;
+    let handles = process.output_handles();
+    handles
+        .output_buffer
+        .lock()
+        .await
+        .push_chunk(b"before input\n");
+    let timing = Arc::new(ToolDispatchTiming::new(Instant::now(), false));
+    let poll = scope_tool_dispatch_timing(
+        Arc::clone(&timing),
+        manager.write_stdin(WriteStdinRequest {
+            process_id: 1000,
+            input: "",
+            yield_time_ms: 120_000,
+            max_output_tokens: None,
+            truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
+        }),
+    );
+    tokio::pin!(poll);
+    assert!(futures::poll!(&mut poll).is_pending());
+    assert_eq!(handles.output_buffer.lock().await.retained_bytes(), 0);
+    let started = Instant::now();
+    let input = manager.write_stdin(WriteStdinRequest {
+        process_id: 1000,
+        input: "hello",
+        yield_time_ms: 250,
+        max_output_tokens: None,
+        truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
+    });
+    tokio::pin!(input);
+    assert!(futures::poll!(&mut input).is_pending());
+    let result = poll.await.unwrap();
+    assert_eq!(Instant::now(), started);
+    assert_eq!(result.raw_output, b"before input\n");
+    assert_eq!(result.process_id, Some(1000));
+    let waits = timing.snapshot(Instant::now()).timer_waits;
+    let wait = waits
+        .iter()
+        .find(|wait| wait.wait_kind == "write_stdin_yield")
+        .unwrap();
+    assert_eq!(wait.requested_timeout_ms, Some(120_000));
+    assert_eq!(
+        wait.effective_timeout_ms,
+        Some(manager.max_write_stdin_yield_time_ms)
+    );
+    assert_eq!(wait.wake_reason, ToolLifecycleWakeReason::Retry);
+    assert!(input.await.unwrap().raw_output.is_empty());
+    assert_eq!(Instant::now() - started, Duration::from_millis(250));
+    manager.process_store.lock().await.remove(1000);
+    process.terminate_confirmed().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn poll_progress_is_completed_and_silence_is_timeout() {
+    use crate::tools::tool_dispatch_trace::{ToolDispatchTiming, scope_tool_dispatch_timing};
+    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let manager = &session.services.unified_exec_manager;
+    let process = crate::unified_exec::process_tests::remote_process(
+        codex_exec_server::WriteStatus::Accepted,
+        None,
+    )
+    .await;
+    crate::unified_exec::process_tests::store_process_for_test(
+        manager,
+        &session,
+        &turn,
+        1000,
+        Arc::clone(&process),
+    )
+    .await;
+    for (bytes, expected, elapsed) in [
+        (
+            b"progress\n".as_slice(),
+            ToolLifecycleWakeReason::Completed,
+            250,
+        ),
+        // Silence runs out the effective empty-poll timeout, not the smaller
+        // requested yield.
+        (
+            b"".as_slice(),
+            ToolLifecycleWakeReason::Timeout,
+            crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS,
+        ),
+    ] {
+        process
+            .output_handles()
+            .output_buffer
+            .lock()
+            .await
+            .push_chunk(bytes);
+        let start = Instant::now();
+        let timing = Arc::new(ToolDispatchTiming::new(start, false));
+        let result = scope_tool_dispatch_timing(
+            Arc::clone(&timing),
+            manager.write_stdin(WriteStdinRequest {
+                process_id: 1000,
+                input: "",
+                yield_time_ms: 1000,
+                max_output_tokens: None,
+                truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.raw_output, bytes);
+        assert_eq!(result.process_id, Some(1000));
+        assert_eq!(Instant::now() - start, Duration::from_millis(elapsed));
+        let waits = timing.snapshot(Instant::now()).timer_waits;
+        let wait = waits
+            .iter()
+            .find(|wait| wait.wait_kind == "write_stdin_yield")
+            .unwrap();
+        assert_eq!(wait.wake_reason, expected);
+        // An empty poll is a background wait, so the requested yield is raised
+        // to the empty-poll floor rather than used as written.
+        assert_eq!(
+            wait.effective_timeout_ms,
+            Some(crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS)
+        );
+    }
+    manager.process_store.lock().await.remove(1000);
+    process.terminate_confirmed().await.unwrap();
+}
+
+#[tokio::test]
+async fn retirement_waits_for_output_without_blocking_store_or_removing_reused_id() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let manager = &session.services.unified_exec_manager;
+    let old = crate::unified_exec::process_tests::remote_process(
+        codex_exec_server::WriteStatus::Accepted,
+        None,
+    )
+    .await;
+    crate::unified_exec::process_tests::store_process_for_test(
+        manager,
+        &session,
+        &turn,
+        1000,
+        Arc::clone(&old),
+    )
+    .await;
+    old.signal_exit_for_test(Some(0));
+    let handles = old.output_handles();
+    handles.output_closed.store(true, Ordering::Release);
+    let buffer = handles.output_buffer.lock().await;
+    let retirement = manager.refresh_process_state(1000, &old);
+    tokio::pin!(retirement);
+    assert!(futures::poll!(&mut retirement).is_pending());
+    let replacement = crate::unified_exec::process_tests::remote_process(
+        codex_exec_server::WriteStatus::Accepted,
+        None,
+    )
+    .await;
+    {
+        let mut store = tokio::time::timeout(Duration::from_secs(1), manager.process_store.lock())
+            .await
+            .expect("one blocked buffer must not lock the process store");
+        store.processes.get_mut(&1000).unwrap().process = Arc::clone(&replacement);
+    }
+    drop(buffer);
+    assert!(matches!(retirement.await, ProcessStatus::Unknown));
+    assert!(Arc::ptr_eq(
+        &manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .get(&1000)
+            .unwrap()
+            .process,
+        &replacement,
+    ));
+    manager.process_store.lock().await.remove(1000);
+    replacement.terminate_confirmed().await.unwrap();
+}
+
 #[tokio::test]
 async fn dropped_process_id_reservation_is_released_before_store_transfer() {
     let manager = UnifiedExecProcessManager::default();
@@ -371,12 +565,48 @@ fn unified_exec_env_preserves_existing_values() {
     let mut base = HashMap::new();
     base.insert("no_color".to_string(), "0".to_string());
     base.insert("PATH".to_string(), "/usr/bin".to_string());
+    base.insert("PAGER".to_string(), "custom-pager".to_string());
 
     let env = apply_unified_exec_env(base, &ShellEnvironmentPolicy::default());
 
     assert_eq!(env.get("no_color"), Some(&"0".to_string()));
     assert!(!env.contains_key("NO_COLOR"));
     assert_eq!(env.get("PATH"), Some(&"/usr/bin".to_string()));
+    assert_eq!(env.get("PAGER"), Some(&"custom-pager".to_string()));
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn unified_exec_windows_default_pager_preserves_bytes() {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    let env = apply_unified_exec_env(HashMap::new(), &ShellEnvironmentPolicy::default());
+    let pager = env.get("PAGER").expect("default pager");
+    assert_eq!(env.get("GIT_PAGER"), Some(pager));
+    assert_eq!(env.get("GH_PAGER"), Some(pager));
+    let mut child = tokio::process::Command::new("cmd.exe")
+        .args(["/d", "/s", "/c", pager.as_str()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start the injected pager through the Windows command shell");
+    let input = format!("a\tb\n\0\u{1b}[31mcafé 中文\n{}\n", "x".repeat(200));
+    let mut stdin = child.stdin.take().expect("pager stdin");
+    stdin
+        .write_all(input.as_bytes())
+        .await
+        .expect("write bytes");
+    drop(stdin);
+    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+        .await
+        .expect("pager must finish at EOF")
+        .expect("read pager output");
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, input.as_bytes());
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
@@ -1865,11 +2095,14 @@ async fn assert_remote_startup_failure_closes_command(cancel_during_registration
 async fn remote_startup_cleanup_failure_retains_native_child_until_session_shutdown_retry() {
     use futures::SinkExt;
     use futures::StreamExt;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
-    };
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::FromRawHandle;
+    use std::os::windows::io::OwnedHandle;
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+    use windows_sys::Win32::System::Threading::OpenProcess;
+    use windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     let (session, mut turn, _events) =
         crate::session::tests::make_session_and_context_with_rx().await;
@@ -3078,11 +3311,16 @@ fn normal_local_termination_keeps_native_request_owned_after_caller_deadline() {
 #[test]
 fn registered_nonpty_interrupt_yields_to_worker_and_preserves_unsupported_process() {
     use codex_tools::ToolExecutor;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
-    };
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::FromRawHandle;
+    use std::os::windows::io::OwnedHandle;
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+    use windows_sys::Win32::System::Threading::OpenProcess;
+    use windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::PROCESS_TERMINATE;
+    use windows_sys::Win32::System::Threading::TerminateProcess;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
     struct ChildGuard(OwnedHandle);
     impl ChildGuard {
         fn exited(&self) -> bool {

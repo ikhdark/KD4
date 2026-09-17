@@ -21,6 +21,136 @@ fn small_output_is_unchanged() {
 }
 
 #[test]
+fn source_reads_use_ordered_truncation_in_the_normal_output_path() {
+    let mut lines = (0..700)
+        .map(|index| format!("source line {index:04}: {}", "x".repeat(80)))
+        .collect::<Vec<_>>();
+    lines[350] = "error[E9999]: this is source text, not a compiler diagnostic".into();
+    let output = lines.join("\n");
+    let exec_output = codex_protocol::exec_output::ExecToolCallOutput {
+        exit_code: 0,
+        stdout: codex_protocol::exec_output::StreamOutput::new(output.clone()),
+        stderr: codex_protocol::exec_output::StreamOutput::new(String::new()),
+        aggregated_output: codex_protocol::exec_output::StreamOutput::new(output),
+        duration: std::time::Duration::ZERO,
+        timed_out: false,
+    };
+    for command in ["sed -n '1,700p' src/lib.rs", "rg -n pattern src/lib.rs"] {
+        let projected = crate::tools::project_exec_output_for_model_with_budget(
+            &exec_output,
+            codex_utils_output_truncation::TruncationPolicy::Tokens(2_000),
+            Some(2_000),
+            Some(command),
+        );
+        assert!(projected.reduced, "{command}");
+        assert!(projected.text.contains("source line 0000"), "{command}");
+        assert!(
+            !projected.text.contains("Shell output summary:"),
+            "{command}"
+        );
+        // Ordered truncation keeps a head/middle/tail window in source order.
+        // The summarizer would instead rank this source text as a diagnostic
+        // and hoist it above the surrounding lines.
+        assert!(
+            projected.text.contains("[omitted before retained middle]"),
+            "{command}"
+        );
+        if let Some(diagnostic) = projected.text.find("error[E9999]") {
+            let head = projected
+                .text
+                .find("source line 0000")
+                .expect("retained head line");
+            assert!(head < diagnostic, "{command}");
+        }
+    }
+}
+
+#[test]
+fn validation_output_uses_structured_wrapper_classification() {
+    let output = (0..700)
+        .map(|index| format!("ordinary output {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let direct =
+        summarize_shell_output_for_model(&output, 0, false, options(Some("cargo test"), None))
+            .unwrap();
+    for command in [
+        "cargo +stable --offline test",
+        "env MODE=test cargo test",
+        "just --justfile tasks.just core-test-fast core_lib focused",
+    ] {
+        assert_eq!(
+            summarize_shell_output_for_model(&output, 0, false, options(Some(command), None)),
+            Some(direct.clone()),
+            "{command}"
+        );
+    }
+    let prose = summarize_shell_output_for_model(
+        &output,
+        0,
+        false,
+        options(Some("printf 'cargo test'"), None),
+    )
+    .unwrap();
+    assert_ne!(
+        prose, direct,
+        "a string argument is not a validation invocation"
+    );
+}
+
+#[test]
+fn oversized_diagnostic_and_distinct_middle_failure_preserve_final_status() {
+    let mut lines = vec!["ordinary output".to_string(); 900];
+    lines[20] = format!("error: EARLY_DIAGNOSTIC {}", "x".repeat(50_000));
+    for index in (40..700).step_by(10) {
+        lines[index] = "error[E0001]: repeated failure".into();
+    }
+    lines[350] = "error[E0002]: UNIQUE_MIDDLE_FAILURE".into();
+    lines[351] = "  --> src/middle.rs:7:3".into();
+    lines[899] = "test result: FAILED. 12 passed; 2 failed".into();
+    let output = lines.join("\n");
+    let exec_output = codex_protocol::exec_output::ExecToolCallOutput {
+        exit_code: 1,
+        stdout: codex_protocol::exec_output::StreamOutput::new(output.clone()),
+        stderr: codex_protocol::exec_output::StreamOutput::new(String::new()),
+        aggregated_output: codex_protocol::exec_output::StreamOutput::new(output),
+        duration: std::time::Duration::ZERO,
+        timed_out: false,
+    };
+    let summary = crate::tools::format_exec_output_for_model(
+        &exec_output,
+        codex_utils_output_truncation::TruncationPolicy::Tokens(10_000),
+    );
+    for expected in [
+        "EARLY_DIAGNOSTIC",
+        "UNIQUE_MIDDLE_FAILURE",
+        "src/middle.rs:7:3",
+        "test result: FAILED. 12 passed; 2 failed",
+        "[line truncated]",
+    ] {
+        assert!(summary.contains(expected), "missing {expected}: {summary}");
+    }
+    assert!(summary.find("EARLY_DIAGNOSTIC") < summary.find("UNIQUE_MIDDLE_FAILURE"));
+    assert!(summary.find("UNIQUE_MIDDLE_FAILURE") < summary.find("test result: FAILED"));
+}
+
+#[test]
+fn unretained_distinct_diagnostics_are_counted() {
+    let mut lines = vec!["ordinary output".to_string(); 900];
+    for index in 0..12 {
+        lines[40 + index * 20] = format!("fatal: distinct category {index}");
+    }
+    let summary =
+        summarize_shell_output_for_model(&lines.join("\n"), 1, false, options(None, None)).unwrap();
+    assert!(
+        summary.contains("omitted_diagnostic_groups: 4; inspect the raw output"),
+        "{summary}"
+    );
+    assert!(summary.contains("fatal: distinct category 0"));
+    assert!(summary.contains("fatal: distinct category 11"));
+}
+
+#[test]
 fn ordinary_try_prose_does_not_displace_diagnostics() {
     let mut lines = (0..900)
         .map(|index| format!("ordinary line {index}"))
@@ -41,7 +171,7 @@ fn ordinary_try_prose_does_not_displace_diagnostics() {
 }
 
 #[test]
-fn exact_byte_limit_discloses_pending_lines_and_retention_counts() {
+fn oversized_first_line_reserves_room_for_the_tail() {
     let mut lines = vec![String::new(); 700];
     lines[0] = "x".repeat(SUMMARY_MAX_BYTES);
     let probe =
@@ -51,10 +181,11 @@ fn exact_byte_limit_discloses_pending_lines_and_retention_counts() {
     let summary =
         summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, None)).unwrap();
     assert!(summary.ends_with("[summary capped]"), "{summary}");
-    assert!(summary.contains("- emitted_source_lines: 1\n"));
+    assert!(summary.contains("- emitted_source_lines: 88\n"));
     // A final empty line is not a source line according to str::lines().
-    assert!(summary.contains("- omitted_source_lines: 698\n"));
-    assert!(!summary.contains("[line truncated]"));
+    assert!(summary.contains("- omitted_source_lines: 611\n"));
+    assert!(summary.contains("[line truncated]"));
+    assert!(summary.contains("  699: "));
     assert!(summary.len() <= SUMMARY_MAX_BYTES);
 }
 
@@ -69,6 +200,33 @@ fn summary_reports_gap_sizes_and_source_line_counts() {
     assert!(summary.contains("- emitted_source_lines: 88\n"));
     assert!(summary.ends_with("- omitted_source_lines: 612"));
     assert!(!summary.contains("[summary capped]"));
+}
+
+#[test]
+fn summary_does_not_end_with_a_gap_when_the_following_line_cannot_fit() {
+    let mut lines = vec!["ordinary".to_string(); 700];
+    lines[0] = "x".repeat(SUMMARY_MAX_BYTES);
+    let probe = summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, None))
+        .expect("large output summary");
+    let prefix_bytes = probe.find("    1: ").expect("first source line") + "    1: ".len();
+    let following_head_bytes = (SUCCESS_HEAD_LINES - 1) * "\n    2: ordinary".len();
+    let gap_bytes = "\n... [612 lines omitted]".len();
+    lines[0] = "x".repeat(
+        SUMMARY_MAX_BYTES - SUMMARY_FOOTER_BYTES - prefix_bytes - following_head_bytes - gap_bytes,
+    );
+
+    let summary =
+        summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, None))
+            .expect("large output summary");
+    let (body, _) = summary
+        .split_once("\n- emitted_source_lines:")
+        .expect("retention counts");
+    assert!(body.ends_with("  700: ordinary"));
+    assert!(body.contains("... [612 lines omitted]\n  637: ordinary"));
+    assert!(summary.contains("- emitted_source_lines: 88\n"));
+    assert!(summary.contains("- omitted_source_lines: 612\n"));
+    assert!(summary.ends_with("[summary capped]"));
+    assert!(summary.len() <= SUMMARY_MAX_BYTES);
 }
 
 #[test]
@@ -124,6 +282,9 @@ fn selected_errors_do_not_spend_the_final_status_quota() {
         lines[50 + index * 10] = format!("suite {index} passed; KEEP_STATUS_{index}");
         lines[300 + index * 10] = format!("compiler error: KEEP_ERROR_{index}");
     }
+    for line in &mut lines[500..520] {
+        *line = "let summary: String = source_text;".to_string();
+    }
     // Exercise the normal exec-output projection boundary, not only selection helpers.
     let output = codex_protocol::exec_output::ExecToolCallOutput {
         exit_code: 1,
@@ -138,6 +299,7 @@ fn selected_errors_do_not_spend_the_final_status_quota() {
         codex_utils_output_truncation::TruncationPolicy::Tokens(10_000),
     );
     assert!(summary.contains("Shell output summary:"), "{summary}");
+    assert!(!summary.contains("let summary:"), "{summary}");
 
     for index in 0..8 {
         assert!(
@@ -297,6 +459,30 @@ fn validation_output_keeps_failure_status_and_tail() {
 }
 
 #[test]
+fn early_failed_suite_survives_later_passing_suites() {
+    let mut lines = (0..900)
+        .map(|index| format!("ordinary line {index}"))
+        .collect::<Vec<_>>();
+    let failure = "test result: FAILED. 12 passed; 1 failed; 0 ignored";
+    lines[100] = failure.to_string();
+    for index in 0..20 {
+        lines[200 + index * 20] = "test result: ok. 10 passed; 0 failed; 0 ignored".to_string();
+    }
+    let summary = summarize_shell_output_for_model(
+        &lines.join("\n"),
+        101,
+        false,
+        options(Some("cargo test --no-fail-fast"), None),
+    )
+    .expect("validation summary");
+
+    assert!(summary.contains(failure), "{summary}");
+    assert!(summary.contains("test result: ok. 10 passed"), "{summary}");
+    assert!(summary.contains("ordinary line 899"), "{summary}");
+    assert!(summary.lines().count() <= SUMMARY_MAX_LINES);
+}
+
+#[test]
 fn validation_output_keeps_the_authoritative_final_status() {
     let mut lines = (0..900)
         .map(|index| format!("ordinary line {index}"))
@@ -392,6 +578,33 @@ fn applied_budget_summarizes_output_below_the_default_threshold() {
 }
 
 #[test]
+fn dense_output_over_token_budget_keeps_middle_diagnostics() {
+    let mut lines = vec!["{}[]():,;".repeat(3); 500];
+    lines[250] = "error: unique middle diagnostic".to_string();
+    lines[499] = "test result: FAILED".to_string();
+    let output = lines.join("\n");
+    let limit = 4000;
+    assert!(output.len() < codex_utils_string::approx_bytes_for_tokens(limit));
+    assert!(codex_utils_string::approx_token_count(&output) > limit);
+    let exec_output = codex_protocol::exec_output::ExecToolCallOutput {
+        exit_code: 1,
+        aggregated_output: codex_protocol::exec_output::StreamOutput::new(output),
+        ..Default::default()
+    };
+    let projected = crate::tools::project_exec_output_for_model_with_budget(
+        &exec_output,
+        codex_utils_output_truncation::TruncationPolicy::Tokens(limit),
+        Some(limit),
+        Some("cargo test"),
+    );
+    assert!(projected.reduced);
+    assert!(projected.text.contains("Shell output summary:"));
+    assert!(projected.text.contains("error: unique middle diagnostic"));
+    assert!(projected.text.contains("test result: FAILED"));
+    assert!(codex_utils_string::approx_token_count(&projected.text) <= limit);
+}
+
+#[test]
 fn disabled_summarizer_returns_unchanged_signal() {
     let output = "line\n".repeat(400);
     let options = ShellOutputSummaryOptions {
@@ -450,4 +663,13 @@ fn validation_summary_keeps_typescript_and_npm_errors_outside_tail() {
         );
         assert!(summary.contains("ordinary line 699"));
     }
+}
+
+#[test]
+fn summary_declines_output_that_would_grow() {
+    let output = "\n".repeat(601);
+    assert_eq!(
+        summarize_shell_output_for_model(&output, 0, false, options(None, None)),
+        None
+    );
 }

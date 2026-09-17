@@ -64,9 +64,12 @@ pub(crate) async fn export_config_lock_if_configured(
                 export_dir.display()
             )
         })?;
-    tokio::fs::write(&path, lock)
-        .await
-        .with_context(|| format!("failed to write config lock to {}", path.display()))?;
+    tokio::task::spawn_blocking(move || {
+        codex_file_system::write_atomically(&path, &lock)
+            .with_context(|| format!("failed to write config lock to {}", path.display()))
+    })
+    .await
+    .context("config lock export task panicked")??;
 
     Ok(())
 }
@@ -357,6 +360,41 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("model = "), "{message}");
+    }
+
+    #[tokio::test]
+    async fn export_replaces_complete_lock_and_preserves_open_snapshot() {
+        use std::io::Read;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sc = crate::session::tests::make_session_configuration_for_tests().await;
+        let mut config = (*sc.original_config_do_not_use).clone();
+        config.config_lock_export_dir = Some(
+            codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(tmp.path()).unwrap(),
+        );
+        sc.original_config_do_not_use = Arc::new(config);
+        let id = ThreadId::new();
+        let path = tmp.path().join(format!("{id}.config.lock.toml"));
+        std::fs::write(&path, "# original\n").unwrap();
+        let mut snapshot = std::fs::File::open(&path).unwrap();
+
+        export_config_lock_if_configured(&sc, id).await.unwrap();
+
+        let mut original = String::new();
+        snapshot.read_to_string(&mut original).unwrap();
+        assert_eq!(original, "# original\n");
+        let exported: ConfigLockfileToml =
+            toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(exported.version, crate::config_lock::CONFIG_LOCK_VERSION);
+        assert_eq!(
+            exported.config.model.as_deref(),
+            Some(sc.collaboration_mode.model())
+        );
+        validate_config_lock_replay(
+            &exported,
+            &sc.to_config_lockfile_toml().unwrap(),
+            ConfigLockReplayOptions::default(),
+        )
+        .unwrap();
     }
 
     #[tokio::test]

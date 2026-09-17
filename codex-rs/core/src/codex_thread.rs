@@ -586,9 +586,11 @@ impl CodexThread {
                 &sub.id,
                 execution_guard,
             )?;
-        self.codex.submit_with_id(sub).await?;
+        let admission = self.codex.enqueue_submission(sub).await?;
+        // Once queued, cancellation of the sender must not revoke capacity
+        // reserved for the receiver's pending operation.
         registration.commit();
-        Ok(())
+        Codex::await_mailbox_admission(admission).await
     }
 
     pub async fn next_event(&self) -> CodexResult<Event> {

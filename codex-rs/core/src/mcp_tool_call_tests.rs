@@ -1186,6 +1186,35 @@ async fn mcp_tool_call_span_records_expected_fields() {
             && logs.contains("turn.id="),
         "missing MCP tool span fields\nlogs:\n{logs}"
     );
+
+    for identity in [None, Some("")] {
+        buffer.lock().expect("buffer lock").clear();
+        async {}
+            .instrument(mcp_tool_call_span(
+                &session,
+                &turn_context,
+                McpToolCallSpanFields {
+                    server_name: "rmcp",
+                    tool_name: "echo",
+                    call_id: "missing-identity",
+                    server_origin: identity,
+                    connector_id: identity,
+                    connector_name: identity,
+                },
+            ))
+            .await;
+        let logs =
+            String::from_utf8(buffer.lock().expect("buffer lock").clone()).expect("utf8 logs");
+        assert!(logs.contains("missing-identity"));
+        for field in [
+            "mcp.server.origin=",
+            "mcp.connector.id=",
+            "mcp.connector.name=",
+        ] {
+            assert_eq!(logs.contains(field), identity.is_some(), "{field}: {logs}");
+        }
+        assert_eq!(logs.contains("mcp.transport="), identity.is_some());
+    }
 }
 
 #[tokio::test]
@@ -2298,7 +2327,7 @@ async fn codex_apps_auth_elicitation_granular_mcp_disabled_returns_original_resu
 }
 
 #[tokio::test]
-async fn codex_apps_auth_elicitation_enabled_by_default_requests_elicitation() {
+async fn codex_apps_auth_elicitation_reports_refresh_failure_after_acceptance() {
     let (session, turn_context, rx_event) = make_session_and_context_with_rx().await;
     let manager = host_owned_codex_apps_manager(&session, &turn_context).await;
     *session.active_turn.lock().await = Some(ActiveTurn::default());
@@ -2358,13 +2387,14 @@ async fn codex_apps_auth_elicitation_enabled_by_default_requests_elicitation() {
         .await
         .expect("auth elicitation task timed out")
         .expect("auth elicitation task failed");
-    assert_eq!(
-        returned.content,
-        vec![serde_json::json!({
-            "type": "text",
-            "text": "Authentication for Google Calendar was requested and accepted. Retry this tool call now.",
-        })]
-    );
+    assert_eq!(returned.is_error, Some(true));
+    assert_eq!(returned.meta, codex_apps_auth_failure_result().meta);
+    let message = returned.content[0]["text"].as_str().expect("error text");
+    assert!(message.contains("Authentication for Google Calendar was requested and accepted"));
+    assert!(message.contains("refreshing its tools failed"));
+    assert!(message.contains("failed to get client"));
+    assert!(message.contains("tool list may be stale"));
+    assert!(!message.contains("Retry this tool call now"));
 }
 
 #[test]
@@ -2797,6 +2827,40 @@ approval_mode = "approve"
         custom_mcp_tool_approval_mode(&session, &turn_context, "sample", "search").await,
         AppToolApproval::Approve
     );
+}
+
+#[tokio::test]
+async fn persistent_mcp_approval_failure_warns_and_limits_grant_to_session() {
+    let (session, turn_context, events) = make_session_and_context_with_rx().await;
+    let config_path = session.codex_home().await.join(CONFIG_TOML_FILE);
+    std::fs::create_dir_all(&config_path).expect("block config file with a directory");
+    let key = McpToolApprovalKey {
+        server: CODEX_APPS_MCP_SERVER_NAME.to_string(),
+        connector_id: Some("calendar".to_string()),
+        tool_name: "calendar/list_events".to_string(),
+    };
+
+    apply_mcp_tool_approval_decision(
+        &session,
+        &turn_context,
+        &McpToolApprovalDecision::AcceptAndRemember,
+        Some(key.clone()),
+        Some(key.clone()),
+    )
+    .await;
+
+    let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .expect("warning should be emitted")
+        .expect("event stream");
+    let EventMsg::Warning(warning) = event.msg else {
+        panic!("expected an approval persistence warning");
+    };
+    assert!(warning.message.contains("calendar/list_events"));
+    assert!(warning.message.contains("Could not save approval"));
+    assert!(warning.message.contains("only to this session"));
+    assert!(config_path.is_dir());
+    assert!(mcp_tool_approval_is_remembered(&session, &key).await);
 }
 
 #[tokio::test]

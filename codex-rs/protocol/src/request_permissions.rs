@@ -114,6 +114,16 @@ pub struct RequestPermissionsResponse {
     pub scope: PermissionGrantScope,
 }
 
+impl RequestPermissionsResponse {
+    /// Describes the serialized tool response, including both supported filesystem formats.
+    pub fn output_schema() -> serde_json::Value {
+        let mut schema = schemars::schema_for!(Self);
+        // Deserialization defaults the scope for older clients, but every output includes it.
+        schema.schema.object().required.insert("scope".to_string());
+        serde_json::to_value(schema).expect("permission response schema is serializable")
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 pub struct RequestPermissionsEvent {
     /// Responses API call id for the associated tool call, if available.

@@ -78,7 +78,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::Registry;
 use tracing_subscriber::util::SubscriberInitExt;
 
-const SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY: &str = "Codex rebuilt its local database.";
+const SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY: &str =
+    "Codex rebuilt a corrupt local database; database-only data may be missing.";
 const STARTUP_WARNING_TARGET: &str = "codex_app_server::startup_warning";
 const DEFAULT_STDERR_LOG_FILTER: &str = "warn";
 
@@ -217,6 +218,17 @@ enum ShutdownSignal {
 }
 
 async fn shutdown_signal() -> IoResult<ShutdownSignal> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            _ = terminate.recv() => {},
+        }
+        Ok(ShutdownSignal::Forceable)
+    }
+    #[cfg(not(unix))]
     tokio::signal::ctrl_c()
         .await
         .map(|_| ShutdownSignal::Forceable)
@@ -860,6 +872,10 @@ pub async fn run_main(
         async move {
             let mut listen_for_threads = true;
             let mut shutdown_state = ShutdownState::default();
+            // Keep the registered listener across unrelated select branches so a pending
+            // SIGTERM is not lost when transport traffic wins the race.
+            let shutdown_signal_wait = shutdown_signal();
+            tokio::pin!(shutdown_signal_wait);
             let exit_reason = loop {
                 let running_turn_count = {
                     let running_turn_count = running_turn_count_rx.borrow();
@@ -878,7 +894,8 @@ pub async fn run_main(
 
                 tokio::select! {
                     _ = transport_shutdown_token.cancelled() => break "outbound_delivery_failed",
-                    shutdown_signal_result = shutdown_signal(), if graceful_signal_restart_enabled && !shutdown_state.forced() => {
+                    shutdown_signal_result = &mut shutdown_signal_wait, if graceful_signal_restart_enabled && !shutdown_state.forced() => {
+                        shutdown_signal_wait.set(shutdown_signal());
                         let signal = match shutdown_signal_result {
                             Ok(signal) => signal,
                             Err(err) => {
@@ -1277,7 +1294,10 @@ fn sqlite_recovery_notice(
         .iter()
         .map(|recovered_database| {
             format!(
-                "Database path: {}\nBackup folder: {}",
+                "Database path: {}\nBackup folder: {}\n\
+                 The corrupt database was backed up and replaced. Session rollout files were \
+                 not deleted. Thread metadata recoverable from those files is rebuilt; \
+                 data stored only in this database may be missing.",
                 recovered_database.database_path, recovered_database.backup_folder
             )
         })
@@ -1369,6 +1389,20 @@ mod tests {
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::Context;
     use tracing_subscriber::layer::SubscriberExt;
+
+    #[test]
+    fn shutdown_signal_drains_running_turns_and_second_signal_forces_exit() {
+        let mut state = super::ShutdownState::default();
+        assert!(matches!(state.update(0, 1), super::ShutdownAction::Noop));
+        state.on_signal(super::ShutdownSignal::Forceable, 1, 1);
+        assert!(state.requested());
+        assert!(!state.forced());
+        assert!(matches!(state.update(1, 1), super::ShutdownAction::Noop));
+        assert!(matches!(state.update(0, 1), super::ShutdownAction::Finish));
+        state.on_signal(super::ShutdownSignal::Forceable, 1, 1);
+        assert!(state.forced());
+        assert!(matches!(state.update(1, 1), super::ShutdownAction::Finish));
+    }
 
     #[derive(Clone, Default)]
     struct EventCapture(Arc<Mutex<Vec<(String, Level)>>>);

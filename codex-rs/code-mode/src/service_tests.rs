@@ -247,6 +247,81 @@ async fn timer_throwing_exit_sentinel_remains_an_error() {
 }
 
 #[tokio::test]
+async fn oversized_cell_errors_are_bounded_without_losing_the_failure() {
+    let service = InProcessCodeModeSession::new();
+    for source in [
+        "throw 'failure: ' + '🦀'.repeat(20000);",
+        "throw {stack: 'failure: ' + '🦀'.repeat(20000)};",
+        "await new Promise(() => setTimeout(() => { throw 'failure: ' + '🦀'.repeat(20000); }, 1));",
+    ] {
+        let response = execute(
+            &service,
+            ExecuteRequest {
+                yield_time_ms: None,
+                ..execute_request(source)
+            },
+        )
+        .await;
+        let RuntimeResponse::Result {
+            error_text: Some(error),
+            content_items,
+            ..
+        } = response
+        else {
+            panic!("expected a failed cell, got {response:?}");
+        };
+        assert!(content_items.is_empty());
+        assert!(error.starts_with("failure: 🦀"));
+        assert!(error.ends_with("\n[code mode error truncated]"));
+        assert!(error.len() <= 16 * 1024);
+    }
+
+    let response = execute(
+        &service,
+        ExecuteRequest {
+            yield_time_ms: None,
+            ..execute_request("throw 'short error';")
+        },
+    )
+    .await;
+    assert!(matches!(response, RuntimeResponse::Result {
+        error_text: Some(error), ..
+    } if error == "short error"));
+}
+
+#[tokio::test]
+async fn pending_timer_limit_rejects_overflow_and_releases_cleared_and_fired_slots() {
+    let service = InProcessCodeModeSession::new();
+    let response = execute(
+        &service,
+        ExecuteRequest {
+            yield_time_ms: None,
+            ..execute_request(
+                r#"
+const timers = Array.from({length: 128}, () => setTimeout(() => text("unexpected"), 60000));
+try {
+    setTimeout(() => text("overflow callback"), 1);
+    text("overflow accepted");
+} catch (error) {
+    text(String(error));
+}
+clearTimeout(timers.pop());
+await new Promise(resolve => setTimeout(resolve, 1));
+await new Promise(resolve => setTimeout(resolve, 1));
+for (const timer of timers) clearTimeout(timer);
+text("slots released");
+"#,
+            )
+        },
+    )
+    .await;
+    assert_eq!(
+        result_text(&response),
+        "code mode cell exceeded its limit of 128 pending timers\nslots released"
+    );
+}
+
+#[tokio::test]
 async fn compact_tool_discovery_resolves_one_exact_description() {
     let service = InProcessCodeModeSession::new();
     let response = execute(

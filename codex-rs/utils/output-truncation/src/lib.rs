@@ -375,6 +375,7 @@ fn just_validation_invocation(mut args: &[&str]) -> bool {
                 | "sdk-ts-check"
                 | "sdk-python-check"
                 | "config-schema-check"
+                | "config-schema-protocol-check"
                 | "app-server-schema-check"
                 | "source-map-check"
                 | "source-owners-check"

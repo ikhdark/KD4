@@ -1382,6 +1382,83 @@ class SourceBinariesForTargetTest(unittest.TestCase):
 
 
 class SourceEvidenceTest(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows executable search semantics")
+    def test_package_executes_the_cargo_selected_by_its_identity_probe(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            parent = root / "parent"
+            build_root = root / "build"
+            tools = build_root / "tools"
+            parent.mkdir()
+            tools.mkdir(parents=True)
+            # The parent-directory executable must never run, even though
+            # CreateProcess normally searches there before the child's PATH.
+            (parent / "fixture-cargo.cmd").write_text(
+                f'@echo off\necho wrong-tool>"{parent / "parent-ran"}"\nexit /b 91\n'
+            )
+            compiler = tools / "compiler.py"
+            compiler.write_text(
+                "import sys\n"
+                "from pathlib import Path\n"
+                "args = sys.argv[1:]\n"
+                "if args[0] != 'build':\n"
+                "    print('fixture cargo 1')\n"
+                "else:\n"
+                "    out = Path(args[args.index('--target-dir') + 1])\n"
+                "    out /= args[args.index('--target') + 1]\n"
+                "    out /= args[args.index('--profile') + 1]\n"
+                "    out.mkdir(parents=True, exist_ok=True)\n"
+                "    for i, arg in enumerate(args):\n"
+                "        if arg == '--bin':\n"
+                "            (out / (args[i + 1] + '.exe')).write_bytes(b'child-built')\n"
+                "    with Path('build-calls').open('a') as log:\n"
+                "        log.write('build\\n')\n",
+                encoding="utf-8",
+            )
+            selected = tools / "fixture-cargo.cmd"
+            selected.write_text(
+                f'@echo off\n"{sys.executable}" "{compiler}" %*\n',
+                encoding="utf-8",
+            )
+            spec = TARGET_SPECS["x86_64-pc-windows-msvc"]
+            with (
+                chdir(parent),
+                mock.patch.object(cargo_module, "CODEX_RS_ROOT", build_root),
+                mock.patch.dict(
+                    os.environ,
+                    {"PATH": "tools", "RUSTC": str(selected), "RUSTC_WRAPPER": ""},
+                ),
+                mock.patch.object(
+                    cargo_module,
+                    "source_tree_fingerprint",
+                    return_value=fixed_source_fingerprint(),
+                ),
+            ):
+                kwargs = dict(
+                    cargo="fixture-cargo.cmd",
+                    profile="release",
+                    entrypoint_bin=None,
+                    code_mode_host_bin=None,
+                    codex_command_runner_bin=None,
+                    codex_windows_sandbox_setup_bin=None,
+                    reuse_existing=True,
+                )
+                outputs = build_source_binaries(
+                    spec, PACKAGE_VARIANTS["codex"], **kwargs
+                )
+                self.assertEqual(
+                    build_source_binaries(spec, PACKAGE_VARIANTS["codex"], **kwargs),
+                    outputs,
+                )
+                stamp = cargo_module.read_source_build_stamp(
+                    cargo_package_target_dir(spec, "release")
+                )
+            self.assertEqual(stamp["build_recipe"]["cargo"]["path"], str(selected))
+            self.assertEqual((build_root / "build-calls").read_text(), "build\n")
+            self.assertFalse((parent / "parent-ran").exists())
+            for path in vars(outputs).values():
+                self.assertEqual(path.read_bytes(), b"child-built")
+
     def test_tool_identity_resolves_supplied_path_relative_to_build_directory(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -84,13 +84,17 @@ map remains useful.
 ## How to use this map
 
 1. Read the root `AGENTS.md`.
-2. For a clear local task, reuse known owner paths, current evidence, and the
-   closest owner instructions. When ownership or a relevant relationship is
+2. Before discovery reads, grep, or glob, call Repo Atlas `task` with the task
+   text and any known paths as anchors, then read its returned files and owner
+   instructions. Reuse that result for the same task and source snapshot.
+   If Atlas is unavailable, or ownership or a relevant relationship remains
    unresolved, query the smallest owner slice before reading the broad map.
    For a known file, use
    `python scripts/source_owners.py slice --path <file> --focus "<task>"`.
    For a known owner, use
    `python scripts/source_owners.py slice --owner <owner-id> --focus "<task description>" --max-relationships 32`.
+   Slice output defaults to 32 KiB; use `--max-bytes` to change that limit.
+   Follow returned continuations with the same focus, owners, and budgets.
 3. Resolve material unknowns. Expand truncated or omitted relationships when
    they could affect the requested change; unrelated omissions do not require
    broader discovery. Establish the applicable control/data flow, callers/consumers,
@@ -98,8 +102,8 @@ map remains useful.
    artifacts, and invariants. A facet may be explicitly `not_applicable` with a
    reason; an absent applicable facet is insufficient evidence.
 4. Read the exact evidence locations for the relationships you will change.
-   Relationships are ranked within each facet by structural role, task-focus
-   overlap, provenance, and directness; start with the first relationship in
+   Relationships are ranked within each facet by task-focus overlap (including
+   behavioral descriptions), structural role, provenance, and directness; start with the first relationship in
    each applicable facet before expanding.
    Treat `exact` and `declared` provenance as grounded; heuristic evidence may
    guide discovery but cannot close it.
@@ -133,10 +137,13 @@ and owners without validation routes produce a partial result and a nonzero exit
 status. To resolve several paths together, use
 `python scripts/source_owners.py validation --path <file> --path <file>`.
 
-The source-owner manifest is the authority for declared ownership and validation
-routes. Repo Atlas can resolve remaining symbol, caller, or impact questions
-within that boundary; its results do not replace declared contracts. When the
-relevant paths and relationships are already known, read their source directly.
+On Windows, `just protos-check` composes the thread-config and exec-server relay
+protobuf freshness checks. Both check existing bindings without replacing them.
+
+Repo Atlas is the first discovery route required by `AGENTS.md`. The source-owner
+manifest remains the authority for declared ownership and validation routes;
+Atlas results do not replace those contracts. After the task handoff, read the
+relevant source directly and use owner slices to resolve remaining relationships.
 
 Workspace-evidence recovery is owned by `codex-rs/core/src/tool_history.rs` and
 `codex-rs/core/src/tools/command_execution.rs`. A response with
@@ -268,6 +275,11 @@ The audited upstream baseline is OpenAI Codex `main`
 [`646f7c0a91b8e327d263335da68ae8ef212895ce`](https://github.com/openai/codex/tree/646f7c0a91b8e327d263335da68ae8ef212895ce/codex-rs)
 (2026-08-12). Confirm the intended baseline again before a later sync.
 
+This mirror audit baseline is separate from `kd4_features.toml`'s
+`upstream_commit`, which anchors the fork feature comparison at
+`9e552e9d15ba52bed7077d5357f3e18e330f8f38`. Neither reference changes the active
+checkout; keep each tied to its own audit or comparison when updating it.
+
 ### Protected source: exact upstream mirrors
 
 These three paths, and only these three paths, are exact mirrors:
@@ -360,6 +372,14 @@ Code-mode JavaScript orchestrates tools; unified exec owns subprocess execution,
 including when invoked as a nested tool. The model-visible batching guidance is
 owned by `code-mode-protocol/src/description/exec_prompt.rs`.
 
+The runtime admits at most 128 pending timers per cell; clearing or firing a
+timer releases its slot. Cancelled scheduler deadlines are removed immediately.
+Final error text is bounded to 16 KiB, including an explicit truncation marker,
+before it crosses the runtime event/host boundary. `yield_time_ms` controls when
+the caller regains control, not an absolute cell lifetime; cancellation and
+termination remain separate operations. These contracts are exercised through
+the session boundary in `codex-rs/code-mode/src/service_tests.rs`.
+
 `codex-rs/ext/extension-api` is the typed host-extension boundary. Prefer an
 existing contributor contract and the immutable registry in
 `codex-rs/ext/extension-api/src/registry.rs` before adding a fork-only hook in
@@ -393,6 +413,20 @@ hook trust, enablement, and plugin identity before engine dispatch. Plugin
 installation therefore contributes executable hook behavior as well as skills
 and tool metadata; pre-tool hooks participate in tool admission.
 
+Tool mentions such as `[$name](resource)` are classified by
+`codex-rs/core-skills/src/injection.rs`: `app://` selects an app, `mcp://` an MCP
+resource, `plugin://` a plugin, and `skill://` or a path ending in `SKILL.md` a
+skill. These are selection locators, not interchangeable filesystem paths.
+Environment and orchestrator skill resources are resolved by the providers in
+`codex-rs/ext/skills/src/provider`; preserve the resource's authority when
+reading it.
+
+The MCP layers have distinct owners: `codex-rs/rmcp-client` implements client
+transport and OAuth; `codex-rs/codex-mcp` manages the configured server catalog,
+connections, tool inventory, and permission routing; `codex-rs/mcp-server`
+exposes Codex to an external MCP client. Trace a connector's tool calls through
+the client layers, and an external client's Codex calls through the server.
+
 ## Persistence and stored state
 
 | State                            | Primary owner                                                                | Consumers and compatibility boundary                                                                                                                                                  |
@@ -403,7 +437,7 @@ and tool metadata; pre-tool hooks participate in tool admission.
 | Thread indexing and lookup       | `codex-rs/thread-store`                                                      | CLI/TUI resume paths and app-server thread APIs                                                                                                                                       |
 | Rollout recording                | `codex-rs/rollout`                                                           | persisted JSONL session history and replay/resume consumers                                                                                                                           |
 | Rollout tracing                  | `codex-rs/rollout-trace`                                                     | diagnostics and execution tracing                                                                                                                                                     |
-| Prompt/message history           | `codex-rs/message-history`                                                   | core context reconstruction and client history                                                                                                                                        |
+| Prompt/message history           | `codex-rs/message-history`                                                   | global user-input recall in clients                                                                                                                                                   |
 | Memories                         | `codex-rs/memories/read`, `codex-rs/memories/write`, `codex-rs/ext/memories` | state DB, prompt context, tools, lifecycle callbacks                                                                                                                                  |
 | Agent graph and tasks            | `codex-rs/agent-graph-store`, `codex-rs/agent-task-store`                    | core multi-agent coordinator, repository/workspace identities, epochs, advisory claims, mutation and validation evidence, wake cursors, isolated handoffs, protocol/app-server status |
 
@@ -427,6 +461,12 @@ persisted conversation. `codex-rs/message-history` stores global user-input
 history in `CODEX_HOME/history.jsonl`; `core/src/context_manager/history.rs`
 maintains the current conversation items used to construct model context.
 
+`codex-rs/secrets/src/sanitizer.rs` supplies best-effort pattern redaction for
+the memory extraction pipeline in `codex-rs/memories/write/src/phase1.rs`.
+It is not a blanket sanitizer for tool results or persisted rollouts. Rollouts
+retain conversation records for resume; treat them and diagnostic bundles as
+potentially sensitive when inspecting or exporting them.
+
 ## Contracts and generated artifacts
 
 | Contract or output                            | Source owner                                                                                                                          | Update and validation path                                                                                                                                                                            |
@@ -435,6 +475,7 @@ maintains the current conversation items used to construct model context.
 | App-server schema tree                        | `codex-rs/app-server-protocol/schema`                                                                                                 | Generated output; never hand-edit; inspect the generator-produced diff                                                                                                                                |
 | Code-mode import and host boundary | `codex-rs/code-mode/src/runtime/module_loader.rs`, `runtime/mod.rs`, and `codex-rs/code-mode-protocol/src/description/exec_prompt.rs` | Static and dynamic imports are rejected; host globals expose registered tools and helpers, with no Node/filesystem/network APIs. Changes require focused code-mode runtime and protocol tests. |
 | Rollout analysis snapshot | `scripts/rollout_snapshot.py`, `scripts/kd4_turn_latency_audit.py`, `scripts/kd4_first_useful_action_analysis.py` | Preserve physical-byte checksums when decoding `.jsonl.zst`; validate CLI discovery, corrupt inputs, and first-action results with `python -m unittest scripts.test_rollout_snapshot`. |
+| SQLite migration ledger | `codex-rs/state/migrations`, `codex-rs/state/src/migrations.rs` | Preserve applied migration checksums and historical ledger compatibility; focused `codex-rs/state/src/migrations_tests.rs` scenarios exercise upgrades, legacy repairs, and rejection of unknown checksums against SQLite. |
 | Config schema                                 | `codex-rs/config`, `codex-rs/features`, `codex-rs/core`                                                                               | Focused config/core tests plus check-only `just config-schema-check`; intentional regeneration uses serialized `just config-schema-regenerate <owner>` and outputs `codex-rs/core/config.schema.json` |
 | Thread-config protobuf binding                | `codex-rs/config/src/thread_config/proto/codex.thread_config.v1.proto`                                                                | `just generate-config-proto-check`; intentional regeneration uses `just generate-config-proto`                                                                                                        |
 | Exec-server relay protobuf binding            | `codex-rs/exec-server/src/proto/codex.exec_server.relay.v1.proto`                                                                     | `just generate-exec-server-relay-proto-check`; intentional regeneration uses `just generate-exec-server-relay-proto`                                                                                  |
@@ -535,7 +576,8 @@ For the normal core test loop, use `just core-test-fast <target> <filter>`.
 `core-test` uses the local profile and continues through failures;
 `core-gate <gate> [<gate> ...]` batches declared gates, sharing helper builds
 and executing overlapping exact test IDs once. Normal runs require every ID to
-report PASS exactly once without a discovery invocation.
+report PASS exactly once. Generated exact selectors need no discovery invocation;
+explicit filters are individually checked before helper builds or execution.
 `python scripts/rust_test_runner.py check-gates <gate> [<gate> ...]` explicitly
 checks filter/ID discovery parity; `check-manifest` validates all Cargo declarations. Every named core target and gate
 already builds in one shared reserved Cargo lane rather than `codex-rs/target`,
@@ -551,6 +593,12 @@ variables; `just target-prune --max-total-lane-gib 200 --max-total-target-gib 25
 requests immediate aggregate accounting after an unusually large build. `validate-crate-focused` is an alias for
 `test-fast -p <crate>`, not an additional validation layer. Core library runs
 require an explicit filter; broad test runs require user authorization.
+
+Repo Benchmark preparation selects the newest locally available stable upstream
+`rust-vMAJOR.MINOR.PATCH` tag by default; `--reference` selects an explicit checkout.
+`prepare.rs::resolve_reference` owns that selection, while
+`prepare/builds.rs::build` verifies and reuses persistent native artifacts across
+preparations. Main-branch advances alone do not trigger an upstream build.
 
 ## Rust workflow reference
 
@@ -611,7 +659,7 @@ This map owns cross-cutting navigation and structural inventory.
 | Dependency or build-system change                    | owning manifest -> lock state -> workspace/recipe consumers -> focused build/test/package proof                                                                                                                                             |
 | New top-level area or package                        | add the owner and policy boundary -> update the machine-checked inventory in this file -> add routing/validation -> run `just source-map-check`                                                                                             |
 
-<!-- BEGIN KD4 SOURCE OWNERS schema=2 manifest_sha256=a0777249655f516a771912d0e17f7a1371f145e650ae705ecf1d12008796e9b6 -->
+<!-- BEGIN KD4 SOURCE OWNERS schema=2 manifest_sha256=c0a241b48703581f8187e8ffbbef53f704b817718f28d9d1d9e88a14948e99fb -->
 ### Managed KD4 source-owner index
 
 This table is generated by `scripts/source_owners.py`; edit `source_owners.toml`, not this block.

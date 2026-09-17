@@ -52,7 +52,14 @@ class CodexLauncherTests(unittest.TestCase):
 
     def write_manifest(self, targets: dict) -> None:
         (self.root / "package.json").write_text(
-            json.dumps({"type": "module", "codexNativeTargets": targets}),
+            json.dumps({
+                "type": "module",
+                "version": "1.2.3",
+                "optionalDependencies": {
+                    self.native_target["package"]: "npm:@openai/codex@1.2.3-test-native"
+                },
+                "codexNativeTargets": targets,
+            }),
             encoding="utf-8",
         )
 
@@ -117,6 +124,19 @@ class CodexLauncherTests(unittest.TestCase):
         self.write_manifest({})
         self.assert_startup_failure(self.run_launcher(), "Unsupported platform:")
 
+    def test_installed_optional_package_reports_missing_executable(self) -> None:
+        package_root = self.root / "node_modules" / "@openai" / "codex-test-native"
+        package_root.mkdir(parents=True)
+        (package_root / "package.json").write_text(
+            json.dumps({"version": "1.2.3-test-native"}), encoding="utf-8"
+        )
+
+        result = self.run_launcher()
+
+        self.assert_startup_failure(result, "is installed but its native executable is missing")
+        self.assertIn(str(self.native_path(package_root)), result.stderr)
+        self.assertNotIn("Missing optional dependency", result.stderr)
+
     def test_malformed_native_target_has_actionable_metadata_error(self) -> None:
         malformed_targets = [None, "invalid"]
         for field in ("targetTriple", "package", "binary"):
@@ -148,6 +168,21 @@ class CodexLauncherTests(unittest.TestCase):
         self.assert_startup_failure(result, '"exports"')
         self.assertIn(str(package_root / "package.json"), result.stderr)
         self.assertNotIn("Missing optional dependency", result.stderr)
+
+    def test_mismatched_native_version_does_not_launch_either_binary(self) -> None:
+        package_root = self.root / "node_modules" / "@openai" / "codex-test-native"
+        for binary in (self.native_path(), self.native_path(package_root)):
+            binary.parent.mkdir(parents=True)
+            shutil.copy2(self.node, binary)
+        for version in ("1.2.2-test-native", "1.2.4-test-native", "1.2.3", None):
+            with self.subTest(version=version):
+                (package_root / "package.json").write_text(
+                    json.dumps({"version": version}), encoding="utf-8"
+                )
+                result = self.run_launcher("-e", "console.log('unexpected launch')")
+                self.assert_startup_failure(result, "Native package version mismatch")
+                self.assertIn("expected 1.2.3-test-native", result.stderr)
+                self.assertIn("Reinstall this KD4 package", result.stderr)
 
     @unittest.skipUnless(os.name == "nt", "Windows exit status contract")
     def test_signal_terminated_child_preserves_numeric_exit_status(self) -> None:
@@ -181,13 +216,56 @@ class CodexLauncherTests(unittest.TestCase):
         self.assert_startup_failure(result, f"Unable to start {binary}")
         self.assertIn("Reinstall this KD4 package", result.stderr)
 
+    def test_signal_forwarding_failure_does_not_wait_for_child_exit(self) -> None:
+        binary = self.native_path()
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b"fixture")
+        cases = (
+            ("return false", "the child process may still be running"),
+            ("throw new Error('permission denied')", "permission denied"),
+            ("setImmediate(() => child.emit('exit', 7, null)); return true", None),
+        )
+        for kill_body, error_detail in cases:
+            with self.subTest(kill_body=kill_body):
+                script = (
+                    "import childProcess from 'node:child_process'; "
+                    "import { EventEmitter } from 'node:events'; "
+                    "import { syncBuiltinESMExports } from 'node:module'; "
+                    "childProcess.spawn = () => { const child = new EventEmitter(); "
+                    f"child.kill = (signal) => {{ console.log(signal); {kill_body}; }}; "
+                    # A real child keeps Node alive; reproduce that until the
+                    # launcher terminates rather than relying on unresolved TLA.
+                    "setInterval(() => {}, 1000); "
+                    "setImmediate(() => process.emit('SIGTERM')); return child; }; "
+                    "syncBuiltinESMExports(); "
+                    f"await import({json.dumps(self.launcher.as_uri())});"
+                )
+                result = subprocess.run(
+                    [self.node, "--input-type=module", "-e", script],
+                    cwd=self.root,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(result.stdout.strip(), "SIGTERM")
+                if error_detail is None:
+                    self.assertEqual(result.returncode, 7, result.stderr)
+                    self.assertEqual(result.stderr, "")
+                else:
+                    self.assertEqual(result.returncode, 143 if os.name == "nt" else -15)
+                    self.assertIn(f"Unable to forward SIGTERM to Codex: {error_detail}.", result.stderr)
+                    self.assertNotIn("\n    at ", result.stderr)
+
     def test_optional_package_launch_forwards_args_environment_and_exit_code(
         self,
     ) -> None:
         package_root = self.root / "node_modules" / "@openai" / "codex-test-native"
         binary = self.native_path(package_root)
         binary.parent.mkdir(parents=True)
-        (package_root / "package.json").write_text("{}", encoding="utf-8")
+        (package_root / "package.json").write_text(
+            json.dumps({"version": "1.2.3-test-native"}), encoding="utf-8"
+        )
         shutil.copy2(self.node, binary)
         result = self.run_launcher(
             "-e",

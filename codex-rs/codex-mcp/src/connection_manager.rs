@@ -129,19 +129,24 @@ fn sanitize_server_collection_error(message: impl Display) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    let mut chars = normalized.chars();
-    let bounded: String = chars
-        .by_ref()
-        .take(MAX_MCP_SERVER_COLLECTION_ERROR_CHARS)
-        .collect();
-    if bounded.is_empty() {
+    if normalized.is_empty() {
         return "request failed".to_string();
     }
-    if chars.next().is_some() {
-        format!("{bounded}…")
-    } else {
-        bounded
+    if normalized.chars().count() <= MAX_MCP_SERVER_COLLECTION_ERROR_CHARS {
+        return normalized;
     }
+    // Keep the operation at the front and the underlying cause at the end.
+    const MARKER: &str = " … ";
+    let head_len = (MAX_MCP_SERVER_COLLECTION_ERROR_CHARS - MARKER.chars().count()) / 2;
+    let tail_len = MAX_MCP_SERVER_COLLECTION_ERROR_CHARS - MARKER.chars().count() - head_len;
+    let head: String = normalized.chars().take(head_len).collect();
+    let tail_start = normalized
+        .char_indices()
+        .rev()
+        .nth(tail_len - 1)
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    format!("{head}{MARKER}{}", &normalized[tail_start..])
 }
 
 /// Returns whether a tool may be included in model-facing tool declarations.
@@ -852,6 +857,9 @@ impl McpConnectionManager {
 
             let tools = self.build_tool_catalog().await;
             if revision != self.tool_catalog_revision() {
+                // A hot catalog must still allow caller deadlines/cancellation
+                // to be polled even when every listing completes immediately.
+                tokio::task::yield_now().await;
                 continue;
             }
 

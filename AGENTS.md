@@ -33,7 +33,9 @@
 2. Repair weak tests covering the changed behavior or blocking its validation.
    Report unrelated weaknesses encountered without starting a broader test audit.
 
-- If blocked by tests, do not repeat, simply finish the full task then report blocked by tests.
+- Do not repeat unchanged failing tests. After a relevant implementation, test,
+  or environment repair, rerun the affected checks once. If they remain blocked,
+  finish independent work and report the blocker.
 
 - Never run the full test suite unless specfically told to.
 
@@ -42,13 +44,24 @@ When validation or tests report errors, warnings, or failures, let the current r
 
 ## Routing and task scope
 
-- Before editing, identify the source owner and focused validation route. Reuse
-  known paths and current evidence. For unresolved ownership or relationships,
-  follow [source-map lookup instructions](SOURCEMAP.md#how-to-use-this-map);
-  read the broad map only when a focused slice cannot resolve the boundary.
+- Before reading, grepping, or globbing to locate code for a coding task, call
+  Repo Atlas `task` with the task text, then read its returned files and owner
+  instructions. Known files are anchors, not a reason to skip the call. Reuse
+  that result for the same task and source snapshot. Select the repository being
+  worked on with `select_root` when it differs from the current Atlas root.
+  Use the [source-map lookup instructions](SOURCEMAP.md#how-to-use-this-map)
+  for ownership details the result leaves unresolved, or if Atlas is unavailable.
+- For Rust changes in `codex-rs`, use KDA: after editing Rust, call `test_plan`
+  with `base: "HEAD"` and run its selected tests through KDA `test`. Before
+  reporting a Rust change complete, call `review` with `base: "HEAD"` on the
+  changed items and resolve its obligations. Run the KDA gate (`gate_start`,
+  then `gate_poll`) when the task requests a gate or the change touches unsafe,
+  atomic, FFI, or allocation code. KDA evidence is bounded; read its coverage
+  and verdicts, and it does not replace the required validation commands.
 - Resolve material unknowns and relevant omitted relationships. Inspect exact
-  evidence for affected callers/consumers, generated representations, and
-  compatibility boundaries; record evidence paths or scoped no-matches.
+  evidence for callers/consumers, generated representations, and compatibility
+  boundaries when the change could affect them. Reuse still-current evidence
+  already collected; record paths or scoped no-matches for material unknowns.
 - Use the owner's representative scenario and focused validation. Confirm the
   scenario enters through the normal boundary and asserts an independently
   expected observable effect, including absent effects for rejected or cancelled

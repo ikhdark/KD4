@@ -6,6 +6,8 @@ use crate::MissingEvidenceObligation;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    #[error("agent task coordinator belongs to root session {expected}, not {requested}")]
+    RootSessionMismatch { expected: String, requested: String },
     #[error("{kind} must be a UUIDv7 value, got {value}")]
     InvalidUuidV7 { kind: &'static str, value: String },
     #[error("invalid repository scope: {0}")]

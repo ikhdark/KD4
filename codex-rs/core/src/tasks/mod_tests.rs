@@ -874,6 +874,28 @@ async fn shutdown_latch_is_linearized_with_task_start_admission() {
 async fn terminalization_aborts_and_joins_turn_auxiliary_tasks() {
     struct Dropped(Arc<AtomicBool>);
 
+    struct UnresponsiveTask;
+
+    impl SessionTask for UnresponsiveTask {
+        fn kind(&self) -> TaskKind {
+            TaskKind::Regular
+        }
+
+        fn span_name(&self) -> &'static str {
+            "session_task.unresponsive"
+        }
+
+        fn run(
+            self: Arc<Self>,
+            _session: Arc<crate::session::session::Session>,
+            _ctx: Arc<TurnContext>,
+            _input: Vec<TurnInput>,
+            _cancellation_token: CancellationToken,
+        ) -> futures::future::BoxFuture<'static, SessionTaskResult> {
+            Box::pin(std::future::pending())
+        }
+    }
+
     impl Drop for Dropped {
         fn drop(&mut self) {
             self.0.store(true, Ordering::Release);
@@ -882,7 +904,7 @@ async fn terminalization_aborts_and_joins_turn_auxiliary_tasks() {
 
     let (session, turn_context, _events) = make_session_and_context_with_rx().await;
     session
-        .start_task(Arc::clone(&turn_context), Vec::new(), FenceBlockingTask)
+        .start_task(Arc::clone(&turn_context), Vec::new(), UnresponsiveTask)
         .await;
     let auxiliary_started = Arc::new(tokio::sync::Notify::new());
     let auxiliary_dropped = Arc::new(AtomicBool::new(false));
@@ -899,13 +921,128 @@ async fn terminalization_aborts_and_joins_turn_auxiliary_tasks() {
     );
     auxiliary_started.notified().await;
 
+    let started = tokio::time::Instant::now();
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 
+    assert!(
+        started.elapsed() < super::GRACEFUL_INTERRUPTION_TIMEOUT + Duration::from_secs(3),
+        "worker and auxiliary cancellation must share one grace period: {:?}",
+        started.elapsed(),
+    );
     assert!(
         auxiliary_dropped.load(Ordering::Acquire),
         "terminal cleanup must join even an auxiliary task that ignores cancellation"
     );
     assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn terminalization_publishes_abort_while_worker_is_synchronously_blocked() {
+    struct BlockingTask {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl SessionTask for BlockingTask {
+        fn kind(&self) -> TaskKind {
+            TaskKind::Regular
+        }
+
+        fn span_name(&self) -> &'static str {
+            "session_task.blocked_worker"
+        }
+
+        fn run(
+            self: Arc<Self>,
+            _session: Arc<crate::session::session::Session>,
+            _ctx: Arc<TurnContext>,
+            _input: Vec<TurnInput>,
+            _cancellation_token: CancellationToken,
+        ) -> futures::future::BoxFuture<'static, SessionTaskResult> {
+            Box::pin(async move {
+                self.started.notify_one();
+                let (released, wake) = self.release.as_ref();
+                let mut released = released.lock().expect("release lock");
+                while !*released {
+                    released = wake.wait(released).expect("release lock");
+                }
+                Ok(super::TurnTaskResult::default())
+            })
+        }
+    }
+
+    // Always release the worker, including when an assertion or deadline fails,
+    // so a regression does not hang the test runtime's own shutdown.
+    struct ReleaseWorker(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+    impl Drop for ReleaseWorker {
+        fn drop(&mut self) {
+            let (released, wake) = self.0.as_ref();
+            *released.lock().expect("release lock") = true;
+            wake.notify_all();
+        }
+    }
+
+    let (session, turn_context, events) = make_session_and_context_with_rx().await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = ReleaseWorker(Arc::new((
+        std::sync::Mutex::new(false),
+        std::sync::Condvar::new(),
+    )));
+    session
+        .start_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            BlockingTask {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release.0),
+            },
+        )
+        .await;
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("worker enters its synchronous section");
+    let worker_done = Arc::clone(
+        &session
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .task
+            .as_ref()
+            .unwrap()
+            .worker_done,
+    );
+
+    tokio::time::timeout(
+        super::GRACEFUL_INTERRUPTION_TIMEOUT
+            + super::FORCED_INTERRUPTION_TIMEOUT
+            + Duration::from_secs(5),
+        session.abort_all_tasks(TurnAbortReason::Interrupted),
+    )
+    .await
+    .expect("abort must finish without waiting for the blocked worker");
+
+    assert!(!worker_done.load(Ordering::Acquire));
+    assert!(session.active_turn.lock().await.is_none());
+    let mut late_tool_accepted = false;
+    assert!(!turn_context.tool_call_acceptance.try_accept(|| {
+        late_tool_accepted = true;
+        true
+    }));
+    assert!(!late_tool_accepted);
+    let mut terminal = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let EventMsg::TurnAborted(aborted) = event.msg {
+            terminal.push(aborted);
+        }
+    }
+    assert_eq!(terminal.len(), 1);
+    assert_eq!(
+        terminal[0].turn_id.as_deref(),
+        Some(turn_context.sub_id.as_str())
+    );
+    assert_eq!(terminal[0].reason, TurnAbortReason::Interrupted);
 }
 
 #[tokio::test]

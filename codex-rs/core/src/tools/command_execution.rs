@@ -183,6 +183,26 @@ impl CommandAttemptKey {
         self
     }
 
+    pub(crate) fn with_search_environment(mut self, environment: &HashMap<String, String>) -> Self {
+        // The scope snapshot cannot account for options or further file inputs
+        // loaded from external configuration. Run the search instead of caching
+        // a negative result based only on the unchanged configuration pathname.
+        if environment.iter().any(|(key, value)| {
+            !value.is_empty()
+                && [
+                    "RIPGREP_CONFIG_PATH",
+                    "GIT_CONFIG_GLOBAL",
+                    "GIT_CONFIG_SYSTEM",
+                ]
+                .iter()
+                .any(|name| key.eq_ignore_ascii_case(name))
+        }) && let Some(search) = self.search_narrowing.as_mut()
+        {
+            search.can_record_miss = false;
+        }
+        self
+    }
+
     fn search_miss_cache_key(&self) -> Option<SearchMissCacheKey> {
         let search = self.eligible_search_miss()?;
         self.search_miss_cache_key_for(search)
@@ -403,6 +423,7 @@ struct CommandProcessState {
 struct CommandRepositoryState {
     epoch: u64,
     workspace_identity_observation_epoch: Option<u64>,
+    workspace_identity_observation_turn: Option<String>,
     observed_workspace_identity: Option<(u64, crate::git_workspace::WorkspaceEvidenceIdentity)>,
     observed_workspace_identity_hash: Option<(u64, String)>,
     observed_turn_mutation_revisions: HashMap<String, u64>,
@@ -458,6 +479,8 @@ pub(crate) struct CommandExecutionLedger {
     #[cfg(test)]
     cache_commit_count: AtomicU64,
     #[cfg(test)]
+    workspace_identity_capture_count: AtomicU64,
+    #[cfg(test)]
     cache_persist_test_gate: std::sync::Mutex<Option<CachePersistTestGate>>,
 }
 
@@ -476,6 +499,8 @@ impl Default for CommandExecutionLedger {
             cache_persist: Arc::new(Mutex::new(())),
             #[cfg(test)]
             cache_commit_count: AtomicU64::new(0),
+            #[cfg(test)]
+            workspace_identity_capture_count: AtomicU64::new(0),
             #[cfg(test)]
             cache_persist_test_gate: std::sync::Mutex::new(None),
         }
@@ -501,6 +526,8 @@ impl CommandExecutionLedger {
             cache_persist: Arc::new(Mutex::new(())),
             #[cfg(test)]
             cache_commit_count: AtomicU64::new(0),
+            #[cfg(test)]
+            workspace_identity_capture_count: AtomicU64::new(0),
             #[cfg(test)]
             cache_persist_test_gate: std::sync::Mutex::new(None),
         }
@@ -613,6 +640,32 @@ impl CommandExecutionLedger {
             .map(|pending| pending.baseline)
     }
 
+    /// Reuse a snapshot captured under the dispatch workspace lease. The ledger
+    /// belongs to its original local cwd; another workspace must not seed it.
+    pub(crate) async fn observe_workspace_baseline(
+        &self,
+        turn_id: &str,
+        mutation_revision: u64,
+        cwd: &Path,
+        identity: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
+    ) {
+        if identity.is_some()
+            && self
+                .persistence
+                .as_ref()
+                .is_some_and(|persistence| persistence.cwd == cwd)
+        {
+            self.observe_repository_revision_with_identity(turn_id, mutation_revision, identity)
+                .await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn workspace_identity_capture_count(&self) -> u64 {
+        self.workspace_identity_capture_count
+            .load(Ordering::Relaxed)
+    }
+
     pub(crate) async fn observe_repository_revision(
         &self,
         turn_id: &str,
@@ -657,7 +710,12 @@ impl CommandExecutionLedger {
                 .is_some_and(|(epoch, _)| *epoch == repository_epoch)
                 || (observed_workspace_identity.is_none()
                     && state.repository.workspace_identity_observation_epoch
-                        == Some(repository_epoch))
+                        == Some(repository_epoch)
+                    && state
+                        .repository
+                        .workspace_identity_observation_turn
+                        .as_deref()
+                        == Some(turn_id))
             {
                 return repository_epoch;
             }
@@ -681,12 +739,20 @@ impl CommandExecutionLedger {
             Some(identity) => Some(identity),
             None => match self.persistence.as_ref() {
                 Some(persistence) => {
+                    #[cfg(test)]
+                    self.workspace_identity_capture_count
+                        .fetch_add(1, Ordering::Relaxed);
                     crate::git_workspace::capture_workspace_evidence_identity(&persistence.cwd)
                         .await
                 }
                 None => None,
             },
         };
+        // A failed capture never authorizes reuse, so it must not be recorded as
+        // an observation either: keeping it would make the retry gate below treat
+        // this turn's failure as a settled answer for the rest of the session.
+        let observed_workspace_identity =
+            observed_workspace_identity.filter(|identity| !identity.unavailable);
         let load_persisted_cache = !self.state.lock().await.search.persisted_cache_loaded;
         let cached_document = if load_persisted_cache {
             match self.persistence.as_ref() {
@@ -708,13 +774,21 @@ impl CommandExecutionLedger {
             .as_ref()
             .map(workspace_identity_hash);
         let cached_document = cached_document.filter(|document| {
-            observed_workspace_identity.as_ref() == Some(&document.workspace_identity)
+            // Each miss proves its own scope at lookup. Only the repository
+            // namespace, not unrelated dirty files, governs restoring entries.
+            observed_workspace_identity
+                .as_ref()
+                .is_some_and(|identity| {
+                    identity.repository_root.is_some()
+                        && identity.repository_root == document.workspace_identity.repository_root
+                })
         });
         let mut state = self.state.lock().await;
         if state.repository.epoch == repository_epoch {
             state.search.persisted_cache_loaded |=
                 load_persisted_cache && workspace_identity_hash.is_some();
             state.repository.workspace_identity_observation_epoch = Some(repository_epoch);
+            state.repository.workspace_identity_observation_turn = Some(turn_id.to_owned());
             if let (Some(workspace_identity), Some(workspace_identity_hash)) =
                 (observed_workspace_identity, workspace_identity_hash)
             {
@@ -724,7 +798,12 @@ impl CommandExecutionLedger {
                     Some((repository_epoch, workspace_identity_hash));
             }
             if let Some(document) = cached_document {
-                let complete_document = state.search.miss_order.is_empty()
+                let complete_document = state
+                    .repository
+                    .observed_workspace_identity
+                    .as_ref()
+                    .is_some_and(|(_, identity)| identity == &document.workspace_identity)
+                    && state.search.miss_order.is_empty()
                     && document.search_misses.len() <= MAX_TRACKED_COMMANDS;
                 for search_miss in document
                     .search_misses
@@ -750,12 +829,30 @@ impl CommandExecutionLedger {
         environment_id: &str,
         cwd: &Path,
     ) -> Option<String> {
-        if environment_id != codex_exec_server::LOCAL_ENVIRONMENT_ID
-            || self.persistence.as_ref()?.cwd != cwd
-        {
+        if environment_id != codex_exec_server::LOCAL_ENVIRONMENT_ID {
             return None;
         }
+        let persisted_cwd = &self.persistence.as_ref()?.cwd;
+        let command_root = if persisted_cwd != cwd {
+            let cwd = cwd.to_path_buf();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    codex_git_utils::get_git_repo_root(&cwd)
+                        .and_then(|root| dunce::canonicalize(root).ok())
+                })
+                .await
+                .ok()??,
+            )
+        } else {
+            None
+        };
         let state = self.state.lock().await;
+        if let Some(root) = command_root {
+            let (_, identity) = state.repository.observed_workspace_identity.as_ref()?;
+            if identity.repository_root.as_deref() != root.to_str() {
+                return None;
+            }
+        }
         let (epoch, identity_hash) = state.repository.observed_workspace_identity_hash.as_ref()?;
         if *epoch != state.repository.epoch {
             return None;
@@ -795,6 +892,7 @@ impl CommandExecutionLedger {
             if let Some(search_miss_key) = key.search_miss_cache_key()
                 && state.search.misses.contains(&search_miss_key)
             {
+                touch_search_miss_locked(&mut state.search, &search_miss_key);
                 return Err(CommandAttemptBlocked {
                     fingerprint: fingerprint_value(&search_miss_key),
                     reason: CommandAttemptBlockedReason::SearchMiss,
@@ -1413,6 +1511,18 @@ fn record_running_exit_locked(
     record_exit_locked(state, &running.key, exit_code);
 }
 
+fn touch_search_miss_locked(search: &mut CommandSearchState, key: &SearchMissCacheKey) {
+    if search.miss_order.back() == Some(key) {
+        return;
+    }
+    if let Some(position) = search.miss_order.iter().position(|cached| cached == key)
+        && let Some(cached) = search.miss_order.remove(position)
+    {
+        search.miss_order.push_back(cached);
+        search.revision = search.revision.wrapping_add(1);
+    }
+}
+
 fn record_search_result_locked(
     state: &mut CommandExecutionState,
     key: &CommandAttemptKey,
@@ -1437,7 +1547,9 @@ fn record_search_result_locked(
                 state.search.misses.remove(&oldest);
             }
         }
-    } else if exit_code != 1 && state.search.misses.remove(&search_miss_key) {
+    } else if exit_code == 1 {
+        touch_search_miss_locked(&mut state.search, &search_miss_key);
+    } else if state.search.misses.remove(&search_miss_key) {
         // A fresh execution error supersedes an older negative result too.
         // Only an attributable no-match exit can keep that result authoritative.
         state.search.revision = state.search.revision.wrapping_add(1);
@@ -1585,7 +1697,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn key(command: &str) -> CommandAttemptKey {
-        CommandAttemptKey::new("exec_command", "local", "C:/repo", &[command.to_string()])
+        let cwd = if cfg!(windows) { "C:/repo" } else { "/repo" };
+        CommandAttemptKey::new("exec_command", "local", cwd, &[command.to_string()])
     }
 
     fn initialize_git_repository(path: &Path) {
@@ -1819,6 +1932,81 @@ mod tests {
                 .unwrap_err()
                 .is_search_miss()
         );
+    }
+
+    #[tokio::test]
+    async fn reused_search_misses_survive_cache_pressure() {
+        for cwd in ["C:/repo", "/repo"] {
+            for refresh_by_execution in [false, true] {
+                let ledger = CommandExecutionLedger::default();
+                let keys = (0..=MAX_TRACKED_COMMANDS)
+                    .map(|index| {
+                        let query = format!("needle-{index}");
+                        CommandAttemptKey::new(
+                            "exec_command",
+                            "local",
+                            cwd,
+                            &[format!("rg {query} src")],
+                        )
+                        .with_workspace_identity(Some("workspace-a"))
+                        .with_search_narrowing(
+                            "turn-a",
+                            "repo-a",
+                            Some(RgSearchNarrowing {
+                                breadth: RgSearchBreadth::Narrow,
+                                query_identity: query.clone(),
+                                search_identity: query,
+                                scope_identity: "src".to_string(),
+                                parent_scope_identity: Some("repo".to_string()),
+                                scope_state_identity: Some("scope-state".to_string()),
+                                state_paths: Vec::new(),
+                                can_record_miss: true,
+                            }),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                for key in keys.iter().take(MAX_TRACKED_COMMANDS) {
+                    ledger.begin_attempt(key, false).await.unwrap();
+                    ledger.record_exit(key, 1).await;
+                }
+                if refresh_by_execution {
+                    ledger
+                        .begin_attempt_with_freshness(&keys[0], false, true)
+                        .await
+                        .unwrap();
+                    ledger.record_exit(&keys[0], 1).await;
+                } else {
+                    assert!(
+                        ledger
+                            .begin_attempt(&keys[0], false)
+                            .await
+                            .unwrap_err()
+                            .is_search_miss()
+                    );
+                }
+                let replacement = &keys[MAX_TRACKED_COMMANDS];
+                ledger.begin_attempt(replacement, false).await.unwrap();
+                ledger.record_exit(replacement, 1).await;
+                assert!(
+                    ledger
+                        .begin_attempt(&keys[0], false)
+                        .await
+                        .unwrap_err()
+                        .is_search_miss()
+                );
+                assert!(
+                    ledger
+                        .begin_attempt(replacement, false)
+                        .await
+                        .unwrap_err()
+                        .is_search_miss()
+                );
+                ledger
+                    .begin_attempt(&keys[1], false)
+                    .await
+                    .expect("the least recently used miss is evicted");
+            }
+        }
     }
 
     #[tokio::test]
@@ -2607,34 +2795,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_hash_follows_repository_identity_across_subdirectories() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repo");
+        initialize_git_repository(&repository);
+        let subdirectory = repository.join("crates/core");
+        std::fs::create_dir_all(&subdirectory).unwrap();
+        let ledger = CommandExecutionLedger::load_or_new(
+            temp.path().join("home"),
+            "thread".into(),
+            &repository,
+        )
+        .await;
+        ledger.observe_repository_revision("turn", 0).await;
+        let root_hash = ledger
+            .current_workspace_identity_hash(codex_exec_server::LOCAL_ENVIRONMENT_ID, &repository)
+            .await
+            .expect("observed repository");
+        assert_eq!(
+            ledger
+                .current_workspace_identity_hash(
+                    codex_exec_server::LOCAL_ENVIRONMENT_ID,
+                    &subdirectory,
+                )
+                .await,
+            Some(root_hash)
+        );
+        let nested_repository = subdirectory.join("nested");
+        initialize_git_repository(&nested_repository);
+        assert_eq!(
+            ledger
+                .current_workspace_identity_hash(
+                    codex_exec_server::LOCAL_ENVIRONMENT_ID,
+                    &nested_repository,
+                )
+                .await,
+            None,
+            "a nested repository has independent evidence"
+        );
+        assert_eq!(
+            ledger
+                .current_workspace_identity_hash("remote", &subdirectory)
+                .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn external_ripgrep_config_changes_cannot_replay_a_cached_miss() {
+        use crate::tools::handlers::command_search::classify_rg_search_narrowing;
+        use crate::tools::handlers::command_search::observe_rg_search_scope_state;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("example.txt"), "needle\n").unwrap();
+        let config = fixture.path().join("rg.conf");
+        std::fs::write(&config, "--glob\n!*.txt\n").unwrap();
+        let environment = HashMap::from([(
+            "RIPGREP_CONFIG_PATH".to_string(),
+            config.to_string_lossy().into_owned(),
+        )]);
+        let command = vec!["rg".to_string(), "needle".to_string(), ".".to_string()];
+        let attempt = async || {
+            let mut scope = classify_rg_search_narrowing(&command, None, &root, &root)
+                .unwrap()
+                .unwrap();
+            observe_rg_search_scope_state(&mut scope).await;
+            assert!(scope.scope_state_identity.is_some());
+            CommandAttemptKey::new("exec_command", "local", root.to_string_lossy(), &command)
+                .with_search_narrowing("turn", "repo", Some(scope))
+                .with_search_environment(&environment)
+        };
+        let run = || {
+            std::process::Command::new("rg")
+                .args(&command[1..])
+                .current_dir(&root)
+                .envs(&environment)
+                .output()
+                .unwrap()
+        };
+        let ledger = CommandExecutionLedger::default();
+        let first = attempt().await;
+        ledger.begin_attempt(&first, false).await.unwrap();
+        let miss = run();
+        assert_eq!(miss.status.code(), Some(1));
+        ledger.record_exit(&first, 1).await;
+        std::fs::write(&config, "--glob\n*.txt\n").unwrap();
+        let second = attempt().await;
+        ledger
+            .begin_attempt(&second, false)
+            .await
+            .expect("config contents can change without changing its environment value");
+        let hit = run();
+        assert_eq!(hit.status.code(), Some(0));
+        assert!(String::from_utf8(hit.stdout).unwrap().contains("needle"));
+    }
+
+    #[tokio::test]
     async fn workspace_identity_and_persisted_search_misses_load_on_first_command() {
+        use crate::tools::handlers::command_search::classify_rg_search_narrowing;
+        use crate::tools::handlers::command_search::observe_rg_search_scope_state;
         let temp = tempfile::tempdir().expect("workspace identity fixture");
         let repository = temp.path().join("repo");
         let codex_home = temp.path().join("codex-home");
         initialize_git_repository(&repository);
-        let search = |turn_id: &str, repository_epoch: u64, workspace_identity: &str| {
+        std::fs::create_dir(repository.join("src")).unwrap();
+        std::fs::write(repository.join("src/lib.rs"), "original content").unwrap();
+        let command = vec!["rg".to_string(), "needle".to_string(), "src".to_string()];
+        let search = async |turn_id: &str, repository_epoch: u64, workspace_identity: &str| {
+            let mut scope = classify_rg_search_narrowing(&command, None, &repository, &repository)
+                .unwrap()
+                .expect("real scoped search");
+            observe_rg_search_scope_state(&mut scope).await;
+            assert!(scope.scope_state_identity.is_some(), "scope must be proven");
             CommandAttemptKey::new(
                 "exec_command",
                 codex_exec_server::LOCAL_ENVIRONMENT_ID,
                 repository.to_string_lossy(),
-                &["rg".to_string(), "needle".to_string(), "src".to_string()],
+                &command,
             )
             .with_repository_epoch(repository_epoch)
             .with_workspace_identity(Some(workspace_identity))
-            .with_search_narrowing(
-                turn_id,
-                "repository",
-                Some(RgSearchNarrowing {
-                    breadth: RgSearchBreadth::Narrow,
-                    query_identity: "needle".to_string(),
-                    search_identity: "needle:src".to_string(),
-                    scope_identity: "src".to_string(),
-                    parent_scope_identity: Some("repository".to_string()),
-                    scope_state_identity: Some("scope-state".to_string()),
-                    state_paths: Vec::new(),
-                    can_record_miss: true,
-                }),
-            )
+            .with_search_narrowing(turn_id, &repository.to_string_lossy(), Some(scope))
         };
 
         let mut producer = CommandExecutionLedger::load_or_new(
@@ -2648,7 +2931,7 @@ mod tests {
             .current_workspace_identity_hash(codex_exec_server::LOCAL_ENVIRONMENT_ID, &repository)
             .await
             .expect("first command observes the workspace");
-        let first_search = search("turn-a", producer_epoch, &producer_identity);
+        let first_search = search("turn-a", producer_epoch, &producer_identity).await;
         producer
             .begin_attempt(&first_search, false)
             .await
@@ -2707,7 +2990,7 @@ mod tests {
             matches!(
                 matching
                     .begin_attempt(
-                        &search("turn-match", matching_epoch, &matching_identity),
+                        &search("turn-match", matching_epoch, &matching_identity).await,
                         false,
                     )
                     .await,
@@ -2743,10 +3026,27 @@ mod tests {
             .await
             .expect("first command observes the edited workspace");
         assert_ne!(producer_identity, consumer_identity);
+        assert!(
+            matches!(
+                consumer
+                    .begin_attempt(
+                        &search("turn-b", consumer_epoch, &consumer_identity).await,
+                        false
+                    )
+                    .await,
+                Err(CommandAttemptBlocked {
+                    reason: CommandAttemptBlockedReason::SearchMiss,
+                    ..
+                })
+            ),
+            "an unrelated pre-command edit preserves a persisted scoped miss"
+        );
+        std::fs::write(repository.join("src/lib.rs"), "needle now exists").unwrap();
+        let changed_scope = search("turn-b", consumer_epoch, &consumer_identity).await;
         consumer
-            .begin_attempt(&search("turn-b", consumer_epoch, &consumer_identity), false)
+            .begin_attempt(&changed_scope, false)
             .await
-            .expect("a pre-command workspace edit invalidates the persisted search miss");
+            .expect("a changed search scope must execute again");
 
         let cache_path = producer.persistence.as_ref().unwrap().cache_path.clone();
         let prior_bytes = std::fs::read(&cache_path).unwrap();
@@ -2861,6 +3161,113 @@ mod tests {
         assert_eq!(
             state.repository.observed_workspace_identity_hash,
             Some((1, identity_hash))
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_workspace_identity_retries_once_in_a_later_turn() {
+        let temp = tempfile::tempdir().expect("workspace recovery fixture");
+        let repository = temp.path().join("missing-repo");
+        let ledger = CommandExecutionLedger::load_or_new(
+            temp.path().join("home"),
+            "recovery".to_string(),
+            &repository,
+        )
+        .await;
+        assert_eq!(ledger.observe_repository_revision("first", 0).await, 0);
+        assert_eq!(ledger.workspace_identity_capture_count(), 1);
+        assert!(
+            ledger
+                .state
+                .lock()
+                .await
+                .repository
+                .observed_workspace_identity
+                .is_none()
+        );
+
+        initialize_git_repository(&repository);
+        assert_eq!(ledger.observe_repository_revision("first", 0).await, 0);
+        assert_eq!(ledger.workspace_identity_capture_count(), 1);
+        assert_eq!(ledger.observe_repository_revision("second", 0).await, 0);
+        assert_eq!(ledger.workspace_identity_capture_count(), 2);
+        assert!(
+            ledger
+                .state
+                .lock()
+                .await
+                .repository
+                .observed_workspace_identity
+                .is_some()
+        );
+
+        assert_eq!(ledger.observe_repository_revision("third", 0).await, 0);
+        assert_eq!(ledger.workspace_identity_capture_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn workspace_baseline_reuse_rejects_other_cwds_and_tracks_mutations() {
+        let temp = tempfile::tempdir().expect("workspace baseline fixture");
+        let repository = temp.path().join("repo");
+        initialize_git_repository(&repository);
+        let ledger = CommandExecutionLedger::load_or_new(
+            temp.path().join("home"),
+            "baseline".to_string(),
+            &repository,
+        )
+        .await;
+        let first = crate::git_workspace::capture_workspace_evidence_identity(&repository)
+            .await
+            .expect("first identity");
+        ledger
+            .observe_workspace_baseline("turn", 0, &temp.path().join("other"), Some(first.clone()))
+            .await;
+        assert!(
+            ledger
+                .current_workspace_identity_hash(
+                    codex_exec_server::LOCAL_ENVIRONMENT_ID,
+                    &repository
+                )
+                .await
+                .is_none()
+        );
+        ledger
+            .observe_workspace_baseline("turn", 0, &repository, Some(first.clone()))
+            .await;
+        ledger.observe_repository_revision("turn", 0).await;
+        assert_eq!(ledger.workspace_identity_capture_count(), 0);
+        assert_eq!(
+            ledger
+                .state
+                .lock()
+                .await
+                .repository
+                .observed_workspace_identity
+                .as_ref()
+                .map(|(_, identity)| identity),
+            Some(&first)
+        );
+
+        std::fs::write(repository.join("changed.txt"), "changed").expect("mutation");
+        let changed = crate::git_workspace::capture_workspace_evidence_identity(&repository)
+            .await
+            .expect("changed identity");
+        assert_ne!(changed, first);
+        ledger
+            .observe_workspace_baseline("turn", 1, &repository, Some(changed.clone()))
+            .await;
+        ledger.observe_repository_revision("turn", 1).await;
+        assert_eq!(ledger.workspace_identity_capture_count(), 0);
+        assert_eq!(
+            ledger
+                .state
+                .lock()
+                .await
+                .repository
+                .observed_workspace_identity
+                .as_ref()
+                .map(|(_, identity)| identity),
+            Some(&changed)
         );
     }
 

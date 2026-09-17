@@ -30,6 +30,25 @@ struct DelayedSnapshotBackend {
     start_delay: Duration,
 }
 
+#[tokio::test]
+async fn pending_shell_snapshot_does_not_block_launch() {
+    use futures::FutureExt;
+    let (_, turn) = crate::session::tests::make_session_and_context().await;
+    let mut environment = turn
+        .environments
+        .primary()
+        .expect("primary environment")
+        .clone();
+    environment.shell_snapshot = futures::future::pending().boxed().shared();
+    assert!(
+        environment
+            .shell_snapshot(environment.cwd())
+            .now_or_never()
+            .expect("snapshot lookup must be immediately ready")
+            .is_none()
+    );
+}
+
 impl ExecBackend for DelayedSnapshotBackend {
     fn start(&self, _params: ExecParams) -> ExecBackendFuture<'_> {
         Box::pin(async move {
@@ -1213,7 +1232,8 @@ async fn assert_remote_snapshot_shutdown(inherit: bool, expire_wait: bool) -> Re
         ready
             .primary()
             .context("remote environment")?
-            .shell_snapshot(&cwd),
+            .shell_snapshot
+            .clone(),
     )
     .await?
     .context("completed remote snapshot")?;

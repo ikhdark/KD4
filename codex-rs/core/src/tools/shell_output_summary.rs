@@ -1,4 +1,8 @@
-use codex_utils_output_truncation::looks_like_validation_command;
+use crate::tools::handlers::command_shape::CommandInvocation;
+use crate::validation_admission::ValidationClassification;
+use crate::validation_admission::classify_validation;
+use std::collections::BTreeSet;
+use std::collections::VecDeque;
 
 const DEFAULT_SUMMARY_AFTER_BYTES: usize = 48 * 1024;
 const DEFAULT_SUMMARY_AFTER_LINES: usize = 600;
@@ -38,19 +42,42 @@ pub(crate) fn summarize_shell_output_for_model(
     if !options.enabled {
         return None;
     }
+    if options.command_text.is_some_and(|command| {
+        let commands = codex_shell_command::parse_command::parse_shell_script(command);
+        !commands.is_empty()
+            && commands.iter().all(|command| {
+                matches!(
+                    command,
+                    codex_protocol::parse_command::ParsedCommand::Read { .. }
+                        | codex_protocol::parse_command::ParsedCommand::Search { .. }
+                        | codex_protocol::parse_command::ParsedCommand::ListFiles { .. }
+                )
+            })
+    }) {
+        // Preserve the requested source order and the existing truncation/raw
+        // artifact recovery path instead of ranking code as diagnostic prose.
+        return None;
+    }
 
-    let byte_threshold = options
+    let exceeds_token_budget = options
         .applied_token_limit
-        .map_or(DEFAULT_SUMMARY_AFTER_BYTES, |limit| {
-            codex_utils_string::approx_bytes_for_tokens(limit).min(DEFAULT_SUMMARY_AFTER_BYTES)
-        });
-    let lines = collect_lines_for_summary(output, byte_threshold, DEFAULT_SUMMARY_AFTER_LINES)?;
-    let line_count = lines.len();
+        .is_some_and(|limit| codex_utils_string::approx_token_count(output) > limit);
+    if !exceeds_token_budget
+        && output.len() <= DEFAULT_SUMMARY_AFTER_BYTES
+        && output.lines().take(DEFAULT_SUMMARY_AFTER_LINES + 1).count()
+            <= DEFAULT_SUMMARY_AFTER_LINES
+    {
+        return None;
+    }
+    let line_count = output.lines().count();
     let failed = timed_out || exit_code != 0;
-    let validation = options
-        .command_text
-        .is_some_and(looks_like_validation_command);
-    let line_states = select_line_states(&lines, failed, validation);
+    let validation = options.command_text.is_some_and(|command| {
+        matches!(
+            classify_validation(&CommandInvocation::Script(command.to_string())),
+            ValidationClassification::Validation { leaves, .. } if !leaves.is_empty()
+        )
+    });
+    let selection = select_lines(output, line_count, failed, validation);
     let selection_policy = if validation {
         "source-ordered failure-focused lines, final status lines, tail"
     } else if failed {
@@ -68,16 +95,60 @@ pub(crate) fn summarize_shell_output_for_model(
         builder.push_line("- timed_out: true");
     }
     builder.push_line(format!("- selection_policy: {selection_policy}"));
+    if selection.omitted_groups > 0 {
+        let qualifier = if selection.groups_overflowed {
+            "at least "
+        } else {
+            ""
+        };
+        builder.push_line(format!("- omitted_diagnostic_groups: {qualifier}{}; inspect the raw output for remaining diagnostics", selection.omitted_groups));
+    }
     builder.push_line("");
     builder.push_line("Selected output lines:");
 
     // Candidate quotas reserve space for actionable and final regions before
     // rendering. Emit the selected lines in source order so a diagnostic stays
     // attached to the context that explains it.
-    let ordered = ordered_line_indexes(&line_states);
+    // Borrow only the bounded selection; never copy oversized source lines.
+    let selected = output
+        .lines()
+        .enumerate()
+        .filter(|(index, _)| selection.indexes.contains(index))
+        .collect::<Vec<_>>();
+    let gap_bytes: usize = selected
+        .windows(2)
+        .filter_map(|pair| {
+            (pair[1].0 != pair[0].0 + 1)
+                .then(|| format!("\n... [{} lines omitted]", pair[1].0 - pair[0].0 - 1).len())
+        })
+        .sum();
+    let prefixes: usize = selected
+        .iter()
+        .map(|(index, _)| format!("{:>5}: ", index + 1).len())
+        .sum();
+    let available = SUMMARY_MAX_BYTES.saturating_sub(
+        SUMMARY_FOOTER_BYTES + builder.text.len() + gap_bytes + prefixes + selected.len(),
+    );
+    let mut low = 0;
+    let mut high = available;
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if selected
+            .iter()
+            .map(|(_, line)| line.len().min(mid))
+            .sum::<usize>()
+            <= available
+        {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    let line_budget = low;
     let mut previous = None;
     let mut emitted_source_lines = 0;
-    for index in ordered {
+    for (index, line) in selected {
+        let before_gap = (builder.text.len(), builder.lines);
         if let Some(previous_index) = previous
             && index != previous_index + 1
             && !builder.push_line(format!(
@@ -85,37 +156,27 @@ pub(crate) fn summarize_shell_output_for_model(
                 index - previous_index - 1
             ))
         {
+            builder.text.truncate(before_gap.0);
+            builder.lines = before_gap.1;
             break;
         }
-        if let Some(line) = lines.get(index) {
+        {
+            builder.capped |= line.len() > line_budget;
+            let line = summarize_oversized_line(line, line_budget);
             if !builder.push_line(format!("{:>5}: {line}", index + 1)) {
+                // A gap describes the next retained line. Keep the pair atomic
+                // when the gap uses the last available byte or line slot.
+                builder.text.truncate(before_gap.0);
+                builder.lines = before_gap.1;
                 break;
             }
             emitted_source_lines += 1;
         }
         previous = Some(index);
     }
-    builder.finish(emitted_source_lines, line_count)
-}
-
-fn collect_lines_for_summary(
-    output: &str,
-    byte_threshold: usize,
-    line_threshold: usize,
-) -> Option<Vec<&str>> {
-    if output.len() > byte_threshold {
-        return Some(output.lines().collect());
-    }
-    let mut buffered = Vec::new();
-    let mut remaining = output.lines();
-    while let Some(line) = remaining.next() {
-        buffered.push(line);
-        if buffered.len() > line_threshold {
-            buffered.extend(remaining);
-            return Some(buffered);
-        }
-    }
-    None
+    builder
+        .finish(emitted_source_lines, line_count)
+        .filter(|summary| summary.len() < output.len())
 }
 
 #[derive(Clone, Copy, Default)]
@@ -123,12 +184,6 @@ struct LineClassification {
     critical: bool,
     advisory: bool,
     status: bool,
-}
-
-#[derive(Clone, Copy, Default)]
-struct LineState {
-    classification: LineClassification,
-    selected: bool,
 }
 
 fn classify_line(line: &str, lower: &mut String) -> LineClassification {
@@ -149,6 +204,9 @@ fn classify_line(line: &str, lower: &mut String) -> LineClassification {
                 })
             })
             || trimmed.starts_with("failures:")
+            // Failed suites must survive later passing status lines in a
+            // multi-package run, even when their detailed errors were omitted.
+            || lower.contains("test result: failed")
             || trimmed.starts_with("panicked at ")
             || lower.contains(" panicked at ")
             || lower.contains(" error:")
@@ -175,7 +233,7 @@ fn classify_line(line: &str, lower: &mut String) -> LineClassification {
                     })))
             || lower.contains("finished ")
             || starts_with_diagnostic_label(trimmed, "error")
-            || lower.contains("summary:")
+            || trimmed.starts_with("summary:")
             || trimmed.starts_with("summary ["),
     }
 }
@@ -196,113 +254,97 @@ fn starts_with_diagnostic_label(line: &str, label: &str) -> bool {
     })
 }
 
-fn select_line_states(lines: &[&str], failed: bool, validation: bool) -> Vec<LineState> {
+// The selector retains at most 64 diagnostic groups and a fixed number of
+// indexes, regardless of log length. Text is borrowed from the captured output.
+const MAX_DIAGNOSTIC_GROUPS: usize = 64;
+
+struct LineSelection {
+    indexes: BTreeSet<usize>,
+    omitted_groups: usize,
+    groups_overflowed: bool,
+}
+
+fn select_lines(output: &str, line_count: usize, failed: bool, validation: bool) -> LineSelection {
+    let mut groups: Vec<((&str, Option<&str>), usize)> = Vec::new();
+    let mut groups_overflowed = false;
     let mut lowercase = String::new();
-    let mut states = lines
-        .iter()
-        .map(|line| LineState {
-            classification: classify_line(line, &mut lowercase),
-            ..LineState::default()
-        })
-        .collect::<Vec<_>>();
-    if failed || validation {
-        add_focus_ranges(&mut states);
-        add_status_lines(&mut states);
-        if !states.iter().any(|state| state.selected) {
-            add_head(&mut states, SUCCESS_HEAD_LINES);
+    let mut lines = output.lines().enumerate().peekable();
+    while let Some((index, line)) = lines.next() {
+        let location = lines
+            .peek()
+            .map(|(_, next)| next.trim())
+            .filter(|next| next.starts_with("-->"));
+        let identity = (line.trim(), location);
+        if classify_line(line, &mut lowercase).critical
+            && !groups.iter().any(|(text, _)| *text == identity)
+        {
+            if groups.len() == MAX_DIAGNOSTIC_GROUPS {
+                groups_overflowed = true;
+                // Retain the latest distinct group as well as the stable prefix.
+                groups.pop();
+            }
+            groups.push((identity, index));
         }
-        add_tail(
-            &mut states,
-            if failed {
-                FAILURE_TAIL_LINES
-            } else {
-                VALIDATION_SUCCESS_TAIL_LINES
-            },
-        );
+    }
+    let group_count = groups.len();
+    let critical: Vec<usize> = if group_count <= MAX_FOCUS_MATCHES {
+        groups.iter().map(|(_, index)| *index).collect()
     } else {
-        add_head(&mut states, SUCCESS_HEAD_LINES);
-        add_focus_ranges(&mut states);
-        add_tail(&mut states, SUCCESS_TAIL_LINES);
+        groups[..MAX_FOCUS_MATCHES / 2]
+            .iter()
+            .chain(groups[group_count - MAX_FOCUS_MATCHES / 2..].iter())
+            .map(|(_, index)| *index)
+            .collect()
+    };
+    let mut indexes = BTreeSet::new();
+    for &index in &critical {
+        indexes.extend(
+            index.saturating_sub(FOCUS_CONTEXT_LINES)
+                ..(index + FOCUS_CONTEXT_LINES + 1).min(line_count),
+        );
     }
-    states
-}
-
-fn add_head(states: &mut [LineState], count: usize) {
-    for state in states.iter_mut().take(count) {
-        state.selected = true;
-    }
-}
-
-fn add_tail(states: &mut [LineState], count: usize) {
-    let start = states.len().saturating_sub(count);
-    for state in &mut states[start..] {
-        state.selected = true;
-    }
-}
-
-fn add_focus_ranges(states: &mut [LineState]) {
-    let all_critical = states
-        .iter()
-        .enumerate()
-        .filter_map(|(index, state)| state.classification.critical.then_some(index))
-        .collect::<Vec<_>>();
-    let critical = bounded_edge_indexes(&all_critical, MAX_FOCUS_MATCHES);
-    add_context_ranges(states, &critical);
-    let remaining = MAX_FOCUS_MATCHES.saturating_sub(critical.len());
-    let advisory = states
-        .iter()
-        .enumerate()
-        .filter_map(|(index, state)| {
-            (state.classification.advisory && !state.selected).then_some(index)
-        })
-        .take(remaining)
-        .collect::<Vec<_>>();
-    add_context_ranges(states, &advisory);
-}
-
-fn bounded_edge_indexes(indexes: &[usize], limit: usize) -> Vec<usize> {
-    if indexes.len() <= limit {
-        return indexes.to_vec();
-    }
-    let head = limit.div_ceil(2);
-    let tail = limit.saturating_sub(head);
-    indexes[..head]
-        .iter()
-        .chain(indexes[indexes.len() - tail..].iter())
-        .copied()
-        .collect()
-}
-
-fn add_context_ranges(states: &mut [LineState], indexes: &[usize]) {
-    for &index in indexes {
-        let start = index.saturating_sub(FOCUS_CONTEXT_LINES);
-        let end = (index + FOCUS_CONTEXT_LINES + 1).min(states.len());
-        for state in &mut states[start..end] {
-            state.selected = true;
+    let mut advisory_slots = MAX_FOCUS_MATCHES - critical.len();
+    let mut statuses = VecDeque::new();
+    for (index, line) in output.lines().enumerate() {
+        let classification = classify_line(line, &mut lowercase);
+        if classification.advisory && advisory_slots > 0 && !indexes.contains(&index) {
+            indexes.extend(
+                index.saturating_sub(FOCUS_CONTEXT_LINES)
+                    ..(index + FOCUS_CONTEXT_LINES + 1).min(line_count),
+            );
+            advisory_slots -= 1;
+        }
+        if (failed || validation) && classification.status && !indexes.contains(&index) {
+            if statuses.len() == MAX_STATUS_MATCHES {
+                statuses.pop_front();
+            }
+            statuses.push_back(index);
         }
     }
-}
-
-fn add_status_lines(states: &mut [LineState]) {
-    let status = states
-        .iter()
-        .enumerate()
-        .rev()
-        .filter_map(|(index, state)| {
-            (state.classification.status && !state.selected).then_some(index)
-        })
-        .take(MAX_STATUS_MATCHES)
-        .collect::<Vec<_>>();
-    for index in status {
-        states[index].selected = true;
+    indexes.extend(statuses);
+    if !(failed || validation) || indexes.is_empty() {
+        indexes.extend(0..SUCCESS_HEAD_LINES.min(line_count));
     }
-}
-
-fn ordered_line_indexes(states: &[LineState]) -> impl Iterator<Item = usize> + '_ {
-    states
+    let tail = if failed {
+        FAILURE_TAIL_LINES
+    } else if validation {
+        VALIDATION_SUCCESS_TAIL_LINES
+    } else {
+        SUCCESS_TAIL_LINES
+    };
+    indexes.extend(line_count.saturating_sub(tail)..line_count);
+    // Count groups whose representative is absent, including context/tail
+    // coverage. After overflow this is a lower bound, never a claim of completeness.
+    let omitted_groups = groups
         .iter()
-        .enumerate()
-        .filter_map(|(index, state)| state.selected.then_some(index))
+        .filter(|(_, index)| !indexes.contains(index))
+        .count()
+        + usize::from(groups_overflowed);
+    LineSelection {
+        indexes,
+        omitted_groups,
+        groups_overflowed,
+    }
 }
 
 struct SummaryBuilder {
@@ -397,29 +439,16 @@ mod optimization_tests {
     use super::*;
 
     #[test]
-    fn summary_threshold_probe_preserves_lines_at_byte_and_line_boundaries() {
-        let at_threshold = "one\ntwo\nthree";
-        assert_eq!(collect_lines_for_summary(at_threshold, 128, 3), None);
-
-        let above_threshold = "one\ntwo\nthree\nfour";
-        assert_eq!(
-            collect_lines_for_summary(above_threshold, 128, 3),
-            Some(vec!["one", "two", "three", "four"])
+    fn selection_storage_is_bounded_for_large_logs() {
+        let output = "error: repeated failure\nordinary context\n".repeat(100_000);
+        let selection = select_lines(&output, 200_000, true, true);
+        assert!(
+            selection.indexes.len()
+                <= FAILURE_TAIL_LINES + MAX_FOCUS_MATCHES * 7 + MAX_STATUS_MATCHES
         );
-        assert_eq!(
-            collect_lines_for_summary("abcdef", 5, 20),
-            Some(vec!["abcdef"])
-        );
-        let large_threshold = DEFAULT_SUMMARY_AFTER_LINES + 100;
-        let output = "line\n".repeat(large_threshold + 1);
-        assert_eq!(
-            collect_lines_for_summary(&output, usize::MAX, large_threshold),
-            Some(vec!["line"; large_threshold + 1])
-        );
-        assert_eq!(
-            collect_lines_for_summary(&output, usize::MAX, usize::MAX),
-            None
-        );
+        assert!(selection.indexes.contains(&0));
+        assert!(selection.indexes.contains(&199_999));
+        assert_eq!(selection.omitted_groups, 0);
     }
 
     #[test]
@@ -447,8 +476,8 @@ mod optimization_tests {
             "tail one",
             "tail two",
         ];
-        let states = select_line_states(&lines, true, true);
-        let ordered = ordered_line_indexes(&states).collect::<Vec<_>>();
+        let selection = select_lines(&lines.join("\n"), lines.len(), true, true);
+        let ordered = selection.indexes.into_iter().collect::<Vec<_>>();
 
         assert_eq!(ordered, (0..lines.len()).collect::<Vec<_>>());
         let mut sorted = ordered.clone();

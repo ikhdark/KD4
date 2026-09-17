@@ -241,7 +241,8 @@ pub(crate) struct PostToolUseHookSpecificOutputWire {
     pub hook_event_name: HookEventNameWire,
     #[serde(default)]
     pub additional_context: Option<String>,
-    #[serde(default)]
+    // This rewrite capability is unsupported even when the requested output is null.
+    #[serde(default, deserialize_with = "deserialize_present_value")]
     #[serde(rename = "updatedMCPToolOutput")]
     pub updated_mcp_tool_output: Option<Value>,
 }

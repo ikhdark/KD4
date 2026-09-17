@@ -359,10 +359,7 @@ pub(crate) fn clamp_yield_time_for_readiness(yield_time_ms: u64, executor_ready:
 }
 
 pub(crate) fn generate_chunk_id() -> String {
-    let mut rng = rng();
-    (0..6)
-        .map(|_| format!("{:x}", rng.random_range(0..16)))
-        .collect()
+    format!("{:016x}", rng().random::<u64>())
 }
 
 #[cfg(test)]

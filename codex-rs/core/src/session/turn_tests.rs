@@ -1163,22 +1163,6 @@ fn sampling_retry_rebuilds_after_accepted_output() {
 }
 
 #[test]
-fn sampling_success_retains_the_shared_accepted_input() {
-    let accepted: Arc<[ResponseItem]> = Arc::from([ResponseItem::FunctionCall {
-        id: None,
-        name: "accepted".to_string(),
-        namespace: None,
-        arguments: "{}".to_string(),
-        call_id: "accepted-call".to_string(),
-        internal_chat_message_metadata_passthrough: None,
-    }]);
-
-    let retained = retain_accepted_sampling_input(Arc::clone(&accepted));
-
-    assert!(Arc::ptr_eq(&retained, &accepted));
-}
-
-#[test]
 fn kd4_latency_continuation_prefetch_rejects_stale_or_steered_state() {
     assert!(continuation_workspace_prefetch_is_current(7, 7, false));
     assert!(!continuation_workspace_prefetch_is_current(7, 8, false));
@@ -1914,16 +1898,6 @@ fn compaction_rebases_but_preserves_a_terminal_completion_request() {
 }
 
 #[test]
-fn server_end_turn_false_completes_on_first_unchanged_signal() {
-    assert!(protocol_resample_completion_allowed(
-        /*server_resample_eligible*/ true,
-    ));
-    assert!(!protocol_resample_completion_allowed(
-        /*server_resample_eligible*/ false,
-    ));
-}
-
-#[test]
 fn verified_turn_contract_after_agent_abort_preserves_completed_output_metadata() {
     let surfaced_result = SurfacedToolResult {
         adapter: "code_mode_cell".to_string(),
@@ -1947,9 +1921,9 @@ fn verified_turn_contract_after_agent_abort_preserves_completed_output_metadata(
 }
 
 #[test]
-fn logical_generation_budget_allows_thirty_two_regular_and_one_terminal_generation() {
+fn logical_generation_budget_allows_128_regular_and_one_terminal_generation() {
     let mut budget = LogicalGenerationBudget::default();
-    for _ in 0..MAX_REGULAR_LOGICAL_GENERATIONS {
+    for _ in 0..128 {
         assert_eq!(
             budget.admit(/*terminal_requested*/ false),
             LogicalGenerationAdmission::Regular
@@ -1990,7 +1964,7 @@ async fn forced_terminal_budget_boundary_warns_without_changing_history() {
     .expect("forced-terminal boundary emits a warning");
     assert_eq!(
         warning.message,
-        "This turn reached its limit of 32 regular model generations. The assistant will now summarize completed work and report anything unfinished. Send another message to continue the remaining work."
+        "This turn reached its limit of 128 regular model generations. The assistant will now summarize completed work and report anything unfinished. Send another message to continue the remaining work."
     );
 }
 
@@ -2088,33 +2062,58 @@ fn logical_generation_budget_new_user_input_reopens_terminal_without_resetting_r
     assert_eq!(budget.admit(false), LogicalGenerationAdmission::Exhausted);
 }
 
-#[test]
-fn orchestration_audit_regular_follow_up_admission_has_one_budget_precedence_table() {
+#[tokio::test]
+async fn regular_follow_up_admission_reports_exhaustion_once() {
+    let (session, turn, events) = crate::session::tests::make_session_and_context_with_rx().await;
     let available = LogicalGenerationBudget::default();
-    assert_eq!(
-        regular_follow_up_admission(&available, false),
-        RegularFollowUpAdmission::Admit
-    );
-    assert_eq!(
-        regular_follow_up_admission(&available, true),
-        RegularFollowUpAdmission::Exhausted
+    let mut reported = false;
+    assert!(admit_regular_follow_up(&session, &turn, &available, &mut reported).await);
+    assert!(!reported);
+    assert!(events.try_recv().is_err());
+
+    reported = true;
+    assert!(!admit_regular_follow_up(&session, &turn, &available, &mut reported).await);
+    assert!(
+        events.try_recv().is_err(),
+        "an earlier failure must not emit a duplicate"
     );
 
-    let mut exhausted = LogicalGenerationBudget::default();
-    assert_eq!(
-        exhausted.admit(/*terminal_requested*/ true),
-        LogicalGenerationAdmission::Terminal { forced: false }
+    let exhausted = LogicalGenerationBudget {
+        regular_generations: MAX_REGULAR_LOGICAL_GENERATIONS,
+        terminal_generation_used: true,
+    };
+    reported = false;
+    assert!(!admit_regular_follow_up(&session, &turn, &exhausted, &mut reported).await);
+    assert!(reported);
+    let EventMsg::Error(error) = events.try_recv().expect("budget error").msg else {
+        panic!("expected budget error");
+    };
+    assert!(error.affects_turn_status());
+    assert_eq!(turn.terminal_error.lock().await.as_ref(), Some(&error));
+    assert!(!admit_regular_follow_up(&session, &turn, &exhausted, &mut reported).await);
+    assert!(
+        events.try_recv().is_err(),
+        "budget error must be emitted once"
     );
-    for _ in 0..MAX_REGULAR_LOGICAL_GENERATIONS {
-        assert_eq!(
-            exhausted.admit(/*terminal_requested*/ false),
-            LogicalGenerationAdmission::Regular
-        );
+}
+
+#[test]
+fn logical_generation_budget_preview_preserves_capacity() {
+    for (regular_generations, terminal_generation_used, regular_allowed, terminal_allowed) in [
+        (0, false, true, true),
+        (0, true, true, false),
+        (MAX_REGULAR_LOGICAL_GENERATIONS, false, true, true),
+        (MAX_REGULAR_LOGICAL_GENERATIONS, true, false, false),
+    ] {
+        let budget = LogicalGenerationBudget {
+            regular_generations,
+            terminal_generation_used,
+        };
+        assert_eq!(budget.can_admit(false), regular_allowed);
+        assert_eq!(budget.can_admit(true), terminal_allowed);
+        assert_eq!(budget.regular_generations, regular_generations);
+        assert_eq!(budget.terminal_generation_used, terminal_generation_used);
     }
-    assert_eq!(
-        regular_follow_up_admission(&exhausted, false),
-        RegularFollowUpAdmission::Exhausted
-    );
 }
 
 #[test]
@@ -2267,7 +2266,7 @@ async fn generation_budget_exhaustion_emits_one_status_affecting_error() {
     };
     assert_eq!(
         error.message,
-        "This turn reached its generation budget (up to 32 regular model generations and one final summary) before all requested work completed. Send another message to continue the remaining work."
+        "This turn reached its generation budget (up to 128 regular model generations and one final summary) before all requested work completed. Send another message to continue the remaining work."
     );
     assert!(error.affects_turn_status());
     assert_eq!(
@@ -2659,64 +2658,8 @@ fn ordinary_continuation_precedence_is_stable() {
     assert_eq!(ordinary_continuation_cause(false, false, false), None);
 }
 
-#[test]
-fn finalized_router_reuse_requires_identical_coarse_exposure_identity() {
-    let disabled = ToolExposureIdentity {
-        goal_surface_state: GoalSurfaceState::Disabled,
-        environment_mode: EnvironmentSurfaceMode::None,
-        ..ToolExposureIdentity::default()
-    };
-    let router = ToolRouter::from_parts_with_warnings_and_identity(
-        ToolRegistry::empty_for_test(),
-        Vec::new(),
-        Vec::new(),
-        disabled.clone(),
-    );
-
-    assert!(finalized_router_matches_exposure(&router, &disabled));
-
-    let inactive = ToolExposureIdentity {
-        goal_surface_state: GoalSurfaceState::Inactive,
-        ..disabled.clone()
-    };
-    assert!(!finalized_router_matches_exposure(&router, &inactive));
-
-    let active = ToolExposureIdentity {
-        goal_surface_state: GoalSurfaceState::Active,
-        ..disabled.clone()
-    };
-    assert!(!finalized_router_matches_exposure(&router, &active));
-
-    let ready_environment = ToolExposureIdentity {
-        environment_mode: EnvironmentSurfaceMode::One,
-        ..disabled.clone()
-    };
-    assert!(!finalized_router_matches_exposure(
-        &router,
-        &ready_environment
-    ));
-
-    let refreshed_mcp_catalog = ToolExposureIdentity {
-        mcp_tool_catalog_revision: disabled.mcp_tool_catalog_revision + 1,
-        ..disabled.clone()
-    };
-    assert!(!finalized_router_matches_exposure(
-        &router,
-        &refreshed_mcp_catalog
-    ));
-
-    let starting_environment = ToolExposureIdentity {
-        environment_starting: true,
-        ..disabled
-    };
-    assert!(!finalized_router_matches_exposure(
-        &router,
-        &starting_environment
-    ));
-}
-
 #[tokio::test]
-async fn finalized_router_reuse_rejects_stale_request_user_input_eligibility() {
+async fn finalized_router_reuse_rejects_changed_dynamic_exposure() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
     let turn = Arc::new(turn);
     let step_context = StepContext::for_test(Arc::clone(&turn));
@@ -2746,6 +2689,44 @@ async fn finalized_router_reuse_rejects_stale_request_user_input_eligibility() {
         )
         .await
     );
+
+    for stale_identity in [
+        ToolExposureIdentity {
+            environment_mode: if matching_identity.environment_mode == EnvironmentSurfaceMode::One {
+                EnvironmentSurfaceMode::None
+            } else {
+                EnvironmentSurfaceMode::One
+            },
+            ..matching_identity.clone()
+        },
+        ToolExposureIdentity {
+            environment_starting: !matching_identity.environment_starting,
+            ..matching_identity.clone()
+        },
+        ToolExposureIdentity {
+            mcp_tool_catalog_revision: matching_identity.mcp_tool_catalog_revision + 1,
+            ..matching_identity.clone()
+        },
+        ToolExposureIdentity {
+            extension_tool_surface_revision: matching_identity.extension_tool_surface_revision + 1,
+            ..matching_identity.clone()
+        },
+        ToolExposureIdentity {
+            mcp_resources_available: !matching_identity.mcp_resources_available,
+            ..matching_identity.clone()
+        },
+    ] {
+        let stale = ToolRouter::from_parts_with_warnings_and_identity(
+            ToolRegistry::empty_for_test(),
+            Vec::new(),
+            Vec::new(),
+            stale_identity,
+        );
+        assert!(
+            !finalized_router_matches_current_exposure(&session, step_context.as_ref(), &stale)
+                .await
+        );
+    }
 
     let stale_router = ToolRouter::from_parts_with_warnings_and_identity(
         ToolRegistry::empty_for_test(),
@@ -2835,13 +2816,8 @@ fn agent_surface_stage_depends_only_on_coarse_graph_and_binding_state() {
         agent_surface_stage_from_snapshot(true, true, true),
         AgentSurfaceStage::TypedAdministration
     );
-
-    // Running/waiting status, gates, targets, and capacity are deliberately absent from this
-    // snapshot, so those fine-grained transitions cannot change the schema identity.
-    assert_eq!(
-        agent_surface_stage_from_snapshot(true, true, false),
-        agent_surface_stage_from_snapshot(true, true, false)
-    );
+    // Running/waiting status, gates, targets, and capacity are deliberately absent from the
+    // snapshot signature, so those fine-grained transitions cannot change the schema identity.
 }
 
 fn response_input_texts(items: &[ResponseItem]) -> Vec<&str> {
@@ -3091,7 +3067,7 @@ async fn generation_budget_survives_reentry_and_terminal_directive_is_request_lo
 -> Result<()> {
     core_test_support::skip_if_no_network!(Ok(()));
     let server = responses::start_mock_server().await;
-    let mut sequence = (0..30)
+    let mut sequence = (0..126)
         .map(|i| {
             let id = format!("regular-{i}");
             responses::sse(vec![
@@ -3132,7 +3108,7 @@ json.load(sys.stdin)
 ready, release = Path({ready}), Path({release})
 if not ready.exists():
     ready.write_text("ready")
-    deadline = time.monotonic() + 20
+    deadline = time.monotonic() + 60
     while not release.exists():
         if time.monotonic() >= deadline:
             raise RuntimeError("reentry input was never queued")
@@ -3180,16 +3156,28 @@ else:
             thread_settings: Default::default(),
         })
         .await?;
-    tokio::time::timeout(Duration::from_secs(20), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         while !test.codex_home_path().join("reentry.ready").exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            // Consume the normal client event stream while the long turn runs.
+            // Otherwise its bounded queue can stall before the reentry hook.
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                event = test.codex.next_event() => {
+                    let event = event.expect("event stream remains open before reentry");
+                    assert!(
+                        !matches!(event.msg, EventMsg::TurnComplete(_) | EventMsg::Error(_)),
+                        "turn ended before the reentry boundary: {:?}",
+                        event.msg
+                    );
+                }
+            }
         }
     })
     .await?;
     assert_eq!(
         requests.requests().len(),
-        31,
-        "reentry follows 31 generations"
+        127,
+        "reentry follows 127 generations"
     );
     // Queue input while Stop holds the first run_turn at its completion boundary.
     // The hook ends that invocation, so RegularTask must drain and reenter it.
@@ -3215,20 +3203,20 @@ else:
     assert_eq!(last_message.as_deref(), Some("terminal"));
     assert_eq!(
         requests.requests().len(),
-        33,
-        "one task admits 32 regular requests and one terminal request across reentry"
+        129,
+        "one task admits 128 regular requests and one terminal request across reentry"
     );
-    assert!(requests.requests()[31].body_contains_text("queued reentry input"));
+    assert!(requests.requests()[127].body_contains_text("queued reentry input"));
 
     test.submit_turn("start a fresh turn").await?;
     let sent = requests.requests();
     assert_eq!(
         sent.len(),
-        34,
+        130,
         "the terminal request cannot trigger another generation"
     );
     for (index, request) in sent.iter().enumerate() {
-        let terminal = index == 32;
+        let terminal = index == 128;
         assert_eq!(
             request.body_contains_text(LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE),
             terminal,
@@ -3402,7 +3390,7 @@ async fn compaction_that_remains_over_limit_is_not_a_retryable_stream_error_impl
         None,
         &mut client,
         None,
-        InitialContextInjection::DoNotInject,
+        None,
         CompactionReason::ContextLimit,
         CompactionPhase::MidTurn,
         &CancellationToken::new(),
@@ -6458,10 +6446,14 @@ fn plan_mode_memory_citations_are_parsed_once_for_live_events() {
 #[test]
 fn pending_turn_mechanism_retries_remain_bounded_without_fixed_point_state() {
     let mut iterations = 0;
-    for _ in 0..MAX_PENDING_TURN_PLAN_ITERATIONS {
-        advance_pending_turn_plan_iteration(&mut iterations).expect("within retry bound");
+    for _ in 0..8 {
+        advance_pending_turn_plan_iteration(&mut iterations, "inventory changed")
+            .expect("within retry bound");
     }
-    assert!(advance_pending_turn_plan_iteration(&mut iterations).is_err());
+    assert_eq!(
+        advance_pending_turn_plan_iteration(&mut iterations, "inventory changed"),
+        Err("pending-turn planning did not stabilize after 8 iterations; last retry: inventory changed".to_string())
+    );
 }
 
 #[tokio::test]
@@ -6491,7 +6483,7 @@ async fn pending_turn_exhausted_budget_stops_before_history_or_snapshot_work() {
     drop(state);
 
     assert!(
-        matches!(result, Err(CodexErr::Fatal(message)) if message.contains("did not stabilize after 8 iterations"))
+        matches!(result, Err(CodexErr::Fatal(message)) if message.contains("did not stabilize after 8 iterations; last retry: retry budget was exhausted before this planning invocation"))
     );
     assert_eq!(completed_effect, None);
     assert_eq!(
@@ -6594,8 +6586,15 @@ fn pending_turn_mechanism_does_not_replay_the_completed_mcp_effect() {
 
 #[test]
 fn pending_turn_mechanism_inventory_effect_requires_a_newer_generation() {
-    assert!(require_newer_planning_generation(4, 4).is_err());
-    assert!(require_newer_planning_generation(4, 5).is_ok());
+    for after_generation in [3, 4] {
+        assert_eq!(
+            require_newer_planning_generation("install:tool@v1", 4, after_generation),
+            Err(format!(
+                "inventory effect `install:tool@v1` completed at planning generation 4, but the next observable generation {after_generation} did not advance"
+            ))
+        );
+    }
+    assert!(require_newer_planning_generation("install:tool@v1", 4, 5).is_ok());
 }
 
 #[tokio::test]

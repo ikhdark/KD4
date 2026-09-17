@@ -138,6 +138,45 @@ async fn workspace_coordination_concurrent_initialization_shares_runtime_and_roo
 }
 
 #[tokio::test]
+async fn conflicting_root_initialization_preserves_original_store() {
+    let codex_home = TempDir::new().expect("codex home tempdir");
+    let state_runtime =
+        StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string())
+            .await
+            .expect("state runtime initializes");
+    let coordinator = AgentTaskCoordinator::default();
+    coordinator
+        .initialize(Arc::clone(&state_runtime), "original-root".to_string())
+        .await
+        .expect("initial root initializes");
+    let original_store = coordinator.store().expect("initialized store");
+
+    let error = coordinator
+        .initialize(Arc::clone(&state_runtime), "other-root".to_string())
+        .await
+        .expect_err("a coordinator cannot switch roots");
+    assert!(matches!(
+        error,
+        StoreError::RootSessionMismatch { expected, requested }
+            if expected == "original-root" && requested == "other-root"
+    ));
+    assert_eq!(
+        coordinator.root_session_id().as_deref(),
+        Some("original-root")
+    );
+    assert!(Arc::ptr_eq(
+        &original_store,
+        &coordinator
+            .store()
+            .expect("original store remains available")
+    ));
+    coordinator
+        .initialize(state_runtime, "original-root".to_string())
+        .await
+        .expect("the original root remains usable");
+}
+
+#[tokio::test]
 async fn terminal_emission_exports_once_after_diagnostic_event_saturation() {
     let codex_home = TempDir::new().expect("codex home tempdir");
     let repository = TempDir::new().expect("repository tempdir");
@@ -230,7 +269,8 @@ async fn terminal_emission_exports_once_after_diagnostic_event_saturation() {
         .iter()
         .find(|metric| metric.name() == "codex.multi_agent.task.terminal_state")
         .expect("actual terminal metric");
-    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    use opentelemetry_sdk::metrics::data::AggregatedMetrics;
+    use opentelemetry_sdk::metrics::data::MetricData;
     let AggregatedMetrics::U64(MetricData::Sum(sum)) = terminal.data() else {
         panic!("terminal counter");
     };

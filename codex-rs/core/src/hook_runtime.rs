@@ -118,7 +118,7 @@ pub(crate) async fn run_pending_session_start_hooks(
             hooks.run_session_start(request, Some(turn_context.sub_id.clone())),
         )
         .await
-        .record_additional_contexts(sess, turn_context, "SessionStart")
+        .record_session_start_contexts(sess, turn_context)
         .await
         {
             return true;
@@ -595,10 +595,9 @@ pub(crate) async fn inspect_pending_input(
             )
             .await
         }
-        TurnInput::ResponseItem(_) | TurnInput::InternalResponseItem(_) => {
-            HookRuntimeOutcome::default()
-        }
-        TurnInput::InterAgentCommunication(_) => HookRuntimeOutcome::default(),
+        TurnInput::ResponseItem(_)
+        | TurnInput::InternalResponseItem(_)
+        | TurnInput::InterAgentCommunication(_) => HookRuntimeOutcome::default(),
     }
 }
 
@@ -655,21 +654,22 @@ where
 }
 
 impl HookRuntimeOutcome {
-    async fn record_additional_contexts(
+    async fn record_session_start_contexts(
         self,
         sess: &Arc<Session>,
         turn_context: &Arc<TurnContext>,
-        hook_name: &'static str,
     ) -> bool {
-        if hook_name == "SessionStart" {
-            record_session_start_additional_contexts(sess, turn_context, self.additional_contexts)
-                .await;
-        } else {
-            record_additional_contexts(sess, turn_context, self.additional_contexts).await;
-        }
+        record_session_start_additional_contexts(sess, turn_context, self.additional_contexts)
+            .await;
 
         if self.should_stop {
-            emit_hook_stop_reason(sess, turn_context, hook_name, self.stop_reason.as_deref()).await;
+            emit_hook_stop_reason(
+                sess,
+                turn_context,
+                "SessionStart",
+                self.stop_reason.as_deref(),
+            )
+            .await;
         }
 
         self.should_stop
@@ -767,11 +767,25 @@ fn single_developer_input_text(item: &ResponseItem) -> Option<&str> {
 }
 
 pub(crate) async fn prepare_additional_context_items(
-    _sess: &Arc<Session>,
-    _turn_context: &Arc<TurnContext>,
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
     additional_contexts: Vec<String>,
 ) -> Vec<ResponseItem> {
-    additional_context_messages(additional_contexts)
+    let total = additional_contexts.len();
+    let messages = additional_context_messages(additional_contexts);
+    let omitted = total - messages.len();
+    if omitted > 0 {
+        sess.send_event(
+            turn_context,
+            EventMsg::Warning(WarningEvent {
+                message: format!(
+                    "Omitted {omitted} hook context fragment(s) because the shared context budget was exhausted."
+                ),
+            }),
+        )
+        .await;
+    }
+    messages
 }
 
 fn additional_context_messages(additional_contexts: Vec<String>) -> Vec<ResponseItem> {
@@ -1061,6 +1075,51 @@ mod tests {
                 ("developer", "first tide note".to_string()),
                 ("developer", "second tide note".to_string()),
             ],
+        );
+    }
+
+    #[tokio::test]
+    async fn omitted_hook_context_emits_one_warning_and_preserves_admitted_text() {
+        let (session, turn, events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        let admitted = "a".repeat(super::ModelContextBudget::default().remaining_bytes());
+        let messages = prepare_additional_context_items(
+            &session,
+            &turn,
+            vec![admitted.clone(), "omitted context".to_string()],
+        )
+        .await;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            super::single_developer_input_text(&messages[0]),
+            Some(admitted.as_str())
+        );
+        let codex_protocol::protocol::EventMsg::Warning(warning) =
+            events.try_recv().expect("omitted context warning").msg
+        else {
+            panic!("expected omitted context warning");
+        };
+        assert!(
+            warning
+                .message
+                .contains("Omitted 1 hook context fragment(s)")
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "one warning per exhausted contribution"
+        );
+
+        let messages =
+            prepare_additional_context_items(&session, &turn, vec!["small context".to_string()])
+                .await;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            super::single_developer_input_text(&messages[0]),
+            Some("small context")
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "fully admitted context needs no warning"
         );
     }
 

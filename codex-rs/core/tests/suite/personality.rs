@@ -41,7 +41,7 @@ use wiremock::MockServer;
 const LOCAL_FRIENDLY_TEMPLATE: &str =
     "You optimize for team morale and being a supportive teammate as much as code quality.";
 const LOCAL_PRAGMATIC_TEMPLATE: &str = "You are a deeply pragmatic, effective software engineer.";
-const PERSONALITY_RESET_TEXT: &str = "The previously requested personality no longer applies. No personality-specific communication style is currently active.";
+const PERSONALITY_RESET_TEXT: &str = "The previous personality no longer applies. No personality-specific communication style is currently active.";
 
 fn read_only_text_turn(
     test: &TestCodex,
@@ -326,6 +326,12 @@ async fn default_personality_is_pragmatic_without_config_toml() -> anyhow::Resul
         .expect("expected default personality message in developer input");
     assert!(personality_text.contains(LOCAL_PRAGMATIC_TEMPLATE));
 
+    assert!(personality_text.starts_with(
+        "<personality_spec>Use the following communication style for future messages:\n"
+    ));
+    assert!(personality_text.ends_with("</personality_spec>"));
+    assert!(!personality_text.contains("The user has requested"));
+
     Ok(())
 }
 
@@ -393,7 +399,7 @@ async fn user_turn_personality_some_adds_update_message() -> anyhow::Result<()> 
         .expect("expected personality update message in developer input");
 
     assert!(
-        personality_text.contains("The user has requested a new communication style."),
+        personality_text.contains("Use the following communication style for future messages:"),
         "expected personality update preamble, got {personality_text:?}"
     );
     assert!(
@@ -916,7 +922,7 @@ async fn user_turn_personality_remote_model_template_includes_update_message() -
         .expect("expected personality update message in developer input");
 
     assert!(
-        personality_text.contains("The user has requested a new communication style."),
+        personality_text.contains("Use the following communication style for future messages:"),
         "expected personality update preamble, got {personality_text:?}"
     );
     assert!(

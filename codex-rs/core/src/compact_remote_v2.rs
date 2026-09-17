@@ -309,6 +309,7 @@ async fn run_remote_compact_task_inner_impl(
     .await;
 
     let reference_context_item = match &initial_context_injection {
+        #[cfg(test)]
         InitialContextInjection::DoNotInject => None,
         InitialContextInjection::AtStart(_) => {
             Some(compaction_turn_context.to_turn_context_item_async().await)

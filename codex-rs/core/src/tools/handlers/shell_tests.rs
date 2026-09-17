@@ -208,14 +208,16 @@ async fn inactive_validation_enforcement_preserves_shell_failure_diagnostics() {
     let python = which::which("python")
         .or_else(|_| which::which("python3"))
         .unwrap();
-    for (tagged, exit_code) in [(true, 7), (false, 7), (true, 0)] {
+    for (tagged, exit_code, preamble_lines) in
+        [(true, 7, 0), (false, 7, 0), (true, 0, 0), (true, 7, 600)]
+    {
         let (session, mut turn) = make_session_and_context().await;
         turn.approval_policy =
             crate::config::Constrained::allow_any(codex_protocol::protocol::AskForApproval::Never);
         turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
         let mut arguments = json!({
             "kind": "argv", "program": python,
-            "args": ["-c", format!("import sys; print('ACTUAL_DIAGNOSTIC'); sys.exit({exit_code})")],
+            "args": ["-c", format!("import sys; print(('build log: ' + '.' * 80 + '\\n') * {preamble_lines}, end=''); print('error[E0308]: ACTUAL_DIAGNOSTIC'); sys.exit({exit_code})")],
         });
         if tagged {
             arguments["validation"] = json!({"covered_paths": ["src"]});
@@ -251,6 +253,16 @@ async fn inactive_validation_enforcement_preserves_shell_failure_diagnostics() {
         assert_eq!(diagnostic.is_some(), tagged && exit_code != 0);
         if let Some(diagnostic) = diagnostic {
             assert!(diagnostic.text.contains("ACTUAL_DIAGNOSTIC"));
+            assert!(diagnostic.text.len() <= 12 * 1024);
+            if preamble_lines > 0 {
+                assert_eq!(diagnostic.text.trim(), "error[E0308]: ACTUAL_DIAGNOSTIC");
+                let range = metadata
+                    .predetermined_ranges
+                    .iter()
+                    .find(|range| range.id == "validation:diagnostics")
+                    .expect("large failure has a recoverable diagnostic range");
+                assert_eq!((range.start_line, range.end_line), (601, 601));
+            }
             assert!(
                 metadata
                     .predetermined_ranges
@@ -310,6 +322,10 @@ fn validation_diagnostic_ranges_are_exact_and_bounded() {
     assert_eq!((range.start_line, range.end_line), (1, 2));
 
     assert!(super::validation_diagnostic_range("", b"failure\n").is_none());
+    let at_byte_limit =
+        super::validation_diagnostic_range("validation:diagnostics", &vec![b'x'; 12 * 1024])
+            .expect("diagnostic exactly at the byte limit");
+    assert_eq!((at_byte_limit.start_line, at_byte_limit.end_line), (1, 1));
     assert!(
         super::validation_diagnostic_range("validation:diagnostics", &vec![b'x'; 12 * 1024 + 1],)
             .is_none()
@@ -317,10 +333,10 @@ fn validation_diagnostic_ranges_are_exact_and_bounded() {
     let too_many_lines = std::iter::repeat_n("line", 201)
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(
-        super::validation_diagnostic_range("validation:diagnostics", too_many_lines.as_bytes(),)
-            .is_none()
-    );
+    let range =
+        super::validation_diagnostic_range("validation:diagnostics", too_many_lines.as_bytes())
+            .expect("large output retains a bounded range");
+    assert_eq!((range.start_line, range.end_line), (2, 201));
 }
 
 #[test]
@@ -1200,7 +1216,9 @@ async fn shell_command_active_path_applies_read_only_repair_and_retains_output()
 
     let rendered = output.code_mode_result(&payload).to_string();
     assert!(rendered.contains("known_flag_typo"));
-    assert!(rendered.contains("Raw output artifact:"));
+    // `rg --version` stays under the lazy artifact threshold, so the repaired
+    // command's output is retained inline instead of spilling to a file.
+    assert!(!rendered.contains("Raw output artifact:"));
     assert!(rendered.contains("ripgrep"));
 }
 

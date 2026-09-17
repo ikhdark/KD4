@@ -103,6 +103,7 @@ pub fn prompt_safe_plugin_description(description: Option<&str>) -> Option<Strin
 pub struct PluginLoadOutcome<M> {
     plugins: Arc<[LoadedPlugin<M>]>,
     capability_summaries: Arc<[PluginCapabilitySummary]>,
+    load_warnings: Arc<[String]>,
 }
 
 impl<M: Clone> Default for PluginLoadOutcome<M> {
@@ -121,7 +122,17 @@ impl<M: Clone> PluginLoadOutcome<M> {
         Self {
             plugins: plugins.into(),
             capability_summaries,
+            load_warnings: Arc::default(),
         }
+    }
+
+    pub fn with_load_warnings(mut self, warnings: Vec<String>) -> Self {
+        self.load_warnings = warnings.into();
+        self
+    }
+
+    pub fn load_warnings(&self) -> &[String] {
+        &self.load_warnings
     }
 
     pub fn effective_skill_roots(&self) -> Vec<AbsolutePathBuf> {

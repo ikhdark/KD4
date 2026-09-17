@@ -542,6 +542,10 @@ generate-exec-server-relay-proto:
 generate-exec-server-relay-proto-check:
     cargo run --locked --manifest-path "{{ justfile_directory() }}/codex-rs/Cargo.toml" -p codex-exec-server --example generate-relay-proto -- --check
 
+# Check both checked-in protobuf bindings using their existing freshness checks.
+[windows]
+protos-check: generate-config-proto-check generate-exec-server-relay-proto-check
+
 # Run focused config schema fixture validation without regenerating schemas.
 config-schema-protocol-check:
     just core-gate config-schema-protocol
@@ -582,9 +586,15 @@ gate-for path:
     import sys
     raise SystemExit(subprocess.call([sys.executable, r"{{ justfile_directory() }}/scripts/source_owners.py", "validation", "--path", sys.argv[1]]))
 
-[windows]
-source-owners-slice owner *args:
-    @$forwarded_args = @($args | Select-Object -Skip 2); {{ python }} "{{ justfile_directory() }}/scripts/source_owners.py" slice --owner "{{ owner }}" --max-relationships 32 @forwarded_args
+# Accept an owner ID, or --path followed by a repository path.
+[script("python")]
+source-owners-slice selector *args:
+    import subprocess
+    import sys
+    selector_args = sys.argv[1:]
+    if selector_args[0] not in ("--owner", "--path"):
+        selector_args.insert(0, "--owner")
+    raise SystemExit(subprocess.call([sys.executable, r"{{ justfile_directory() }}/scripts/source_owners.py", "slice", *selector_args]))
 
 tui-large-widget-check:
     just core-gate tui-large-widget

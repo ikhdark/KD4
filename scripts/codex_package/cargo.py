@@ -183,8 +183,15 @@ def run_cargo_build(
     release_version: str | None = None,
     build_env: dict[str, str] | None = None,
 ) -> None:
+    cargo_env = (
+        build_env
+        if build_env is not None
+        else cargo_build_env(
+            spec, profile, target_dir=target_dir, release_version=release_version
+        )
+    )
     cmd = [
-        cargo,
+        resolve_command(cargo, env=cargo_env) or cargo,
         "build",
         "--locked",
         "--target-dir",
@@ -197,13 +204,6 @@ def run_cargo_build(
     for binary in binaries:
         cmd.extend(["--bin", binary])
 
-    cargo_env = (
-        build_env
-        if build_env is not None
-        else cargo_build_env(
-            spec, profile, target_dir=target_dir, release_version=release_version
-        )
-    )
     print("+", " ".join(cmd))
     start = time.perf_counter()
     try:
@@ -825,9 +825,8 @@ def cargo_config_paths(env: dict[str, str]) -> tuple[Path, ...]:
     )
 
 
-def command_identity(
-    command: str, *args: str, env: dict[str, str] | None = None
-) -> dict[str, object]:
+def resolve_command(command: str, *, env: dict[str, str] | None = None) -> str | None:
+    """Use the build environment for both discovery and execution on Windows."""
     effective_env = os.environ if env is None else env
     cwd = CODEX_RS_ROOT.resolve()
     command_path = Path(command)
@@ -850,6 +849,13 @@ def command_identity(
             ),
             None,
         )
+    return executable
+
+
+def command_identity(
+    command: str, *args: str, env: dict[str, str] | None = None
+) -> dict[str, object]:
+    executable = resolve_command(command, env=env)
     if executable is None:
         return {"path": command, "status": "unavailable", "error": "tool not found"}
     try:

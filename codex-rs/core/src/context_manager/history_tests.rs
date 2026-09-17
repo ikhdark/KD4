@@ -49,6 +49,80 @@ const EXEC_FORMAT_MAX_BYTES: usize = 10_000;
 const EXEC_FORMAT_MAX_TOKENS: usize = 2_500;
 
 #[test]
+fn prepared_prompt_small_prefix_releases_discarded_storage() {
+    let expected = agent_message("retained");
+    let original = PreparedPromptItems::from_shared(vec![expected.clone(); 128].into());
+    let old_storage = Arc::downgrade(&original.0);
+    let prefix = original.truncated(2);
+    drop(original);
+    assert!(old_storage.upgrade().is_none());
+    assert_eq!(prefix.as_slice(), &[expected.clone(), expected]);
+    assert_eq!(prefix.get(2), None);
+
+    let lazy = prefix.appended(vec![agent_message("tail")].into());
+    let retained_storage = Arc::downgrade(&lazy.0);
+    let small_adjustment = lazy.truncated(2);
+    drop(lazy);
+    assert!(retained_storage.upgrade().is_some());
+    assert!(!small_adjustment.is_materialized());
+    let empty = small_adjustment.truncated(0);
+    drop(small_adjustment);
+    assert!(retained_storage.upgrade().is_none());
+    assert!(empty.as_slice().is_empty());
+}
+
+#[test]
+fn prepared_prompt_truncation_releases_large_discarded_storage() {
+    let first = agent_message("retained");
+    let mut source = vec![agent_message("discarded"); 1024];
+    source[0] = first.clone();
+    let source: Arc<[ResponseItem]> = source.into();
+    let weak = Arc::downgrade(&source);
+    let prefix = PreparedPromptItems::from_shared(source).truncated(1);
+    assert_eq!(prefix.shared().as_ref(), &[first]);
+    assert!(
+        weak.upgrade().is_none(),
+        "discarded backing must be released"
+    );
+
+    let source: Arc<[ResponseItem]> = vec![agent_message("small"); 4].into();
+    let weak = Arc::downgrade(&source);
+    let prefix = PreparedPromptItems::from_shared(source).truncated(3);
+    assert!(weak.upgrade().is_some(), "small cuts keep a cheap view");
+    assert_eq!(prefix.shared().len(), 3);
+}
+
+#[test]
+fn tool_search_compaction_preserves_metadata_and_nested_identities() {
+    let original = ResponseItem::ToolSearchOutput {
+        id: None,
+        call_id: Some("lookup".into()),
+        status: "completed".into(),
+        execution: "server".into(),
+        tools: vec![serde_json::json!({
+            "type": "namespace", "name": "calendar", "description": "discard",
+            "tools": [{"type": "function", "name": "create", "parameters": {"type": "object"}}]
+        })],
+        omitted_result_count: Some(2),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let compact = compact_acknowledged_tool_search_outputs(
+        vec![original.clone(), agent_message("acknowledged")].into(),
+    );
+    let mut expected = serde_json::to_value(&original).unwrap();
+    expected["tools"] = serde_json::json!([{
+        "type": "namespace", "name": "calendar",
+        "tools": [{"type": "function", "name": "create"}]
+    }]);
+    assert_eq!(serde_json::to_value(&compact[0]).unwrap(), expected);
+    assert_eq!(compact[1], agent_message("acknowledged"));
+    assert_eq!(
+        serde_json::to_value(original).unwrap()["tools"][0]["description"],
+        "discard"
+    );
+}
+
+#[test]
 fn prepared_prompt_index_uses_materialized_items_and_respects_truncation() {
     let first = agent_message("first");
     let second = agent_message("second");
@@ -328,6 +402,58 @@ fn prepared_token_estimates_cache_existing_items_and_only_measure_appends() {
 
     history.replace(vec![first, second, third]);
     assert_eq!(history.cached_item_token_estimate_count(), 0);
+}
+
+#[test]
+fn total_token_usage_caches_raw_items_without_reusing_projected_estimates() {
+    let mut items = update_plan_pair(
+        "plan",
+        &"verbose plan arguments ".repeat(100),
+        serde_json::json!({"current_plan": {"plan": [{"step": "current"}]}}),
+    );
+    items.push(user_input_text_msg("continue with the plan"));
+    for (index, item) in items.iter_mut().enumerate() {
+        item.set_id(Some(ResponseItemId::with_suffix(
+            "item",
+            &index.to_string(),
+        )));
+    }
+    let mut history = create_history_with_items(items);
+    let base = BaseInstructions {
+        text: "base".to_string(),
+    };
+    let expected_raw = ContextManager::estimate_items_token_count_with_base_instructions(
+        history.raw_items(),
+        &base,
+    )
+    .unwrap();
+    let projected = history
+        .estimate_prepared_token_count_with_base_instructions(&default_input_modalities(), &base)
+        .unwrap();
+    assert!(
+        projected < expected_raw,
+        "projection must change same-ID item content"
+    );
+    for _ in 0..2 {
+        assert_eq!(history.get_total_token_usage(false, &base), expected_raw);
+        assert_eq!(history.cached_item_token_estimate_namespace_count(), 2);
+        assert_eq!(history.cached_item_token_estimate_count(), 6);
+    }
+
+    let mut replacement = user_input_text_msg("new history");
+    replacement.set_id(Some(ResponseItemId::with_suffix("item", "2")));
+    history.replace(vec![replacement]);
+    let expected_replacement = ContextManager::estimate_items_token_count_with_base_instructions(
+        history.raw_items(),
+        &base,
+    )
+    .unwrap();
+    assert_ne!(expected_replacement, expected_raw);
+    assert_eq!(
+        history.get_total_token_usage(false, &base),
+        expected_replacement
+    );
+    assert_eq!(history.cached_item_token_estimate_count(), 1);
 }
 
 #[test]
@@ -2470,15 +2596,32 @@ fn for_prompt_assigns_stable_id_to_synthetic_output_without_reordering_history()
 
 #[test]
 fn prepared_prompt_cache_reuses_shared_items_across_non_history_changes() {
-    let mut history = create_history_with_items(vec![agent_message("hello")]);
+    let mut repository = user_input_text_msg(
+        "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\ncurrent\n</INSTRUCTIONS>",
+    );
+    crate::stable_context::mark_trusted_stable_context_item(&mut repository);
+    let mut history = create_history_with_items(vec![repository, agent_message("hello")]);
     let first = history
         .clone()
         .prepare_for_prompt(&default_input_modalities());
     history.set_token_info(history.token_info());
-    let second = history.prepare_for_prompt(&default_input_modalities());
+    let second = history
+        .clone()
+        .prepare_for_prompt(&default_input_modalities());
+    let third = history.prepare_for_prompt(&default_input_modalities());
 
     assert!(Arc::ptr_eq(&first.shared_items(), &second.shared_items()));
     assert_eq!(first.fingerprint(), second.fingerprint());
+    assert_eq!(second.fingerprint(), third.fingerprint());
+    let original = first.stable_context_manifest().components();
+    let reused = second.stable_context_manifest().components();
+    assert!(!original.is_empty());
+    assert!(original.iter().all(|component| !component.local_reused));
+    assert!(reused.iter().all(|component| component.local_reused));
+    assert!(std::ptr::eq(
+        reused,
+        third.stable_context_manifest().components()
+    ));
 }
 
 #[test]
@@ -3243,7 +3386,7 @@ fn normalize_adds_missing_output_for_tool_search_call() {
 
 #[cfg(debug_assertions)]
 #[test]
-#[should_panic]
+#[should_panic(expected = "Custom tool call output is missing for call id: tool-x")]
 fn normalize_adds_missing_output_for_custom_tool_call_panics_in_debug() {
     let items = vec![ResponseItem::CustomToolCall {
         id: None,
@@ -3260,7 +3403,7 @@ fn normalize_adds_missing_output_for_custom_tool_call_panics_in_debug() {
 
 #[cfg(debug_assertions)]
 #[test]
-#[should_panic]
+#[should_panic(expected = "Local shell call output is missing for call id: shell-1")]
 fn normalize_adds_missing_output_for_local_shell_call_with_id_panics_in_debug() {
     let items = vec![ResponseItem::LocalShellCall {
         id: None,
@@ -3281,7 +3424,7 @@ fn normalize_adds_missing_output_for_local_shell_call_with_id_panics_in_debug() 
 
 #[cfg(debug_assertions)]
 #[test]
-#[should_panic]
+#[should_panic(expected = "Orphan function call output for call id: orphan-1")]
 fn normalize_removes_orphan_function_call_output_panics_in_debug() {
     let items = vec![ResponseItem::FunctionCallOutput {
         id: None,
@@ -3295,7 +3438,7 @@ fn normalize_removes_orphan_function_call_output_panics_in_debug() {
 
 #[cfg(debug_assertions)]
 #[test]
-#[should_panic]
+#[should_panic(expected = "Orphan custom tool call output for call id: orphan-2")]
 fn normalize_removes_orphan_custom_tool_call_output_panics_in_debug() {
     let items = vec![ResponseItem::CustomToolCallOutput {
         id: None,
@@ -3329,7 +3472,7 @@ fn normalize_removes_orphan_client_tool_search_output() {
 
 #[cfg(debug_assertions)]
 #[test]
-#[should_panic]
+#[should_panic(expected = "Orphan tool search output for call id: orphan-search")]
 fn normalize_removes_orphan_client_tool_search_output_panics_in_debug() {
     let items = vec![ResponseItem::ToolSearchOutput {
         id: None,
@@ -3375,7 +3518,7 @@ fn normalize_keeps_server_tool_search_output_without_matching_call() {
 
 #[cfg(debug_assertions)]
 #[test]
-#[should_panic]
+#[should_panic(expected = "Custom tool call output is missing for call id: t1")]
 fn normalize_mixed_inserts_and_removals_panics_in_debug() {
     let items = vec![
         ResponseItem::FunctionCall {
@@ -3860,4 +4003,54 @@ fn tool_history_mutations_preserve_canonical_preparation() {
     let second = history.prepare_for_prompt(&default_input_modalities());
     assert!(Arc::ptr_eq(&first.shared_items(), &second.shared_items()));
     assert_eq!(first.fingerprint(), second.fingerprint());
+}
+
+#[test]
+fn idless_token_estimates_are_cached_and_invalidated_on_rewrite() {
+    let first = user_input_text_msg("initial instruction");
+    let second = assistant_msg("response");
+    assert!(first.id().is_none() && second.id().is_none());
+    let mut history = create_history_with_items(vec![first, second]);
+    let base = BaseInstructions {
+        text: "base".into(),
+    };
+    for _ in 0..2 {
+        let expected = ContextManager::estimate_items_token_count_with_base_instructions(
+            history
+                .clone()
+                .prepare_for_prompt(&default_input_modalities())
+                .items(),
+            &base,
+        );
+        assert_eq!(
+            history.estimate_prepared_token_count_with_base_instructions(
+                &default_input_modalities(),
+                &base
+            ),
+            expected
+        );
+        assert_eq!(history.cached_item_token_estimate_count(), 2);
+    }
+    history.record_items(
+        [&assistant_msg("appended")],
+        TruncationPolicy::Tokens(10_000),
+    );
+    history
+        .estimate_prepared_token_count_with_base_instructions(&default_input_modalities(), &base)
+        .unwrap();
+    assert_eq!(history.cached_item_token_estimate_count(), 3);
+    history.replace(vec![user_input_text_msg(&"replacement ".repeat(100))]);
+    assert_eq!(history.cached_item_token_estimate_count(), 0);
+    let expected = ContextManager::estimate_items_token_count_with_base_instructions(
+        history.raw_items(),
+        &base,
+    );
+    assert_eq!(
+        history.estimate_prepared_token_count_with_base_instructions(
+            &default_input_modalities(),
+            &base
+        ),
+        expected
+    );
+    assert_eq!(history.cached_item_token_estimate_count(), 1);
 }

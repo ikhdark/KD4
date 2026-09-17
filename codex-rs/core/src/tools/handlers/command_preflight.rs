@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::path::Path;
 
+use super::command_search::rg_search_path_operands;
 use crate::shell::ShellType;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use codex_shell_command::quote_powershell_single_quoted;
@@ -346,8 +347,12 @@ fn git_status_read_only_equivalent(invocation: &CommandInvocation) -> Option<Com
     let CommandInvocation::Argv { program, args } = invocation else {
         return None;
     };
-    if !program_name(program).eq_ignore_ascii_case("git")
-        || args.first().map(String::as_str) != Some("status")
+    let command = invocation.to_direct_argv()?;
+    let (subcommand_index, _) =
+        codex_shell_command::is_dangerous_command::find_git_subcommand(&command, &["status"])?;
+    if command[1..subcommand_index]
+        .iter()
+        .any(|arg| arg == "--no-optional-locks")
     {
         return None;
     }
@@ -961,38 +966,13 @@ fn lint_rg_literal_glob_paths(
         return Ok(());
     }
 
-    let Some(program) = argv.first().map(|program| program_name(program)) else {
-        return Ok(());
-    };
-    if !matches_ignore_ascii_case(program, &["rg", "rga"]) {
+    // Share argument roles with search scoping so explicit patterns, short
+    // option clusters, and metadata modes cannot be mistaken for path operands.
+    if !argv.first().is_some_and(|program| is_rg_program(program)) {
         return Ok(());
     }
-
-    let files_mode = argv
-        .iter()
-        .skip(1)
-        .take_while(|arg| arg.as_str() != "--")
-        .any(|arg| arg == "--files");
-    let mut positional = 0usize;
-    let mut index = 1usize;
-    let mut options_terminated = false;
-    while let Some(arg) = argv.get(index) {
-        if !options_terminated && arg == "--" {
-            options_terminated = true;
-            index += 1;
-            continue;
-        }
-        if !options_terminated && rg_option_consumes_next(arg) {
-            index += 2;
-            continue;
-        }
-        if !options_terminated && arg.starts_with('-') {
-            index += 1;
-            continue;
-        }
-
-        let is_path_position = files_mode || positional > 0;
-        if is_path_position && looks_like_unexpanded_glob_path(arg) {
+    for arg in rg_search_path_operands(&[argv.to_vec()]).unwrap_or_default() {
+        if looks_like_unexpanded_glob_path(&arg) {
             let detail = match shell_type {
                 Some(ShellType::PowerShell) => format!(
                     "PowerShell does not POSIX-expand native-command wildcard path arguments; `rg` receives `{arg}` as a literal path."
@@ -1015,9 +995,6 @@ fn lint_rg_literal_glob_paths(
                 None,
             ));
         }
-
-        positional += 1;
-        index += 1;
     }
 
     Ok(())

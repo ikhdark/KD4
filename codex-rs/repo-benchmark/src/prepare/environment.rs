@@ -20,8 +20,6 @@ model_reasoning_effort = "high"
 plan_mode_reasoning_effort = "ultra"
 model_verbosity = "low"
 model_reasoning_summary = "concise"
-model_auto_compact_token_limit = 129000
-model_auto_compact_token_limit_scope = "total"
 "#;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -96,7 +94,7 @@ impl ProjectConfigComparison {
         let mut project_keys = BTreeMap::new();
         leaves(&serde_json::to_value(project)?, "", &mut project_keys);
         let mut by_variant = BTreeMap::new();
-        for variant in Variant::ALL {
+        for &variant in overrides.keys() {
             let mut benchmark_keys = BTreeMap::new();
             leaves(
                 &configured_value(base, &overrides[&variant])?,

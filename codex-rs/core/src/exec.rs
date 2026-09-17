@@ -980,6 +980,7 @@ struct OutputCapture {
     max_bytes: Option<usize>,
     truncated: bool,
     omitted_bytes: usize,
+    drain_timed_out: bool,
 }
 
 impl OutputCapture {
@@ -994,6 +995,7 @@ impl OutputCapture {
             max_bytes,
             truncated: false,
             omitted_bytes: 0,
+            drain_timed_out: false,
         }
     }
 
@@ -1023,8 +1025,12 @@ impl OutputCapture {
         }
     }
 
-    fn mark_truncated(&mut self) {
+    fn mark_drain_timeout(&mut self) {
         self.truncated = true;
+        if !self.drain_timed_out {
+            self.drain_timed_out = true;
+            self.append(b"\n[... output capture stopped: pipe drain deadline exceeded ...]\n");
+        }
     }
 
     fn snapshot(&self) -> StreamOutput<Vec<u8>> {
@@ -1218,7 +1224,7 @@ async fn consume_output(
         }
     };
     tokio::pin!(expiration_wait);
-    let (exit_status, timed_out) = tokio::select! {
+    let (exit_status, timed_out, cancelled) = tokio::select! {
         status_result = child.wait() => {
             let exit_status = status_result?;
             if let Err(err) = managed_root.preserve_descendants() {
@@ -1226,7 +1232,7 @@ async fn consume_output(
                     "Windows direct exec failed to preserve descendants after root exit: {err}"
                 );
             }
-            (exit_status, false)
+            (exit_status, false, false)
         }
         outcome = &mut expiration_wait => {
             match outcome {
@@ -1238,11 +1244,12 @@ async fn consume_output(
                     (
                         synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + TIMEOUT_CODE),
                         true,
+                        false,
                     )
                 }
                 Some(ExecExpirationOutcome::Cancelled) => {
                     terminate_and_reap_child_process_tree(child, managed_root).await?;
-                    (synthetic_exit_status_for_code(/*code*/ 1), false)
+                    (synthetic_exit_status_for_code(/*code*/ 130), false, true)
                 }
                 None => unreachable!("expiration wait only resolves while expiration is active"),
             }
@@ -1250,7 +1257,7 @@ async fn consume_output(
     };
 
     let drain_deadline = tokio::time::Instant::now() + capture_policy.io_drain_timeout();
-    let (stdout, stderr) = await_captured_output_until_deadline(
+    let (stdout, mut stderr) = await_captured_output_until_deadline(
         stdout_handle,
         stderr_handle,
         Arc::clone(&stdout_capture),
@@ -1259,6 +1266,18 @@ async fn consume_output(
         drain_deadline,
     )
     .await?;
+    if cancelled {
+        const CANCELLATION_NOTICE: &[u8] = b"\nCommand cancelled.\n";
+        let mut capture = stderr_capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        capture.append(CANCELLATION_NOTICE);
+        stderr = capture.snapshot();
+        aggregate_capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .append(CANCELLATION_NOTICE);
+    }
     let aggregated_output = aggregate_capture
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1298,11 +1317,11 @@ async fn await_captured_output_until_deadline(
                 capture
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .mark_truncated();
+                    .mark_drain_timeout();
                 aggregate_capture
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .mark_truncated();
+                    .mark_drain_timeout();
             }
         }
         Ok(capture

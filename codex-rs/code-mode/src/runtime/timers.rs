@@ -12,6 +12,8 @@ use super::RuntimeState;
 use super::module_loader::is_exit_exception;
 use super::value::value_to_error_text;
 
+const MAX_PENDING_TIMEOUTS_PER_CELL: usize = 128;
+
 pub(super) struct ScheduledTimeout {
     callback: v8::Global<v8::Function>,
 }
@@ -101,6 +103,9 @@ fn run_scheduler(
             }
             TimerSchedulerCommand::Cancel { id } => {
                 scheduled.remove(&id);
+                // A long-lived earlier timer must not retain cancelled later
+                // deadlines indefinitely when a cell repeatedly replaces timers.
+                deadlines.retain(|Reverse((_, pending_id))| *pending_id != id);
             }
             TimerSchedulerCommand::Shutdown => break,
         }
@@ -128,6 +133,11 @@ pub(super) fn schedule_timeout(
     let state = scope
         .get_slot_mut::<RuntimeState>()
         .ok_or_else(|| "runtime state unavailable".to_string())?;
+    if state.pending_timeouts.len() >= MAX_PENDING_TIMEOUTS_PER_CELL {
+        return Err(format!(
+            "code mode cell exceeded its limit of {MAX_PENDING_TIMEOUTS_PER_CELL} pending timers"
+        ));
+    }
     let timeout_id = state.next_timeout_id;
     state.next_timeout_id = state.next_timeout_id.saturating_add(1);
     state

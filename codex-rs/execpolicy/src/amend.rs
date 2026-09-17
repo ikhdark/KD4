@@ -149,7 +149,9 @@ fn append_rule_line(policy_path: &Path, rule: &str, deduplicate: bool) -> Result
 }
 
 fn append_locked_line(policy_path: &Path, line: &str, deduplicate: bool) -> Result<(), AmendError> {
-    let mut file = OpenOptions::new()
+    // Create through any symlink before resolving the destination. Never replace
+    // the symlink itself, including when it initially has a missing target.
+    let file = OpenOptions::new()
         .create(true)
         .read(true)
         .append(true)
@@ -158,10 +160,46 @@ fn append_locked_line(policy_path: &Path, line: &str, deduplicate: bool) -> Resu
             path: policy_path.to_path_buf(),
             source,
         })?;
-    file.lock().map_err(|source| AmendError::LockPolicyFile {
-        path: policy_path.to_path_buf(),
-        source,
-    })?;
+    let write_path =
+        std::fs::canonicalize(policy_path).map_err(|source| AmendError::OpenPolicyFile {
+            path: policy_path.to_path_buf(),
+            source,
+        })?;
+    drop(file);
+
+    // Lock a stable sibling: locking the destination inode cannot serialize
+    // read/modify/replace operations once that inode has been replaced.
+    let mut lock_name = std::ffi::OsString::from(".");
+    lock_name.push(
+        write_path
+            .file_name()
+            .ok_or_else(|| AmendError::MissingParent {
+                path: policy_path.to_path_buf(),
+            })?,
+    );
+    lock_name.push(".lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(write_path.with_file_name(lock_name))
+        .and_then(|file| {
+            file.lock()?;
+            Ok(file)
+        })
+        .map_err(|source| AmendError::LockPolicyFile {
+            path: policy_path.to_path_buf(),
+            source,
+        })?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&write_path)
+        .map_err(|source| AmendError::OpenPolicyFile {
+            path: policy_path.to_path_buf(),
+            source,
+        })?;
 
     file.seek(SeekFrom::Start(0))
         .map_err(|source| AmendError::SeekPolicyFile {
@@ -191,18 +229,40 @@ fn append_locked_line(policy_path: &Path, line: &str, deduplicate: bool) -> Resu
     }
 
     if !contents.is_empty() && !contents.ends_with('\n') {
-        file.write_all(b"\n")
-            .map_err(|source| AmendError::WritePolicyFile {
-                path: policy_path.to_path_buf(),
-                source,
-            })?;
+        contents.push('\n');
     }
-
-    file.write_all(format!("{line}\n").as_bytes())
-        .map_err(|source| AmendError::WritePolicyFile {
+    contents.push_str(line);
+    contents.push('\n');
+    let permissions = file
+        .metadata()
+        .map_err(|source| AmendError::ReadPolicyFile {
             path: policy_path.to_path_buf(),
             source,
-        })?;
+        })?
+        .permissions();
+    drop(file);
+
+    // This crate is below codex-file-system in the dependency graph. Keep the
+    // same temporary-file publication discipline without introducing a cycle.
+    let publish = || -> std::io::Result<()> {
+        let mut temporary = tempfile::NamedTempFile::new_in(
+            write_path
+                .parent()
+                .expect("canonical policy path has a parent"),
+        )?;
+        temporary.write_all(contents.as_bytes())?;
+        temporary.as_file().set_permissions(permissions)?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(&write_path)
+            .map_err(|error| error.error)?;
+        Ok(())
+    };
+    publish().map_err(|source| AmendError::WritePolicyFile {
+        path: policy_path.to_path_buf(),
+        source,
+    })?;
+    drop(lock);
 
     Ok(())
 }
@@ -239,6 +299,96 @@ mod tests {
         let mut last = [1];
         file.read_exact(&mut last).expect("read last byte");
         assert_eq!(last, [0]);
+    }
+
+    #[test]
+    fn amendment_preserves_open_snapshot() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("default.rules");
+        std::fs::write(&path, "# original\n").unwrap();
+        let mut snapshot = std::fs::File::open(&path).unwrap();
+        blocking_append_allow_prefix_rule(&path, &["echo".into()]).unwrap();
+        let mut original = String::new();
+        snapshot.read_to_string(&mut original).unwrap();
+        assert_eq!(original, "# original\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# original\nprefix_rule(pattern=[\"echo\"], decision=\"allow\")\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn amendment_preserves_symlink_and_target_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("target.rules");
+        let link = tmp.path().join("default.rules");
+        std::fs::write(&target, "# original\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::os::unix::fs::symlink("target.rules", &link).unwrap();
+        blocking_append_allow_prefix_rule(&link, &["echo".into()]).unwrap();
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            Path::new("target.rules")
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "# original\nprefix_rule(pattern=[\"echo\"], decision=\"allow\")\n"
+        );
+    }
+
+    #[test]
+    fn concurrent_amendments_preserve_distinct_rules_and_deduplicate() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("default.rules");
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let path = &path;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    blocking_append_allow_prefix_rule(path, &[format!("command{}", index % 4)])
+                        .unwrap();
+                });
+            }
+        });
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let mut lines = contents.lines().collect::<Vec<_>>();
+        lines.sort_unstable();
+        assert_eq!(
+            lines,
+            [
+                "prefix_rule(pattern=[\"command0\"], decision=\"allow\")",
+                "prefix_rule(pattern=[\"command1\"], decision=\"allow\")",
+                "prefix_rule(pattern=[\"command2\"], decision=\"allow\")",
+                "prefix_rule(pattern=[\"command3\"], decision=\"allow\")",
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_replacement_leaves_policy_unchanged() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("default.rules");
+        std::fs::write(&path, "# original\n").unwrap();
+        // Readers that do not share deletion prevent atomic publication.
+        let _reader = OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(&path)
+            .unwrap();
+        let error = blocking_append_allow_prefix_rule(&path, &["echo".into()]).unwrap_err();
+        assert!(matches!(error, AmendError::WritePolicyFile { .. }));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# original\n");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 2);
     }
 
     #[test]

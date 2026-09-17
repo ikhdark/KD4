@@ -168,6 +168,9 @@ fn includes_request_rule_instructions_for_on_request() {
     let text = instructions.body();
     assert!(text.contains("prefix_rule"));
     assert!(text.contains("Approved command prefixes"));
+    assert!(text.contains("Simple PowerShell `-NoProfile` commands can match"));
+    assert!(text.contains("cmd.exe `^` escapes characters"));
+    assert!(text.contains("Unsupported syntax may require approval for the whole invocation"));
     assert!(text.contains(r#"["git", "pull"]"#));
     assert!(text.contains("A network error alone does not establish that escalation will help."));
     assert!(
@@ -179,6 +182,7 @@ fn includes_request_rule_instructions_for_on_request() {
         "otherwise resume the failed portion with its required inputs and working directory"
     ));
     assert!(text.contains("Use the returned result to avoid replaying completed effects"));
+    assert!(text.contains("Do not evade the approval flow by switching tools or techniques, or by delegating to another agent."));
 }
 
 #[test]
@@ -220,7 +224,11 @@ fn includes_request_permission_rule_instructions_for_on_request_when_enabled() {
     assert!(text.contains("with_additional_permissions"));
     assert!(text.contains("additional_permissions"));
     assert!(text.contains("Propose only narrowly scoped reusable prefixes."));
+    assert!(text.contains("Do not evade the approval flow by switching tools or techniques, or by delegating to another agent."));
     assert!(text.contains("Never provide `prefix_rule` for interpreter-only prefixes, destructive commands, heredocs, or herestrings."));
+    assert!(text.contains("Simple PowerShell `-NoProfile` commands can match"));
+    assert!(text.contains("cmd.exe `^` are not POSIX separators"));
+    assert!(text.contains("Unsupported syntax may require approval for the whole invocation"));
 }
 
 #[test]

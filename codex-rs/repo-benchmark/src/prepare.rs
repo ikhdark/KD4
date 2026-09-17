@@ -49,6 +49,7 @@ pub const MANIFEST_VERSION: u32 = 2;
 pub struct PrepareOptions {
     pub repo: PathBuf,
     pub mode: Mode,
+    pub fork_only_on: bool,
     pub fork_ref: String,
     pub reference_checkout: Option<PathBuf>,
 }
@@ -80,6 +81,8 @@ pub struct Prepared {
     pub directory: PathBuf,
     pub repo: PathBuf,
     pub mode: Mode,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fork_only_on: bool,
     pub schedule: Vec<ScheduledAttempt>,
     pub workspace: PathBuf,
     pub workspace_lock: PathBuf,
@@ -144,6 +147,40 @@ pub fn resolve_source(
         checkout,
         upstream,
     })
+}
+
+fn resolve_reference(
+    repo: &Path,
+    reference_checkout: Option<&Path>,
+    checkout: PathBuf,
+) -> Result<SourceIdentity> {
+    if let Some(origin) = reference_checkout {
+        return resolve_source(origin, "HEAD", checkout, false);
+    }
+    // Release branches need not be ancestors of upstream/main. Use local release
+    // tags so ordinary main commits cannot advance the benchmark baseline.
+    let tags = git(repo, &["tag", "--list", "rust-v*"])?;
+    let release = tags
+        .lines()
+        .filter_map(|tag| {
+            let mut parts = tag.strip_prefix("rust-v")?.split('.');
+            let mut version = [0_u64; 3];
+            for component in &mut version {
+                let part = parts.next()?;
+                if part.is_empty()
+                    || !part.bytes().all(|byte| byte.is_ascii_digit())
+                    || part.len() > 1 && part.starts_with('0')
+                {
+                    return None;
+                }
+                *component = part.parse().ok()?;
+            }
+            parts.next().is_none().then_some((version, tag))
+        })
+        .max_by_key(|(version, _)| *version)
+        .map(|(_, tag)| tag)
+        .context("no local stable upstream release tag (rust-vMAJOR.MINOR.PATCH); make upstream release tags available or select --reference CHECKOUT (no automatic fetch)")?;
+    resolve_source(repo, &format!("refs/tags/{release}"), checkout, true)
 }
 
 fn checkout(source: &SourceIdentity) -> Result<()> {
@@ -382,15 +419,15 @@ pub fn prepare(options: PrepareOptions) -> Result<PathBuf> {
         directory.join("sources/fork"),
         false,
     )?;
-    let reference = match &options.reference_checkout {
-        Some(path) => resolve_source(path, "HEAD", directory.join("sources/reference"), false)?,
-        None => resolve_source(
-            &repo,
-            "upstream/main",
-            directory.join("sources/reference"),
-            true,
-        )?,
-    };
+    let reference = resolve_reference(
+        &repo,
+        options.reference_checkout.as_deref(),
+        directory.join("sources/reference"),
+    )?;
+    eprintln!(
+        "Reference: {} at {}",
+        reference.selection, reference.revision
+    );
     let environment = Environment::capture(&repo)?;
     validate_selected_toolchain(&fork, &environment.rust_toolchain, "fork variants")?;
     validate_selected_toolchain(&reference, &environment.rust_toolchain, "reference")?;
@@ -402,11 +439,14 @@ pub fn prepare(options: PrepareOptions) -> Result<PathBuf> {
     let inventory: toml::Value = toml::from_str(&fs::read_to_string(&inventory_path)?)?;
     let features: Vec<Value> =
         serde_json::from_value(serde_json::to_value(&inventory["features"])?)?;
-    let overrides = BTreeMap::from([
+    let mut overrides = BTreeMap::from([
         (Variant::ForkOff, feature_overrides(&features, false)?),
         (Variant::ForkOn, feature_overrides(&features, true)?),
         (Variant::Reference, vec![]),
     ]);
+    if options.fork_only_on {
+        overrides.remove(&Variant::ForkOff);
+    }
     let project_config_comparison =
         ProjectConfigComparison::capture(&repo, BASE_CONFIG, &overrides)?;
     let shared_inputs = directory.join("frozen/shared");
@@ -482,11 +522,14 @@ pub fn prepare(options: PrepareOptions) -> Result<PathBuf> {
         &reference_targets,
     )
     .with_context(|| format!("reference at {}", reference.revision))?;
-    let builds = BTreeMap::from([
+    let mut builds = BTreeMap::from([
         (Variant::ForkOff, fork_build.clone()),
         (Variant::ForkOn, fork_build),
         (Variant::Reference, reference_build),
     ]);
+    if options.fork_only_on {
+        builds.remove(&Variant::ForkOff);
+    }
     let mut fixtures = BTreeMap::new();
     let scripted = directory.join("fixtures/scripted");
     copy_tree(&shared_inputs, &scripted)?;
@@ -540,7 +583,8 @@ pub fn prepare(options: PrepareOptions) -> Result<PathBuf> {
         directory: directory.clone(),
         repo: repo.clone(),
         mode: options.mode,
-        schedule: schedule(options.mode),
+        fork_only_on: options.fork_only_on,
+        schedule: schedule(options.mode, options.fork_only_on),
         workspace,
         workspace_lock: directory.join("workspace.lock"),
         additional_roots: vec![],
@@ -581,12 +625,19 @@ impl Prepared {
             "unsupported prepared manifest version"
         );
         ensure!(
-            prepared.schedule == schedule(prepared.mode),
+            prepared.schedule == schedule(prepared.mode, prepared.fork_only_on),
             "prepared workload schedule changed"
         );
         // Loaded manifests are an external boundary. Verify mandatory map entries
         // before execution can reset the workspace or publish run evidence.
-        for variant in Variant::ALL {
+        if prepared.fork_only_on {
+            ensure!(
+                !prepared.builds.contains_key(&Variant::ForkOff)
+                    && !prepared.overrides.contains_key(&Variant::ForkOff),
+                "fork-only-on manifest contains fork_off configuration"
+            );
+        }
+        for variant in Variant::selected(prepared.fork_only_on) {
             ensure!(
                 prepared.overrides.contains_key(&variant),
                 "prepared manifest lacks overrides for {}",

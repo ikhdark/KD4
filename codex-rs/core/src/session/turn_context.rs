@@ -130,7 +130,7 @@ impl TurnEnvironment {
         if self.cwd != *cwd {
             return None;
         }
-        self.shell_snapshot.clone().await
+        self.shell_snapshot.clone().now_or_never().flatten()
     }
 
     pub(crate) fn cwd(&self) -> &PathUri {

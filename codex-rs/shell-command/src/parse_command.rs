@@ -114,6 +114,21 @@ mod tests {
     }
 
     #[test]
+    fn bounded_source_reads_parse_as_reads_for_output_shaping() {
+        for source in ["sed -n '1,700p' src/lib.rs", "rg -n pattern src/lib.rs"] {
+            let parsed = parse_shell_script(source);
+            assert!(
+                !parsed.is_empty()
+                    && parsed.iter().all(|command| matches!(
+                        command,
+                        ParsedCommand::Read { .. } | ParsedCommand::Search { .. }
+                    )),
+                "{source}: {parsed:?}"
+            );
+        }
+    }
+
+    #[test]
     fn git_status_is_unknown() {
         assert_parsed(
             &vec_str(&["git", "status"]),

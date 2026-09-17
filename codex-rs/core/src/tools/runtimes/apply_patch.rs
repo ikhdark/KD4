@@ -86,6 +86,15 @@ impl ApplyPatchRuntime {
         Self::default()
     }
 
+    pub(crate) fn with_workspace_operation_permit(
+        workspace_operation_permit: Option<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Self {
+        Self {
+            workspace_operation_permit,
+            ..Self::new()
+        }
+    }
+
     pub fn mutation_in_progress(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         self.mutation_in_progress.clone()
     }
@@ -518,11 +527,7 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
             let sandbox_denied = failed && is_likely_sandbox_denied(attempt.sandbox, &output);
             self.finish_mutation_evidence(ctx, !sandbox_denied).await;
             if sandbox_denied {
-                // A denied attempt with no possible writes need not serialize the
-                // next user approval. Retain the gate for any committed/uncertain delta.
-                if self.committed_delta.is_empty() && self.committed_delta.is_exact() {
-                    self.workspace_operation_permit.take();
-                }
+                // Keep the verified file state serialized across retry approval too.
                 return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
                     output: Box::new(output),
                     network_policy_decision: None,

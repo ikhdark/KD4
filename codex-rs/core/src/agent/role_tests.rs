@@ -558,6 +558,31 @@ fn spawn_tool_spec_marks_role_locked_model_and_reasoning_effort() {
 }
 
 #[test]
+fn spawn_tool_spec_keeps_configured_role_files_fresh_after_building_defaults() {
+    let defaults = spawn_tool_spec::build(&BTreeMap::new());
+    assert!(defaults.contains("default: {\nDefault agent.\n}"));
+    let tempdir = TempDir::new().expect("create temp dir");
+    let role_path = tempdir.path().join("researcher.toml");
+    let roles = BTreeMap::from([(
+        "researcher".to_string(),
+        AgentRoleConfig {
+            description: Some("Research carefully.".to_string()),
+            config_file: Some(role_path.clone()),
+            nickname_candidates: None,
+        },
+    )]);
+
+    fs::write(&role_path, "model = \"first-model\"\n").expect("write role config");
+    let first = spawn_tool_spec::build(&roles);
+    assert!(first.contains("This role's model is set to `first-model`"));
+    fs::write(&role_path, "model = \"second-model\"\n").expect("update role config");
+    let updated = spawn_tool_spec::build(&roles);
+    assert!(updated.contains("This role's model is set to `second-model`"));
+    assert!(!updated.contains("first-model"));
+    assert_eq!(spawn_tool_spec::build(&BTreeMap::new()), defaults);
+}
+
+#[test]
 fn spawn_tool_spec_marks_role_locked_reasoning_effort_only() {
     let tempdir = TempDir::new().expect("create temp dir");
     let role_path = tempdir.path().join("reviewer.toml");

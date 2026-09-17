@@ -36,6 +36,7 @@ use crate::context::RecommendedPluginsInstructions;
 use crate::context::TaskModelGuidance;
 use crate::context::base_instructions_own_task_model_guidance;
 use crate::context::is_startup_contextual_user_fragment;
+use crate::context::world_state::WorldState;
 use crate::context_manager::ContextManager;
 use crate::context_manager::PreparedPromptInput;
 use crate::context_manager::compact_acknowledged_tool_search_outputs;
@@ -788,8 +789,7 @@ pub(crate) async fn run_turn(
                         &request_signals,
                         &settled_state,
                         has_pending_input,
-                        kd4_runtime
-                            && protocol_resample_completion_allowed(server_resample_eligible),
+                        kd4_runtime && server_resample_eligible,
                     )
                 });
                 if terminal_completion_required {
@@ -885,7 +885,7 @@ pub(crate) async fn run_turn(
                         /*fallback_step_context*/ None,
                         &mut client_session,
                         prefetched_workspace_identity.as_ref(),
-                        InitialContextInjection::AtStart(Arc::clone(&world_state)),
+                        Some(Arc::clone(&world_state)),
                         CompactionReason::ContextLimit,
                         CompactionPhase::MidTurn,
                         &cancellation_token,
@@ -959,7 +959,7 @@ pub(crate) async fn run_turn(
                         .await;
                         stop_hook_active = true;
                         reasoning_governor.host_diagnose();
-                        clear_pending_generation_request(&mut pending_generation_request);
+                        pending_generation_request = None;
                         pending_continuation_cause = Some(ContinuationCause::StopHook);
                         continue 'sampling_loop;
                     }
@@ -1053,7 +1053,7 @@ pub(crate) async fn run_turn(
                     {
                         break;
                     } else {
-                        clear_pending_generation_request(&mut pending_generation_request);
+                        pending_generation_request = None;
                         pending_continuation_cause = Some(ContinuationCause::InvalidImageRecovery);
                         continue;
                     }
@@ -1091,10 +1091,6 @@ pub(crate) async fn run_turn(
         required_tool_terminal: None,
         defer_pending_input,
     })
-}
-
-fn clear_pending_generation_request<Request>(pending_generation_request: &mut Option<Request>) {
-    *pending_generation_request = None;
 }
 
 fn rebase_generation_request_after_compaction(
@@ -1189,7 +1185,7 @@ fn authoritative_wait_terminal_surface(
 // Keep a finite emergency boundary for genuinely non-converging turns while
 // leaving room for legitimate multi-step tool work. Deterministic repeated
 // cycles are handled earlier by the reasoning governor.
-const MAX_REGULAR_LOGICAL_GENERATIONS: u32 = 32;
+const MAX_REGULAR_LOGICAL_GENERATIONS: u32 = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LogicalGenerationAdmission {
@@ -1198,7 +1194,7 @@ enum LogicalGenerationAdmission {
     Exhausted,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct LogicalGenerationBudget {
     regular_generations: u32,
     terminal_generation_used: bool,
@@ -1237,12 +1233,8 @@ impl LogicalGenerationBudget {
     }
 
     fn can_admit(&self, terminal_requested: bool) -> bool {
-        if terminal_requested {
-            !self.terminal_generation_used
-        } else {
-            self.regular_generations < MAX_REGULAR_LOGICAL_GENERATIONS
-                || !self.terminal_generation_used
-        }
+        let mut preview = *self;
+        preview.admit(terminal_requested) != LogicalGenerationAdmission::Exhausted
     }
 }
 
@@ -1331,36 +1323,17 @@ async fn report_logical_generation_budget_exhausted(
     .await;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RegularFollowUpAdmission {
-    Admit,
-    Exhausted,
-}
-
-fn regular_follow_up_admission(
-    budget: &LogicalGenerationBudget,
-    exhaustion_reported: bool,
-) -> RegularFollowUpAdmission {
-    if exhaustion_reported || !budget.can_admit(/*terminal_requested*/ false) {
-        RegularFollowUpAdmission::Exhausted
-    } else {
-        RegularFollowUpAdmission::Admit
-    }
-}
-
 async fn admit_regular_follow_up(
     sess: &Session,
     turn_context: &TurnContext,
     budget: &LogicalGenerationBudget,
     exhaustion_reported: &mut bool,
 ) -> bool {
-    match regular_follow_up_admission(budget, *exhaustion_reported) {
-        RegularFollowUpAdmission::Admit => true,
-        RegularFollowUpAdmission::Exhausted => {
-            report_logical_generation_budget_exhausted(sess, turn_context, exhaustion_reported)
-                .await;
-            false
-        }
+    if *exhaustion_reported || !budget.can_admit(/*terminal_requested*/ false) {
+        report_logical_generation_budget_exhausted(sess, turn_context, exhaustion_reported).await;
+        false
+    } else {
+        true
     }
 }
 
@@ -1390,10 +1363,6 @@ fn generation_needs_follow_up(
     } else {
         model_needs_follow_up || has_pending_input
     }
-}
-
-fn protocol_resample_completion_allowed(server_resample_eligible: bool) -> bool {
-    server_resample_eligible
 }
 
 fn generation_request_action_changed(
@@ -1973,13 +1942,14 @@ async fn stabilize_pending_turn_plan(
 ) -> CodexResult<PendingTurnPlan> {
     let mut check_previous_model_compaction = true;
     let mut incoming_precompaction_completed = false;
+    let mut last_retry_reason = "retry budget was exhausted before this planning invocation";
     loop {
         if cancellation_token.is_cancelled() {
             return Err(CodexErr::TurnAborted);
         }
         // Charge every attempt before maintenance or snapshot work, including
         // retries caused by compaction and stale generations.
-        advance_pending_turn_plan_iteration(planning_iterations)
+        advance_pending_turn_plan_iteration(planning_iterations, last_retry_reason)
             .map_err(|message| planning_failure_with_timing(turn_context, message))?;
 
         // Model-transition compaction is independent of pending input. Context-pressure
@@ -1997,7 +1967,8 @@ async fn stabilize_pending_turn_plan(
         .await?;
         drop(compaction_timing_guard);
         check_previous_model_compaction = false;
-        if history_compaction.reason.is_some() {
+        if history_compaction.is_some() {
+            last_retry_reason = "history compaction invalidated the plan";
             client_session.invalidate_incremental_history("compaction");
             turn_context
                 .turn_timing_state
@@ -2033,7 +2004,10 @@ async fn stabilize_pending_turn_plan(
         .or_cancel(cancellation_token)
         .await??;
         let plan = match plan_build {
-            PendingTurnPlanBuild::Stale => continue,
+            PendingTurnPlanBuild::Stale => {
+                last_retry_reason = "planning generation changed while building the plan";
+                continue;
+            }
             PendingTurnPlanBuild::Ready(plan) => *plan,
         };
         turn_context
@@ -2058,6 +2032,7 @@ async fn stabilize_pending_turn_plan(
         .await?;
         drop(compaction_timing_guard);
         if compaction_reason.is_some() {
+            last_retry_reason = "pending-input compaction invalidated the plan";
             incoming_precompaction_completed = true;
             client_session.invalidate_incremental_history("compaction");
             turn_context
@@ -2094,11 +2069,13 @@ async fn stabilize_pending_turn_plan(
                 .turn_timing_state
                 .record_planning_semantic_effect();
             if inventory_changed {
+                last_retry_reason = "MCP dependency installation changed the inventory";
                 client_session.invalidate_incremental_history("model-visible planning effect");
                 turn_context
                     .turn_timing_state
                     .record_planning_invalidation();
                 require_newer_planning_generation(
+                    &effect.id,
                     plan.planning_generation,
                     sess.services.planning_generation(),
                 )
@@ -2108,6 +2085,7 @@ async fn stabilize_pending_turn_plan(
         }
 
         if sess.services.planning_generation() != plan.planning_generation {
+            last_retry_reason = "planning generation changed before committing the plan";
             turn_context
                 .turn_timing_state
                 .record_planning_invalidation();
@@ -2119,11 +2097,14 @@ async fn stabilize_pending_turn_plan(
 
 const MAX_PENDING_TURN_PLAN_ITERATIONS: usize = 8;
 
-fn advance_pending_turn_plan_iteration(iterations: &mut usize) -> Result<(), String> {
+fn advance_pending_turn_plan_iteration(
+    iterations: &mut usize,
+    last_retry_reason: &str,
+) -> Result<(), String> {
     *iterations = iterations.saturating_add(1);
     if *iterations > MAX_PENDING_TURN_PLAN_ITERATIONS {
         return Err(format!(
-            "pending-turn planning did not stabilize after {MAX_PENDING_TURN_PLAN_ITERATIONS} iterations"
+            "pending-turn planning did not stabilize after {MAX_PENDING_TURN_PLAN_ITERATIONS} iterations; last retry: {last_retry_reason}"
         ));
     }
     Ok(())
@@ -2137,12 +2118,13 @@ fn mcp_dependency_effect_is_completed(
 }
 
 fn require_newer_planning_generation(
+    effect_id: &str,
     before_generation: u64,
     after_generation: u64,
 ) -> Result<(), String> {
     if after_generation <= before_generation {
         return Err(format!(
-            "inventory effect completed at planning generation {before_generation}, but the next observable generation did not advance"
+            "inventory effect `{effect_id}` completed at planning generation {before_generation}, but the next observable generation {after_generation} did not advance"
         ));
     }
     Ok(())
@@ -2584,11 +2566,6 @@ enum PreSamplingCompactionReason {
     ProjectedContextLimit,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct HistoryPreSamplingCompaction {
-    reason: Option<PreSamplingCompactionReason>,
-}
-
 #[instrument(level = "trace", skip_all)]
 async fn run_history_pre_sampling_compact(
     sess: &Arc<Session>,
@@ -2596,7 +2573,7 @@ async fn run_history_pre_sampling_compact(
     client_session: &mut ModelClientSession,
     check_previous_model: bool,
     cancellation_token: &CancellationToken,
-) -> CodexResult<HistoryPreSamplingCompaction> {
+) -> CodexResult<Option<PreSamplingCompactionReason>> {
     if check_previous_model
         && maybe_run_previous_model_inline_compact(
             sess,
@@ -2606,11 +2583,9 @@ async fn run_history_pre_sampling_compact(
         )
         .await?
     {
-        return Ok(HistoryPreSamplingCompaction {
-            reason: Some(PreSamplingCompactionReason::PreviousModel),
-        });
+        return Ok(Some(PreSamplingCompactionReason::PreviousModel));
     }
-    Ok(HistoryPreSamplingCompaction { reason: None })
+    Ok(None)
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -2652,7 +2627,7 @@ async fn run_pending_input_pre_sampling_compact(
         /*fallback_step_context*/ None,
         client_session,
         /*prefetched_workspace_identity*/ None,
-        InitialContextInjection::DoNotInject,
+        /*prefetched_world_state*/ None,
         CompactionReason::ContextLimit,
         CompactionPhase::PreTurn,
         cancellation_token,
@@ -2734,7 +2709,7 @@ async fn maybe_run_previous_model_inline_compact(
             fallback_step_context,
             client_session,
             /*prefetched_workspace_identity*/ None,
-            InitialContextInjection::DoNotInject,
+            /*prefetched_world_state*/ None,
             CompactionReason::CompHashChanged,
             CompactionPhase::PreTurn,
             cancellation_token,
@@ -2783,7 +2758,7 @@ async fn maybe_run_previous_model_inline_compact(
             fallback_step_context,
             client_session,
             /*prefetched_workspace_identity*/ None,
-            InitialContextInjection::DoNotInject,
+            /*prefetched_world_state*/ None,
             CompactionReason::ModelDownshift,
             CompactionPhase::PreTurn,
             cancellation_token,
@@ -2806,21 +2781,20 @@ async fn run_auto_compact(
     fallback_step_context: Option<Arc<StepContext>>,
     client_session: &mut ModelClientSession,
     prefetched_workspace_identity: Option<&Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
-    initial_context_injection: InitialContextInjection,
+    prefetched_world_state: Option<Arc<WorldState>>,
     reason: CompactionReason,
     phase: CompactionPhase,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
     let budget_turn_context = Arc::clone(turn_context);
-    let initial_context_injection = match initial_context_injection {
-        InitialContextInjection::DoNotInject => {
-            let world_state =
-                Arc::new(sess.build_world_state_for_step(step_context.as_ref()).await);
-            InitialContextInjection::AtStart(world_state)
-        }
-        initial_context_injection => initial_context_injection,
+    // Automatic compaction restores initial context. Reuse a snapshot already
+    // captured by the caller, or capture one before dispatching compaction.
+    let world_state = match prefetched_world_state {
+        Some(world_state) => world_state,
+        None => Arc::new(sess.build_world_state_for_step(step_context.as_ref()).await),
     };
+    let initial_context_injection = InitialContextInjection::AtStart(world_state);
     if should_use_remote_compact_task(
         turn_context.provider.info(),
         turn_context.config.compact_prompt.as_deref(),
@@ -3532,6 +3506,9 @@ async fn run_sampling_request(
         let advertised_deferred_tools = turn_context.activated_deferred_tools();
         AdvertisedDeferredToolLease::new(Arc::clone(&turn_context), advertised_deferred_tools)
     });
+    let router_preparation_guard = turn_context
+        .turn_timing_state
+        .begin_local_phase(TurnLocalPhase::RouterBuild);
     let cached_router = prebuilt_router.take();
     let router = match cached_router {
         Some(router) if terminal_completion_only => {
@@ -3584,6 +3561,10 @@ async fn run_sampling_request(
     // Its exposure identity is revalidated above, so genuine surface changes
     // still rebuild while ordinary tool continuations reuse the same registry.
     *prebuilt_router = Some(Arc::clone(&router));
+    drop(router_preparation_guard);
+    let scaffold_guard = turn_context
+        .turn_timing_state
+        .begin_local_phase(TurnLocalPhase::RequestTransformation);
     let request_scaffold = sess
         .request_scaffold_cache
         .lock()
@@ -3609,6 +3590,10 @@ async fn run_sampling_request(
         None
     }));
 
+    drop(scaffold_guard);
+    let worker_preparation_guard = turn_context
+        .turn_timing_state
+        .begin_local_phase(TurnLocalPhase::ExecutorReadinessWait);
     let tool_runtime = ToolCallRuntime::new(
         Arc::clone(&sess),
         Arc::clone(&step_context),
@@ -3623,6 +3608,7 @@ async fn run_sampling_request(
             request_signals,
         )
     });
+    drop(worker_preparation_guard);
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retry_state = ResponsesStreamRetryState::default();
     let mut accepted_attempt_input = prepared_input.shared_items();
@@ -3671,10 +3657,7 @@ async fn run_sampling_request(
         .await
         {
             Ok(output) => {
-                return Ok((
-                    output,
-                    retain_accepted_sampling_input(accepted_attempt_input),
-                ));
+                return Ok((output, accepted_attempt_input));
             }
             Err(CodexErr::ContextWindowExceeded) => {
                 sess.set_total_tokens_full(&turn_context).await;
@@ -3734,12 +3717,6 @@ async fn run_sampling_request(
     }
 }
 
-fn retain_accepted_sampling_input(
-    accepted_attempt_input: Arc<[ResponseItem]>,
-) -> Arc<[ResponseItem]> {
-    accepted_attempt_input
-}
-
 pub(super) async fn persist_sampling_prefix_before_dispatch(
     sess: &Session,
     manifest: Option<codex_protocol::protocol::ToolManifestItem>,
@@ -3782,14 +3759,6 @@ fn enforce_terminal_prompt_contract(prompt: &mut Prompt, terminal_completion_onl
         prompt.digests.tools = Some(prompt.tools.digest());
         prompt.parallel_tool_calls = false;
     }
-}
-
-#[cfg(test)]
-fn finalized_router_matches_exposure(
-    router: &ToolRouter,
-    current_identity: &ToolExposureIdentity,
-) -> bool {
-    router.exposure_identity() == current_identity
 }
 
 async fn finalized_router_matches_current_exposure(
@@ -5558,12 +5527,9 @@ async fn try_run_sampling_request(
             Ok(sampling_admission)
         })
     });
-    // Background tool completion can publish a durability obligation after
-    // response preparation. Resolve it at the actual provider boundary.
-    sess.drain_tool_history_persistence()
-        .or_cancel(&cancellation_token)
-        .await
-        .map_err(|_| CodexErr::TurnAborted)??;
+    // In-memory history already contains the accepted ordered mutations.
+    // Surface writer failures here; terminalization owns the durability barrier.
+    sess.check_tool_history_persistence()?;
     let stream_result = client_session
         .stream_with_attempt_prepared(
             prompt,
@@ -6321,10 +6287,22 @@ async fn try_run_sampling_request(
     });
 
     if should_emit_turn_diff {
-        let unified_diff = {
+        let (unified_diff, invalidation_warning) = {
             let mut tracker = turn_diff_tracker.lock().await;
-            tracker.take_unified_diff_if_changed()
+            (
+                tracker.take_unified_diff_if_changed(),
+                tracker.take_invalidation_warning(),
+            )
         };
+        if let Some(message) = invalidation_warning {
+            sess.send_event(
+                &turn_context,
+                EventMsg::Warning(codex_protocol::protocol::WarningEvent {
+                    message: message.to_string(),
+                }),
+            )
+            .await;
+        }
         if let Some(unified_diff) = unified_diff {
             let msg = EventMsg::TurnDiff(TurnDiffEvent { unified_diff });
             sess.clone().send_event(&turn_context, msg).await;

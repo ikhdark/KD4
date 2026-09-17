@@ -5,9 +5,7 @@ use crate::prepare::provenance::{
     write_json,
 };
 use crate::prepare::{Prepared, unique_id};
-use crate::schedule::{
-    ATTEMPT_LIMIT_MS, ExecutionBudget, SCRIPTED_LIMIT_MS, ScheduledAttempt, Segment,
-};
+use crate::schedule::{ExecutionBudget, ScheduledAttempt, Segment};
 use crate::workloads::{VerificationOutcome, VerificationStatus, verify_fixture_with_env};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -236,8 +234,19 @@ pub fn execute(
     let result_path = directory.join("result.json");
     // Record every resolved attempt path before any native execution.
     write_atomic_json(&result_path, &result)?;
-    let mut scripted_budget = ExecutionBudget::new(SCRIPTED_LIMIT_MS);
-    let mut live_budget = ExecutionBudget::new(prepared.mode.live_limit_ms());
+    // Replay the ceilings frozen at preparation, including manifests prepared
+    // before the defaults were increased.
+    let budget_ms = |key: &str| -> Result<u64> {
+        prepared.budgets[key]
+            .as_u64()
+            .filter(|value| *value > 0)
+            .with_context(|| format!("prepared budget {key} must be a positive integer"))
+    };
+    let scripted_limit = budget_ms("scriptedMs")?;
+    let live_limit = budget_ms("realModelMs")?;
+    let attempt_limit = budget_ms("attemptMs")?;
+    let mut scripted_budget = ExecutionBudget::new(scripted_limit);
+    let mut live_budget = ExecutionBudget::new(live_limit);
     let mut unrecoverable: Option<String> = None;
     for index in 0..result.attempts.len() {
         let attempt = &mut result.attempts[index];
@@ -263,7 +272,7 @@ pub fn execute(
             budget.remaining_ms()
         );
         let timeout = if attempt.scheduled.segment == Segment::RealModel {
-            budget.remaining_ms().min(ATTEMPT_LIMIT_MS)
+            budget.remaining_ms().min(attempt_limit)
         } else {
             budget.remaining_ms()
         };
@@ -285,14 +294,14 @@ pub fn execute(
         }
         if let Some(native) = &attempt.native {
             budget.charge(native.elapsed_ms);
-            if native.status == "timeout" && timeout < ATTEMPT_LIMIT_MS
+            if native.status == "timeout" && timeout < attempt_limit
                 || native.status == "timeout" && attempt.scheduled.segment == Segment::Scripted
             {
                 attempt.reason = Some("segment_budget_exhausted during attempt".into());
             }
         }
-        result.scripted_execution_ms = SCRIPTED_LIMIT_MS - scripted_budget.remaining_ms();
-        result.real_model_execution_ms = prepared.mode.live_limit_ms() - live_budget.remaining_ms();
+        result.scripted_execution_ms = scripted_limit - scripted_budget.remaining_ms();
+        result.real_model_execution_ms = live_limit - live_budget.remaining_ms();
         checkpoint(attempt)?;
     }
     result.finished = true;

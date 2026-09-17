@@ -522,6 +522,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ready_startup_transport_is_available_for_prewarm() {
+        let (session, _) = crate::session::tests::make_session_and_context().await;
+        let client_session = session.services.model_client.new_speculative_session();
+        let task = tokio::spawn(async move { Ok(client_session) });
+
+        let preconnected_session =
+            resolve_startup_transport(Some(SessionStartupTransportHandle::new(task))).await;
+
+        assert!(
+            preconnected_session.is_some(),
+            "a ready transport must reach prewarm"
+        );
+    }
+
+    #[tokio::test]
     async fn failed_startup_transport_is_soft_for_remaining_prewarm() {
         let task =
             tokio::spawn(async { Err(CodexErr::Stream("preconnect failed".to_string(), None)) });

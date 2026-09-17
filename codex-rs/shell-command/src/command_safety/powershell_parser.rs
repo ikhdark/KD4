@@ -41,6 +41,25 @@ static TEMPORARY_PARSER_SLOT: Mutex<()> = Mutex::new(());
 static PARSER_PROCESSES: LazyLock<Mutex<HashMap<PowershellFlavor, CachedParser>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Warm the same trusted host used by command analysis. Speculation never
+/// waits for an occupied parser or consumes the temporary foreground slot.
+pub fn prewarm_powershell_parser(executable: &str) {
+    let Some(flavor) = PowershellFlavor::from_requested_executable(executable) else {
+        return;
+    };
+    let parser = PARSER_PROCESSES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(flavor)
+        .or_insert_with(|| Arc::new(Mutex::new(None)))
+        .clone();
+    if let Ok(mut parser) = parser.try_lock()
+        && parser.is_none()
+    {
+        let _ = parse_with_cached_process(&mut parser, executable, "", None);
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct PowershellResolutionState {
     pub cwd: String,

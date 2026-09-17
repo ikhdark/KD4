@@ -34,14 +34,8 @@ use tracing::warn;
 /// Core-facing handle to the SQLite-backed state runtime.
 pub type StateDbHandle = Arc<codex_state::StateRuntime>;
 
-#[cfg(not(test))]
 const STARTUP_BACKFILL_POLL_INTERVAL: Duration = Duration::from_secs(1);
-#[cfg(test)]
-const STARTUP_BACKFILL_POLL_INTERVAL: Duration = Duration::from_millis(10);
-#[cfg(not(test))]
 const STARTUP_BACKFILL_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(test)]
-const STARTUP_BACKFILL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CONCURRENT_ROLLOUT_PATH_VALIDATIONS: usize = 8;
 
 /// Initialize the state runtime for thread state persistence.

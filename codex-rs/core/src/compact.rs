@@ -117,11 +117,16 @@ struct CompactionTextOmissionReceiptV1 {
 /// The test-only `BeforeLastUserMessage` variant preserves coverage for legacy replacement-history
 /// ordering. `AtStart` keeps the summary or compaction item last while preserving the stable prompt
 /// prefix in production.
+///
+/// `DoNotInject` is likewise test-only: every production compaction path now restores initial
+/// context, capturing a world-state snapshot when the caller did not already have one. It is
+/// retained so tests can exercise compaction without building that snapshot.
 #[derive(Clone, Debug)]
 pub(crate) enum InitialContextInjection {
     AtStart(Arc<WorldState>),
     #[cfg(test)]
     BeforeLastUserMessage(Arc<WorldState>),
+    #[cfg(test)]
     DoNotInject,
 }
 
@@ -155,6 +160,7 @@ pub(crate) async fn build_compaction_initial_context(
                 .await;
             (items, Some(delivered_snapshot), fragment_digests)
         }
+        #[cfg(test)]
         InitialContextInjection::DoNotInject => (Vec::new(), None, Vec::new()),
     }
 }
@@ -369,7 +375,7 @@ async fn run_compact_task_inner_impl(
     let (
         mut unresolved_history,
         retained_image_count,
-        omitted_images,
+        omitted_image_count,
         omitted_user_text,
         omitted_text,
     ) = build_bounded_unresolved_input_history(history.raw_items());
@@ -565,9 +571,9 @@ async fn run_compact_task_inner_impl(
     // The summary and durable world state own consumed continuation state. Preserve only the
     // exact input tail that no model-generated item has consumed yet, in its original order.
     let mut summary_for_history = summary_text.clone();
-    if omitted_images {
+    if omitted_image_count > 0 {
         summary_for_history.push_str("\n\n");
-        summary_for_history.push_str(COMPACT_IMAGE_OMISSION_MARKER);
+        summary_for_history.push_str(&compaction_image_omission_marker(omitted_image_count));
     }
     let mut summary_item =
         compaction_summary_item_with_artifact_pins(summary_for_history, artifact_pin_payload);
@@ -598,6 +604,7 @@ async fn run_compact_task_inner_impl(
         );
     }
     let reference_context_item = match &initial_context_injection {
+        #[cfg(test)]
         InitialContextInjection::DoNotInject => None,
         InitialContextInjection::AtStart(_) => {
             Some(turn_context.to_turn_context_item_async().await)
@@ -709,9 +716,12 @@ fn bounded_task_state_summary(previous_summary: Option<&str>, summary_suffix: &s
 }
 
 fn has_compaction_section(summary: &str) -> bool {
-    COMPACTION_SECTIONS
-        .iter()
-        .any(|(heading, _)| summary.lines().any(|line| line.trim() == *heading))
+    summary.lines().any(|line| {
+        let line = line.trim();
+        COMPACTION_SECTIONS
+            .iter()
+            .any(|(heading, _)| line == *heading)
+    })
 }
 
 fn validate_generated_compaction_summary(
@@ -743,11 +753,11 @@ fn validate_generated_compaction_summary(
         Some(previous_summary) => format!("{previous_summary}\n\n{summary_suffix}"),
         None => summary_suffix.to_string(),
     };
+    let populated_sections = compaction_section_bodies(&complete_summary);
     let missing = COMPACTION_SECTIONS
         .iter()
-        .filter_map(|(heading, _)| {
-            (!section_has_nonempty_body(&complete_summary, heading)).then_some(*heading)
-        })
+        .zip(populated_sections)
+        .filter_map(|((heading, _), populated)| (!populated).then_some(*heading))
         .collect::<Vec<_>>();
     if missing.is_empty() {
         Ok(())
@@ -775,30 +785,30 @@ fn validated_compaction_summary(
 }
 
 fn has_nonempty_compaction_section(summary: &str) -> bool {
-    COMPACTION_SECTIONS
-        .iter()
-        .any(|(heading, _)| section_has_nonempty_body(summary, heading))
+    compaction_section_bodies(summary)
+        .into_iter()
+        .any(|populated| populated)
 }
 
-fn section_has_nonempty_body(summary: &str, target_heading: &str) -> bool {
-    let mut in_target = false;
+fn compaction_section_bodies(summary: &str) -> [bool; COMPACTION_SECTIONS.len()] {
+    let mut populated = [false; COMPACTION_SECTIONS.len()];
+    let mut current = None;
     for line in summary.lines() {
         let trimmed = line.trim();
-        if COMPACTION_SECTIONS
+        if let Some(index) = COMPACTION_SECTIONS
             .iter()
-            .any(|(heading, _)| trimmed == *heading)
+            .position(|(heading, _)| trimmed == *heading)
         {
-            if in_target && trimmed != target_heading {
-                return false;
-            }
-            in_target = trimmed == target_heading;
-            continue;
-        }
-        if in_target && !trimmed.is_empty() {
-            return true;
+            current = Some(index);
+        } else if !trimmed.is_empty()
+            && let Some(index) = current
+        {
+            // Incremental checkpoints may repeat a heading. An earlier empty
+            // occurrence must not hide a later body for the same section.
+            populated[index] = true;
         }
     }
-    false
+    populated
 }
 
 fn retain_unstructured_incremental_update(
@@ -896,13 +906,13 @@ fn truncate_compaction_summary(summary: &str, max_tokens: usize) -> String {
             } else {
                 candidate
             };
-            let mut candidate_bodies = bodies.clone();
-            candidate_bodies[index] = candidate.clone();
-            let rendered =
-                render_structured_compaction(&bounded_preamble, &sections, &candidate_bodies);
+            // Only this section changes during a probe; retain the other bodies
+            // instead of cloning the whole checkpoint at every binary-search step.
+            bodies[index] = candidate;
+            let rendered = render_structured_compaction(&bounded_preamble, &sections, &bodies);
             if approx_token_count(&rendered) <= max_tokens {
                 low = candidate_budget;
-                selected = candidate;
+                selected = bodies[index].clone();
             } else {
                 high = candidate_budget.saturating_sub(1);
             }
@@ -1308,15 +1318,19 @@ fn is_compaction_model_generated_item(item: &ResponseItem) -> bool {
     }
 }
 
+fn compaction_image_omission_marker(count: usize) -> String {
+    format!("{COMPACT_IMAGE_OMISSION_MARKER} Omitted image count: {count}.")
+}
+
 pub(crate) fn build_unresolved_user_history(items: &[ResponseItem]) -> (Vec<ResponseItem>, usize) {
-    let (mut history, retained_image_count, omitted_images, _, _) =
+    let (mut history, retained_image_count, omitted_image_count, _, _) =
         build_bounded_unresolved_input_history(items);
-    if omitted_images {
+    if omitted_image_count > 0 {
         history.push(ResponseItem::Message {
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
-                text: COMPACT_IMAGE_OMISSION_MARKER.to_string(),
+                text: compaction_image_omission_marker(omitted_image_count),
             }],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
@@ -1327,7 +1341,7 @@ pub(crate) fn build_unresolved_user_history(items: &[ResponseItem]) -> (Vec<Resp
 
 fn build_bounded_unresolved_input_history(
     items: &[ResponseItem],
-) -> (Vec<ResponseItem>, usize, bool, bool, bool) {
+) -> (Vec<ResponseItem>, usize, usize, bool, bool) {
     let unresolved = unresolved_compaction_items(items);
     let (user_source_indices, messages): (Vec<_>, Vec<_>) = unresolved
         .iter()
@@ -1338,7 +1352,7 @@ fn build_bounded_unresolved_input_history(
                 .map(move |message| (index, message))
         })
         .unzip();
-    let (user_items, retained_image_count, omitted_images, selected_user_indices) =
+    let (user_items, retained_image_count, omitted_image_count, selected_user_indices) =
         append_bounded_user_messages(
             Vec::new(),
             &messages,
@@ -1488,7 +1502,7 @@ fn build_bounded_unresolved_input_history(
     (
         history,
         retained_image_count,
-        omitted_images,
+        omitted_image_count,
         omitted_user_text,
         omitted_text,
     )
@@ -1724,6 +1738,7 @@ pub(crate) fn insert_compaction_initial_context(
                 initial_context,
             )
         }
+        #[cfg(test)]
         InitialContextInjection::DoNotInject => compacted_history,
     }
 }
@@ -1825,7 +1840,7 @@ fn build_compacted_history_with_limits(
     max_images: usize,
     max_image_bytes: usize,
 ) -> Vec<ResponseItem> {
-    let (mut history, _retained_image_count, omitted_images, _selected_indices) =
+    let (mut history, _retained_image_count, omitted_image_count, _selected_indices) =
         append_bounded_user_messages(
             history,
             user_messages,
@@ -1839,9 +1854,9 @@ fn build_compacted_history_with_limits(
     } else {
         summary_text.to_string()
     };
-    if omitted_images {
+    if omitted_image_count > 0 {
         summary_text.push_str("\n\n");
-        summary_text.push_str(COMPACT_IMAGE_OMISSION_MARKER);
+        summary_text.push_str(&compaction_image_omission_marker(omitted_image_count));
     }
 
     history.push(compaction_summary_item(summary_text));
@@ -1855,12 +1870,12 @@ fn append_bounded_user_messages(
     max_tokens: usize,
     max_images: usize,
     max_image_bytes: usize,
-) -> (Vec<ResponseItem>, usize, bool, Vec<usize>) {
+) -> (Vec<ResponseItem>, usize, usize, Vec<usize>) {
     let mut selected_messages: Vec<(usize, CompactedUserMessage)> = Vec::new();
     let mut remaining = max_tokens;
     let mut retained_image_count = 0usize;
     let mut retained_image_bytes = 0usize;
-    let mut omitted_images = false;
+    let mut omitted_image_count = 0usize;
     for (index, message) in user_messages.iter().enumerate().rev() {
         let mut content = Vec::new();
         for item in &message.content {
@@ -1894,7 +1909,7 @@ fn append_bounded_user_messages(
                         retained_image_count = retained_image_count.saturating_add(1);
                         retained_image_bytes = next_bytes;
                     } else {
-                        omitted_images = true;
+                        omitted_image_count += 1;
                     }
                 }
                 _ => {}
@@ -1946,7 +1961,7 @@ fn append_bounded_user_messages(
     (
         history,
         retained_image_count,
-        omitted_images,
+        omitted_image_count,
         selected_indices,
     )
 }

@@ -512,13 +512,12 @@ fn walker_worker(
                         .any(|root| target.starts_with(root))
                 })
         });
+    walk_builder.add_custom_ignore_filename(".rgignore");
     if !inner.respect_gitignore {
         walk_builder
             .git_ignore(false)
             .git_global(false)
-            .git_exclude(false)
-            .ignore(false)
-            .parents(false);
+            .git_exclude(false);
     }
     if let Some(override_matcher) = override_matcher {
         walk_builder.overrides(override_matcher);
@@ -1438,6 +1437,54 @@ mod tests {
                 .iter()
                 .all(|m| m.match_type == MatchType::File && dir.path().join(&m.path).is_file())
         );
+    }
+
+    #[test]
+    fn disabling_gitignore_preserves_local_and_parent_ignore_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(dir.path().join(".ignore"), "needle-parent.txt\n").unwrap();
+        fs::write(repo.join(".ignore"), "needle-local.txt\n").unwrap();
+        fs::write(repo.join(".rgignore"), "needle-rg.txt\n").unwrap();
+        fs::write(repo.join(".gitignore"), "needle-git.txt\n").unwrap();
+        for name in [
+            "needle-parent.txt",
+            "needle-local.txt",
+            "needle-rg.txt",
+            "needle-git.txt",
+            "needle-visible.txt",
+        ] {
+            fs::write(repo.join(name), "contents").unwrap();
+        }
+        for respect_gitignore in [false, true] {
+            let results = run(
+                "needle",
+                vec![repo.clone()],
+                FileSearchOptions {
+                    respect_gitignore,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+            let mut paths = results
+                .matches
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect::<Vec<_>>();
+            paths.sort();
+            let expected = if respect_gitignore {
+                vec![PathBuf::from("needle-visible.txt")]
+            } else {
+                vec![
+                    PathBuf::from("needle-git.txt"),
+                    PathBuf::from("needle-visible.txt"),
+                ]
+            };
+            assert_eq!(paths, expected);
+            assert!(results.walk_complete);
+        }
     }
 
     #[test]

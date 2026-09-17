@@ -51,7 +51,7 @@ const ARTIFACT_WRITING_MESSAGE: &str =
 const ACTIVE_TOOL_HISTORY_PROTECTION_EXTENSION: &str = "active-tool-history";
 const ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES: &[u8] = b"KD4_ACTIVE_TOOL_HISTORY_ARTIFACT_V1\n";
 pub(crate) const MAX_RAW_OUTPUT_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
-const LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES: usize = 4 * 1024;
+pub(crate) const LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES: usize = 4 * 1024;
 const MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD: u64 = 256 * 1024 * 1024;
 const MAX_RETAINED_ARTIFACT_BYTES_TOTAL: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_RETENTION_INDEX_ROOTS: usize = 4;
@@ -1230,9 +1230,13 @@ impl RawOutputArtifactWriter {
             if self.pending_output.len() <= LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES {
                 return;
             }
-            let artifact =
-                create_raw_output_artifact(codex_home.as_path(), &thread_id, &self.pending_output)
-                    .await;
+            let artifact = create_raw_output_artifact_inner(
+                codex_home.as_path(),
+                &thread_id,
+                &self.pending_output,
+                false,
+            )
+            .await;
             if let Some(state) = state {
                 *state.lock().await = artifact;
                 if let Some(opened) = Self::open(Some(state)).await {
@@ -1250,7 +1254,12 @@ impl RawOutputArtifactWriter {
         let remaining = MAX_RAW_OUTPUT_ARTIFACT_BYTES.saturating_sub(self.bytes as usize);
         let retained = &output[..output.len().min(remaining)];
         self.truncated |= retained.len() != output.len();
-        if let Err(err) = file.write_all(retained).await {
+        if let Err(err) = async {
+            file.write_all(retained).await?;
+            file.flush().await
+        }
+        .await
+        {
             if let Some(file) = self.file.take() {
                 let _ = unlock_output_file(file).await;
             }
@@ -1294,12 +1303,9 @@ impl RawOutputArtifactWriter {
     }
 
     pub(crate) async fn finish(&mut self, state: Option<&Arc<Mutex<RawOutputArtifact>>>) {
-        if let Some((codex_home, thread_id)) = self.pending_target.take() {
-            let artifact =
-                create_raw_output_artifact(&codex_home, &thread_id, &self.pending_output).await;
-            if let Some(state) = state {
-                *state.lock().await = artifact;
-            }
+        if self.pending_target.take().is_some() {
+            // The complete output fits inline. Keep the target unmaterialized;
+            // callers already omit pending artifacts from recovery metadata.
             self.pending_output.clear();
             self.lifecycle_completed = true;
             return;
@@ -1620,6 +1626,15 @@ pub(crate) async fn create_raw_output_artifact(
     thread_id: &str,
     output: &[u8],
 ) -> RawOutputArtifact {
+    create_raw_output_artifact_inner(codex_home, thread_id, output, true).await
+}
+
+async fn create_raw_output_artifact_inner(
+    codex_home: &Path,
+    thread_id: &str,
+    output: &[u8],
+    durable: bool,
+) -> RawOutputArtifact {
     let directory = codex_home.join("tool-output").join(thread_id);
     if let Err(err) = tokio::fs::create_dir_all(&directory).await {
         return RawOutputArtifact::unavailable(format!(
@@ -1681,7 +1696,7 @@ pub(crate) async fn create_raw_output_artifact(
                 )
                 .await;
             }
-            if let Err(err) = file.sync_all().await {
+            if durable && let Err(err) = file.sync_all().await {
                 let _ = unlock_output_file(file).await;
                 return failed_with_owned_path(
                     path.clone(),
@@ -1709,8 +1724,9 @@ pub(crate) async fn create_raw_output_artifact(
             };
             let handle = Arc::new(file);
             let sync_path = path.clone();
-            if let Err(err) =
-                run_blocking_artifact_io(move || sync_parent_directory(&sync_path)).await
+            if durable
+                && let Err(err) =
+                    run_blocking_artifact_io(move || sync_parent_directory(&sync_path)).await
             {
                 return failed_with_owned_path(
                     path.clone(),
@@ -4162,17 +4178,9 @@ fn search_logical_artifact(
     let query_bytes = query.as_bytes();
     let search_offset = usize::try_from(start_byte).unwrap_or(usize::MAX);
     let search_bytes = snapshot.get(search_offset..).unwrap_or_default();
-    let mut cursor = 0_usize;
     let mut total_matches = 0_usize;
     let mut indexed_matches = Vec::with_capacity(max_results);
-    while cursor <= search_bytes.len().saturating_sub(query_bytes.len()) {
-        let Some(relative_start) = search_bytes[cursor..]
-            .windows(query_bytes.len())
-            .position(|window| window == query_bytes)
-        else {
-            break;
-        };
-        let relative_match_start = cursor.saturating_add(relative_start);
+    for relative_match_start in memchr::memmem::find_iter(search_bytes, query_bytes) {
         let relative_match_end = relative_match_start.saturating_add(query_bytes.len());
         let match_start = search_offset.saturating_add(relative_match_start);
         let match_end = search_offset.saturating_add(relative_match_end);
@@ -4180,7 +4188,6 @@ fn search_logical_artifact(
         if indexed_matches.len() < max_results {
             indexed_matches.push((match_start, match_end));
         }
-        cursor = relative_match_end;
     }
 
     let build_result = |matches_returned: usize| {
@@ -4274,9 +4281,7 @@ fn search_logical_artifact(
         result
     };
 
-    let mut result = build_result(0);
-    for matches_returned in 1..=indexed_matches.len() {
-        let candidate = build_result(matches_returned);
+    let fits = |candidate: &ToolOutputSelectorResult| {
         let response = ReadToolOutputResult {
             artifact_id: metadata.artifact_id.clone(),
             canonical_sha256: metadata.canonical_sha256.clone(),
@@ -4286,7 +4291,19 @@ fn search_logical_artifact(
             unavailable_ranges: metadata.unavailable_ranges.clone(),
             results: vec![candidate.clone()],
         };
-        if !response_fits_recovery_token_ceiling(&response, token_ceiling) {
+        response_fits_recovery_token_ceiling(&response, token_ceiling)
+    };
+    // Most search pages fit as a whole. Avoid building and serializing every
+    // smaller prefix in that case. Oversized pages retain the exact bounded
+    // fallback: merging context ranges makes their sizes non-monotonic.
+    let full_page = build_result(indexed_matches.len());
+    if fits(&full_page) {
+        return full_page;
+    }
+    let mut result = build_result(0);
+    for matches_returned in 1..indexed_matches.len() {
+        let candidate = build_result(matches_returned);
+        if !fits(&candidate) {
             break;
         }
         result = candidate;

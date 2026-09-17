@@ -401,9 +401,10 @@ impl Features {
                 }
                 _ => {}
             }
-            let feature = canonical_feature_for_key(k)
-                .filter(|feature| !matches!(feature.stage(), Stage::Internal));
-            match feature {
+            match canonical_feature_for_key(k) {
+                Some(feat) if matches!(feat.stage(), Stage::Internal) => {
+                    tracing::warn!("internal feature key cannot be set in user config: {k}");
+                }
                 Some(feat) => {
                     if *v {
                         self.enable(feat);

@@ -139,9 +139,10 @@ fn execute(request: &NativeAttemptRequest, evidence: &mut NativeAttemptEvidence)
     }
     let started = Instant::now();
     let deadline = started + Duration::from_millis(request.timeout_ms);
-    let mut process = spawn_recorded(request, &overrides, started, deadline, 0, evidence)?;
+    let mut process = spawn_recorded(request, &overrides, started, deadline, None, evidence)?;
     let result = (|| -> Result<()> {
         initialize(&mut process, request, &overrides, evidence)?;
+        let prepared_config = fs::read(request.codex_home.join("config.toml"))?;
         let response = process.rpc(
             "thread/start",
             json!({
@@ -163,7 +164,14 @@ fn execute(request: &NativeAttemptRequest, evidence: &mut NativeAttemptEvidence)
             if turn_index == 1 && request.scenario == Some(ScriptedScenario::RestartResume) {
                 process.stop()?;
                 evidence.events.append(&mut process.events);
-                process = spawn_recorded(request, &overrides, started, deadline, 1, evidence)?;
+                process = spawn_recorded(
+                    request,
+                    &overrides,
+                    started,
+                    deadline,
+                    Some(&prepared_config),
+                    evidence,
+                )?;
                 initialize(&mut process, request, &overrides, evidence)?;
                 let resumed = process.rpc(
                     "thread/resume",
@@ -216,9 +224,12 @@ fn execute(request: &NativeAttemptRequest, evidence: &mut NativeAttemptEvidence)
                     );
                 }
                 if let Some(provider) = &scripted {
+                    // The interrupted terminal releases the artificial provider
+                    // hold. Cleanup must not wait on a response that the harness
+                    // itself keeps blocked while checking child termination.
+                    provider.confirm_interrupted();
                     let stopped = provider.verify_cancelled(request, deadline)?;
                     process.events.push(json!({"elapsedMs":started.elapsed().as_millis() as u64,"message":{"method":"repoBenchmark/cancellationStopped","params":stopped}}));
-                    provider.confirm_interrupted();
                 }
             } else {
                 if terminal.status != "completed" {
@@ -259,9 +270,16 @@ fn spawn_recorded(
     overrides: &[String],
     started: Instant,
     deadline: Instant,
-    launch: usize,
+    restart_config: Option<&[u8]>,
     evidence: &mut NativeAttemptEvidence,
 ) -> Result<client::NativeClient> {
+    let launch = usize::from(restart_config.is_some());
+    if let Some(config) = restart_config {
+        // thread/start can persist workspace trust. Reapply the frozen base on
+        // restart while retaining the isolated home's session data.
+        fs::write(request.codex_home.join("config.toml"), config)
+            .context("restore prepared configuration before native restart")?;
+    }
     let process = client::NativeClient::spawn(request, overrides, started, deadline, launch);
     // These logs are opened before process launch. Keep their identities even
     // when an executable is missing or Windows rejects process creation.
@@ -389,13 +407,20 @@ fn verify_effective_config(
                 }
                 let reported = Path::new(path);
                 if !reported.is_absolute()
-                    || (reported != home.join("config.toml") && reported != config_path)
                     || fs::canonicalize(path).context("resolve reported user config file")?
                         != config_path
                 {
                     bail!("user layer must use the exact isolated home/config.toml");
                 }
-                if config != &base {
+                // Native config migration adds schema metadata in memory, even
+                // when the isolated file has no explicit version.
+                let mut reported_base = config.clone();
+                if base.get("config_version").is_none()
+                    && reported_base.get("config_version") == Some(&json!(1))
+                {
+                    reported_base.as_object_mut().unwrap().remove("config_version");
+                }
+                if reported_base != base {
                     bail!("reported user config differs from isolated config.toml");
                 }
             }
@@ -411,7 +436,9 @@ fn verify_effective_config(
             | "enterpriseManaged"
             | "legacyManagedConfigTomlFromFile"
             | "legacyManagedConfigTomlFromMdm"
-                if config.as_object().is_some_and(|map| map.is_empty()) => {}
+                // An otherwise empty layer can acquire the same schema marker.
+                if config.as_object().is_some_and(|map| map.is_empty())
+                    || config == &json!({"config_version": 1}) => {}
             _ => bail!("unexpected nonempty configuration layer: {name}"),
         }
     }

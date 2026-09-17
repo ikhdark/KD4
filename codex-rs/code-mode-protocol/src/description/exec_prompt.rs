@@ -2,21 +2,20 @@ const DEFERRED_NESTED_TOOLS_GUIDANCE: &str =
     "Some deferred nested tools may be omitted from this description.";
 const LAZY_NESTED_TOOL_SCHEMA_GUIDANCE: &str = r#"Nested tool schemas are discovered lazily at runtime. When `tool_search` is advertised, use it to activate tools that are not yet listed."#;
 pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript, not JSON/Markdown; no Node/filesystem/network.
-- Nested tools live on the global `tools` object: `await tools.exec_command({ cmd: "..." })`, `await tools.apply_patch(patchText)` when declared below. Bare `exec(...)` / `exec_command(...)` alias `tools.exec_command`; `console.log(...)` aliases `text(...)`. Only `ALL_TOOL_NAMES` entries are callable.
+- Nested tools live on the global `tools` object: `await tools.exec_command({cmd:"..."})`, `await tools.apply_patch(patchText)` if registered. Bare `exec(...)` / `exec_command(...)` alias `tools.exec_command`; `console.log(...)` aliases `text(...)`. Only `ALL_TOOL_NAMES` entries are callable.
 - Edit with `apply_patch`: nested when registered, otherwise direct (`*** Begin Patch` envelope); never pipe a patch through a shell wrapper.
-- `text(...)` emits values; on failure/no output, the host also retains bounded nested-tool results.
-- Reuse current schemas, CLI usage, and results. Resolve missing/stale tool schemas before calling; consult CLI `--help` only for uncertain arguments/subcommands.
+- `text(...)` emits values; on failure/no output, the host retains up to eight nested-tool results, each capped at 4096 bytes, and reports omissions. Emit needed results explicitly.
+- Reuse schemas, CLI usage, and results; resolve missing/stale schemas before calls. Use CLI `--help` only for uncertain arguments/subcommands.
 - Nested tools: use a present schema; else `resolve_tool(name)` when the name is known, or inspect `ALL_TOOL_NAMES`. Never scan/filter/stringify/print `ALL_TOOLS`.
-- Do not rediscover known paths. Read/list known locations directly; otherwise search narrowly within that path. Reuse current applicable `AGENTS.md`; retrieve missing scopes or invalidated content.
-- Start useful work in the initial exec. Await `Promise.allSettled` for independent known reads/probes and inspect every result. Finish discovery before choosing dependent mutations. Keep status and file outputs distinct; independent calls may share one exec.
-- Prefer a purpose-built tool over shell; consolidate related read-only probes in one call. Never spawn a subprocess merely to re-filter a result already returned.
-- Nested calls: hard 60s default deadline. After a timeout, resume a returned live session/cell ID. Do not rerun while the original is live or its effects are uncertain. Retry only if it never started, stopped and is safe to repeat, or the tool permits retry.
-- A cell yields on `yield_control()`, new input, or expiry of its initial 10s budget. Keep long commands in the same awaited evaluation; use `yield_control()` only for a new model decision.
-- Run required validation after the final relevant edit. Parallelize only tool-permitted commands with independent build locks, output paths, and services. Propagate failures with `&&` or exit-code checks; never mask them with `|| true`. Complete work and checks, or report failures/blockers. Follow plans while they match the current request.
-- Do not repeat unchanged deterministic failures. Change route/state or report the blocker; resume live operations through documented wait interfaces.
-- Read relevant ranges for large files; whole files when small or required. Before editing, read the complete enclosing unit and refresh it after intervening writes. Use retained-artifact selectors after truncation.
+- Read/list known paths directly; search unknown locations narrowly. Reuse applicable `AGENTS.md`; refresh missing/invalidated scopes.
+- Start useful work in the initial exec. Await `Promise.allSettled` for independent known reads/probes and inspect every result. Use `await notify(...)` in a handler for useful early results; still await the batch. At evaluation end, unawaited work is discarded. Finish discovery before dependent mutations. Separate status/file output; batch independent calls.
+- Prefer a purpose-built tool over shell; consolidate related read-only probes. Never spawn subprocesses to re-filter returned results.
+- Calls: hard 60s default deadline. After timeout, resume the returned live session/cell ID; never rerun live or uncertain effects. Retry only if unstarted, safely repeatable after stopping, or tool-approved.
+- Cells yield on `yield_control()`, input, or their initial 10s budget. Keep long commands in the same awaited evaluation; yield explicitly only for a new model decision.
+- Run required validation after the final relevant edit. Parallelize only when tools permit and build locks, outputs, and services are independent. Propagate failures with `&&` or exit-code checks; never mask them with `|| true`. Finish work/checks or report failures/blockers. Keep plans aligned with the request.
+- For unchanged deterministic failures, change route/state or report blockers; resume live operations via documented waits.
+- Read relevant ranges for large files; whole files when small or required. Read the complete enclosing unit before editing; refresh after intervening writes. Use retained-artifact selectors after truncation.
 - Output defaults to the 10000-token hard cap. Set the smallest useful budget with first-line `// @exec: {"max_output_tokens": 2000}`. Nested-call deadlines use the documented `{ timeout_ms }` option.
-- When evaluation ends, unawaited work is discarded.
 
 Helpers:
 - Media: `{ type: "image" }` / `{ type: "audio" }` blocks.
@@ -37,6 +36,9 @@ pub fn build_exec_tool_description(
 ) -> String {
     let mut sections = Vec::new();
     sections.push(EXEC_DESCRIPTION_TEMPLATE.to_string());
+    if !code_mode_only {
+        sections.push("For a single call, prefer its direct interface when advertised. Use `exec` for orchestration or result processing.".to_string());
+    }
     if !direct_only_tool_names.is_empty() {
         let names = direct_only_tool_names
             .iter()
@@ -79,6 +81,10 @@ mod tests {
                         has_deferred_tools,
                         &direct_names,
                     );
+                    assert_eq!(
+                        description.contains("prefer its direct interface when advertised"),
+                        !code_mode_only,
+                    );
                     let directives = description
                         .split('`')
                         .filter(|part| part.starts_with("// @exec:"))
@@ -117,20 +123,20 @@ mod tests {
                 let description =
                     build_exec_tool_description(code_mode_only, has_deferred_tools, &[]);
                 for required in [
-                    "Complete work and checks, or report failures/blockers.",
-                    "Follow plans while they match the current request.",
-                    "Do not repeat unchanged deterministic failures.",
-                    "resume live operations through documented wait interfaces.",
+                    "Finish work/checks or report failures/blockers.",
+                    "Keep plans aligned with the request.",
+                    "For unchanged deterministic failures, change route/state or report blockers;",
+                    "resume live operations via documented waits.",
                     "whole files when small or required.",
-                    "Before editing, read the complete enclosing unit and refresh it after intervening writes.",
-                    "Finish discovery before choosing dependent mutations.",
+                    "Read the complete enclosing unit before editing; refresh after intervening writes.",
+                    "Finish discovery before dependent mutations.",
                     "Await `Promise.allSettled`",
-                    "Reuse current schemas, CLI usage, and results.",
-                    "consult CLI `--help` only for uncertain arguments/subcommands.",
-                    "Reuse current applicable `AGENTS.md`; retrieve missing scopes or invalidated content.",
-                    "After a timeout, resume a returned live session/cell ID.",
-                    "Do not rerun while the original is live or its effects are uncertain.",
-                    "Retry only if it never started, stopped and is safe to repeat, or the tool permits retry.",
+                    "Reuse schemas, CLI usage, and results;",
+                    "Use CLI `--help` only for uncertain arguments/subcommands.",
+                    "Reuse applicable `AGENTS.md`; refresh missing/invalidated scopes.",
+                    "After timeout, resume the returned live session/cell ID;",
+                    "never rerun live or uncertain effects.",
+                    "Retry only if unstarted, safely repeatable after stopping, or tool-approved.",
                 ] {
                     assert!(
                         description.contains(required),

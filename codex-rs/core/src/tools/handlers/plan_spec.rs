@@ -36,12 +36,38 @@ pub fn create_update_plan_tool() -> ToolSpec {
                 ),
                 (
                     "plan".to_string(),
-                    JsonSchema::array(plan_item, Some("Complete task checklist, replacing the previous plan. Omitted steps are removed; include every step you want to retain.".to_string())),
+                    JsonSchema::array(plan_item.clone(), Some("Complete task checklist, replacing the previous plan. Omitted steps are removed; include every step you want to retain.".to_string())),
                 ),
             ]),
             Some(vec!["plan".to_string()]),
             Some(false.into()),
         ),
-        output_schema: None,
+        output_schema: Some(json!({
+            "type": "object",
+            "properties": {
+                "current_plan": {
+                    "type": "object",
+                    "description": "The complete stored checklist after this update.",
+                    "properties": {
+                        "explanation": { "type": ["string", "null"] },
+                        "plan": { "type": "array", "items": plan_item }
+                    },
+                    "required": ["explanation", "plan"],
+                    "additionalProperties": false
+                },
+                "message": { "type": "string" },
+                "effect": {
+                    "type": "string",
+                    "enum": ["initial", "structural_revision", "status_only", "no_op"],
+                    "description": "Whether this created the first plan, revised its step text or order, changed only statuses or explanation, or left the plan unchanged."
+                },
+                "no_progress": {
+                    "type": "boolean",
+                    "description": "True when this update left the stored plan unchanged; this does not assess progress on the underlying work."
+                }
+            },
+            "required": ["current_plan", "message", "effect", "no_progress"],
+            "additionalProperties": false
+        })),
     })
 }

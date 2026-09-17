@@ -447,6 +447,7 @@ async fn patch_workspace_waits_cancel_without_writing_or_publishing_a_diff() {
                     },
                     Some(tracker.clone()),
                     emitter,
+                    None,
                 )
                 .await
                 .map(|_| ())
@@ -502,6 +503,175 @@ async fn patch_workspace_waits_cancel_without_writing_or_publishing_a_diff() {
         assert!(!path.exists(), "cancelled patch must not create its target");
         assert_eq!(tracker.lock().await.get_unified_diff(), None);
         drop(other_writer);
+    }
+}
+
+#[tokio::test]
+async fn patch_workspace_verification_and_approval_share_one_permit() {
+    use codex_protocol::protocol::AskForApproval;
+
+    for (route, cancel) in [
+        ("handler", false),
+        ("handler", true),
+        ("exec_command", false),
+        ("exec_command", true),
+        ("shell_cd", false),
+        ("shell_cd", true),
+    ] {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let cwd = workspace.path().abs();
+        let cwd_uri = PathUri::from_abs_path(&cwd);
+        let patch_cwd = if route == "shell_cd" {
+            let child = cwd.join("child");
+            std::fs::create_dir(&child).unwrap();
+            child
+        } else {
+            cwd.clone()
+        };
+        let path = patch_cwd.join("hello.txt");
+        let (session, mut turn, events) =
+            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                codex_login::CodexAuth::from_api_key("test key"),
+                Vec::new(),
+                home.path(),
+                |config| {
+                    config.cwd = cwd.clone();
+                    config.workspace_roots = vec![cwd.clone()];
+                    config.permissions.approval_policy =
+                        crate::config::Constrained::allow_any(AskForApproval::UnlessTrusted);
+                    config
+                        .permissions
+                        .set_permission_profile(PermissionProfile::Disabled)
+                        .unwrap();
+                },
+            )
+            .await;
+        let environment = TurnEnvironment::new(
+            codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
+            Arc::new(codex_exec_server::Environment::default_for_tests()),
+            cwd_uri,
+            None,
+        );
+        Arc::get_mut(&mut turn)
+            .unwrap()
+            .environments
+            .turn_environments = vec![environment.clone()];
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let other_writer =
+            crate::workspace_operation_gate::acquire_workspace_operation(&patch_cwd).await;
+        let handler = ApplyPatchHandler::default();
+        let patch =
+            "*** Begin Patch\n*** Update File: hello.txt\n@@\n-hello\n+updated\n*** End Patch";
+        let call = async {
+            if route != "handler" {
+                crate::tools::handlers::unified_exec::ExecCommandHandler::default()
+                    .handle_call(ToolInvocation {
+                        session: session.clone(),
+                        step_context: StepContext::for_test(turn.clone()),
+                        tracker: tracker.clone(),
+                        call_id: "cancel-exec-patch-wait".into(),
+                        tool_name: codex_tools::ToolName::plain("exec_command"),
+                        source: crate::tools::context::ToolCallSource::Direct,
+                        payload: ToolPayload::Function {
+                            arguments: if route == "shell_cd" {
+                                json!({
+                                    "kind": "argv", "program": "bash",
+                                    "args": ["-c", format!("cd child && apply_patch <<'PATCH'\n{patch}\nPATCH")],
+                                })
+                            } else {
+                                json!({
+                                    "kind": "argv", "program": "apply_patch",
+                                    "args": [patch],
+                                })
+                            }.to_string(),
+                        },
+                        cancellation_token: cancellation.clone(),
+                    })
+                    .await
+                    .map(|_| ())
+            } else {
+                handler
+                    .handle_call(ToolInvocation {
+                        session: session.clone(),
+                        step_context: StepContext::for_test(turn.clone()),
+                        tracker: tracker.clone(),
+                        call_id: "cancel-handler-wait".into(),
+                        tool_name: codex_tools::ToolName::plain("apply_patch"),
+                        source: crate::tools::context::ToolCallSource::Direct,
+                        payload: ToolPayload::Custom {
+                            input: patch.into(),
+                        },
+                        cancellation_token: cancellation.clone(),
+                    })
+                    .await
+                    .map(|_| ())
+            }
+        };
+        tokio::pin!(call);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), call.as_mut())
+                .await
+                .is_err()
+        );
+        // The target did not exist during the wait. Verification must read the state
+        // committed by the preceding writer, then retain its permit through approval.
+        std::fs::write(&path, "hello\n").unwrap();
+        drop(other_writer);
+        let request = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    result = call.as_mut() => panic!("patch completed before approval: {result:?}"),
+                    event = events.recv() => {
+                        if let EventMsg::ApplyPatchApprovalRequest(request) = event.unwrap().msg {
+                            break request;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("patch should request approval after verifying the new file");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                crate::workspace_operation_gate::acquire_workspace_operation(&patch_cwd),
+            )
+            .await
+            .is_err(),
+            "approval must retain the verification permit"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+        if cancel {
+            cancellation.cancel();
+        } else {
+            session
+                .notify_approval(
+                    &request.call_id,
+                    codex_protocol::protocol::ReviewDecision::Approved,
+                )
+                .await;
+        }
+        let result = tokio::time::timeout(Duration::from_secs(5), call.as_mut())
+            .await
+            .expect("patch should complete without reacquiring its own gate");
+        if cancel {
+            assert!(result.is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+            assert_eq!(tracker.lock().await.get_unified_diff(), None);
+        } else {
+            result.expect("approved patch should succeed");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "updated\n");
+            let diff = tracker.lock().await.get_unified_diff().unwrap();
+            assert!(diff.contains("-hello\n+updated"), "{diff}");
+        }
+        let _released = tokio::time::timeout(
+            Duration::from_secs(1),
+            crate::workspace_operation_gate::acquire_workspace_operation(&patch_cwd),
+        )
+        .await
+        .expect("completion must release the workspace");
     }
 }
 

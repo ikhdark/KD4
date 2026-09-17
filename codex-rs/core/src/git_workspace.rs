@@ -52,7 +52,9 @@ use tracing::warn;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 
 const GIT_DEPENDENCY_TIMEOUT: Duration = Duration::from_secs(5);
-const WORKSPACE_GENERATION_DEADLINE: Duration = Duration::from_secs(5);
+// Status collection and metadata capture share this aggregate allowance. A
+// single Git dependency can consume five seconds before metadata work starts.
+const WORKSPACE_GENERATION_DEADLINE: Duration = Duration::from_secs(15);
 const WORKSPACE_GENERATION_MAX_DECLARED_BYTES: u64 = 64 * 1024 * 1024;
 const WORKSPACE_WATCHER_DEBOUNCE: Duration = Duration::from_millis(50);
 const SOURCE_CHANGE_JOURNAL_CAPACITY: usize = 4_096;
@@ -537,6 +539,12 @@ impl WorkspaceStatusReader {
 
     fn push(&mut self, chunk: &[u8]) -> Option<()> {
         if self.bytes.len().checked_add(chunk.len())? > Self::MAX_STATUS_BYTES {
+            warn!(
+                collected_bytes = self.bytes.len(),
+                incoming_bytes = chunk.len(),
+                max_bytes = Self::MAX_STATUS_BYTES,
+                "Git status output exceeded the byte limit; workspace evidence is unavailable"
+            );
             return None;
         }
         let start = self.bytes.len();
@@ -2140,26 +2148,48 @@ impl GitWorkspaceCache {
     /// The returned token is safe to persist in model-visible tool output: it
     /// is accepted only by this live watcher epoch and only while the bounded
     /// journal proves that the path and its ancestors were untouched.
+    ///
+    /// Production registers a dependency set in one call; this single-path
+    /// shape is retained for tests that observe one path at a time.
+    #[cfg(test)]
     pub(crate) async fn begin_source_path_change_observation(
         &self,
         repo_root: &Path,
         path: &Path,
         recursive: bool,
     ) -> Option<SourcePathChangeObservation> {
+        self.begin_source_path_change_observations(repo_root, &[(path.to_path_buf(), recursive)])
+            .await?
+            .pop()
+    }
+
+    /// Establish one retained repository watch for the whole dependency set.
+    /// Canonicalization finishes before the observation generation is captured.
+    pub(crate) async fn begin_source_path_change_observations(
+        &self,
+        repo_root: &Path,
+        paths: &[(PathBuf, bool)],
+    ) -> Option<Vec<SourcePathChangeObservation>> {
         if !self.source_watcher_reliable.load(Ordering::Acquire) {
             return None;
         }
         let repo_root = repo_root.to_path_buf();
-        let path = path.to_path_buf();
-        let (repo_root, path) = tokio::task::spawn_blocking(move || {
+        let paths = paths.to_vec();
+        let (repo_root, paths) = tokio::task::spawn_blocking(move || {
             let repo_root = dunce::canonicalize(&repo_root).unwrap_or(repo_root);
-            let path = dunce::canonicalize(&path).unwrap_or(path);
-            (repo_root, path)
+            let paths = paths
+                .into_iter()
+                .filter_map(|(path, recursive)| {
+                    let path = dunce::canonicalize(&path).unwrap_or(path);
+                    path_is_same_or_descendant(&path, &repo_root).then_some((path, recursive))
+                })
+                .collect::<Vec<_>>();
+            (repo_root, paths)
         })
         .await
         .ok()?;
-        if !path_is_same_or_descendant(&path, &repo_root) {
-            return None;
+        if paths.is_empty() {
+            return Some(Vec::new());
         }
         let existing_generation = {
             let mut retention = self
@@ -2215,14 +2245,19 @@ impl GitWorkspaceCache {
             generation
         };
         let watcher_generation = self.reliable_source_watcher_generation()?;
-        Some(SourcePathChangeObservation {
-            watcher_epoch: self.watcher_epoch,
-            watcher_generation,
-            registration_generation,
-            repo_root,
-            path,
-            recursive,
-        })
+        Some(
+            paths
+                .into_iter()
+                .map(|(path, recursive)| SourcePathChangeObservation {
+                    watcher_epoch: self.watcher_epoch,
+                    watcher_generation,
+                    registration_generation,
+                    repo_root: repo_root.clone(),
+                    path,
+                    recursive,
+                })
+                .collect(),
+        )
     }
 
     pub(crate) fn source_path_change_observation_is_current(

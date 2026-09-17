@@ -25,7 +25,15 @@ pub(crate) fn agent_status_from_event(msg: &EventMsg) -> Option<AgentStatus> {
             | codex_protocol::protocol::TurnAbortReason::BudgetLimited => {
                 Some(AgentStatus::Interrupted)
             }
-            _ => Some(AgentStatus::Errored(format!("{:?}", ev.reason))),
+            codex_protocol::protocol::TurnAbortReason::Replaced => Some(AgentStatus::Errored(
+                "The turn was replaced by another turn.".to_string(),
+            )),
+            codex_protocol::protocol::TurnAbortReason::ReviewEnded => Some(AgentStatus::Errored(
+                "The review ended before the agent completed.".to_string(),
+            )),
+            codex_protocol::protocol::TurnAbortReason::InternalError => Some(AgentStatus::Errored(
+                "The turn was aborted because of an internal error.".to_string(),
+            )),
         },
         EventMsg::Error(ev) => Some(AgentStatus::Errored(ev.message.clone())),
         EventMsg::ShutdownComplete => Some(AgentStatus::Shutdown),
@@ -103,6 +111,42 @@ mod tests {
     use codex_protocol::protocol::ErrorEvent;
     use codex_protocol::protocol::SurfacedToolResult;
     use codex_protocol::protocol::TurnCompleteEvent;
+
+    #[test]
+    fn aborted_turns_preserve_interruption_and_explain_failures() {
+        use codex_protocol::protocol::TurnAbortReason;
+        use codex_protocol::protocol::TurnAbortedEvent;
+
+        for (reason, expected) in [
+            (TurnAbortReason::Interrupted, AgentStatus::Interrupted),
+            (TurnAbortReason::BudgetLimited, AgentStatus::Interrupted),
+            (
+                TurnAbortReason::Replaced,
+                AgentStatus::Errored("The turn was replaced by another turn.".to_string()),
+            ),
+            (
+                TurnAbortReason::ReviewEnded,
+                AgentStatus::Errored("The review ended before the agent completed.".to_string()),
+            ),
+            (
+                TurnAbortReason::InternalError,
+                AgentStatus::Errored(
+                    "The turn was aborted because of an internal error.".to_string(),
+                ),
+            ),
+        ] {
+            assert_eq!(
+                agent_status_from_event(&EventMsg::TurnAborted(TurnAbortedEvent {
+                    turn_id: Some("turn-1".to_string()),
+                    reason,
+                    completed_at: None,
+                    duration_ms: None,
+                    timing: None,
+                })),
+                Some(expected)
+            );
+        }
+    }
 
     #[test]
     fn completion_with_embedded_error_is_errored() {

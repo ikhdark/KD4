@@ -1172,6 +1172,58 @@ fn skills_tool_call(
 }
 
 #[tokio::test]
+async fn skills_list_reports_warnings_omitted_by_count_and_output_budget() -> TestResult {
+    for (warning_count, budget, shown) in [(0, 8_000, 0), (4, 8_000, 4), (7, 8_000, 4), (7, 80, 0)]
+    {
+        let provider = StaticSkillProvider {
+            catalog: SkillCatalog {
+                entries: Vec::new(),
+                warnings: (0..warning_count)
+                    .map(|index| format!("warning {index}: {}", "é".repeat(200)))
+                    .collect(),
+            },
+            read_requests: Default::default(),
+            list_calls: None,
+            fail_first_list: false,
+        };
+        let (registry, session, thread) = start_test_extension(
+            SkillProviders::new().with_orchestrator_provider(Arc::new(provider)),
+            default_config(),
+        )
+        .await;
+        let tools = registry.tool_contributors()[0].tools(&session, &thread);
+        let list = tools
+            .iter()
+            .find(|tool| tool.tool_name().name == "list")
+            .ok_or("missing list")?;
+        let call = skills_tool_call(
+            list.tool_name(),
+            serde_json::json!({"authority":{"kind":"orchestrator"}}),
+            budget,
+        );
+        let byte_budget = call.response_byte_budget(8_000);
+        let payload = call.payload.clone();
+        let response = list
+            .handle(call)
+            .await?
+            .post_tool_use_response("call", &payload)
+            .ok_or("missing output")?;
+        let warnings = response["warnings"].as_array().ok_or("missing warnings")?;
+        assert_eq!(warnings.len(), shown);
+        assert_eq!(response["warnings_omitted"], warning_count - shown);
+        assert_eq!(response["next_cursor"], serde_json::Value::Null);
+        for (index, warning) in warnings.iter().enumerate() {
+            let warning = warning.as_str().ok_or("warning should be text")?;
+            assert!(warning.starts_with(&format!("warning {index}: ")));
+            assert!(warning.ends_with("..."));
+            assert!(warning.len() <= 256);
+        }
+        assert!(serde_json::to_vec(&response)?.len() <= byte_budget);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn skills_list_pages_preserve_handles_and_respect_serialized_budget() -> TestResult {
     let entries: Vec<_> = (0..8)
         .map(|index| {

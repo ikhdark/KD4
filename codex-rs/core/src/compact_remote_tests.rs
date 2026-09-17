@@ -40,6 +40,32 @@ fn function_call(id: &str, call_id: &str) -> ResponseItem {
     }
 }
 
+#[test]
+fn receipt_index_preserves_first_counterparts_and_rejects_incompatible_orphans() {
+    let items = vec![
+        function_call("first", "same"),
+        function_call("duplicate", "same"),
+        custom_tool_call_output("wrong-kind", "same", "receipt"),
+        function_call_output("output", "same", "receipt"),
+        function_call("orphan", "missing"),
+    ];
+    let index = tool_receipt_index(&items);
+    assert_eq!(
+        complete_tool_receipt_indices(&items, &index, 0),
+        Some(vec![0, 3])
+    );
+    assert_eq!(
+        complete_tool_receipt_indices(&items, &index, 1),
+        Some(vec![1, 3])
+    );
+    assert_eq!(
+        complete_tool_receipt_indices(&items, &index, 3),
+        Some(vec![0, 3])
+    );
+    assert_eq!(complete_tool_receipt_indices(&items, &index, 2), None);
+    assert_eq!(complete_tool_receipt_indices(&items, &index, 4), None);
+}
+
 fn custom_tool_call_output(id: &str, call_id: &str, output: &str) -> ResponseItem {
     ResponseItem::CustomToolCallOutput {
         id: Some(ResponseItemId::from_server(id.to_string())),

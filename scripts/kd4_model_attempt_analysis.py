@@ -560,6 +560,12 @@ def analyze(
             "(dispatch-to-completion for nonterminal attempts) plus terminal "
             "dispatch-to-first-actionable-output"
         ),
+        "quantileMethod": "linear interpolation at (n - 1) * p on sorted samples",
+        "sampleLimitations": (
+            "Percentiles describe the observed samples, not population tail estimates. "
+            "For n=1 all percentiles equal the single observation; quantile bins may "
+            "contain one observation, with equal predictorMin and predictorMax."
+        ),
         "totalPhysicalAttempts": len(records),
         "includedPhysicalAttempts": included_physical_attempts,
         "totalLogicalRequests": len(logical),
@@ -590,6 +596,8 @@ def analyze(
 def render(analysis: dict[str, Any]) -> str:
     lines = [
         "Model decision latency analysis (observational and non-causal)",
+        f"quantile method: {analysis['quantileMethod']}",
+        analysis["sampleLimitations"],
         f"physical attempts: {analysis['totalPhysicalAttempts']}",
         f"included physical attempts: {analysis['includedPhysicalAttempts']}",
         f"logical requests: {analysis['totalLogicalRequests']}",

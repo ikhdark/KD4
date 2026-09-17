@@ -1,7 +1,7 @@
 {
-  "index_sha256": "ad34bfd9869193e4a007b74a39554a170e4d80bf7aa8978af4c859fe42c3ed04",
+  "index_sha256": "360771c46128c22e9a0e40f07a35216ba39a830125371e1bb2fd913abfa1641a",
   "index_version": 1,
-  "manifest_sha256": "a0777249655f516a771912d0e17f7a1371f145e650ae705ecf1d12008796e9b6",
+  "manifest_sha256": "c0a241b48703581f8187e8ffbbef53f704b817718f28d9d1d9e88a14948e99fb",
   "omitted": {
     "relationships": 0
   },
@@ -1059,7 +1059,7 @@
           ],
           "id": "one-benchmark-two-sequential-segments",
           "kind": "semantic",
-          "statement": "Repo Benchmark alone schedules and compares fork_off, fork_on and reference through native runtimes. Scripted execution precedes real-model execution; fast/full differ only in selected live tasks, finite budgets are ceilings, and performance has no pass/fail verdict.",
+          "statement": "Repo Benchmark alone schedules and compares fork_off, fork_on and reference through native runtimes; --fork-only-on freezes a two-variant selection of fork_on and reference throughout preparation, execution and reports. Scripted execution precedes real-model execution; fast/full differ only in selected live tasks, finite budgets are ceilings, and performance has no pass/fail verdict.",
           "tests": [
             "codex-rs/repo-benchmark/src/schedule.rs",
             "codex-rs/repo-benchmark/src/statistics.rs"
@@ -4348,7 +4348,7 @@
       "target": "path:codex-rs/windows-sandbox-rs/src/winutil.rs"
     }
   ],
-  "repository_revision": "manifest:a0777249655f516a771912d0e17f7a1371f145e650ae705ecf1d12008796e9b6:sources:c67817cc240f5cb73f7728bc9077cde40a8c615370f7db917a220a46807ab9b6",
+  "repository_revision": "manifest:c0a241b48703581f8187e8ffbbef53f704b817718f28d9d1d9e88a14948e99fb:sources:a5c852c2fdd63450abb8c19e6414164f354f663637f2c3a504b330376fd07e58",
   "schema_version": 2,
   "status": "complete",
   "unresolved": []

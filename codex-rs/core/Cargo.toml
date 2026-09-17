@@ -90,6 +90,7 @@ image = { workspace = true, features = ["jpeg", "png", "webp"] }
 indexmap = { workspace = true }
 jsonschema = { workspace = true }
 lru = { workspace = true }
+memchr = { workspace = true }
 rand = { workspace = true }
 regex-lite = { workspace = true }
 rmcp = { workspace = true, default-features = false, features = [

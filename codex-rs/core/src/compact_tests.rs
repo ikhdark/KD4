@@ -688,13 +688,27 @@ fn final_bounded_compaction_preserves_all_required_sections() {
     let summary = bounded_task_state_summary(None, &generated);
 
     assert!(approx_token_count(&summary) <= COMPACT_TASK_STATE_MAX_TOKENS);
-    for (heading, _) in COMPACTION_SECTIONS {
-        assert!(
-            section_has_nonempty_body(&summary, heading),
-            "bounded checkpoint lost {heading}: {summary}"
-        );
+    for ((heading, _), populated) in COMPACTION_SECTIONS
+        .iter()
+        .zip(compaction_section_bodies(&summary))
+    {
+        assert!(populated, "bounded checkpoint lost {heading}: {summary}");
     }
     assert!(validate_generated_compaction_summary(None, &summary).is_ok());
+}
+
+#[test]
+fn compaction_validation_accepts_a_later_nonempty_duplicate_section() {
+    let checkpoint = format!(
+        "{GOAL_HEADING}\n\n{CURRENT_STATE_HEADING}\nworking\n\n{GOAL_HEADING}\nkeep the user requirement\n\n{COMPLETED_WORK_HEADING}\nverified\n\n{UNRESOLVED_WORK_HEADING}\nnone\n\n{EVIDENCE_HEADING}\ntest passed\n\n{NEXT_ACTION_HEADING}\nfinish"
+    );
+    let summary = validated_compaction_summary(None, &checkpoint, true)
+        .expect("a complete checkpoint remains valid when a heading was repeated");
+    assert!(summary.contains("keep the user requirement"));
+    assert!(summary.contains("test passed"));
+    let incomplete = checkpoint.replace("keep the user requirement", "");
+    let error = validated_compaction_summary(None, &incomplete, true).unwrap_err();
+    assert!(error.to_string().contains(GOAL_HEADING));
 }
 
 #[test]
@@ -1266,7 +1280,47 @@ fn image_limits_emit_a_stable_compaction_omission_marker() {
     };
 
     assert_eq!(retained_images, 1);
-    assert!(summary.contains(COMPACT_IMAGE_OMISSION_MARKER));
+    assert!(summary.ends_with(
+        "[codex-local-compaction omitted user images: limits exceeded] Omitted image count: 2."
+    ));
+}
+
+#[test]
+fn unresolved_history_reports_exact_image_omissions() {
+    for total in [0, MAX_RETAINED_USER_IMAGES, MAX_RETAINED_USER_IMAGES + 3] {
+        let items = vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: (0..total)
+                .map(|index| ContentItem::InputImage {
+                    image_url: format!("img-{index}"),
+                    detail: None,
+                })
+                .collect(),
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }];
+        let (history, retained) = build_unresolved_user_history(&items);
+        assert_eq!(retained, total.min(MAX_RETAINED_USER_IMAGES));
+        let notices: Vec<_> = history
+            .iter()
+            .filter_map(|item| match item {
+                ResponseItem::Message { content, .. } => content_items_to_text(content),
+                _ => None,
+            })
+            .filter(|text| text.contains(COMPACT_IMAGE_OMISSION_MARKER))
+            .collect();
+        if total > MAX_RETAINED_USER_IMAGES {
+            assert_eq!(notices, vec![
+                "[codex-local-compaction omitted user images: limits exceeded] Omitted image count: 3.".to_string()
+            ]);
+        } else {
+            assert!(
+                notices.is_empty(),
+                "no omission notice when every image fits"
+            );
+        }
+    }
 }
 
 #[test]

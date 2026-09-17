@@ -450,8 +450,9 @@ impl PluginLoadCacheKey {
     }
 }
 
-fn retain_first_active_plugin_mcp_server_by_name(plugins: &mut [LoadedPlugin]) {
+fn retain_first_active_plugin_mcp_server_by_name(plugins: &mut [LoadedPlugin]) -> Vec<String> {
     let mut winning_plugins = HashMap::<String, String>::new();
+    let mut warnings = Vec::new();
     for plugin in plugins {
         if !plugin.is_active() {
             continue;
@@ -468,9 +469,14 @@ fn retain_first_active_plugin_mcp_server_by_name(plugins: &mut [LoadedPlugin]) {
                 ignored_plugin = %plugin_config_name,
                 "ignoring duplicate plugin MCP server name"
             );
+            warnings.push(format!(
+                "Plugin `{plugin_config_name}` cannot provide MCP server `{server_name}` because plugin `{winning_plugin}` already provides that name. Other plugin capabilities remain available."
+            ));
             false
         });
     }
+    warnings.sort();
+    warnings
 }
 
 fn resolve_loaded_plugins_for_auth_mode(
@@ -486,8 +492,8 @@ fn resolve_loaded_plugins_for_auth_mode(
             plugin_active,
         );
     }
-    retain_first_active_plugin_mcp_server_by_name(&mut plugins);
-    PluginLoadOutcome::from_plugins(plugins)
+    let warnings = retain_first_active_plugin_mcp_server_by_name(&mut plugins);
+    PluginLoadOutcome::from_plugins(plugins).with_load_warnings(warnings)
 }
 
 impl PluginsManager {
@@ -941,15 +947,17 @@ impl PluginsManager {
             cached_remote_plugin_id
         } else {
             let store = self.store.clone();
-            let plugin_id = plugin_id.clone();
-            match tokio::task::spawn_blocking(move || store.remote_plugin_id(&plugin_id)).await {
+            let lookup_plugin_id = plugin_id.clone();
+            match tokio::task::spawn_blocking(move || store.remote_plugin_id(&lookup_plugin_id))
+                .await
+            {
                 Ok(Ok(id)) => id,
                 Ok(Err(err)) => {
-                    warn!(error = %err, "failed to read persisted remote plugin identity");
+                    warn!(plugin_id = %plugin_id.as_key(), error = %err, "failed to read persisted remote plugin identity");
                     None
                 }
                 Err(err) => {
-                    warn!(error = %err, "failed to inspect persisted remote plugin identity");
+                    warn!(plugin_id = %plugin_id.as_key(), error = %err, "failed to inspect persisted remote plugin identity");
                     None
                 }
             }

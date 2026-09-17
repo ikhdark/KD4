@@ -6,6 +6,37 @@ use std::io::Write;
 use tempfile::TempDir;
 
 #[tokio::test]
+#[cfg(unix)]
+async fn append_entry_creates_private_history_and_keeps_it_private_after_retention() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let codex_home = TempDir::new().expect("create temp dir");
+    let mut config = HistoryConfig::new(codex_home.path(), &History::default());
+    let history_path = codex_home.path().join(HISTORY_FILENAME);
+    append_entry("first prompt", "session", &config)
+        .await
+        .expect("create history");
+    let metadata = std::fs::metadata(&history_path).expect("history metadata");
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+
+    config.max_bytes = Some(metadata.len() as usize + 1);
+    append_entry("second prompt", "session", &config)
+        .await
+        .expect("replace history during retention");
+    assert_eq!(
+        std::fs::metadata(&history_path)
+            .expect("retained history metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let entries = std::fs::read_to_string(history_path).expect("read retained history");
+    assert!(!entries.contains("first prompt"));
+    assert!(entries.contains("second prompt"));
+}
+
+#[tokio::test]
 async fn lookup_reads_history_entries() {
     let temp_dir = TempDir::new().expect("create temp dir");
     let history_path = temp_dir.path().join(HISTORY_FILENAME);

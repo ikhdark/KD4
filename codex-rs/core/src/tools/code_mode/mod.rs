@@ -146,7 +146,7 @@ struct BoundedJsonWriter {
 impl BoundedJsonWriter {
     fn new(limit: usize) -> Self {
         Self {
-            bytes: Vec::with_capacity(limit),
+            bytes: Vec::with_capacity(limit.min(128)),
             total_bytes: 0,
             limit,
         }
@@ -501,23 +501,23 @@ impl CodeModeService {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err("code mode session is shutting down".to_string());
         }
-        self.session
+        let session = self
+            .session
             .get_or_try_init(|| async {
                 if self.shutting_down.load(Ordering::Acquire) {
                     return Err("code mode session is shutting down".to_string());
                 }
-                let session = self
-                    .session_provider
+                // Publish successful creation even if shutdown races it. The shutdown
+                // waiter owns cleanup and must receive any error from that cleanup.
+                self.session_provider
                     .create_session(self.dispatch_broker.clone())
-                    .await?;
-                if self.shutting_down.load(Ordering::Acquire) {
-                    let _ = session.shutdown().await;
-                    return Err("code mode session is shutting down".to_string());
-                }
-                Ok(session)
+                    .await
             })
-            .await
-            .map(Arc::clone)
+            .await?;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err("code mode session is shutting down".to_string());
+        }
+        Ok(Arc::clone(session))
     }
 }
 
@@ -1515,6 +1515,14 @@ mod tests {
     }
 
     #[test]
+    fn retained_nested_result_allocates_in_proportion_to_small_output() {
+        let mut writer = super::BoundedJsonWriter::new(MAX_RETAINED_NESTED_RESULT_BYTES);
+        serde_json::to_writer(&mut writer, &json!({"ok": true})).unwrap();
+        assert!(writer.bytes.capacity() < MAX_RETAINED_NESTED_RESULT_BYTES);
+        assert_eq!(writer.finish(), (r#"{"ok":true}"#.to_string(), false, 11));
+    }
+
+    #[test]
     fn retained_nested_result_counts_full_json_bytes_including_utf8() {
         let value = json!({
             "text": "multi-byte: é",
@@ -1590,6 +1598,124 @@ mod tests {
         let first = service.session().await.expect("prewarmed session");
         let second = service.session().await.expect("reused session");
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    struct ShutdownTestSession {
+        result: Result<(), String>,
+        shutdown_calls: std::sync::Mutex<usize>,
+    }
+
+    impl codex_code_mode::CodeModeSession for ShutdownTestSession {
+        fn execute<'a>(
+            &'a self,
+            _request: ExecuteRequest,
+        ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::StartedCell>
+        {
+            panic!("shutdown must prevent execution");
+        }
+
+        fn wait<'a>(
+            &'a self,
+            _request: codex_code_mode::WaitRequest,
+        ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::WaitOutcome>
+        {
+            panic!("shutdown must prevent waiting on cells");
+        }
+
+        fn terminate<'a>(
+            &'a self,
+            _cell_id: CellId,
+        ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::WaitOutcome>
+        {
+            panic!("shutdown must prevent cell operations");
+        }
+
+        fn shutdown<'a>(&'a self) -> codex_code_mode::CodeModeSessionResultFuture<'a, ()> {
+            Box::pin(async move {
+                *self.shutdown_calls.lock().unwrap() += 1;
+                self.result.clone()
+            })
+        }
+    }
+
+    struct DelayedSessionProvider {
+        session: Arc<ShutdownTestSession>,
+        finish_creation: tokio::sync::Notify,
+        creation_calls: std::sync::Mutex<usize>,
+    }
+
+    impl codex_code_mode::CodeModeSessionProvider for DelayedSessionProvider {
+        fn create_session<'a>(
+            &'a self,
+            _delegate: Arc<dyn codex_code_mode::CodeModeSessionDelegate>,
+        ) -> codex_code_mode::CodeModeSessionProviderFuture<'a> {
+            Box::pin(async move {
+                *self.creation_calls.lock().unwrap() += 1;
+                self.finish_creation.notified().await;
+                Ok(Arc::clone(&self.session) as Arc<dyn codex_code_mode::CodeModeSession>)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_initialization_and_preserves_cleanup_errors() {
+        for cleanup_result in [Ok(()), Err("host cleanup failed".to_string())] {
+            let session = Arc::new(ShutdownTestSession {
+                result: cleanup_result.clone(),
+                shutdown_calls: Default::default(),
+            });
+            let provider = Arc::new(DelayedSessionProvider {
+                session: Arc::clone(&session),
+                finish_creation: Default::default(),
+                creation_calls: Default::default(),
+            });
+            let service = CodeModeService::new(provider.clone());
+            let initialization = service.prewarm();
+            tokio::pin!(initialization);
+            assert!(futures::poll!(initialization.as_mut()).is_pending());
+            assert_eq!(*provider.creation_calls.lock().unwrap(), 1);
+
+            let shutdown = service.shutdown();
+            tokio::pin!(shutdown);
+            assert!(futures::poll!(shutdown.as_mut()).is_pending());
+            assert_eq!(*session.shutdown_calls.lock().unwrap(), 0);
+            provider.finish_creation.notify_one();
+
+            let (initialization_result, shutdown_result) = tokio::join!(initialization, shutdown);
+            assert_eq!(
+                initialization_result,
+                Err("code mode session is shutting down".to_string())
+            );
+            assert_eq!(shutdown_result, cleanup_result);
+            assert_eq!(*session.shutdown_calls.lock().unwrap(), 1);
+            assert_eq!(*provider.creation_calls.lock().unwrap(), 1);
+            assert_eq!(
+                service.prewarm().await,
+                Err("code mode session is shutting down".to_string())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_does_not_initialize_an_unused_service() {
+        let session = Arc::new(ShutdownTestSession {
+            result: Ok(()),
+            shutdown_calls: Default::default(),
+        });
+        let provider = Arc::new(DelayedSessionProvider {
+            session: Arc::clone(&session),
+            finish_creation: Default::default(),
+            creation_calls: Default::default(),
+        });
+        let service = CodeModeService::new(provider.clone());
+
+        assert_eq!(service.shutdown().await, Ok(()));
+        assert_eq!(
+            service.prewarm().await,
+            Err("code mode session is shutting down".to_string())
+        );
+        assert_eq!(*provider.creation_calls.lock().unwrap(), 0);
+        assert_eq!(*session.shutdown_calls.lock().unwrap(), 0);
     }
 
     #[test]

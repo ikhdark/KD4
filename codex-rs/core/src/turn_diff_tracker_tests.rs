@@ -84,6 +84,34 @@ fn changed_diff_emission_deduplicates_and_preserves_clear_transition() {
 }
 
 #[test]
+fn invalidation_reports_unknown_changes_even_without_a_published_diff() {
+    for published in [false, true] {
+        let mut tracker = TurnDiffTracker::new();
+        if published {
+            tracker.unified_diff = Some("old diff".to_string());
+            assert_eq!(
+                tracker.take_unified_diff_if_changed(),
+                Some("old diff".to_string())
+            );
+        }
+        assert_eq!(tracker.take_invalidation_warning(), None);
+        tracker.record_unknown_mutation();
+        assert_eq!(
+            tracker.take_unified_diff_if_changed(),
+            published.then(String::new)
+        );
+        assert_eq!(
+            tracker.take_invalidation_warning(),
+            Some(
+                "The turn diff is unavailable after a workspace mutation that could not be tracked exactly. A cleared diff does not mean there are no changes."
+            )
+        );
+        assert_eq!(tracker.take_invalidation_warning(), None);
+        assert_eq!(tracker.take_unified_diff_if_changed(), None);
+    }
+}
+
+#[test]
 fn direct_shell_mutation_paths_are_exact_and_complex_scripts_fall_back() {
     let dir = tempdir().expect("tempdir");
     let exact = command_mutation_paths(&["touch".into(), "src/foo.rs".into()], Some(dir.path()))
@@ -650,7 +678,6 @@ async fn accumulates_delete() {
     let left_oid = git_blob_sha1_hex("x\n");
     let expected = format!(
         r#"diff --git a/b.txt b/b.txt
-deleted file mode {REGULAR_FILE_MODE}
 index {left_oid}..{ZERO_OID}
 --- a/b.txt
 +++ {DEV_NULL}
@@ -785,7 +812,6 @@ async fn move_over_existing_destination_without_content_change_deletes_source_on
     let left_oid = git_blob_sha1_hex("same\n");
     let expected = format!(
         r#"diff --git a/a.txt b/a.txt
-deleted file mode {REGULAR_FILE_MODE}
 index {left_oid}..{ZERO_OID}
 --- a/a.txt
 +++ {DEV_NULL}
@@ -816,7 +842,6 @@ async fn move_over_existing_destination_with_content_change_deletes_source_and_u
     let right_oid_b = git_blob_sha1_hex("new\n");
     let expected = format!(
         r#"diff --git a/a.txt b/a.txt
-deleted file mode {REGULAR_FILE_MODE}
 index {left_oid_a}..{ZERO_OID}
 --- a/a.txt
 +++ {DEV_NULL}
@@ -859,7 +884,6 @@ async fn preserves_committed_change_order_with_delete_then_move_overwrite() {
     let right_oid_b = git_blob_sha1_hex("new\n");
     let expected = format!(
         r#"diff --git a/a.txt b/a.txt
-deleted file mode {REGULAR_FILE_MODE}
 index {left_oid_a}..{ZERO_OID}
 --- a/a.txt
 +++ {DEV_NULL}

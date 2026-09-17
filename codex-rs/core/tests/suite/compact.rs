@@ -333,7 +333,7 @@ fn user_texts_without_task_model_guidance(request: &responses::ResponsesRequest)
 
 fn expected_instruction_fragment(contents: &str) -> String {
     format!(
-        "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n\n{contents}\n</INSTRUCTIONS>"
+        "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>"
     )
 }
 
@@ -1312,9 +1312,12 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         let input = body.get("input").and_then(|v| v.as_array()).unwrap();
         let input = normalize_inputs(input);
         assert_eq!(input.len(), 2, "normalized request {i}: {input:#?}");
-        let environment_message = input[0]["content"][0]["text"].as_str().unwrap();
+        let compaction_environment_message = input[0]["content"][0]["text"].as_str().unwrap();
         let summary_message = input[1]["content"][0]["text"].as_str().unwrap();
-        assert_eq!(environment_message, environment_message);
+        assert_eq!(
+            compaction_environment_message, environment_message,
+            "compaction request at index {i} should keep the initial environment message"
+        );
         assert_eq!(
             summary_message, expected_summary,
             "compaction request at index {i} should include the prefixed summary"
@@ -5094,7 +5097,7 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 4);
     let replacement_fragment = format!(
-        "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n\n{NEW_GLOBAL_INSTRUCTIONS}\n</INSTRUCTIONS>"
+        "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\nResult provenance: direct_file_read; freshness: refreshed_for_this_sampling_step.\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\n{NEW_GLOBAL_INSTRUCTIONS}\n</INSTRUCTIONS>"
     );
     assert_eq!(
         instruction_fragments(&requests[3]),

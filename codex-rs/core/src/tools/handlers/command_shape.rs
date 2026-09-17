@@ -407,11 +407,18 @@ pub(crate) fn powershell_script_failure_advisory(
     is_powershell_script: bool,
     output: &str,
 ) -> Option<&'static str> {
-    if shell_type != Some(ShellType::PowerShell) || exit_code.is_none_or(|code| code == 0) {
+    if shell_type != Some(ShellType::PowerShell) || exit_code.is_none() {
         return None;
     }
 
     let lower = output.to_ascii_lowercase();
+    // A later successful command can mask a non-terminating PowerShell error.
+    // Require an error record before interpreting successful output as a failure hint.
+    if exit_code == Some(0)
+        && !(lower.contains("categoryinfo") && lower.contains("fullyqualifiederrorid"))
+    {
+        return None;
+    }
     let looks_like_measure_object_failure = lower.contains("measure-object")
         && (lower.contains("cannot bind")
             || lower.contains("parameter")

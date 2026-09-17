@@ -213,7 +213,14 @@ async fn git_output(git_path: &Path, cwd: &Path, args: &[&str]) -> Result<String
         .kill_on_drop(true);
     let output = timeout(GIT_COMMAND_TIMEOUT, command.output())
         .await
-        .map_err(|_| "timed out after 2 seconds".to_string())?
+        .map_err(|_| {
+            format!(
+                "{} {args:?} timed out after {} ms (cwd: {})",
+                git_path.display(),
+                GIT_COMMAND_TIMEOUT.as_millis(),
+                cwd.display()
+            )
+        })?
         .map_err(|err| err.to_string())?;
     command_output_text(output)
 }

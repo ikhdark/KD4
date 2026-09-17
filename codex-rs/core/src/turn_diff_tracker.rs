@@ -113,6 +113,7 @@ impl From<bool> for CommandMutation {
 /// mutations, without rereading the workspace filesystem.
 pub struct TurnDiffTracker {
     valid: bool,
+    invalidation_reported: bool,
     display_roots_by_environment: HashMap<String, PathBuf>,
     baseline_by_path: HashMap<TrackedPath, TrackedContent>,
     current_by_path: HashMap<TrackedPath, TrackedContent>,
@@ -135,6 +136,7 @@ impl Default for TurnDiffTracker {
     fn default() -> Self {
         Self {
             valid: true,
+            invalidation_reported: false,
             display_roots_by_environment: HashMap::new(),
             baseline_by_path: HashMap::new(),
             current_by_path: HashMap::new(),
@@ -359,7 +361,8 @@ impl TurnDiffTracker {
 
     /// Returns the latest aggregate only when it differs from the last value
     /// returned by this method. An empty string represents a previously
-    /// published diff being cleared.
+    /// published diff being cleared. Publish `take_invalidation_warning` too:
+    /// clearing an invalidated diff does not mean the workspace is unchanged.
     pub fn take_unified_diff_if_changed(&mut self) -> Option<String> {
         if self.aggregate_dirty {
             self.unified_diff = self.flatten_diff();
@@ -371,6 +374,16 @@ impl TurnDiffTracker {
         self.last_emitted_unified_diff
             .clone_from(&self.unified_diff);
         Some(self.unified_diff.clone().unwrap_or_default())
+    }
+
+    pub(crate) fn take_invalidation_warning(&mut self) -> Option<&'static str> {
+        if self.valid || self.invalidation_reported {
+            return None;
+        }
+        self.invalidation_reported = true;
+        Some(
+            "The turn diff is unavailable after a workspace mutation that could not be tracked exactly. A cleared diff does not mean there are no changes.",
+        )
     }
 
     fn record_mutation(&mut self) {
@@ -610,18 +623,20 @@ impl TurnDiffTracker {
         let mut diff = format!("diff --git a/{left_display} b/{right_display}\n");
         match (left_content, right_content) {
             (None, Some(_)) => {
-                let mode = right_content
+                if let Some(mode) = right_content
                     .and_then(|content| content.mode.as_deref())
                     .or_else(|| self.file_mode(right_path))
-                    .unwrap_or(REGULAR_FILE_MODE);
-                diff.push_str(&format!("new file mode {mode}\n"));
+                {
+                    diff.push_str(&format!("new file mode {mode}\n"));
+                }
             }
             (Some(_), None) => {
-                let mode = left_content
+                if let Some(mode) = left_content
                     .and_then(|content| content.mode.as_deref())
                     .or_else(|| self.file_mode(left_path))
-                    .unwrap_or(REGULAR_FILE_MODE);
-                diff.push_str(&format!("deleted file mode {mode}\n"));
+                {
+                    diff.push_str(&format!("deleted file mode {mode}\n"));
+                }
             }
             (Some(_), Some(_)) => {}
             (None, None) => return None,

@@ -47,8 +47,8 @@ pub fn assess_patch_safety(
         AskForApproval::Never | AskForApproval::OnRequest | AskForApproval::Granular(_) => {
             // Continue to see if this can be auto-approved.
         }
-        // TODO(ragona): I'm not sure this is actually correct? I believe in this case
-        // we want to continue to the writable paths check before asking the user.
+        // UnlessTrusted only auto-approves known read-only commands. A patch
+        // mutates files even when all its targets are within writable roots.
         AskForApproval::UnlessTrusted => {
             return SafetyCheck::AskUser;
         }
@@ -148,7 +148,7 @@ fn is_write_patch_constrained_to_writable_paths(
     };
     // Normalize a path by removing `.` and resolving `..` without touching the
     // filesystem (works even if the file does not exist).
-    fn normalize(path: &Path) -> Option<PathBuf> {
+    fn normalize(path: &Path) -> PathBuf {
         let mut out = PathBuf::new();
         for comp in path.components() {
             match comp {
@@ -159,7 +159,7 @@ fn is_write_patch_constrained_to_writable_paths(
                 other => out.push(other.as_os_str()),
             }
         }
-        Some(out)
+        out
     }
 
     // Determine whether `path` is inside **any** writable root. Both `path`
@@ -171,10 +171,7 @@ fn is_write_patch_constrained_to_writable_paths(
             return false;
         };
         let abs = path.into_path_buf();
-        let abs = match normalize(&abs) {
-            Some(v) => v,
-            None => return false,
-        };
+        let abs = normalize(&abs);
 
         file_system_sandbox_policy.can_write_path_with_cwd(&abs, &native_cwd)
     };

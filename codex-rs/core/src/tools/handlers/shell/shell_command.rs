@@ -26,7 +26,7 @@ use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::command_preflight::preflight_invocation_for_kd4_runtime;
 use crate::tools::handlers::command_search::classify_rg_search_with_repository;
-use crate::tools::handlers::command_search::observe_rg_search_scope_state;
+use crate::tools::handlers::command_search::observe_rg_search_scope_state_with_freshness;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::parse_arguments_with_base_path;
 use crate::tools::handlers::resolve_search_repository_root;
@@ -495,7 +495,11 @@ impl ShellCommandHandler {
             })?
             .map_err(FunctionCallError::RespondToModel)?;
             if let Some((_, search)) = search.as_mut() {
-                observe_rg_search_scope_state(search).await;
+                observe_rg_search_scope_state_with_freshness(
+                    search,
+                    params.force_fresh.unwrap_or(false),
+                )
+                .await;
             }
             let attempt_key = match search {
                 Some((repository, search)) => attempt_key.with_search_narrowing(
@@ -504,7 +508,8 @@ impl ShellCommandHandler {
                     Some(search),
                 ),
                 None => attempt_key,
-            };
+            }
+            .with_search_environment(&exec_params.env);
             session
                 .services
                 .command_execution

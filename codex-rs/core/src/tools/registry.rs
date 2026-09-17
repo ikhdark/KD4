@@ -1253,6 +1253,7 @@ impl ToolRegistry {
         }
 
         let mut hook_rewrote_input = false;
+        let mut hook_input_notice = None;
         let pre_tool_use_payload =
             with_parsed_function_arguments(parsed_function_arguments.clone(), async {
                 tool.pre_tool_use_payload(&invocation)
@@ -1284,6 +1285,9 @@ impl ToolRegistry {
                 PreToolUseHookResult::Continue {
                     updated_input: Some(updated_input),
                 } => {
+                    let notice = format!(
+                        "PreToolUse hook changed the input for tool `{tool_name_flat}` (call `{call_id_owned}`). The tool will receive this input: {updated_input}"
+                    );
                     match with_parsed_function_arguments(parsed_function_arguments.clone(), async {
                         tool.with_updated_hook_input(invocation.clone(), updated_input)
                     })
@@ -1294,6 +1298,7 @@ impl ToolRegistry {
                             parsed_function_arguments =
                                 ParsedFunctionArguments::from_payload(&invocation.payload);
                             hook_rewrote_input = true;
+                            hook_input_notice = Some(notice);
                             let rewritten_tool_name = flat_tool_name(&invocation.tool_name);
                             rewritten_source_dependencies = crate::tool_history::tool_observes_workspace(
                                 rewritten_tool_name.as_ref(),
@@ -1363,6 +1368,15 @@ impl ToolRegistry {
             )
             .await;
             return Err(err);
+        }
+
+        if let Some(notice) = hook_input_notice {
+            record_additional_contexts(
+                &invocation.session,
+                &invocation.step_context.turn,
+                vec![notice],
+            )
+            .await;
         }
 
         let invocation_for_tool = invocation.clone();

@@ -897,12 +897,19 @@ async fn output_drain_timeout_preserves_captured_prefix_and_marks_it_truncated()
     )
     .await?;
 
-    assert_eq!(stdout.text, b"retained prefix");
+    let drain_notice = b"\n[... output capture stopped: pipe drain deadline exceeded ...]\n";
+    assert_eq!(
+        stdout.text,
+        [b"retained prefix".as_slice(), drain_notice].concat()
+    );
     assert!(stdout.truncated);
     assert_eq!(stderr.text, b"stderr");
     assert!(!stderr.truncated);
     let aggregated = aggregate_capture.lock().unwrap().snapshot();
-    assert_eq!(aggregated.text, b"retained prefixstderr");
+    assert_eq!(
+        aggregated.text,
+        [b"retained prefixstderr".as_slice(), drain_notice].concat()
+    );
     assert!(aggregated.truncated);
     Ok(())
 }
@@ -1858,8 +1865,9 @@ async fn process_exec_tool_call_respects_cancellation_token() -> Result<()> {
     .expect("cancellation should stop the process promptly");
     let output = result.expect("cancellation should return a non-timeout exec result");
     assert!(!output.timed_out);
-    assert_ne!(output.exit_code, 0);
-    assert_ne!(output.exit_code, EXEC_TIMEOUT_EXIT_CODE);
+    assert_eq!(output.exit_code, 130);
+    assert!(output.stderr.text.contains("Command cancelled."));
+    assert!(output.aggregated_output.text.contains("Command cancelled."));
     Ok(())
 }
 

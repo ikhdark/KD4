@@ -2023,27 +2023,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn embedded_turn_permissions_select_profile_id_only() {
-        let cwd = test_path_buf("/workspace/project").abs();
-        let active_permission_profile =
-            ActivePermissionProfile::new(BUILT_IN_PERMISSION_PROFILE_WORKSPACE);
-
-        let (sandbox_policy, permission_profile, permissions) = turn_permissions_overrides(
-            TurnPermissionsOverride::ActiveProfile(active_permission_profile),
-            cwd.as_path(),
-        )
-        .await
-        .expect("turn permissions");
-
-        assert_eq!(sandbox_policy, None);
-        assert_eq!(permission_profile, None);
-        assert_eq!(
-            permissions,
-            Some(BUILT_IN_PERMISSION_PROFILE_WORKSPACE.to_string())
-        );
-    }
-
-    #[tokio::test]
     async fn turn_permissions_preserve_thread_permissions_without_override() {
         let cwd = test_path_buf("/workspace/project").abs();
 

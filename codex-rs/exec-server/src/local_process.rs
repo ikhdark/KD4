@@ -796,6 +796,15 @@ impl LocalProcess {
     async fn terminate(&self, process_id: &ProcessId) -> Result<(), ExecServerError> {
         tokio::time::timeout(PROCESS_TERMINATION_TIMEOUT, async {
             loop {
+                // Subscribe before checking/requesting termination so an exit between
+                // that check and the await cannot be missed.
+                let wake_rx = {
+                    let processes = self.inner.processes.lock().await;
+                    match processes.get(process_id) {
+                        Some(ProcessEntry::Running(process)) => Some(process.wake_tx.subscribe()),
+                        Some(ProcessEntry::Starting(_)) | None => None,
+                    }
+                };
                 let response = self
                     .terminate_process(TerminateParams {
                         process_id: process_id.clone(),
@@ -805,7 +814,9 @@ impl LocalProcess {
                 if !response.running {
                     return Ok(());
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                if let Some(mut wake_rx) = wake_rx {
+                    let _ = wake_rx.changed().await;
+                }
             }
         })
         .await
@@ -1397,7 +1408,7 @@ mod tests {
         assert_finished_process_result(metrics, &exporter, "success");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn termination_request_before_exit_records_terminated() {
         let (backend, metrics, exporter) = telemetry_backend();
         let mut process = spawn_test_process(&backend, "terminate-before-exit").await;
@@ -1419,11 +1430,17 @@ mod tests {
                 .is_err(),
             "termination should not be confirmed while the process is still running"
         );
+        let exit_observed_at = tokio::time::Instant::now();
         process.exit(/*exit_code*/ 0);
         tokio::time::timeout(Duration::from_secs(1), confirmed_termination)
             .await
             .expect("termination should be confirmed after exit")
             .expect("confirmed termination should succeed");
+        assert_eq!(
+            tokio::time::Instant::now(),
+            exit_observed_at,
+            "exit notification should confirm termination without a polling delay"
+        );
         let _ = read_process_until_change(&backend, &process.process_id, /*after_seq*/ None).await;
         backend.shutdown().await;
 

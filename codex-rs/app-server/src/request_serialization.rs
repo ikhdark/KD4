@@ -74,7 +74,7 @@ pub(crate) enum RequestSerializationAccess {
 }
 
 impl RequestSerializationQueueKey {
-    pub(crate) fn from_scope(
+    pub(crate) async fn from_scope(
         connection_id: ConnectionId,
         scope: ClientRequestSerializationScope,
     ) -> (Self, RequestSerializationAccess) {
@@ -97,7 +97,7 @@ impl RequestSerializationQueueKey {
             ),
             ClientRequestSerializationScope::ThreadPath { path } => (
                 Self::ThreadPath {
-                    path: normalize_thread_path(path),
+                    path: normalize_thread_path(path).await,
                 },
                 RequestSerializationAccess::Exclusive,
             ),
@@ -134,8 +134,8 @@ impl RequestSerializationQueueKey {
     }
 }
 
-fn normalize_thread_path(path: PathBuf) -> PathBuf {
-    if let Ok(canonical) = std::fs::canonicalize(&path) {
+async fn normalize_thread_path(path: PathBuf) -> PathBuf {
+    if let Ok(canonical) = tokio::fs::canonicalize(&path).await {
         return canonical;
     }
 
@@ -533,8 +533,8 @@ mod tests {
         Duration::from_millis(/*millis*/ 50)
     }
 
-    #[test]
-    fn thread_path_scope_normalizes_lexical_aliases() {
+    #[tokio::test]
+    async fn thread_path_scope_normalizes_lexical_aliases() {
         let (aliased, _) = RequestSerializationQueueKey::from_scope(
             ConnectionId(1),
             ClientRequestSerializationScope::ThreadPath {
@@ -543,13 +543,15 @@ mod tests {
                     .join("..")
                     .join("active"),
             },
-        );
+        )
+        .await;
         let (direct, _) = RequestSerializationQueueKey::from_scope(
             ConnectionId(2),
             ClientRequestSerializationScope::ThreadPath {
                 path: PathBuf::from("threads").join("active"),
             },
-        );
+        )
+        .await;
 
         assert_eq!(aliased, direct);
 
@@ -562,7 +564,8 @@ mod tests {
             ClientRequestSerializationScope::ThreadPath {
                 path: unresolved_path.clone(),
             },
-        );
+        )
+        .await;
         assert_eq!(
             unresolved,
             RequestSerializationQueueKey::ThreadPath {
@@ -576,8 +579,29 @@ mod tests {
             ClientRequestSerializationScope::ThreadPath {
                 path: PathBuf::from(missing_name),
             },
-        );
+        )
+        .await;
         assert_ne!(unresolved, current_directory);
+    }
+
+    #[tokio::test]
+    async fn thread_path_scope_canonicalizes_existing_aliases() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let rollout = directory.path().join("rollout.jsonl");
+        std::fs::write(&rollout, "").expect("rollout file");
+        std::fs::create_dir(directory.path().join("nested")).expect("nested directory");
+        let expected = RequestSerializationQueueKey::ThreadPath {
+            path: std::fs::canonicalize(&rollout).expect("canonical rollout"),
+        };
+        for path in [rollout, directory.path().join("nested/../rollout.jsonl")] {
+            let (key, access) = RequestSerializationQueueKey::from_scope(
+                ConnectionId(1),
+                ClientRequestSerializationScope::ThreadPath { path },
+            )
+            .await;
+            assert_eq!(key, expected);
+            assert_eq!(access, RequestSerializationAccess::Exclusive);
+        }
     }
 
     #[tokio::test]
@@ -868,20 +892,22 @@ mod tests {
         let _ = release_tx.send(());
     }
 
-    #[test]
-    fn turn_interrupt_uses_the_thread_control_lane() {
+    #[tokio::test]
+    async fn turn_interrupt_uses_the_thread_control_lane() {
         let (key, access) = RequestSerializationQueueKey::from_scope(
             ConnectionId(1),
             ClientRequestSerializationScope::ThreadControl {
                 thread_id: "thread-1".to_string(),
             },
-        );
+        )
+        .await;
         let (mutation_key, mutation_access) = RequestSerializationQueueKey::from_scope(
             ConnectionId(1),
             ClientRequestSerializationScope::Thread {
                 thread_id: "thread-1".to_string(),
             },
-        );
+        )
+        .await;
 
         assert_eq!(
             key, mutation_key,

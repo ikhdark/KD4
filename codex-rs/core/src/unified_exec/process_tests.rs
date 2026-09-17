@@ -1813,6 +1813,7 @@ async fn local_output_is_published_while_artifact_state_is_busy() {
         output_handles,
         output_tx,
         Some(Arc::clone(&artifact)),
+        CancellationToken::new(),
     );
     stdout_tx
         .send(b"live-output".to_vec())
@@ -1854,7 +1855,7 @@ async fn local_output_is_published_while_artifact_state_is_busy() {
 }
 
 #[tokio::test]
-async fn local_output_artifact_is_flushed_and_unlocked_before_output_closed() {
+async fn local_output_artifact_is_flushed_and_unlocked_after_worker_finishes() {
     let temp = tempfile::tempdir().expect("tempdir");
     let artifact = Arc::new(Mutex::new(
         create_raw_output_artifact(temp.path(), "completion-barrier", b"").await,
@@ -1886,6 +1887,7 @@ async fn local_output_artifact_is_flushed_and_unlocked_before_output_closed() {
         output_handles,
         output_tx,
         Some(Arc::clone(&artifact)),
+        CancellationToken::new(),
     );
     stdout_tx
         .send(b"artifact-tail".to_vec())
@@ -1908,6 +1910,7 @@ async fn local_output_artifact_is_flushed_and_unlocked_before_output_closed() {
         .await
         .expect("local output should close");
     assert!(output_closed.load(Ordering::Acquire));
+    output_task.await.expect("local output task should finish");
     let (path, handle) = match &*artifact.lock().await {
         RawOutputArtifact::Stored { path, handle, .. } => (path.clone(), Arc::clone(handle)),
         RawOutputArtifact::Pending { .. } => panic!("artifact remained pending"),
@@ -1921,11 +1924,10 @@ async fn local_output_artifact_is_flushed_and_unlocked_before_output_closed() {
     );
     handle.try_lock().expect("artifact should be unlocked");
     handle.unlock().expect("release test artifact lock");
-    output_task.await.expect("local output task should finish");
 }
 
 #[tokio::test(start_paused = true)]
-async fn local_output_waits_for_terminal_artifact_state_after_finalization_stalls() {
+async fn local_output_closes_while_artifact_finalization_stalls() {
     let temp = tempfile::tempdir().expect("tempdir");
     let artifact = Arc::new(Mutex::new(
         create_raw_output_artifact(temp.path(), "stalled-finalization", b"").await,
@@ -1956,18 +1958,20 @@ async fn local_output_waits_for_terminal_artifact_state_after_finalization_stall
         output_handles,
         output_tx,
         Some(Arc::clone(&artifact)),
+        CancellationToken::new(),
     );
     drop(stdout_tx);
     drop(stderr_tx);
     tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::time::advance(Duration::from_secs(10)).await;
+    tokio::time::timeout(Duration::from_millis(1), &mut closed)
+        .await
+        .expect("artifact finalization must not delay output closure");
+    assert!(output_closed.load(Ordering::Acquire));
     assert!(
-        tokio::time::timeout(Duration::from_millis(1), &mut closed)
-            .await
-            .is_err(),
-        "output closure must not publish while the artifact remains pending"
+        !output_task.is_finished(),
+        "the artifact worker must remain owned"
     );
-    assert!(!output_closed.load(Ordering::Acquire));
 
     artifact_release
         .send(())
@@ -1975,9 +1979,6 @@ async fn local_output_waits_for_terminal_artifact_state_after_finalization_stall
     artifact_lock_thread
         .join()
         .expect("artifact lock thread should finish");
-    tokio::time::timeout(Duration::from_secs(1), &mut closed)
-        .await
-        .expect("output should close after the artifact becomes terminal");
     assert!(output_closed.load(Ordering::Acquire));
     output_task.await.expect("local output task should finish");
     assert!(matches!(
@@ -1988,7 +1989,7 @@ async fn local_output_waits_for_terminal_artifact_state_after_finalization_stall
 }
 
 #[tokio::test]
-async fn remote_termination_finalizes_artifact_before_publishing_output_closed() {
+async fn remote_termination_keeps_empty_output_inline() {
     for confirmed in [false, true] {
         let temp = tempfile::tempdir().expect("tempdir");
         let process = remote_process_with_options(
@@ -2007,7 +2008,7 @@ async fn remote_termination_finalizes_artifact_before_publishing_output_closed()
         closed.as_mut().enable();
 
         // Terminate before the output worker has to be polled. Even an empty
-        // remote stream must finalize its pending artifact before closing.
+        // remote stream should close without materializing an artifact.
         if confirmed {
             process
                 .terminate_confirmed()
@@ -2022,38 +2023,17 @@ async fn remote_termination_finalizes_artifact_before_publishing_output_closed()
                 .expect("remote output should finalize after termination");
         }
         assert!(output.output_closed.load(Ordering::Acquire));
-        let artifact = process
-            .raw_output_artifact()
-            .await
-            .expect("output closure must not expose a pending artifact");
-        let RawOutputArtifact::Stored {
-            path,
-            bytes,
-            truncated,
-            handle,
-            ..
-        } = artifact
-        else {
-            panic!("remote termination should preserve a stored artifact");
-        };
-        assert_eq!(bytes, 0);
-        assert!(!truncated);
-        assert_eq!(
-            tokio::fs::read(path)
-                .await
-                .expect("read finalized artifact"),
-            b""
+        assert!(process.raw_output_artifact().await.is_none());
+        assert!(
+            !temp.path().join("tool-output").exists(),
+            "empty output must not create storage"
         );
-        handle
-            .try_lock()
-            .expect("terminal artifact must be unlocked");
-        handle.unlock().expect("release assertion lock");
     }
 }
 
 #[cfg(windows)]
 #[tokio::test]
-async fn terminating_local_process_finalizes_pending_raw_output_artifact() {
+async fn terminating_local_process_keeps_empty_output_inline() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (program, args) = (
         "cmd.exe",
@@ -2092,8 +2072,8 @@ async fn terminating_local_process_finalizes_pending_raw_output_artifact() {
     }
 
     assert!(
-        process.raw_output_artifact().await.is_some(),
-        "local termination must not leave the raw-output artifact pending"
+        process.raw_output_artifact().await.is_none(),
+        "empty local output needs no artifact"
     );
 }
 

@@ -9,15 +9,13 @@ impl PersonalitySpecInstructions {
     pub(crate) fn new(spec: impl Into<String>) -> Self {
         let spec = spec.into();
         Self {
-            body: format!(
-                " The user has requested a new communication style. Future messages should adhere to the following personality: \n{spec} "
-            ),
+            body: format!("Use the following communication style for future messages:\n{spec}"),
         }
     }
 
     pub(crate) fn reset() -> Self {
         Self {
-            body: "The previously requested personality no longer applies. No personality-specific communication style is currently active."
+            body: "The previous personality no longer applies. No personality-specific communication style is currently active."
                 .to_string(),
         }
     }

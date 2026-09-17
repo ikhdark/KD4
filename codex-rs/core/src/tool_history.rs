@@ -355,22 +355,23 @@ impl ToolHistoryCandidate {
         }
 
         let mut digest_limit = RECEIPT_DIGEST_TARGET_TOKENS;
-        loop {
+        while digest_limit > 0 {
             receipt.digest =
                 truncate_text_to_token_ceiling(&self.bounded_model_output, digest_limit);
+            if receipt.digest.is_empty() {
+                return None;
+            }
             let rendered = serde_json::to_string(&receipt).ok()?;
             let receipt_tokens = u64::try_from(approx_token_count(&rendered)).unwrap_or(u64::MAX);
             if receipt_tokens <= RECEIPT_MAX_TOKENS as u64 {
                 return Some((rendered, receipt_tokens));
-            }
-            if digest_limit == 0 {
-                return None;
             }
             // Preserve a useful digest at the 256-token envelope boundary.
             // A 32-token decrement could jump from an oversized 32-token
             // digest directly to an empty one even when a 16-token digest fit.
             digest_limit = digest_limit.saturating_sub(16);
         }
+        None
     }
 
     fn matches_parsed_receipt(&self, receipt: &ToolHistoryReceipt) -> bool {
@@ -1153,6 +1154,21 @@ impl ToolHistoryState {
             .map(|admission| admission.item_index.0)
             .max();
 
+        // Both projections can reuse the same immutable recovery handle. Render
+        // it once under pressure; when all raw results fit, no pin is needed.
+        let artifact_pins = if raw_results_fit {
+            BTreeMap::new()
+        } else {
+            admission_candidates
+                .iter()
+                .filter(|admission| admission.non_text_tokens == 0)
+                .filter_map(|admission| {
+                    let pin = self.candidates.get(&admission.call_id)?.artifact_pin()?;
+                    Some((admission.call_id.clone(), pin))
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+
         #[derive(Debug)]
         enum AdmissionRepresentation {
             Raw,
@@ -1173,6 +1189,9 @@ impl ToolHistoryState {
         // monopolization.
         let cheapest_receiptable_representation_tokens =
             |admission_candidate: &AdmissionCandidate| -> usize {
+                if raw_results_fit {
+                    return 0;
+                }
                 let item_index = admission_candidate.item_index.0;
                 if let Some(raw_tokens) = admission_candidate.structured_tokens {
                     return projected
@@ -1208,9 +1227,9 @@ impl ToolHistoryState {
                         raw_tokens.min(receipt_tokens)
                     })
                     .filter(|tokens| *tokens <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET);
-                let pin_tokens = (non_text_tokens == 0)
-                    .then(|| candidate.artifact_pin().map(|(_, tokens)| tokens))
-                    .flatten()
+                let pin_tokens = artifact_pins
+                    .get(&admission_candidate.call_id)
+                    .map(|(_, tokens)| *tokens)
                     .filter(|tokens| *tokens <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET);
                 [Some(raw_tokens), receipt_tokens, pin_tokens]
                     .into_iter()
@@ -1228,7 +1247,7 @@ impl ToolHistoryState {
         let fallback_reservations = admission_candidates
             .iter()
             .map(|admission| {
-                if admission.structured_tokens.is_some() {
+                if raw_results_fit || admission.structured_tokens.is_some() {
                     // Structured results have no exact artifact fallback. Retain
                     // their raw forms by priority after protecting artifact handles.
                     return 0;
@@ -1241,10 +1260,9 @@ impl ToolHistoryState {
                 };
                 let raw_tokens =
                     approx_token_count(&output).saturating_add(admission.non_text_tokens);
-                let pin_tokens = (admission.non_text_tokens == 0)
-                    .then(|| self.candidates.get(&admission.call_id)?.artifact_pin())
-                    .flatten()
-                    .map(|(_, tokens)| tokens);
+                let pin_tokens = artifact_pins
+                    .get(&admission.call_id)
+                    .map(|(_, tokens)| *tokens);
                 pin_tokens.map_or(raw_tokens, |tokens| tokens.min(raw_tokens))
             })
             .collect::<Vec<_>>();
@@ -1273,9 +1291,6 @@ impl ToolHistoryState {
             let item_index = admission_candidate.item_index.0;
             let call_id = admission_candidate.call_id;
             if let Some(raw_tokens) = admission_candidate.structured_tokens {
-                let receipt = projected.get(item_index).and_then(|item| {
-                    tool_search_receipt_item(item, tool_search_arguments.get(&call_id))
-                });
                 let (representation, retain_raw_fallback) = if raw_tokens <= remaining_raw_tokens {
                     remaining_tokens = remaining_tokens.saturating_sub(raw_tokens);
                     let retain_raw = raw_tokens <= available_fallback_tokens;
@@ -1284,7 +1299,10 @@ impl ToolHistoryState {
                             remaining_fallback_tokens.saturating_sub(raw_tokens);
                     }
                     (AdmissionRepresentation::Raw, retain_raw)
-                } else if let Some((item, receipt_tokens)) = receipt
+                } else if let Some((item, receipt_tokens)) =
+                    projected.get(item_index).and_then(|item| {
+                        tool_search_receipt_item(item, tool_search_arguments.get(&call_id))
+                    })
                     && receipt_tokens <= remaining_tokens
                 {
                     remaining_tokens = remaining_tokens.saturating_sub(receipt_tokens);
@@ -1337,9 +1355,7 @@ impl ToolHistoryState {
                             .saturating_add(non_text_tokens);
                         (receipt_id, text, tokens)
                     });
-            let artifact_pin = (non_text_tokens == 0)
-                .then(|| candidate.artifact_pin())
-                .flatten();
+            let artifact_pin = artifact_pins.get(&call_id);
 
             // A newly returned image cannot be represented by a text receipt.
             // Preserve the newest such result through its first exposure, even
@@ -1373,7 +1389,6 @@ impl ToolHistoryState {
                 // when this result has a cheaper exact artifact handle.
                 && (receipt_tokens <= remaining_raw_tokens
                     || artifact_pin
-                        .as_ref()
                         .is_none_or(|(_, pin_tokens)| *pin_tokens >= receipt_tokens))
             {
                 remaining_tokens = remaining_tokens.saturating_sub(receipt_tokens);
@@ -1385,13 +1400,13 @@ impl ToolHistoryState {
                     retain_raw_fallback: false,
                 }
             } else if let Some((text, pin_tokens)) = artifact_pin
-                && pin_tokens <= remaining_tokens
+                && *pin_tokens <= remaining_tokens
             {
                 // Recovery handles still consume context. Evict lower-priority pairs when
                 // even their handles no longer fit; canonical outputs remain in the rollout.
-                remaining_tokens = remaining_tokens.saturating_sub(pin_tokens);
+                remaining_tokens = remaining_tokens.saturating_sub(*pin_tokens);
                 AdmissionDecision {
-                    representation: AdmissionRepresentation::ArtifactPin { text },
+                    representation: AdmissionRepresentation::ArtifactPin { text: text.clone() },
                     retain_raw_fallback: false,
                 }
             } else {
@@ -1406,9 +1421,7 @@ impl ToolHistoryState {
                 let fallback_tokens = if decision.retain_raw_fallback {
                     raw_tokens
                 } else {
-                    candidate
-                        .artifact_pin()
-                        .map_or(raw_tokens, |(_, tokens)| tokens)
+                    artifact_pin.map_or(raw_tokens, |(_, tokens)| *tokens)
                 };
                 remaining_fallback_tokens =
                     remaining_fallback_tokens.saturating_sub(fallback_tokens);
@@ -1421,10 +1434,7 @@ impl ToolHistoryState {
             item_call_id(item).is_none_or(|call_id| {
                 decisions.get(call_id).is_none_or(|decision| {
                     decision.retain_raw_fallback
-                        || (self
-                            .candidates
-                            .get(call_id)
-                            .is_some_and(|candidate| candidate.artifact_pin().is_some())
+                        || (artifact_pins.contains_key(call_id)
                             && matches!(
                                 &decision.representation,
                                 AdmissionRepresentation::Raw
@@ -1567,10 +1577,10 @@ impl ToolHistoryState {
                 {
                     continue;
                 }
-                let Some((text, _)) = candidate.artifact_pin() else {
+                let Some((text, _)) = artifact_pins.get(call_id) else {
                     continue;
                 };
-                replace_model_visible_output_text(body, text);
+                replace_model_visible_output_text(body, text.clone());
             }
         }
         self.enforce_tool_result_budget(&mut projected);
@@ -2688,8 +2698,8 @@ pub(crate) async fn persist_tool_history_mutations(
             .map_err(|error| format!("failed to seek tool-history journal append: {error}"))?;
         file.write_all(&bytes)
             .map_err(|error| format!("failed to append tool-history journal: {error}"))?;
-        file.sync_all()
-            .map_err(|error| format!("failed to sync tool-history journal: {error}"))?;
+        // Appends must be visible to readers, but crash durability belongs to
+        // the ordered terminal checkpoint, alongside the rollout flush.
         Ok(persisted_bytes)
     })
     .await
@@ -4144,6 +4154,7 @@ fn dependency_search_command(
         .or_else(|| arguments.get("cmd"))
         .or_else(|| arguments.get("script_body"))?
         .as_str()?;
+    let default_shell = std::cell::LazyCell::new(crate::shell::default_user_shell);
     let shell_type =
         if arguments.get("kind").and_then(serde_json::Value::as_str) == Some("powershell_script") {
             crate::shell::ShellType::PowerShell
@@ -4152,14 +4163,24 @@ fn dependency_search_command(
                 .get("shell")
                 .and_then(serde_json::Value::as_str)
                 .and_then(shell_type_from_name)
-                .unwrap_or_else(|| crate::shell::default_user_shell().shell_type)
+                .unwrap_or_else(|| default_shell.shell_type)
         };
     let command = match shell_type {
-        crate::shell::ShellType::PowerShell => vec![
-            "powershell".to_string(),
-            "-Command".to_string(),
-            script.to_string(),
-        ],
+        crate::shell::ShellType::PowerShell => {
+            // Keep the host used by execution: `powershell` and `pwsh` have
+            // different syntax and separate long-lived AST parser processes.
+            let executable = match arguments.get("shell").and_then(serde_json::Value::as_str) {
+                Some(shell) => shell.to_string(),
+                None if default_shell.shell_type == crate::shell::ShellType::PowerShell => {
+                    default_shell.shell_path.to_string_lossy().into_owned()
+                }
+                None => crate::shell::get_shell(crate::shell::ShellType::PowerShell, None)?
+                    .shell_path
+                    .to_string_lossy()
+                    .into_owned(),
+            };
+            vec![executable, "-Command".to_string(), script.to_string()]
+        }
         crate::shell::ShellType::Cmd => {
             vec!["cmd".to_string(), "/c".to_string(), script.to_string()]
         }

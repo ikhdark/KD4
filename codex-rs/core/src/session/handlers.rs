@@ -1,6 +1,7 @@
 use async_channel::Receiver;
 use codex_otel::set_parent_from_w3c_trace_context;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::Result as CodexResult;
 use codex_protocol::protocol::Submission;
 use std::time::Duration;
 use tracing::Instrument;
@@ -322,12 +323,19 @@ pub async fn inter_agent_communication(
     sess: &Arc<Session>,
     sub_id: String,
     communication: InterAgentCommunication,
+    admission: Option<tokio::sync::oneshot::Sender<CodexResult<()>>>,
 ) {
     let trigger_turn = communication.trigger_turn;
-    let accepted = sess
+    let result = sess
         .input_queue
         .enqueue_mailbox_communication(communication)
         .await;
+    let accepted = matches!(&result, Ok(true));
+    // Acknowledge queue admission before scheduling a turn, which can itself
+    // communicate with other agents. Senders must not wait for turn startup.
+    if let Some(admission) = admission {
+        let _ = admission.send(result.map(|_| ()));
+    }
     if !accepted {
         return;
     }
@@ -368,6 +376,7 @@ pub async fn run_user_shell_command(sess: &Arc<Session>, sub_id: String, command
 
 pub async fn resolve_elicitation(
     sess: &Arc<Session>,
+    sub_id: String,
     server_name: String,
     request_id: ProtocolRequestId,
     decision: codex_protocol::approvals::ElicitationAction,
@@ -396,13 +405,24 @@ pub async fn resolve_elicitation(
         ProtocolRequestId::Integer(value) => rmcp::model::NumberOrString::Number(value),
     };
     if let Err(err) = sess
-        .resolve_elicitation(server_name, request_id, response)
+        .resolve_elicitation(server_name.clone(), request_id.clone(), response)
         .await
     {
         warn!(
             error = %err,
             "failed to resolve elicitation request in session"
         );
+        // This is a failed reply, not a failure of the active turn. Keep the
+        // server error in diagnostics: it can include the user's form content.
+        sess.send_event_raw_without_materializing_rollout(Event {
+            id: sub_id,
+            msg: EventMsg::Warning(WarningEvent {
+                message: format!(
+                    "Failed to deliver your response to MCP server `{server_name}` for elicitation request `{request_id}`. The request may have expired or the server may have disconnected."
+                ),
+            }),
+        })
+        .await;
     }
 }
 
@@ -804,7 +824,7 @@ pub async fn review(
 pub(super) async fn submission_loop(
     sess: Arc<Session>,
     config: Arc<Config>,
-    rx_sub: Receiver<Submission>,
+    rx_sub: Receiver<super::QueuedSubmission>,
 ) {
     let _execution_permit_thread_cleanup = sess
         .services
@@ -812,7 +832,11 @@ pub(super) async fn submission_loop(
         .execution_permit_thread_cleanup(sess.thread_id);
     // To break out of this loop, send Op::Shutdown.
     let mut shutdown_received = false;
-    while let Ok(sub) = rx_sub.recv().await {
+    while let Ok(super::QueuedSubmission {
+        submission: sub,
+        mailbox_admission,
+    }) = rx_sub.recv().await
+    {
         let _execution_permit_cleanup = sess
             .services
             .agent_control
@@ -839,7 +863,13 @@ pub(super) async fn submission_loop(
                     false
                 }
                 Op::InterAgentCommunication { communication } => {
-                    inter_agent_communication(&sess, sub.id.clone(), communication).await;
+                    inter_agent_communication(
+                        &sess,
+                        sub.id.clone(),
+                        communication,
+                        mailbox_admission,
+                    )
+                    .await;
                     false
                 }
                 Op::ExecApproval {
@@ -897,8 +927,16 @@ pub(super) async fn submission_loop(
                     content,
                     meta,
                 } => {
-                    resolve_elicitation(&sess, server_name, request_id, decision, content, meta)
-                        .await;
+                    resolve_elicitation(
+                        &sess,
+                        sub.id.clone(),
+                        server_name,
+                        request_id,
+                        decision,
+                        content,
+                        meta,
+                    )
+                    .await;
                     false
                 }
                 Op::Shutdown => shutdown(&sess, sub.id.clone()).await,

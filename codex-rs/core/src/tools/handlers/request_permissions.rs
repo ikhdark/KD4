@@ -189,6 +189,111 @@ mod tests {
     use codex_protocol::permissions::FileSystemPath;
 
     #[tokio::test]
+    async fn permission_output_schema_covers_denial_and_session_grant() {
+        use crate::session::step_context::StepContext;
+        use crate::state::ActiveTurn;
+        use crate::tools::context::ToolCallSource;
+        use crate::turn_diff_tracker::TurnDiffTracker;
+        use codex_protocol::protocol::AskForApproval;
+        use codex_protocol::protocol::EventMsg;
+        use codex_protocol::request_permissions::RequestPermissionsResponse;
+        use serde_json::json;
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        let spec = RequestPermissionsHandler.spec();
+        let definition = codex_tools::tool_spec_to_code_mode_tool_definition(&spec)
+            .expect("permission tool definition");
+        assert!(definition.description.contains("scope:"));
+        assert!(!definition.description.contains("unresolved $ref"));
+        let ToolSpec::Function(spec) = spec else {
+            panic!("permissions uses a function spec");
+        };
+        let validator =
+            jsonschema::validator_for(spec.output_schema.as_ref().expect("output schema"))
+                .expect("valid permission output schema");
+        for expected in [
+            json!({"permissions":{"network":null,"file_system":null},"scope":"turn"}),
+            json!({"permissions":{"network":{"enabled":true},"file_system":null},"scope":"session"}),
+        ] {
+            let (session, mut turn, events) =
+                crate::session::tests::make_session_and_context_with_rx().await;
+            Arc::get_mut(&mut turn)
+                .expect("unique turn context")
+                .approval_policy
+                .set(AskForApproval::OnRequest)
+                .expect("interactive approval policy");
+            *session.active_turn.lock().await = Some(ActiveTurn::default());
+            let payload = ToolPayload::Function {
+                arguments: json!({"permissions":{"network":{"enabled":true}}}).to_string(),
+            };
+            let handler = RequestPermissionsHandler;
+            let mut request = handler.handle(ToolInvocation {
+                session: Arc::clone(&session),
+                step_context: StepContext::for_test(Arc::clone(&turn)),
+                cancellation_token: CancellationToken::new(),
+                tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                call_id: "permission-schema".to_string(),
+                tool_name: ToolName::plain("request_permissions"),
+                source: ToolCallSource::Direct,
+                payload: payload.clone(),
+            });
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    tokio::select! {
+                        result = &mut request => panic!("request completed before reply: {:?}", result.err()),
+                        event = events.recv() => {
+                            if let EventMsg::RequestPermissions(event) = event.unwrap().msg {
+                                assert_eq!(event.call_id, "permission-schema");
+                                assert_eq!(event.permissions.network, Some(NetworkPermissions { enabled: Some(true) }));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }).await.expect("permission request event");
+            session
+                .notify_request_permissions_response(
+                    "permission-schema",
+                    serde_json::from_value::<RequestPermissionsResponse>(expected.clone()).unwrap(),
+                )
+                .await;
+            let result = tokio::time::timeout(Duration::from_secs(3), request)
+                .await
+                .expect("reply completes request")
+                .expect("permission output");
+            let actual = result.code_mode_result(&payload);
+            assert_eq!(actual, expected);
+            assert!(
+                validator.is_valid(&actual),
+                "invalid permission output: {actual}"
+            );
+            let mut malformed = actual;
+            malformed["scope"] = json!("forever");
+            assert!(!validator.is_valid(&malformed));
+            malformed.as_object_mut().unwrap().remove("scope");
+            assert!(!validator.is_valid(&malformed));
+        }
+        for file_system in [
+            json!({"read":["file:///tmp/project"],"write":null}),
+            json!({"entries":[{"path":{"type":"glob_pattern","pattern":"**/*.rs"},"access":"read"}]}),
+        ] {
+            let response: RequestPermissionsResponse = serde_json::from_value(json!({
+                "permissions":{"network":null,"file_system":file_system},"scope":"turn"
+            }))
+            .expect("supported filesystem permission response");
+            let actual = serde_json::to_value(response).unwrap();
+            assert!(
+                validator.is_valid(&actual),
+                "invalid filesystem output: {actual}"
+            );
+            let mut malformed = actual;
+            malformed["permissions"]["file_system"] = json!({"entries":[{"path":{"type":"glob_pattern","pattern":"**/*.rs"},"access":"invalid"}]});
+            assert!(!validator.is_valid(&malformed));
+        }
+    }
+
+    #[tokio::test]
     async fn permission_requests_wait_for_runtime_cancellation_cleanup() {
         use crate::session::step_context::StepContext;
         use crate::state::ActiveTurn;

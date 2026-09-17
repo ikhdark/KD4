@@ -784,6 +784,102 @@ function Get-Command($Name) {
             f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
         )
 
+    def test_windows_installer_validates_release_repository_before_effects(self) -> None:
+        ps = powershell()
+        if ps is None:
+            self.skipTest("PowerShell is required for the Windows installer test")
+        installer = REPO_ROOT / "scripts" / "install" / "install.ps1"
+        for repository, accepted in [
+            ("ikhdark/KD4", True),
+            ("a/.github", True),
+            ("my-org/repo_name-1.2", True),
+            ("../..", False),
+            ("owner/.", False),
+            ("owner/..", False),
+            ("-x/-y", False),
+            ("owner/repo/extra", False),
+            ("owner/repo\nextra", False),
+        ]:
+            with self.subTest(repository=repository):
+                # Execute the actual parameter/validation preamble. Stop before
+                # function definitions so accepted cases cannot install anything.
+                command = (
+                    "$tokens=$null; $errors=$null; "
+                    f"$ast=[Management.Automation.Language.Parser]::ParseFile({ps_single_quote(installer)},[ref]$tokens,[ref]$errors); "
+                    "$first=$ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst]},$true)[0]; "
+                    "$preamble=$ast.Extent.Text.Substring(0,$first.Extent.StartOffset); "
+                    "$probe=[scriptblock]::Create($preamble + '; $ReleaseApiBase'); "
+                    f"try {{ & $probe -ReleaseRepository {ps_single_quote(repository)} }} "
+                    "catch { [Console]::Error.WriteLine($_.Exception.Message); exit 7 }"
+                )
+                completed = subprocess.run(
+                    [ps, "-NoProfile", "-NonInteractive", "-Command", command],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0 if accepted else 7, completed.stderr)
+                if accepted:
+                    self.assertEqual(
+                        completed.stdout.strip(),
+                        f"https://api.github.com/repos/{repository}/releases",
+                    )
+                else:
+                    self.assertIn("Invalid Codex release repository:", completed.stderr)
+                    self.assertEqual(completed.stdout, "")
+
+    def test_windows_installer_warns_when_native_uninstall_fails(self) -> None:
+        ps = powershell()
+        if ps is None:
+            self.skipTest("PowerShell is required for the Windows installer test")
+        installer = REPO_ROOT / "scripts" / "install" / "install.ps1"
+        for manager, exit_code, approved in [
+            ("npm", 23, True),
+            ("bun", 23, True),
+            ("npm", 0, True),
+            ("bun", 0, True),
+            ("npm", 23, False),
+        ]:
+            with self.subTest(manager=manager, exit_code=exit_code, approved=approved):
+                command = (
+                    "$ErrorActionPreference='Stop'; $tokens=$null; $errors=$null; "
+                    f"$ast=[Management.Automation.Language.Parser]::ParseFile({ps_single_quote(installer)},[ref]$tokens,[ref]$errors); "
+                    "$fn=$ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Maybe-HandleConflictingInstall'},$true)[0]; "
+                    "Invoke-Expression $fn.Extent.Text; "
+                    "$script:calledArgs=@(); $warnings=[Collections.Generic.List[string]]::new(); "
+                    "function Write-Step {}; function Write-WarningStep { param($Message) $warnings.Add($Message) }; "
+                    f"function Prompt-YesNo {{ return ${str(approved).lower()} }}; "
+                    f"function {manager} {{ $script:calledArgs=@($args); "
+                    f"& {ps_single_quote(Path(sys.executable))} -c 'import sys; sys.exit({exit_code})' }}; "
+                    f"Maybe-HandleConflictingInstall -Conflict ([pscustomobject]@{{Manager='{manager}'}}); "
+                    "@{warnings=@($warnings.ToArray()); arguments=$script:calledArgs; completed=$true} | ConvertTo-Json -Compress"
+                )
+                completed = subprocess.run(
+                    [ps, "-NoProfile", "-NonInteractive", "-Command", command],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                result = json.loads(completed.stdout)
+                self.assertTrue(result["completed"])
+                self.assertEqual(
+                    result["arguments"],
+                    ["remove" if manager == "bun" else "uninstall", "-g", "@openai/codex"]
+                    if approved else [],
+                )
+                if approved and exit_code:
+                    self.assertEqual(result["warnings"], [
+                        f"Failed to uninstall the existing {manager}-managed Codex: "
+                        f"{manager} exited with code {exit_code}. Continuing with the standalone install."
+                    ])
+                elif approved:
+                    self.assertEqual(result["warnings"], [])
+                else:
+                    self.assertEqual(result["warnings"], [
+                        f"Leaving the existing {manager}-managed Codex installed. PATH order will determine which codex runs."
+                    ])
+
     def test_powershell_installer_completeness_rejects_package_without_code_mode_host(
         self,
     ) -> None:
@@ -1884,6 +1980,23 @@ function Get-Command($Name) {
             "cargo nextest run --profile local --no-tests=fail -p codex-hooks --lib "
             "-E 'test(=schema::tests::generated_hook_schemas_match_fixtures)'",
         )
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows protobuf wrapper")
+    def test_protos_check_runs_both_freshness_checks(self) -> None:
+        result = subprocess.run(
+            ["just", "--dry-run", "protos-check"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        commands = (result.stdout + result.stderr).strip().splitlines()
+        self.assertEqual(len(commands), 2, commands)
+        self.assertIn("config\\scripts\\generate-proto.ps1", commands[0])
+        self.assertTrue(commands[0].endswith(" -Check"), commands[0])
+        self.assertIn("-p codex-exec-server --example generate-relay-proto", commands[1])
+        self.assertTrue(commands[1].endswith(" -- --check"), commands[1])
 
     def test_justfile_only_exposes_canonical_developer_tooling_recipes(self) -> None:
         justfile = "\n" + (REPO_ROOT / "justfile").read_text(encoding="utf-8")

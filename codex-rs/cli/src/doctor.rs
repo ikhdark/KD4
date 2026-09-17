@@ -1093,11 +1093,13 @@ where
                     stdout.metadata()?.len() > MAX_OUTPUT || stderr.metadata()?.len() > MAX_OUTPUT;
                 if start.elapsed() >= timeout || too_large {
                     return Ok(Err(if too_large {
-                        "diagnostic command output limit exceeded"
+                        "diagnostic command output limit exceeded".to_string()
                     } else {
-                        "diagnostic command timed out"
-                    }
-                    .to_string()));
+                        format!(
+                            "diagnostic command {program:?} timed out after {} ms",
+                            timeout.as_millis()
+                        )
+                    }));
                 }
                 if let Some(status) = child.try_wait()? {
                     return Ok(Ok(status));
@@ -4143,7 +4145,10 @@ mod tests {
             ],
             Duration::from_millis(100),
         );
-        assert_eq!(result, Err("diagnostic command timed out".to_string()));
+        assert_eq!(
+            result,
+            Err("diagnostic command \"powershell.exe\" timed out after 100 ms".to_string())
+        );
         let result = run_command(
             "powershell.exe",
             [

@@ -9,13 +9,15 @@ import hashlib
 import heapq
 import json
 import os
-from pathlib import Path
 import re
 import stat
 import sys
 import tempfile
-import tomllib
+import time
 import unicodedata
+from pathlib import Path
+
+import tomllib
 
 try:
     from scripts.generated_output_lock import GenerationLockError, source_map_lock
@@ -62,6 +64,7 @@ INVARIANT_KINDS = frozenset({"semantic", "compatibility"})
 TARGET_PREFIXES = ("owner:", "path:", "config:", "generated:", "contract:")
 MAX_QUERY_RELATIONSHIPS = 64
 MAX_SLICE_RELATIONSHIPS = 32
+MAX_SLICE_OUTPUT_BYTES = 32 * 1024
 ARCHITECTURE_FACETS = (
     "control_and_data_flow",
     "callers_and_consumers",
@@ -349,9 +352,12 @@ def _has_primary_declaration(path: Path, source: str, symbol: str) -> bool:
                     for alias in node.names
                 ):
                     return True
-            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-                if node.id == symbol:
-                    return True
+            elif (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Store)
+                and node.id == symbol
+            ):
+                return True
         return False
     code = _rust_declaration_source(source)
     name = rf"(?:r\#)?{re.escape(symbol)}\b"
@@ -364,12 +370,30 @@ def _has_primary_declaration(path: Path, source: str, symbol: str) -> bool:
     )
 
 
+def _target_owner_ids(target: str, owners: list[dict]) -> set[str]:
+    """Resolve declared path endpoints to the most specific declared roots."""
+    if target.startswith("owner:"):
+        return {target[6:]}
+    if not target.startswith("path:"):
+        return set()
+    path = Path(target[5:])
+    matches = [
+        (len(Path(root).parts), owner["id"])
+        for owner in owners
+        for root in owner.get("roots", [])
+        if path.is_relative_to(Path(root))
+    ]
+    specificity = max((depth for depth, _ in matches), default=-1)
+    return {owner_id for depth, owner_id in matches if depth == specificity}
+
+
 def load_and_validate(
     manifest_path: Path,
     root: Path | None = None,
     owner_ids: list[str] | None = None,
     *,
     raw: bytes | None = None,
+    source_fingerprints: dict[Path, tuple[bytes, int]] | None = None,
 ) -> tuple[dict, str]:
     if raw is None:
         raw = manifest_path.read_bytes()
@@ -433,7 +457,12 @@ def load_and_validate(
             return
         try:
             if candidate not in source_text:
-                source_text[candidate] = candidate.read_text(encoding="utf-8")
+                contents = candidate.read_bytes()
+                source_text[candidate] = contents.decode("utf-8")
+                if source_fingerprints is not None:
+                    # Retain only the digest and byte count across phases, not
+                    # whole source files. Validation and hashing use one capture.
+                    source_fingerprints[candidate] = (hashlib.sha256(contents).digest(), len(contents))
         except (OSError, UnicodeError) as error:
             errors.append(f"{owner_id}: unreadable symbol evidence {raw_path}: {error}")
             return
@@ -478,12 +507,8 @@ def load_and_validate(
         for relationship_index, relationship in enumerate(
             owner.get("relationships", [])
         ):
-            target_owner = (
-                relationship.get("target", "")[6:]
-                if relationship.get("target", "").startswith("owner:")
-                else None
-            )
-            if validate_owner_paths or target_owner in selected_owner_ids:
+            target_owners = _target_owner_ids(relationship.get("target", ""), owners)
+            if validate_owner_paths or target_owners & selected_owner_ids:
                 for evidence_index, evidence in enumerate(
                     relationship.get("evidence", [])
                 ):
@@ -538,8 +563,7 @@ def load_and_validate(
             declared.extend(
                 evidence.get("path", "")
                 for relationship in owner.get("relationships", [])
-                if relationship.get("target", "").startswith("owner:")
-                and relationship.get("target", "")[6:] in selected_owner_ids
+                if _target_owner_ids(relationship.get("target", ""), owners) & selected_owner_ids
                 for evidence in relationship.get("evidence", [])
             )
         for raw_path in declared:
@@ -824,12 +848,8 @@ def _query_graph(
     relationships: list[dict] = []
     for source_id, owner in owners_by_id.items():
         for relationship in owner.get("relationships", []):
-            target_owner = (
-                relationship["target"][6:]
-                if relationship["target"].startswith("owner:")
-                else None
-            )
-            if source_id not in selected_ids and target_owner not in selected_ids:
+            target_owners = _target_owner_ids(relationship["target"], manifest["owners"])
+            if source_id not in selected_ids and not target_owners.intersection(selected_ids):
                 continue
             relationships.append({"source": f"owner:{source_id}", **relationship})
     relationships = _deduplicate_graph_relationships(relationships)
@@ -955,10 +975,15 @@ def _architecture_index_is_usable(index: object, digest: str) -> bool:
 
 
 def load_architecture_index(
-    index_path: Path, digest: str, root: Path, *, refresh_sources: bool = True
+    index_path: Path, digest: str, root: Path, *, refresh_sources: bool = True,
+    read_metrics: dict[str, int] | None = None,
 ) -> dict | None:
     try:
-        candidate = json.loads(index_path.read_text(encoding="utf-8"))
+        raw = index_path.read_bytes()
+        if read_metrics is not None:
+            read_metrics["files_read"] += 1
+            read_metrics["bytes_read"] += len(raw)
+        candidate = json.loads(raw.decode("utf-8"))
     except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
         return None
     if not _architecture_index_is_usable(candidate, digest):
@@ -985,10 +1010,7 @@ def _select_index_graph(
         relationship
         for relationship in index["relationships"]
         if relationship["source"].removeprefix("owner:") in selected_ids
-        or (
-            relationship["target"].startswith("owner:")
-            and relationship["target"].removeprefix("owner:") in selected_ids
-        )
+        or _target_owner_ids(relationship["target"], index["owners"]).intersection(selected_ids)
     ]
     relationships = _deduplicate_graph_relationships(relationships)
     relationship_count = len(relationships)
@@ -1079,6 +1101,7 @@ def _relationship_rank_key(
         -overlap,
         -kind_priority,
         -bool(relationship.get("behavioral_contracts")),
+        -bool(relationship.get("scenario_symbols")),
         -provenance_priority,
         -selected_endpoint_count,
         relationship.get("source", ""),
@@ -1156,7 +1179,8 @@ def _budgeted_relationships(
 
 
 def _slice_source_snapshot(
-    root: Path, graph: dict, owners: list[dict]
+    root: Path, graph: dict, owners: list[dict],
+    source_fingerprints: dict[Path, tuple[bytes, int]] | None = None,
 ) -> tuple[str, int, int]:
     """Hash the exact declared files that support a bounded architecture slice."""
     root = root.resolve()
@@ -1184,6 +1208,11 @@ def _slice_source_snapshot(
         except ValueError:
             digest.update(b"\0missing-or-not-a-file\0")
             continue
+        captured = (source_fingerprints or {}).get(candidate)
+        if captured is not None:
+            digest.update(b"\0file\0")
+            digest.update(captured[0])
+            continue
         contents, reads, source_bytes = _read_snapshot_file(candidate)
         files_read += reads
         bytes_read += source_bytes
@@ -1195,6 +1224,74 @@ def _slice_source_snapshot(
     return digest.hexdigest(), files_read, bytes_read
 
 
+def _focused_validation_routes(owners: list[dict], scenario: dict | None, focus: str | None) -> tuple[list[dict], int]:
+    """Prefer declared scenario symbols, then task overlap; never invent a test filter."""
+    focus_tokens = _ranking_tokens(focus)
+    scenario_symbols = {
+        evidence.split("::", 1)[1]
+        for evidence in (scenario or {}).get("evidence", "").split(", ")
+        if "::" in evidence
+    }
+    selected = []
+    omitted = 0
+    for owner in owners:
+        routes = [route for route in owner.get("validation", []) if route.get("role") == "focused_tests"]
+        ranked = []
+        for route in routes:
+            command = " ".join(route.get("argv", []))
+            rank = (
+                any(symbol in command for symbol in scenario_symbols),
+                len(focus_tokens & _ranking_tokens(command + " " + route.get("id", ""))),
+            )
+            ranked.append((rank, route))
+        best = max((rank for rank, _ in ranked), default=(False, 0))
+        matches = [route for rank, route in ranked if rank == best]
+        selected.extend(matches)
+        omitted += len(routes) - len(matches)
+    return selected, omitted
+
+
+def _bound_slice_output(result: dict, max_bytes: int) -> dict:
+    """Bound the complete wire JSON while keeping evidence and pagination intact."""
+    if max_bytes < 4096:
+        raise ValueError("max_bytes must be at least 4096")
+    result["output_budget_bytes"] = max_bytes
+    while len((json.dumps(result, indent=2, sort_keys=True) + "\n").encode("utf-8")) > max_bytes:
+        tests = result.get("tests_and_contracts", {})
+        scenario = tests.get("representative_scenario")
+        # Pop only suffixes so continuation offsets still describe an exact page.
+        # Keep minimum facet coverage, the representative scenario, and one route.
+        candidates = [
+            (len(json.dumps(result[facet]["relationships"][-1])), facet)
+            for facet in ARCHITECTURE_FACETS
+            if facet in result and len(result[facet]["relationships"]) > 1
+            and result[facet]["relationships"][-1] != scenario
+        ]
+        if candidates:
+            _, facet = max(candidates)
+            section = result[facet]
+            section["relationships"].pop()
+            section["status"] = "partial"
+            section["omitted_relationships"] = section.get("omitted_relationships", 0) + 1
+            result["omitted_relationships"] += 1
+            continuation = next((item for item in result["continuations"] if item["facet"] == facet), None)
+            if continuation is None:
+                continuation = {**result["continuation_context"], "facet": facet}
+                result["continuations"].append(continuation)
+            continuation["offset"] = result["offset"] + len(section["relationships"])
+            result["truncated"] = True
+        elif len(tests.get("focused_validation", [])) > 1:
+            tests["focused_validation"].pop()
+            tests["omitted_validation_routes"] += 1
+            result["truncated"] = True
+        else:
+            raise ValueError(
+                "slice output budget cannot fit protected evidence and recovery metadata; "
+                "select fewer --owner values or a single --facet, or increase --max-bytes"
+            )
+    return result
+
+
 def architecture_slice(
     manifest: dict,
     digest: str,
@@ -1204,12 +1301,24 @@ def architecture_slice(
     focus: str | None = None,
     manifest_bytes_read: int = 0,
     graph: dict | None = None,
+    facet: str | None = None,
+    offset: int = 0,
+    expected_snapshot: str | None = None,
+    max_bytes: int = MAX_SLICE_OUTPUT_BYTES,
+    source_fingerprints: dict[Path, tuple[bytes, int]] | None = None,
 ) -> dict:
     """Return a completeness-first slice ranked within each architecture facet."""
     if not 1 <= max_relationships <= MAX_SLICE_RELATIONSHIPS:
         raise ValueError(
             f"max_relationships must be between 1 and {MAX_SLICE_RELATIONSHIPS}"
         )
+    if facet is not None and facet not in ARCHITECTURE_FACETS:
+        raise ValueError(f"unknown architecture facet: {facet}")
+    if offset < 0 or (offset and facet is None):
+        raise ValueError("offset must be nonnegative and requires a facet")
+    if offset and expected_snapshot is None:
+        raise ValueError("pagination requires expected_snapshot from the preceding slice")
+    active_facets = (facet,) if facet is not None else ARCHITECTURE_FACETS
     if graph is None:
         graph = _query_graph(
             manifest,
@@ -1249,27 +1358,37 @@ def architecture_slice(
         ).encode("utf-8")
     ).hexdigest()
     source_snapshot, files_read, bytes_read = _slice_source_snapshot(
-        root, graph, selected_owners
+        root, graph, selected_owners, source_fingerprints
     )
+    snapshot = f"slice-v4:{','.join(selected_ids)}:routing:{routing_digest}:sources:{source_snapshot}"
+    if expected_snapshot is not None and snapshot != expected_snapshot:
+        raise ValueError("slice snapshot changed; restart pagination from the first page")
     facets: dict[str, list[dict]] = {name: [] for name in ARCHITECTURE_FACETS}
     coverage: dict[str, set[str]] = {name: set() for name in ARCHITECTURE_FACETS}
 
     for relationship in graph["relationships"]:
         source_id = relationship["source"].removeprefix("owner:")
-        target_id = relationship["target"].removeprefix("owner:")
-        involved = set(selected_ids) & {source_id, target_id}
+        target_ids = _target_owner_ids(relationship["target"], list(selected.values()))
+        involved = set(selected_ids) & ({source_id} | target_ids)
         facet = CATEGORY_FACETS[relationship["category"]]
-        # Prefer an exact scenario tied to an existing semantic contract over
-        # filename proximity. This is declared evidence to read, not proof that
-        # the test is sufficient; no source crawl or second test index is needed.
+        # A shared test file does not establish which scenario covers a
+        # contract. Require an identical path-and-symbol declaration.
         scenario_contracts = []
-        if relationship["kind"] == "validated_by" and any(
-            item.get("symbol") for item in relationship["evidence"]
-        ):
+        scenario_evidence = {
+            (item["path"], item["symbol"])
+            for item in relationship["evidence"]
+            if relationship["kind"] == "validated_by"
+            and item.get("symbol")
+            and relationship["target"] == f"path:{item['path']}"
+        }
+        if scenario_evidence:
             for invariant in selected.get(source_id, {}).get("invariants", []):
-                if invariant["kind"] == "semantic" and relationship["target"] in {
-                    f"path:{path}" for path in invariant.get("tests", [])
-                }:
+                declared_scenarios = {
+                    (item["path"], item.get("symbol"))
+                    for item in invariant["evidence"]
+                    if item["path"] in invariant.get("tests", [])
+                }
+                if invariant["kind"] == "semantic" and scenario_evidence & declared_scenarios:
                     scenario_contracts.append(invariant["statement"])
         coverage[facet].update(involved or {source_id})
         facets[facet].append(
@@ -1283,6 +1402,8 @@ def architecture_slice(
                 # Confidence is a manifest assertion, not a compiler receipt
                 # tied to this source state, target, and feature configuration.
                 "provenance": "declared",
+                **({"scenario_symbols": sorted(symbol for _, symbol in scenario_evidence)}
+                   if scenario_evidence else {}),
                 **(
                     {"behavioral_contracts": scenario_contracts}
                     if scenario_contracts
@@ -1356,7 +1477,7 @@ def architecture_slice(
     unknowns: list[str] = []
     output: dict[str, object] = {}
     facet_relationship_totals: dict[str, int] = {}
-    for facet in ARCHITECTURE_FACETS:
+    for facet in active_facets:
         uncovered = []
         reasons = []
         for owner_id in selected_ids:
@@ -1371,13 +1492,15 @@ def architecture_slice(
             unknowns.append(f"{facet}: missing declarations for {', '.join(uncovered)}")
         unique_relationships = _deduplicate_relationships(facets[facet])
         facet_relationship_totals[facet] = len(unique_relationships)
+        if offset > len(unique_relationships):
+            raise ValueError("offset exceeds the selected facet's relationship count")
         relationships = _bounded_sorted(
             unique_relationships,
-            lambda item: _relationship_rank_key(
+            lambda item, facet=facet: _relationship_rank_key(
                 facet, item, selected_id_set, focus_tokens
             ),
-            max_relationships,
-        )
+            offset + max_relationships,
+        )[offset:]
         if relationships:
             output[facet] = {
                 "status": "partial" if uncovered else "established",
@@ -1385,31 +1508,46 @@ def architecture_slice(
             }
         else:
             output[facet] = {
-                "status": "not_applicable" if reasons and not uncovered else "unknown",
+                "status": (
+                    "established" if offset and not uncovered
+                    else "not_applicable" if reasons and not uncovered else "unknown"
+                ),
                 "relationships": [],
                 **({"not_applicable_reason": "; ".join(reasons)} if reasons else {}),
             }
 
     relationship_total = sum(facet_relationship_totals.values())
-    omitted_relationships = graph["omitted"]["relationships"]
     if relationship_total > max_relationships:
         retained = _budgeted_relationships(
-            {facet: output[facet]["relationships"] for facet in ARCHITECTURE_FACETS},
+            {facet: output[facet]["relationships"] for facet in active_facets},
             max_relationships,
             selected_id_set,
             focus_tokens,
         )
-        omitted_relationships += relationship_total - max_relationships
-        for facet in ARCHITECTURE_FACETS:
+        for facet in active_facets:
             output[facet]["relationships"] = retained[facet]
 
-    for facet in ARCHITECTURE_FACETS:
-        omitted = facet_relationship_totals[facet] - len(output[facet]["relationships"])
+    continuations = []
+    for facet in active_facets:
+        next_offset = offset + len(output[facet]["relationships"])
+        omitted = max(0, facet_relationship_totals[facet] - next_offset)
         if omitted:
             output[facet]["omitted_relationships"] = omitted
             output[facet]["status"] = (
                 "partial" if output[facet]["relationships"] else "unknown"
             )
+            continuations.append({
+                "facet": facet,
+                "offset": next_offset,
+                "owners": selected_ids,
+                "focus": focus,
+                "max_relationships": max_relationships,
+                "max_bytes": max_bytes,
+                "expected_snapshot": snapshot,
+            })
+    omitted_relationships = sum(
+        output[facet].get("omitted_relationships", 0) for facet in active_facets
+    ) + graph["omitted"]["relationships"]
 
     ranking_limitation = (
         "One relationship per nonempty facet is protected when the budget permits; "
@@ -1417,23 +1555,36 @@ def architecture_slice(
         "facet-specific kind, declared behavioral scenario, provenance, and selected-owner directness. "
         "Inspect the selected scenario's normal entry point and asserted effect; declarations do not prove test quality."
     )
-    test_facet = output["tests_and_contracts"]
+    test_facet = output.get("tests_and_contracts", {})
     test_facet["representative_scenario"] = next(
         (
             item
-            for item in test_facet["relationships"]
-            if item.get("behavioral_contracts")
+            for item in test_facet.get("relationships", [])
+            if item.get("scenario_symbols")
         ),
         None,
     )
-    test_facet["focused_validation"] = [
-        validation
-        for owner in selected_owners
-        for validation in owner.get("validation", [])
-        if validation.get("role") == "focused_tests"
-    ]
-    return {
-        "snapshot": f"slice-v4:{','.join(selected_ids)}:routing:{routing_digest}:sources:{source_snapshot}",
+    validation, omitted_validation = _focused_validation_routes(
+        selected_owners, test_facet["representative_scenario"], focus
+    )
+    test_facet["focused_validation"] = validation
+    test_facet["omitted_validation_routes"] = omitted_validation
+    test_facet["validation_selection"] = (
+        "Per owner: prefer the declared scenario symbol, then task-term overlap. "
+        "Ties are retained; this ranking does not prove test sufficiency. "
+        "Use validation with the same --owner selections for every declared route."
+    )
+    return _bound_slice_output({
+        "snapshot": snapshot,
+        "offset": offset,
+        "continuations": continuations,
+        "continuation_context": {
+            "owners": selected_ids,
+            "focus": focus,
+            "max_relationships": max_relationships,
+            "max_bytes": max_bytes,
+            "expected_snapshot": snapshot,
+        },
         "freshness_scope": "selected owners and their incoming/outgoing relationship evidence",
         **output,
         "truncated": graph["status"] != "complete" or omitted_relationships > 0,
@@ -1441,6 +1592,12 @@ def architecture_slice(
         "material_unknowns": unknowns,
         "limitations": [
             "Manifest relationships are declarative; inspect exact source before mutation.",
+            "Non-primary symbol checks establish literal presence only, not a declaration or call edge.",
+            (
+                "Follow each continuation with slice --facet, --offset, --expected-snapshot, "
+                "the same --owner selections, --focus, --max-relationships, and --max-bytes. "
+                "Restart from the first page if the snapshot changes."
+            ),
             ranking_limitation,
         ],
         "metrics": {
@@ -1450,7 +1607,34 @@ def architecture_slice(
             "bytes_read": bytes_read + manifest_bytes_read,
             "late_relationship_discoveries": None,
         },
-    }
+    }, max_bytes)
+
+
+def compact_slice_output(result: dict) -> dict:
+    """Reference response-local relationships once; keep the rich API unchanged."""
+    compact = dict(result)
+    records: dict[str, dict] = {}
+    identifiers: dict[str, str] = {}
+
+    def reference(item: dict) -> str:
+        key = json.dumps(item, sort_keys=True, separators=(",", ":"))
+        if key not in identifiers:
+            identifier = f"r{len(records) + 1}"
+            identifiers[key] = identifier
+            records[identifier] = item
+        return identifiers[key]
+
+    for name in ARCHITECTURE_FACETS:
+        if name not in result:
+            continue
+        facet = dict(result[name])
+        facet["relationships"] = [reference(item) for item in facet["relationships"]]
+        if facet.get("representative_scenario") is not None:
+            facet["representative_scenario"] = reference(facet["representative_scenario"])
+        compact[name] = facet
+    compact["relationship_records"] = records
+    compact["format"] = "compact-slice-v1"
+    return compact
 
 
 def expected_architecture_index(manifest: dict, digest: str, root: Path) -> str:
@@ -1615,7 +1799,26 @@ def owners_for_paths(
     return sorted(selected)
 
 
+def owners_for_focus(manifest: dict, root: Path, focus: str) -> list[str]:
+    """Resolve declared names and paths without reading repository sources."""
+    paths = [token.strip("`\"'(),:;") for token in focus.replace("\\", "/").split()]
+    paths = [path for path in paths if "/" in path and not path.startswith(("/", "http:" , "https:"))]
+    selected = owners_for_paths(manifest, root, paths)
+    if selected:
+        return selected
+    normalized_focus = " " + " ".join(re.findall(r"\w+", focus.casefold())) + " "
+    scores = {}
+    for owner in manifest["owners"]:
+        for label in [owner["id"], *owner.get("aliases", []), *owner.get("phrases", [])]:
+            words = re.findall(r"\w+", label.casefold())
+            if words and " " + " ".join(words) + " " in normalized_focus:
+                scores[owner["id"]] = max(scores.get(owner["id"], 0), len(words))
+    best = max(scores.values(), default=0)
+    return sorted(owner for owner, score in scores.items() if score == best)
+
+
 def main() -> int:
+    started = time.perf_counter()
     parser = argparse.ArgumentParser(
         description=__doc__,
         epilog="Use `slice --path <file>` for a known file, or `list` to find an owner ID.",
@@ -1650,12 +1853,20 @@ def main() -> int:
         "--focus",
         help="Slice-only task description used to rank architecture relationships.",
     )
+    parser.add_argument("--facet", choices=ARCHITECTURE_FACETS, help="Slice facet to page through.")
+    parser.add_argument("--offset", type=int, default=0, help="Relationships already read in --facet.")
+    parser.add_argument("--expected-snapshot", help="Reject a slice page if its source snapshot changed.")
+    parser.add_argument("--compact", action="store_true", help="Slice-only compact JSON with shared relationship records.")
+    parser.add_argument("--max-bytes", type=int, default=MAX_SLICE_OUTPUT_BYTES,
+                        help="Slice JSON byte budget, including metadata (minimum 4096).")
     parser.add_argument(
         "--repo-root",
         type=Path,
         help="Repository root for declared paths (defaults to the manifest directory).",
     )
     args = parser.parse_args()
+    if args.command != "slice" and (args.facet or args.offset or args.expected_snapshot or args.compact):
+        parser.error("--facet, --offset, --expected-snapshot, and --compact are only valid with slice")
     if args.paths and args.command not in {"query", "slice", "validation"}:
         parser.error("--path is only valid with query, slice, or validation")
     if args.command == "validation" and not (args.paths or args.owners):
@@ -1701,7 +1912,19 @@ def main() -> int:
     try:
         if args.command in {"query", "slice", "validation"}:
             manifest_bytes = args.manifest.read_bytes()
+            read_metrics = {"files_read": 1, "bytes_read": len(manifest_bytes)}
+            source_fingerprints: dict[Path, tuple[bytes, int]] = {}
             unowned_paths: list[str] = []
+            owner_resolution = None
+            if args.command == "slice" and args.focus and not (args.owners or args.paths):
+                args.owners = owners_for_focus(
+                    tomllib.loads(manifest_bytes.decode("utf-8")), root, args.focus
+                )
+                owner_resolution = {
+                    "status": "selected" if len(args.owners) == 1 else "ambiguous" if args.owners else "unresolved",
+                    "candidates": args.owners,
+                    "basis": "declared paths, owner IDs, aliases, and phrases",
+                }
             if args.paths:
                 resolved = owners_for_paths(
                     tomllib.loads(manifest_bytes.decode("utf-8")),
@@ -1749,11 +1972,13 @@ def main() -> int:
                 digest,
                 root,
                 refresh_sources=False,
+                read_metrics=read_metrics,
             )
             # The index authenticates the manifest projection, not the current
             # sources. Revalidate the selected declaration closure on warm reads too.
             manifest, digest = load_and_validate(
-                args.manifest, root, owner_ids=args.owners, raw=manifest_bytes
+                args.manifest, root, owner_ids=args.owners, raw=manifest_bytes,
+                source_fingerprints=source_fingerprints,
             )
             if args.command == "query":
                 if not 1 <= args.max_relationships <= MAX_QUERY_RELATIONSHIPS:
@@ -1779,6 +2004,11 @@ def main() -> int:
                     args.focus,
                     len(manifest_bytes),
                     graph=cached_graph,
+                    facet=args.facet,
+                    offset=args.offset,
+                    expected_snapshot=args.expected_snapshot,
+                    max_bytes=args.max_bytes,
+                    source_fingerprints=source_fingerprints,
                 )
             result["index_status"] = (
                 "reused" if cached_graph is not None else "fallback"
@@ -1811,15 +2041,31 @@ def main() -> int:
                 if args.command == "query":
                     result["status"] = "partial"
                 else:
-                    for facet in ARCHITECTURE_FACETS:
+                    for facet in (args.facet,) if args.facet else ARCHITECTURE_FACETS:
                         result[facet]["status"] = (
                             "partial" if result[facet]["relationships"] else "unknown"
                         )
                         result[facet].pop("not_applicable_reason", None)
+            if args.command == "slice":
+                if owner_resolution is not None:
+                    result["owner_resolution"] = owner_resolution
+                    if owner_resolution["status"] != "selected":
+                        result["material_unknowns"].append(
+                            "Ownership is " + owner_resolution["status"] + "; refine --focus or supply --owner/--path."
+                        )
+                read_metrics["files_read"] += len(source_fingerprints) + result["metrics"]["files_read"] - 1
+                read_metrics["bytes_read"] += sum(size for _, size in source_fingerprints.values()) + result["metrics"]["bytes_read"] - len(manifest_bytes)
+                result["metrics"]["command"] = {
+                    "scope": "manifest/index loading, source validation, and slice construction; excludes output serialization",
+                    **read_metrics,
+                    "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
+                }
+                _bound_slice_output(result, args.max_bytes)
             print(
                 json.dumps(
-                    result,
-                    indent=2,
+                    compact_slice_output(result) if args.compact else result,
+                    indent=None if args.compact else 2,
+                    separators=(",", ":") if args.compact else None,
                     sort_keys=True,
                 )
             )

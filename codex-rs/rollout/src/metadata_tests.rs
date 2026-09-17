@@ -546,12 +546,35 @@ async fn backfill_sessions_resumes_from_watermark_and_marks_complete() {
         .checkpoint_backfill(first_watermark.as_str())
         .await
         .expect("checkpoint first watermark");
-    tokio::time::sleep(std::time::Duration::from_secs(
-        (BACKFILL_LEASE_SECONDS + 1) as u64,
-    ))
-    .await;
-
+    // The production lease must still protect a worker after the former
+    // one-second test-only lease would have expired.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     backfill_sessions(runtime.as_ref(), codex_home.as_path(), "test-provider").await;
+    assert_eq!(
+        runtime
+            .get_backfill_state()
+            .await
+            .expect("active backfill")
+            .status,
+        BackfillStatus::Running
+    );
+    assert_eq!(
+        runtime
+            .get_thread(ThreadId::from_string(&second_uuid.to_string()).expect("second thread id"))
+            .await
+            .expect("unprocessed thread"),
+        None
+    );
+
+    // Expire this fixture explicitly, without changing the default lease for
+    // every unit test or waiting fifteen minutes to exercise recovery.
+    backfill_sessions_with_lease(
+        runtime.as_ref(),
+        codex_home.as_path(),
+        "test-provider",
+        /*backfill_lease_seconds*/ 0,
+    )
+    .await;
 
     let first_id = ThreadId::from_string(&first_uuid.to_string()).expect("first thread id");
     let second_id = ThreadId::from_string(&second_uuid.to_string()).expect("second thread id");

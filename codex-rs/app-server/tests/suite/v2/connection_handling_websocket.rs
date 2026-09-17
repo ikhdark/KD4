@@ -65,6 +65,31 @@ pub(super) const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 pub(super) type WsClient = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 type HmacSha256 = Hmac<Sha256>;
 
+#[cfg(unix)]
+#[tokio::test]
+async fn websocket_sigterm_gracefully_stops_idle_server() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
+    let mut ws = connect_websocket(bind_addr).await?;
+    send_initialize_request(&mut ws, 1, "sigterm_client").await?;
+    read_response_for_id(&mut ws, 1).await?;
+
+    let pid = process.id().context("server should still be running")?;
+    let delivered = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .await?;
+    assert!(delivered.success(), "SIGTERM should be delivered");
+    let status = timeout(DEFAULT_READ_TIMEOUT, process.wait()).await??;
+    assert!(
+        status.success(),
+        "server must drain and exit normally: {status}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn websocket_transport_routes_per_connection_handshake_and_responses() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;

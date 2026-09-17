@@ -48,6 +48,7 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::ToolLifecycleBoundary;
 use codex_protocol::protocol::TurnTimingToolCallSource;
 use codex_tools::ToolOutputOutcome;
 use codex_tools::ToolOutputOutcomeContext;
@@ -310,6 +311,9 @@ impl WorkspaceEvidenceGenerationOwner {
 /// in one model sampling generation have settled.
 pub(crate) struct WorkspaceEvidenceGenerationBatch {
     state: Mutex<WorkspaceEvidenceGenerationBatchState>,
+    baselines: tokio::sync::Mutex<
+        std::collections::HashMap<std::path::PathBuf, (u64, WorkspaceEvidenceBaseline)>,
+    >,
 }
 
 impl Drop for WorkspaceEvidenceGenerationBatch {
@@ -332,6 +336,7 @@ impl Drop for WorkspaceEvidenceGenerationBatch {
         // sealing early or rejecting effects from a still-running nested call.
         let batch = Arc::new(Self {
             state: Mutex::new(std::mem::take(state)),
+            baselines: Default::default(),
         });
         let terminal_tasks = owner.session.terminal_tasks.clone();
         terminal_tasks.spawn(async move {
@@ -359,7 +364,60 @@ impl WorkspaceEvidenceGenerationBatch {
     pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(WorkspaceEvidenceGenerationBatchState::default()),
+            baselines: Default::default(),
         }
+    }
+
+    async fn capture_baseline(
+        &self,
+        cache: &crate::git_workspace::GitWorkspaceCache,
+        turn: Option<&TurnContext>,
+        cwd: &std::path::Path,
+        dependencies: std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
+        mutation_revision: u64,
+    ) -> WorkspaceEvidenceBaseline {
+        // Coalesce sibling captures, including the authoritative non-Git None.
+        // A mutation invalidates the batch entry before the next admitted call.
+        let mut baselines = self.baselines.lock().await;
+        if let Some((revision, baseline)) = baselines.get(cwd)
+            && *revision == mutation_revision
+        {
+            let mut baseline = baseline.clone();
+            baseline.cache_hit = true;
+            let repo_root = baseline
+                .revision
+                .as_ref()
+                .and_then(|identity| identity.repository_root.as_deref())
+                .map(std::path::Path::new);
+            if !dependencies.is_subset(&baseline.source_dependencies)
+                && !turn.is_some_and(|turn| {
+                    turn.environments
+                        .primary()
+                        .is_some_and(|selected| selected.environment.is_remote())
+                })
+            {
+                baseline.source_path_observations =
+                    begin_source_path_observations(cache, repo_root, &dependencies).await;
+            }
+            baseline.source_dependencies = dependencies;
+            return baseline;
+        }
+        let baseline = capture_workspace_evidence_baseline(
+            cache,
+            turn,
+            cwd,
+            dependencies,
+            !baselines.contains_key(cwd),
+        )
+        .await;
+        if baseline
+            .revision
+            .as_ref()
+            .is_none_or(|identity| !identity.unavailable)
+        {
+            baselines.insert(cwd.to_path_buf(), (mutation_revision, baseline.clone()));
+        }
+        baseline
     }
 
     fn retain_generation_owner(
@@ -433,6 +491,11 @@ impl WorkspaceEvidenceGenerationBatch {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.sealed || !state.call_ordinals.contains_key(call_id) {
+            return;
+        }
+        // This is a mutation epoch: reads need ordering against edits, not
+        // against other reads in the same epoch.
         let ordinal = state.next_effect_ordinal;
         state
             .observation_effect_ordinals
@@ -496,7 +559,9 @@ impl WorkspaceEvidenceGenerationBatch {
             .observation_effect_ordinals
             .get(call_id)
             .copied()
-            .unwrap_or(state.next_effect_ordinal);
+            // Without an observation we cannot prove the result followed any
+            // mutation in this generation. Invalidate it for overlapping edits.
+            .unwrap_or(0);
         state.responses.push(PendingWorkspaceEvidenceResponse {
             ordinal,
             observed_effect_ordinal,
@@ -516,6 +581,9 @@ impl WorkspaceEvidenceGenerationBatch {
         classification: &crate::tool_history::WorkspaceCallClassification,
         source_path_observations: Vec<crate::git_workspace::SourcePathChangeObservation>,
     ) -> bool {
+        if let Some(call_id) = response_input_call_id(response) {
+            self.record_workspace_observation(call_id);
+        }
         self.queue_response(
             response,
             classification,
@@ -604,19 +672,30 @@ impl WorkspaceEvidenceGenerationBatch {
         let stale_response_call_ids = groups
             .values()
             .flat_map(|group| {
-                group.responses.iter().filter(|response| {
-                    group.mutations.iter().any(|mutation| {
-                        mutation.ordinal >= response.observed_effect_ordinal
-                            && mutation.affected_paths.as_ref().is_none_or(|paths| {
+                let mutations = group
+                    .mutations
+                    .iter()
+                    .map(|mutation| {
+                        let paths = mutation.affected_paths.as_ref().map(|paths| {
+                            paths
+                                .iter()
+                                .map(|path| {
+                                    crate::tool_history::SourceDependencyV1::new(path, false).path
+                                })
+                                .collect::<Vec<_>>()
+                        });
+                        (mutation.ordinal, paths)
+                    })
+                    .collect::<Vec<_>>();
+                group.responses.iter().filter(move |response| {
+                    mutations.iter().any(|(ordinal, paths)| {
+                        *ordinal >= response.observed_effect_ordinal
+                            && paths.as_ref().is_none_or(|paths| {
                                 response.source_dependencies.is_empty()
-                                    || paths.iter().any(|path| {
-                                        let changed = crate::tool_history::SourceDependencyV1::new(
-                                            path, false,
-                                        );
+                                    || paths.iter().any(|changed| {
                                         response.source_dependencies.iter().any(|dependency| {
                                             crate::tool_history::source_dependency_overlaps(
-                                                dependency,
-                                                &changed.path,
+                                                dependency, changed,
                                             )
                                         })
                                     })
@@ -973,6 +1052,7 @@ fn workspace_resource_gate(
     gate
 }
 
+#[derive(Clone)]
 struct WorkspaceEvidenceBaseline {
     revision: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
     cache_hit: bool,
@@ -1172,20 +1252,19 @@ async fn begin_source_path_observations(
     let Some(repo_root) = repo_root else {
         return Vec::new();
     };
-    let mut observations = Vec::new();
-    for dependency in source_dependencies {
-        if let Some(observation) = cache
-            .begin_source_path_change_observation(
-                repo_root,
-                std::path::Path::new(&dependency.path),
+    let paths = source_dependencies
+        .iter()
+        .map(|dependency| {
+            (
+                std::path::PathBuf::from(&dependency.path),
                 dependency.recursive,
             )
-            .await
-        {
-            observations.push(observation);
-        }
-    }
-    observations
+        })
+        .collect::<Vec<_>>();
+    cache
+        .begin_source_path_change_observations(repo_root, &paths)
+        .await
+        .unwrap_or_default()
 }
 
 fn finish_workspace_evidence_capture(
@@ -1291,18 +1370,18 @@ impl ToolCallRuntime {
         if !classification.observes_workspace {
             return false;
         }
-        let source_dependencies = workspace_evidence_source_dependencies(
-            baseline.as_ref(),
-            source_dependencies_override.as_ref(),
-            classification,
-        );
-        let source_path_observations = baseline
-            .as_ref()
-            .filter(|baseline| baseline.source_dependencies == source_dependencies)
-            .map(|baseline| baseline.source_path_observations.clone())
-            .unwrap_or_default();
-        if mutation_advanced
-            && self
+        if mutation_advanced {
+            let source_dependencies = workspace_evidence_source_dependencies(
+                baseline.as_ref(),
+                source_dependencies_override.as_ref(),
+                classification,
+            );
+            let source_path_observations = baseline
+                .as_ref()
+                .filter(|baseline| baseline.source_dependencies == source_dependencies)
+                .map(|baseline| baseline.source_path_observations.clone())
+                .unwrap_or_default();
+            if self
                 .step_context
                 .workspace_evidence_generation_batch
                 .queue_response(
@@ -1312,8 +1391,9 @@ impl ToolCallRuntime {
                     source_path_observations,
                     timing,
                 )
-        {
-            return true;
+            {
+                return true;
+            }
         }
         let gate_guard = Some(WorkspaceGateGuard::Shared {
             _guard: Arc::clone(&self.parallel_execution).read_owned().await,
@@ -1378,22 +1458,12 @@ impl ToolCallRuntime {
             return true;
         }
         let (revision, captured_current) = match baseline.as_ref() {
-            Some(_baseline) if mutation_advanced => {
-                let revision = session
-                    .services
-                    .git_workspace
-                    .workspace_evidence_for_turn(turn, &classification.workspace_cwd)
-                    .await
-                    .identity;
-                // A `None` revision is also authoritative for a non-Git workspace: the
-                // observation was captured after the tool completed.
-                let captured_current = true;
-                (revision, captured_current)
+            Some(baseline) if !mutation_advanced => {
+                finish_workspace_evidence_capture(baseline, mutation_advanced)
             }
-            Some(baseline) => finish_workspace_evidence_capture(baseline, mutation_advanced),
-            None => {
-                // An executed payload can refine the workspace classification
-                // enough to invalidate the pre-dispatch baseline. Capture the
+            _ => {
+                // A mutation or refined payload can invalidate the pre-dispatch
+                // baseline. Capture the
                 // authoritative post-call identity instead of publishing an
                 // observation that is stale from birth. `None` remains an
                 // authoritative identity for a non-Git workspace.
@@ -2138,7 +2208,7 @@ impl ToolCallRuntime {
         // after the abort owns the terminal outcome.
         let runtime_cancellation_token = CancellationToken::new();
         let invocation_cancellation_token = runtime_cancellation_token.clone();
-        let started = Instant::now();
+        let started = TokioInstant::now();
         let abort_session = Arc::clone(&session);
         let abort_source = source.clone();
         // Direct calls own evidence registration in the outer response path,
@@ -2219,6 +2289,7 @@ impl ToolCallRuntime {
 
         let mut dispatch_handle: AbortOnDropHandle<Result<AnyToolResult, FunctionCallError>> =
             AbortOnDropHandle::new(tokio::spawn(async move {
+                timing.record_boundary(ToolLifecycleBoundary::ResourceResolutionStart);
                 let resource_key = workspace_resource_key_for_admission(
                     &workspace_admission_classification,
                     &canonical_workspace_resources,
@@ -2226,6 +2297,7 @@ impl ToolCallRuntime {
                     workspace_capable,
                 )
                 .await;
+                timing.record_boundary(ToolLifecycleBoundary::ResourceResolutionEnd);
                 let workspace_admission = workspace_admission_plan(
                     &evidence_call.tool_name,
                     &workspace_admission_classification,
@@ -2234,13 +2306,16 @@ impl ToolCallRuntime {
                     workspace_capable,
                 );
                 if tracks_workspace {
+                    timing.record_boundary(ToolLifecycleBoundary::DiffTrackerWaitStart);
                     tracker
                         .lock()
                         .await
                         .activate_workspace_evidence_generation_batch(
                             &step_context.workspace_evidence_generation_batch,
                         );
+                    timing.record_boundary(ToolLifecycleBoundary::DiffTrackerWaitEnd);
                 }
+                timing.record_boundary(ToolLifecycleBoundary::WorkspaceGateWaitStart);
                 let gate_guard = if workspace_admission.bypass_outer_gate {
                     None
                 } else {
@@ -2257,6 +2332,7 @@ impl ToolCallRuntime {
                         .await,
                     )
                 };
+                timing.record_boundary(ToolLifecycleBoundary::WorkspaceGateWaitEnd);
                 if admission_cancellation_token.is_cancelled()
                     || !admission_dispatch_state.try_admit()
                 {
@@ -2297,17 +2373,21 @@ impl ToolCallRuntime {
                         // The repository lease must precede baseline work. A queued
                         // call must neither spend Git/disk resources nor carry an
                         // observation made before its execution boundary.
+                        timing.record_boundary(ToolLifecycleBoundary::EvidenceTrackerWaitStart);
                         let admitted_mutation_revision =
                             evidence_tracker.lock().await.current_mutation_revision();
+                        timing.record_boundary(ToolLifecycleBoundary::EvidenceTrackerWaitEnd);
                         let evidence_capture_started = Instant::now();
-                        let baseline = capture_workspace_evidence_baseline(
-                            session.services.git_workspace.as_ref(),
-                            Some(&turn),
-                            &classification.workspace_cwd,
-                            classification.source_dependencies.clone(),
-                            true,
-                        )
-                        .await;
+                        let baseline = step_context
+                            .workspace_evidence_generation_batch
+                            .capture_baseline(
+                                session.services.git_workspace.as_ref(),
+                                Some(&turn),
+                                &classification.workspace_cwd,
+                                classification.source_dependencies.clone(),
+                                admitted_mutation_revision,
+                            )
+                            .await;
                         let capture_duration = evidence_capture_started.elapsed();
                         timing.record_workspace_evidence_before(capture_duration);
                         timing.record_workspace_evidence_before_attribution(
@@ -2318,6 +2398,22 @@ impl ToolCallRuntime {
                                 .map(|dependency| dependency.as_str().to_string())
                                 .collect(),
                         );
+                        if turn
+                            .environments
+                            .primary()
+                            .is_some_and(|environment| !environment.environment.is_remote())
+                        {
+                            session
+                                .services
+                                .command_execution
+                                .observe_workspace_baseline(
+                                    &turn.sub_id,
+                                    admitted_mutation_revision,
+                                    &classification.workspace_cwd,
+                                    baseline.revision.clone(),
+                                )
+                                .await;
+                        }
                         if let Some(slot) = workspace_evidence_baseline_slot.as_ref() {
                             *slot
                                 .lock()
@@ -2486,7 +2582,7 @@ impl ToolCallRuntime {
                             }
                         };
                         let mut cancellation_recovery = None;
-                        let secs = started.elapsed().as_secs_f32().max(0.1);
+                        let secs = started.elapsed().as_secs_f32();
                         abort_dispatch_span.record("aborted", true);
                         if cancelled_before_admission {
                             dispatch_handle.abort();
@@ -5235,6 +5331,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_generation_reuses_non_git_baseline_until_mutation() {
+        let cwd = tempfile::tempdir().expect("non-Git cwd");
+        let cache = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
+        let batch = WorkspaceEvidenceGenerationBatch::new();
+        let first = batch
+            .capture_baseline(&cache, None, cwd.path(), Default::default(), 0)
+            .await;
+        assert!(first.revision.is_none());
+        assert!(!first.cache_hit);
+        let count = cache.workspace_evidence_capture_count();
+        let second = batch
+            .capture_baseline(&cache, None, cwd.path(), Default::default(), 0)
+            .await;
+        assert!(second.cache_hit);
+        assert_eq!(cache.workspace_evidence_capture_count(), count);
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(cwd.path())
+                .status()
+                .expect("initialize repository after mutation")
+                .success()
+        );
+        let third = batch
+            .capture_baseline(&cache, None, cwd.path(), Default::default(), 1)
+            .await;
+        assert!(!third.cache_hit);
+        assert!(third.revision.is_some());
+        assert_eq!(cache.workspace_evidence_capture_count(), count + 1);
+    }
+
+    #[tokio::test]
     async fn workspace_evidence_baseline_attributes_fresh_then_cached_capture() {
         let repo = tempfile::tempdir().expect("temporary repository cwd");
         let init_status = std::process::Command::new("git")
@@ -5772,6 +5900,7 @@ mod tests {
             .try_write_owned()
             .expect("workspace gate should initially be available");
         let cancellation_token = CancellationToken::new();
+        tokio::time::pause();
         let response_task = tokio::spawn(runtime.handle_tool_call(
             ToolCall {
                 tool_name,
@@ -5803,6 +5932,7 @@ mod tests {
             "cleanup-owning handler should be waiting for gate admission"
         );
 
+        tokio::time::advance(Duration::from_millis(5)).await;
         cancellation_token.cancel();
         let response = tokio::time::timeout(Duration::from_secs(1), response_task)
             .await
@@ -5814,7 +5944,7 @@ mod tests {
         let FunctionCallOutputBody::Text(text) = output.body else {
             anyhow::bail!("cancelled tool output should be text");
         };
-        assert!(text.contains("aborted by user"));
+        assert_eq!(text, "aborted by user after 0.0s");
         assert!(
             started_rx.try_recv().is_err(),
             "handler must not enter after cancellation wins the admission race"
@@ -7076,6 +7206,7 @@ mod tests {
             Some(std::collections::BTreeSet::from([source.clone()])),
             false
         ));
+        batch.record_workspace_observation("actual-mutation");
         assert!(batch.queue_response(
             &ResponseInputItem::FunctionCallOutput {
                 call_id: "actual-mutation".to_string(),
@@ -7135,6 +7266,7 @@ mod tests {
                 Some(std::collections::BTreeSet::from([source.clone()])),
                 false
             ));
+            batch.record_workspace_observation("late-nested-mutation");
             assert!(batch.queue_response(
                 &ResponseInputItem::FunctionCallOutput {
                     call_id: "late-nested-mutation".to_string(),
@@ -7230,6 +7362,104 @@ mod tests {
                     .is_some(),
                 "late nested response must remain durable after terminalization"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn generation_flush_preserves_only_proven_current_observations() {
+        use crate::tool_history::SourceDependencyV1;
+        use std::collections::BTreeSet;
+
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("source.txt");
+        tokio::fs::write(&source, "before").await.unwrap();
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+        let batch = Arc::new(WorkspaceEvidenceGenerationBatch::new());
+        for call_id in ["before", "after", "unknown", "unrelated", "late"] {
+            assert!(batch.register_call(call_id));
+        }
+        batch.record_workspace_observation("unregistered");
+        assert!(
+            batch
+                .state
+                .lock()
+                .unwrap()
+                .observation_effect_ordinals
+                .is_empty()
+        );
+        batch.record_workspace_observation("before");
+        batch.record_workspace_observation("unrelated");
+        tokio::fs::write(&source, "after").await.unwrap();
+        tracker.lock().await.record_unknown_mutation();
+        assert!(batch.record_mutation(
+            "after",
+            workspace.path().to_path_buf(),
+            Some(BTreeSet::from([source.clone()])),
+            false,
+        ));
+        batch.record_workspace_observation("after");
+        let classification = crate::tool_history::WorkspaceCallClassification {
+            observes_workspace: true,
+            workspace_cwd: workspace.path().to_path_buf(),
+            // Executed payload dependencies can differ from this initial classification.
+            source_dependencies: BTreeSet::from([SourceDependencyV1::new(
+                &workspace.path().join("unrelated.txt"),
+                false,
+            )]),
+        };
+        for call_id in ["before", "after", "unknown", "unrelated"] {
+            let dependencies = if call_id == "unrelated" {
+                classification.source_dependencies.clone()
+            } else {
+                BTreeSet::from([SourceDependencyV1::new(&source, false)])
+            };
+            assert!(batch.queue_response(
+                &ResponseInputItem::FunctionCallOutput {
+                    call_id: call_id.to_string(),
+                    output: FunctionCallOutputPayload::from_text(call_id.to_string()),
+                },
+                &classification,
+                dependencies,
+                Vec::new(),
+                None,
+            ));
+        }
+        batch.flush(&session, &turn, &tracker).await.unwrap();
+        batch.record_workspace_observation("late");
+        assert!(
+            !batch
+                .state
+                .lock()
+                .unwrap()
+                .observation_effect_ordinals
+                .contains_key("late")
+        );
+        session.flush_tool_history_persistence().await.unwrap();
+        let live =
+            serde_json::to_value(session.clone_history().await.tool_history_state()).unwrap();
+        let (saved, warning) = crate::tool_history::load_tool_history_state(
+            &turn.config.codex_home,
+            &session.thread_id.to_string(),
+        )
+        .await
+        .into_state_and_warning();
+        assert_eq!(warning, None);
+        let saved = serde_json::to_value(saved).unwrap();
+        for state in [&live, &saved] {
+            for (call_id, current) in [
+                ("before", false),
+                ("after", true),
+                ("unknown", false),
+                ("unrelated", true),
+            ] {
+                assert_eq!(
+                    state["workspace_evidence"][call_id]["source_dependencies_current"], current,
+                    "{call_id}"
+                );
+            }
+            assert!(state["workspace_evidence"].get("unregistered").is_none());
+            assert!(state["workspace_evidence"].get("late").is_none());
         }
     }
 

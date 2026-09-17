@@ -15,6 +15,7 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RequestUserInputEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+#[cfg(test)]
 use codex_protocol::protocol::Submission;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::request_permissions::PermissionGrantScope;
@@ -475,7 +476,7 @@ async fn forward_event_or_shutdown(
 /// Forward ops from a caller to a sub-agent, respecting cancellation.
 async fn forward_ops(
     codex: Arc<Codex>,
-    rx_ops: Receiver<Submission>,
+    rx_ops: Receiver<crate::session::QueuedSubmission>,
     cancel_token_ops: CancellationToken,
 ) {
     loop {
@@ -483,7 +484,9 @@ async fn forward_ops(
             Ok(Ok(submission)) => submission,
             Ok(Err(_)) | Err(_) => break,
         };
-        if codex.submit_with_id(submission).await.is_err() {
+        // Preserve the original acknowledgement through the proxy. Creating a
+        // second submission here would acknowledge forwarding instead of admission.
+        if codex.tx_sub.send(submission).await.is_err() {
             break;
         }
     }

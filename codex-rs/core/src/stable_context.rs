@@ -259,6 +259,13 @@ impl StableContextManifest {
     }
 
     pub(crate) fn with_local_reused(&self, local_reused: bool) -> Self {
+        if self
+            .components
+            .iter()
+            .all(|component| component.local_reused == local_reused)
+        {
+            return self.clone();
+        }
         let mut components = self.components.to_vec();
         for component in &mut components {
             component.local_reused = local_reused;
@@ -1639,6 +1646,14 @@ mod tests_optimization {
         MANIFEST_FINGERPRINT_CALLS.with(|calls| calls.set(0));
 
         let reused = manifest.with_local_reused(true);
+        let reused_again = reused.with_local_reused(true);
+        assert!(Arc::ptr_eq(&reused.components, &reused_again.components));
+        assert!(
+            manifest
+                .components()
+                .iter()
+                .all(|component| !component.local_reused)
+        );
 
         assert_eq!(
             MANIFEST_FINGERPRINT_CALLS.with(Cell::get),

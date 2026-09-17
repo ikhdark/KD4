@@ -252,7 +252,7 @@ mod tests {
         assert!(description.contains("`console.log(...)` aliases `text(...)`"));
         assert!(description.contains("Only `ALL_TOOL_NAMES` entries are callable"));
         assert!(description.contains("never pipe a patch through a shell wrapper"));
-        assert!(description.contains("host also retains bounded nested-tool results"));
+        assert!(description.contains("host retains up to eight nested-tool results, each capped at 4096 bytes, and reports omissions"));
         assert!(!description.contains("yield_time_ms"));
         assert!(description.contains("max_output_tokens"));
         assert!(description.contains("type: \"image\""));
@@ -260,54 +260,54 @@ mod tests {
         assert!(description.contains("unawaited work is discarded"));
         assert!(description.contains("Prefer a purpose-built tool over shell"));
         assert!(description.contains("consolidate related read-only probes"));
-        assert!(description.contains("merely to re-filter a result already returned"));
+        assert!(description.contains("Never spawn subprocesses to re-filter returned results"));
         assert!(description.contains("Start useful work in the initial exec"));
         assert!(
             description.contains("Await `Promise.allSettled` for independent known reads/probes")
         );
-        assert!(description.contains("Reuse current applicable `AGENTS.md`"));
-        assert!(description.contains("retrieve missing scopes or invalidated content"));
-        assert!(description.contains("Reuse current schemas, CLI usage, and results"));
-        assert!(description.contains("Resolve missing/stale tool schemas before calling"));
+        assert!(description.contains("Reuse applicable `AGENTS.md`"));
+        assert!(description.contains("refresh missing/invalidated scopes"));
+        assert!(description.contains("Reuse schemas, CLI usage, and results"));
+        assert!(description.contains("resolve missing/stale schemas before calls"));
         assert!(
-            description.contains("consult CLI `--help` only for uncertain arguments/subcommands")
+            description.contains("Use CLI `--help` only for uncertain arguments/subcommands")
         );
         assert!(description.contains("Nested tools: use a present schema"));
         assert!(description.contains("`resolve_tool(name)` when the name is known"));
         assert!(description.contains("or inspect `ALL_TOOL_NAMES`"));
         assert!(description.contains("Never scan/filter/stringify/print `ALL_TOOLS`"));
-        assert!(description.contains("Do not rediscover known paths"));
-        assert!(description.contains("Read/list known locations directly"));
-        assert!(description.contains("otherwise search narrowly within that path"));
+        assert!(description.contains("Read/list known paths directly"));
+        assert!(description.contains("Read/list known paths directly"));
+        assert!(description.contains("search unknown locations narrowly"));
         assert!(!description.contains("do not substitute a search or second shell"));
         assert!(description.contains("hard 60s default deadline"));
-        assert!(description.contains("After a timeout, resume a returned live session/cell ID"));
-        assert!(description.contains("Do not rerun while the original is live or its effects are uncertain"));
-        assert!(description.contains("Retry only if it never started, stopped and is safe to repeat, or the tool permits retry"));
+        assert!(description.contains("After timeout, resume the returned live session/cell ID"));
+        assert!(description.contains("never rerun live or uncertain effects"));
+        assert!(description.contains("Retry only if unstarted, safely repeatable after stopping, or tool-approved"));
         assert!(description.contains("inspect every result"));
-        assert!(description.contains("Finish discovery before choosing dependent mutations"));
-        assert!(description.contains("Keep status and file outputs distinct"));
-        assert!(description.contains("independent calls may share one exec"));
+        assert!(description.contains("Finish discovery before dependent mutations"));
+        assert!(description.contains("Separate status/file output"));
+        assert!(description.contains("batch independent calls"));
         assert!(description.contains("initial 10s budget"));
         assert!(description.contains("same awaited evaluation"));
         assert!(description.contains("only for a new model decision"));
         assert!(description.contains("Run required validation after the final relevant edit"));
         assert!(description.contains(
-            "Parallelize only tool-permitted commands with independent build locks, output paths, and services"
+            "Parallelize only when tools permit and build locks, outputs, and services are independent"
         ));
         assert!(
             description.contains("Propagate failures with `&&` or exit-code checks")
         );
         assert!(description.contains("never mask them with `|| true`"));
         assert!(
-            description.contains("Complete work and checks, or report failures/blockers")
+            description.contains("Finish work/checks or report failures/blockers")
         );
-        assert!(description.contains("Follow plans while they match the current request"));
-        assert!(description.contains("Do not repeat unchanged deterministic failures"));
-        assert!(description.contains("resume live operations through documented wait interfaces"));
+        assert!(description.contains("Keep plans aligned with the request"));
+        assert!(description.contains("For unchanged deterministic failures"));
+        assert!(description.contains("resume live operations via documented waits"));
         assert!(!description.contains("never repeat the same call/poll"));
-        assert!(description.contains("Change route/state"));
-        assert!(description.contains("Before editing, read the complete enclosing unit and refresh it after intervening writes"));
+        assert!(description.contains("change route/state"));
+        assert!(description.contains("Read the complete enclosing unit before editing; refresh after intervening writes"));
         assert!(description.contains("relevant ranges for large files"));
         assert!(description.contains("whole files when small or required"));
         assert!(!description.contains("never whole files"));

@@ -13,8 +13,8 @@ pub(crate) const READ_TOOL_OUTPUT_MAX_BYTES: usize = 16_384;
 pub(crate) const READ_TOOL_OUTPUT_MAX_SELECTORS: usize = 64;
 pub(crate) const READ_TOOL_OUTPUT_MAX_LEGACY_RANGES: usize = 16;
 
-pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
-    let selector_schema = JsonSchema::one_of(
+pub(crate) fn tool_output_selector_schema() -> JsonSchema {
+    JsonSchema::one_of(
         vec![
             selector_variant(
                 "bytes",
@@ -106,7 +106,11 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
             ),
         ],
         Some("Ordered search or exact-select operations over the original artifact.".to_string()),
-    );
+    )
+}
+
+pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
+    let selector_schema = tool_output_selector_schema();
     let artifact_id = JsonSchema::string(Some(
         "Opaque UUID from the original tool projection.".to_string(),
     ));
@@ -143,7 +147,9 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
         ),
         1,
         READ_TOOL_OUTPUT_MAX_LEGACY_RANGES as u64,
-        "Up to 16 legacy line ranges normalized into selectors.".to_string(),
+        format!(
+            "Up to {READ_TOOL_OUTPUT_MAX_LEGACY_RANGES} legacy line ranges normalized into selectors."
+        ),
     );
     let input_variant = |variant_properties: Vec<(String, JsonSchema)>, required: Vec<&str>| {
         let mut properties = BTreeMap::from([("artifact_id".to_string(), artifact_id.clone())]);
@@ -157,7 +163,7 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: READ_TOOL_OUTPUT_TOOL_NAME.to_string(),
-        description: "Search or select one validated immutable tool-output snapshot without rerunning it. Batch independent selectors instead of rereading tiny fragments.\nSearches return exact hydrated_ranges in results[].value in the same call. Values are never clipped; overflow returns exact ranges and deterministic child_selectors.\ncomplete means every selector is present. After overflow, retry only the returned continuation or child_selectors. Check continuation_stop for the reason recovery stopped and whether its selector is resumable.\nRecovery reopens and validates the retained artifact without recursive spills or child artifacts.".to_string(),
+        description: "Read a saved tool-output snapshot without rerunning the tool. Batch independent searches or selections in one call. Search results include matching text in results[].value.hydrated_ranges. Selected values are returned intact; oversized selections return smaller child_selectors or a continuation selector to retry. complete indicates whether all requested selections were returned. If continuation_stop is present, check its reason and resumable fields before retrying.".to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::one_of(
@@ -187,7 +193,7 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
     })
 }
 
-fn read_tool_output_output_schema(mut selector_schema: JsonSchema) -> serde_json::Value {
+pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) -> serde_json::Value {
     // Invalid selectors are echoed in error results, so output coordinates must
     // describe the parsed unsigned values without imposing input validity bounds.
     for variant in selector_schema.one_of.iter_mut().flatten() {
@@ -342,11 +348,12 @@ fn selector_variant(
         JsonSchema::string_enum(vec![serde_json::Value::String(kind.to_string())], None),
     );
     let mut required = required.into_iter().map(str::to_string).collect::<Vec<_>>();
-    required.insert(0, "kind".to_string());
+    required.push("kind".to_string());
     JsonSchema::object(properties, Some(required), Some(false.into()))
 }
 
 fn bounded_integer(minimum: u64, maximum: u64, description: String) -> JsonSchema {
+    // Code-mode calls pass through JavaScript numbers, whose exact integer range ends at 2^53 - 1.
     JsonSchema {
         minimum: Some(Number::from(minimum)),
         maximum: Some(Number::from(maximum.min((1_u64 << 53) - 1))),
@@ -415,13 +422,20 @@ mod tests {
             ),
             Some(&serde_json::json!(ARTIFACT_SEARCH_MAX_RESULTS)),
         );
-        let description = tool["description"].as_str().expect("tool description");
-        assert!(description.contains("Search or select"));
-        assert!(description.contains("hydrated_ranges"));
-        assert!(description.contains("same call"));
-        assert!(description.contains("instead of rereading tiny fragments"));
-        assert!(description.contains("retry only the returned continuation or child_selectors"));
-        assert!(description.contains("reopens and validates the retained artifact"));
+        let validator = jsonschema::validator_for(&tool["parameters"]).expect("artifact schema");
+        for selector in [
+            serde_json::json!({"kind": "search", "query": "error"}),
+            serde_json::json!({"kind": "section", "id": "diagnostics"}),
+            serde_json::json!({"kind": "json_pointer", "pointer": "/result"}),
+        ] {
+            let mut args = serde_json::json!({"artifact_id": "artifact", "selectors": [selector]});
+            assert!(validator.is_valid(&args));
+            args["selectors"][0]
+                .as_object_mut()
+                .expect("selector")
+                .remove("kind");
+            assert!(!validator.is_valid(&args), "selector kind is required");
+        }
         let ToolSpec::Function(spec) = create_read_tool_output_tool() else {
             panic!("recovery uses a function spec");
         };

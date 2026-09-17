@@ -41,18 +41,19 @@ fn normalize_windows_path_for_display(path: impl AsRef<Path>) -> String {
 }
 
 fn world_writable_warning_details_from_scan(
-    scan: Result<Vec<PathBuf>>,
+    scan: Result<WorldWritableScan>,
 ) -> Option<(Vec<String>, usize, bool)> {
     match scan {
-        Ok(paths) if paths.is_empty() => None,
-        Ok(paths) => {
+        Ok(scan) if scan.paths.is_empty() && !scan.incomplete => None,
+        Ok(scan) => {
+            let paths = scan.paths;
             let paths = paths
                 .iter()
                 .map(normalize_windows_path_for_display)
                 .collect::<Vec<_>>();
             let sample_paths = paths.iter().take(3).cloned().collect::<Vec<_>>();
             let extra_count = paths.len().saturating_sub(sample_paths.len());
-            Some((sample_paths, extra_count, false))
+            Some((sample_paths, extra_count, scan.incomplete))
         }
         Err(_) => Some((Vec::new(), 0, true)),
     }
@@ -130,12 +131,33 @@ unsafe fn path_has_world_write_allow(path: &Path) -> Result<bool> {
     }
 }
 
-pub fn audit_everyone_writable(
+#[derive(Default)]
+struct WorldWritableScan {
+    paths: Vec<PathBuf>,
+    incomplete: bool,
+}
+
+fn audit_everyone_writable(
     cwd: &Path,
     env: &std::collections::HashMap<String, String>,
     logs_base_dir: Option<&Path>,
-) -> Result<Vec<PathBuf>> {
+) -> Result<WorldWritableScan> {
+    audit_everyone_writable_with_timeout(
+        cwd,
+        env,
+        logs_base_dir,
+        Duration::from_secs(AUDIT_TIME_LIMIT_SECS as u64),
+    )
+}
+
+fn audit_everyone_writable_with_timeout(
+    cwd: &Path,
+    env: &std::collections::HashMap<String, String>,
+    logs_base_dir: Option<&Path>,
+    time_limit: Duration,
+) -> Result<WorldWritableScan> {
     let start = Instant::now();
+    let mut incomplete = false;
     let mut flagged: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut checked = 0usize;
@@ -159,9 +181,8 @@ pub fn audit_everyone_writable(
     // Fast path: check CWD immediate children first so workspace issues are caught early.
     if let Ok(read) = std::fs::read_dir(cwd) {
         for ent in read.flatten().take(MAX_ITEMS_PER_DIR as usize) {
-            if start.elapsed() > Duration::from_secs(AUDIT_TIME_LIMIT_SECS as u64)
-                || checked > MAX_CHECKED_LIMIT as usize
-            {
+            if start.elapsed() >= time_limit || checked >= MAX_CHECKED_LIMIT as usize {
+                incomplete = true;
                 break;
             }
             let ft = match ent.file_type() {
@@ -185,9 +206,8 @@ pub fn audit_everyone_writable(
     // Continue with broader candidate sweep
     let candidates = gather_candidates(cwd, env);
     for root in candidates {
-        if start.elapsed() > Duration::from_secs(AUDIT_TIME_LIMIT_SECS as u64)
-            || checked > MAX_CHECKED_LIMIT as usize
-        {
+        if start.elapsed() >= time_limit || checked >= MAX_CHECKED_LIMIT as usize {
+            incomplete = true;
             break;
         }
         checked += 1;
@@ -202,9 +222,8 @@ pub fn audit_everyone_writable(
         if let Ok(read) = std::fs::read_dir(&root) {
             for ent in read.flatten().take(MAX_ITEMS_PER_DIR as usize) {
                 let p = ent.path();
-                if start.elapsed() > Duration::from_secs(AUDIT_TIME_LIMIT_SECS as u64)
-                    || checked > MAX_CHECKED_LIMIT as usize
-                {
+                if start.elapsed() >= time_limit || checked >= MAX_CHECKED_LIMIT as usize {
+                    incomplete = true;
                     break;
                 }
                 // Skip reparse points (symlinks/junctions) to avoid auditing link ACLs
@@ -235,6 +254,14 @@ pub fn audit_everyone_writable(
         }
     }
     let elapsed_ms = start.elapsed().as_millis();
+    if incomplete {
+        log_note(
+            &format!(
+                "AUDIT: world-writable scan INCOMPLETE; time or item limit reached; checked={checked}; duration_ms={elapsed_ms}"
+            ),
+            logs_base_dir,
+        );
+    }
     if !flagged.is_empty() {
         let mut list = String::new();
         for p in &flagged {
@@ -247,14 +274,21 @@ pub fn audit_everyone_writable(
             logs_base_dir,
         );
 
-        return Ok(flagged);
+        return Ok(WorldWritableScan {
+            paths: flagged,
+            incomplete,
+        });
     }
-    // Log success once if nothing flagged
-    crate::logging::log_note(
-        &format!("AUDIT: world-writable scan OK; checked={checked}; duration_ms={elapsed_ms}"),
-        logs_base_dir,
-    );
-    Ok(Vec::new())
+    if !incomplete {
+        log_note(
+            &format!("AUDIT: world-writable scan OK; checked={checked}; duration_ms={elapsed_ms}"),
+            logs_base_dir,
+        );
+    }
+    Ok(WorldWritableScan {
+        paths: flagged,
+        incomplete,
+    })
 }
 
 pub fn apply_world_writable_scan_and_denies_for_permissions(
@@ -264,13 +298,11 @@ pub fn apply_world_writable_scan_and_denies_for_permissions(
     permissions: &ResolvedWindowsSandboxPermissions,
     logs_base_dir: Option<&Path>,
 ) -> Result<()> {
-    let flagged = audit_everyone_writable(cwd, env_map, logs_base_dir)?;
-    if flagged.is_empty() {
-        return Ok(());
-    }
+    let scan = audit_everyone_writable(cwd, env_map, logs_base_dir)?;
+    // Preserve remediation of paths already found even when the scan hit its limit.
     if let Err(err) = apply_capability_denies_for_world_writable_for_permissions(
         codex_home,
-        &flagged,
+        &scan.paths,
         permissions,
         cwd,
         env_map,
@@ -280,6 +312,9 @@ pub fn apply_world_writable_scan_and_denies_for_permissions(
             &format!("AUDIT: failed to apply capability deny ACEs: {err}"),
             logs_base_dir,
         );
+    }
+    if scan.incomplete {
+        anyhow::bail!("world-writable scan incomplete: time or item limit reached");
     }
     Ok(())
 }
@@ -353,6 +388,7 @@ fn apply_capability_denies_for_world_writable_for_permissions(
 
 #[cfg(test)]
 mod tests {
+    use super::WorldWritableScan;
     use super::gather_candidates;
     use super::world_writable_warning_details_from_scan;
     use anyhow::anyhow;
@@ -441,12 +477,15 @@ mod tests {
 
     #[test]
     fn warning_details_sample_paths_and_report_scan_failures() {
-        let details = world_writable_warning_details_from_scan(Ok(vec![
-            "C:/one".into(),
-            "C:/two".into(),
-            "C:/three".into(),
-            "C:/four".into(),
-        ]))
+        let details = world_writable_warning_details_from_scan(Ok(WorldWritableScan {
+            paths: vec![
+                "C:/one".into(),
+                "C:/two".into(),
+                "C:/three".into(),
+                "C:/four".into(),
+            ],
+            incomplete: false,
+        }))
         .expect("non-empty scan should produce warning details");
         assert_eq!(
             details,
@@ -462,12 +501,46 @@ mod tests {
         );
 
         assert_eq!(
-            world_writable_warning_details_from_scan(Ok(Vec::new())),
+            world_writable_warning_details_from_scan(Ok(WorldWritableScan::default())),
             None
         );
         assert_eq!(
             world_writable_warning_details_from_scan(Err(anyhow!("scan failed"))),
             Some((Vec::new(), 0, true))
+        );
+    }
+
+    #[test]
+    fn timed_out_audit_reports_incomplete_instead_of_success() -> anyhow::Result<()> {
+        let cwd = tempfile::tempdir()?;
+        let logs = tempfile::tempdir()?;
+        let scan = super::audit_everyone_writable_with_timeout(
+            cwd.path(),
+            &HashMap::new(),
+            Some(logs.path()),
+            std::time::Duration::ZERO,
+        )?;
+        assert!(scan.incomplete);
+        assert!(scan.paths.is_empty());
+        assert_eq!(
+            world_writable_warning_details_from_scan(Ok(scan)),
+            Some((Vec::new(), 0, true))
+        );
+        let log = fs::read_to_string(crate::logging::current_log_file_path(logs.path()))?;
+        assert!(log.contains("world-writable scan INCOMPLETE"));
+        assert!(!log.contains("world-writable scan OK"));
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_audit_preserves_flagged_paths_in_warning() {
+        let scan = WorldWritableScan {
+            paths: vec!["C:/flagged".into()],
+            incomplete: true,
+        };
+        assert_eq!(
+            world_writable_warning_details_from_scan(Ok(scan)),
+            Some((vec!["C:\\flagged".to_string()], 0, true))
         );
     }
 }

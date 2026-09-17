@@ -901,7 +901,8 @@ impl MessageProcessor {
         );
 
         if let Some(scope) = serialization_scope {
-            let (key, access) = RequestSerializationQueueKey::from_scope(connection_id, scope);
+            let (key, access) =
+                RequestSerializationQueueKey::from_scope(connection_id, scope).await;
             if matches!(
                 self.request_serialization_queues
                     .enqueue(key, access, request)

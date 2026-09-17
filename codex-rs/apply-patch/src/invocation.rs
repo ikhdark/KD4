@@ -139,6 +139,19 @@ fn maybe_parse_apply_patch(argv: &[String], cwd: &PathUri) -> MaybeApplyPatch {
     }
 }
 
+/// Resolves a parsed patch command's working directory without reading the filesystem.
+/// Callers can acquire that workspace's mutation guard before filesystem verification.
+/// Non-patch commands and invalid paths return `None`; verification reports their errors.
+pub fn apply_patch_command_cwd(argv: &[String], cwd: &PathUri) -> Option<PathUri> {
+    let MaybeApplyPatch::Body(args) = maybe_parse_apply_patch(argv, cwd) else {
+        return None;
+    };
+    match args.workdir {
+        Some(dir) => cwd.join(&dir).ok(),
+        None => Some(cwd.clone()),
+    }
+}
+
 /// `cwd` must identify an absolute environment-native path so relative patch paths can be
 /// resolved without projecting them onto the app-server or exec-server host.
 pub async fn maybe_parse_apply_patch_verified(
@@ -559,6 +572,38 @@ mod tests {
     /// Helper to construct a patch with the given body.
     fn wrap_patch(body: &str) -> String {
         format!("*** Begin Patch\n{body}\n*** End Patch")
+    }
+
+    #[test]
+    fn test_patch_command_cwd_resolves_without_filesystem_verification() {
+        let root = tempdir().unwrap();
+        let cwd = PathUri::from_host_native_path(root.path()).unwrap();
+        let patch = wrap_patch("*** Update File: missing.txt\n@@\n-before\n+after");
+        for command in ["apply_patch", "applypatch"] {
+            assert_eq!(
+                apply_patch_command_cwd(&[command.to_string(), patch.clone()], &cwd),
+                Some(cwd.clone()),
+            );
+        }
+        let child = cwd.join("child").unwrap();
+        assert!(!root.path().join("child").exists());
+        assert_eq!(
+            apply_patch_command_cwd(
+                &args_bash(&format!(
+                    "cd child && apply_patch <<'PATCH'\n{patch}\nPATCH"
+                )),
+                &cwd
+            ),
+            Some(child),
+        );
+        assert_eq!(
+            apply_patch_command_cwd(&args_bash("echo hello"), &cwd),
+            None
+        );
+        assert_eq!(
+            apply_patch_command_cwd(&["apply_patch".to_string(), "invalid".to_string()], &cwd),
+            None
+        );
     }
 
     fn assert_duplicate_path_error(result: MaybeApplyPatchVerified, expected_path: &PathUri) {

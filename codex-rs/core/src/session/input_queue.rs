@@ -84,7 +84,7 @@ impl InputQueue {
     }
 
     #[cfg(test)]
-    fn with_mailbox_limits(max_pending: usize, max_seen_ids: usize) -> Self {
+    pub(crate) fn with_mailbox_limits(max_pending: usize, max_seen_ids: usize) -> Self {
         let mut queue = Self::new();
         queue.max_pending_mailbox_communications = max_pending;
         queue.max_seen_mailbox_communication_ids = max_seen_ids;
@@ -131,21 +131,20 @@ impl InputQueue {
     pub(crate) async fn enqueue_mailbox_communication(
         &self,
         communication: InterAgentCommunication,
-    ) -> bool {
+    ) -> Result<bool, codex_protocol::error::CodexErr> {
         let mut mailbox = self.mailbox.lock().await;
         if communication
             .id
             .as_ref()
             .is_some_and(|id| mailbox.seen_communication_ids.contains(id))
         {
-            return false;
+            return Ok(false);
         }
         if mailbox.pending_mails.len() >= self.max_pending_mailbox_communications {
-            tracing::warn!(
-                max_pending = self.max_pending_mailbox_communications,
-                "rejecting mailbox communication because the session mailbox is full"
-            );
-            return false;
+            return Err(codex_protocol::error::CodexErr::InvalidRequest(format!(
+                "session mailbox is full ({} pending messages); retry after messages are consumed",
+                self.max_pending_mailbox_communications
+            )));
         }
         if let Some(id) = communication.id.as_ref() {
             mailbox.seen_communication_ids.insert(id.clone());
@@ -155,7 +154,7 @@ impl InputQueue {
         mailbox.pending_mails.push_back(communication);
         drop(mailbox);
         self.activity_tx.send_replace(InputQueueActivity::Mailbox);
-        true
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -185,17 +184,25 @@ impl InputQueue {
         }
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Read recovered input and mailbox input as one snapshot in recovery -> mailbox lock order"
+    )]
     pub(crate) async fn has_pending_mailbox_items(&self) -> bool {
-        self.startup_recovery_items
-            .lock()
-            .await
+        let recovered = self.startup_recovery_items.lock().await;
+        recovered
             .iter()
             .any(|item| matches!(item, TurnInput::InterAgentCommunication(_)))
             || !self.mailbox.lock().await.pending_mails.is_empty()
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Read recovered input and mailbox input as one snapshot in recovery -> mailbox lock order"
+    )]
     pub(crate) async fn has_trigger_turn_mailbox_items(&self) -> bool {
-        self.startup_recovery_items.lock().await.iter().any(
+        let recovered = self.startup_recovery_items.lock().await;
+        recovered.iter().any(
             |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
         ) || self
             .mailbox
@@ -209,8 +216,13 @@ impl InputQueue {
     /// Whether recovered input should start a new turn once the current turn releases its
     /// terminal fence. User input was already accepted as turn work, while mailbox input still
     /// honors its explicit `trigger_turn` policy.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Read recovered input and mailbox input as one snapshot in recovery -> mailbox lock order"
+    )]
     pub(crate) async fn has_pending_turn_start_work(&self) -> bool {
-        self.startup_recovery_items.lock().await.iter().any(|item| {
+        let recovered = self.startup_recovery_items.lock().await;
+        recovered.iter().any(|item| {
             matches!(
                 item,
                 TurnInput::UserInput { content, .. } if !content.is_empty()
@@ -285,7 +297,12 @@ impl InputQueue {
             return;
         };
         let mut turn_state = turn_state.lock().await;
-        if !turn_state.pending_input.items.is_empty() {
+        if turn_state
+            .pending_input
+            .items
+            .iter()
+            .any(TurnInput::requires_turn_continuation)
+        {
             return;
         }
         turn_state.set_mailbox_delivery_phase(MailboxDeliveryPhase::NextTurn);
@@ -637,7 +654,8 @@ mod tests {
                 "one",
                 /*trigger_turn*/ false,
             ))
-            .await;
+            .await
+            .expect("mailbox admission");
         input_queue
             .enqueue_mailbox_communication(make_mail(
                 AgentPath::root(),
@@ -645,7 +663,8 @@ mod tests {
                 "two",
                 /*trigger_turn*/ false,
             ))
-            .await;
+            .await
+            .expect("mailbox admission");
 
         activity_rx.changed().await.expect("mailbox update");
         assert_eq!(
@@ -724,10 +743,12 @@ mod tests {
 
         input_queue
             .enqueue_mailbox_communication(mail_one.clone())
-            .await;
+            .await
+            .expect("mailbox admission");
         input_queue
             .enqueue_mailbox_communication(mail_two.clone())
-            .await;
+            .await
+            .expect("mailbox admission");
 
         assert_eq!(
             input_queue.get_pending_input(&Mutex::new(None)).await,
@@ -737,6 +758,49 @@ mod tests {
             ]
         );
         assert!(!input_queue.has_pending_mailbox_items().await);
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Hold the contested owner to assert cancellation, admission, or cleanup behavior under contention"
+    )]
+    async fn pending_mail_checks_observe_a_consistent_recovery_snapshot() {
+        for check in 0..3 {
+            let input_queue = InputQueue::new();
+            let has_work = || async {
+                match check {
+                    0 => input_queue.has_pending_mailbox_items().await,
+                    1 => input_queue.has_trigger_turn_mailbox_items().await,
+                    _ => input_queue.has_pending_turn_start_work().await,
+                }
+            };
+            let mail = make_mail(
+                AgentPath::root(),
+                AgentPath::try_from("/root/worker").expect("agent path"),
+                "recovered while checking pending work",
+                true,
+            );
+
+            let mailbox_guard = input_queue.mailbox.lock().await;
+            let mut pending_check = Box::pin(has_work());
+            assert!(futures::poll!(pending_check.as_mut()).is_pending());
+            let mut recovery = Box::pin(input_queue.restore_transferred_startup_input(vec![
+                TurnInput::InterAgentCommunication(mail.clone()),
+            ]));
+            // Recovery must wait until the check finishes reading both queues.
+            assert!(futures::poll!(recovery.as_mut()).is_pending());
+
+            drop(mailbox_guard);
+            assert!(!pending_check.await);
+            recovery.await;
+            assert!(has_work().await);
+            assert_eq!(
+                input_queue.get_pending_input(&Mutex::new(None)).await,
+                vec![TurnInput::InterAgentCommunication(mail)]
+            );
+            assert!(!has_work().await);
+        }
     }
 
     #[tokio::test]
@@ -785,6 +849,7 @@ mod tests {
             input_queue
                 .enqueue_mailbox_communication(mail.clone())
                 .await
+                .expect("mailbox admission")
         );
 
         let mailbox_guard = input_queue.mailbox.lock().await;
@@ -844,6 +909,7 @@ mod tests {
             input_queue
                 .enqueue_mailbox_communication(mail.clone())
                 .await
+                .expect("mailbox admission")
         );
 
         let mailbox_guard = input_queue.mailbox.lock().await;
@@ -943,7 +1009,8 @@ mod tests {
                 "queued",
                 /*trigger_turn*/ false,
             ))
-            .await;
+            .await
+            .expect("mailbox admission");
         assert!(!input_queue.has_trigger_turn_mailbox_items().await);
 
         input_queue
@@ -953,7 +1020,8 @@ mod tests {
                 "wake",
                 /*trigger_turn*/ true,
             ))
-            .await;
+            .await
+            .expect("mailbox admission");
         assert!(input_queue.has_trigger_turn_mailbox_items().await);
     }
 
@@ -973,11 +1041,13 @@ mod tests {
             input_queue
                 .enqueue_mailbox_communication(communication.clone())
                 .await
+                .expect("mailbox admission")
         );
         assert!(
             !input_queue
                 .enqueue_mailbox_communication(communication.clone())
                 .await
+                .expect("mailbox admission")
         );
 
         let restored = InputQueue::new();
@@ -986,7 +1056,12 @@ mod tests {
                 communication.clone(),
             )])
             .await;
-        assert!(!restored.enqueue_mailbox_communication(communication).await);
+        assert!(
+            !restored
+                .enqueue_mailbox_communication(communication)
+                .await
+                .expect("mailbox admission")
+        );
     }
 
     #[tokio::test]
@@ -1009,17 +1084,29 @@ mod tests {
             "bounded-retry".to_string(),
         ));
 
-        assert!(input_queue.enqueue_mailbox_communication(first).await);
         assert!(
-            !input_queue
-                .enqueue_mailbox_communication(retry.clone())
+            input_queue
+                .enqueue_mailbox_communication(first)
                 .await
+                .expect("mailbox admission")
+        );
+        let error = input_queue
+            .enqueue_mailbox_communication(retry.clone())
+            .await
+            .expect_err("full mailbox must reject admission");
+        assert!(
+            matches!(error, codex_protocol::error::CodexErr::InvalidRequest(message) if message.contains("session mailbox is full"))
         );
         assert_eq!(
             input_queue.get_pending_input(&Mutex::new(None)).await.len(),
             1
         );
-        assert!(input_queue.enqueue_mailbox_communication(retry).await);
+        assert!(
+            input_queue
+                .enqueue_mailbox_communication(retry)
+                .await
+                .expect("mailbox admission")
+        );
     }
 
     #[tokio::test]
@@ -1055,8 +1142,18 @@ mod tests {
             ids[2].to_string(),
         ));
 
-        assert!(input_queue.enqueue_mailbox_communication(oldest).await);
-        assert!(!input_queue.enqueue_mailbox_communication(newest).await);
+        assert!(
+            input_queue
+                .enqueue_mailbox_communication(oldest)
+                .await
+                .expect("mailbox admission")
+        );
+        assert!(
+            !input_queue
+                .enqueue_mailbox_communication(newest)
+                .await
+                .expect("mailbox admission")
+        );
     }
 
     #[tokio::test]

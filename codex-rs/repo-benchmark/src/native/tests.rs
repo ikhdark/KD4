@@ -126,6 +126,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         'initialize' { Send @{id=$request.id;result=@{userAgent='benchmark-native-test-peer'}} }
         'config/read' { Send @{id=$request.id;result=(Get-Content -LiteralPath (Join-Path $PSScriptRoot 'config-response.json') -Raw | ConvertFrom-Json)} }
         'thread/start' { Send @{id=$request.id;result=@{thread=@{id='thread-1'}}} }
+        'thread/resume' { Send @{id=$request.id;result=@{thread=@{id=$request.params.threadId}}} }
         'turn/start' {
             Send @{method='item/started';params=@{threadId='thread-1';turnId='turn-1';item=@{id='tool-1';type='commandExecution'}}}
             if ('TERMINAL' -eq 'hang') { Start-Sleep -Seconds 30 }
@@ -151,6 +152,61 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         timeout_ms: 10000,
         scenario: None,
     }
+}
+
+#[test]
+#[cfg(windows)]
+fn native_restart_restores_prepared_config_and_preserves_sessions() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut request = peer_request(temp.path(), "completed");
+    let prepared_config = b"# Preserve exact prepared bytes\nmodel = 'benchmark-model'\nmodel_auto_compact_token_limit = 190000\n[features]\nkd4_runtime = false\n";
+    request.expected_config = json!({"model": "benchmark-model", "model_auto_compact_token_limit": 190000, "features": {"kd4_runtime": false}});
+    fs::write(request.codex_home.join("config.toml"), prepared_config).unwrap();
+    let path = temp.path().join("config-response.json");
+    let mut response: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    response["config"] = request.expected_config.clone();
+    response["layers"][0]["config"] = request.expected_config.clone();
+    fs::write(path, serde_json::to_vec(&response).unwrap()).unwrap();
+    let mut evidence = run_attempt(&request);
+    assert_eq!(evidence.status, "completed", "{:?}", evidence.failure);
+    let sessions = request.codex_home.join("sessions");
+    fs::create_dir(&sessions).unwrap();
+    let rollout = sessions.join("thread-1.jsonl");
+    fs::write(&rollout, "preserved session\n").unwrap();
+    fs::write(
+        request.codex_home.join("config.toml"),
+        "[projects.'C:/benchmark/workspace']\ntrust_level = 'trusted'\n",
+    )
+    .unwrap();
+
+    let started = Instant::now();
+    let mut process = spawn_recorded(
+        &request,
+        &[],
+        started,
+        started + Duration::from_secs(10),
+        Some(prepared_config),
+        &mut evidence,
+    )
+    .unwrap();
+    initialize(&mut process, &request, &[], &mut evidence).unwrap();
+    let resumed = process
+        .rpc("thread/resume", json!({"threadId": evidence.thread_id}))
+        .unwrap();
+    process.stop().unwrap();
+    assert_eq!(resumed["thread"]["id"], "thread-1");
+    assert_eq!(
+        fs::read(request.codex_home.join("config.toml")).unwrap(),
+        prepared_config
+    );
+    let config: toml::Value =
+        toml::from_str(&fs::read_to_string(request.codex_home.join("config.toml")).unwrap())
+            .unwrap();
+    assert_eq!(
+        serde_json::to_value(config).unwrap(),
+        request.expected_config
+    );
+    assert_eq!(fs::read_to_string(rollout).unwrap(), "preserved session\n");
 }
 
 #[test]
@@ -191,9 +247,43 @@ fn native_stdio_preserves_early_notifications_and_rejects_failed_terminal() {
 
 #[test]
 #[cfg(windows)]
+fn native_stdio_accepts_normalized_isolated_home_and_migration_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut request = peer_request(temp.path(), "completed");
+    request.codex_home = fs::canonicalize(&request.codex_home).unwrap();
+    let path = temp.path().join("config-response.json");
+    let mut response: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let reported = response["layers"][0]["name"]["file"].as_str().unwrap();
+    let reported = reported
+        .strip_prefix(r"\\?\")
+        .unwrap_or(reported)
+        .to_owned();
+    assert_ne!(Path::new(&reported), request.codex_home.join("config.toml"));
+    response["layers"][0]["name"]["file"] = json!(reported);
+    response["layers"][0]["config"]["config_version"] = json!(1);
+    response["config"]["config_version"] = json!(1);
+    response["layers"].as_array_mut().unwrap().push(json!({
+        "name": {"type": "system", "file": "C:/ProgramData/OpenAI/Codex/config.toml"},
+        "config": {"config_version": 1}
+    }));
+    fs::write(path, serde_json::to_vec(&response).unwrap()).unwrap();
+
+    let evidence = run_attempt(&request);
+    assert_eq!(evidence.status, "completed", "{:?}", evidence.failure);
+    assert_eq!(evidence.thread_id.as_deref(), Some("thread-1"));
+    assert_eq!(evidence.completed_turns, 1);
+    assert_eq!(evidence.tool_executions, 1);
+}
+
+#[test]
+#[cfg(windows)]
 fn native_stdio_rejects_config_inheritance_before_starting_a_thread() {
     for (case, reason) in [
         ("wrong_file", "exact isolated home/config.toml"),
+        ("relative_file", "exact isolated home/config.toml"),
+        ("user_version", "reported user config differs"),
+        ("system_version", "unexpected nonempty configuration layer"),
+        ("system_settings", "unexpected nonempty configuration layer"),
         ("profile", "must not select a profile"),
         ("flags", "other than the prepared overrides"),
         ("missing_layer", "malformed or missing layer config"),
@@ -210,6 +300,10 @@ fn native_stdio_rejects_config_inheritance_before_starting_a_thread() {
                 fs::write(&other, "").unwrap();
                 response["layers"][0]["name"]["file"] = json!(other);
             }
+            "relative_file" => response["layers"][0]["name"]["file"] = json!("home/config.toml"),
+            "user_version" => response["layers"][0]["config"]["config_version"] = json!(2),
+            "system_version" => response["layers"].as_array_mut().unwrap().push(json!({"name":{"type":"system"},"config":{"config_version":2}})),
+            "system_settings" => response["layers"].as_array_mut().unwrap().push(json!({"name":{"type":"system"},"config":{"config_version":1,"developer_instructions":"inherited"}})),
             "profile" => response["layers"][0]["name"]["profile"] = json!("secret-profile"),
             "flags" => response["layers"].as_array_mut().unwrap().push(json!({"name":{"type":"sessionFlags"},"config":{"developer_instructions":"inherited"}})),
             "missing_layer" => { response["layers"][0].as_object_mut().unwrap().remove("config"); }

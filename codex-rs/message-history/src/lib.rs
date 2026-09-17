@@ -144,12 +144,19 @@ pub async fn append_entry(
 // same protocol so their identity and contents describe one coherent snapshot.
 fn open_locked_history(path: &Path, exclusive: bool) -> Result<File> {
     for _ in 0..MAX_RETRIES {
-        let file = OpenOptions::new()
+        let mut options = OpenOptions::new();
+        options
             .read(true)
             .write(exclusive)
             .create(exclusive)
-            .truncate(false)
-            .open(path)?;
+            .truncate(false);
+        // Prompt history must not become readable by other users under a permissive umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(path)?;
         let lock = if exclusive {
             file.try_lock()
         } else {

@@ -22,7 +22,7 @@ use crate::tools::handlers::apply_patch::intercept_apply_patch;
 use crate::tools::handlers::command_preflight::preflight_invocation_for_kd4_runtime;
 use crate::tools::handlers::command_search::classify_rg_search_narrowing_without_native_scope;
 use crate::tools::handlers::command_search::classify_rg_search_with_repository;
-use crate::tools::handlers::command_search::observe_rg_search_scope_state;
+use crate::tools::handlers::command_search::observe_rg_search_scope_state_with_freshness;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
 use crate::tools::handlers::normalize_and_validate_additional_permissions_uri;
@@ -347,9 +347,7 @@ impl ExecCommandHandler {
                 parse_arguments(&arguments)?
             }
         };
-        let original_invocation = args
-            .command_invocation()
-            .map_err(FunctionCallError::RespondToModel)?;
+        let original_invocation = args.command_invocation();
         let environment_is_remote = environment.is_remote();
         if environment_is_remote && !original_invocation.is_argv() {
             if turn_environment.shell.is_none() {
@@ -469,7 +467,7 @@ impl ExecCommandHandler {
                 })?
                 .map_err(FunctionCallError::RespondToModel)?;
                 if let Some((_, search)) = search.as_mut() {
-                    observe_rg_search_scope_state(search).await;
+                    observe_rg_search_scope_state_with_freshness(search, args.force_fresh).await;
                 }
                 search.map(|(root, search)| (root.to_string_lossy().into_owned(), search))
             } else {
@@ -651,7 +649,8 @@ impl ExecCommandHandler {
             attempt_key.with_search_narrowing(&turn.sub_id, &repository_identity, Some(search))
         } else {
             attempt_key
-        };
+        }
+        .with_search_environment(&effective_environment);
         if validation_launch.is_none() {
             session
                 .services
@@ -744,12 +743,12 @@ impl ExecCommandHandler {
         match intercepted {
             Ok(Some(output)) => {
                 let raw_output = output.into_text().into_bytes();
-                let raw_output_artifact = create_raw_output_artifact(
+                let raw_output_artifact = if raw_output.len() > crate::tools::command_output_artifact::LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES { Some(create_raw_output_artifact(
                     turn.config.codex_home.as_path(),
                     &session.thread_id.to_string(),
                     &raw_output,
                 )
-                .await;
+                .await) } else { None };
                 if !known_delta_hit && !validation_attempt {
                     session
                         .services
@@ -772,7 +771,7 @@ impl ExecCommandHandler {
                         search_no_match: false,
                         original_token_count: None,
                         hook_command: Some(hook_command),
-                        raw_output_artifact: Some(raw_output_artifact),
+                        raw_output_artifact,
                         raw_output_reduction_notice: None,
                         repair_notice,
                     }

@@ -84,7 +84,7 @@ pub(crate) fn executable_name_lookup_key(raw: &str) -> Option<String> {
 /// may appear before it (e.g., `-C`, `-c`, `--git-dir`).
 ///
 /// Shared with `is_safe_command` to avoid git-global-option bypasses.
-pub(crate) fn find_git_subcommand<'a>(
+pub fn find_git_subcommand<'a>(
     command: &'a [String],
     subcommands: &[&str],
 ) -> Option<(usize, &'a str)> {

@@ -171,8 +171,13 @@ impl App {
                             .await;
                     }
                     None => {
+                        let lookup_scope = if uuid::Uuid::parse_str(&id_or_name).is_ok() {
+                            "The app server could not find that thread ID."
+                        } else {
+                            "Names are matched exactly among unarchived CLI and VS Code chats across all directories. Try /resume with the thread ID."
+                        };
                         self.chat_widget.add_error_message(format!(
-                            "No saved chat found matching '{id_or_name}'."
+                            "No saved chat found matching '{id_or_name}'. {lookup_scope}"
                         ));
                     }
                 }
@@ -204,6 +209,7 @@ impl App {
                         .await;
                     match app_server.fork_thread(self.config.clone(), thread_id).await {
                         Ok(forked) => {
+                            let forked_thread_id = forked.session.thread_id;
                             self.shutdown_current_thread(app_server).await;
                             match self
                                 .replace_chat_widget_with_app_server_thread(
@@ -219,7 +225,7 @@ impl App {
                                 }
                                 Err(err) => {
                                     self.chat_widget.add_error_message(format!(
-                                        "Failed to attach to forked app-server thread: {err}"
+                                        "Forked thread {forked_thread_id} was created, but attaching to it failed: {err}. Resume it with /resume {forked_thread_id}."
                                     ));
                                 }
                             }
@@ -232,7 +238,7 @@ impl App {
                     }
                 } else {
                     self.chat_widget.add_error_message(
-                        "A thread must contain at least one turn before it can be forked."
+                        "There is no active thread to fork yet. Send a message to start one, then try /fork again."
                             .to_string(),
                     );
                 }

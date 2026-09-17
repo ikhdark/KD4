@@ -24,6 +24,68 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 class BuildToolingStorageTest(unittest.TestCase):
+    def test_lane_timing_cli_separates_phases_and_preserves_failed_child(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            output = repo / "timing.json"
+            target = repo / "codex-rs" / "target" / "lanes" / "unit"
+
+            def child(command, *, env, check):
+                self.assertTrue(rust_build_status.lane_active_lock_is_held(target))
+                self.assertNotIn("CARGO_TARGET_DIR", env)
+                self.assertEqual(command[-4:], ["--target-dir", str(target.resolve()), "-p", "example"])
+                return subprocess.CompletedProcess(command, 7)
+
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.object(rust_build_status, "maintain_cargo_lanes") as maintain,
+                mock.patch.object(rust_build_status.subprocess, "run", side_effect=child),
+                mock.patch.object(rust_build_status.time, "perf_counter_ns",
+                                  side_effect=[0, 2_000_000, 5_000_000, 12_000_000, 23_000_000, 24_000_000]),
+            ):
+                self.assertEqual(rust_build_status.main([
+                    "run-lane", "--repo-root", str(repo), "--lane", "unit",
+                    "--timing-json", str(output), "--", "cargo", "check", "-p", "example",
+                ]), 7)
+            record = json.loads(output.read_text())
+            self.assertEqual(record["phaseDurationsMs"], {
+                "reservation": 2, "setup": 3, "maintenance": 7, "command": 11, "release": 1,
+            })
+            self.assertEqual(record["totalMs"], 24)
+            self.assertEqual((record["schemaVersion"], record["status"], record["exitCode"]), (1, "failed", 7))
+            self.assertEqual(record["resolvedLane"], "unit")
+            self.assertEqual(record["command"], ["cargo", "check", "-p", "example"])
+            maintain.assert_called_once_with(repo, target.parent.resolve())
+            self.assertFalse(rust_build_status.lane_active_lock_is_held(target))
+
+    def test_lane_timing_records_reservation_failure_without_launch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "timing.json"
+            with (
+                mock.patch.object(rust_build_status, "reserve_cargo_lane", side_effect=RuntimeError("busy")),
+                mock.patch.object(rust_build_status.subprocess, "run") as child,
+                mock.patch.object(rust_build_status.time, "perf_counter_ns", side_effect=[0, 9_000_000]),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(rust_build_status.main([
+                    "run-lane", "--lane", "unit", "--timing-json", str(output), "--", "cargo", "check",
+                ]), 2)
+            child.assert_not_called()
+            record = json.loads(output.read_text())
+            self.assertEqual(record["phaseDurationsMs"], {
+                "reservation": 9, "setup": None, "maintenance": None, "command": None, "release": None,
+            })
+            self.assertEqual(record["status"], "error")
+            self.assertEqual(record["errorType"], "RuntimeError")
+            self.assertIsNone(record["exitCode"])
+            # Reusing the path must preserve earlier evidence and prevent a build.
+            with mock.patch.object(rust_build_status.subprocess, "run") as child, contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(rust_build_status.main([
+                    "run-lane", "--lane", "unit", "--timing-json", str(output), "--", "cargo", "check",
+                ]), 2)
+            child.assert_not_called()
+            self.assertEqual(json.loads(output.read_text()), record)
+
     def test_indirect_roots_are_rejected_before_launch_or_prune(self):
         for source in ("default", "environment", "explicit", "ancestor"):
             with self.subTest(source=source), tempfile.TemporaryDirectory() as temp:
@@ -441,6 +503,70 @@ class BuildToolingStorageTest(unittest.TestCase):
             rust_build_status._cargo_command_with_target_dir(
                 ["cargo", "watch", "-x", "check", "-s", "cargo test"], target
             )
+
+    def test_watch_attached_short_options_cannot_bypass_reserved_target(self):
+        target = Path("lane").resolve()
+        for option in ("-scommand", "-s=command", "-qscommand", "-cqs=command"):
+            with (
+                self.subTest(option=option),
+                self.assertRaisesRegex(ValueError, "--shell"),
+            ):
+                rust_build_status._cargo_command_with_target_dir(
+                    ["cargo", "watch", "-x", "check", option], target
+                )
+        for option in ("-xcheck", "-x=check"):
+            with self.subTest(option=option):
+                self.assertEqual(
+                    rust_build_status._cargo_command_with_target_dir(
+                        ["cargo", "watch", "-x", "build", option], target
+                    ),
+                    [
+                        "cargo",
+                        "watch",
+                        "-x",
+                        f"build --target-dir {target}",
+                        f"-xcheck --target-dir {target}",
+                    ],
+                )
+        with self.assertRaisesRegex(ValueError, "target-dir"):
+            rust_build_status._cargo_command_with_target_dir(
+                ["cargo", "watch", "-xcheck", "-xbuild --target-dir elsewhere"], target
+            )
+        self.assertEqual(
+            rust_build_status._cargo_command_with_target_dir(
+                ["cargo", "watch", "-cqxcheck", "-qw", "build"], target
+            ),
+            [
+                "cargo",
+                "watch",
+                "-cq",
+                f"-xcheck --target-dir {target}",
+                "-q",
+                "-w",
+                "build",
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "positional commands"):
+            rust_build_status._cargo_command_with_target_dir(
+                ["cargo", "watch", "build", "--target-dir", "elsewhere"], target
+            )
+
+    def test_run_lane_rejects_attached_shell_before_launch_and_releases_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            lanes = repo / "codex-rs" / "target" / "lanes"
+            with (
+                mock.patch.object(subprocess, "run") as launch,
+                self.assertRaisesRegex(ValueError, "--shell"),
+            ):
+                rust_build_status.run_in_cargo_lane(
+                    repo_root=repo,
+                    requested_lane="unit",
+                    lane_root=lanes,
+                    command=["cargo", "watch", "-xcheck", "-qsecho escaped"],
+                )
+            launch.assert_not_called()
+            self.assertFalse(rust_build_status.lane_active_lock_is_held(lanes / "unit"))
 
     def test_process_lane_patterns_accept_powershell_forms(self):
         for command, expected in [

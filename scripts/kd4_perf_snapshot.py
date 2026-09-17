@@ -9,6 +9,7 @@ import json
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -30,6 +31,54 @@ except ImportError:  # Direct script execution places scripts/ on sys.path.
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TIMEOUT_SECONDS = 1_800
 FAILURE_OUTPUT_TAIL_BYTES = 4_096
+
+
+def _run_scenario(
+    command: tuple[str, ...],
+    *,
+    cwd: Path,
+    stdout: BinaryIO,
+    stderr: BinaryIO,
+    timeout: float,
+) -> subprocess.CompletedProcess:
+    # Keep the parent alive until tree termination. subprocess.run kills it
+    # first on timeout, losing the Windows parent/descendant relationship.
+    with subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdout=stdout,
+        stderr=stderr,
+        start_new_session=os.name != "nt",
+    ) as process:
+        try:
+            returncode = process.wait(timeout=timeout)
+        except BaseException:
+            try:
+                if os.name == "nt":
+                    subprocess.run(
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                        timeout=15,
+                        check=True,
+                    )
+                else:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                process.wait(timeout=15)
+            except (OSError, subprocess.SubprocessError) as cleanup_error:
+                process.kill()
+                process.wait()
+                # Do not proceed into another measurement with unknown children.
+                raise RuntimeError(
+                    f"Failed to stop scenario process tree {process.pid}; "
+                    "remaining measurements aborted"
+                ) from cleanup_error
+            raise
+    return subprocess.CompletedProcess(command, returncode)
 
 
 @dataclass(frozen=True)
@@ -271,13 +320,12 @@ def measure_scenario(
         ):
             try:
                 started = time.perf_counter_ns()
-                completed = subprocess.run(
+                completed = _run_scenario(
                     scenario.command,
                     cwd=scenario.cwd,
                     stdout=stdout_file,
                     stderr=stderr_file,
                     timeout=timeout_seconds,
-                    check=False,
                 )
                 elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
             except (OSError, subprocess.TimeoutExpired) as exc:

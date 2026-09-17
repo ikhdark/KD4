@@ -16,7 +16,7 @@ if ([string]::IsNullOrWhiteSpace($ReleaseRepository)) {
     $ReleaseRepository = "ikhdark/KD4"
 }
 $ReleaseRepository = $ReleaseRepository.Trim()
-if ($ReleaseRepository -cnotmatch "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$") {
+if ($ReleaseRepository -cnotmatch '\A[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/(?!\.{1,2}\z)[A-Za-z0-9_.-]+\z') {
     throw "Invalid Codex release repository: $ReleaseRepository. Expected owner/name."
 }
 $ReleaseApiBase = "https://api.github.com/repos/$ReleaseRepository/releases"
@@ -1035,8 +1035,11 @@ function Maybe-HandleConflictingInstall {
         Write-Step "Running: $uninstallCommand $($uninstallArgs -join ' ')"
         try {
             & $uninstallCommand @uninstallArgs
+            if ($LASTEXITCODE -ne 0) {
+                throw "$uninstallCommand exited with code $LASTEXITCODE."
+            }
         } catch {
-            Write-WarningStep "Failed to uninstall the existing $manager-managed Codex. Continuing with the standalone install."
+            Write-WarningStep "Failed to uninstall the existing $manager-managed Codex: $_ Continuing with the standalone install."
         }
     } else {
         Write-WarningStep "Leaving the existing $manager-managed Codex installed. PATH order will determine which codex runs."

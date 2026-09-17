@@ -202,8 +202,10 @@ fn assert_shell_command_output(output: &str, expected: &str) -> Result<()> {
         .trim_end_matches('\n')
         .to_string();
 
+    // These commands stay under the lazy raw-artifact threshold, so the output
+    // is retained inline and no artifact file is materialized for it.
     let expected_pattern = format!(
-        r"(?s)^Exit code: 0\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nRaw output artifact: .+? \([0-9]+ bytes retained\)\nOutput:\n{expected}\n?$"
+        r"(?s)^Exit code: 0\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nOutput:\n{expected}\n?$"
     );
 
     assert_regex_match(&expected_pattern, &normalized_output);
@@ -309,7 +311,7 @@ async fn shell_command_times_out_with_timeout_ms() -> anyhow::Result<()> {
         .replace('\r', "\n")
         .trim_end_matches('\n')
         .to_string();
-    let expected_pattern = r"(?s)^Exit code: 124\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nRaw output artifact: .+? \([0-9]+ bytes retained\)\nOutput:\ncommand timed out after [0-9]+ milliseconds\n?$";
+    let expected_pattern = r"(?s)^Exit code: 124\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nOutput:\ncommand timed out after [0-9]+ milliseconds\n?$";
     assert_regex_match(expected_pattern, &normalized_output);
 
     Ok(())
@@ -334,7 +336,7 @@ async fn shell_command_cancels_after_output_stalls() -> anyhow::Result<()> {
     )
     .await?;
     let normalized_output = output.replace("\r\n", "\n").replace('\r', "\n");
-    let expected_pattern = r"(?s)^Exit code: 124\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nRaw output artifact: .+? \([0-9]+ bytes retained\)\nOutput:\ncommand timed out after [0-9]+ milliseconds\n.*command stalled after 200 milliseconds without stdout or stderr\n?$";
+    let expected_pattern = r"(?s)^Exit code: 124\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nOutput:\ncommand timed out after [0-9]+ milliseconds\n.*command stalled after 200 milliseconds without stdout or stderr\n?$";
     assert!(
         regex_lite::Regex::new(expected_pattern)
             .expect("stall output regex is valid")

@@ -150,7 +150,10 @@ pub fn write_frame<W: Write>(mut writer: W, msg: &FramedMessage) -> Result<()> {
     validate_protocol_version(msg.version)?;
     let payload = serde_json::to_vec(msg)?;
     if payload.len() > MAX_FRAME_LEN {
-        anyhow::bail!("frame too large: {}", payload.len());
+        anyhow::bail!(
+            "frame is {} bytes, exceeding the {MAX_FRAME_LEN}-byte limit",
+            payload.len()
+        );
     }
     let len = payload.len() as u32;
     writer.write_all(&len.to_le_bytes())?;
@@ -179,7 +182,7 @@ pub fn read_frame<R: Read>(mut reader: R) -> Result<Option<FramedMessage>> {
     }
     let len = u32::from_le_bytes(len_buf) as usize;
     if len > MAX_FRAME_LEN {
-        anyhow::bail!("frame too large: {len}");
+        anyhow::bail!("frame is {len} bytes, exceeding the {MAX_FRAME_LEN}-byte limit");
     }
     let mut payload = vec![0u8; len];
     reader.read_exact(&mut payload)?;
@@ -225,6 +228,40 @@ mod tests {
             }
             other => panic!("unexpected message: {other:?}"),
         }
+    }
+
+    #[test]
+    fn oversized_frame_reports_actual_and_maximum_lengths() {
+        let header = 8_388_609_u32.to_le_bytes();
+        let error = read_frame(header.as_slice())
+            .expect_err("oversized frame must be rejected before reading its body");
+        assert_eq!(
+            error.to_string(),
+            "frame is 8388609 bytes, exceeding the 8388608-byte limit"
+        );
+        let message = FramedMessage {
+            version: IPC_PROTOCOL_VERSION,
+            message: Message::Output {
+                payload: OutputPayload {
+                    data_b64: "x".repeat(8_388_609),
+                    stream: OutputStream::Stdout,
+                },
+            },
+        };
+        let encoded_length = serde_json::to_vec(&message)
+            .expect("serializable frame")
+            .len();
+        let mut destination = Vec::new();
+        let error = write_frame(&mut destination, &message)
+            .expect_err("oversized frame must not be written");
+        assert_eq!(
+            error.to_string(),
+            format!("frame is {encoded_length} bytes, exceeding the 8388608-byte limit")
+        );
+        assert!(
+            destination.is_empty(),
+            "rejection must not leave a partial frame"
+        );
     }
 
     #[test]
