@@ -2222,7 +2222,7 @@ mod tests {
         let payload = build_nested_tool_payload(
             CodeModeToolKind::Function,
             &ToolName::plain(codex_tools::TOOL_SEARCH_TOOL_NAME),
-            Some(json!({ "query": "repo atlas", "limit": 8 })),
+            Some(json!({ "query": "example plugin", "limit": 8 })),
         )
         .expect("tool search payload should parse");
 
@@ -2230,7 +2230,7 @@ mod tests {
             payload,
             ToolPayload::ToolSearch {
                 arguments: SearchToolCallParams {
-                    query: "repo atlas".to_string(),
+                    query: "example plugin".to_string(),
                     limit: Some(8),
                 },
             }

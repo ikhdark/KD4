@@ -1,7 +1,7 @@
 {
-  "index_sha256": "510e62f997b52978017f00536b51429dc03ff78467ecdaed6a3fb4dfc306ff2d",
+  "index_sha256": "a4f38d9a6f71aee618127cb59a22936ea7837757e28299e77faf75f50ea45c89",
   "index_version": 1,
-  "manifest_sha256": "15c08453d1c909ec63ca5d555a814f81caf72c624f45c99a030fe20528474009",
+  "manifest_sha256": "fe2515a1edea2715c34f91280716c56d5f3525f984ef69ee08a9c5be27c864fb",
   "omitted": {
     "relationships": 0
   },
@@ -4348,7 +4348,7 @@
       "target": "path:codex-rs/windows-sandbox-rs/src/winutil.rs"
     }
   ],
-  "repository_revision": "manifest:15c08453d1c909ec63ca5d555a814f81caf72c624f45c99a030fe20528474009:sources:de0b973b9227c50ef6da794db51704f9b7f4623b4c2ab60a8587d1f3bfca750a",
+  "repository_revision": "manifest:fe2515a1edea2715c34f91280716c56d5f3525f984ef69ee08a9c5be27c864fb:sources:9cc615fb5e969b4c7f0792a013db02d6b649017319ef12f3eed355a6f4f9d5ea",
   "schema_version": 2,
   "status": "complete",
   "unresolved": []

@@ -920,9 +920,9 @@ fn independent_review_policy_allows_inspection_and_denies_mutation() {
             .expect("review inspection tool should be authorized");
         }
 
-        let repo_atlas_call = ToolCall {
-            tool_name: ToolName::namespaced("mcp__repo_atlas", "context_for"),
-            call_id: "review-atlas".to_string(),
+        let inspection_call = ToolCall {
+            tool_name: ToolName::namespaced("mcp__example", "context_for"),
+            call_id: "review-inspection".to_string(),
             payload: ToolPayload::Function {
                 arguments: "{}".to_string(),
             },
@@ -930,10 +930,10 @@ fn independent_review_policy_allows_inspection_and_denies_mutation() {
         authorize_independent_review_tool_call(
             &source,
             TypedToolClass::DynamicExternal,
-            &repo_atlas_call,
+            &inspection_call,
             ExternalMutationIntent::ProvenReadOnly,
         )
-        .expect("allowlisted Repo Atlas inspection should be authorized");
+        .expect("read-only external inspection should be authorized");
 
         for (tool_name, class) in [
             (
@@ -941,7 +941,7 @@ fn independent_review_policy_allows_inspection_and_denies_mutation() {
                 TypedToolClass::StructuredEdit,
             ),
             (
-                ToolName::namespaced("mcp__repo_atlas", "write_file"),
+                ToolName::namespaced("mcp__example", "write_file"),
                 TypedToolClass::DynamicExternal,
             ),
             (

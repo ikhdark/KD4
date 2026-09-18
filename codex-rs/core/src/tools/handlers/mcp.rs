@@ -68,24 +68,6 @@ pub(crate) fn is_allowlisted_read_only_external_tool(name: &ToolName) -> bool {
     matches!(
         (name.namespace.as_deref(), name.name.as_str()),
         (
-            Some("mcp__repo_atlas"),
-            "batch"
-                | "cochange"
-                | "context_for"
-                | "contract"
-                | "crate_graph"
-                | "crate_summary"
-                | "find_def"
-                | "find_refs"
-                | "impact"
-                | "index_status"
-                | "outline"
-                | "repo_facts"
-                | "select_root"
-                | "slice"
-                | "trace"
-                | "where_belongs"
-        ) | (
             Some("mcp__codex_apps__github"),
             "fetch"
                 | "fetch_blob"
@@ -637,11 +619,11 @@ mod tests {
 
     #[test]
     fn external_mutation_intent_uses_runtime_annotations_and_inspection_allowlist() {
-        let repo_atlas = McpHandler::new(tool_info("repo_atlas", "mcp__repo_atlas", "context_for"))
+        let unannotated = McpHandler::new(tool_info("example", "mcp__example", "context_for"))
             .expect("MCP tool spec should build");
         assert_eq!(
-            repo_atlas.external_mutation_intent(),
-            ExternalMutationIntent::ProvenReadOnly
+            unannotated.external_mutation_intent(),
+            ExternalMutationIntent::MayMutate
         );
 
         let github = McpHandler::new(tool_info("github", "mcp__codex_apps__github", "fetch_file"))
@@ -651,7 +633,7 @@ mod tests {
             ExternalMutationIntent::ProvenReadOnly
         );
 
-        let mut explicit_mutation = tool_info("repo_atlas", "mcp__repo_atlas", "context_for");
+        let mut explicit_mutation = tool_info("github", "mcp__codex_apps__github", "fetch_file");
         explicit_mutation.tool.annotations =
             Some(rmcp::model::ToolAnnotations::new().read_only(false));
         assert_eq!(

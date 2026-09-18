@@ -1161,27 +1161,6 @@ async fn environment_count_controls_environment_backed_tools() {
 }
 
 #[tokio::test]
-async fn retired_kda_tool_is_not_exposed_or_registered() {
-    for tool_mode in [ToolMode::Direct, ToolMode::CodeMode, ToolMode::CodeModeOnly] {
-        let local = probe(|turn| turn.model_info.tool_mode = Some(tool_mode)).await;
-        local.assert_visible_lacks(&["kda"]);
-        local.assert_registered_lacks(&["kda"]);
-    }
-
-    let no_environment = probe(|turn| turn.environments.turn_environments.clear()).await;
-    no_environment.assert_visible_lacks(&["kda"]);
-    no_environment.assert_registered_lacks(&["kda"]);
-
-    let multiple_environments = probe(duplicate_primary_environment).await;
-    multiple_environments.assert_visible_lacks(&["kda"]);
-    multiple_environments.assert_registered_lacks(&["kda"]);
-
-    let foreign_environment = probe(set_foreign_primary_environment).await;
-    foreign_environment.assert_visible_lacks(&["kda"]);
-    foreign_environment.assert_registered_lacks(&["kda"]);
-}
-
-#[tokio::test]
 async fn view_image_registration_requires_image_input_support() {
     let image_capable = probe(|turn| {
         turn.model_info.input_modalities = vec![InputModality::Text, InputModality::Image];

@@ -49,7 +49,7 @@ an SDK, schema, package, installed binary, or Codex Desktop.
 Update it in the same change whenever the repository materially changes.
 
 <!-- BEGIN TRACKED PATH SNAPSHOT -->
-Tracked repository path snapshot: `count=4904 sha256=bb4e7896f4a3685bbc642e4472dc8f961f667900bb817f15a9e2275d0ad8cd03`.
+Tracked repository path snapshot: `count=4906 sha256=8da0fbee5a187f0616ff53b5805d9cee01d0b66d36150ae9996f356bdb334a19`.
 <!-- END TRACKED PATH SNAPSHOT -->
 
 Every repository file or directory add, delete, move, or rename also requires
@@ -84,11 +84,8 @@ map remains useful.
 ## How to use this map
 
 1. Read the root `AGENTS.md`.
-2. Before discovery reads, grep, or glob, call Repo Atlas `task` with the task
-   text and any known paths as anchors, then read its returned files and owner
-   instructions. Reuse that result for the same task and source snapshot.
-   If Atlas is unavailable, or ownership or a relevant relationship remains
-   unresolved, query the smallest owner slice before reading the broad map.
+2. Query the smallest owner slice before reading the broad map, then read the
+   relevant source files and owner instructions.
    For a known file, use
    `python scripts/source_owners.py slice --path <file> --focus "<task>"`.
    For a known owner, use
@@ -140,10 +137,9 @@ status. To resolve several paths together, use
 On Windows, `just protos-check` composes the thread-config and exec-server relay
 protobuf freshness checks. Both check existing bindings without replacing them.
 
-Repo Atlas is the first discovery route required by `AGENTS.md`. The source-owner
-manifest remains the authority for declared ownership and validation routes;
-Atlas results do not replace those contracts. After the task handoff, read the
-relevant source directly and use owner slices to resolve remaining relationships.
+The source-owner manifest is the authority for declared ownership and validation
+routes. Read the relevant source directly and use owner slices to resolve
+remaining relationships.
 
 Workspace-evidence recovery is owned by `codex-rs/core/src/tool_history.rs` and
 `codex-rs/core/src/tools/command_execution.rs`. A response with
@@ -188,6 +184,7 @@ below.
 | Path                                                             | Owns                                                                                                                                                                                                                                                                  |
 | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `.codex/`                                                        | Repo-local Codex configuration, environment setup, fork-local skills, and workspace policy                                                                                                                                                  |
+| `.kdv/`                                                         | Audit evidence attribution and recorded disputes for repository changes |
 | `.vscode/`                                                       | Checked-in editor and workspace defaults                                                                                                                                                                                                                              |
 | `architecture_index.json`                                        | Generated, manifest-keyed source-owner relationship graph consumed by task-scoped architecture discovery                                                                                                                                                              |
 | `codex-cli/`                                                     | npm-facing `@openai/codex` wrapper, native binary discovery, and npm package inputs                                                                                                                                                                                   |
@@ -566,7 +563,6 @@ remain required.
 | Python SDK                                   | focused `uv run pytest` and `uv run ruff check .`                                                                                                                                |
 | Package/archive flow                         | package-local tests followed by the relevant staging or dry-run proof                                                                                                            |
 | Local publish wiring                         | `just publish-local-codex-final -DryRun`; installed replacement requires `just publish-local-codex-final`                                                                        |
-| Installed provider external-evidence path    | `python scripts/investigation_evidence_smoke.py --run`; uses staged local KDS and Repo Atlas plugins, disposable Git repositories and Codex homes, and a loopback model endpoint |
 
 Green tooling alone does not prove runtime behavior. Use the focused failing
 test or approved runtime gate for the behavior being changed, and confirm that
@@ -659,7 +655,7 @@ This map owns cross-cutting navigation and structural inventory.
 | Dependency or build-system change                    | owning manifest -> lock state -> workspace/recipe consumers -> focused build/test/package proof                                                                                                                                             |
 | New top-level area or package                        | add the owner and policy boundary -> update the machine-checked inventory in this file -> add routing/validation -> run `just source-map-check`                                                                                             |
 
-<!-- BEGIN KD4 SOURCE OWNERS schema=2 manifest_sha256=15c08453d1c909ec63ca5d555a814f81caf72c624f45c99a030fe20528474009 -->
+<!-- BEGIN KD4 SOURCE OWNERS schema=2 manifest_sha256=fe2515a1edea2715c34f91280716c56d5f3525f984ef69ee08a9c5be27c864fb -->
 ### Managed KD4 source-owner index
 
 This table is generated by `scripts/source_owners.py`; edit `source_owners.toml`, not this block.

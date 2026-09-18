@@ -1361,7 +1361,7 @@ async fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
 
 #[test]
 fn remote_ca_environment_waits_for_worker_and_preserves_peer_hash_contract() {
-    const CHILD: &str = "KDA_REMOTE_CA_ENV_CHILD";
+    const CHILD: &str = "CODEX_REMOTE_CA_ENV_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let home = tempfile::tempdir().unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())

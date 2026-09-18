@@ -256,7 +256,6 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
         expectation: AnchorExpectation::None,
         anchors: &[
             "KD4",
-            "Repo Atlas",
             "repository source map",
             "official session roots",
         ],

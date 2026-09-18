@@ -1225,7 +1225,7 @@ cwd = "."
 argv = ["python", "-m", "unittest", "scripts.test_kd4_timing_analysis", "scripts.test_kd4_turn_latency_audit", "scripts.test_kd4_first_useful_action_analysis", "scripts.test_rollout_snapshot"]
 role = "focused_tests"
 
-# Manually reviewed KDA repair ownership; relationships use declared provenance.
+# Manually reviewed repair ownership; relationships use declared provenance.
 
 [[owners]]
 id = "agent-identity-contracts"

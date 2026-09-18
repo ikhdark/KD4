@@ -37,7 +37,6 @@ CLAUDE.md
 AGENTS.override.md
 
 # caches
-.kda/
 .cache/
 .turbo/
 .parcel-cache/

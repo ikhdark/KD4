@@ -147,18 +147,18 @@ fn test_mcp_server() -> McpServerConfig {
 
 fn plugin_outcome(tool_exposure: Option<PluginToolExposure>) -> PluginLoadOutcome<McpServerConfig> {
     PluginLoadOutcome::from_plugins(vec![LoadedPlugin {
-        config_name: "repo-atlas".to_string(),
-        manifest_name: Some("repo-atlas".to_string()),
-        plugin_namespace: Some("repo-atlas".to_string()),
+        config_name: "example-plugin".to_string(),
+        manifest_name: Some("example-plugin".to_string()),
+        plugin_namespace: Some("example-plugin".to_string()),
         manifest_description: None,
         tool_exposure,
-        root: AbsolutePathBuf::from_absolute_path_checked(std::env::temp_dir().join("repo-atlas"))
+        root: AbsolutePathBuf::from_absolute_path_checked(std::env::temp_dir().join("example-plugin"))
             .expect("temporary path should be absolute"),
         enabled: true,
         skill_roots: Vec::new(),
         disabled_skill_paths: HashSet::new(),
         has_enabled_skills: true,
-        mcp_servers: HashMap::from([("repo-atlas".to_string(), test_mcp_server())]),
+        mcp_servers: HashMap::from([("example-plugin".to_string(), test_mcp_server())]),
         apps: Vec::new(),
         hook_sources: Vec::new(),
         hook_load_warnings: Vec::new(),
@@ -166,13 +166,13 @@ fn plugin_outcome(tool_exposure: Option<PluginToolExposure>) -> PluginLoadOutcom
     }])
 }
 
-fn repo_atlas_tool_exposure(tool_names: &[&str]) -> PluginToolExposure {
+fn example_plugin_tool_exposure(tool_names: &[&str]) -> PluginToolExposure {
     PluginToolExposure::Valid(PluginToolExposureConfig {
         skills: BTreeMap::from([(
-            "repo-atlas".to_string(),
+            "example-plugin".to_string(),
             PluginSkillToolExposure {
                 mcp_tools: BTreeMap::from([(
-                    "repo-atlas".to_string(),
+                    "example-plugin".to_string(),
                     tool_names.iter().map(ToString::to_string).collect(),
                 )]),
             },
@@ -180,14 +180,14 @@ fn repo_atlas_tool_exposure(tool_names: &[&str]) -> PluginToolExposure {
     })
 }
 
-fn repo_atlas_tools() -> Vec<ToolInfo> {
+fn example_plugin_tools() -> Vec<ToolInfo> {
     ["task", "trace"]
         .into_iter()
         .map(|tool_name| {
             make_mcp_tool(
-                "repo-atlas",
+                "example-plugin",
                 tool_name,
-                "mcp__repo_atlas",
+                "mcp__example_plugin",
                 tool_name,
                 None,
                 None,
@@ -198,17 +198,17 @@ fn repo_atlas_tools() -> Vec<ToolInfo> {
 
 #[test]
 fn selected_skill_promotes_only_declared_mcp_entrypoints() {
-    let tools = repo_atlas_tools();
+    let tools = example_plugin_tools();
     let exposure = resolve_selected_skill_mcp_exposure(
-        &[selected_plugin_skill("repo-atlas", "repo-atlas")],
-        &plugin_outcome(Some(repo_atlas_tool_exposure(&["task"]))),
+        &[selected_plugin_skill("example-plugin", "example-plugin")],
+        &plugin_outcome(Some(example_plugin_tool_exposure(&["task"]))),
         &tools,
     );
 
     assert_eq!(
         exposure.direct_entrypoints,
         vec![DirectMcpToolEntrypoint {
-            server_name: "repo-atlas".to_string(),
+            server_name: "example-plugin".to_string(),
             tool_name: "task".to_string(),
         }]
     );
@@ -219,9 +219,9 @@ fn selected_skill_promotes_only_declared_mcp_entrypoints() {
 
 #[test]
 fn selected_skill_without_declaration_preserves_whole_server_promotion() {
-    let tools = repo_atlas_tools();
+    let tools = example_plugin_tools();
     let exposure = resolve_selected_skill_mcp_exposure(
-        &[selected_plugin_skill("repo-atlas", "repo-atlas")],
+        &[selected_plugin_skill("example-plugin", "example-plugin")],
         &plugin_outcome(None),
         &tools,
     );
@@ -230,11 +230,11 @@ fn selected_skill_without_declaration_preserves_whole_server_promotion() {
         exposure.direct_entrypoints,
         vec![
             DirectMcpToolEntrypoint {
-                server_name: "repo-atlas".to_string(),
+                server_name: "example-plugin".to_string(),
                 tool_name: "task".to_string(),
             },
             DirectMcpToolEntrypoint {
-                server_name: "repo-atlas".to_string(),
+                server_name: "example-plugin".to_string(),
                 tool_name: "trace".to_string(),
             },
         ]
@@ -244,9 +244,9 @@ fn selected_skill_without_declaration_preserves_whole_server_promotion() {
 
 #[test]
 fn invalid_explicit_declaration_does_not_broaden_exposure() {
-    let tools = repo_atlas_tools();
+    let tools = example_plugin_tools();
     let exposure = resolve_selected_skill_mcp_exposure(
-        &[selected_plugin_skill("repo-atlas", "repo-atlas")],
+        &[selected_plugin_skill("example-plugin", "example-plugin")],
         &plugin_outcome(Some(PluginToolExposure::Invalid(
             "invalid fixture".to_string(),
         ))),
@@ -262,10 +262,10 @@ fn invalid_explicit_declaration_does_not_broaden_exposure() {
 
 #[test]
 fn unselected_skills_promote_nothing() {
-    let tools = repo_atlas_tools();
+    let tools = example_plugin_tools();
     let exposure = resolve_selected_skill_mcp_exposure(
         &[],
-        &plugin_outcome(Some(repo_atlas_tool_exposure(&["task"]))),
+        &plugin_outcome(Some(example_plugin_tool_exposure(&["task"]))),
         &tools,
     );
 

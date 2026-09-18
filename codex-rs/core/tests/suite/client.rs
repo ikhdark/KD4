@@ -183,15 +183,15 @@ fn assert_codex_client_metadata(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn retired_kda_tool_is_not_advertised_and_calls_are_rejected() -> anyhow::Result<()> {
+async fn unknown_tool_is_not_advertised_and_calls_are_rejected() -> anyhow::Result<()> {
     let server = MockServer::start().await;
-    let call_id = "retired-kda-call";
+    let call_id = "unknown-tool-call";
     let response_mock = mount_sse_sequence(
         &server,
         vec![
             sse(vec![
                 ev_response_created("resp1"),
-                ev_function_call(call_id, "kda", "{}"),
+                ev_function_call(call_id, "unknown_tool", "{}"),
                 ev_completed("resp1"),
             ]),
             sse(vec![ev_response_created("resp2"), ev_completed("resp2")]),
@@ -209,13 +209,13 @@ async fn retired_kda_tool_is_not_advertised_and_calls_are_rejected() -> anyhow::
         let tools = body["tools"].as_array().expect("model tool definitions");
         assert!(!tools.is_empty(), "the runtime should advertise its tools");
         assert!(
-            !serde_json::to_string(tools)?.contains("\"kda\""),
-            "the retired KDA tool must not be advertised"
+            !serde_json::to_string(tools)?.contains("\"unknown_tool\""),
+            "an unknown tool must not be advertised"
         );
     }
     assert_eq!(
         requests[1].function_call_output_text(call_id).as_deref(),
-        Some("unsupported call: kda")
+        Some("unsupported call: unknown_tool")
     );
 
     Ok(())

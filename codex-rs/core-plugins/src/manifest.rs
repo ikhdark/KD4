@@ -824,16 +824,16 @@ mod tests {
     #[test]
     fn plugin_manifest_parses_skill_scoped_tool_exposure() {
         let tmp = tempdir().expect("tempdir");
-        let plugin_root = tmp.path().join("repo-atlas");
+        let plugin_root = tmp.path().join("example-plugin");
         fs::create_dir_all(plugin_root.join(".codex-plugin")).expect("create manifest dir");
         fs::write(
             plugin_root.join(".codex-plugin/plugin.json"),
             r#"{
-  "name": "repo-atlas",
+  "name": "example-plugin",
   "toolExposure": {
     "skills": {
-      "repo-atlas": {
-        "mcpTools": { "repo-atlas": ["task"] }
+      "example-plugin": {
+        "mcpTools": { "example-plugin": ["task"] }
       }
     }
   }
@@ -846,7 +846,7 @@ mod tests {
             panic!("expected valid tool exposure");
         };
         assert_eq!(
-            config.skills["repo-atlas"].mcp_tools["repo-atlas"],
+            config.skills["example-plugin"].mcp_tools["example-plugin"],
             vec!["task".to_string()]
         );
     }
