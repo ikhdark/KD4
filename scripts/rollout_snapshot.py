@@ -43,7 +43,9 @@ class RolloutSnapshot:
                     with zstd.open(raw, "rb") as decoded:
                         yield decoded
                 except (zstd.ZstdError, EOFError) as error:
-                    raise ValueError(f"cannot decompress rollout {self.path}: {error}") from error
+                    raise ValueError(
+                        f"cannot decompress rollout {self.path}: {error}"
+                    ) from error
             else:
                 yield raw
 

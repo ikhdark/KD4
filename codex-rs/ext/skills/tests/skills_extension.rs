@@ -139,14 +139,24 @@ async fn assert_installed_host_skill_fragment(
         let mut foreign = request.clone();
         foreign.authority = authority;
         assert_eq!(
-            provider.read(foreign).await.unwrap_err().message,
+            provider
+                .read(foreign)
+                .await
+                .err()
+                .ok_or("foreign skill read should fail")?
+                .message,
             "host skill provider cannot read this authority"
         );
     }
     let mut foreign = request;
     foreign.package = SkillPackageId("different-package".to_string());
     assert_eq!(
-        provider.read(foreign).await.unwrap_err().message,
+        provider
+            .read(foreign)
+            .await
+            .err()
+            .ok_or("foreign skill read should fail")?
+            .message,
         "host skill resource does not match its package"
     );
 

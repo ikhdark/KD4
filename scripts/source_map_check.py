@@ -283,9 +283,13 @@ def tracked_path_snapshot(source_paths: set[str]) -> tuple[int, str]:
 
 def render_tracked_path_snapshot(source_paths: set[str], *, newline: str) -> str:
     count, digest = tracked_path_snapshot(source_paths)
+    # Prettier separates an HTML comment from the paragraph that follows it, so
+    # emit that blank line here; otherwise every sync leaves SOURCEMAP.md
+    # failing `format.py --check`.
     return newline.join(
         (
             TRACKED_PATH_SNAPSHOT_BEGIN,
+            "",
             f"Tracked repository path snapshot: `count={count} sha256={digest}`.",
             TRACKED_PATH_SNAPSHOT_END,
         )

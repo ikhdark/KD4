@@ -672,6 +672,8 @@ class CheckKd4FeaturesTest(unittest.TestCase):
             + "\n[[features]]"
             + feature.replace('id = "feature"', 'id = "second"', 1)
         )
+        runner_class = check_kd4_features.rust_test_runner.RustTestRunner
+        load_metadata = check_kd4_features.rust_test_runner.load_metadata
         for stream, expected in (
             ("PASS [ 0.001s] fixture test_feature_is_live", "passed"),
             ("", "not_executed"),
@@ -719,9 +721,23 @@ class CheckKd4FeaturesTest(unittest.TestCase):
             with (
                 self.subTest(stream=stream),
                 mock.patch.object(subprocess, "run", side_effect=cargo),
+                mock.patch.object(
+                    check_kd4_features.rust_test_runner,
+                    "load_metadata",
+                    side_effect=lambda **kwargs: load_metadata(
+                        executor=cargo, **kwargs
+                    ),
+                ),
+                mock.patch.object(
+                    check_kd4_features.rust_test_runner,
+                    "RustTestRunner",
+                    side_effect=lambda *args, **kwargs: runner_class(
+                        *args, **kwargs, executor=cargo
+                    ),
+                ),
             ):
                 payload = self.run_json_verification(manifest)
-            self.assertEqual(payload["ok"], passed)
+            self.assertEqual(payload["ok"], passed, payload)
             results = payload["runtimeVerificationResults"]
             self.assertEqual(
                 [item["outcome"] for item in results], [expected, expected]

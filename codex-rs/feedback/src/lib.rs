@@ -1035,6 +1035,9 @@ mod tests {
                 }
             };
             stream
+                .set_nonblocking(false)
+                .expect("blocking accepted socket");
+            stream
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .expect("bound request read");
             let mut request = Vec::new();

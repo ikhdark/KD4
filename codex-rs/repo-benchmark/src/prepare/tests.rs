@@ -588,19 +588,11 @@ fn feature_overrides_preserve_intentionally_disabled_features() {
         json!({"id":"instrumentation","benchmark_control":{"kind":"fixed"}}),
     ];
     assert_eq!(
-        feature_overrides(&features, true).unwrap(),
+        feature_overrides(&features).unwrap(),
         vec![
             "features.code_mode=true",
             "features.experimental_disabled=false",
             "features.kd4_runtime=true"
-        ]
-    );
-    assert_eq!(
-        feature_overrides(&features, false).unwrap(),
-        vec![
-            "features.code_mode=false",
-            "features.experimental_disabled=false",
-            "features.kd4_runtime=false"
         ]
     );
 }
@@ -610,37 +602,31 @@ fn conflicting_or_unclassified_feature_controls_fail_preparation() {
     let runtime = runtime_feature("runtime", "features.kd4_runtime", true);
     let conflicting = runtime_feature("conflict", "features.kd4_runtime", false);
     assert!(
-        feature_overrides(&[runtime.clone(), conflicting], true)
+        feature_overrides(&[runtime.clone(), conflicting])
             .unwrap_err()
             .to_string()
             .contains("conflicting inventory")
     );
     assert!(
-        feature_overrides(&[json!({"id":"unknown"})], false)
+        feature_overrides(&[json!({"id":"unknown"})])
             .unwrap_err()
             .to_string()
             .contains("classification")
     );
     assert!(
-        feature_overrides(
-            &[
-                runtime.clone(),
-                json!({"id":"compiled","benchmark_control":{"kind":"build"}})
-            ],
-            true
-        )
+        feature_overrides(&[
+            runtime.clone(),
+            json!({"id":"compiled","benchmark_control":{"kind":"build"}})
+        ])
         .unwrap_err()
         .to_string()
-        .contains("compile-time ablation")
+        .contains("compile-time settings")
     );
     assert!(
-        feature_overrides(
-            &[
-                runtime,
-                runtime_feature("other", "model_reasoning_effort", true)
-            ],
-            true
-        )
+        feature_overrides(&[
+            runtime,
+            runtime_feature("other", "model_reasoning_effort", true)
+        ])
         .unwrap_err()
         .to_string()
         .contains("non-feature boolean control")
@@ -648,7 +634,7 @@ fn conflicting_or_unclassified_feature_controls_fail_preparation() {
 }
 
 #[test]
-fn cargo_settings_use_six_jobs_and_the_recorded_release_toolchain() {
+fn cargo_settings_use_the_configured_jobs_and_the_recorded_release_toolchain() {
     let environment = Environment {
         variables: BTreeMap::new(),
         tools: BTreeMap::new(),
@@ -656,7 +642,7 @@ fn cargo_settings_use_six_jobs_and_the_recorded_release_toolchain() {
     };
     let settings = builds::settings(&environment);
     for (key, expected) in [
-        ("jobs", "6"),
+        ("jobs", "12"),
         ("profile", "release"),
         ("CARGO_PROFILE_RELEASE_OPT_LEVEL", "3"),
         ("CARGO_PROFILE_RELEASE_LTO", "thin"),
@@ -697,7 +683,6 @@ fn project_configuration_comparison_records_explicit_differences_per_arm_without
 
     let temp = tempfile::tempdir().unwrap();
     let overrides = BTreeMap::from([
-        (Variant::ForkOff, vec!["features.kd4_runtime=false".into()]),
         (Variant::ForkOn, vec!["features.kd4_runtime=true".into()]),
         (Variant::Reference, vec![]),
     ]);
@@ -712,14 +697,12 @@ fn project_configuration_comparison_records_explicit_differences_per_arm_without
     let comparison = ProjectConfigComparison::capture(temp.path(), BASE_CONFIG, &overrides)
         .unwrap()
         .unwrap();
-    let off = &comparison.by_variant[&Variant::ForkOff];
-    assert_eq!(off.changed, ["features.kd4_runtime", "model"]);
+    let on = &comparison.by_variant[&Variant::ForkOn];
     assert_eq!(
-        off.project_only,
+        on.project_only,
         ["allow_login_shell", "reasoning_phase_efforts.verify"]
     );
-    assert_eq!(off.matching_keys, 1);
-    assert!(off.benchmark_only.contains(&"personality".into()));
+    assert!(on.benchmark_only.contains(&"personality".into()));
     assert_eq!(comparison.by_variant[&Variant::ForkOn].changed, ["model"]);
     assert_eq!(comparison.by_variant[&Variant::ForkOn].matching_keys, 2);
     assert_eq!(
@@ -912,13 +895,15 @@ fn reused_build_reports_lookup_time_without_replacing_original_build_time() {
     let requested = [("codex-app-server", "codex-app-server")];
     let lockfile = FileIdentity::record(&source.join("codex-rs/Cargo.lock")).unwrap();
     // Supply a valid prior cache record; this test exercises reuse accounting,
-    // not the cache-key algorithm or a Cargo build.
+    // including compatibility with the original six-job cache encoding.
+    let mut legacy_settings = settings;
+    legacy_settings.insert("jobs".into(), "6".into());
     let key = hash_bytes(
         &serde_json::to_vec(&(
             "pinned-revision",
             &lockfile.sha256,
             Option::<&str>::None,
-            &settings,
+            &legacy_settings,
             &requested,
             &environment.tools,
         ))
@@ -932,7 +917,8 @@ fn reused_build_reports_lookup_time_without_replacing_original_build_time() {
         revision: "pinned-revision".into(),
         source: source.clone(),
         target_directory: target_directory.clone(),
-        settings,
+        build_directory: None,
+        settings: legacy_settings,
         lockfile,
         cargo_config: None,
         v8_artifacts: None,
@@ -970,6 +956,7 @@ fn reused_build_reports_lookup_time_without_replacing_original_build_time() {
         "adding source-pinned V8 setup must not invalidate an unaffected fork cache"
     );
     assert!(reused.v8_artifacts.is_none());
+    assert!(reused.build_directory.is_none());
     let lookup_ms = reused
         .cache_reuse_elapsed_ms
         .expect("cache hit must record this preparation's lookup separately");
@@ -1211,7 +1198,7 @@ fn loaded_manifest_rejects_missing_execution_inputs_before_side_effects() {
         "settings":{},"lockfile":identity,"cargoConfig":null,
         "executables":{"codex-app-server":identity},"log":sentinel,"cacheKey":"fixture",
         "buildElapsedMs":0,"cacheReuseElapsedMs":null});
-    let schedule = schedule(Mode::Fast, false);
+    let schedule = schedule(Mode::Fast);
     let fixtures: BTreeMap<_, _> = schedule
         .iter()
         .map(|attempt| {
@@ -1247,15 +1234,13 @@ fn loaded_manifest_rejects_missing_execution_inputs_before_side_effects() {
     write_json(&path, &manifest).unwrap();
     let loaded = Prepared::load(&path).unwrap();
     assert_eq!(loaded.id, "structural-fixture");
-    assert_eq!(
-        loaded.schedule,
-        crate::schedule::schedule(Mode::Fast, false)
-    );
+    assert_eq!(loaded.schedule, crate::schedule::schedule(Mode::Fast));
 
-    assert!(!loaded.fork_only_on);
-    // Omitted selection preserves an older manifest's three variants and gets
-    // as far as checking the fixture's synthetic artifact identity, without
-    // starting execution.
+    assert_eq!(loaded.schedule.len(), 86);
+    assert_eq!(
+        loaded.builds.keys().copied().collect::<Vec<_>>(),
+        [Variant::ForkOn, Variant::Reference]
+    );
     let error = crate::cli::run(vec![
         "compare".into(),
         "--prepared".into(),
@@ -1266,61 +1251,43 @@ fn loaded_manifest_rejects_missing_execution_inputs_before_side_effects() {
         error.to_string().contains("changed prepared artifact"),
         "{error:#}"
     );
-    let error = crate::cli::run(vec![
-        "compare".into(),
-        "--prepared".into(),
-        path.to_string_lossy().into_owned(),
-        "--fork-only-on".into(),
-    ])
-    .unwrap_err();
-    assert!(error.to_string().contains("variant selection differs"));
     assert!(!temp.path().join("runs").exists());
 
-    let mut only_on = manifest.clone();
-    only_on["forkOnlyOn"] = json!(true);
-    only_on["schedule"] = json!(crate::schedule::schedule(Mode::Fast, true));
-    for mapping in ["builds", "overrides"] {
-        only_on[mapping].as_object_mut().unwrap().remove("fork_off");
-    }
-    write_json(&path, &only_on).unwrap();
-    let selected = Prepared::load(&path).unwrap();
-    assert!(selected.fork_only_on);
-    let error = crate::cli::run(vec![
-        "compare".into(),
-        "--prepared".into(),
-        path.to_string_lossy().into_owned(),
-        "--all-variants".into(),
-    ])
-    .unwrap_err();
-    assert!(error.to_string().contains("variant selection differs"));
-    assert!(!temp.path().join("runs").exists());
-    assert_eq!(selected.schedule.len(), 86);
-    assert_eq!(
-        selected.builds.keys().copied().collect::<Vec<_>>(),
-        [Variant::ForkOn, Variant::Reference]
-    );
-    for (field, value, expected) in [
-        (
-            "schedule",
-            manifest["schedule"].clone(),
-            "workload schedule changed",
-        ),
-        ("builds", manifest["builds"].clone(), "contains fork_off"),
-        (
-            "overrides",
-            manifest["overrides"].clone(),
-            "contains fork_off",
-        ),
-    ] {
-        let mut invalid = only_on.clone();
-        invalid[field] = value;
+    // Reject removed variants at the normal execution boundary before touching the workspace.
+    for location in ["schedule", "builds", "overrides", "projectConfigComparison"] {
+        let mut invalid = manifest.clone();
+        match location {
+            "schedule" => invalid["schedule"][0]["variant"] = json!("fork_off"),
+            "builds" => invalid["builds"]["fork_off"] = manifest["builds"]["fork_on"].clone(),
+            "overrides" => invalid["overrides"]["fork_off"] = json!(["features.kd4_runtime=false"]),
+            _ => {
+                invalid["projectConfigComparison"] = json!({
+                    "path":temp.path().join("config.toml"),"sha256":"fixture",
+                    "byVariant":{"fork_off":{"changed":[],"projectOnly":[],"benchmarkOnly":[],"matchingKeys":0}}
+                });
+            }
+        }
         write_json(&path, &invalid).unwrap();
         let error = crate::runner::execute(&path, None, None).unwrap_err();
-        assert!(error.to_string().contains(expected), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("unknown variant `fork_off`"),
+            "{error:#}"
+        );
         assert_eq!(fs::read_to_string(&sentinel).unwrap(), "existing workspace");
         assert!(!temp.path().join("workspace.lock").exists());
         assert!(!temp.path().join("runs").exists());
     }
+    let mut legacy = manifest.clone();
+    legacy["schemaVersion"] = json!(2);
+    write_json(&path, &legacy).unwrap();
+    let error = crate::runner::execute(&path, None, None).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported prepared manifest version; prepare again")
+    );
+    assert_eq!(fs::read_to_string(&sentinel).unwrap(), "existing workspace");
+    assert!(!temp.path().join("runs").exists());
 
     let mut omissions = Vec::new();
     for variant in Variant::ALL {
@@ -1377,4 +1344,131 @@ fn loaded_manifest_rejects_missing_execution_inputs_before_side_effects() {
         assert!(!temp.path().join("runs").exists());
         assert!(!temp.path().join("accepted").exists());
     }
+}
+
+fn lockfile(entries: &[(&str, &str, Option<&str>)]) -> String {
+    let mut text = String::from("version = 4\n");
+    for (name, version, source) in entries {
+        text.push_str(&format!("\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\n"));
+        if let Some(source) = source {
+            text.push_str(&format!("source = \"{source}\"\nchecksum = \"{name}-sum\"\n"));
+        }
+        text.push_str("dependencies = [\n \"anyhow\",\n]\n");
+    }
+    text
+}
+
+const REGISTRY: &str = "registry+https://github.com/rust-lang/crates.io-index";
+
+/// The upstream release tag leaves its own members at their pre-release version.
+#[test]
+fn release_tag_lockfile_repair_accepts_only_workspace_member_versions() {
+    let committed = lockfile(&[
+        ("anyhow", "1.0.103", Some(REGISTRY)),
+        ("codex-core", "0.0.0", None),
+        ("codex-cli", "0.0.0", None),
+    ]);
+    let resolved = lockfile(&[
+        ("anyhow", "1.0.103", Some(REGISTRY)),
+        ("codex-core", "0.155.0", None),
+        ("codex-cli", "0.155.0", None),
+    ]);
+    assert_eq!(
+        super::workspace_version_only_changes(&committed, &resolved).unwrap(),
+        vec!["codex-core".to_string(), "codex-cli".to_string()]
+    );
+    // An unchanged lockfile never reaches this repair, so a caller that got here
+    // with equal inputs compared the wrong bytes.
+    assert!(
+        super::workspace_version_only_changes(&committed, &committed)
+            .unwrap_err()
+            .to_string()
+            .contains("without any workspace member version difference")
+    );
+}
+
+/// A repair that tolerated dependency drift would silently rebase the baseline
+/// onto different third-party code, which no lockfile hash would disclose.
+#[test]
+fn lockfile_repair_rejects_every_difference_beyond_a_member_version() {
+    let committed = lockfile(&[
+        ("anyhow", "1.0.103", Some(REGISTRY)),
+        ("codex-core", "0.0.0", None),
+    ]);
+    for (resolved, expected) in [
+        (
+            lockfile(&[
+                ("anyhow", "1.0.104", Some(REGISTRY)),
+                ("codex-core", "0.155.0", None),
+            ]),
+            "changed registry package anyhow",
+        ),
+        (
+            lockfile(&[
+                ("anyhow", "1.0.103", Some(REGISTRY)),
+                ("codex-core", "0.155.0", None),
+                ("serde", "1.0.0", Some(REGISTRY)),
+            ]),
+            "changed the locked package set",
+        ),
+        (
+            lockfile(&[
+                ("codex-core", "0.155.0", None),
+                ("anyhow", "1.0.103", Some(REGISTRY)),
+            ]),
+            "reordered the locked package set",
+        ),
+        (
+            committed.replace("version = 4", "version = 3"),
+            "lockfile metadata outside the package list",
+        ),
+        (
+            lockfile(&[
+                ("anyhow", "1.0.103", Some(REGISTRY)),
+                ("codex-core", "0.155.0", None),
+            ])
+            .replace(
+                "name = \"codex-core\"\nversion = \"0.155.0\"\ndependencies = [\n \"anyhow\",\n]",
+                "name = \"codex-core\"\nversion = \"0.155.0\"\ndependencies = [\n \"anyhow\",\n \"serde\",\n]",
+            ),
+            "beyond its workspace version",
+        ),
+    ] {
+        let error = super::workspace_version_only_changes(&committed, &resolved).unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected}, got {error:#}"
+        );
+    }
+}
+
+/// Reconciliation relaxes the clean-checkout requirement for one path only.
+#[test]
+fn reconciled_checkout_accepts_the_lockfile_and_nothing_else() {
+    assert!(super::only_workspace_lock_modified(""));
+    assert!(super::only_workspace_lock_modified(" M codex-rs/Cargo.lock"));
+    assert!(super::only_workspace_lock_modified(
+        "M  codex-rs/Cargo.lock\n M codex-rs/Cargo.lock"
+    ));
+    for status in [
+        " M codex-rs/core/src/lib.rs",
+        " M codex-rs/Cargo.lock\n M codex-rs/Cargo.toml",
+        " M codex-rs/Cargo.lock.bak",
+        " M Cargo.lock",
+    ] {
+        assert!(
+            !super::only_workspace_lock_modified(status),
+            "accepted {status}"
+        );
+    }
+}
+
+/// A freshly resolved source has nothing to disclose until a checkout is repaired.
+#[test]
+fn resolved_sources_start_without_a_recorded_lockfile_repair() {
+    let temp = tempfile::tempdir().unwrap();
+    let origin = repository(temp.path(), "origin", "pinned");
+    let source = resolve_source(&origin, "HEAD", temp.path().join("checkout"), true).unwrap();
+    assert!(source.lock_reconciliation.is_none());
+    assert!(serde_json::to_value(&source).unwrap().get("lockReconciliation").is_none());
 }

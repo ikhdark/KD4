@@ -506,10 +506,6 @@ function Get-Command($Name) {
         self.assertNotRegex(responses_stream, r"#\[allow\(dead_code\)\]\s*struct Error")
 
     def test_skills_build_script_requires_bundled_samples(self) -> None:
-        text = (REPO_ROOT / "codex-rs" / "skills" / "build.rs").read_text(
-            encoding="utf-8"
-        )
-
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             executable = root / (
@@ -639,7 +635,6 @@ function Get-Command($Name) {
 
     def test_agents_bootstraps_bounded_routing_before_broad_source_map(self) -> None:
         text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
-        normalized = " ".join(text.split())
         slice_command = (
             "python scripts/source_owners.py slice --owner <owner-id> "
             '--focus "<task description>" --max-relationships 32'
@@ -655,8 +650,8 @@ function Get-Command($Name) {
         self.assertIn("Expand truncated or omitted relationships", guidance)
         self.assertIn("Resolve material unknowns", guidance)
         self.assertIn(
-            "read the broad map only when a focused slice cannot resolve the boundary",
-            normalized,
+            "Use this broad map only when no owner matches",
+            guidance,
         )
 
     def test_agents_desktop_boundary_is_top_level_guidance(self) -> None:
@@ -784,7 +779,9 @@ function Get-Command($Name) {
             f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
         )
 
-    def test_windows_installer_validates_release_repository_before_effects(self) -> None:
+    def test_windows_installer_validates_release_repository_before_effects(
+        self,
+    ) -> None:
         ps = powershell()
         if ps is None:
             self.skipTest("PowerShell is required for the Windows installer test")
@@ -818,7 +815,9 @@ function Get-Command($Name) {
                     capture_output=True,
                     check=False,
                 )
-                self.assertEqual(completed.returncode, 0 if accepted else 7, completed.stderr)
+                self.assertEqual(
+                    completed.returncode, 0 if accepted else 7, completed.stderr
+                )
                 if accepted:
                     self.assertEqual(
                         completed.stdout.strip(),
@@ -865,20 +864,31 @@ function Get-Command($Name) {
                 self.assertTrue(result["completed"])
                 self.assertEqual(
                     result["arguments"],
-                    ["remove" if manager == "bun" else "uninstall", "-g", "@openai/codex"]
-                    if approved else [],
+                    [
+                        "remove" if manager == "bun" else "uninstall",
+                        "-g",
+                        "@openai/codex",
+                    ]
+                    if approved
+                    else [],
                 )
                 if approved and exit_code:
-                    self.assertEqual(result["warnings"], [
-                        f"Failed to uninstall the existing {manager}-managed Codex: "
-                        f"{manager} exited with code {exit_code}. Continuing with the standalone install."
-                    ])
+                    self.assertEqual(
+                        result["warnings"],
+                        [
+                            f"Failed to uninstall the existing {manager}-managed Codex: "
+                            f"{manager} exited with code {exit_code}. Continuing with the standalone install."
+                        ],
+                    )
                 elif approved:
                     self.assertEqual(result["warnings"], [])
                 else:
-                    self.assertEqual(result["warnings"], [
-                        f"Leaving the existing {manager}-managed Codex installed. PATH order will determine which codex runs."
-                    ])
+                    self.assertEqual(
+                        result["warnings"],
+                        [
+                            f"Leaving the existing {manager}-managed Codex installed. PATH order will determine which codex runs."
+                        ],
+                    )
 
     def test_powershell_installer_completeness_rejects_package_without_code_mode_host(
         self,
@@ -1187,13 +1197,12 @@ function Get-Command($Name) {
             root_maintenance.python_test_targets(
                 [],
                 [
-                    "scripts/investigation_eval/score_results.py",
-                    "scripts/investigation_eval/validate_cases.py",
+                    "scripts/generated_output_lock.py",
                     "scripts/kd4_model_attempt_analysis.py",
                 ],
             ),
             [
-                "scripts.investigation_eval.test_investigation_eval",
+                "scripts.test_dev_environment",
                 "scripts.test_kd4_perf_snapshot",
             ],
         )
@@ -1516,16 +1525,6 @@ function Get-Command($Name) {
             encoding="utf-8"
         )
         self.assertIn("clean: true", tsup_config)
-
-    def test_config_documentation_uses_current_public_destinations(self) -> None:
-        config_docs = (REPO_ROOT / "codex-rs" / "config.md").read_text(encoding="utf-8")
-
-        self.assertNotIn("../docs/config.md", config_docs)
-        self.assertIn(
-            "https://developers.openai.com/codex/config-file/config-reference",
-            config_docs,
-        )
-        self.assertIn("https://developers.openai.com/codex/extend/mcp", config_docs)
 
     def test_root_maintenance_script_audit_current_tree_has_no_hard_findings(
         self,
@@ -1995,7 +1994,9 @@ function Get-Command($Name) {
         self.assertEqual(len(commands), 2, commands)
         self.assertIn("config\\scripts\\generate-proto.ps1", commands[0])
         self.assertTrue(commands[0].endswith(" -Check"), commands[0])
-        self.assertIn("-p codex-exec-server --example generate-relay-proto", commands[1])
+        self.assertIn(
+            "-p codex-exec-server --example generate-relay-proto", commands[1]
+        )
         self.assertTrue(commands[1].endswith(" -- --check"), commands[1])
 
     def test_justfile_only_exposes_canonical_developer_tooling_recipes(self) -> None:
@@ -2375,8 +2376,13 @@ function Get-Command($Name) {
         self.assertEqual(
             calls[0]["args"][1:],
             [
-                "run-lane", "--lane", "core-tests", "just", "_core-gate-reserved",
-                "app-server-command-exec", "app-server-process-exec",
+                "run-lane",
+                "--lane",
+                "core-tests",
+                "just",
+                "_core-gate-reserved",
+                "app-server-command-exec",
+                "app-server-process-exec",
                 "app-server-thread-status",
             ],
         )
@@ -2499,6 +2505,9 @@ function Get-Command($Name) {
         self.assertIn("usage:", help_result.stdout.lower())
 
         unicode_argument = "--unknown-KD4-λ-path with spaces"
+        # Pin the child's stderr encoding: on a legacy code page Python falls
+        # back to backslashreplace and reports the argument as an escape
+        # sequence, which says nothing about whether argv survived.
         rejected = subprocess.run(
             ["just", "check-kd4-features", unicode_argument],
             cwd=REPO_ROOT,
@@ -2507,10 +2516,10 @@ function Get-Command($Name) {
             errors="replace",
             capture_output=True,
             check=False,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         )
         self.assertEqual(rejected.returncode, 2, rejected.stderr)
-        rendered_argument = unicode_argument.encode("unicode_escape").decode("ascii")
-        self.assertIn(rendered_argument, rejected.stderr)
+        self.assertIn(unicode_argument, rejected.stderr)
 
     def test_dependency_audit_prerequisite_runs_and_gates_cargo_audit(self) -> None:
         for fail_program in ("", "python", "cargo"):

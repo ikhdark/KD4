@@ -130,7 +130,7 @@ runtime_feature_key = "features.code_mode"
 runtime_status = "enabled"
 runtime_status_source = "codex-rs/features/src/lib.rs"
 benchmark_on = true
-benchmark_control = { kind = "runtime", reason = "Code-mode tool registration and process-host selection already have independent runtime switches; both are disabled in fork_off." }
+benchmark_control = { kind = "runtime", reason = "Code-mode tool registration and process-host selection already have independent runtime switches; the benchmark fork uses their configured enabled states." }
 runtime_verification = { kind = "integration_test", path = "codex-rs/core/tests/suite/code_mode.rs", symbol = "code_mode_can_return_exec_command_output", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-code-mode-runtime", "--profile", "fast"] }
 
 [[features.evidence]]
@@ -154,14 +154,14 @@ version = 1
 status = "disabled"
 capability_kind = "runtime"
 owner = "codex-rs/core"
-summary = "Under-development code-only tool surface, intentionally disabled in both benchmark fork variants."
+summary = "Under-development code-only tool surface, intentionally disabled in the benchmark fork."
 upstream_equivalent = "partial"
 config_keys = ["features.code_mode_only"]
 runtime_feature_key = "features.code_mode_only"
 runtime_status = "disabled"
 runtime_status_source = "codex-rs/features/src/lib.rs"
 benchmark_on = false
-benchmark_control = { kind = "runtime", reason = "Existing switch remains false in both variants; enabling other implemented controls does not activate unfinished tool restrictions." }
+benchmark_control = { kind = "runtime", reason = "Existing switch remains false in the benchmark fork; enabling other implemented controls does not activate unfinished tool restrictions." }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -174,7 +174,7 @@ version = 1
 status = "disabled"
 capability_kind = "runtime"
 owner = "codex-rs/core"
-summary = "Under-development direct runtime behavior, intentionally disabled in both benchmark fork variants."
+summary = "Under-development direct runtime behavior, intentionally disabled in the benchmark fork."
 upstream_equivalent = "none"
 config_keys = ["features.direct_runtime"]
 runtime_feature_key = "features.direct_runtime"
@@ -194,7 +194,7 @@ version = 1
 status = "disabled"
 capability_kind = "runtime"
 owner = "codex-rs/core"
-summary = "Optional task-model guidance injection, preserving its deliberately disabled default in both variants."
+summary = "Optional task-model guidance injection, preserving its deliberately disabled default in the benchmark fork."
 upstream_equivalent = "none"
 config_keys = ["features.task_model_guidance"]
 runtime_feature_key = "features.task_model_guidance"
@@ -295,7 +295,7 @@ owner = "codex-rs/ext/extension-api"
 summary = "Reuse ToolContributor, ToolLifecycleContributor, and ContextContributor before adding KD4-only hooks."
 upstream_equivalent = "codex extension-api contributor registry"
 config_keys = []
-benchmark_control = { kind = "lacking_off_state", reason = "No independent off state exists; this native fork behavior remains in both fork variants and is reported as fixed drift." }
+benchmark_control = { kind = "lacking_off_state", reason = "No independent off state exists; this native behavior remains part of the fork in the overall comparison." }
 runtime_verification = { kind = "contract_test", path = "codex-rs/ext/extension-api/tests/registry.rs", symbol = "build_round_trips_every_contributor_category", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-extension-boundary-core", "--profile", "fast"] }
 
 [[features.evidence]]
@@ -342,7 +342,7 @@ owner = "codex-rs/core"
 summary = "Script and argv command shapes with untagged legacy compatibility; explicitly tagged legacy input is rejected."
 upstream_equivalent = "partial"
 config_keys = []
-benchmark_control = { kind = "lacking_off_state", reason = "No independent off state exists; this native fork behavior remains in both fork variants and is reported as fixed drift." }
+benchmark_control = { kind = "lacking_off_state", reason = "No independent off state exists; this native behavior remains part of the fork in the overall comparison." }
 runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/handlers/command_shape_tests.rs", symbol = "tagged_script_is_canonical_and_tagged_legacy_is_rejected", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-structured-command-execution", "--profile", "fast"] }
 
 [[features.evidence]]
@@ -415,7 +415,7 @@ owner = "codex-rs/core"
 summary = "Bounded failure-focused output on classic and unified execution paths."
 upstream_equivalent = "partial"
 config_keys = []
-benchmark_control = { kind = "lacking_off_state", reason = "No independent off state exists; this native fork behavior remains in both fork variants and is reported as fixed drift." }
+benchmark_control = { kind = "lacking_off_state", reason = "No independent off state exists; this native behavior remains part of the fork in the overall comparison." }
 runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/shell_output_summary_tests.rs", symbol = "failed_output_keeps_exact_error_lines", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-shell-output-summary", "--profile", "fast"] }
 
 [[features.evidence]]
@@ -447,7 +447,7 @@ owner = "codex-rs/core"
 summary = "Session-bounded command fingerprints with repair accounting and third-identical-failure prevention."
 upstream_equivalent = "none"
 config_keys = []
-benchmark_control = { kind = "lacking_off_state", reason = "No independent off state exists; this native fork behavior remains in both fork variants and is reported as fixed drift." }
+benchmark_control = { kind = "lacking_off_state", reason = "No independent off state exists; this native behavior remains part of the fork in the overall comparison." }
 runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/command_execution.rs", symbol = "input_state_determined_failure_blocks_exact_retry_but_freshness_bypasses", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-command-attempt-ledger", "--profile", "fast"] }
 
 [[features.evidence]]
@@ -484,7 +484,7 @@ owner = "codex-rs/core"
 summary = "Addressable full raw command output streamed before bounded transcript retention or model summarization, including background completion."
 upstream_equivalent = "none"
 config_keys = []
-benchmark_control = { kind = "lacking_off_state", reason = "No independent off state exists; this native fork behavior remains in both fork variants and is reported as fixed drift." }
+benchmark_control = { kind = "lacking_off_state", reason = "No independent off state exists; this native behavior remains part of the fork in the overall comparison." }
 runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/handlers/unified_exec_tests.rs", symbol = "foreground_output_artifact_retains_bytes_beyond_transcript_cap", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-command-output-artifacts", "--profile", "fast"] }
 
 [[features.evidence]]
@@ -526,7 +526,7 @@ owner = "codex-rs/shell-command"
 summary = "Explicit PowerShell paths win, otherwise pwsh is preferred with Windows PowerShell compatibility fallback."
 upstream_equivalent = "partial"
 config_keys = []
-benchmark_control = { kind = "lacking_off_state", reason = "No independent off state exists; this native fork behavior remains in both fork variants and is reported as fixed drift." }
+benchmark_control = { kind = "lacking_off_state", reason = "No independent off state exists; this native behavior remains part of the fork in the overall comparison." }
 runtime_verification = { kind = "contract_test", path = "codex-rs/shell-command/src/shell_detect.rs", symbol = "powershell_resolver_prefers_pwsh_then_compatibility_host", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-preferred-powershell-host", "--profile", "fast"] }
 
 [[features.evidence]]
@@ -579,7 +579,7 @@ owner = "codex-rs/app-server"
 summary = "Build, install, runtime, and KD4 watermark metadata at initialization."
 upstream_equivalent = "partial"
 config_keys = []
-benchmark_control = { kind = "lacking_off_state", reason = "No independent off state exists; this native fork behavior remains in both fork variants and is reported as fixed drift." }
+benchmark_control = { kind = "lacking_off_state", reason = "No independent off state exists; this native behavior remains part of the fork in the overall comparison." }
 runtime_verification = { kind = "integration_test", path = "codex-rs/app-server/tests/suite/v2/initialize.rs", symbol = "initialize_response_includes_local_runtime_metadata", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-app-server-runtime-provenance", "--profile", "fast"] }
 generated_artifacts = [
   "codex-rs/app-server-protocol/schema/json/v1/InitializeResponse.json",
@@ -641,7 +641,7 @@ owner = "codex-rs/core"
 summary = "Cached and diversified discovery of deferred core and extension tools."
 upstream_equivalent = "partial"
 config_keys = []
-benchmark_control = { kind = "lacking_off_state", reason = "No independent off state exists; this native fork behavior remains in both fork variants and is reported as fixed drift." }
+benchmark_control = { kind = "lacking_off_state", reason = "No independent off state exists; this native behavior remains part of the fork in the overall comparison." }
 runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/spec_plan_tests.rs", symbol = "tool_search_cache_rebuilds_when_deferred_sources_change", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-tool-search-routing", "--profile", "fast"] }
 
 [[features.evidence]]
@@ -673,7 +673,7 @@ owner = "codex-rs/config"
 summary = "Human-readable configuration reference exposed through codex config explain."
 upstream_equivalent = "none"
 config_keys = []
-benchmark_control = { kind = "lacking_off_state", reason = "No independent off state exists; this native fork behavior remains in both fork variants and is reported as fixed drift." }
+benchmark_control = { kind = "lacking_off_state", reason = "No independent off state exists; this native behavior remains part of the fork in the overall comparison." }
 runtime_verification = { kind = "contract_test", path = "codex-rs/cli/src/main.rs", symbol = "config_explain_parses_optional_filter", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-config-explain", "--profile", "fast"] }
 
 [[features.evidence]]
@@ -733,7 +733,7 @@ owner = "codex-rs/agent-task-store"
 summary = "Nonblocking workspace revision and path-event tracking, advisory claims, best-effort mutation evidence, validation singleflight, lifecycle quiescence, and versioned isolated-worktree handoffs."
 upstream_equivalent = "none"
 config_keys = []
-benchmark_control = { kind = "lacking_off_state", reason = "No independent off state exists; this native fork behavior remains in both fork variants and is reported as fixed drift." }
+benchmark_control = { kind = "lacking_off_state", reason = "No independent off state exists; this native behavior remains part of the fork in the overall comparison." }
 runtime_verification = { kind = "contract_test", path = "codex-rs/agent-task-store/src/tests.rs", symbol = "completed_receipt_rejects_workspace_change_after_validation", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-shared-worktree-reliability", "--profile", "fast"] }
 
 [[features.evidence]]
@@ -790,7 +790,7 @@ owner = "codex-rs/core"
 summary = "Inactive in production: turn initialization disables directive-based validation admission; test-only activation does not establish enforcement."
 upstream_equivalent = "none"
 config_keys = []
-benchmark_control = { kind = "lacking_off_state", reason = "Production validation admission remains disabled in both variants; test-only activation is not an implemented runtime control." }
+benchmark_control = { kind = "lacking_off_state", reason = "Production validation admission remains disabled in the benchmark fork; test-only activation is not an implemented runtime control." }
 
 [[features.evidence]]
 kind = "entrypoint"

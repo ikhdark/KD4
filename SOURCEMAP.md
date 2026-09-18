@@ -21,15 +21,15 @@ an SDK, schema, package, installed binary, or Codex Desktop.
 - [Maintenance contract](#maintenance-contract)
 - [How to use this map](#how-to-use-this-map)
 - [Runtime architecture](#runtime-architecture)
-- [Top-level ownership](#toplevel-ownership)
+- [Top-level ownership](#top-level-ownership)
 - [Instruction scopes](#instruction-scopes)
 - [Runtime and executable entrypoints](#runtime-and-executable-entrypoints)
 - [Rust package inventory](#rust-package-inventory)
 - [Rust edit and upstream synchronization boundaries](#rust-edit-and-upstream-synchronization-boundaries)
   - [Protected source: exact upstream mirrors](#protected-source-exact-upstream-mirrors)
-  - [Mixed areas: editable parents and workflow-managed children](#mixed-areas-editable-parents-and-workflowmanaged-children)
-  - [Workflow-managed remainder](#workflowmanaged-remainder)
-- [Non-Rust project inventory](#nonrust-project-inventory)
+  - [Mixed areas: editable parents and workflow-managed children](#mixed-areas-editable-parents-and-workflow-managed-children)
+  - [Workflow-managed remainder](#workflow-managed-remainder)
+- [Non-Rust project inventory](#non-rust-project-inventory)
 - [Core runtime routing](#core-runtime-routing)
 - [Extension boundary](#extension-boundary)
 - [Persistence and stored state](#persistence-and-stored-state)
@@ -38,8 +38,8 @@ an SDK, schema, package, installed binary, or Codex Desktop.
 - [Validation routes](#validation-routes)
 - [Rust workflow reference](#rust-workflow-reference)
 - [Documentation and policy](#documentation-and-policy)
-- [Cross-cutting change routes](#crosscutting-change-routes)
-  - [Managed KD4 source-owner index](#managed-kd4-sourceowner-index)
+- [Cross-cutting change routes](#cross-cutting-change-routes)
+  - [Managed KD4 source-owner index](#managed-kd4-source-owner-index)
 
 <!-- End ToC -->
 
@@ -49,6 +49,7 @@ an SDK, schema, package, installed binary, or Codex Desktop.
 Update it in the same change whenever the repository materially changes.
 
 <!-- BEGIN TRACKED PATH SNAPSHOT -->
+
 Tracked repository path snapshot: `count=4906 sha256=8da0fbee5a187f0616ff53b5805d9cee01d0b66d36150ae9996f356bdb334a19`.
 <!-- END TRACKED PATH SNAPSHOT -->
 
@@ -89,7 +90,8 @@ map remains useful.
    For a known file, use
    `python scripts/source_owners.py slice --path <file> --focus "<task>"`.
    For a known owner, use
-   `python scripts/source_owners.py slice --owner <owner-id> --focus "<task description>" --max-relationships 32`.
+   `python scripts/source_owners.py slice --owner <owner-id> --focus "<task description>"
+--max-relationships 32`.
    Slice output defaults to 32 KiB; use `--max-bytes` to change that limit.
    Follow returned continuations with the same focus, owners, and budgets.
 3. Resolve material unknowns. Expand truncated or omitted relationships when
@@ -100,7 +102,8 @@ map remains useful.
    reason; an absent applicable facet is insufficient evidence.
 4. Read the exact evidence locations for the relationships you will change.
    Relationships are ranked within each facet by task-focus overlap (including
-   behavioral descriptions), structural role, provenance, and directness; start with the first relationship in
+   behavioral descriptions), structural role, provenance, and directness; start with the first
+   relationship in
    each applicable facet before expanding.
    Treat `exact` and `declared` provenance as grounded; heuristic evidence may
    guide discovery but cannot close it.
@@ -183,8 +186,8 @@ below.
 
 | Path                                                             | Owns                                                                                                                                                                                                                                                                  |
 | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `.codex/`                                                        | Repo-local Codex configuration, environment setup, fork-local skills, and workspace policy                                                                                                                                                  |
-| `.kdv/`                                                         | Audit evidence attribution and recorded disputes for repository changes |
+| `.codex/`                                                        | Repo-local Codex configuration, environment setup, fork-local skills, and workspace policy                                                                                                                                                                            |
+| `.kdv/`                                                          | Audit evidence attribution and recorded disputes for repository changes                                                                                                                                                                                               |
 | `.vscode/`                                                       | Checked-in editor and workspace defaults                                                                                                                                                                                                                              |
 | `architecture_index.json`                                        | Generated, manifest-keyed source-owner relationship graph consumed by task-scoped architecture discovery                                                                                                                                                              |
 | `codex-cli/`                                                     | npm-facing `@openai/codex` wrapper, native binary discovery, and npm package inputs                                                                                                                                                                                   |
@@ -239,7 +242,7 @@ below.
 
 | Domain                                            | Package roots                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Workspace and repository tooling                  | `codex-rs`, `codex-rs/repo-benchmark`, `tools/argument-comment-lint`                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Workspace and repository tooling                  | `codex-rs`, `codex-rs/repo-benchmark`, `tools/argument-comment-lint`                                                                                                                                                                                                                                                                                                                                                                                                              |
 | CLI, authentication, home, and install context    | `codex-rs/arg0`, `codex-rs/aws-auth`, `codex-rs/cli`, `codex-rs/codex-home`, `codex-rs/install-context`, `codex-rs/keyring-store`, `codex-rs/login`, `codex-rs/secrets`                                                                                                                                                                                                                                                                                                           |
 | Interactive and headless clients                  | `codex-rs/tui`, `codex-rs/exec`                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | Core runtime, configuration, context, and prompts | `codex-rs/config`, `codex-rs/context-fragments`, `codex-rs/core`, `codex-rs/core/tests/common`, `codex-rs/features`, `codex-rs/prompts`                                                                                                                                                                                                                                                                                                                                           |
@@ -353,11 +356,11 @@ Code mode has three independent configuration roles, defined in
 `codex-rs/features/src/lib.rs` and wired by `core/src/thread_manager.rs` and
 `core/src/tools/spec_plan.rs` (both under `codex-rs`):
 
-| `code_mode` | `code_mode_only` | Tool surface |
-| ----------- | ---------------- | ------------ |
-| false | false | Direct tools; no code-mode batching surface |
-| true | false | Code-mode batching alongside direct tools |
-| either | true | Normalization enables code mode; eligible tools are nested, with direct-only exceptions |
+| `code_mode` | `code_mode_only` | Tool surface                                                                            |
+| ----------- | ---------------- | --------------------------------------------------------------------------------------- |
+| false       | false            | Direct tools; no code-mode batching surface                                             |
+| true        | false            | Code-mode batching alongside direct tools                                               |
+| either      | true             | Normalization enables code mode; eligible tools are nested, with direct-only exceptions |
 
 `code_mode_host` selects a process-owned runtime with an in-process fallback;
 false selects the in-process runtime. It does not enable the tool surface by
@@ -382,18 +385,18 @@ existing contributor contract and the immutable registry in
 `codex-rs/ext/extension-api/src/registry.rs` before adding a fork-only hook in
 core.
 
-| Contribution                 | Owns                                                                    |
-| ---------------------------- | ----------------------------------------------------------------------- |
-| `McpServerContributor`       | Runtime MCP server resolution from host and thread configuration        |
-| `ContextContributor`         | Thread, turn, and rendered world-state prompt fragments                 |
-| `ThreadLifecycleContributor` | Thread start, resume, idle, and stop extension state                    |
-| `TurnLifecycleContributor`   | Turn start, stop, abort, and error lifecycle                            |
-| `TurnInputContributor`       | Turn-local model-visible contextual input                               |
-| `ConfigContributor`          | Notifications after effective thread configuration changes              |
-| `TokenUsageContributor`      | Model token-usage checkpoints                                           |
-| `ToolContributor`            | Native extension-owned tool executors                                   |
-| `ToolLifecycleContributor`   | Accepted tool-call start and terminal observation                       |
-| `TurnItemContributor`        | Ordered post-processing of parsed turn items                            |
+| Contribution                 | Owns                                                             |
+| ---------------------------- | ---------------------------------------------------------------- |
+| `McpServerContributor`       | Runtime MCP server resolution from host and thread configuration |
+| `ContextContributor`         | Thread, turn, and rendered world-state prompt fragments          |
+| `ThreadLifecycleContributor` | Thread start, resume, idle, and stop extension state             |
+| `TurnLifecycleContributor`   | Turn start, stop, abort, and error lifecycle                     |
+| `TurnInputContributor`       | Turn-local model-visible contextual input                        |
+| `ConfigContributor`          | Notifications after effective thread configuration changes       |
+| `TokenUsageContributor`      | Model token-usage checkpoints                                    |
+| `ToolContributor`            | Native extension-owned tool executors                            |
+| `ToolLifecycleContributor`   | Accepted tool-call start and terminal observation                |
+| `TurnItemContributor`        | Ordered post-processing of parsed turn items                     |
 
 Built-in implementations live under `codex-rs/ext/*`; host installation and
 dispatch cross `codex-rs/core-plugins`, `codex-rs/core-skills`, and core
@@ -466,46 +469,52 @@ potentially sensitive when inspecting or exporting them.
 
 ## Contracts and generated artifacts
 
-| Contract or output                            | Source owner                                                                                                                          | Update and validation path                                                                                                                                                                            |
-| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| App-server request/notification schema        | `codex-rs/app-server`, `codex-rs/app-server-protocol`, `codex-rs/protocol`                                                            | Focused protocol/app-server tests plus check-only `just app-server-schema-check`; intentional regeneration uses serialized `just app-server-schema-regenerate <owner>`                                |
-| App-server schema tree                        | `codex-rs/app-server-protocol/schema`                                                                                                 | Generated output; never hand-edit; inspect the generator-produced diff                                                                                                                                |
-| Code-mode import and host boundary | `codex-rs/code-mode/src/runtime/module_loader.rs`, `runtime/mod.rs`, and `codex-rs/code-mode-protocol/src/description/exec_prompt.rs` | Static and dynamic imports are rejected; host globals expose registered tools and helpers, with no Node/filesystem/network APIs. Changes require focused code-mode runtime and protocol tests. |
-| Rollout analysis snapshot | `scripts/rollout_snapshot.py`, `scripts/kd4_turn_latency_audit.py`, `scripts/kd4_first_useful_action_analysis.py` | Preserve physical-byte checksums when decoding `.jsonl.zst`; validate CLI discovery, corrupt inputs, and first-action results with `python -m unittest scripts.test_rollout_snapshot`. |
-| SQLite migration ledger | `codex-rs/state/migrations`, `codex-rs/state/src/migrations.rs` | Preserve applied migration checksums and historical ledger compatibility; focused `codex-rs/state/src/migrations_tests.rs` scenarios exercise upgrades, legacy repairs, and rejection of unknown checksums against SQLite. |
-| Config schema                                 | `codex-rs/config`, `codex-rs/features`, `codex-rs/core`                                                                               | Focused config/core tests plus check-only `just config-schema-check`; intentional regeneration uses serialized `just config-schema-regenerate <owner>` and outputs `codex-rs/core/config.schema.json` |
-| Thread-config protobuf binding                | `codex-rs/config/src/thread_config/proto/codex.thread_config.v1.proto`                                                                | `just generate-config-proto-check`; intentional regeneration uses `just generate-config-proto`                                                                                                        |
-| Exec-server relay protobuf binding            | `codex-rs/exec-server/src/proto/codex.exec_server.relay.v1.proto`                                                                     | `just generate-exec-server-relay-proto-check`; intentional regeneration uses `just generate-exec-server-relay-proto`                                                                                  |
-| Hook schemas                                  | `codex-rs/hooks/src`                                                                                                                  | `just hooks-schema-check`; intentional regeneration uses `just write-hooks-schema` and produces `codex-rs/hooks/schema/generated`                                                                            |
-| Python SDK generated package                  | Fork-local app-server schema bundle under `codex-rs/app-server-protocol/schema/json` via `sdk/python/scripts/update_sdk_artifacts.py` | `generate-types` replaces the complete `src/openai_codex/generated` tree, including its initializer, and the focused Python SDK freshness test rejects drift, retired contracts, or abandoned files   |
-| npm package layout                            | `codex-cli`, `scripts/stage_npm_packages.py`, `scripts/codex_package`                                                                 | Staging/package tests, archive inspection, and the owning dry-run                                                                                                                                     |
-| Cargo package membership and dependency state | Rust package manifests, `codex-rs/Cargo.toml`, `codex-rs/Cargo.lock`                                                                  | Cargo owns the lock update; never hand-edit generated dependency state                                                                                                                                |
-| JavaScript workspace and dependency state     | root/package manifests and `pnpm-workspace.yaml`                                                                                      | pnpm owns `pnpm-lock.yaml`; use the configured package-manager workflow                                                                                                                               |
-| Rust snapshots and schema fixtures            | Owning crate tests or generator                                                                                                       | Regenerate through the owning command, then review focused diffs                                                                                                                                      |
-| Build outputs and vendored trees              | `codex-rs/target`, `node_modules`, `codex-rs/vendor`, `third_party`                                                                   | Do not hand-edit; rebuild, reinstall, or run the owning update workflow                                                                                                                               |
+| Contract or output                            | Source owner                                                                                                                          | Update and validation path                                                                                                                                                                                                 |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| App-server request/notification schema        | `codex-rs/app-server`, `codex-rs/app-server-protocol`, `codex-rs/protocol`                                                            | Focused protocol/app-server tests plus check-only `just app-server-schema-check`; intentional regeneration uses serialized `just app-server-schema-regenerate <owner>`                                                     |
+| App-server schema tree                        | `codex-rs/app-server-protocol/schema`                                                                                                 | Generated output; never hand-edit; inspect the generator-produced diff                                                                                                                                                     |
+| Code-mode import and host boundary            | `codex-rs/code-mode/src/runtime/module_loader.rs`, `runtime/mod.rs`, and `codex-rs/code-mode-protocol/src/description/exec_prompt.rs` | Static and dynamic imports are rejected; host globals expose registered tools and helpers, with no Node/filesystem/network APIs. Changes require focused code-mode runtime and protocol tests.                             |
+| Rollout analysis snapshot                     | `scripts/rollout_snapshot.py`, `scripts/kd4_turn_latency_audit.py`, `scripts/kd4_first_useful_action_analysis.py`                     | Preserve physical-byte checksums when decoding `.jsonl.zst`; validate CLI discovery, corrupt inputs, and first-action results with `python -m unittest scripts.test_rollout_snapshot`.                                     |
+| SQLite migration ledger                       | `codex-rs/state/migrations`, `codex-rs/state/src/migrations.rs`                                                                       | Preserve applied migration checksums and historical ledger compatibility; focused `codex-rs/state/src/migrations_tests.rs` scenarios exercise upgrades, legacy repairs, and rejection of unknown checksums against SQLite. |
+| Config schema                                 | `codex-rs/config`, `codex-rs/features`, `codex-rs/core`                                                                               | Focused config/core tests plus check-only `just config-schema-check`; intentional regeneration uses serialized `just config-schema-regenerate <owner>` and outputs `codex-rs/core/config.schema.json`                      |
+| Thread-config protobuf binding                | `codex-rs/config/src/thread_config/proto/codex.thread_config.v1.proto`                                                                | `just generate-config-proto-check`; intentional regeneration uses `just generate-config-proto`                                                                                                                             |
+| Exec-server relay protobuf binding            | `codex-rs/exec-server/src/proto/codex.exec_server.relay.v1.proto`                                                                     | `just generate-exec-server-relay-proto-check`; intentional regeneration uses `just generate-exec-server-relay-proto`                                                                                                       |
+| Hook schemas                                  | `codex-rs/hooks/src`                                                                                                                  | `just hooks-schema-check`; intentional regeneration uses `just write-hooks-schema` and produces `codex-rs/hooks/schema/generated`                                                                                          |
+| Python SDK generated package                  | Fork-local app-server schema bundle under `codex-rs/app-server-protocol/schema/json` via `sdk/python/scripts/update_sdk_artifacts.py` | `generate-types` replaces the complete `src/openai_codex/generated` tree, including its initializer, and the focused Python SDK freshness test rejects drift, retired contracts, or abandoned files                        |
+| npm package layout                            | `codex-cli`, `scripts/stage_npm_packages.py`, `scripts/codex_package`                                                                 | Staging/package tests, archive inspection, and the owning dry-run                                                                                                                                                          |
+| Cargo package membership and dependency state | Rust package manifests, `codex-rs/Cargo.toml`, `codex-rs/Cargo.lock`                                                                  | Cargo owns the lock update; never hand-edit generated dependency state                                                                                                                                                     |
+| JavaScript workspace and dependency state     | root/package manifests and `pnpm-workspace.yaml`                                                                                      | pnpm owns `pnpm-lock.yaml`; use the configured package-manager workflow                                                                                                                                                    |
+| Rust snapshots and schema fixtures            | Owning crate tests or generator                                                                                                       | Regenerate through the owning command, then review focused diffs                                                                                                                                                           |
+| Build outputs and vendored trees              | `codex-rs/target`, `node_modules`, `codex-rs/vendor`, `third_party`                                                                   | Do not hand-edit; rebuild, reinstall, or run the owning update workflow                                                                                                                                                    |
 
 ## Build, package, publish, and install paths
 
-| Flow                                        | Owner and entrypoint                                                                                                                                                          | Required downstream proof                                                                                                                                                     |
-| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Rust workspace build/test                   | `codex-rs/Cargo.toml`, `codex-rs/.cargo/config.toml`, `codex-rs/.config/nextest.toml`, root `justfile`, crate manifests                                                       | bounded local compiler/test fanout by default; focused crate check/test; use isolated lanes when parallel Rust work exists                                                    |
-| Named `codex-core` test targets and gates   | `codex-rs/.config/kd4-rust-tests.toml`, `scripts/rust_test_runner.py`, `scripts/test_rust_test_runner.py`, root `justfile`                                                    | `python -m unittest scripts.test_rust_test_runner` plus `just core-test-manifest-check`; generic recipes reject `-p codex-core`, so use `just core-test`/`just core-gate`     |
-| npm CLI wrapper staging                     | `codex-cli/bin/codex.js`, `codex-cli/package.json`, `scripts/stage_npm_packages.py`                                                                                           | wrapper lint, staging/package tests, platform layout inspection                                                                                                               |
-| Canonical package archives                  | `scripts/codex_package`                                                                                                                                                       | package-local tests and archive/content checks                                                                                                                                |
-| Standalone installer                        | `scripts/install/install.ps1`                                                                                                                                                 | installer tests, digest/layout/locking/PATH/migration behavior                                                                                                                |
-| TypeScript SDK                              | `sdk/typescript`                                                                                                                                                              | `just sdk-ts-check` and package-facing type/tests                                                                                                                             |
-| Python SDK                                  | `sdk/python`                                                                                                                                                                  | focused `uv run pytest` and `uv run ruff check .`                                                                                                                             |
-| Python runtime package                      | `sdk/python-runtime`                                                                                                                                                          | focused runtime-package tests and lint                                                                                                                                        |
-| Windows local publish                       | `scripts/publish-local-codex.ps1`, `just publish-local-codex-final`                                                                                                           | concise build/install/restart; optional doctor; backup/rollback guards, installed hash/version                                                          |
-| Desktop-visible completion                  | local publish output plus app-server/CLI runtime                                                                                                                              | publish final, restart Desktop, prove process path and binary hash/version, inspect initialize/model metadata, capture visible evidence                                       |
-| Source-owner and architecture index refresh | `source_owners.toml`, `scripts/source_owners.py`, `scripts/test_source_owners.py`                                                                                             | regenerate `architecture_index.json` and the marked `SOURCEMAP.md` block through the owner workflow; run source-owner freshness and representative relationship-recall checks |
-| Generated schema freshness                  | `scripts/config_schema_check.py`, `scripts/app_server_schema_runtime_check.py`, `scripts/generated_output_lock.py`                                                            | use the owning check/regeneration command under the shared generated-output lock; never hand-edit generated schemas                                                           |
-| KD4 audits, evaluation, and measurement | `codex-rs/repo-benchmark`, `scripts/kd4_sync_audit.py`, `scripts/kd4_perf_snapshot.py`, `scripts/kd4_turn_latency_audit.py`, `scripts/kd4_timing_analysis.py`, `scripts/kd4_first_useful_action_analysis.py`, `scripts/kd4_model_attempt_analysis.py`, `scripts/investigation_evidence_smoke.py`, `scripts/investigation_eval` | Repo Benchmark alone schedules native variant comparisons; the frozen Python audit owns session diagnostics, timing, observed tool-item behavior and real-model token/cache analysis; aggregate before trace retention; keep Git preflight and local workflow timing separate |
-| Runtime binary selection proof              | `scripts/vscode_runtime_proof.py`                                                                                                                                             | read-only path, version, and environment evidence; binary replacement remains owned by the explicit publish/update flow                                                       |
+| Flow                                        | Owner and entrypoint                                                                                                                                                                                                                                                                                                           | Required downstream proof                                                                                                                                                                                                                                                     |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Rust workspace build/test                   | `codex-rs/Cargo.toml`, `codex-rs/.cargo/config.toml`, `codex-rs/.config/nextest.toml`, root `justfile`, crate manifests                                                                                                                                                                                                        | bounded local compiler/test fanout by default; focused crate check/test; use isolated lanes when parallel Rust work exists                                                                                                                                                    |
+| Named `codex-core` test targets and gates   | `codex-rs/.config/kd4-rust-tests.toml`, `scripts/rust_test_runner.py`, `scripts/test_rust_test_runner.py`, root `justfile`                                                                                                                                                                                                     | `python -m unittest scripts.test_rust_test_runner` plus `just core-test-manifest-check`; generic recipes reject `-p codex-core`, so use `just core-test`/`just core-gate`                                                                                                     |
+| npm CLI wrapper staging                     | `codex-cli/bin/codex.js`, `codex-cli/package.json`, `scripts/stage_npm_packages.py`                                                                                                                                                                                                                                            | wrapper lint, staging/package tests, platform layout inspection                                                                                                                                                                                                               |
+| Canonical package archives                  | `scripts/codex_package`                                                                                                                                                                                                                                                                                                        | package-local tests and archive/content checks                                                                                                                                                                                                                                |
+| Standalone installer                        | `scripts/install/install.ps1`                                                                                                                                                                                                                                                                                                  | installer tests, digest/layout/locking/PATH/migration behavior                                                                                                                                                                                                                |
+| TypeScript SDK                              | `sdk/typescript`                                                                                                                                                                                                                                                                                                               | `just sdk-ts-check` and package-facing type/tests                                                                                                                                                                                                                             |
+| Python SDK                                  | `sdk/python`                                                                                                                                                                                                                                                                                                                   | focused `uv run pytest` and `uv run ruff check .`                                                                                                                                                                                                                             |
+| Python runtime package                      | `sdk/python-runtime`                                                                                                                                                                                                                                                                                                           | focused runtime-package tests and lint                                                                                                                                                                                                                                        |
+| Windows local publish                       | `scripts/publish-local-codex.ps1`, `just publish-local-codex-final`                                                                                                                                                                                                                                                            | concise build/install/restart; optional doctor; backup/rollback guards, installed hash/version                                                                                                                                                                                |
+| Desktop-visible completion                  | local publish output plus app-server/CLI runtime                                                                                                                                                                                                                                                                               | publish final, restart Desktop, prove process path and binary hash/version, inspect initialize/model metadata, capture visible evidence                                                                                                                                       |
+| Source-owner and architecture index refresh | `source_owners.toml`, `scripts/source_owners.py`, `scripts/test_source_owners.py`                                                                                                                                                                                                                                              | regenerate `architecture_index.json` and the marked `SOURCEMAP.md` block through the owner workflow; run source-owner freshness and representative relationship-recall checks                                                                                                 |
+| Generated schema freshness                  | `scripts/config_schema_check.py`, `scripts/app_server_schema_runtime_check.py`, `scripts/generated_output_lock.py`                                                                                                                                                                                                             | use the owning check/regeneration command under the shared generated-output lock; never hand-edit generated schemas                                                                                                                                                           |
+| KD4 audits, evaluation, and measurement     | `codex-rs/repo-benchmark`, `scripts/kd4_sync_audit.py`, `scripts/kd4_perf_snapshot.py`, `scripts/kd4_turn_latency_audit.py`, `scripts/kd4_timing_analysis.py`, `scripts/kd4_first_useful_action_analysis.py`, `scripts/kd4_model_attempt_analysis.py`, `scripts/investigation_evidence_smoke.py`, `scripts/investigation_eval` | Repo Benchmark alone schedules native variant comparisons; the frozen Python audit owns session diagnostics, timing, observed tool-item behavior and real-model token/cache analysis; aggregate before trace retention; keep Git preflight and local workflow timing separate |
+| Runtime binary selection proof              | `scripts/vscode_runtime_proof.py`                                                                                                                                                                                                                                                                                              | read-only path, version, and environment evidence; binary replacement remains owned by the explicit publish/update flow                                                                                                                                                       |
 
 `just publish-local-codex-final` runs only the local publisher. Release-tooling tests
 remain available via `just test-release-tooling`; use `-RunDoctor -DoctorOnNoop`
 for doctor checks and `-Verbose` for full publisher diagnostics.
+The recipe and direct publisher default to `local-release`; pass `-Profile release`
+for cross-crate ThinLTO. When auto-skip requires a rebuild, its source snapshot is
+reused as the pre-build identity; independent post-build and pre-publish scans
+still reject changed inputs. Focused coverage lives in
+`scripts/test_publish_local_codex_build.py` and
+`scripts/test_publish_local_codex_freshness.py`.
 
 Package reuse in `scripts/codex_package/cargo.py` requires matching source and
 recipe identities before and after the build. The recipe includes Cargo config
@@ -543,26 +552,26 @@ remain required.
 
 ## Validation routes
 
-| Changed surface                              | Smallest owning proof                                                                                                                                                            |
-| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Source map or structural inventory           | `python -m unittest scripts.test_source_map_check` and `just source-map-check`                                                                                                   |
-| Source-owner manifest or architecture index  | `just source-owners-check` (freshness and representative relationship tests)                                                                                                     |
-| Root or Python maintenance scripts           | closest `python -m unittest scripts.test_<name>` plus syntax/lint appropriate to the script                                                                                      |
-| Dependency manifest or lockfile             | Rust: `just deps-policy-check` plus focused consumer tests; JavaScript: frozen pnpm lockfile validation and the affected package's focused checks                                |
-| KD4 audit, evaluation, or measurement script | closest matching `python -m unittest scripts.test_<name>` plus only the fixture/freshness check owned by the changed surface                                                     |
+| Changed surface                                      | Smallest owning proof                                                                                                                                                                                                      |
+| ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Source map or structural inventory                   | `python -m unittest scripts.test_source_map_check` and `just source-map-check`                                                                                                                                             |
+| Source-owner manifest or architecture index          | `just source-owners-check` (freshness and representative relationship tests)                                                                                                                                               |
+| Root or Python maintenance scripts                   | closest `python -m unittest scripts.test_<name>` plus syntax/lint appropriate to the script                                                                                                                                |
+| Dependency manifest or lockfile                      | Rust: `just deps-policy-check` plus focused consumer tests; JavaScript: frozen pnpm lockfile validation and the affected package's focused checks                                                                          |
+| KD4 audit, evaluation, or measurement script         | closest matching `python -m unittest scripts.test_<name>` plus only the fixture/freshness check owned by the changed surface                                                                                               |
 | Repo Benchmark configuration, reports or diagnostics | `cargo test --locked --jobs 6 -p repo-benchmark --lib` from `codex-rs`, plus affected `scripts.test_kd4_timing_analysis` / `scripts.test_kd4_turn_latency_audit` tests; no live benchmark required for report-only changes |
-| Named Rust test runner or manifest           | `python -m unittest scripts.test_rust_test_runner` and `just core-test-manifest-check`                                                                                           |
-| `codex-core` Rust tests                      | `just core-test <target>`, `just core-test-fast <target>`, or `just core-gate <gate>`; `just core-test-list` prints the names                                                    |
-| Focused Rust crate                           | `just test-fast -p <crate>` or the nearest focused recipe/filter                                                                                                                 |
-| App-server protocol/schema                   | focused crate tests plus `just app-server-schema-check`                                                                                                                          |
-| Config schema                                | focused config/core tests plus `just config-schema-check`                                                                                                                        |
-| Adaptive-reasoning config and sampling       | `just adaptive-reasoning-contract-check`                                                                                                                                         |
-| Thread-config protobuf                       | `just generate-config-proto-check`                                                                                                                                               |
-| Hooks/schema                                 | `just hooks-schema-check` plus focused behavior tests; run `just write-hooks-schema` only for intentional regeneration                                                                                              |
-| TypeScript SDK                               | `just sdk-ts-check`                                                                                                                                                              |
-| Python SDK                                   | focused `uv run pytest` and `uv run ruff check .`                                                                                                                                |
-| Package/archive flow                         | package-local tests followed by the relevant staging or dry-run proof                                                                                                            |
-| Local publish wiring                         | `just publish-local-codex-final -DryRun`; installed replacement requires `just publish-local-codex-final`                                                                        |
+| Named Rust test runner or manifest                   | `python -m unittest scripts.test_rust_test_runner` and `just core-test-manifest-check`                                                                                                                                     |
+| `codex-core` Rust tests                              | `just core-test <target>`, `just core-test-fast <target>`, or `just core-gate <gate>`; `just core-test-list` prints the names                                                                                              |
+| Focused Rust crate                                   | `just test-fast -p <crate>` or the nearest focused recipe/filter                                                                                                                                                           |
+| App-server protocol/schema                           | focused crate tests plus `just app-server-schema-check`                                                                                                                                                                    |
+| Config schema                                        | focused config/core tests plus `just config-schema-check`                                                                                                                                                                  |
+| Adaptive-reasoning config and sampling               | `just adaptive-reasoning-contract-check`                                                                                                                                                                                   |
+| Thread-config protobuf                               | `just generate-config-proto-check`                                                                                                                                                                                         |
+| Hooks/schema                                         | `just hooks-schema-check` plus focused behavior tests; run `just write-hooks-schema` only for intentional regeneration                                                                                                     |
+| TypeScript SDK                                       | `just sdk-ts-check`                                                                                                                                                                                                        |
+| Python SDK                                           | focused `uv run pytest` and `uv run ruff check .`                                                                                                                                                                          |
+| Package/archive flow                                 | package-local tests followed by the relevant staging or dry-run proof                                                                                                                                                      |
+| Local publish wiring                                 | `just publish-local-codex-final -DryRun`; installed replacement requires `just publish-local-codex-final`                                                                                                                  |
 
 Green tooling alone does not prove runtime behavior. Use the focused failing
 test or approved runtime gate for the behavior being changed, and confirm that
@@ -575,7 +584,8 @@ and executing overlapping exact test IDs once. Normal runs require every ID to
 report PASS exactly once. Generated exact selectors need no discovery invocation;
 explicit filters are individually checked before helper builds or execution.
 `python scripts/rust_test_runner.py check-gates <gate> [<gate> ...]` explicitly
-checks filter/ID discovery parity; `check-manifest` validates all Cargo declarations. Every named core target and gate
+checks filter/ID discovery parity; `check-manifest` validates all Cargo declarations. Every named
+core target and gate
 already builds in one shared reserved Cargo lane rather than `codex-rs/target`,
 so a concurrent build cannot invalidate the loop's incremental cache;
 `core-test-lane` takes a further per-target lane, which is only worth its own
@@ -586,7 +596,8 @@ reserved siblings. Core lane commands launch the manifest runner directly.
 Routine lane maintenance remains hourly-throttled and uses age/warm-lane
 cleanup. Recursive size accounting is opt-in via explicit byte-limit environment
 variables; `just target-prune --max-total-lane-gib 200 --max-total-target-gib 250`
-requests immediate aggregate accounting after an unusually large build. `validate-crate-focused` is an alias for
+requests immediate aggregate accounting after an unusually large build. `validate-crate-focused` is
+an alias for
 `test-fast -p <crate>`, not an additional validation layer. Core library runs
 require an explicit filter; broad test runs require user authorization.
 
@@ -621,7 +632,7 @@ install tools or add dependencies solely to follow this reference.
 | Repository-wide editing policy                                     | `AGENTS.md`                                                           |
 | Rust workspace policy                                              | `AGENTS.md`, then the Rust workflow reference in this map             |
 | Script ownership and validation                                    | Owner script help or the closest checked-in README                    |
-| Repo-local Codex setup | `.codex/config.toml` and `.codex/environments/README.md` |
+| Repo-local Codex setup                                             | `.codex/config.toml` and `.codex/environments/README.md`              |
 | Local build and Desktop publish                                    | `scripts/publish-local-codex.ps1` and the build/publish section above |
 | Standalone installation                                            | `scripts/install/README.md`                                           |
 | Product usage, configuration, authentication, and sandbox guidance | [OpenAI Codex documentation](https://developers.openai.com/codex)     |
@@ -655,7 +666,10 @@ This map owns cross-cutting navigation and structural inventory.
 | Dependency or build-system change                    | owning manifest -> lock state -> workspace/recipe consumers -> focused build/test/package proof                                                                                                                                             |
 | New top-level area or package                        | add the owner and policy boundary -> update the machine-checked inventory in this file -> add routing/validation -> run `just source-map-check`                                                                                             |
 
-<!-- BEGIN KD4 SOURCE OWNERS schema=2 manifest_sha256=fe2515a1edea2715c34f91280716c56d5f3525f984ef69ee08a9c5be27c864fb -->
+<!-- prettier-ignore-start -->
+
+<!-- markdownlint-disable-next-line MD013 -->
+<!-- BEGIN KD4 SOURCE OWNERS schema=2 manifest_sha256=949219c6c0f880357e1b9626a5cd2e45dd1d6b7d753848e86e6c7d8d09437caf -->
 ### Managed KD4 source-owner index
 
 This table is generated by `scripts/source_owners.py`; edit `source_owners.toml`, not this block.
@@ -691,3 +705,5 @@ This table is generated by `scripts/source_owners.py`; edit `source_owners.toml`
 | `uds-transport-adapter` | `codex-rs/uds` | `codex-rs/uds/src/lib.rs::UnixListener`<br>`codex-rs/uds/src/lib.rs::UnixStream`<br>`codex-rs/uds/src/lib.rs::prepare_private_socket_directory` | `control_flow:calls` -> `path:codex-rs/uds/src/lib.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/app-server-transport/src/transport/unix_socket.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/app-server-client/src/remote.rs`<br>+3 more | `semantic:uds-transport-adapter-behavior`<br>`compatibility:uds-transport-adapter-compatibility` | `uds-round-trip` |
 | `windows-sandbox-runtime` | `codex-rs/windows-sandbox-rs` | `codex-rs/windows-sandbox-rs/src/wrapper.rs::run_windows_sandbox_wrapper_main`<br>`codex-rs/windows-sandbox-rs/src/winutil.rs::string_from_sid_bytes` | `control_flow:calls` -> `path:codex-rs/windows-sandbox-rs/src/elevated/runner_pipe.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/arg0/src/lib.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/core/src/exec.rs`<br>+6 more | `semantic:windows-sandbox-runtime-sid-conversion`<br>`semantic:windows-sandbox-runtime-credential-roundtrip`<br>`semantic:windows-sandbox-runtime-pipe-error`<br>+1 more | `sandbox-sid`<br>`sandbox-dpapi`<br>`sandbox-named-pipe` |
 <!-- END KD4 SOURCE OWNERS -->
+
+<!-- prettier-ignore-end -->

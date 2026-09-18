@@ -700,24 +700,25 @@ impl ExecCommandHandler {
             .as_ref()
             .is_some_and(crate::tools::known_delta_store::PreparedKnownDelta::is_hit);
         let validation_attempt = validation_launch.is_some();
-        if !known_delta_hit && !validation_attempt {
-            if let Err(blocked) = session
+        if !known_delta_hit
+            && !validation_attempt
+            && let Err(blocked) = session
                 .services
                 .command_execution
                 .begin_attempt_with_freshness(&attempt_key, repaired, force_fresh)
                 .await
-            {
-                if blocked.is_search_miss() {
-                    return Ok(boxed_tool_output(FunctionToolOutput::from_text(
-                        blocked.render_for_model(),
-                        Some(true),
-                    )));
-                }
-                return Err(FunctionCallError::RespondToModel(
+        {
+            if blocked.is_search_miss() {
+                return Ok(boxed_tool_output(FunctionToolOutput::from_text(
                     blocked.render_for_model(),
-                ));
+                    Some(true),
+                )));
             }
+            return Err(FunctionCallError::RespondToModel(
+                blocked.render_for_model(),
+            ));
         }
+
         let interception_started_at = std::time::Instant::now();
         let intercepted = intercept_apply_patch(
             validation_attempt,

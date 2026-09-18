@@ -368,6 +368,10 @@ impl WorkspaceEvidenceGenerationBatch {
         }
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the guard coalesces sibling captures and serializes mutation revisions until the baseline is recorded"
+    )]
     async fn capture_baseline(
         &self,
         cache: &crate::git_workspace::GitWorkspaceCache,

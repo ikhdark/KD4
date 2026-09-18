@@ -155,7 +155,7 @@ pub(crate) async fn handle_mcp_tool_call(
         };
     }
     let live_tool_info = manager.tool_info(&sampled_server, &sampled_tool_name).await;
-    if !live_tool_info.as_ref().is_some_and(tool_is_model_visible) {
+    let Some(live_tool_info) = live_tool_info.filter(tool_is_model_visible) else {
         let invocation = McpInvocation {
             server: sampled_server.clone(),
             tool: sampled_tool_name.clone(),
@@ -189,9 +189,7 @@ pub(crate) async fn handle_mcp_tool_call(
             tool_input: arguments_value
                 .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
         };
-    }
-
-    let live_tool_info = live_tool_info.expect("model-visible tool was checked above");
+    };
     let server = live_tool_info.server_name.clone();
     let tool_name = live_tool_info.tool.name.to_string();
     let hook_tool_name = live_mcp_hook_tool_name(&live_tool_info);

@@ -27,10 +27,17 @@ class DevEnvironmentDoctorTest(unittest.TestCase):
     def test_git_version_is_reported_as_an_available_prerequisite(self):
         with (
             mock.patch.object(dev_env_doctor.shutil, "which", return_value="git.exe"),
-            mock.patch.object(dev_env_doctor.subprocess, "run", return_value=subprocess.CompletedProcess(
-                [], 0, "git version 2.53.0.windows.1\n", "")),
+            mock.patch.object(
+                dev_env_doctor.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    [], 0, "git version 2.53.0.windows.1\n", ""
+                ),
+            ),
         ):
-            check = dev_env_doctor.check_tool("git", ["git", "--version"], required=True, guidance="Install Git")
+            check = dev_env_doctor.check_tool(
+                "git", ["git", "--version"], required=True, guidance="Install Git"
+            )
         self.assertTrue(check.ok)
         self.assertEqual(check.version, "git version 2.53.0.windows.1")
 
@@ -38,9 +45,21 @@ class DevEnvironmentDoctorTest(unittest.TestCase):
         for available in (False, True):
             with (
                 self.subTest(available=available),
-                mock.patch.object(dev_env_doctor, "package_manager_pin", return_value="pnpm@99.0.0"),
-                mock.patch.object(dev_env_doctor.shutil, "which", side_effect=lambda name: None if name == "rg" and not available else name),
-                mock.patch.object(dev_env_doctor.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "99.0.0\n", "")),
+                mock.patch.object(
+                    dev_env_doctor, "package_manager_pin", return_value="pnpm@99.0.0"
+                ),
+                mock.patch.object(
+                    dev_env_doctor.shutil,
+                    "which",
+                    side_effect=lambda name: (
+                        None if name == "rg" and not available else name
+                    ),
+                ),
+                mock.patch.object(
+                    dev_env_doctor.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess([], 0, "99.0.0\n", ""),
+                ),
                 contextlib.redirect_stdout(io.StringIO()) as stdout,
             ):
                 result = dev_env_doctor.main(["--json"])

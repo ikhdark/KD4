@@ -1,21 +1,37 @@
-use crate::diagnostics::{DiagnosticResult, analyze};
-use crate::native::{NativeAttemptEvidence, NativeAttemptRequest, ScriptedScenario, run_attempt};
-use crate::prepare::provenance::{
-    FileIdentity, copy_tree, hash_file, reset_workspace, source_tree_inventory, write_atomic_json,
-    write_json,
-};
-use crate::prepare::{Prepared, unique_id};
-use crate::schedule::{ExecutionBudget, ScheduledAttempt, Segment};
-use crate::workloads::{VerificationOutcome, VerificationStatus, verify_fixture_with_env};
-use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize};
+use crate::diagnostics::DiagnosticResult;
+use crate::diagnostics::analyze;
+use crate::native::NativeAttemptEvidence;
+use crate::native::NativeAttemptRequest;
+use crate::native::ScriptedScenario;
+use crate::native::run_attempt;
+use crate::prepare::Prepared;
+use crate::prepare::provenance::FileIdentity;
+use crate::prepare::provenance::copy_tree;
+use crate::prepare::provenance::hash_file;
+use crate::prepare::provenance::reset_workspace;
+use crate::prepare::provenance::source_tree_inventory;
+use crate::prepare::provenance::write_atomic_json;
+use crate::prepare::provenance::write_json;
+use crate::prepare::unique_id;
+use crate::schedule::ExecutionBudget;
+use crate::schedule::ScheduledAttempt;
+use crate::schedule::Segment;
+use crate::workloads::VerificationOutcome;
+use crate::workloads::VerificationStatus;
+use crate::workloads::verify_fixture_with_env;
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::json;
-use std::{
-    collections::BTreeMap,
-    fs,
-    path::{Path, PathBuf},
-    time::{Instant, SystemTime, UNIX_EPOCH},
-};
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 #[cfg(test)]
 mod tests;
 
@@ -283,19 +299,19 @@ pub fn execute(
             if error.downcast_ref::<ResetFailure>().is_some() {
                 unrecoverable = attempt.reason.clone();
             }
-            if attempt.evidence_files.is_empty() {
-                if let Err(freeze_error) = freeze_attempt_evidence(attempt) {
-                    attempt.reason = Some(format!(
-                        "{}; cannot freeze partial evidence: {freeze_error:#}",
-                        attempt.reason.as_deref().unwrap_or_default()
-                    ));
-                }
+            if attempt.evidence_files.is_empty()
+                && let Err(freeze_error) = freeze_attempt_evidence(attempt)
+            {
+                attempt.reason = Some(format!(
+                    "{}; cannot freeze partial evidence: {freeze_error:#}",
+                    attempt.reason.as_deref().unwrap_or_default()
+                ));
             }
         }
         if let Some(native) = &attempt.native {
             budget.charge(native.elapsed_ms);
-            if native.status == "timeout" && timeout < attempt_limit
-                || native.status == "timeout" && attempt.scheduled.segment == Segment::Scripted
+            if native.status == "timeout"
+                && (timeout < attempt_limit || attempt.scheduled.segment == Segment::Scripted)
             {
                 attempt.reason = Some("segment_budget_exhausted during attempt".into());
             }

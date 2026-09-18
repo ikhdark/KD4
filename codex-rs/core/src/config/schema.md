@@ -6,6 +6,6 @@ and commit it at `codex-rs/core/config.schema.json` for editor integration.
 When you change any fields included in `ConfigToml` (or nested config types),
 regenerate the schema:
 
-```
+```text
 just config-schema-regenerate <owner>
 ```

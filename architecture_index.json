@@ -1,7 +1,7 @@
 {
-  "index_sha256": "a4f38d9a6f71aee618127cb59a22936ea7837757e28299e77faf75f50ea45c89",
+  "index_sha256": "a224eb7413fcfdc086d8c3cd48e1c7a7e23ab505aa658bc12e91366b65fd0cfb",
   "index_version": 1,
-  "manifest_sha256": "fe2515a1edea2715c34f91280716c56d5f3525f984ef69ee08a9c5be27c864fb",
+  "manifest_sha256": "949219c6c0f880357e1b9626a5cd2e45dd1d6b7d753848e86e6c7d8d09437caf",
   "omitted": {
     "relationships": 0
   },
@@ -1059,7 +1059,7 @@
           ],
           "id": "one-benchmark-two-sequential-segments",
           "kind": "semantic",
-          "statement": "Repo Benchmark alone schedules and compares fork_off, fork_on and reference through native runtimes; --fork-only-on freezes a two-variant selection of fork_on and reference throughout preparation, execution and reports. Scripted execution precedes real-model execution; fast/full differ only in selected live tasks, finite budgets are ceilings, and performance has no pass/fail verdict.",
+          "statement": "Repo Benchmark alone schedules and compares fork_on and reference through native runtimes; preparation, execution and reports support only these two variants. Scripted execution precedes real-model execution; fast/full differ only in selected live tasks, finite budgets are ceilings, and performance has no pass/fail verdict.",
           "tests": [
             "codex-rs/repo-benchmark/src/schedule.rs",
             "codex-rs/repo-benchmark/src/statistics.rs"
@@ -1104,7 +1104,7 @@
           ],
           "id": "native-source-and-independent-verification-integrity",
           "kind": "semantic",
-          "statement": "One frozen harness launches each selected revision's own app-server. Preparation pins clean sources, locked dependencies, six-job release settings, shared inputs and environment; protected verifiers assert expected task results after final mutation. B need not descend from A.",
+          "statement": "One frozen harness launches each selected revision's own app-server. Preparation pins clean sources, locked dependencies, twelve-job release settings, shared inputs and environment; protected verifiers assert expected task results after final mutation. B need not descend from A.",
           "tests": [
             "codex-rs/repo-benchmark/src/prepare/tests.rs",
             "codex-rs/repo-benchmark/src/workloads/tests.rs"
@@ -4348,7 +4348,7 @@
       "target": "path:codex-rs/windows-sandbox-rs/src/winutil.rs"
     }
   ],
-  "repository_revision": "manifest:fe2515a1edea2715c34f91280716c56d5f3525f984ef69ee08a9c5be27c864fb:sources:9cc615fb5e969b4c7f0792a013db02d6b649017319ef12f3eed355a6f4f9d5ea",
+  "repository_revision": "manifest:949219c6c0f880357e1b9626a5cd2e45dd1d6b7d753848e86e6c7d8d09437caf:sources:09833954f949ec748aa17d1639e7e18a0ec8ec32f1880991119beb9dab334ef4",
   "schema_version": 2,
   "status": "complete",
   "unresolved": []

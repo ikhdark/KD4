@@ -1332,6 +1332,10 @@ impl AgentControl {
             return Err(pending_cleanup.rollback(err).await);
         }
         agent_metadata.last_task_message = initial_last_task_message;
+        #[expect(
+            clippy::expect_used,
+            reason = "PendingSpawnCleanup owns the reservation until this commit consumes it"
+        )]
         let reservation = pending_cleanup
             .capacity
             .reservation
@@ -1918,6 +1922,10 @@ impl AgentControl {
         );
         let mut agent_metadata = agent_metadata;
         agent_metadata.agent_id = Some(resumed_thread.thread_id);
+        #[expect(
+            clippy::expect_used,
+            reason = "PendingSpawnCleanup owns the reservation until this commit consumes it"
+        )]
         let reservation = pending_cleanup
             .capacity
             .reservation

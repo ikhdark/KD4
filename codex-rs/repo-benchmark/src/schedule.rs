@@ -1,4 +1,5 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 pub const SCRIPTED_LIMIT_MS: u64 = 30 * 60 * 1000;
 // Implementation plus focused validation can exceed the old ten-minute cap.
@@ -22,10 +23,10 @@ pub enum Mode {
 impl Mode {
     pub fn live_limit_ms(self) -> u64 {
         (match self {
-            // Cover all three variants at the per-attempt cap, with 25%
+            // Cover both variants at the per-attempt cap, with 25%
             // headroom for deadline overshoot and native teardown scheduling.
-            Self::Fast => 75,
-            Self::Full => 225,
+            Self::Fast => 50,
+            Self::Full => 150,
         }) * 60
             * 1000
     }
@@ -40,21 +41,14 @@ impl Mode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Variant {
-    ForkOff,
     ForkOn,
     Reference,
 }
 
 impl Variant {
-    pub const ALL: [Self; 3] = [Self::ForkOff, Self::ForkOn, Self::Reference];
-    pub fn selected(fork_only_on: bool) -> impl Iterator<Item = Self> {
-        Self::ALL
-            .into_iter()
-            .filter(move |variant| !fork_only_on || *variant != Self::ForkOff)
-    }
+    pub const ALL: [Self; 2] = [Self::ForkOn, Self::Reference];
     pub fn name(self) -> &'static str {
         match self {
-            Self::ForkOff => "fork_off",
             Self::ForkOn => "fork_on",
             Self::Reference => "reference",
         }
@@ -99,26 +93,19 @@ pub const SCRIPTED_WORKLOADS: [&str; 14] = [
     "cancel_then_prompt",
 ];
 
-fn order(index: usize) -> [Variant; 3] {
+fn order(index: usize) -> [Variant; 2] {
     use Variant::*;
-    [
-        [ForkOff, ForkOn, Reference],
-        [ForkOn, Reference, ForkOff],
-        [Reference, ForkOff, ForkOn],
-        [Reference, ForkOn, ForkOff],
-        [ForkOn, ForkOff, Reference],
-        [ForkOff, Reference, ForkOn],
-    ][index % 6]
+    [[ForkOn, Reference], [Reference, ForkOn]][index % 2]
 }
 
-pub fn schedule(mode: Mode, fork_only_on: bool) -> Vec<ScheduledAttempt> {
+pub fn schedule(mode: Mode) -> Vec<ScheduledAttempt> {
     let mut attempts = Vec::new();
     for cluster in 0..CLUSTERS {
         for repetition in 0..ITERATIONS {
             for (index, workload) in SCRIPTED_WORKLOADS.iter().enumerate() {
                 let mut variants = order(index + repetition as usize);
-                // Balance every workload separately: each variant occupies each
-                // position exactly once across the three independent clusters.
+                // Alternate the first variant across clusters and workloads.
+                // Three clusters give each variant both execution positions.
                 let positions = variants.len();
                 variants.rotate_left(cluster as usize % positions);
                 for variant in variants {
@@ -155,7 +142,6 @@ pub fn schedule(mode: Mode, fork_only_on: bool) -> Vec<ScheduledAttempt> {
             });
         }
     }
-    attempts.retain(|attempt| !fork_only_on || attempt.variant != Variant::ForkOff);
     attempts
 }
 
@@ -185,8 +171,8 @@ mod tests {
     use super::*;
     #[test]
     fn modes_only_change_live_selection() {
-        let fast = schedule(Mode::Fast, false);
-        let full = schedule(Mode::Full, false);
+        let fast = schedule(Mode::Fast);
+        let full = schedule(Mode::Full);
         let scripted = |v: Vec<ScheduledAttempt>| {
             v.into_iter()
                 .filter(|s| s.segment == Segment::Scripted)
@@ -199,17 +185,17 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let fast_live = live(fast);
-        assert_eq!(fast_live.len(), 3);
+        assert_eq!(fast_live.len(), 2);
         assert!(fast_live.iter().all(|s| s.workload == "rust_bugfix"));
         assert_eq!(
             fast_live.iter().map(|s| s.variant).collect::<Vec<_>>(),
             Variant::ALL
         );
-        assert_eq!(live(full).len(), 9);
-        assert_eq!(Mode::Fast.live_limit_ms(), 4_500_000);
-        assert_eq!(Mode::Full.live_limit_ms(), 13_500_000);
+        assert_eq!(live(full).len(), 6);
+        assert_eq!(Mode::Fast.live_limit_ms(), 3_000_000);
+        assert_eq!(Mode::Full.live_limit_ms(), 9_000_000);
         for mode in [Mode::Fast, Mode::Full] {
-            let attempts = schedule(mode, false)
+            let attempts = schedule(mode)
                 .iter()
                 .filter(|attempt| attempt.segment == Segment::RealModel)
                 .count() as u64;
@@ -218,7 +204,7 @@ mod tests {
     }
     #[test]
     fn every_native_scenario_has_three_independent_measurements_without_warmups() {
-        let schedule = schedule(Mode::Fast, false);
+        let schedule = schedule(Mode::Fast);
         let scripted: Vec<_> = schedule
             .iter()
             .filter(|attempt| attempt.segment == Segment::Scripted)
@@ -241,7 +227,7 @@ mod tests {
             "restart_resume",
             "cancel_then_prompt",
         ];
-        assert_eq!(scripted.len(), 126);
+        assert_eq!(scripted.len(), 84);
         assert_eq!(WARMUPS, 0);
         assert!(
             scripted
@@ -250,23 +236,23 @@ mod tests {
         );
         assert_eq!(SCRIPTED_LIMIT_MS, 1_800_000);
         for workload in expected {
-            for variant in [Variant::ForkOff, Variant::ForkOn, Variant::Reference] {
+            for variant in [Variant::ForkOn, Variant::Reference] {
                 let clusters: Vec<_> = scripted
                     .iter()
                     .filter(|attempt| attempt.workload == workload && attempt.variant == variant)
                     .map(|attempt| attempt.cluster)
                     .collect();
                 assert_eq!(clusters, [0, 1, 2], "{workload}/{}", variant.name());
-                assert_eq!(scripted[..42].iter().filter(|attempt| attempt.workload == workload && attempt.variant == variant).count(), 1);
+                assert_eq!(scripted[..28].iter().filter(|attempt| attempt.workload == workload && attempt.variant == variant).count(), 1);
             }
         }
         assert!(
-            schedule[..126]
+            schedule[..84]
                 .iter()
                 .all(|attempt| attempt.segment == Segment::Scripted)
         );
         assert!(
-            schedule[126..]
+            schedule[84..]
                 .iter()
                 .all(|attempt| attempt.segment == Segment::RealModel)
         );
@@ -275,7 +261,7 @@ mod tests {
     }
     #[test]
     fn each_variant_occupies_every_native_execution_position_per_workload() {
-        let schedule = schedule(Mode::Fast, false);
+        let schedule = schedule(Mode::Fast);
         for workload in SCRIPTED_WORKLOADS {
             let groups: Vec<_> = (0..3)
                 .map(|cluster| {
@@ -290,37 +276,14 @@ mod tests {
                         .collect::<Vec<_>>()
                 })
                 .collect();
-            for position in 0..3 {
+            for position in 0..2 {
                 let variants: std::collections::BTreeSet<_> =
                     groups.iter().map(|group| group[position]).collect();
                 assert_eq!(
                     variants,
-                    [Variant::ForkOff, Variant::ForkOn, Variant::Reference]
-                        .into_iter()
-                        .collect(),
+                    [Variant::ForkOn, Variant::Reference].into_iter().collect(),
                     "{workload} position {position}"
                 );
-            }
-        }
-    }
-    #[test]
-    fn fork_only_on_preserves_original_measurement_ids_and_pairing() {
-        for mode in [Mode::Fast, Mode::Full] {
-            let selected = schedule(mode, true);
-            let expected: Vec<_> = schedule(mode, false)
-                .into_iter()
-                .filter(|attempt| attempt.variant != Variant::ForkOff)
-                .collect();
-            assert_eq!(selected, expected);
-            for workload in SCRIPTED_WORKLOADS {
-                for variant in [Variant::ForkOn, Variant::Reference] {
-                    let clusters: Vec<_> = selected
-                        .iter()
-                        .filter(|a| a.workload == workload && a.variant == variant)
-                        .map(|a| a.cluster)
-                        .collect();
-                    assert_eq!(clusters, [0, 1, 2]);
-                }
             }
         }
     }

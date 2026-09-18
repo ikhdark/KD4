@@ -104,7 +104,10 @@ impl HookOutputSpiller {
         spilled_hook_output_preview(&text, &path)
     }
 
-    #[expect(clippy::await_holding_invalid_type, reason = "The try-lock prevents concurrent asynchronous pruning even when a prune exceeds the throttle interval")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "The try-lock prevents concurrent asynchronous pruning even when a prune exceeds the throttle interval"
+    )]
     async fn prune_crash_leftovers(&self, protected_path: Option<&Path>) {
         let Ok(mut last_prune) = self.last_prune.try_lock() else {
             return;

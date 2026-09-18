@@ -39,13 +39,12 @@ const PLAN_UNCHANGED_MESSAGE: &str = "Plan unchanged";
 
 impl PlanToolOutput {
     fn response_result(&self) -> JsonValue {
-        serde_json::to_value(PlanToolResponse {
+        serde_json::json!(PlanToolResponse {
             message: self.message().to_string(),
             effect: self.effect.as_str().to_string(),
             no_progress: self.effect == PlanUpdateEffect::NoOp,
             current_plan: self.current_plan.clone(),
         })
-        .expect("plan response contains serializable fields")
     }
 
     fn message(&self) -> &'static str {

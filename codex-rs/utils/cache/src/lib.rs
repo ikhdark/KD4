@@ -186,6 +186,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the fixture holds the cache lock until the competing operation is ready"
+    )]
     async fn contended_multi_thread_callback_waits_and_mutates_the_cache() {
         // Run on the only worker so the guard-release task can progress only
         // after with_mut enters block_in_place.

@@ -173,11 +173,18 @@ pub(super) fn record_current_source_refreshes(
             let Some(&index) = identities.get(&key) else {
                 continue;
             };
-            if index == latest_index && records[index].as_ref().is_some_and(|record| record.source_modified_at == refresh.source_modified_at) {
+            if index == latest_index
+                && records[index]
+                    .as_ref()
+                    .is_some_and(|record| record.source_modified_at == refresh.source_modified_at)
+            {
                 continue;
             }
             let Some(mut record) = records[index].take() else {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "indexed ledger record is missing"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "indexed ledger record is missing",
+                ));
             };
             record.imported_at = imported_at;
             record.source_modified_at = refresh.source_modified_at;

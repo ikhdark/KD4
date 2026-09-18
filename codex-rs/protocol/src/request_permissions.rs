@@ -120,7 +120,7 @@ impl RequestPermissionsResponse {
         let mut schema = schemars::schema_for!(Self);
         // Deserialization defaults the scope for older clients, but every output includes it.
         schema.schema.object().required.insert("scope".to_string());
-        serde_json::to_value(schema).expect("permission response schema is serializable")
+        serde_json::json!(schema)
     }
 }
 

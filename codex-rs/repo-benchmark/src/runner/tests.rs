@@ -163,11 +163,13 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         tree: "test-peer".into(),
         checkout: frozen.clone(),
         upstream: false,
+        lock_reconciliation: None,
     };
     let build = BuildIdentity {
         revision: "test-peer".into(),
         source: frozen.clone(),
         target_directory: frozen.clone(),
+        build_directory: None,
         settings: BTreeMap::new(),
         lockfile: config_identity.clone(),
         cargo_config: None,
@@ -187,8 +189,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         directory: directory.clone(),
         repo,
         mode: Mode::Fast,
-        fork_only_on: false,
-        schedule: schedule(Mode::Fast, false),
+        schedule: schedule(Mode::Fast),
         workspace,
         workspace_lock: directory.join("workspace.lock"),
         additional_roots: vec![],
@@ -211,7 +212,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             .into_iter()
             .map(|variant| (variant, vec![]))
             .collect(),
-        fixtures: schedule(Mode::Fast, false)
+        fixtures: schedule(Mode::Fast)
             .into_iter()
             .map(|scheduled| {
                 let name = match scheduled.segment {
@@ -238,21 +239,18 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
 }
 
 #[test]
-fn fork_only_on_default_preserves_selection_and_unrun_pairs_in_reports_and_reanalysis() {
+fn enabled_fork_and_reference_preserve_unrun_pairs_in_reports_and_reanalysis() {
     let temp = tempfile::tempdir().unwrap();
     let mut prepared = prepared_peer(temp.path(), false);
 
     let options = crate::cli::parse(vec![]).unwrap();
-    prepared.fork_only_on = options.fork_only_on;
-    prepared.schedule = schedule(options.mode, options.fork_only_on);
-    prepared.builds.remove(&Variant::ForkOff);
-    prepared.overrides.remove(&Variant::ForkOff);
+    prepared.schedule = schedule(options.mode);
     prepared.features = vec![
         json!({"id":"runtime", "config_keys":["features.kd4_runtime"], "benchmark_on":true, "benchmark_control":{"kind":"runtime"}}),
     ];
     prepared.overrides.insert(
         Variant::ForkOn,
-        crate::prepare::feature_overrides(&prepared.features, true).unwrap(),
+        crate::prepare::feature_overrides(&prepared.features).unwrap(),
     );
     let project = temp.path().join("project");
     fs::create_dir_all(project.join(".codex")).unwrap();
@@ -305,7 +303,7 @@ fn fork_only_on_default_preserves_selection_and_unrun_pairs_in_reports_and_reana
         assert_eq!(report["completion"]["scheduled"], 86);
         assert_eq!(report["completion"]["completed"], 0);
         assert_eq!(report["completion"]["unrun"], 86);
-        assert_eq!(report["prepared"]["forkOnlyOn"], true);
+        assert!(report["prepared"].get("forkOnlyOn").is_none());
         let comparisons = report["comparisons"].as_array().unwrap();
         assert!(!comparisons.is_empty());
         assert!(comparisons.iter().all(|c| c["kind"] == "overall"
@@ -322,10 +320,7 @@ fn fork_only_on_default_preserves_selection_and_unrun_pairs_in_reports_and_reana
             report["featureCoverage"][0]["configuredByVariant"]["fork_on"],
             true
         );
-        assert_eq!(
-            report["featureCoverage"][0]["ablationStatus"],
-            "not_ablated"
-        );
+        assert!(report["featureCoverage"][0].get("ablationStatus").is_none());
         for mapping in [
             &report["prepared"]["builds"],
             &report["prepared"]["overrides"],
@@ -350,22 +345,20 @@ fn fork_only_on_default_preserves_selection_and_unrun_pairs_in_reports_and_reana
 }
 
 #[test]
-fn report_write_exposes_ablation_scope_verification_and_incomplete_pair_rates() {
+fn report_write_exposes_feature_configuration_verification_and_incomplete_pair_rates() {
     let temp = tempfile::tempdir().unwrap();
     let mut prepared = prepared_peer(temp.path(), false);
     prepared.features = vec![
         json!({"id":"runtime", "config_keys":["features.kd4_runtime"], "benchmark_on":true, "benchmark_control":{"kind":"runtime"}, "runtime_verification":{"kind":"contract_test", "path":"core/tests.rs", "symbol":"runtime_contract"}}),
         json!({"id":"preflight", "config_keys":["features.kd4_runtime"], "benchmark_on":true, "benchmark_control":{"kind":"runtime"}}),
         json!({"id":"disabled", "config_keys":["features.disabled"], "benchmark_on":false, "benchmark_control":{"kind":"runtime"}}),
-        json!({"id":"fixed", "config_keys":[], "benchmark_control":{"kind":"lacking_off_state", "reason":"present in both fork builds"}}),
+        json!({"id":"fixed", "config_keys":[], "benchmark_control":{"kind":"lacking_off_state", "reason":"fixed fork behavior"}}),
         json!({"id":"workflow", "config_keys":[], "benchmark_control":{"kind":"lacking_off_state", "reason":"repository workflow"}}),
     ];
-    for (variant, enabled) in [(Variant::ForkOff, false), (Variant::ForkOn, true)] {
-        prepared.overrides.insert(
-            variant,
-            crate::prepare::feature_overrides(&prepared.features, enabled).unwrap(),
-        );
-    }
+    prepared.overrides.insert(
+        Variant::ForkOn,
+        crate::prepare::feature_overrides(&prepared.features).unwrap(),
+    );
     prepared.features.push(json!({"id":"unknown", "config_keys":["features.missing"], "benchmark_control":{"kind":"runtime"}}));
     let project = temp.path().join("project");
     fs::create_dir_all(project.join(".codex")).unwrap();
@@ -410,19 +403,9 @@ fn report_write_exposes_ablation_scope_verification_and_incomplete_pair_rates() 
     write_json(&result.directory.join("result.json"), &result).unwrap();
     crate::reports::write(&prepared, &result).unwrap();
     let report: Value = read_json(&result.directory.join("report.json")).unwrap();
-    assert_eq!(
-        report["ablationCounts"],
-        json!({"runtime_changed":2, "runtime_unchanged":1, "not_ablated":2, "configuration_unavailable":1})
-    );
-    assert_eq!(
-        report["coupledControls"],
-        json!({"features.kd4_runtime":["runtime", "preflight"]})
-    );
+    assert!(report.get("ablationCounts").is_none());
+    assert!(report.get("coupledControls").is_none());
     let features = report["featureCoverage"].as_array().unwrap();
-    assert_eq!(
-        report["prepared"]["projectConfigComparison"]["byVariant"]["fork_off"]["changed"],
-        json!(["features.kd4_runtime"])
-    );
     assert_eq!(
         report["prepared"]["projectConfigComparison"]["byVariant"]["fork_on"]["changed"],
         json!([])
@@ -430,10 +413,6 @@ fn report_write_exposes_ablation_scope_verification_and_incomplete_pair_rates() 
     assert_eq!(
         features[0]["declaredVerification"]["symbol"],
         "runtime_contract"
-    );
-    assert_eq!(
-        features[0]["configuredSettingsByVariant"]["fork_off"]["features.kd4_runtime"],
-        false
     );
     assert_eq!(
         features[0]["configuredSettingsByVariant"]["fork_on"]["features.kd4_runtime"],
@@ -444,17 +423,14 @@ fn report_write_exposes_ablation_scope_verification_and_incomplete_pair_rates() 
             .iter()
             .all(|feature| feature["exercised"].is_null())
     );
-    assert_eq!(features[3]["ablationStatus"], "not_ablated");
-    assert_eq!(features[5]["ablationStatus"], "configuration_unavailable");
+    assert_eq!(features[2]["configuredByVariant"]["fork_on"], false);
+    assert!(features[3]["configuredByVariant"]["fork_on"].is_null());
+    assert!(features[5]["configuredByVariant"]["fork_on"].is_null());
     let markdown = fs::read_to_string(result.directory.join("report.md")).unwrap();
     for expected in [
-        "2 change runtime settings",
-        "1 keep identical runtime settings",
-        "2 are not ablated",
-        "1 have unavailable configuration",
-        "Shared control `features.kd4_runtime`",
+        "6 inventoried features",
+        "Configured fork_on / reference",
         "core/tests.rs::runtime_contract",
-        "not controlled in either fork arm",
         "100.0% incomplete",
         "Excluded pairs",
         "100.0%",
@@ -477,7 +453,8 @@ fn report_write_exposes_ablation_scope_verification_and_incomplete_pair_rates() 
         .iter()
         .filter(|row| row["scheduledPairSlots"] == 1)
         .collect();
-    assert_eq!(represented.len(), 2);
+    assert_eq!(represented.len(), 1);
+    assert_eq!(represented[0]["kind"], "overall");
     assert!(represented.iter().all(|row| row["excludedPairRate"] == 1.0));
 }
 
@@ -870,7 +847,7 @@ fn reports_compare_versioned_behavior_from_all_frozen_audit_sessions() {
             && item.cluster == 0
             && !item.warmup
     });
-    assert_eq!(prepared.schedule.len(), 3);
+    assert_eq!(prepared.schedule.len(), 2);
     fs::create_dir_all(&prepared.runs_directory).unwrap();
     let manifest = prepared.directory.join("prepared.json");
     write_json(&manifest, &prepared).unwrap();
@@ -882,7 +859,6 @@ fn reports_compare_versioned_behavior_from_all_frozen_audit_sessions() {
         fs::create_dir_all(&item.evidence_directory).unwrap();
         let searches = match scheduled.variant {
             Variant::Reference => 3,
-            Variant::ForkOff => 4,
             Variant::ForkOn => 1,
         };
         let capture = item.evidence_directory.join("requests.jsonl");
@@ -979,7 +955,7 @@ fn reports_compare_versioned_behavior_from_all_frozen_audit_sessions() {
         mode: prepared.mode,
         original_run: None,
         attempts,
-        scripted_execution_ms: 300,
+        scripted_execution_ms: 200,
         real_model_execution_ms: 0,
         finished: true,
     };
@@ -987,17 +963,17 @@ fn reports_compare_versioned_behavior_from_all_frozen_audit_sessions() {
     crate::reports::write(&prepared, &result).unwrap();
     let report: Value = read_json(&result.directory.join("report.json")).unwrap();
     assert_eq!(report["behaviorSchemaVersion"], 2);
-    assert_eq!(report["completion"]["completed"], 3);
+    assert_eq!(report["completion"]["completed"], 2);
     let comparisons = report["comparisons"].as_array().unwrap();
     let retries = comparisons
         .iter()
-        .find(|value| value["metric"] == "tool_retries" && value["kind"] == "feature_effect")
+        .find(|value| value["metric"] == "tool_retries" && value["kind"] == "overall")
         .unwrap();
     assert_eq!(retries["candidateDistribution"]["median"], 1.0);
-    assert_eq!(retries["baselineDistribution"]["median"], 4.0);
+    assert_eq!(retries["baselineDistribution"]["median"], 3.0);
     let reentries = comparisons
         .iter()
-        .find(|value| value["metric"] == "tool_reentries" && value["kind"] == "feature_effect")
+        .find(|value| value["metric"] == "tool_reentries" && value["kind"] == "overall")
         .unwrap();
     assert_eq!(reentries["candidateDistribution"]["median"], 2.0);
     assert_eq!(reentries["baselineDistribution"]["median"], 2.0);
@@ -1006,7 +982,8 @@ fn reports_compare_versioned_behavior_from_all_frozen_audit_sessions() {
             .unwrap()
             .contains("tool_retries (count)")
     );
-    for (kind, expected) in [("drift", 1.0), ("feature_effect", -3.0), ("overall", -2.0)] {
+    {
+        let (kind, expected) = ("overall", -2.0);
         let comparison = comparisons
             .iter()
             .find(|value| value["metric"] == "discovery_searches" && value["kind"] == kind)

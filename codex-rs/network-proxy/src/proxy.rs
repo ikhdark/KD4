@@ -880,7 +880,10 @@ impl NetworkProxy {
         Ok(addrs)
     }
 
-    #[expect(clippy::await_holding_invalid_type, reason = "Keep asynchronous validation and settings publication in one serialized configuration transaction")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Keep asynchronous validation and settings publication in one serialized configuration transaction"
+    )]
     pub async fn replace_config_state(&self, new_state: ConfigState) -> Result<()> {
         let _update = self.config_update_lock.lock().await;
         let current_cfg = self.state.current_cfg().await?;

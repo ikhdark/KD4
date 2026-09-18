@@ -84,6 +84,10 @@ fn collect_with_discovery(
         if contexts.len() == MAX_SELECTED_PATHS || remaining < 1024 || index == MAX_PATH_CANDIDATES
         {
             if let Some((_, content)) = contexts.last_mut() {
+                #[expect(
+                    clippy::expect_used,
+                    reason = "path_tokens yields plain strings, which always serialize"
+                )]
                 let omitted = serde_json::to_string(&tokens[index..]).expect("path strings");
                 content.push_str(&truncate_context(
                     format!(

@@ -33,26 +33,68 @@ class BuildToolingStorageTest(unittest.TestCase):
             def child(command, *, env, check):
                 self.assertTrue(rust_build_status.lane_active_lock_is_held(target))
                 self.assertNotIn("CARGO_TARGET_DIR", env)
-                self.assertEqual(command[-4:], ["--target-dir", str(target.resolve()), "-p", "example"])
+                self.assertEqual(
+                    command[-4:],
+                    ["--target-dir", str(target.resolve()), "-p", "example"],
+                )
                 return subprocess.CompletedProcess(command, 7)
 
             with (
                 mock.patch.dict(os.environ, {}, clear=True),
-                mock.patch.object(rust_build_status, "maintain_cargo_lanes") as maintain,
-                mock.patch.object(rust_build_status.subprocess, "run", side_effect=child),
-                mock.patch.object(rust_build_status.time, "perf_counter_ns",
-                                  side_effect=[0, 2_000_000, 5_000_000, 12_000_000, 23_000_000, 24_000_000]),
+                mock.patch.object(
+                    rust_build_status, "maintain_cargo_lanes"
+                ) as maintain,
+                mock.patch.object(
+                    rust_build_status.subprocess, "run", side_effect=child
+                ),
+                mock.patch.object(
+                    rust_build_status.time,
+                    "perf_counter_ns",
+                    side_effect=[
+                        0,
+                        2_000_000,
+                        5_000_000,
+                        12_000_000,
+                        23_000_000,
+                        24_000_000,
+                    ],
+                ),
             ):
-                self.assertEqual(rust_build_status.main([
-                    "run-lane", "--repo-root", str(repo), "--lane", "unit",
-                    "--timing-json", str(output), "--", "cargo", "check", "-p", "example",
-                ]), 7)
+                self.assertEqual(
+                    rust_build_status.main(
+                        [
+                            "run-lane",
+                            "--repo-root",
+                            str(repo),
+                            "--lane",
+                            "unit",
+                            "--timing-json",
+                            str(output),
+                            "--",
+                            "cargo",
+                            "check",
+                            "-p",
+                            "example",
+                        ]
+                    ),
+                    7,
+                )
             record = json.loads(output.read_text())
-            self.assertEqual(record["phaseDurationsMs"], {
-                "reservation": 2, "setup": 3, "maintenance": 7, "command": 11, "release": 1,
-            })
+            self.assertEqual(
+                record["phaseDurationsMs"],
+                {
+                    "reservation": 2,
+                    "setup": 3,
+                    "maintenance": 7,
+                    "command": 11,
+                    "release": 1,
+                },
+            )
             self.assertEqual(record["totalMs"], 24)
-            self.assertEqual((record["schemaVersion"], record["status"], record["exitCode"]), (1, "failed", 7))
+            self.assertEqual(
+                (record["schemaVersion"], record["status"], record["exitCode"]),
+                (1, "failed", 7),
+            )
             self.assertEqual(record["resolvedLane"], "unit")
             self.assertEqual(record["command"], ["cargo", "check", "-p", "example"])
             maintain.assert_called_once_with(repo, target.parent.resolve())
@@ -62,27 +104,69 @@ class BuildToolingStorageTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp) / "timing.json"
             with (
-                mock.patch.object(rust_build_status, "reserve_cargo_lane", side_effect=RuntimeError("busy")),
+                mock.patch.object(
+                    rust_build_status,
+                    "reserve_cargo_lane",
+                    side_effect=RuntimeError("busy"),
+                ),
                 mock.patch.object(rust_build_status.subprocess, "run") as child,
-                mock.patch.object(rust_build_status.time, "perf_counter_ns", side_effect=[0, 9_000_000]),
+                mock.patch.object(
+                    rust_build_status.time,
+                    "perf_counter_ns",
+                    side_effect=[0, 9_000_000],
+                ),
                 contextlib.redirect_stderr(io.StringIO()),
             ):
-                self.assertEqual(rust_build_status.main([
-                    "run-lane", "--lane", "unit", "--timing-json", str(output), "--", "cargo", "check",
-                ]), 2)
+                self.assertEqual(
+                    rust_build_status.main(
+                        [
+                            "run-lane",
+                            "--lane",
+                            "unit",
+                            "--timing-json",
+                            str(output),
+                            "--",
+                            "cargo",
+                            "check",
+                        ]
+                    ),
+                    2,
+                )
             child.assert_not_called()
             record = json.loads(output.read_text())
-            self.assertEqual(record["phaseDurationsMs"], {
-                "reservation": 9, "setup": None, "maintenance": None, "command": None, "release": None,
-            })
+            self.assertEqual(
+                record["phaseDurationsMs"],
+                {
+                    "reservation": 9,
+                    "setup": None,
+                    "maintenance": None,
+                    "command": None,
+                    "release": None,
+                },
+            )
             self.assertEqual(record["status"], "error")
             self.assertEqual(record["errorType"], "RuntimeError")
             self.assertIsNone(record["exitCode"])
             # Reusing the path must preserve earlier evidence and prevent a build.
-            with mock.patch.object(rust_build_status.subprocess, "run") as child, contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual(rust_build_status.main([
-                    "run-lane", "--lane", "unit", "--timing-json", str(output), "--", "cargo", "check",
-                ]), 2)
+            with (
+                mock.patch.object(rust_build_status.subprocess, "run") as child,
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(
+                    rust_build_status.main(
+                        [
+                            "run-lane",
+                            "--lane",
+                            "unit",
+                            "--timing-json",
+                            str(output),
+                            "--",
+                            "cargo",
+                            "check",
+                        ]
+                    ),
+                    2,
+                )
             child.assert_not_called()
             self.assertEqual(json.loads(output.read_text()), record)
 

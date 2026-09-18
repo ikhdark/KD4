@@ -1271,11 +1271,18 @@ def run_in_cargo_lane(
     # Open exclusively before any child work: a bad path must not launch a build
     # or overwrite an earlier measurement. Reporting never changes the child exit.
     stream = timing_path.open("x", encoding="utf-8") if timing_path else None
-    phases = dict.fromkeys(("reservation", "setup", "maintenance", "command", "release"))
+    phases = dict.fromkeys(
+        ("reservation", "setup", "maintenance", "command", "release")
+    )
     record = {
-        "schemaVersion": 1, "startedUnixMs": time.time_ns() // 1_000_000,
-        "requestedLane": requested_lane, "resolvedLane": None, "targetDir": None,
-        "command": list(command), "exitCode": None, "status": "error",
+        "schemaVersion": 1,
+        "startedUnixMs": time.time_ns() // 1_000_000,
+        "requestedLane": requested_lane,
+        "resolvedLane": None,
+        "targetDir": None,
+        "command": list(command),
+        "exitCode": None,
+        "status": "error",
         "phaseDurationsMs": phases,
     }
     phase = "reservation"
@@ -1319,21 +1326,30 @@ def run_in_cargo_lane(
                 target_dir,
             )
             if not Path(child_command[0]).parent.name:
-                resolved_program = shutil.which(child_command[0], path=child_env.get("PATH"))
+                resolved_program = shutil.which(
+                    child_command[0], path=child_env.get("PATH")
+                )
                 if resolved_program is not None:
                     child_command[0] = resolved_program
             next_phase("maintenance")
             maintain_cargo_lanes(repo_root, target_dir.parent)
             next_phase("command")
             try:
-                exit_code = subprocess.run(child_command, env=child_env, check=False).returncode
-                record.update(exitCode=exit_code, status="completed" if exit_code == 0 else "failed")
+                exit_code = subprocess.run(
+                    child_command, env=child_env, check=False
+                ).returncode
+                record.update(
+                    exitCode=exit_code,
+                    status="completed" if exit_code == 0 else "failed",
+                )
                 return exit_code
             finally:
                 next_phase("release")
     except BaseException as error:
-        record.update(status="interrupted" if isinstance(error, KeyboardInterrupt) else "error",
-                      errorType=type(error).__name__)
+        record.update(
+            status="interrupted" if isinstance(error, KeyboardInterrupt) else "error",
+            errorType=type(error).__name__,
+        )
         raise
     finally:
         next_phase(None)
@@ -1344,7 +1360,10 @@ def run_in_cargo_lane(
                     json.dump(record, stream, indent=2)
                     stream.write("\n")
             except OSError as error:
-                print(f"warning: Cargo lane timing could not be saved: {error}", file=sys.stderr)
+                print(
+                    f"warning: Cargo lane timing could not be saved: {error}",
+                    file=sys.stderr,
+                )
 
 
 def is_protected_target_dir_name(name: str) -> bool:
@@ -1944,8 +1963,11 @@ def main(argv: list[str] | None = None) -> int:
     run_lane_parser.add_argument("--lane", required=True)
     run_lane_parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     run_lane_parser.add_argument("--lanes-root", type=Path)
-    run_lane_parser.add_argument("--timing-json", type=Path,
-                                 help="Write phase durations to a new JSON file (never overwrite).")
+    run_lane_parser.add_argument(
+        "--timing-json",
+        type=Path,
+        help="Write phase durations to a new JSON file (never overwrite).",
+    )
     run_lane_parser.add_argument(
         "--lock-timeout-seconds",
         type=positive_float,

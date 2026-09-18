@@ -249,7 +249,7 @@ fn approval_text(
         }
         sections.join("\n\n")
     };
-    let text = match approval_policy {
+    match approval_policy {
         AskForApproval::Never => APPROVAL_POLICY_NEVER.to_string(),
         AskForApproval::UnlessTrusted => {
             with_request_permissions_tool(APPROVAL_POLICY_UNLESS_TRUSTED)
@@ -261,9 +261,7 @@ fn approval_text(
             exec_permission_approvals_enabled,
             request_permissions_tool_enabled,
         ),
-    };
-
-    text
+    }
 }
 
 fn sandbox_text(mode: SandboxMode, network_access: NetworkAccess) -> String {

@@ -1,10 +1,16 @@
-use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
+use serde::Deserialize;
+use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -82,7 +88,8 @@ pub fn git(root: &Path, args: &[&str]) -> Result<String> {
 pub fn git_path(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
-        use std::path::{Component, Prefix};
+        use std::path::Component;
+        use std::path::Prefix;
         if let Some(Component::Prefix(prefix)) = path.components().next() {
             let base = match prefix.kind() {
                 Prefix::VerbatimDisk(drive) => Some(PathBuf::from(format!("{}:\\", drive as char))),
@@ -297,6 +304,12 @@ fn make_writable(path: &Path) -> Result<()> {
     {
         let mut permissions = fs::metadata(path)?.permissions();
         if permissions.readonly() {
+            // Windows-only: this clears the read-only attribute and grants no
+            // extra access. The lint's concern is the Unix world-writable mode.
+            #[expect(
+                clippy::permissions_set_readonly_false,
+                reason = "cfg(windows) only, where this clears the read-only attribute"
+            )]
             permissions.set_readonly(false);
             fs::set_permissions(path, permissions)?;
         }
@@ -380,7 +393,9 @@ pub fn materialize_commit(repo: &Path, revision: &str, destination: &Path) -> Re
         revision,
     ]))?;
     // One cat-file process avoids a process launch for every tracked file.
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::BufRead;
+    use std::io::BufReader;
+    use std::io::Write;
     use std::process::Stdio;
     let mut command = Command::new("git");
     command

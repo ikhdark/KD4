@@ -1340,7 +1340,7 @@ mod tests {
             parse_shell_script_with_full_paths(script).as_slice(),
             [ParsedCommand::Search { query: Some(query), path: Some(path), .. }]
                 if query == "needle"
-                    && PathBuf::from(path) == PathBuf::from("home/memories").join("rollout_summaries")
+                    && std::path::Path::new(path) == PathBuf::from("home/memories").join("rollout_summaries")
         ));
         assert!(matches!(
             parse_shell_script("rg needle home/memories/rollout_summaries").as_slice(),

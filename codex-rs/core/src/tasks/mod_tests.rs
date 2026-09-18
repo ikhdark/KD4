@@ -1031,7 +1031,19 @@ async fn terminalization_publishes_abort_while_worker_is_synchronously_blocked()
         true
     }));
     assert!(!late_tool_accepted);
-    let mut terminal = Vec::new();
+    // Interaction release precedes terminal-event publication. Wait for the
+    // observable event while the worker remains blocked by ReleaseWorker.
+    let aborted = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let EventMsg::TurnAborted(aborted) = events.recv().await.unwrap().msg {
+                break aborted;
+            }
+        }
+    })
+    .await
+    .expect("terminal event must not wait for the blocked worker");
+    assert!(!worker_done.load(Ordering::Acquire));
+    let mut terminal = vec![aborted];
     while let Ok(event) = events.try_recv() {
         if let EventMsg::TurnAborted(aborted) = event.msg {
             terminal.push(aborted);

@@ -564,11 +564,20 @@ fn namespaced_tools_preserve_domain_action_milestones() {
     assert_eq!(timing.milestones.first_infrastructure_action_ms, Some(3));
     assert_eq!(timing.milestones.first_tool_discovery_action_ms, Some(11));
     assert_eq!(timing.milestones.first_useful_tool_accepted_ms, Some(13));
-    assert_eq!(timing.milestones.first_useful_tool_gate_admitted_ms, Some(14));
+    assert_eq!(
+        timing.milestones.first_useful_tool_gate_admitted_ms,
+        Some(14)
+    );
     assert_eq!(timing.milestones.first_domain_action_ms, Some(15));
     assert_eq!(timing.milestones.first_useful_action_ms, Some(15));
-    assert_eq!(timing.milestones.first_successful_domain_action_ms, Some(16));
-    assert_eq!(timing.milestones.first_successful_useful_action_ms, Some(16));
+    assert_eq!(
+        timing.milestones.first_successful_domain_action_ms,
+        Some(16)
+    );
+    assert_eq!(
+        timing.milestones.first_successful_useful_action_ms,
+        Some(16)
+    );
     assert_eq!(timing.counters.tool_call_count, 4);
 }
 

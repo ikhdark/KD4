@@ -191,7 +191,7 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 temp_path / "fake-codex.cmd",
                 timestamp=source_timestamp,
             )
-            self.write_build_stamp("release", source_timestamp, fake_codex)
+            self.write_build_stamp("local-release", source_timestamp, fake_codex)
             self.touch_tracked_source(source_timestamp + 10)
 
             result = self.run_script(
@@ -213,9 +213,9 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 "autoSkipBuildReason: tracked publish inputs changed",
                 result.stdout,
             )
-            self.assertIn("buildCommand: cargo --config", result.stdout)
+            self.assertIn("buildCommand: cargo build --target-dir", result.stdout)
             self.assertIn(" build --target-dir ", result.stdout)
-            self.assertIn("--profile release", result.stdout)
+            self.assertIn("--profile local-release", result.stdout)
             self.assertIn("(not run)", result.stdout)
             self.assertNotIn("buildCommand: <skipped>", result.stdout)
 
@@ -229,7 +229,7 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 temp_path / "fake-codex.cmd",
                 timestamp=source_timestamp,
             )
-            self.write_build_stamp("release", source_timestamp, fake_codex)
+            self.write_build_stamp("local-release", source_timestamp, fake_codex)
             tracked = self.repo_root / "codex-rs" / "tracked-source.rs"
             original_stat = tracked.stat()
             original_size = original_stat.st_size
@@ -260,7 +260,7 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 "autoSkipBuildReason: tracked publish inputs changed",
                 result.stdout,
             )
-            self.assertIn("buildCommand: cargo --config", result.stdout)
+            self.assertIn("buildCommand: cargo build --target-dir", result.stdout)
             self.assertNotIn("buildCommand: <skipped>", result.stdout)
 
     def test_auto_skip_build_scans_committed_publish_entrypoint(self) -> None:
@@ -280,7 +280,7 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
             self.run_git("commit", "--quiet", "-m", "add publish entrypoint")
             os.utime(entrypoint, (source_timestamp + 10, source_timestamp + 10))
             self.assertEqual(self.run_git("status", "--porcelain").stdout, "")
-            self.write_build_stamp("release", source_timestamp, fake_codex)
+            self.write_build_stamp("local-release", source_timestamp, fake_codex)
             entrypoint.write_text("# changed publish entrypoint\n", encoding="utf-8")
             os.utime(entrypoint, (source_timestamp + 10, source_timestamp + 10))
 
@@ -303,7 +303,7 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 "autoSkipBuildReason: tracked publish inputs changed",
                 result.stdout,
             )
-            self.assertIn("buildCommand: cargo --config", result.stdout)
+            self.assertIn("buildCommand: cargo build --target-dir", result.stdout)
             self.assertNotIn("buildCommand: <skipped>", result.stdout)
 
     def test_auto_skip_build_ignores_unrelated_source_changes(self) -> None:
@@ -316,7 +316,7 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 temp_path / "fake-codex.cmd",
                 timestamp=source_timestamp + 20,
             )
-            self.write_build_stamp("release", source_timestamp, fake_codex)
+            self.write_build_stamp("local-release", source_timestamp, fake_codex)
             self.touch_unrelated_source(source_timestamp + 10)
 
             result = self.run_script(
@@ -358,7 +358,7 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 self.source_code_mode_host,
                 (sidecar_timestamp, sidecar_timestamp),
             )
-            self.write_build_stamp("release", source_timestamp, fake_codex)
+            self.write_build_stamp("local-release", source_timestamp, fake_codex)
 
             result = self.run_script(
                 "-DryRun",
@@ -411,7 +411,7 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 self.source_code_mode_host,
                 (sidecar_timestamp, sidecar_timestamp),
             )
-            self.write_build_stamp("release", source_timestamp, fake_codex)
+            self.write_build_stamp("local-release", source_timestamp, fake_codex)
 
             result = self.run_script(
                 "-DryRun",
@@ -466,7 +466,7 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 encoding="utf-8",
             )
             os.utime(fake_codex, (source_timestamp, source_timestamp))
-            self.write_build_stamp("release", source_timestamp, fake_codex)
+            self.write_build_stamp("local-release", source_timestamp, fake_codex)
 
             result = self.run_script(
                 "-AutoSkipBuild",
@@ -514,7 +514,7 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 temp_path / "fake-codex.cmd",
                 timestamp=source_timestamp,
             )
-            self.write_build_stamp("release", source_timestamp, fake_codex)
+            self.write_build_stamp("local-release", source_timestamp, fake_codex)
             original_stat = fake_codex.stat()
             original_bytes = fake_codex.read_bytes()
             changed_bytes = original_bytes.replace(b"test-commit", b"best-commit")
@@ -545,7 +545,7 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 "autoSkipBuildReason: source artifact differs from stamped build",
                 result.stdout,
             )
-            self.assertIn("buildCommand: cargo --config", result.stdout)
+            self.assertIn("buildCommand: cargo build --target-dir", result.stdout)
             self.assertNotIn("buildCommand: <skipped>", result.stdout)
 
     def test_auto_skip_build_requires_code_mode_host_artifact(self) -> None:
@@ -577,7 +577,7 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
             )
             self.assertIn("autoSkipBuild: false", result.stdout)
             self.assertIn("autoSkipBuildReason: source artifact missing", result.stdout)
-            self.assertIn("buildCommand: cargo --config", result.stdout)
+            self.assertIn("buildCommand: cargo build --target-dir", result.stdout)
             self.assertIn("-p codex-cli -p codex-code-mode-host", result.stdout)
 
     def test_auto_skip_build_does_not_skip_without_build_stamp(self) -> None:
@@ -608,9 +608,9 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 "autoSkipBuildReason: build stamp missing",
                 result.stdout,
             )
-            self.assertIn("buildCommand: cargo --config", result.stdout)
+            self.assertIn("buildCommand: cargo build --target-dir", result.stdout)
             self.assertIn(" build --target-dir ", result.stdout)
-            self.assertIn("--profile release", result.stdout)
+            self.assertIn("--profile local-release", result.stdout)
             self.assertIn("(not run)", result.stdout)
             self.assertNotIn("buildCommand: <skipped>", result.stdout)
 
@@ -628,7 +628,7 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 self.repo_root
                 / "codex-rs"
                 / "target"
-                / "codex-local-publish-release.stamp"
+                / "codex-local-publish-local-release.stamp"
             )
             stamp.parent.mkdir(parents=True)
             stamp.write_text("2000-01-01T00:00:00.0000000Z", encoding="utf-8")
@@ -652,7 +652,7 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 "autoSkipBuildReason: build stamp legacy or invalid",
                 result.stdout,
             )
-            self.assertIn("buildCommand: cargo --config", result.stdout)
+            self.assertIn("buildCommand: cargo build --target-dir", result.stdout)
             self.assertNotIn("buildCommand: <skipped>", result.stdout)
 
     def test_print_built_codex_path_uses_profile_output_dir(self) -> None:
@@ -667,8 +667,8 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
             self.repo_root
             / "codex-rs"
             / "target"
-            / "publish-release"
-            / "release"
+            / "publish-local-release"
+            / "local-release"
             / "codex.exe",
         )
 
@@ -688,21 +688,19 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
             / "codex.exe",
         )
 
-        local_release_result = self.run_script(
-            "-PrintBuiltCodexPath", "-Profile", "local-release"
-        )
+        release_result = self.run_script("-PrintBuiltCodexPath", "-Profile", "release")
         self.assertEqual(
-            local_release_result.returncode,
+            release_result.returncode,
             0,
-            f"stdout:\n{local_release_result.stdout}\nstderr:\n{local_release_result.stderr}",
+            f"stdout:\n{release_result.stdout}\nstderr:\n{release_result.stderr}",
         )
         self.assertEqual(
-            Path(local_release_result.stdout.strip()),
+            Path(release_result.stdout.strip()),
             self.repo_root
             / "codex-rs"
             / "target"
-            / "publish-local-release"
-            / "local-release"
+            / "publish-release"
+            / "release"
             / "codex.exe",
         )
 
@@ -745,6 +743,8 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
 
             result = self.run_script(
                 "-DryRun",
+                "-Profile",
+                "release",
                 "-SourceExe",
                 str(fake_codex),
                 "-InstallDir",
@@ -756,6 +756,7 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 0,
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
+            self.assertIn("--profile release", result.stdout)
             self.assertNotIn("preflightCheckCommand:", result.stdout)
             self.assertNotIn(" check --target-dir ", result.stdout)
             self.assertIn("buildCommand: cargo --config", result.stdout)

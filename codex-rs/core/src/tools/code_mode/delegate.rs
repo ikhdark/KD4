@@ -670,7 +670,8 @@ mod tests {
     )]
     async fn broker_notify_cancellation_preserves_physical_live_and_model_history()
     -> anyhow::Result<()> {
-        use codex_protocol::protocol::{EventMsg, RolloutItem};
+        use codex_protocol::protocol::EventMsg;
+        use codex_protocol::protocol::RolloutItem;
         use std::time::Duration;
 
         fn outputs(items: &[ResponseItem], call: &str) -> Vec<ResponseItem> {

@@ -481,17 +481,16 @@ fn render_json_schema_object(
         if required.contains(name) && value == &JsonValue::Bool(false) {
             return Ok("never".to_string());
         }
-        if multiline
-            && let Some(description) = value.get("description").and_then(JsonValue::as_str)
+        if multiline && let Some(description) = value.get("description").and_then(JsonValue::as_str)
         {
-                budget.spend(description.len())?;
-                for description_line in description
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                {
-                    lines.push(format!("// {description_line}"));
-                }
+            budget.spend(description.len())?;
+            for description_line in description
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+            {
+                lines.push(format!("// {description_line}"));
+            }
         }
         budget.spend(name.len().saturating_mul(6))?;
         let property_name = render_json_schema_property_name(name);

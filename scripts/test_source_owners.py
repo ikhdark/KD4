@@ -11,18 +11,21 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts import source_owners
-from scripts.generated_output_lock import source_map_lock
+from scripts import source_owners  # noqa: E402
+from scripts.generated_output_lock import source_map_lock  # noqa: E402
 
 
 class SourceOwnersTest(unittest.TestCase):
-    def test_slice_focus_resolves_ownership_and_exposes_ambiguity_through_cli(self) -> None:
+    def test_slice_focus_resolves_ownership_and_exposes_ambiguity_through_cli(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "alpha").mkdir()
             (root / "beta").mkdir()
             manifest = root / "owners.toml"
-            manifest.write_text('''schema_version = 2
+            manifest.write_text(
+                """schema_version = 2
 [[owners]]
 id = "alpha"
 roots = ["alpha"]
@@ -34,7 +37,9 @@ id = "beta"
 roots = ["beta"]
 aliases = ["shared label"]
 ambiguous_with = ["alpha"]
-''', encoding="utf-8")
+""",
+                encoding="utf-8",
+            )
             for focus, extra, expected, status in [
                 ("fix output routing", [], ["alpha"], "selected"),
                 ("retain final diagnostics after failure", [], ["alpha"], "selected"),
@@ -44,34 +49,72 @@ ambiguous_with = ["alpha"]
                 ("output routing", ["--owner", "beta"], ["beta"], None),
             ]:
                 with self.subTest(focus=focus, extra=extra):
-                    completed = subprocess.run([
-                        sys.executable, str(REPO_ROOT / "scripts/source_owners.py"), "slice",
-                        "--manifest", str(manifest), "--repo-root", str(root),
-                        "--architecture-index", str(root / "missing-index.json"),
-                        "--focus", focus, *extra,
-                    ], text=True, capture_output=True, check=False)
+                    completed = subprocess.run(
+                        [
+                            sys.executable,
+                            str(REPO_ROOT / "scripts/source_owners.py"),
+                            "slice",
+                            "--manifest",
+                            str(manifest),
+                            "--repo-root",
+                            str(root),
+                            "--architecture-index",
+                            str(root / "missing-index.json"),
+                            "--focus",
+                            focus,
+                            *extra,
+                        ],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
                     self.assertEqual(completed.returncode, 0, completed.stderr)
                     result = json.loads(completed.stdout)
-                    self.assertTrue(result["snapshot"].startswith("slice-v4:" + ",".join(expected) + ":routing:"))
+                    self.assertTrue(
+                        result["snapshot"].startswith(
+                            "slice-v4:" + ",".join(expected) + ":routing:"
+                        )
+                    )
                     if status is None:
                         self.assertNotIn("owner_resolution", result)
                     else:
                         self.assertEqual(result["owner_resolution"]["status"], status)
-                        self.assertEqual(result["owner_resolution"]["candidates"], expected)
+                        self.assertEqual(
+                            result["owner_resolution"]["candidates"], expected
+                        )
                     if status in {"ambiguous", "unresolved"}:
-                        self.assertTrue(any(status in str(item) for item in result["material_unknowns"]))
+                        self.assertTrue(
+                            any(
+                                status in str(item)
+                                for item in result["material_unknowns"]
+                            )
+                        )
 
-    def test_compact_slice_cli_preserves_relationships_and_shared_scenario(self) -> None:
-        argv = ["source_owners.py", "slice", "--path", "scripts/source_owners.py", "--max-bytes", "10000"]
+    def test_compact_slice_cli_preserves_relationships_and_shared_scenario(
+        self,
+    ) -> None:
+        argv = [
+            "source_owners.py",
+            "slice",
+            "--path",
+            "scripts/source_owners.py",
+            "--max-bytes",
+            "10000",
+        ]
         with mock.patch.object(sys, "argv", argv), mock.patch("builtins.print") as emit:
             self.assertEqual(source_owners.main(), 0)
         rich_wire = emit.call_args.args[0]
         rich = json.loads(rich_wire)
-        with mock.patch.object(sys, "argv", [*argv, "--compact"]), mock.patch("builtins.print") as emit:
+        with (
+            mock.patch.object(sys, "argv", [*argv, "--compact"]),
+            mock.patch("builtins.print") as emit,
+        ):
             self.assertEqual(source_owners.main(), 0)
         compact_wire = emit.call_args.args[0]
         compact = json.loads(compact_wire)
-        self.assertLess(len(compact_wire.encode("utf-8")), len(rich_wire.encode("utf-8")))
+        self.assertLess(
+            len(compact_wire.encode("utf-8")), len(rich_wire.encode("utf-8"))
+        )
         self.assertLessEqual(len((compact_wire + "\n").encode("utf-8")), 10000)
         self.assertEqual(compact["format"], "compact-slice-v1")
         self.assertEqual(compact["snapshot"], rich["snapshot"])
@@ -80,7 +123,9 @@ ambiguous_with = ["alpha"]
         for facet in source_owners.ARCHITECTURE_FACETS:
             if facet in rich:
                 expanded = dict(compact[facet])
-                expanded["relationships"] = [records[ref] for ref in expanded["relationships"]]
+                expanded["relationships"] = [
+                    records[ref] for ref in expanded["relationships"]
+                ]
                 if expanded.get("representative_scenario") is not None:
                     scenario_ref = expanded["representative_scenario"]
                     self.assertIn(scenario_ref, compact[facet]["relationships"])
@@ -96,10 +141,13 @@ ambiguous_with = ["alpha"]
             manifest_path = root / "source_owners.toml"
             manifest_path.write_text(
                 'schema_version = 2\n[[owners]]\nid = "alpha"\nroots = ["source.rs"]\n'
-                'primary_entries = [{path = "source.rs", symbol = "entry"}]\n', encoding="utf-8"
+                'primary_entries = [{path = "source.rs", symbol = "entry"}]\n',
+                encoding="utf-8",
             )
             manifest, digest = source_owners.load_and_validate(manifest_path, root)
-            expected_snapshot = source_owners.architecture_slice(manifest, digest, root, ["alpha"])["snapshot"]
+            expected_snapshot = source_owners.architecture_slice(
+                manifest, digest, root, ["alpha"]
+            )["snapshot"]
             manifest_bytes = manifest_path.stat().st_size
             read_bytes = Path.read_bytes
             reads = []
@@ -113,7 +161,20 @@ ambiguous_with = ["alpha"]
 
             output = io.StringIO()
             with (
-                mock.patch.object(sys, "argv", ["source_owners.py", "slice", "--manifest", str(manifest_path), "--architecture-index", str(root / "missing.json"), "--owner", "alpha"]),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "source_owners.py",
+                        "slice",
+                        "--manifest",
+                        str(manifest_path),
+                        "--architecture-index",
+                        str(root / "missing.json"),
+                        "--owner",
+                        "alpha",
+                    ],
+                ),
                 mock.patch.object(Path, "read_bytes", capture),
                 mock.patch.object(sys, "stdout", output),
             ):
@@ -122,25 +183,38 @@ ambiguous_with = ["alpha"]
             self.assertEqual(reads, [source])
             self.assertEqual(result["snapshot"], expected_snapshot)
             self.assertEqual(result["metrics"]["command"]["files_read"], 2)
-            self.assertEqual(result["metrics"]["command"]["bytes_read"], manifest_bytes + len(original))
+            self.assertEqual(
+                result["metrics"]["command"]["bytes_read"],
+                manifest_bytes + len(original),
+            )
             self.assertGreaterEqual(result["metrics"]["command"]["elapsed_ms"], 0)
             self.assertIsNone(result["metrics"]["late_relationship_discoveries"])
 
     def test_contract_association_requires_the_exact_test_symbol(self) -> None:
         owner = {
-            "id": "alpha", "tests": ["tests.py"],
+            "id": "alpha",
+            "tests": ["tests.py"],
             "relationships": [
-                {"category": "tests_contracts", "kind": "validated_by",
-                 "target": "path:tests.py", "confidence": "declared",
-                 "evidence": [{"path": "tests.py", "symbol": symbol}]}
+                {
+                    "category": "tests_contracts",
+                    "kind": "validated_by",
+                    "target": "path:tests.py",
+                    "confidence": "declared",
+                    "evidence": [{"path": "tests.py", "symbol": symbol}],
+                }
                 for symbol in ["rejects_cancelled_write", "accepts_valid_write"]
             ],
-            "invariants": [{
-                "id": "cancelled", "kind": "semantic",
-                "statement": "Cancelled writes leave the file unchanged.",
-                "tests": ["tests.py"],
-                "evidence": [{"path": "tests.py", "symbol": "rejects_cancelled_write"}],
-            }],
+            "invariants": [
+                {
+                    "id": "cancelled",
+                    "kind": "semantic",
+                    "statement": "Cancelled writes leave the file unchanged.",
+                    "tests": ["tests.py"],
+                    "evidence": [
+                        {"path": "tests.py", "symbol": "rejects_cancelled_write"}
+                    ],
+                }
+            ],
         }
         with tempfile.TemporaryDirectory() as directory:
             result = source_owners.architecture_slice(
@@ -151,30 +225,60 @@ ambiguous_with = ["alpha"]
                 for item in result["tests_and_contracts"]["relationships"]
                 if item.get("scenario_symbols")
             }
-            self.assertEqual(scenarios["rejects_cancelled_write"]["behavioral_contracts"],
-                             ["Cancelled writes leave the file unchanged."])
+            self.assertEqual(
+                scenarios["rejects_cancelled_write"]["behavioral_contracts"],
+                ["Cancelled writes leave the file unchanged."],
+            )
             self.assertNotIn("behavioral_contracts", scenarios["accepts_valid_write"])
             owner["invariants"][0]["evidence"] = [{"path": "tests.py"}]
             unbound = source_owners.architecture_slice(
                 {"owners": [owner]}, "digest", Path(directory), ["alpha"]
             )
-            self.assertFalse(any(item.get("behavioral_contracts") for item in
-                                 unbound["tests_and_contracts"]["relationships"]))
+            self.assertFalse(
+                any(
+                    item.get("behavioral_contracts")
+                    for item in unbound["tests_and_contracts"]["relationships"]
+                )
+            )
 
-    def test_slice_validation_prefers_scenario_then_task_without_inventing_commands(self) -> None:
-        unrelated = {"id": "network", "role": "focused_tests", "argv": ["cargo", "test", "network"]}
-        focused = {"id": "output", "role": "focused_tests", "argv": ["cargo", "test", "output_budget"]}
-        scenario_route = {"id": "effect", "role": "focused_tests", "argv": ["cargo", "test", "submitted_write_changes_file"]}
-        manifest = {"owners": [{"id": "alpha", "validation": [unrelated, focused, scenario_route]}]}
-        result = source_owners.architecture_slice(manifest, "digest", REPO_ROOT, ["alpha"], focus="output budget")
+    def test_slice_validation_prefers_scenario_then_task_without_inventing_commands(
+        self,
+    ) -> None:
+        unrelated = {
+            "id": "network",
+            "role": "focused_tests",
+            "argv": ["cargo", "test", "network"],
+        }
+        focused = {
+            "id": "output",
+            "role": "focused_tests",
+            "argv": ["cargo", "test", "output_budget"],
+        }
+        scenario_route = {
+            "id": "effect",
+            "role": "focused_tests",
+            "argv": ["cargo", "test", "submitted_write_changes_file"],
+        }
+        manifest = {
+            "owners": [
+                {"id": "alpha", "validation": [unrelated, focused, scenario_route]}
+            ]
+        }
+        result = source_owners.architecture_slice(
+            manifest, "digest", REPO_ROOT, ["alpha"], focus="output budget"
+        )
         self.assertEqual(result["tests_and_contracts"]["focused_validation"], [focused])
         self.assertEqual(result["tests_and_contracts"]["omitted_validation_routes"], 2)
         selected, omitted = source_owners._focused_validation_routes(
-            manifest["owners"], {"evidence": "src/effect.rs::submitted_write_changes_file"}, "network"
+            manifest["owners"],
+            {"evidence": "src/effect.rs::submitted_write_changes_file"},
+            "network",
         )
         self.assertEqual(selected, [scenario_route])
         self.assertEqual(omitted, 2)
-        selected, omitted = source_owners._focused_validation_routes(manifest["owners"], None, "unmatched")
+        selected, omitted = source_owners._focused_validation_routes(
+            manifest["owners"], None, "unmatched"
+        )
         self.assertEqual(selected, [unrelated, focused, scenario_route])
         self.assertEqual(omitted, 0)
 
@@ -183,15 +287,34 @@ ambiguous_with = ["alpha"]
             root = Path(directory)
             source = root / "lib.rs"
             source.write_text("fn entry() {}", encoding="utf-8")
-            manifest = {"owners": [{
-                "id": "alpha", "primary_entries": [{"path": "lib.rs", "symbol": "entry"}],
-                "invariants": [{"id": f"contract-{index}", "kind": "semantic",
+            manifest = {
+                "owners": [
+                    {
+                        "id": "alpha",
+                        "primary_entries": [{"path": "lib.rs", "symbol": "entry"}],
+                        "invariants": [
+                            {
+                                "id": f"contract-{index}",
+                                "kind": "semantic",
                                 "statement": f"Behavior {index}: " + "évidence " * 180,
-                                "evidence": [{"path": "lib.rs", "symbol": "entry"}], "tests": []}
-                               for index in range(12)],
-                "validation": [{"id": "focused", "role": "focused_tests", "argv": ["cargo", "test", "entry"]}],
-            }]}
-            result = source_owners.architecture_slice(manifest, "digest", root, ["alpha"], max_bytes=10_000)
+                                "evidence": [{"path": "lib.rs", "symbol": "entry"}],
+                                "tests": [],
+                            }
+                            for index in range(12)
+                        ],
+                        "validation": [
+                            {
+                                "id": "focused",
+                                "role": "focused_tests",
+                                "argv": ["cargo", "test", "entry"],
+                            }
+                        ],
+                    }
+                ]
+            }
+            result = source_owners.architecture_slice(
+                manifest, "digest", root, ["alpha"], max_bytes=10_000
+            )
             wire = (json.dumps(result, indent=2, sort_keys=True) + "\n").encode("utf-8")
             self.assertLessEqual(len(wire), 10_000)
             self.assertTrue(result["truncated"])
@@ -199,24 +322,49 @@ ambiguous_with = ["alpha"]
             self.assertGreater(len(retained), 0)
             self.assertLess(len(retained), 12)
             self.assertEqual(result["invariants"]["status"], "partial")
-            self.assertEqual(result["invariants"]["omitted_relationships"], 12 - len(retained))
-            self.assertEqual(result["tests_and_contracts"]["focused_validation"][0]["argv"], ["cargo", "test", "entry"])
-            continuation = next(item for item in result["continuations"] if item["facet"] == "invariants")
+            self.assertEqual(
+                result["invariants"]["omitted_relationships"], 12 - len(retained)
+            )
+            self.assertEqual(
+                result["tests_and_contracts"]["focused_validation"][0]["argv"],
+                ["cargo", "test", "entry"],
+            )
+            continuation = next(
+                item
+                for item in result["continuations"]
+                if item["facet"] == "invariants"
+            )
             self.assertEqual(continuation["offset"], len(retained))
-            page = source_owners.architecture_slice(manifest, "digest", root, ["alpha"],
-                facet="invariants", offset=continuation["offset"], expected_snapshot=continuation["expected_snapshot"], max_bytes=10_000)
+            page = source_owners.architecture_slice(
+                manifest,
+                "digest",
+                root,
+                ["alpha"],
+                facet="invariants",
+                offset=continuation["offset"],
+                expected_snapshot=continuation["expected_snapshot"],
+                max_bytes=10_000,
+            )
             self.assertTrue(
                 {item["target"] for item in retained}.isdisjoint(
-                    item["target"]
-                    for item in page["invariants"]["relationships"]
+                    item["target"] for item in page["invariants"]["relationships"]
                 )
             )
             manifest["owners"][0]["invariants"][0]["statement"] = "x" * 40_000
             with self.assertRaisesRegex(ValueError, "cannot fit protected evidence"):
-                source_owners.architecture_slice(manifest, "digest", root, ["alpha"], max_bytes=4096)
+                source_owners.architecture_slice(
+                    manifest, "digest", root, ["alpha"], max_bytes=4096
+                )
 
     def test_slice_cli_byte_budget_includes_index_metadata(self) -> None:
-        argv = ["source_owners.py", "slice", "--path", "scripts/source_owners.py", "--max-bytes", "10000"]
+        argv = [
+            "source_owners.py",
+            "slice",
+            "--path",
+            "scripts/source_owners.py",
+            "--max-bytes",
+            "10000",
+        ]
         with mock.patch.object(sys, "argv", argv), mock.patch("builtins.print") as emit:
             self.assertEqual(source_owners.main(), 0)
         wire = emit.call_args.args[0]
@@ -230,11 +378,14 @@ ambiguous_with = ["alpha"]
             root = Path(directory)
             (root / "src/callee").mkdir(parents=True)
             (root / "caller").mkdir()
-            (root / "src/callee/lib.rs").write_text("fn callee() {}\n", encoding="utf-8")
+            (root / "src/callee/lib.rs").write_text(
+                "fn callee() {}\n", encoding="utf-8"
+            )
             caller = root / "caller/lib.rs"
             caller.write_text("fn caller() { callee(); }\n", encoding="utf-8")
             manifest_path = root / "source_owners.toml"
-            manifest_path.write_text('''schema_version = 2
+            manifest_path.write_text(
+                """schema_version = 2
 [[owners]]
 id = "broad"
 roots = ["src"]
@@ -250,37 +401,64 @@ kind = "calls"
 target = "path:src/callee/lib.rs"
 confidence = "declared"
 evidence = [{path = "caller/lib.rs", symbol = "caller"}]
-''', encoding="utf-8")
+""",
+                encoding="utf-8",
+            )
             index_path = root / "architecture_index.json"
 
             def query() -> dict:
-                argv = ["source_owners.py", "slice", "--manifest", str(manifest_path),
-                        "--repo-root", str(root), "--architecture-index", str(index_path),
-                        "--path", "src/callee/lib.rs"]
-                with mock.patch.object(sys, "argv", argv), mock.patch("builtins.print") as emit:
+                argv = [
+                    "source_owners.py",
+                    "slice",
+                    "--manifest",
+                    str(manifest_path),
+                    "--repo-root",
+                    str(root),
+                    "--architecture-index",
+                    str(index_path),
+                    "--path",
+                    "src/callee/lib.rs",
+                ]
+                with (
+                    mock.patch.object(sys, "argv", argv),
+                    mock.patch("builtins.print") as emit,
+                ):
                     self.assertEqual(source_owners.main(), 0)
                 return json.loads(emit.call_args.args[0])
 
             fallback = query()
             edges = fallback["control_and_data_flow"]["relationships"]
-            self.assertEqual([(edge["source"], edge["target"]) for edge in edges],
-                             [("owner:caller", "path:src/callee/lib.rs")])
+            self.assertEqual(
+                [(edge["source"], edge["target"]) for edge in edges],
+                [("owner:caller", "path:src/callee/lib.rs")],
+            )
             self.assertEqual(fallback["control_and_data_flow"]["status"], "established")
             manifest, digest = source_owners.load_and_validate(manifest_path, root)
-            index_path.write_text(source_owners.expected_architecture_index(manifest, digest, root), encoding="utf-8")
+            index_path.write_text(
+                source_owners.expected_architecture_index(manifest, digest, root),
+                encoding="utf-8",
+            )
             indexed = query()
             self.assertEqual(indexed["index_status"], "reused")
-            self.assertEqual(indexed["control_and_data_flow"], fallback["control_and_data_flow"])
+            self.assertEqual(
+                indexed["control_and_data_flow"], fallback["control_and_data_flow"]
+            )
             self.assertEqual(indexed["snapshot"], fallback["snapshot"])
             broad = source_owners.query_graph(manifest, digest, root, ["broad"])
             self.assertEqual(broad["relationships"], [])
-            caller.write_text("fn caller() { changed(); callee(); }\n", encoding="utf-8")
+            caller.write_text(
+                "fn caller() { changed(); callee(); }\n", encoding="utf-8"
+            )
             self.assertNotEqual(query()["snapshot"], indexed["snapshot"])
             caller.unlink()
             with self.assertRaisesRegex(ValueError, "caller/lib.rs"):
-                source_owners.load_and_validate(manifest_path, root, owner_ids=["callee"])
+                source_owners.load_and_validate(
+                    manifest_path, root, owner_ids=["callee"]
+                )
 
-    def test_slice_cli_paginates_every_relationship_and_rejects_changed_sources(self) -> None:
+    def test_slice_cli_paginates_every_relationship_and_rejects_changed_sources(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "src").mkdir()
@@ -289,7 +467,7 @@ evidence = [{path = "caller/lib.rs", symbol = "caller"}]
             manifest_path = root / "source_owners.toml"
             manifest_path.write_text(
                 'schema_version = 2\n[[owners]]\nid = "alpha"\nroots = ["src"]\n'
-                + ''.join(
+                + "".join(
                     '[[owners.relationships]]\ncategory = "control_flow"\nkind = "calls"\n'
                     f'target = "config:edge-{index:03}"\nconfidence = "declared"\n'
                     'evidence = [{ path = "src/lib.rs", symbol = "entry" }]\n'
@@ -299,12 +477,31 @@ evidence = [{path = "caller/lib.rs", symbol = "caller"}]
             )
 
             def query(continuation: dict | None = None) -> dict:
-                argv = ["source_owners.py", "slice", "--manifest", str(manifest_path),
-                        "--repo-root", str(root), "--owner", "alpha", "--max-relationships", "7"]
+                argv = [
+                    "source_owners.py",
+                    "slice",
+                    "--manifest",
+                    str(manifest_path),
+                    "--repo-root",
+                    str(root),
+                    "--owner",
+                    "alpha",
+                    "--max-relationships",
+                    "7",
+                ]
                 if continuation:
-                    argv += ["--facet", continuation["facet"], "--offset", str(continuation["offset"]),
-                             "--expected-snapshot", continuation["expected_snapshot"]]
-                with mock.patch.object(sys, "argv", argv), mock.patch("builtins.print") as emit:
+                    argv += [
+                        "--facet",
+                        continuation["facet"],
+                        "--offset",
+                        str(continuation["offset"]),
+                        "--expected-snapshot",
+                        continuation["expected_snapshot"],
+                    ]
+                with (
+                    mock.patch.object(sys, "argv", argv),
+                    mock.patch("builtins.print") as emit,
+                ):
                     self.assertEqual(source_owners.main(), 0)
                 return json.loads(emit.call_args.args[0])
 
@@ -312,26 +509,45 @@ evidence = [{path = "caller/lib.rs", symbol = "caller"}]
             page = first
             targets = []
             for _ in range(12):
-                targets.extend(edge["target"] for edge in page["control_and_data_flow"]["relationships"])
+                targets.extend(
+                    edge["target"]
+                    for edge in page["control_and_data_flow"]["relationships"]
+                )
                 if not page["continuations"]:
                     break
                 self.assertTrue(page["truncated"])
                 self.assertEqual(len(page["continuations"]), 1)
                 page = query(page["continuations"][0])
                 self.assertEqual(page["snapshot"], first["snapshot"])
-            self.assertEqual(targets, [f"config:edge-{index:03}" for index in range(75)])
+            self.assertEqual(
+                targets, [f"config:edge-{index:03}" for index in range(75)]
+            )
             self.assertFalse(page["truncated"])
             self.assertEqual(page["omitted_relationships"], 0)
             self.assertEqual(page["control_and_data_flow"]["status"], "established")
 
             manifest, digest = source_owners.load_and_validate(manifest_path, root)
             with self.assertRaisesRegex(ValueError, "requires expected_snapshot"):
-                source_owners.architecture_slice(manifest, digest, root, ["alpha"], facet="control_and_data_flow", offset=7)
+                source_owners.architecture_slice(
+                    manifest,
+                    digest,
+                    root,
+                    ["alpha"],
+                    facet="control_and_data_flow",
+                    offset=7,
+                )
             source.write_text("fn entry() { changed(); }\n", encoding="utf-8")
             continuation = first["continuations"][0]
             with self.assertRaisesRegex(ValueError, "snapshot changed"):
-                source_owners.architecture_slice(manifest, digest, root, ["alpha"], facet=continuation["facet"],
-                    offset=continuation["offset"], expected_snapshot=continuation["expected_snapshot"])
+                source_owners.architecture_slice(
+                    manifest,
+                    digest,
+                    root,
+                    ["alpha"],
+                    facet=continuation["facet"],
+                    offset=continuation["offset"],
+                    expected_snapshot=continuation["expected_snapshot"],
+                )
 
     def test_validation_cli_returns_only_the_most_specific_declared_routes(
         self,
@@ -898,9 +1114,7 @@ primary_entries = [{ path = "unrelated.rs", symbol = "unrelated" }]
                                     result["tests_and_contracts"]["focused_validation"],
                                     [],
                                 )
-                                self.assertEqual(
-                                    result["metrics"]["files_read"], 1
-                                )
+                                self.assertEqual(result["metrics"]["files_read"], 1)
                                 # Declaration validation already read owned.rs;
                                 # slice hashing reuses those bytes. Command metrics
                                 # must still count that read and any index read.
@@ -942,7 +1156,7 @@ primary_entries = [{ path = "unrelated.rs", symbol = "unrelated" }]
             manifest_path = root / "source_owners.toml"
             manifest_path.write_text(
                 'schema_version = 2\n[[owners]]\nid = "alpha"\nroots = ["src"]\n'
-                + ''.join(
+                + "".join(
                     '[[owners.relationships]]\ncategory = "control_flow"\nkind = "calls"\n'
                     f'target = "config:edge-{index}"\nconfidence = "declared"\n'
                     'evidence = [{ path = "src/lib.rs", symbol = "entry" }]\n'
@@ -953,14 +1167,29 @@ primary_entries = [{ path = "unrelated.rs", symbol = "unrelated" }]
             for selector in (["alpha"], ["--path", "src/lib.rs"]):
                 with self.subTest(selector=selector):
                     completed = subprocess.run(
-                        ["just", "--justfile", str(REPO_ROOT / "justfile"), "source-owners-slice",
-                         *selector, "--manifest", str(manifest_path), "--repo-root", str(root),
-                         "--max-relationships", "1"],
-                        capture_output=True, text=True, check=True,
+                        [
+                            "just",
+                            "--justfile",
+                            str(REPO_ROOT / "justfile"),
+                            "source-owners-slice",
+                            *selector,
+                            "--manifest",
+                            str(manifest_path),
+                            "--repo-root",
+                            str(root),
+                            "--max-relationships",
+                            "1",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=True,
                     )
                     result = json.loads(completed.stdout)
                     self.assertEqual(
-                        [edge["target"] for edge in result["control_and_data_flow"]["relationships"]],
+                        [
+                            edge["target"]
+                            for edge in result["control_and_data_flow"]["relationships"]
+                        ],
                         ["config:edge-0"],
                     )
                     self.assertEqual(result["omitted_relationships"], 2)
@@ -1359,7 +1588,7 @@ invariants = [{ id = "stable", kind = "semantic", statement = "Stable.", evidenc
                 mock.patch.object(
                     source_owners,
                     "confined_path",
-                    wraps=source_owners.confined_path,
+                    return_value=source,
                 ) as resolve_path,
                 mock.patch.object(Path, "stat", tracked_stat),
             ):

@@ -17,7 +17,8 @@ use tokio::time::Instant;
 
 #[tokio::test(start_paused = true)]
 async fn input_handoff_preserves_poll_bytes_and_reports_actual_wait() {
-    use crate::tools::tool_dispatch_trace::{ToolDispatchTiming, scope_tool_dispatch_timing};
+    use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
+    use crate::tools::tool_dispatch_trace::scope_tool_dispatch_timing;
     let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
     let manager = &session.services.unified_exec_manager;
     let process = crate::unified_exec::process_tests::remote_process(
@@ -86,7 +87,8 @@ async fn input_handoff_preserves_poll_bytes_and_reports_actual_wait() {
 
 #[tokio::test(start_paused = true)]
 async fn poll_progress_is_completed_and_silence_is_timeout() {
-    use crate::tools::tool_dispatch_trace::{ToolDispatchTiming, scope_tool_dispatch_timing};
+    use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
+    use crate::tools::tool_dispatch_trace::scope_tool_dispatch_timing;
     let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
     let manager = &session.services.unified_exec_manager;
     let process = crate::unified_exec::process_tests::remote_process(
@@ -157,6 +159,10 @@ async fn poll_progress_is_completed_and_silence_is_timeout() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the held buffer guard is the contention that keeps retirement pending"
+)]
 async fn retirement_waits_for_output_without_blocking_store_or_removing_reused_id() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
     let session = Arc::new(session);

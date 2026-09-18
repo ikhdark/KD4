@@ -318,7 +318,10 @@ fn count_from_unified(diff: &str) -> (usize, usize) {
     }
 }
 
-#[expect(clippy::expect_used, reason = "This fixed fixture timestamp is within the supported date range")]
+#[expect(
+    clippy::expect_used,
+    reason = "This fixed fixture timestamp is within the supported date range"
+)]
 fn fixture_timestamp() -> chrono::DateTime<Utc> {
     chrono::DateTime::from_timestamp(1_735_689_600, 0).expect("valid fixture timestamp")
 }

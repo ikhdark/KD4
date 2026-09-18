@@ -963,7 +963,12 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     let features = turn_context.config.features.get();
     let environment_mode = tool_environment_mode(context.step_context);
     planned_tools.add_with_authorization_class(ReadToolOutputHandler, TypedToolClass::ReadSearch);
-    if !context.step_context.environments.starting.is_empty() {
+    if !context
+        .step_context
+        .environments
+        .turn_environments
+        .is_empty()
+    {
         planned_tools.add_with_authorization_class(ReadFileHandler, TypedToolClass::ReadSearch);
     }
 

@@ -370,10 +370,10 @@ fn map_remote_error(error: ExecServerError) -> io::Error {
         ExecServerError::Server { code, message } if code == NOT_FOUND_ERROR_CODE => {
             io::Error::new(io::ErrorKind::NotFound, message)
         }
-        ExecServerError::Server { code: INVALID_REQUEST_ERROR_CODE | INVALID_PARAMS_ERROR_CODE, message } =>
-        {
-            io::Error::new(io::ErrorKind::InvalidInput, message)
-        }
+        ExecServerError::Server {
+            code: INVALID_REQUEST_ERROR_CODE | INVALID_PARAMS_ERROR_CODE,
+            message,
+        } => io::Error::new(io::ErrorKind::InvalidInput, message),
         ExecServerError::Server { message, .. } => io::Error::other(message),
         ExecServerError::Closed | ExecServerError::Disconnected(_) => {
             io::Error::new(io::ErrorKind::BrokenPipe, "exec-server transport closed")

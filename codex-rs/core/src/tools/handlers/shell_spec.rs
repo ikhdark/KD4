@@ -215,6 +215,10 @@ pub(crate) fn create_exec_command_tool_for_policy(
     })
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "create_exec_command_tool_for_policy always constructs command properties containing cmd"
+)]
 pub(crate) fn create_foreign_shell_command_tool(
     options: CommandToolOptions,
     allow_escalated_sandbox_permissions: bool,

@@ -667,7 +667,10 @@ impl RouteAwareClientPool {
             .await
             .map_err(RouteAwareClientPoolError::Resolve)?;
         let cached_client = {
-            let mut clients = self.clients.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut clients = self
+                .clients
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             clients.get(&route)
         };
         if let Some(client) = cached_client {
@@ -675,7 +678,12 @@ impl RouteAwareClientPool {
         }
 
         let build_guard = Arc::clone(&self.client_build).lock_owned().await;
-        if let Some(client) = self.clients.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&route) {
+        if let Some(client) = self
+            .clients
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&route)
+        {
             return Ok((route, client));
         }
 

@@ -2,8 +2,10 @@
 
 Public surface of `openai_codex` for Codex workflows.
 
-This SDK is in beta. Public APIs may change before `1.0`. Turn streams are routed by turn ID so one client can consume multiple active turns concurrently.
-Thread starts default to `ApprovalMode.deny_all`; turn starts accept an optional `approval_mode` override.
+This SDK is in beta. Public APIs may change before `1.0`. Turn streams are routed by turn ID so one
+client can consume multiple active turns concurrently.
+Thread starts default to `ApprovalMode.deny_all`; turn starts accept an optional `approval_mode`
+override.
 
 ## Package Entry
 
@@ -65,10 +67,19 @@ Properties/methods:
 - `login_chatgpt_device_code() -> DeviceCodeLoginHandle`
 - `account(*, refresh_token: bool = False) -> GetAccountResponse`
 - `logout() -> None`
-- `thread_start(*, approval_mode=ApprovalMode.deny_all, base_instructions=None, config=None, cwd=None, developer_instructions=None, ephemeral=None, model=None, model_provider=None, personality=None, sandbox: Sandbox | None = None, service_name=None, service_tier=None, session_start_source=None, thread_source=None) -> Thread`
-- `thread_list(*, archived=None, cursor=None, cwd=None, limit=None, model_providers=None, search_term=None, sort_direction=None, sort_key=None, source_kinds=None, use_state_db_only=None) -> ThreadListResponse`
-- `thread_resume(thread_id: str, *, approval_mode=None, base_instructions=None, config=None, cwd=None, developer_instructions=None, model=None, model_provider=None, personality=None, sandbox: Sandbox | None = None, service_tier=None) -> Thread`
-- `thread_fork(thread_id: str, *, approval_mode=None, base_instructions=None, config=None, cwd=None, developer_instructions=None, ephemeral=None, model=None, model_provider=None, sandbox: Sandbox | None = None, service_tier=None, thread_source=None) -> Thread`
+- `thread_start(*, approval_mode=ApprovalMode.deny_all, base_instructions=None, config=None,
+  cwd=None, developer_instructions=None, ephemeral=None, model=None, model_provider=None,
+  personality=None, sandbox: Sandbox | None = None, service_name=None, service_tier=None,
+  session_start_source=None, thread_source=None) -> Thread`
+- `thread_list(*, archived=None, cursor=None, cwd=None, limit=None, model_providers=None,
+  search_term=None, sort_direction=None, sort_key=None, source_kinds=None, use_state_db_only=None)
+  -> ThreadListResponse`
+- `thread_resume(thread_id: str, *, approval_mode=None, base_instructions=None, config=None,
+  cwd=None, developer_instructions=None, model=None, model_provider=None, personality=None, sandbox:
+  Sandbox | None = None, service_tier=None) -> Thread`
+- `thread_fork(thread_id: str, *, approval_mode=None, base_instructions=None, config=None, cwd=None,
+  developer_instructions=None, ephemeral=None, model=None, model_provider=None, sandbox: Sandbox |
+  None = None, service_tier=None, thread_source=None) -> Thread`
 - `thread_archive(thread_id: str) -> ThreadArchiveResponse`
 - `thread_unarchive(thread_id: str) -> Thread`
 - `models(*, include_hidden: bool = False) -> ModelListResponse`
@@ -105,10 +116,19 @@ Properties/methods:
 - `login_chatgpt_device_code() -> Awaitable[AsyncDeviceCodeLoginHandle]`
 - `account(*, refresh_token: bool = False) -> Awaitable[GetAccountResponse]`
 - `logout() -> Awaitable[None]`
-- `thread_start(*, approval_mode=ApprovalMode.deny_all, base_instructions=None, config=None, cwd=None, developer_instructions=None, ephemeral=None, model=None, model_provider=None, personality=None, sandbox: Sandbox | None = None, service_name=None, service_tier=None, session_start_source=None, thread_source=None) -> Awaitable[AsyncThread]`
-- `thread_list(*, archived=None, cursor=None, cwd=None, limit=None, model_providers=None, search_term=None, sort_direction=None, sort_key=None, source_kinds=None, use_state_db_only=None) -> Awaitable[ThreadListResponse]`
-- `thread_resume(thread_id: str, *, approval_mode=None, base_instructions=None, config=None, cwd=None, developer_instructions=None, model=None, model_provider=None, personality=None, sandbox: Sandbox | None = None, service_tier=None) -> Awaitable[AsyncThread]`
-- `thread_fork(thread_id: str, *, approval_mode=None, base_instructions=None, config=None, cwd=None, developer_instructions=None, ephemeral=None, model=None, model_provider=None, sandbox: Sandbox | None = None, service_tier=None, thread_source=None) -> Awaitable[AsyncThread]`
+- `thread_start(*, approval_mode=ApprovalMode.deny_all, base_instructions=None, config=None,
+  cwd=None, developer_instructions=None, ephemeral=None, model=None, model_provider=None,
+  personality=None, sandbox: Sandbox | None = None, service_name=None, service_tier=None,
+  session_start_source=None, thread_source=None) -> Awaitable[AsyncThread]`
+- `thread_list(*, archived=None, cursor=None, cwd=None, limit=None, model_providers=None,
+  search_term=None, sort_direction=None, sort_key=None, source_kinds=None, use_state_db_only=None)
+  -> Awaitable[ThreadListResponse]`
+- `thread_resume(thread_id: str, *, approval_mode=None, base_instructions=None, config=None,
+  cwd=None, developer_instructions=None, model=None, model_provider=None, personality=None, sandbox:
+  Sandbox | None = None, service_tier=None) -> Awaitable[AsyncThread]`
+- `thread_fork(thread_id: str, *, approval_mode=None, base_instructions=None, config=None, cwd=None,
+  developer_instructions=None, ephemeral=None, model=None, model_provider=None, sandbox: Sandbox |
+  None = None, service_tier=None, thread_source=None) -> Awaitable[AsyncThread]`
 - `thread_archive(thread_id: str) -> Awaitable[ThreadArchiveResponse]`
 - `thread_unarchive(thread_id: str) -> Awaitable[AsyncThread]`
 - `models(*, include_hidden: bool = False) -> Awaitable[ModelListResponse]`
@@ -150,16 +170,24 @@ attempt. API-key login completes synchronously and does not return a handle.
 
 ### Thread
 
-- `run(input: str | Input, *, approval_mode=None, cwd=None, effort=None, model=None, output_schema=None, personality=None, sandbox: Sandbox | None = None, service_tier=None, summary=None) -> TurnResult`
-- `turn(input: str | Input, *, approval_mode=None, cwd=None, effort=None, model=None, output_schema=None, personality=None, sandbox: Sandbox | None = None, service_tier=None, summary=None) -> TurnHandle`
+- `run(input: str | Input, *, approval_mode=None, cwd=None, effort=None, model=None,
+  output_schema=None, personality=None, sandbox: Sandbox | None = None, service_tier=None,
+  summary=None) -> TurnResult`
+- `turn(input: str | Input, *, approval_mode=None, cwd=None, effort=None, model=None,
+  output_schema=None, personality=None, sandbox: Sandbox | None = None, service_tier=None,
+  summary=None) -> TurnHandle`
 - `read(*, include_turns: bool = False) -> ThreadReadResponse`
 - `set_name(name: str) -> ThreadSetNameResponse`
 - `compact() -> ThreadCompactStartResponse`
 
 ### AsyncThread
 
-- `run(input: str | Input, *, approval_mode=None, cwd=None, effort=None, model=None, output_schema=None, personality=None, sandbox: Sandbox | None = None, service_tier=None, summary=None) -> Awaitable[TurnResult]`
-- `turn(input: str | Input, *, approval_mode=None, cwd=None, effort=None, model=None, output_schema=None, personality=None, sandbox: Sandbox | None = None, service_tier=None, summary=None) -> Awaitable[AsyncTurnHandle]`
+- `run(input: str | Input, *, approval_mode=None, cwd=None, effort=None, model=None,
+  output_schema=None, personality=None, sandbox: Sandbox | None = None, service_tier=None,
+  summary=None) -> Awaitable[TurnResult]`
+- `turn(input: str | Input, *, approval_mode=None, cwd=None, effort=None, model=None,
+  output_schema=None, personality=None, sandbox: Sandbox | None = None, service_tier=None,
+  summary=None) -> Awaitable[AsyncTurnHandle]`
 - `read(*, include_turns: bool = False) -> Awaitable[ThreadReadResponse]`
 - `set_name(name: str) -> Awaitable[ThreadSetNameResponse]`
 - `compact() -> Awaitable[ThreadCompactStartResponse]`
@@ -199,7 +227,8 @@ with Codex() as codex:
 Presets:
 
 - `Sandbox.read_only`: read files without allowing writes.
-- `Sandbox.workspace_write`: the normal default for projects with a recorded trust decision; read files and write inside the workspace and configured writable roots.
+- `Sandbox.workspace_write`: the normal default for projects with a recorded trust decision; read
+  files and write inside the workspace and configured writable roots.
 - `Sandbox.full_access`: run without filesystem access restrictions.
 
 When `sandbox=` is omitted, Codex uses its configured default. A sandbox

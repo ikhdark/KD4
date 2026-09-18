@@ -528,7 +528,10 @@ fn payload_ref_part(label: &str, raw_payload: &RawPayloadRef) -> ConversationPar
     }
 }
 
-#[expect(clippy::expect_used, reason = "JSON Value and SummaryWriter serialization are infallible; the prefix is explicitly validated as UTF-8 before conversion")]
+#[expect(
+    clippy::expect_used,
+    reason = "JSON Value and SummaryWriter serialization are infallible; the prefix is explicitly validated as UTF-8 before conversion"
+)]
 fn summarize_json(value: &Value) -> (String, String) {
     // Reconciliation needs the full content identity: keep serialization
     // streaming so even large values allocate only a bounded display prefix.

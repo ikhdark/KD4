@@ -880,9 +880,9 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             body = justfile.split(recipe, 1)[1].split("\n\n", 1)[0]
             self.assertIn('just _core-test-reserved fast "{{ target }}"', body)
             self.assertNotIn("--fail-fast", body)
-        reserved = justfile.split("_core-test-reserved profile target *args:", 1)[1].split(
-            "\n\n", 1
-        )[0]
+        reserved = justfile.split("_core-test-reserved profile target *args:", 1)[
+            1
+        ].split("\n\n", 1)[0]
         self.assertIn('$env:NEXTEST_PROFILE = "{{ profile }}"', reserved)
         local_app_server_override = {
             "filter": "package(codex-app-server) & kind(test)",
@@ -999,7 +999,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             "toolchain"
         ]
 
-        self.assertEqual(toolchain["channel"], "1.98.1")
+        self.assertEqual(toolchain["channel"], "1.95.0")
         self.assertEqual(toolchain["components"], ["clippy", "rustfmt", "rust-src"])
         self.assertNotIn("profile", toolchain)
         self.assertNotIn("targets", toolchain)
@@ -1214,7 +1214,10 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             REPO_ROOT / "codex-rs" / "scripts" / "setup-windows.ps1"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("$toolchain = '1.98.1'", setup_windows)
+        channel = load_toml(REPO_ROOT / "codex-rs" / "rust-toolchain.toml")[
+            "toolchain"
+        ]["channel"]
+        self.assertIn(f"$toolchain = '{channel}'", setup_windows)
         self.assertIn(
             "& rustup toolchain install $toolchain --profile minimal",
             setup_windows,

@@ -479,7 +479,10 @@ async fn arm_post_failure(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[expect(clippy::await_holding_invalid_type, reason = "Fault admission and consumption must remain atomic while reading the admitted request method")]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Fault admission and consumption must remain atomic while reading the admitted request method"
+)]
 async fn fail_mcp_post_when_armed(
     State(state): State<PostFailureState>,
     request: Request<Body>,

@@ -14,7 +14,10 @@ const GPT_5_BEDROCK_CONTEXT_WINDOW: i64 = 272_000;
 const GPT_5_5_OPENAI_MODEL_ID: &str = "gpt-5.5";
 const GPT_5_4_OPENAI_MODEL_ID: &str = "gpt-5.4";
 
-#[expect(clippy::expect_used, reason = "The embedded model catalog is validated by catalog tests and cannot change at runtime")]
+#[expect(
+    clippy::expect_used,
+    reason = "The embedded model catalog is validated by catalog tests and cannot change at runtime"
+)]
 pub(crate) fn static_model_catalog() -> ModelsResponse {
     let bundled = bundled_models_response().expect("bundled models.json should parse");
     with_default_only_service_tier(ModelsResponse {

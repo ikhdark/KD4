@@ -10,7 +10,7 @@ param(
     [switch]$BuildOnly,
     [switch]$TestRun,
     [ValidateSet("debug", "release", "local-release")]
-    [string]$Profile = "release",
+    [string]$Profile = "local-release",
     [switch]$PrintBuiltCodexPath,
     [string]$RepoRoot,
     [string]$SourceExe,
@@ -880,7 +880,7 @@ function Get-AutoSkipBuildDecision {
         -not (Test-Path -LiteralPath $SourceWindowsSandboxSetupExe -PathType Leaf) -or
         -not (Test-Path -LiteralPath $SourceCommandRunnerExe -PathType Leaf)
     ) {
-        return [pscustomobject]@{ CanSkip = $false; Reason = "source artifact missing" }
+        return [pscustomobject]@{ CanSkip = $false; Reason = "source artifact missing"; SourceSnapshot = $null }
     }
 
     $stamp = Read-BuildStamp -StampPath $StampPath
@@ -891,10 +891,10 @@ function Get-AutoSkipBuildDecision {
         else {
             "build stamp missing"
         }
-        return [pscustomobject]@{ CanSkip = $false; Reason = $reason }
+        return [pscustomobject]@{ CanSkip = $false; Reason = $reason; SourceSnapshot = $null }
     }
     if ($stamp.Profile -cne $Profile) {
-        return [pscustomobject]@{ CanSkip = $false; Reason = "build stamp profile mismatch" }
+        return [pscustomobject]@{ CanSkip = $false; Reason = "build stamp profile mismatch"; SourceSnapshot = $null }
     }
 
     if ($null -eq $SourceSnapshot) {
@@ -907,10 +907,10 @@ function Get-AutoSkipBuildDecision {
         $SourceSnapshot.Fingerprint
     }
     if (-not (Test-Sha256Text -Value $sourceFingerprint)) {
-        return [pscustomobject]@{ CanSkip = $false; Reason = "publish input fingerprint unavailable" }
+        return [pscustomobject]@{ CanSkip = $false; Reason = "publish input fingerprint unavailable"; SourceSnapshot = $null }
     }
     if ($stamp.SourceFingerprint -cne $sourceFingerprint) {
-        return [pscustomobject]@{ CanSkip = $false; Reason = "tracked publish inputs changed" }
+        return [pscustomobject]@{ CanSkip = $false; Reason = "tracked publish inputs changed"; SourceSnapshot = $SourceSnapshot }
     }
 
     $codexSha256 = Get-CachedLocalPublishFileSha256 -Path $SourceExe
@@ -923,12 +923,13 @@ function Get-AutoSkipBuildDecision {
         $stamp.WindowsSandboxSetupSha256 -cne $windowsSandboxSetupSha256 -or
         $stamp.CommandRunnerSha256 -cne $commandRunnerSha256
     ) {
-        return [pscustomobject]@{ CanSkip = $false; Reason = "source artifact differs from stamped build" }
+        return [pscustomobject]@{ CanSkip = $false; Reason = "source artifact differs from stamped build"; SourceSnapshot = $SourceSnapshot }
     }
 
     return [pscustomobject]@{
         CanSkip = $true
         Reason = "source artifacts and tracked publish inputs match build stamp"
+        SourceSnapshot = $SourceSnapshot
     }
 }
 
@@ -3422,6 +3423,7 @@ if ($TestRun -and $SkipBuild) {
 }
 
 $sourceBuildStampMustRemainValid = $false
+$buildInputSnapshotBefore = $null
 if ($AutoSkipBuild -and -not $SkipBuild) {
     $autoSkipBuildDecision = Get-AutoSkipBuildDecision `
         -RepoRoot $repoRoot `
@@ -3431,6 +3433,7 @@ if ($AutoSkipBuild -and -not $SkipBuild) {
         -SourceCodeModeHostExe $SourceCodeModeHostExe `
         -SourceWindowsSandboxSetupExe $SourceWindowsSandboxSetupExe `
         -SourceCommandRunnerExe $SourceCommandRunnerExe
+    $buildInputSnapshotBefore = $autoSkipBuildDecision.SourceSnapshot
     if ($autoSkipBuildDecision.CanSkip) {
         $SkipBuild = $true
         $sourceBuildStampMustRemainValid = $true
@@ -3447,7 +3450,14 @@ if (-not $SkipBuild) {
     $buildInputFingerprintBefore = $null
     if (-not $DryRun) {
         Remove-BuildStamp -StampPath $buildStampPath
-        $buildInputFingerprintBefore = Get-LocalPublishBuildInputFingerprint -RepoRoot $repoRoot
+        # Reuse the live scan that rejected auto-skip. The independent post-build
+        # scan still rejects any input changes before or during compilation.
+        $buildInputFingerprintBefore = if ($null -ne $buildInputSnapshotBefore) {
+            $buildInputSnapshotBefore.Fingerprint
+        }
+        else {
+            Get-LocalPublishBuildInputFingerprint -RepoRoot $repoRoot
+        }
         if (-not (Test-Sha256Text -Value $buildInputFingerprintBefore)) {
             Write-ProofLine "buildStamp" "disabled: publish input fingerprint unavailable"
             $buildInputFingerprintBefore = $null

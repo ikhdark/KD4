@@ -71,7 +71,11 @@ it("preserves nullable outcomes and search actions through the event stream", as
     received.push(event);
   }
   expect(received).toEqual(events);
-  expect((await thread.run("search and run tools")).items).toEqual([command, { ...patch, status: "declined" }, ...searches]);
+  expect((await thread.run("search and run tools")).items).toEqual([
+    command,
+    { ...patch, status: "declined" },
+    ...searches,
+  ]);
 });
 
 // @ts-expect-error exit_code is required even while it is null.

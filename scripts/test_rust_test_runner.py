@@ -315,32 +315,53 @@ class RunnerTestCase(unittest.TestCase):
 class RealExecutorTest(RunnerTestCase):
     def test_metadata_failure_preserves_full_log_recovery(self):
         results = []
+
         def execute_metadata(*args, **kwargs):
-            result = self.execute("import sys; sys.stderr.write('metadata diagnostic' * 100000); sys.exit(7)")
+            result = self.execute(
+                "import sys; sys.stderr.write('metadata diagnostic' * 100000); sys.exit(7)"
+            )
             results.append(result)
             return result
+
         with self.assertRaises(RunnerError) as raised:
             rust_test_runner.load_metadata(execute_metadata)
         self.assertIn(str(results[0].stderr_path), str(raised.exception))
-        self.assertEqual(results[0].stderr_path.read_text(), "metadata diagnostic" * 100000)
+        self.assertEqual(
+            results[0].stderr_path.read_text(), "metadata diagnostic" * 100000
+        )
         self.assertLess(len(str(raised.exception)), 5000)
 
     def execute(self, script: str, **extra_env: str):
         return rust_test_runner._default_executor(
-            [sys.executable, "-c", script], cwd=self.temp_dir,
-            env={**os.environ, "CODEX_RUST_TEST_LOG_DIR": str(self.temp_dir), **extra_env},
+            [sys.executable, "-c", script],
+            cwd=self.temp_dir,
+            env={
+                **os.environ,
+                "CODEX_RUST_TEST_LOG_DIR": str(self.temp_dir),
+                **extra_env,
+            },
             capture=rust_test_runner.CAPTURE_BOTH,
         )
 
     def test_large_logs_are_file_backed_with_bounded_diagnostics(self):
-        result = self.execute("import sys; print('start'); print('x' * 2000000); print('end'); sys.stderr.write('failure' * 300000)")
+        result = self.execute(
+            "import sys; print('start'); print('x' * 2000000); print('end'); sys.stderr.write('failure' * 300000)"
+        )
         self.assertEqual(result.returncode, 0)
-        self.assertLessEqual(len(result.stdout), rust_test_runner.MAX_FAILURE_STREAM_CHARS)
-        self.assertLessEqual(len(result.stderr), rust_test_runner.MAX_FAILURE_STREAM_CHARS)
-        self.assertEqual(result.stdout_path.stat().st_size, 2_000_011 + (3 if os.name == "nt" else 0))
+        self.assertLessEqual(
+            len(result.stdout), rust_test_runner.MAX_FAILURE_STREAM_CHARS
+        )
+        self.assertLessEqual(
+            len(result.stderr), rust_test_runner.MAX_FAILURE_STREAM_CHARS
+        )
+        self.assertEqual(
+            result.stdout_path.stat().st_size, 2_000_011 + (3 if os.name == "nt" else 0)
+        )
         self.assertEqual(result.stderr_path.read_text(), "failure" * 300000)
         self.assertTrue(result.stdout.endswith("end\n"))
-        self.assertEqual(list(rust_test_runner._output_lines(result, "stdout")), ["start\n", "end\n"])
+        self.assertEqual(
+            list(rust_test_runner._output_lines(result, "stdout")), ["start\n", "end\n"]
+        )
         runner, _ = self.runner()
         detail = runner._failure_detail(result)
         self.assertIn(str(result.stdout_path), detail)
@@ -349,14 +370,27 @@ class RealExecutorTest(RunnerTestCase):
 
     def test_gate_counts_early_statuses_from_log_and_rejects_duplicates(self):
         data = copy.deepcopy(MANIFEST_DATA)
-        data["gates"]["demo-gate"]["steps"] = [{"target": "core_lib", "tests": ["mod::tests::alpha"], "helpers": []}]
-        runner = RustTestRunner(Manifest.from_data(data), self.metadata(), target_dir=self.target_dir)
+        data["gates"]["demo-gate"]["steps"] = [
+            {"target": "core_lib", "tests": ["mod::tests::alpha"], "helpers": []}
+        ]
+        runner = RustTestRunner(
+            Manifest.from_data(data), self.metadata(), target_dir=self.target_dir
+        )
         for count in (1, 2):
             with self.subTest(count=count):
-                command = [sys.executable, "-c", f"print('PASS [0.1s] core mod::tests::alpha\\n' * {count}); print('x' * 2000000)"]
-                with mock.patch.object(runner, "_gate_run_command", return_value=command):
+                command = [
+                    sys.executable,
+                    "-c",
+                    f"print('PASS [0.1s] core mod::tests::alpha\\n' * {count}); print('x' * 2000000)",
+                ]
+                with mock.patch.object(
+                    runner, "_gate_run_command", return_value=command
+                ):
                     if count == 1:
-                        self.assertEqual(runner.run_gates(["demo-gate"], quiet=True), {"demo-gate": ["mod::tests::alpha"]})
+                        self.assertEqual(
+                            runner.run_gates(["demo-gate"], quiet=True),
+                            {"demo-gate": ["mod::tests::alpha"]},
+                        )
                     else:
                         with self.assertRaises(RunnerError) as failure:
                             runner.run_gates(["demo-gate"], quiet=True)
@@ -369,10 +403,17 @@ class RealExecutorTest(RunnerTestCase):
         with self.assertRaises(RunnerError) as failure:
             self.execute(parent, CODEX_RUST_TEST_TIMEOUT_SECS="2")
         self.assertEqual(failure.exception.outcome, "timed_out")
-        self.assertTrue(pid_file.exists(), "descendant must have started before the deadline")
+        self.assertTrue(
+            pid_file.exists(), "descendant must have started before the deadline"
+        )
         child_pid = int(pid_file.read_text())
         if os.name == "nt":
-            status = subprocess.run(["tasklist", "/FI", f"PID eq {child_pid}", "/FO", "CSV", "/NH"], capture_output=True, text=True, check=True)
+            status = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {child_pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
             self.assertNotIn(f'"{child_pid}"', status.stdout)
         else:
             with self.assertRaises(ProcessLookupError):
@@ -382,11 +423,13 @@ class RealExecutorTest(RunnerTestCase):
     def test_interrupt_is_cancelled_and_reaps_the_child(self):
         real_wait = subprocess.Popen.wait
         observed = []
+
         def interrupt_once(process, *args, **kwargs):
             if not observed:
                 observed.append(process)
                 raise KeyboardInterrupt
             return real_wait(process, *args, **kwargs)
+
         with mock.patch.object(subprocess.Popen, "wait", interrupt_once):
             with self.assertRaises(RunnerError) as failure:
                 self.execute("import time; time.sleep(60)")
@@ -484,17 +527,38 @@ class ManifestSchemaTest(RunnerTestCase):
 
 
 class MetadataValidationTest(RunnerTestCase):
-    def test_metadata_deadline_reaches_executor_and_rejects_invalid_values(self) -> None:
-        executor = mock.Mock(return_value=subprocess.CompletedProcess(
-            [], 0, json.dumps({"target_directory": str(self.target_dir), "packages": METADATA_PACKAGES}), ""
-        ))
-        metadata = rust_test_runner.load_metadata(executor, command_timeout_seconds=123.5)
+    def test_metadata_deadline_reaches_executor_and_rejects_invalid_values(
+        self,
+    ) -> None:
+        executor = mock.Mock(
+            return_value=subprocess.CompletedProcess(
+                [],
+                0,
+                json.dumps(
+                    {
+                        "target_directory": str(self.target_dir),
+                        "packages": METADATA_PACKAGES,
+                    }
+                ),
+                "",
+            )
+        )
+        metadata = rust_test_runner.load_metadata(
+            executor, command_timeout_seconds=123.5
+        )
         self.assertEqual(metadata.target_directory, self.target_dir)
-        self.assertEqual(executor.call_args.kwargs["env"]["CODEX_RUST_TEST_TIMEOUT_SECS"], "123.5")
+        self.assertEqual(
+            executor.call_args.kwargs["env"]["CODEX_RUST_TEST_TIMEOUT_SECS"], "123.5"
+        )
         for invalid in (0, -1, float("nan"), float("inf")):
             executor.reset_mock()
-            with self.subTest(invalid=invalid), self.assertRaisesRegex(RunnerError, "finite positive"):
-                rust_test_runner.load_metadata(executor, command_timeout_seconds=invalid)
+            with (
+                self.subTest(invalid=invalid),
+                self.assertRaisesRegex(RunnerError, "finite positive"),
+            ):
+                rust_test_runner.load_metadata(
+                    executor, command_timeout_seconds=invalid
+                )
             executor.assert_not_called()
 
     def test_helper_binary_must_exist_in_cargo_metadata(self) -> None:
@@ -1031,14 +1095,29 @@ class RunGateTest(RunnerTestCase):
     def test_cli_deadline_covers_metadata_and_gate_commands(self) -> None:
         executor = self.gate_executor(self.matching_listings())
         runners = []
+
         def construct(manifest, metadata, **kwargs):
             runner = RustTestRunner(manifest, metadata, executor=executor, **kwargs)
             runners.append(runner)
             return runner
-        with mock.patch.object(rust_test_runner.Manifest, "load", return_value=self.manifest()), \
-             mock.patch.object(rust_test_runner, "load_metadata", return_value=self.metadata()) as metadata, \
-             mock.patch.object(rust_test_runner, "RustTestRunner", side_effect=construct):
-            self.assertEqual(rust_test_runner.main(["run-gate", "--command-timeout-seconds", "23.5", "demo-gate"]), 0)
+
+        with (
+            mock.patch.object(
+                rust_test_runner.Manifest, "load", return_value=self.manifest()
+            ),
+            mock.patch.object(
+                rust_test_runner, "load_metadata", return_value=self.metadata()
+            ) as metadata,
+            mock.patch.object(
+                rust_test_runner, "RustTestRunner", side_effect=construct
+            ),
+        ):
+            self.assertEqual(
+                rust_test_runner.main(
+                    ["run-gate", "--command-timeout-seconds", "23.5", "demo-gate"]
+                ),
+                0,
+            )
         metadata.assert_called_once_with(command_timeout_seconds=23.5)
         self.assertEqual(len(executor.commands(["cargo", "nextest", "run"])), 2)
         self.assertEqual(executor.last_env()["CODEX_RUST_TEST_TIMEOUT_SECS"], "23.5")
@@ -1051,11 +1130,13 @@ class RunGateTest(RunnerTestCase):
                 runner, _ = self.runner(executor=executor)
                 original = runner._checked
                 commands = []
+
                 def stop_first_run(args, **kwargs):
                     if args[:3] == ["cargo", "nextest", "run"]:
                         commands.append(args)
                         raise RunnerError("requested stop", outcome=outcome)
                     return original(args, **kwargs)
+
                 with mock.patch.object(runner, "_checked", side_effect=stop_first_run):
                     with self.assertRaises(RunnerError) as raised:
                         runner.run_gates(["demo-gate"], quiet=True)

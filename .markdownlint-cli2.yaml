@@ -1,6 +1,10 @@
 config:
   MD013:
     line_length: 100
+    tables: false
+    code_blocks: false
+  MD033:
+    allowed_elements: [br]
 
 globs:
   - "**/*.md"
@@ -10,3 +14,11 @@ globs:
   - "!.worktrees/**"
   - "!codex-rs/vendor/**"
   - "!docs/audits/**"
+  - "!.git/**"
+  - "!CLAUDE.md"
+  - "!codex-rs/**/templates/**"
+  - "!codex-rs/protocol/src/prompts/**"
+  - "!codex-rs/skills/src/assets/**"
+  - "!codex-rs/ext/**/*_description.md"
+  - "!codex-rs/tui/prompt_for_init_command.md"
+  - "!codex-rs/apply-patch/tests/fixtures/scenarios/**/expected/**"

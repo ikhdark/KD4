@@ -62,6 +62,10 @@ class ReadmeTocTest(unittest.TestCase):
 
     def test_slugify_preserves_underscores_and_removes_unicode_dashes(self) -> None:
         self.assertEqual(
+            readme_toc.generate_toc_lines(["## Top-level ownership"]),
+            ["- [Top-level ownership](#top-level-ownership)"],
+        )
+        self.assertEqual(
             readme_toc.slugify_heading("run_tui_with_exec_server.sh"),
             "run_tui_with_exec_serversh",
         )

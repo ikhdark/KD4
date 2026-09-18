@@ -437,7 +437,10 @@ impl NetworkProxyState {
         Ok(guard.config.enabled)
     }
 
-    #[expect(clippy::await_holding_invalid_type, reason = "Serialize asynchronous reload and mutation transactions so stale state cannot overwrite newer policy")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serialize asynchronous reload and mutation transactions so stale state cannot overwrite newer policy"
+    )]
     pub async fn force_reload(&self) -> Result<()> {
         let _reload = self.reload_lock.lock().await;
         let previous_cfg = {
@@ -469,7 +472,10 @@ impl NetworkProxyState {
         }
     }
 
-    #[expect(clippy::await_holding_invalid_type, reason = "Serialize asynchronous reload and mutation transactions so stale state cannot overwrite newer policy")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serialize asynchronous reload and mutation transactions so stale state cannot overwrite newer policy"
+    )]
     pub async fn replace_config_state(&self, mut new_state: ConfigState) -> Result<()> {
         let _reload = self.reload_lock.lock().await;
         self.reload_if_needed_locked().await?;
@@ -560,7 +566,10 @@ impl NetworkProxyState {
         Ok(self.request_policy_snapshot().await?.network_mode())
     }
 
-    #[expect(clippy::await_holding_invalid_type, reason = "Serialize asynchronous reload and mutation transactions so stale state cannot overwrite newer policy")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serialize asynchronous reload and mutation transactions so stale state cannot overwrite newer policy"
+    )]
     pub async fn set_network_mode(&self, mode: NetworkMode) -> Result<()> {
         let _reload = self.reload_lock.lock().await;
         loop {
@@ -599,7 +608,10 @@ impl NetworkProxyState {
         self.update_domain_list(host, DomainListKind::Deny).await
     }
 
-    #[expect(clippy::await_holding_invalid_type, reason = "Serialize asynchronous reload and mutation transactions so stale state cannot overwrite newer policy")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serialize asynchronous reload and mutation transactions so stale state cannot overwrite newer policy"
+    )]
     async fn update_domain_list(&self, host: &str, target: DomainListKind) -> Result<()> {
         let _reload = self.reload_lock.lock().await;
         let host = Host::parse(host).context("invalid network host")?;
@@ -659,7 +671,10 @@ impl NetworkProxyState {
         }
     }
 
-    #[expect(clippy::await_holding_invalid_type, reason = "Serialize asynchronous reload and mutation transactions so stale state cannot overwrite newer policy")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serialize asynchronous reload and mutation transactions so stale state cannot overwrite newer policy"
+    )]
     async fn reload_if_needed(&self) -> Result<()> {
         let _reload = self.reload_lock.lock().await;
         self.reload_if_needed_locked().await

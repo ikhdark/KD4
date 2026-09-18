@@ -97,11 +97,11 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
                 0,
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
-            self.assertIn("profile: release", result.stdout)
+            self.assertIn("profile: local-release", result.stdout)
             self.assertIn("sourceMissing: true", result.stdout)
-            self.assertIn("buildCommand: cargo --config", result.stdout)
+            self.assertIn("buildCommand: cargo build --target-dir", result.stdout)
             self.assertIn(" build --target-dir ", result.stdout)
-            self.assertIn("--profile release", result.stdout)
+            self.assertIn("--profile local-release", result.stdout)
             self.assertFalse((install_dir / "codex.exe").exists())
 
     def test_dry_run_reports_missing_windows_rusty_v8_archive(self) -> None:
@@ -538,7 +538,11 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
     def test_stale_local_build_is_blocked_without_a_bundle_manifest(self) -> None:
         self.init_repo_fixture()
         built_dir = (
-            self.repo_root / "codex-rs" / "target" / "publish-release" / "release"
+            self.repo_root
+            / "codex-rs"
+            / "target"
+            / "publish-local-release"
+            / "local-release"
         )
         built_dir.mkdir(parents=True)
         binaries = {

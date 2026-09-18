@@ -29,7 +29,10 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unsupported_interactive_tools_abort_instead_of_hanging() -> anyhow::Result<()> {
-    use core_test_support::responses::{ev_completed, ev_function_call, ev_response_created, sse};
+    use core_test_support::responses::ev_completed;
+    use core_test_support::responses::ev_function_call;
+    use core_test_support::responses::ev_response_created;
+    use core_test_support::responses::sse;
     skip_if_no_network!();
     for (tool, arguments) in [
         (

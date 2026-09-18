@@ -167,7 +167,7 @@ def slugify_heading(text: str) -> str:
     for character in text.lower():
         if character.isspace():
             slug.append("-")
-        elif character == "_" or not unicodedata.category(character).startswith(
+        elif character in "_-" or not unicodedata.category(character).startswith(
             ("C", "P")
         ):
             slug.append(character)

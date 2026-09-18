@@ -5722,10 +5722,12 @@ mod tests {
 
     #[test]
     fn unsafe_final_observations_do_not_terminalize() {
-        for extra_payload in [ToolPayload::Function {
-            arguments: r#"{"cmd":"git diff --check | Out-File result.txt; git status --short"}"#
-                .to_string(),
-        }] {
+        {
+            let extra_payload = ToolPayload::Function {
+                arguments:
+                    r#"{"cmd":"git diff --check | Out-File result.txt; git status --short"}"#
+                        .to_string(),
+            };
             let mut governor = SamplingReasoningGovernor::new(None);
             settle_plan(&mut governor, plan(&[StepStatus::Completed]));
             let baselines = governor.baselines(0);

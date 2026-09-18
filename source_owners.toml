@@ -1071,7 +1071,7 @@ role = "generated_contract_check"
 id = "repo-benchmark"
 concern_ids = ["repo-benchmark", "native-runtime-measurement", "live-task-verification", "session-diagnostics"]
 aliases = ["Repo Benchmark", "Rust repository benchmark", "session latency diagnostics"]
-phrases = ["one Rust benchmark with sequential scripted and real-model segments", "fork_off fork_on reference comparisons and independent verification", "canonical Python generation retry and token analysis"]
+phrases = ["one Rust benchmark with sequential scripted and real-model segments", "fork_on reference comparisons and independent verification", "canonical Python generation retry and token analysis"]
 roots = ["codex-rs/repo-benchmark", "docs/benchmarks/repo-benchmark", "scripts/kd4_timing_analysis.py", "scripts/kd4_turn_latency_audit.py", "scripts/kd4_first_useful_action_analysis.py", "scripts/rollout_snapshot.py", "scripts/test_rollout_snapshot.py", "scripts/test_kd4_timing_analysis.py", "scripts/test_kd4_turn_latency_audit.py", "scripts/test_kd4_first_useful_action_analysis.py"]
 primary_entries = [{ path = "codex-rs/repo-benchmark/src/main.rs", symbol = "main" }, { path = "codex-rs/repo-benchmark/src/cli.rs", symbol = "run" }, { path = "scripts/kd4_turn_latency_audit.py", symbol = "main" }]
 instructions = ["AGENTS.md"]
@@ -1139,7 +1139,7 @@ evidence = [{ path = "codex-rs/repo-benchmark/src/workloads/tests.rs", symbol = 
 [[owners.invariants]]
 id = "one-benchmark-two-sequential-segments"
 kind = "semantic"
-statement = "Repo Benchmark alone schedules and compares fork_off, fork_on and reference through native runtimes; --fork-only-on freezes a two-variant selection of fork_on and reference throughout preparation, execution and reports. Scripted execution precedes real-model execution; fast/full differ only in selected live tasks, finite budgets are ceilings, and performance has no pass/fail verdict."
+statement = "Repo Benchmark alone schedules and compares fork_on and reference through native runtimes; preparation, execution and reports support only these two variants. Scripted execution precedes real-model execution; fast/full differ only in selected live tasks, finite budgets are ceilings, and performance has no pass/fail verdict."
 evidence = [{ path = "codex-rs/repo-benchmark/src/runner.rs", symbol = "execute" }, { path = "codex-rs/repo-benchmark/src/schedule.rs", symbol = "schedule" }, { path = "codex-rs/repo-benchmark/src/statistics.rs", symbol = "summarize" }]
 tests = ["codex-rs/repo-benchmark/src/schedule.rs", "codex-rs/repo-benchmark/src/statistics.rs"]
 
@@ -1153,7 +1153,7 @@ tests = ["codex-rs/repo-benchmark/src/reports.rs"]
 [[owners.invariants]]
 id = "native-source-and-independent-verification-integrity"
 kind = "semantic"
-statement = "One frozen harness launches each selected revision's own app-server. Preparation pins clean sources, locked dependencies, six-job release settings, shared inputs and environment; protected verifiers assert expected task results after final mutation. B need not descend from A."
+statement = "One frozen harness launches each selected revision's own app-server. Preparation pins clean sources, locked dependencies, twelve-job release settings, shared inputs and environment; protected verifiers assert expected task results after final mutation. B need not descend from A."
 evidence = [{ path = "codex-rs/repo-benchmark/src/prepare.rs", symbol = "resolve_source" }, { path = "codex-rs/repo-benchmark/src/prepare/builds.rs", symbol = "build" }, { path = "codex-rs/repo-benchmark/src/workloads.rs", symbol = "verify_fixture_with_env" }]
 tests = ["codex-rs/repo-benchmark/src/prepare/tests.rs", "codex-rs/repo-benchmark/src/workloads/tests.rs"]
 

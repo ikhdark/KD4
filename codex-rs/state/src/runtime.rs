@@ -238,8 +238,12 @@ impl StateRuntime {
             }
         }
         let [pool, logs_pool, goals_pool, memories_pool] = results;
-        let (pool, logs_pool, goals_pool, memories_pool) =
-            (Arc::new(pool?), Arc::new(logs_pool?), Arc::new(goals_pool?), Arc::new(memories_pool?));
+        let (pool, logs_pool, goals_pool, memories_pool) = (
+            Arc::new(pool?),
+            Arc::new(logs_pool?),
+            Arc::new(goals_pool?),
+            Arc::new(memories_pool?),
+        );
         let started = Instant::now();
         let backfill_state_result = ensure_backfill_state_row_in_pool(pool.as_ref())
             .await

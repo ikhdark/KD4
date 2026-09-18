@@ -303,10 +303,10 @@ impl TraceReducer {
             if used_item_ids.insert(item_id.clone())
                 && let Some(call_id) = tool_link_item.call_id
             {
-                    let ids = call_items.entry(call_id).or_default();
-                    if !ids.contains(&item_id) {
-                        ids.push(item_id.clone());
-                    }
+                let ids = call_items.entry(call_id).or_default();
+                if !ids.contains(&item_id) {
+                    ids.push(item_id.clone());
+                }
             }
             item_ids.push(item_id);
         }
@@ -441,10 +441,10 @@ impl TraceReducer {
             if used_item_ids.insert(item_id.clone())
                 && let Some(call_id) = tool_link_item.call_id
             {
-                    let ids = call_items.entry(call_id).or_default();
-                    if !ids.contains(&item_id) {
-                        ids.push(item_id.clone());
-                    }
+                let ids = call_items.entry(call_id).or_default();
+                if !ids.contains(&item_id) {
+                    ids.push(item_id.clone());
+                }
             }
             item_ids.push(item_id);
         }

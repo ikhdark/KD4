@@ -35,23 +35,39 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Stdio;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-pub const MANIFEST_VERSION: u32 = 2;
+pub const MANIFEST_VERSION: u32 = 3;
 
 #[derive(Clone, Debug)]
 pub struct PrepareOptions {
     pub repo: PathBuf,
     pub mode: Mode,
-    pub fork_only_on: bool,
     pub fork_ref: String,
     pub reference_checkout: Option<PathBuf>,
+}
+
+/// Upstream release tags bump `[workspace.package].version` without
+/// regenerating `Cargo.lock`, so the committed lock records its own members at
+/// their pre-release version and Cargo's `--locked` builds refuse the checkout.
+/// Offline resolution repairs exactly those member entries; this records the
+/// repair so the changed working tree stays accountable.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LockReconciliation {
+    pub path: PathBuf,
+    pub committed_sha256: String,
+    pub resolved_sha256: String,
+    /// Workspace members whose recorded version changed. No registry entry moved.
+    pub members: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -63,6 +79,9 @@ pub struct SourceIdentity {
     pub tree: String,
     pub checkout: PathBuf,
     pub upstream: bool,
+    /// Absent when the committed lockfile already matched its own manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_reconciliation: Option<LockReconciliation>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -81,8 +100,6 @@ pub struct Prepared {
     pub directory: PathBuf,
     pub repo: PathBuf,
     pub mode: Mode,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub fork_only_on: bool,
     pub schedule: Vec<ScheduledAttempt>,
     pub workspace: PathBuf,
     pub workspace_lock: PathBuf,
@@ -146,7 +163,152 @@ pub fn resolve_source(
         tree,
         checkout,
         upstream,
+        lock_reconciliation: None,
     })
+}
+
+/// The one lockfile in a native checkout that Cargo resolves for these builds.
+const WORKSPACE_LOCK: &str = "codex-rs/Cargo.lock";
+
+/// True when a reconciled checkout's `git status --porcelain` reports nothing
+/// but the workspace lockfile. Porcelain v1 prints two status characters, a
+/// space, then the path.
+fn only_workspace_lock_modified(status: &str) -> bool {
+    status
+        .lines()
+        .all(|line| line.get(3..) == Some(WORKSPACE_LOCK))
+}
+
+/// Accept only the upstream release-tag difference: the locked package list must
+/// keep its exact order and membership, every registry entry must stay
+/// byte-identical, and a local member may differ in nothing but its version.
+fn workspace_version_only_changes(committed: &str, resolved: &str) -> Result<Vec<String>> {
+    let split = |text: &str| -> Result<(Vec<toml::Value>, toml::Value)> {
+        let mut document: toml::Value = toml::from_str(text)?;
+        let packages = document
+            .get("package")
+            .and_then(toml::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(table) = document.as_table_mut() {
+            table.remove("package");
+        }
+        Ok((packages, document))
+    };
+    let (committed, committed_rest) = split(committed)?;
+    let (resolved, resolved_rest) = split(resolved)?;
+    ensure!(
+        committed_rest == resolved_rest,
+        "offline resolution changed lockfile metadata outside the package list"
+    );
+    ensure!(
+        committed.len() == resolved.len(),
+        "offline resolution changed the locked package set"
+    );
+    let mut members = Vec::new();
+    for (committed, resolved) in committed.iter().zip(resolved.iter()) {
+        if committed == resolved {
+            continue;
+        }
+        let name = committed
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .context("locked package name")?;
+        ensure!(
+            resolved.get("name").and_then(toml::Value::as_str) == Some(name),
+            "offline resolution reordered the locked package set at {name}"
+        );
+        ensure!(
+            committed.get("source").is_none() && resolved.get("source").is_none(),
+            "offline resolution changed registry package {name}"
+        );
+        let mut stripped = (committed.clone(), resolved.clone());
+        for entry in [&mut stripped.0, &mut stripped.1] {
+            if let Some(table) = entry.as_table_mut() {
+                table.remove("version");
+            }
+        }
+        ensure!(
+            stripped.0 == stripped.1,
+            "offline resolution changed locked package {name} beyond its workspace version"
+        );
+        members.push(name.to_owned());
+    }
+    ensure!(
+        !members.is_empty(),
+        "lockfile changed without any workspace member version difference"
+    );
+    Ok(members)
+}
+
+/// Resolve the checkout's own committed lockfile offline, so no registry update
+/// can reach it, and accept the result only when it is the release-tag repair.
+/// Resolution is scoped to the packages this variant builds: a whole-workspace
+/// resolve spans every platform and would demand crates this host never caches.
+fn reconcile_lock(
+    source: &mut SourceIdentity,
+    environment: &Environment,
+    requested: &[(&str, &str)],
+) -> Result<()> {
+    let workspace = source.checkout.join("codex-rs");
+    let path = workspace.join("Cargo.lock");
+    let committed = fs::read_to_string(&path)?;
+    let mut command = Command::new(
+        &environment
+            .tools
+            .get("cargo")
+            .context("pinned Cargo identity")?
+            .executable
+            .path,
+    );
+    command
+        .current_dir(&workspace)
+        .args([
+            "tree",
+            "--offline",
+            "--edges",
+            "normal,build",
+            "--prefix",
+            "none",
+            "--format",
+            "{p}",
+        ])
+        .env("RUSTUP_TOOLCHAIN", &environment.rust_toolchain)
+        .env_remove("CARGO_TARGET_DIR")
+        // The resolved graph is read back from the lockfile itself.
+        .stdout(Stdio::null());
+    for package in requested
+        .iter()
+        .map(|(package, _)| *package)
+        .collect::<BTreeSet<_>>()
+    {
+        command.args(["-p", package]);
+    }
+    v8::clear_inherited_overrides(&mut command);
+    command_output(&mut command).with_context(|| {
+        format!(
+            "resolve the committed lockfile of {} offline",
+            source.revision
+        )
+    })?;
+    let resolved = fs::read_to_string(&path)?;
+    if resolved == committed {
+        return Ok(());
+    }
+    let members = workspace_version_only_changes(&committed, &resolved)
+        .with_context(|| format!("reconcile the lockfile of {}", source.revision))?;
+    eprintln!(
+        "Reconciled {} workspace member versions in the lockfile of {}",
+        members.len(),
+        source.revision
+    );
+    source.lock_reconciliation = Some(LockReconciliation {
+        committed_sha256: hash_bytes(committed.as_bytes()),
+        resolved_sha256: provenance::hash_file(&path)?,
+        path,
+        members,
+    });
+    Ok(())
 }
 
 fn resolve_reference(
@@ -275,7 +437,7 @@ fn snapshot_feature_inventory(source: &SourceIdentity, destination: &Path) -> Re
     Ok(())
 }
 
-pub fn feature_overrides(features: &[Value], enabled: bool) -> Result<Vec<String>> {
+pub fn feature_overrides(features: &[Value]) -> Result<Vec<String>> {
     let mut values = BTreeMap::new();
     for feature in features {
         let kind = feature
@@ -284,7 +446,7 @@ pub fn feature_overrides(features: &[Value], enabled: bool) -> Result<Vec<String
             .context("feature lacks benchmark control classification")?;
         ensure!(
             kind != "build",
-            "feature {} requires compile-time ablation settings not present in its inventory; cannot share a fork binary",
+            "feature {} requires compile-time settings not present in its inventory",
             feature["id"]
         );
         if kind != "runtime" {
@@ -303,7 +465,7 @@ pub fn feature_overrides(features: &[Value], enabled: bool) -> Result<Vec<String
                 key.starts_with("features."),
                 "unsupported non-feature boolean control {key}"
             );
-            let value = enabled && on;
+            let value = on;
             if let Some(previous) = values.insert(key.to_owned(), value) {
                 ensure!(
                     previous == value,
@@ -314,7 +476,7 @@ pub fn feature_overrides(features: &[Value], enabled: bool) -> Result<Vec<String
     }
     ensure!(
         values.contains_key("features.kd4_runtime"),
-        "feature inventory lacks KD4 runtime ablation"
+        "feature inventory lacks KD4 runtime control"
     );
     Ok(values
         .into_iter()
@@ -429,7 +591,7 @@ pub fn prepare(options: PrepareOptions) -> Result<PathBuf> {
         reference.selection, reference.revision
     );
     let environment = Environment::capture(&repo)?;
-    validate_selected_toolchain(&fork, &environment.rust_toolchain, "fork variants")?;
+    validate_selected_toolchain(&fork, &environment.rust_toolchain, "fork")?;
     validate_selected_toolchain(&reference, &environment.rust_toolchain, "reference")?;
     fs::create_dir_all(directory.join("frozen"))?;
     let base_config_path = directory.join("frozen/config.toml");
@@ -439,14 +601,10 @@ pub fn prepare(options: PrepareOptions) -> Result<PathBuf> {
     let inventory: toml::Value = toml::from_str(&fs::read_to_string(&inventory_path)?)?;
     let features: Vec<Value> =
         serde_json::from_value(serde_json::to_value(&inventory["features"])?)?;
-    let mut overrides = BTreeMap::from([
-        (Variant::ForkOff, feature_overrides(&features, false)?),
-        (Variant::ForkOn, feature_overrides(&features, true)?),
+    let overrides = BTreeMap::from([
+        (Variant::ForkOn, feature_overrides(&features)?),
         (Variant::Reference, vec![]),
     ]);
-    if options.fork_only_on {
-        overrides.remove(&Variant::ForkOff);
-    }
     let project_config_comparison =
         ProjectConfigComparison::capture(&repo, BASE_CONFIG, &overrides)?;
     let shared_inputs = directory.join("frozen/shared");
@@ -475,9 +633,11 @@ pub fn prepare(options: PrepareOptions) -> Result<PathBuf> {
     });
     fs::copy(std::env::current_exe()?, &harness_path)?;
     let harness = FileIdentity::record(&harness_path)?;
+    let mut fork = fork;
+    let mut reference = reference;
     checkout(&fork)?;
     checkout(&reference)?;
-    // A checkout predating the new switch cannot honestly participate in the ablation.
+    // The fork must support the inventoried runtime controls.
     let fork_features = fs::read_to_string(fork.checkout.join("codex-rs/features/src/lib.rs"))?;
     ensure!(
         fork_features.contains("kd4_runtime"),
@@ -495,6 +655,9 @@ pub fn prepare(options: PrepareOptions) -> Result<PathBuf> {
     {
         fork_targets.push(("codex-code-mode-host", "codex-code-mode-host"));
     }
+    // Both builds run Cargo with --locked, and the build cache key includes the
+    // lockfile hash, so reconcile before the build reads this checkout.
+    reconcile_lock(&mut fork, &environment, &fork_targets)?;
     let fork_build = builds::build(
         &fork.checkout,
         &fork.revision,
@@ -502,7 +665,7 @@ pub fn prepare(options: PrepareOptions) -> Result<PathBuf> {
         &environment,
         &fork_targets,
     )
-    .with_context(|| format!("fork variants at {}", fork.revision))?;
+    .with_context(|| format!("fork at {}", fork.revision))?;
     let mut reference_targets = vec![
         ("codex-app-server", "codex-app-server"),
         ("codex-cli", "codex"),
@@ -514,6 +677,7 @@ pub fn prepare(options: PrepareOptions) -> Result<PathBuf> {
     {
         reference_targets.push(("codex-code-mode-host", "codex-code-mode-host"));
     }
+    reconcile_lock(&mut reference, &environment, &reference_targets)?;
     let reference_build = builds::build(
         &reference.checkout,
         &reference.revision,
@@ -522,14 +686,10 @@ pub fn prepare(options: PrepareOptions) -> Result<PathBuf> {
         &reference_targets,
     )
     .with_context(|| format!("reference at {}", reference.revision))?;
-    let mut builds = BTreeMap::from([
-        (Variant::ForkOff, fork_build.clone()),
+    let builds = BTreeMap::from([
         (Variant::ForkOn, fork_build),
         (Variant::Reference, reference_build),
     ]);
-    if options.fork_only_on {
-        builds.remove(&Variant::ForkOff);
-    }
     let mut fixtures = BTreeMap::new();
     let scripted = directory.join("fixtures/scripted");
     copy_tree(&shared_inputs, &scripted)?;
@@ -583,8 +743,7 @@ pub fn prepare(options: PrepareOptions) -> Result<PathBuf> {
         directory: directory.clone(),
         repo: repo.clone(),
         mode: options.mode,
-        fork_only_on: options.fork_only_on,
-        schedule: schedule(options.mode, options.fork_only_on),
+        schedule: schedule(options.mode),
         workspace,
         workspace_lock: directory.join("workspace.lock"),
         additional_roots: vec![],
@@ -622,22 +781,15 @@ impl Prepared {
         )?;
         ensure!(
             prepared.schema_version == MANIFEST_VERSION,
-            "unsupported prepared manifest version"
+            "unsupported prepared manifest version; prepare again"
         );
         ensure!(
-            prepared.schedule == schedule(prepared.mode, prepared.fork_only_on),
+            prepared.schedule == schedule(prepared.mode),
             "prepared workload schedule changed"
         );
         // Loaded manifests are an external boundary. Verify mandatory map entries
         // before execution can reset the workspace or publish run evidence.
-        if prepared.fork_only_on {
-            ensure!(
-                !prepared.builds.contains_key(&Variant::ForkOff)
-                    && !prepared.overrides.contains_key(&Variant::ForkOff),
-                "fork-only-on manifest contains fork_off configuration"
-            );
-        }
-        for variant in Variant::selected(prepared.fork_only_on) {
+        for variant in Variant::ALL.into_iter() {
             ensure!(
                 prepared.overrides.contains_key(&variant),
                 "prepared manifest lacks overrides for {}",
@@ -699,15 +851,29 @@ impl Prepared {
                 git(&source.checkout, &["rev-parse", "HEAD"])? == source.revision,
                 "native checkout revision changed"
             );
-            ensure!(
-                git(
-                    &source.checkout,
-                    &["status", "--porcelain", "--untracked-files=no"]
-                )?
-                .is_empty(),
-                "native source at {} is modified",
-                source.revision
-            );
+            let status = git(
+                &source.checkout,
+                &["status", "--porcelain", "--untracked-files=no"],
+            )?;
+            match &source.lock_reconciliation {
+                None => ensure!(
+                    status.is_empty(),
+                    "native source at {} is modified",
+                    source.revision
+                ),
+                Some(lock) => {
+                    ensure!(
+                        only_workspace_lock_modified(&status),
+                        "native source at {} is modified beyond its reconciled lockfile",
+                        source.revision
+                    );
+                    ensure!(
+                        provenance::hash_file(&lock.path)? == lock.resolved_sha256,
+                        "reconciled lockfile at {} changed",
+                        source.revision
+                    );
+                }
+            }
         }
         for build in self.builds.values() {
             build.verify()?;

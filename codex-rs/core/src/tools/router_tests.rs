@@ -1729,7 +1729,10 @@ fn namespace_function_names(specs: &[ToolSpec], namespace_name: &str) -> Vec<Str
 
 #[tokio::test]
 async fn router_apply_patch_cancel_during_approval_has_no_mutation() -> anyhow::Result<()> {
-    use codex_protocol::protocol::{AskForApproval, EventMsg, ReviewDecision, TurnAbortReason};
+    use codex_protocol::protocol::AskForApproval;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::ReviewDecision;
+    use codex_protocol::protocol::TurnAbortReason;
     use std::time::Duration;
 
     struct ApprovalWaitTask;
@@ -1843,8 +1846,8 @@ async fn router_apply_patch_cancel_during_approval_has_no_mutation() -> anyhow::
     );
     assert!(!repo.join("tail.txt").exists());
     assert!(
-        gate.try_lock().is_ok(),
-        "approval waits do not own the mutation gate"
+        gate.try_lock().is_err(),
+        "approval retains the permit protecting the verified patch state"
     );
     cancellation.cancel();
     let result = tokio::time::timeout(Duration::from_secs(5), response)

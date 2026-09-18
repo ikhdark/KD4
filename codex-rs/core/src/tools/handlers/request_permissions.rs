@@ -3,7 +3,6 @@ use codex_sandboxing::policy_transforms::normalize_uri_additional_permissions;
 use std::sync::Arc;
 
 use crate::FunctionCallError;
-use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
@@ -14,6 +13,7 @@ use crate::tools::handlers::shell_spec::request_permissions_tool_description;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutionTiming;
 use crate::tools::registry::ToolExecutor;
+use codex_tools::JsonToolOutput;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use codex_utils_path_uri::PathUri;
@@ -101,16 +101,13 @@ impl RequestPermissionsHandler {
                 )
             })?;
 
-        let content = serde_json::to_string(&response).map_err(|err| {
+        let content = serde_json::to_value(&response).map_err(|err| {
             FunctionCallError::Fatal(format!(
                 "failed to serialize request_permissions response: {err}"
             ))
         })?;
 
-        Ok(boxed_tool_output(FunctionToolOutput::from_text(
-            content,
-            Some(true),
-        )))
+        Ok(boxed_tool_output(JsonToolOutput::new(content)))
     }
 }
 

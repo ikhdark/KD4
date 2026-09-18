@@ -292,7 +292,10 @@ impl LiveThread {
         should_persist_event_msg(event, self.history_mode)
     }
 
-    #[expect(clippy::await_holding_invalid_type, reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations"
+    )]
     async fn append_items_with_durability(
         &self,
         raw_items: &[RolloutItem],
@@ -345,7 +348,10 @@ impl LiveThread {
         Ok(())
     }
 
-    #[expect(clippy::await_holding_invalid_type, reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations"
+    )]
     pub async fn persist(&self) -> ThreadStoreResult<()> {
         let mut metadata_sync = self.metadata_sync.lock().await;
         self.thread_store.persist_thread(self.thread_id).await?;
@@ -354,7 +360,10 @@ impl LiveThread {
             .await
     }
 
-    #[expect(clippy::await_holding_invalid_type, reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations"
+    )]
     pub async fn flush(&self) -> ThreadStoreResult<()> {
         let mut metadata_sync = self.metadata_sync.lock().await;
         self.thread_store.flush_thread(self.thread_id).await?;
@@ -363,7 +372,10 @@ impl LiveThread {
             .await
     }
 
-    #[expect(clippy::await_holding_invalid_type, reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations"
+    )]
     pub async fn shutdown(&self) -> ThreadStoreResult<()> {
         let mut metadata_sync = self.metadata_sync.lock().await;
         self.thread_store.shutdown_thread(self.thread_id).await?;
@@ -372,7 +384,10 @@ impl LiveThread {
             .await
     }
 
-    #[expect(clippy::await_holding_invalid_type, reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations"
+    )]
     pub async fn discard(&self) -> ThreadStoreResult<()> {
         let _metadata_sync = self.metadata_sync.lock().await;
         self.thread_store.discard_thread(self.thread_id).await
@@ -395,7 +410,10 @@ impl LiveThread {
     ///
     /// Successful live appends and resume history keep this lookup process-local. A full history
     /// read is reserved for an ambiguous append whose future was cancelled or returned an error.
-    #[expect(clippy::await_holding_invalid_type, reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations"
+    )]
     pub async fn terminal_event(
         &self,
         turn_id: &str,
@@ -457,7 +475,10 @@ impl LiveThread {
             .await
     }
 
-    #[expect(clippy::await_holding_invalid_type, reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations"
+    )]
     pub async fn update_memory_mode(
         &self,
         mode: ThreadMemoryMode,
@@ -480,7 +501,10 @@ impl LiveThread {
         Ok(())
     }
 
-    #[expect(clippy::await_holding_invalid_type, reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations"
+    )]
     pub async fn update_metadata(
         &self,
         patch: ThreadMetadataPatch,
@@ -642,7 +666,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::await_holding_invalid_type, reason = "Holds the metadata owner to assert that history submission waits for its release")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Holds the metadata owner to assert that history submission waits for its release"
+    )]
     async fn append_waits_for_metadata_owner_before_submitting_history() {
         let store = Arc::new(InMemoryThreadStore::default());
         let live = LiveThread::create(

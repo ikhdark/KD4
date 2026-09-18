@@ -141,7 +141,7 @@ fn search_operands_respect_option_values_and_terminators() {
             strings(&["src"])
         };
         assert_eq!(
-            rg_search_path_operands(&[command.clone()]),
+            rg_search_path_operands(std::slice::from_ref(&command)),
             Some(expected.clone())
         );
         let search = classify_rg_search_narrowing(&command, None, root, root)
@@ -166,7 +166,7 @@ fn search_executable_aliases_have_consistent_dependency_extraction() {
     for program in ["rg", "rga", "ripgrep", "RIPGREP.EXE"] {
         let command = strings(&[program, "needle", "src"]);
         assert_eq!(
-            rg_search_path_operands(&[command.clone()]),
+            rg_search_path_operands(std::slice::from_ref(&command)),
             Some(strings(&["src"]))
         );
         let search = classify_rg_search_narrowing(&command, None, root, root)

@@ -1,8 +1,11 @@
 # Repo Benchmark
 
-Repo Benchmark is the only repository-supported mechanism for A/B benchmarking. It reports measurements and does not issue performance pass/fail verdicts. Incorrect results, failed tasks, and invalid setup remain explicit failures.
+Repo Benchmark is the only repository-supported mechanism for A/B benchmarking. It reports
+measurements and does not issue performance pass/fail verdicts. Incorrect results, failed tasks, and
+invalid setup remain explicit failures.
 
-The Rust package is `codex-rs/repo-benchmark`, beside `core`. It drives each revision's own native app-server. The Python session audit remains the sole diagnostic analyzer and has no A/B mode.
+The Rust package is `codex-rs/repo-benchmark`, beside `core`. It drives each revision's own native
+app-server. The Python session audit remains the sole diagnostic analyzer and has no A/B mode.
 
 ## Choose a measurement
 
@@ -196,9 +199,8 @@ reproducible; a report name alone does not establish compatible provenance.
 just repo-benchmark
 just repo-benchmark -fast
 just repo-benchmark -full
-just repo-benchmark scan -fast only on
-just repo-benchmark scan -full fork only on
-just repo-benchmark prepare -full --fork-only-on
+just repo-benchmark scan -fast
+just repo-benchmark scan -full
 just repo-benchmark prepare -full
 just repo-benchmark prepare -full --reference C:\path\to\candidate
 just repo-benchmark compare --prepared C:\absolute\path\prepared.json -full
@@ -207,57 +209,113 @@ just repo-benchmark rerun --result C:\absolute\path\result.json --attempt ATTEMP
 just repo-benchmark rerun --result C:\absolute\path\result.json --analysis-only
 ```
 
-`run`, `prepare`, `compare`, `import`, and `rerun` are operations of this one command. Fast is the default. The exact single-hyphen flags `-fast` and `-full` cannot be combined. Prepared comparisons retain their selected mode; changing the mode requires preparation again.
+`run`, `prepare`, `compare`, `import`, and `rerun` are operations of this one command. Fast is the
+default. The exact single-hyphen flags `-fast` and `-full` cannot be combined. Prepared comparisons
+retain their selected mode; changing the mode requires preparation again.
 
-New runs and preparations default to comparing only `fork_on` with `reference`
-(upstream by default). `--fork-only-on`, `only on`, and `fork only on` explicitly
-select this default; `scan` is an alias for `run`. Add `--all-variants` to include
-`fork_off`, for example `just repo-benchmark scan -full --all-variants`.
-Selection is frozen in the prepared manifest: `compare` and reruns inherit it,
-including older three-variant manifests. An explicit selection that differs from
-an existing manifest requires preparing again.
+Every run compares `fork_on` with `reference` (upstream by default).
+`scan` is an alias for `run`. There is no disabled-feature fork variant or
+variant-selection switch. Prepared manifest schema 3 freezes this comparison;
+older manifests must be prepared again before comparison, rerun, or import.
 
-By default, both modes schedule 84 scripted attempts (14 workloads ×
-three clusters × two variants). Fast schedules two live attempts; full schedules
-six. Execution ceilings stay unchanged and finite schedules finish as soon as
-the selected work completes. Reports contain only the overall comparison and
-selected variant configuration; fork drift and isolated feature effects are
-not measured because the disabled-fork arm is absent.
+Both modes schedule 84 scripted attempts (14 workloads × three clusters ×
+two variants). Fast schedules two live attempts; full schedules six. Reports
+contain the overall comparison and both variants' configuration. Individual
+feature effects are not isolated.
 
 | Mode | Scripted execution ceiling | Real-model work and ceiling |
 |---|---:|---|
-| Fast | 30 minutes | Rust task × two variants by default; 75 minutes |
-| Full | 30 minutes | Rust, TypeScript, Python tasks × two variants by default; 225 minutes |
+| Fast | 30 minutes | Rust task Ã— two variants; 50 minutes |
+| Full | 30 minutes | Rust, TypeScript, Python tasks Ã— two variants; 150 minutes |
 
-Each real-model attempt has a ten-minute ceiling. Execution is sequential: scripted work, cleanup, then real-model work. Variants and independent attempts run one at a time. These are maximum allowances; finite schedules stop immediately when finished. Unused time never creates extra repetitions or model calls. Preparation, builds, resets, independent verification, cleanup, and analysis are recorded outside execution budgets. Independent verification has its own two-minute limit.
+Each real-model attempt has a twenty-minute ceiling. Execution is sequential: scripted work,
+cleanup, then real-model work. Variants and independent attempts run one at a time. These are
+maximum allowances; finite schedules stop immediately when finished. Unused time never creates extra
+repetitions or model calls. Preparation, builds, resets, independent verification, cleanup, and
+analysis are recorded outside execution budgets. Independent verification has its own two-minute
+limit.
 
 ## Revisions and controls
 
-A defaults to committed local `main`. B defaults to the newest locally available stable upstream release tag (`rust-vMAJOR.MINOR.PATCH`, ordered numerically). Prerelease tags and unreleased `upstream/main` commits do not advance the baseline. Preparation never fetches; upstream release tags must already be available locally. Missing stable release tags produce an error. `--reference` explicitly selects another checkout's committed HEAD. No ancestry relationship is required. `--fork-ref` explicitly selects another committed fork revision. An older fork revision without the inventoried runtime controls fails preparation rather than silently incorporating working-tree edits.
+A defaults to committed local `main`. B defaults to the newest locally available stable upstream
+release tag (`rust-vMAJOR.MINOR.PATCH`, ordered numerically). Prerelease tags and unreleased
+`upstream/main` commits do not advance the baseline. Preparation never fetches; upstream release
+tags must already be available locally. Missing stable release tags produce an error. `--reference`
+explicitly selects another checkout's committed HEAD. No ancestry relationship is required.
+`--fork-ref` explicitly selects another committed fork revision. An older fork revision without the
+inventoried runtime controls fails preparation rather than silently incorporating working-tree
+edits.
 
 | Variant | Native implementation |
 |---|---|
-| `fork_off` | A with the inventoried KD4 controls disabled |
 | `fork_on` | A with implemented controls enabled and deliberately disabled features still disabled |
 | `reference` | B's own app-server; displayed as `reference (upstream)` for the default |
 
-`fork_off` against `reference` measures fork drift. `fork_on` against `fork_off` measures the controlled feature effect. `fork_on` against `reference` measures the overall result. Fixed instrumentation and other fork differences remain in both fork variants, so drift is not parity.
+`fork_on` against `reference` measures the overall result, including runtime controls,
+instrumentation, and other fixed fork differences.
 
-The feature inventory is the selected fork commit's `kd4_features.toml`, including phase reasoning and `features.kd4_runtime`. Reports separate declared controls, enabled settings, evidence of exercise, and fixed differences. Enabling a feature alone does not prove that a workload exercised it. Preparation freezes declarations; it does not claim that feature test gates ran against the selected revision.
+The feature inventory is the selected fork commit's `kd4_features.toml`, including phase reasoning
+and `features.kd4_runtime`. Reports separate declared controls, enabled settings, evidence of
+exercise, and fixed differences. Enabling a feature alone does not prove that a workload exercised
+it. Preparation freezes declarations; it does not claim that feature test gates ran against the
+selected revision.
 
-Preparation pins all source, executable, fixture, analyzer, configuration, and environment identities. No benchmark sources or Cargo registrations are injected into candidate checkouts. Native builds use each revision's own dependencies and lockfile, six Cargo jobs, release optimization, thin LTO, four codegen units, disabled incremental compilation, and the same pinned toolchain. Separate persistent target directories and available sccache support verified reuse.
+Preparation pins all source, executable, fixture, analyzer, configuration, and environment
+identities. No benchmark sources or Cargo registrations are injected into candidate checkouts.
+Native builds use each revision's own dependencies and lockfile, twelve Cargo jobs, release
+optimization, thin LTO, four codegen units, disabled incremental compilation, and the same pinned
+toolchain. Each build keeps its final executables in a separate persistent target directory. Cargo's
+intermediate build directory is shared across revisions within each fork/reference lane, so
+unchanged dependencies can be reused when the selected revision changes. Cargo owns fingerprint
+invalidation and build locking; available sccache provides additional reuse. The first build
+populates the shared intermediates. Intermediate paths are recorded as optional provenance and are
+not required to verify a completed build.
 
-Upstream is not rebuilt for every benchmark. After the first build, preparations reuse the verified native artifacts under `codex-rs/target/repo-benchmark/builds/reference` and print that Cargo was skipped. A newer local stable release selects a new baseline and builds it once. Changes to the fork, benchmark mode, schedule, or harness alone do not invalidate upstream's build. Build inputs and toolchain identities must still match; changed build inputs or a deleted cache require a build, and failed artifact verification stops preparation. Keep prior prepared source directories alongside the build cache because their pinned lockfile and configuration remain part of verification. Original build duration is retained separately from each preparation's cache verification time.
+Upstream is not rebuilt for every benchmark. After the first build, preparations reuse the verified
+native artifacts under `codex-rs/target/repo-benchmark/builds/reference` and print that Cargo was
+skipped. A newer local stable release selects a new baseline and builds it once. Changes to the
+fork, benchmark mode, schedule, or harness alone do not invalidate upstream's build. Build inputs
+and toolchain identities must still match; changed build inputs or a deleted cache require a build,
+and failed artifact verification stops preparation. Keep prior prepared source directories alongside
+the build cache because their pinned lockfile and configuration remain part of verification.
+Original build duration is retained separately from each preparation's cache verification time.
 
-For revisions using upstream's custom V8 release, preparation follows that revision's dependency setup: download the matching archive and Rust bindings from the official Codex release, verify the release manifest against the revision's tracked checksum, then verify both artifacts against that manifest. Their URLs, hashes, and effective build paths are preserved in build provenance and checked before reuse. This supplies build dependencies without changing the selected revision or its Cargo manifests.
+For revisions using upstream's custom V8 release, preparation follows that revision's dependency
+setup: download the matching archive and Rust bindings from the official Codex release, verify the
+release manifest against the revision's tracked checksum, then verify both artifacts against that
+manifest. Their URLs, hashes, and effective build paths are preserved in build provenance and
+checked before reuse. This supplies build dependencies without changing the selected revision or its
+Cargo manifests.
 
 ## Tasks, diagnostics, and evidence
 
-The scripted segment covers requests/history/cache behavior, direct/nested/parallel tools, retained processes, cancellation, continuation, and tool completion after follow-up and restart/resume. Its default fixed schedule is three independent clusters across 14 workloads and two variants: 84 attempts, one measured observation per workload/variant in each cluster and no warmup attempts. With `--all-variants`, the schedule includes all three variants for 126 attempts. Each attempt starts a fresh native process, so the old in-process warmup/repetition counts did not warm subsequent processes and made the native schedule infeasible. The first cluster covers every selected workload/variant combination. The three-variant schedule rotates each variant through first, second and third positions once per workload; the default preserves the relative order of its selected variants. Both modes use this schedule and the unchanged shared 30-minute ceiling. Completing within that ceiling still requires evidence from the actual run. Three clusters provide descriptive measurements only. Intervals require at least five independent paired clusters; failed or unrun pairs reduce coverage further. This is an explicit reporting floor, not a guarantee of statistical power. The complete schedule is frozen in preparation; old manifests whose schedule differs must be prepared again. This segment never computes token diagnostics.
+The scripted segment covers requests/history/cache behavior, direct/nested/parallel tools, retained
+processes, cancellation, continuation, and tool completion after follow-up and restart/resume. Its
+fixed schedule is three independent clusters across 14 workloads and two variants: 84 attempts, one
+measured observation per workload/variant in each cluster and no warmup attempts. Each attempt
+starts a fresh native process, so the old in-process warmup/repetition counts did not warm
+subsequent processes and made the native schedule infeasible. The first cluster covers every
+selected workload/variant combination. The schedule alternates which variant runs first across
+workloads and clusters; each variant occupies both positions for every workload. Both modes use this
+schedule and the unchanged shared 30-minute ceiling. Completing within that ceiling still requires
+evidence from the actual run. Three clusters provide descriptive measurements only. Intervals
+require at least five independent paired clusters; failed or unrun pairs reduce coverage further.
+This is an explicit reporting floor, not a guarantee of statistical power. The complete schedule is
+frozen in preparation; old manifests whose schedule differs must be prepared again. This segment
+never computes token diagnostics.
 
-Real-model task 1 fixes a Rust bug in a synthetic repository with generated discovery-noise files. Task 2 adds a TypeScript feature across files in a similar synthetic repository. These fixtures measure focused edits amid search noise, not production repository complexity. Task 3 performs a behavior-preserving Python refactor in a pinned KD4 Git snapshot. Focused tests and protected independent verifiers check the requested behavior, meaningful regression tests, and final workspace changes. Task snapshots exclude working-tree build output and untracked content; shared instructions and scripts are separately recorded identical additions.
+Real-model task 1 fixes a Rust bug in a synthetic repository with generated discovery-noise files.
+Task 2 adds a TypeScript feature across files in a similar synthetic repository. These fixtures
+measure focused edits amid search noise, not production repository complexity. Task 3 performs a
+behavior-preserving Python refactor in a pinned KD4 Git snapshot. Focused tests and protected
+independent verifiers check the requested behavior, meaningful regression tests, and final workspace
+changes. Task snapshots exclude working-tree build output and untracked content; shared instructions
+and scripts are separately recorded identical additions.
 
-All variants receive the same supplied root AGENTS, scripts, task root, prompts, permissions, shell, executable search paths, and dependencies. Homes and sessions are isolated. The exact approved base configuration is used without remaining user/project configuration or service-tier overrides. Authentication is supplied separately and excluded from preserved configuration.
+All variants receive the same supplied root AGENTS, scripts, task root, prompts, permissions, shell,
+executable search paths, and dependencies. Homes and sessions are isolated. The exact approved base
+configuration is used without remaining user/project configuration or service-tier overrides.
+Authentication is supplied separately and excluded from preserved configuration.
 
 Tool discovery accepts both top-level declarations and Responses Lite's in-band
 `additional_tools`. The exclusive-tool scenario overlaps an `apply_patch` mutation
@@ -270,27 +328,62 @@ Windows configuration checks accept equivalent canonical paths and schema-versio
 1 migration metadata; additional settings remain rejected. Rust verification uses
 a short temporary build path so deeply nested evidence paths do not break MSVC.
 
-Preparation records how each arm's fixed configuration and feature overrides differ from the current checkout's explicit `.codex/config.toml`. Reports show project-only keys, benchmark-only keys, and keys with different values, together with the captured file's hash. Values are not retained in this comparison. This is not the layered daily effective configuration: home settings and defaults are outside its scope. Missing project configuration or older preparation manifests are reported as unavailable. Code-mode host differences across builds are also called out because they affect nested-tool comparability.
+Preparation records how each arm's fixed configuration and feature overrides differ from the current
+checkout's explicit `.codex/config.toml`. Reports show project-only keys, benchmark-only keys, and
+keys with different values, together with the captured file's hash. Values are not retained in this
+comparison. This is not the layered daily effective configuration: home settings and defaults are
+outside its scope. Missing project configuration or older preparation manifests are reported as
+unavailable. Code-mode host differences across builds are also called out because they affect
+nested-tool comparability.
 
-Native tool dispatch retry and reentry counts appear in the diagnostic summary and comparison tables only when all captured turns have the required counters and no tool timing overflow. Unknown counts remain unavailable; partial observations are retained separately. Request retention compares the uncapped `counters.modelRequestCount` with retained `modelRequests`; a mismatch withdraws complete request, continuation and token totals. Provider usage with contradictory cached, uncached, output or total counts cannot establish complete token coverage. These checks consume existing native evidence and do not generate extra model calls.
+Native tool dispatch retry and reentry counts appear in the diagnostic summary and comparison tables
+only when all captured turns have the required counters and no tool timing overflow. Unknown counts
+remain unavailable; partial observations are retained separately. Request retention compares the
+uncapped `counters.modelRequestCount` with retained `modelRequests`; a mismatch withdraws complete
+request, continuation and token totals. Provider usage with contradictory cached, uncached, output
+or total counts cannot establish complete token coverage. These checks consume existing native
+evidence and do not generate extra model calls.
 
-Raw native evidence is saved before the frozen Python analyzer runs. Startup failures, unfinished turns, rejected tools, retries, verification failures, and missing telemetry remain visible. Real-model token data comes from native telemetry, with provider counts distinguished from estimates and unsupported reference categories marked unavailable. No recording proxy is used. Expensive analysis and workspace verification occur outside measured execution.
+Raw native evidence is saved before the frozen Python analyzer runs. Startup failures, unfinished
+turns, rejected tools, retries, verification failures, and missing telemetry remain visible.
+Real-model token data comes from native telemetry, with provider counts distinguished from estimates
+and unsupported reference categories marked unavailable. No recording proxy is used. Expensive
+analysis and workspace verification occur outside measured execution.
 
-Reports lead with completion and failures, distinguishing changes outside the permitted task scope from incorrect behavior. Report schema 2 compares named metrics independently: elapsed time, tool and turn counts, first-output and first-action timing, request volume, complete live token usage, discovery work, and outside-execution durations. Missing or partial evidence excludes the attempt for that metric rather than supplying zero. Statistics retain matched pairs, run clusters, distributions, sample identities, and 10,000-resample bootstrap intervals when supported. Markdown suppresses tail comparisons below 20 observations in either arm; JSON retains the interpolated sample quantiles. Behavior counts remain descriptive without significance tests. One live attempt per task and variant is an observation, not evidence of repeat-to-repeat model variance. Different tasks are not repeated samples of one task.
+Reports lead with completion and failures, distinguishing changes outside the permitted task scope
+from incorrect behavior. Report schema 3 compares named metrics independently: elapsed time, tool
+and turn counts, first-output and first-action timing, request volume, complete live token usage,
+discovery work, and outside-execution durations. Missing or partial evidence excludes the attempt
+for that metric rather than supplying zero. Statistics retain matched pairs, run clusters,
+distributions, sample identities, and 10,000-resample bootstrap intervals when supported. Markdown
+suppresses tail comparisons below 20 observations in either arm; JSON retains the interpolated
+sample quantiles. Behavior counts remain descriptive without significance tests. One live attempt
+per task and variant is an observation, not evidence of repeat-to-repeat model variance. Different
+tasks are not repeated samples of one task.
 
-Scripted request count and compact UTF-8 JSON request-body bytes are measured from the captured provider requests through the frozen analyzer. Bytes include tools and input and are a request-volume proxy, not tokenizer output, transport bytes, or provider cache hits. Scripted token regressions are not measured directly. Single live attempts cannot establish behavioral regression rates or variance. The live fixtures do not cover long-session compaction, approval decisions, user corrections, or broad production refactors. Discovery counts describe recognized tool-call events, not distinct files read, retained edits, or instruction compliance.
+Scripted request count and compact UTF-8 JSON request-body bytes are measured from the captured
+provider requests through the frozen analyzer. Bytes include tools and input and are a
+request-volume proxy, not tokenizer output, transport bytes, or provider cache hits. Scripted token
+regressions are not measured directly. Single live attempts cannot establish behavioral regression
+rates or variance. The live fixtures do not cover long-session compaction, approval decisions, user
+corrections, or broad production refactors. Discovery counts describe recognized tool-call events,
+not distinct files read, retained edits, or instruction compliance.
 
-Every started attempt retains its inputs, native evidence, logs, verifier result, identities, and specific rerun command. Analysis failure preserves the raw experiment. Analysis-only reruns and report import make no model calls; live reruns preserve the original and can produce different behavior.
+Every started attempt retains its inputs, native evidence, logs, verifier result, identities, and
+specific rerun command. Analysis failure preserves the raw experiment. Analysis-only reruns and
+report import make no model calls; live reruns preserve the original and can produce different
+behavior.
 
-Generated run artifacts live under the prepared paths beneath `codex-rs/target/repo-benchmark`. Imported reports go to this documentation directory's ignored `accepted` subdirectory. Historical reports retain their original provenance. Old prepared comparisons must be prepared again.
+Generated run artifacts live under the prepared paths beneath `codex-rs/target/repo-benchmark`.
+Imported reports go to this documentation directory's ignored `accepted` subdirectory. Historical
+reports retain their original provenance. Old prepared comparisons must be prepared again.
 
 ## Behavior measurements
 
-The feature inventory reports how many entries change runtime settings, retain
-identical settings, cannot be ablated, or lack configuration evidence. Per-key
-settings expose shared controls; features sharing a switch cannot have their
-individual effects isolated by that comparison. Declared verification references
-are shown separately from observed exercise and do not certify a passing gate.
+The feature inventory reports configured and observed effective settings for
+both variants. Settings and declared verification references are shown
+separately from observed exercise and do not certify a passing gate. The
+overall comparison does not isolate individual feature effects.
 
 Incomplete token accounting leaves top-level totals and cache share unavailable.
 `observedTotals` retains partial provider counts and output-only observations;
@@ -375,7 +468,7 @@ Rollout-trace recording remains opt-in: enabling additional trace recording on
 the timed path would require assessing overhead and compatibility across all
 selected revisions. The Python audit remains authoritative for benchmark metrics.
 
-## Audit AJ–AY: verified changes and measurement limits
+## Audit AJâ€“AY: verified changes and measurement limits
 
 The behavior vector uses the existing `investigation-evidence-v1` envelope.
 Its snapshot hashes the captured rollout byte identities, independently of file
@@ -423,9 +516,15 @@ Summed thread durations are not elapsed task time.
 
 ## Focused validation
 
-Use `cargo test --locked -p repo-benchmark --jobs 6`, the affected feature/core gates, the Python audit/timing tests, and `just source-map-check`. Do not run the full repository suite. Completion requires a full-mode execution covering scripted work and all nine live attempts with preserved evidence; fast selection is checked without another paid matrix.
+Use `cargo test --locked -p repo-benchmark --jobs 6`, the affected feature/core gates, the Python
+audit/timing tests, and `just source-map-check`. Do not run the full repository suite. Completion
+requires a full-mode execution covering scripted work and all nine live attempts with preserved
+evidence; fast selection is checked without another paid matrix.
 
-The approved implementation plan and fixed paths are recorded verbatim in the installed Stay On Track reminder record. Its checkpoints apply before implementation, verification, and completion. Builds or required execution that remain blocked must be reported as blocked, not as completed validation.
+The approved implementation plan and fixed paths are recorded verbatim in the installed Stay On
+Track reminder record. Its checkpoints apply before implementation, verification, and completion.
+Builds or required execution that remain blocked must be reported as blocked, not as completed
+validation.
 
 Execution checkpoints are stored per attempt in `attempt.json`; the complete
 `result.json` is written when the run starts and finishes. An analysis-only rerun
@@ -443,6 +542,10 @@ final source digest and saved changes exclude `.git`, `target`, `node_modules`,
 and `__pycache__`; these are source-state measurements, not build-output hashes.
 The pinned KD4 fixture still contains the full committed source tree.
 
-The live attempt allowance is 20 minutes. Fast and full segment ceilings are 75 and 225 minutes, covering all three variants with 25% scheduling headroom. Default scans still select only fork-on and upstream. Replay uses the budgets frozen in each prepared manifest; these defaults apply to new preparations.
+The live attempt allowance is 20 minutes. Fast and full segment ceilings are 50 and 150 minutes,
+covering fork-on and upstream with 25% scheduling headroom. Replay uses the budgets frozen in each
+prepared manifest; these defaults apply to new preparations.
 
-Cancellation verification checks both PID creation time and actual exit state. A published retained process can intentionally survive turn interruption; such an attempt remains failed and does not become a passing pair merely because the turn reported interrupted.
+Cancellation verification checks both PID creation time and actual exit state. A published retained
+process can intentionally survive turn interruption; such an attempt remains failed and does not
+become a passing pair merely because the turn reported interrupted.

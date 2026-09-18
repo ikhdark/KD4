@@ -74,7 +74,8 @@ cargo test
 ```
 
 GitHub releases also publish a DotSlash file named
-`argument-comment-lint` for Windows x64. The published package contains a small runner executable, a bundled
+`argument-comment-lint` for Windows x64. The published package contains a small runner executable, a
+bundled
 `cargo-dylint`, and the prebuilt lint library.
 
 The package is not a full Rust toolchain. Running the prebuilt path still
@@ -96,7 +97,8 @@ available in `run.py` for people iterating on the lint crate itself.
 The Windows archive is a `.zip` containing `.exe` runner/tool files and the `.dll` lint library.
 
 DotSlash resolves the package entrypoint to
-`argument-comment-lint/bin/argument-comment-lint.exe`. That runner finds the sibling bundled `cargo-dylint`
+`argument-comment-lint/bin/argument-comment-lint.exe`. That runner finds the sibling bundled
+`cargo-dylint`
 binary and the single packaged Dylint library under `lib/`, normalizes the
 host-qualified nightly filename to the plain `nightly-2025-09-18` channel when
 needed, and then invokes `cargo-dylint dylint --lib-path <that-library>` with

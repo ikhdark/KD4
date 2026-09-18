@@ -1096,7 +1096,10 @@ mod tests {
             let (mut stream, _) = listener.accept().await?;
             let mut request = [0; 8192];
             let read = stream.read(&mut request).await?;
-            assert!(read > 0, "client must send a request before the error response");
+            assert!(
+                read > 0,
+                "client must send a request before the error response"
+            );
             stream
                 .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 1000000\r\n\r\n")
                 .await?;

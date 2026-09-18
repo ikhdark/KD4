@@ -122,9 +122,11 @@ fn timer_rejects_invalid_inputs_at_construction() -> Result<()> {
 
 #[test]
 fn grpc_exporters_reject_invalid_and_ambiguous_headers_without_credentials_in_errors() {
+    use codex_otel::OtelExporter;
     use codex_otel::OtelProvider;
-    use codex_otel::{OtelExporter, OtelSettings};
-    use std::collections::{BTreeMap, HashMap};
+    use codex_otel::OtelSettings;
+    use std::collections::BTreeMap;
+    use std::collections::HashMap;
     for (headers, expected) in [
         (
             HashMap::from([("bad header".to_string(), "secret".to_string())]),

@@ -1489,11 +1489,11 @@ impl ToolRegistry {
         // already claimed the terminal outcome. Do not continue into
         // projection, persistence, or finish notification for that result.
         if dispatch_state.is_aborted() {
-            if invocation.tool_name.name == "apply_patch" {
-                if let Err(error) = result {
-                    dispatch_trace.record_failed(&error).await;
-                    return Err(error);
-                }
+            if invocation.tool_name.name == "apply_patch"
+                && let Err(error) = result
+            {
+                dispatch_trace.record_failed(&error).await;
+                return Err(error);
             }
             let err = FunctionCallError::RespondToModel(
                 "tool cancelled after runtime cleanup".to_string(),

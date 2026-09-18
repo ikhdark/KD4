@@ -113,9 +113,9 @@ impl WorldStateSection for AgentsMdState {
                 directory: current.directory,
                 text: "The previously provided instruction body is unchanged.".to_string(),
             };
-            return Some(Box::new(instructions.with_observation(
-                current.freshness.model_visible_description(),
-            )));
+            return Some(Box::new(
+                instructions.with_observation(current.freshness.model_visible_description()),
+            ));
         }
 
         let previous_may_contain_instructions = match previous {

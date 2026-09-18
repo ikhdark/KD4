@@ -245,17 +245,19 @@ fn append_locked_line(policy_path: &Path, line: &str, deduplicate: bool) -> Resu
     // This crate is below codex-file-system in the dependency graph. Keep the
     // same temporary-file publication discipline without introducing a cycle.
     let publish = || -> std::io::Result<()> {
-        let mut temporary = tempfile::NamedTempFile::new_in(
-            write_path
-                .parent()
-                .expect("canonical policy path has a parent"),
-        )?;
+        let mut temporary =
+            tempfile::NamedTempFile::new_in(write_path.parent().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "canonical policy path has no parent",
+                )
+            })?)?;
         temporary.write_all(contents.as_bytes())?;
         temporary.as_file().set_permissions(permissions)?;
         temporary.as_file().sync_all()?;
-        temporary
-            .persist(&write_path)
-            .map_err(|error| error.error)?;
+        let (_file, path) = temporary.keep().map_err(|error| error.error)?;
+        let path = tempfile::TempPath::try_from_path(path)?;
+        std::fs::rename(&path, &write_path)?;
         Ok(())
     };
     publish().map_err(|source| AmendError::WritePolicyFile {

@@ -827,7 +827,11 @@ text(reads.map(read => read.value).join(""));"#
         );
         let output = custom_tool_output_last_non_empty_text(&request, "call-0")
             .expect("the original read must remain available to the model");
-        assert_eq!(output.trim(), expected_read.trim(), "model request {index}");
+        assert_eq!(
+            output.replace("\r\n", "\n").trim(),
+            expected_read.trim(),
+            "model request {index}"
+        );
     }
     let stale = custom_tool_output_last_non_empty_text(&final_request.single_request(), "call-0")
         .expect("changed source must leave a freshness notice");
@@ -967,7 +971,7 @@ async fn code_mode_preserves_post_patch_validation_but_invalidates_earlier_reads
 
 #[test_case::test_case("completed", false, false, false, true; "completed required suites")]
 #[test_case::test_case("pending", false, false, false, false; "unfinished work")]
-#[test_case::test_case("absent", false, false, false, false; "unconfirmed completion")]
+#[test_case::test_case("absent", false, false, false, true; "validated edit without plan")]
 #[test_case::test_case("completed", true, true, false, false; "masked failure")]
 #[test_case::test_case("completed", true, false, false, false; "failed first suite")]
 #[test_case::test_case("completed", false, false, true, false; "edit after validation")]
@@ -3364,7 +3368,7 @@ text("phase 2");
         &server,
         sse(vec![
             ev_response_created("resp-1"),
-            ev_custom_tool_call("call-1", "exec", &code),
+            ev_custom_tool_call("call-1", "exec", code),
             ev_completed("resp-1"),
         ]),
     )

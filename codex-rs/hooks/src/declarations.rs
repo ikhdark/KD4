@@ -27,6 +27,10 @@ impl HookKeyBuilder {
                 .map(str::to_owned),
             hooks: vec![handler.clone()],
         };
+        #[expect(
+            clippy::expect_used,
+            reason = "the hook identity is a concrete TOML-compatible config schema; changing it requires a persisted-key migration"
+        )]
         let identity = TomlValue::try_from(identity)
             .expect("hook declarations contain only TOML-serializable fields");
         let base = format!(

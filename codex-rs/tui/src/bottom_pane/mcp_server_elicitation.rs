@@ -710,6 +710,9 @@ fn parse_single_select_field(
     }
 }
 
+/// Wrapped prompt lines cached against the field index and render width that produced them.
+type CachedPromptLayout = (usize, u16, Arc<Vec<String>>);
+
 pub(crate) struct McpServerElicitationOverlay {
     app_event_tx: AppEventSender,
     request: McpServerElicitationFormRequest,
@@ -722,7 +725,7 @@ pub(crate) struct McpServerElicitationOverlay {
     list_keymap: ListKeymap,
     prompt_offset: Cell<usize>,
     prompt_viewport: Cell<(u16, u16)>,
-    prompt_layouts: RefCell<VecDeque<(usize, u16, Arc<Vec<String>>)>>,
+    prompt_layouts: RefCell<VecDeque<CachedPromptLayout>>,
 }
 
 impl McpServerElicitationOverlay {

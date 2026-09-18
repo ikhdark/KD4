@@ -1119,6 +1119,9 @@ fn websocket_prefix_hash_ignores_internal_metadata_only() {
     assert_ne!(first, visible_change);
 }
 
+/// A named property and the mutation that changes it on a request under test.
+type LabeledRequestMutation = (&'static str, fn(&mut ResponsesApiRequest));
+
 #[test]
 fn websocket_property_fingerprint_tracks_every_reuse_property() {
     let original = history_test_request(vec![history_test_item("user", None)]);
@@ -1141,7 +1144,7 @@ fn websocket_property_fingerprint_tracks_every_reuse_property() {
         client_metadata: _,
     } = &original;
     let fingerprint = super::responses_request_properties_fingerprint(&original).unwrap();
-    let changes: &[(&str, fn(&mut ResponsesApiRequest))] = &[
+    let changes: &[LabeledRequestMutation] = &[
         ("model", |request| request.model.push_str("-new")),
         ("instructions", |request| {
             request.instructions.push_str(" updated")
@@ -1217,7 +1220,7 @@ fn websocket_property_fingerprint_tracks_every_reuse_property() {
         assert_eq!(prepared.input, current.input, "{name}");
     }
 
-    let delivery_changes: &[(&str, fn(&mut ResponsesApiRequest))] = &[
+    let delivery_changes: &[LabeledRequestMutation] = &[
         ("input", |request| {
             request.input = vec![history_test_item("other input", None)].into();
         }),
@@ -2669,7 +2672,10 @@ async fn provider_response_ids_cannot_replace_trusted_context() {
         } else {
             provider_id
         };
-        assert_eq!(done.id().map(|id| id.as_str()), Some(expected_id));
+        assert_eq!(
+            done.id().map(codex_protocol::ResponseItemId::as_str),
+            Some(expected_id)
+        );
         assert!(matches!(
             stream.next().await,
             Some(Ok(ResponseEvent::Completed { .. }))

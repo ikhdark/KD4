@@ -1972,11 +1972,11 @@ async fn forced_terminal_budget_boundary_warns_without_changing_history() {
 fn completion_pending_input_stays_in_the_sampling_loop_when_capacity_remains() {
     let available = LogicalGenerationBudget::default();
     assert_eq!(
-        completion_pending_input_disposition(&available, true),
+        completion_pending_input_disposition(available, true),
         CompletionPendingInputDisposition::Continue
     );
     assert_eq!(
-        completion_pending_input_disposition(&available, false),
+        completion_pending_input_disposition(available, false),
         CompletionPendingInputDisposition::None
     );
 
@@ -1988,7 +1988,7 @@ fn completion_pending_input_stays_in_the_sampling_loop_when_capacity_remains() {
         );
     }
     assert_eq!(
-        completion_pending_input_disposition(&no_regular_capacity, true),
+        completion_pending_input_disposition(no_regular_capacity, true),
         CompletionPendingInputDisposition::Defer
     );
 }
@@ -2139,7 +2139,7 @@ fn used_terminal_then_regular_generation_limit_blocks_follow_up_before_input_dra
 
     assert!(budget.is_exhausted());
     assert!(generation_budget_blocks_follow_up(
-        &budget,
+        budget,
         Some(&next_request)
     ));
 }
@@ -6457,6 +6457,10 @@ fn pending_turn_mechanism_retries_remain_bounded_without_fixed_point_state() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the held guard is the contention this test asserts stabilization waits on"
+)]
 async fn pending_turn_exhausted_budget_stops_before_history_or_snapshot_work() {
     let (session, turn_context) = crate::session::tests::make_session_and_context().await;
     let session = Arc::new(session);
@@ -6538,6 +6542,10 @@ async fn pending_turn_missing_inventory_records_a_planning_failure() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the held guard proves cancellation returns without waiting for the state owner"
+)]
 async fn pending_turn_cancelled_before_planning_does_not_charge_budget() {
     let (session, turn_context) = crate::session::tests::make_session_and_context().await;
     let session = Arc::new(session);

@@ -1,10 +1,15 @@
 //! Measurements for the frozen schedule. No performance acceptance thresholds.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
-use rand::{Rng, SeedableRng, rngs::StdRng};
-use serde::{Deserialize, Serialize};
+use rand::Rng;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+use serde::Deserialize;
+use serde::Serialize;
 
-use crate::schedule::{Segment, Variant};
+use crate::schedule::Segment;
+use crate::schedule::Variant;
 
 pub const BOOTSTRAP_REPLICATES: usize = 10_000;
 pub const BOOTSTRAP_SEED: u64 = 0x4b44_345f_4142_7631;
@@ -124,11 +129,8 @@ pub struct Comparison {
     pub quantile_method: String,
 }
 
-const COMPARISONS: [(&str, Variant, Variant); 3] = [
-    ("drift", Variant::Reference, Variant::ForkOff),
-    ("feature_effect", Variant::ForkOff, Variant::ForkOn),
-    ("overall", Variant::Reference, Variant::ForkOn),
-];
+const COMPARISONS: [(&str, Variant, Variant); 1] =
+    [("overall", Variant::Reference, Variant::ForkOn)];
 
 /// Workloads never get pooled: different tasks are not repetitions.
 pub fn summarize(observations: &[Observation]) -> Vec<Comparison> {
@@ -383,6 +385,12 @@ fn percentile(sorted: &[f64], q: f64) -> Option<f64> {
 
 fn interval(mut values: Vec<f64>) -> Interval {
     values.sort_by(f64::total_cmp);
+    // `percentile` only returns `None` for an empty slice; every caller passes
+    // a full set of bootstrap replicates.
+    #[expect(
+        clippy::expect_used,
+        reason = "callers pass a non-empty bootstrap replicate set"
+    )]
     Interval {
         lower: percentile(&values, 0.025).expect("bootstrap samples"),
         upper: percentile(&values, 0.975).expect("bootstrap samples"),
@@ -480,7 +488,7 @@ mod tests {
             })
             .collect();
         let results = summarize(&observations);
-        let comparison = &results[2];
+        let comparison = &results[0];
         assert_eq!(
             comparison.quantile_method,
             "linear interpolation at (n-1)*q"
@@ -495,40 +503,36 @@ mod tests {
         assert_eq!(comparison.excluded_pair_rate, Some(0.0));
         observations[1].completed = false;
         let results = summarize(&observations);
-        assert_eq!(results[2].pairs.len(), 3);
-        assert_eq!(results[2].scheduled_pair_slots, 4);
-        assert_eq!(results[2].excluded_pair_rate, Some(0.25));
-        assert_eq!(results[2].baseline_distribution.count, 4);
-        assert_eq!(results[2].candidate_distribution.count, 3);
+        assert_eq!(results[0].pairs.len(), 3);
+        assert_eq!(results[0].scheduled_pair_slots, 4);
+        assert_eq!(results[0].excluded_pair_rate, Some(0.25));
+        assert_eq!(results[0].baseline_distribution.count, 4);
+        assert_eq!(results[0].candidate_distribution.count, 3);
     }
 
     #[test]
-    fn three_comparisons_have_explicit_direction_and_shared_identity() {
+    fn overall_comparison_has_explicit_direction_and_sample_identity() {
         let results = summarize(&[
             sample(Variant::Reference, 0, 0, 100),
-            sample(Variant::ForkOff, 0, 0, 80),
             sample(Variant::ForkOn, 0, 0, 40),
         ]);
-        assert_eq!(results.len(), 3);
-        assert_eq!(results[0].kind, "drift");
-        assert_eq!(
-            results[0].observed.as_ref().unwrap().median_difference,
-            -20.0
-        );
-        assert_eq!(
-            results[1].observed.as_ref().unwrap().median_ratio,
-            Some(0.5)
-        );
-        assert_eq!(results[2].observed.as_ref().unwrap().p95_ratio, Some(0.4));
+        assert_eq!(results.len(), 1);
+        let result = &results[0];
+        assert_eq!(result.kind, "overall");
+        assert_eq!(result.baseline, Variant::Reference);
+        assert_eq!(result.candidate, Variant::ForkOn);
+        assert_eq!(result.observed.as_ref().unwrap().median_difference, -60.0);
+        assert_eq!(result.observed.as_ref().unwrap().median_ratio, Some(0.4));
+        assert_eq!(result.observed.as_ref().unwrap().p95_ratio, Some(0.4));
         assert!(
-            results[0]
+            result
                 .reused_sample_ids
                 .contains(&"reference-0-0".to_string())
         );
         assert!(
-            results[2]
+            result
                 .reused_sample_ids
-                .contains(&"reference-0-0".to_string())
+                .contains(&"fork_on-0-0".to_string())
         );
     }
 
@@ -556,7 +560,7 @@ mod tests {
                 })
                 .collect();
             let results = summarize(&observations);
-            let result = &results[2];
+            let result = &results[0];
             assert_eq!(result.baseline_distribution.median, Some(median), "{name}");
             assert_eq!(result.baseline_distribution.p95, Some(p95), "{name}");
             assert_eq!(
@@ -583,7 +587,7 @@ mod tests {
             warmup,
             sample(Variant::ForkOn, 1, 0, 50),
         ]);
-        let result = &results[2];
+        let result = &results[0];
         assert_eq!(result.baseline_distribution.median, Some(100.0));
         assert_eq!(result.candidate_distribution.median, Some(50.0));
         assert!(result.pairs.is_empty());
@@ -622,7 +626,7 @@ mod tests {
         })
         .collect();
         let results = summarize(&observations);
-        let result = &results[2];
+        let result = &results[0];
         assert_eq!(result.baseline_distribution.median, Some(600.0));
         assert!((result.baseline_distribution.p95.unwrap() - 810.0).abs() < 1e-9);
         let bootstrap = result.bootstrap.as_ref().unwrap();
@@ -646,7 +650,7 @@ mod tests {
         let again = summarize(&observations);
         assert_eq!(
             bootstrap.median_difference,
-            again[2].bootstrap.as_ref().unwrap().median_difference
+            again[0].bootstrap.as_ref().unwrap().median_difference
         );
     }
 
@@ -755,7 +759,7 @@ mod tests {
         let observations: Vec<_> = ["rust", "typescript", "python"]
             .into_iter()
             .flat_map(|task| {
-                [Variant::Reference, Variant::ForkOff, Variant::ForkOn]
+                [Variant::Reference, Variant::ForkOn]
                     .into_iter()
                     .map(move |variant| {
                         let mut observation = sample(variant, 0, 0, 100);
@@ -767,7 +771,7 @@ mod tests {
             })
             .collect();
         let results = summarize(&observations);
-        assert_eq!(results.len(), 9);
+        assert_eq!(results.len(), 3);
         for result in results {
             assert_eq!(result.pairs.len(), 1);
             assert!(result.bootstrap.is_none());
@@ -790,7 +794,7 @@ mod tests {
             })
             .collect();
         let results = summarize(&observations);
-        let bootstrap = results[2].bootstrap.as_ref().unwrap();
+        let bootstrap = results[0].bootstrap.as_ref().unwrap();
         assert_eq!(bootstrap.cluster_count, 5);
         assert_eq!(bootstrap.pair_count, 5);
         assert_eq!(
@@ -803,10 +807,10 @@ mod tests {
         assert!((bootstrap.p95_difference.lower - 20.0).abs() < 1e-9);
         assert!((bootstrap.p95_difference.upper - 20.0).abs() < 1e-9);
         let three = summarize(&observations[..6]);
-        assert_eq!(three[2].cluster_count, 3);
-        assert!(three[2].bootstrap.is_none());
+        assert_eq!(three[0].cluster_count, 3);
+        assert!(three[0].bootstrap.is_none());
         assert_eq!(
-            three[2].interval_unavailable_reason.as_deref(),
+            three[0].interval_unavailable_reason.as_deref(),
             Some("insufficient_independent_run_clusters")
         );
         for observation in &mut observations {
@@ -815,15 +819,15 @@ mod tests {
             }
         }
         let incomplete = summarize(&observations);
-        assert_eq!(incomplete[2].pairs.len(), 1);
-        assert!(incomplete[2].bootstrap.is_none());
+        assert_eq!(incomplete[0].pairs.len(), 1);
+        assert!(incomplete[0].bootstrap.is_none());
         assert_eq!(
-            incomplete[2].interval_unavailable_reason.as_deref(),
+            incomplete[0].interval_unavailable_reason.as_deref(),
             Some("insufficient_paired_repetitions")
         );
         for id in ["fork_on-1-0", "fork_on-2-0"] {
             assert!(
-                incomplete[2]
+                incomplete[0]
                     .exclusions
                     .iter()
                     .any(|sample| sample.sample_id == id && sample.reason == "not_completed")
@@ -840,11 +844,14 @@ mod tests {
             sample(Variant::ForkOn, 0, 0, 50),
             duplicate_slot,
         ]);
-        assert_eq!(results[0].missing_variants, vec![Variant::ForkOff]);
-        assert!(results[2].pairs.is_empty());
-        assert_eq!(results[2].exclusions.len(), 3);
+        assert!(results[0].missing_variants.is_empty());
+        let missing = summarize(&[sample(Variant::Reference, 0, 0, 100)]);
+        assert_eq!(missing[0].missing_variants, vec![Variant::ForkOn]);
+        assert!(missing[0].pairs.is_empty());
+        assert!(results[0].pairs.is_empty());
+        assert_eq!(results[0].exclusions.len(), 3);
         assert!(
-            results[2]
+            results[0]
                 .exclusions
                 .iter()
                 .all(|e| e.reason == "ambiguous_schedule_slot")
@@ -862,7 +869,7 @@ mod tests {
             })
             .collect();
         let results = summarize(&observations);
-        let result = &results[2];
+        let result = &results[0];
         assert_eq!(result.observed.as_ref().unwrap().median_difference, 10.0);
         assert!(result.observed.as_ref().unwrap().median_ratio.is_none());
         let bootstrap = result.bootstrap.as_ref().unwrap();

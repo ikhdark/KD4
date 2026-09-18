@@ -181,7 +181,7 @@ fn prepared_prompt_index_preserves_compacted_search_tail_during_runtime_append()
         .clone()
         .prepare_for_prompt(&default_input_modalities());
     let original = first.compacted_tool_search_outputs(compact_acknowledged_tool_search_outputs);
-    assert_eq!(original[0].as_ref(), &[search.clone()]);
+    assert_eq!(original[0].as_ref(), std::slice::from_ref(&search));
 
     let mut compacted_search = search;
     if let ResponseItem::ToolSearchOutput { tools, .. } = &mut compacted_search {
@@ -413,10 +413,7 @@ fn total_token_usage_caches_raw_items_without_reusing_projected_estimates() {
     );
     items.push(user_input_text_msg("continue with the plan"));
     for (index, item) in items.iter_mut().enumerate() {
-        item.set_id(Some(ResponseItemId::with_suffix(
-            "item",
-            &index.to_string(),
-        )));
+        item.set_id(Some(ResponseItemId::with_suffix("item", index.to_string())));
     }
     let mut history = create_history_with_items(items);
     let base = BaseInstructions {
@@ -2009,7 +2006,7 @@ fn drop_last_n_user_turns_trims_context_updates_above_rolled_back_turn() {
     let modalities = default_input_modalities();
     let mut history = create_history_with_items(items);
     let reference_context_item = reference_context_item();
-    history.set_reference_context_item(Some(reference_context_item.clone()));
+    history.set_reference_context_item(Some(reference_context_item));
     history.drop_last_n_user_turns(/*num_turns*/ 1);
 
     assert_eq!(

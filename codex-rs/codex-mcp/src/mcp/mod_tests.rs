@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use super::*;
 use crate::McpPluginAttribution;
 use crate::McpServerRegistration;
@@ -17,6 +16,7 @@ use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 fn test_mcp_config(codex_home: PathBuf) -> McpConfig {
     McpConfig {

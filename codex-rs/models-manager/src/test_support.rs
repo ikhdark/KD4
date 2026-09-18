@@ -9,7 +9,10 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
 
 /// Get model identifier without consulting remote state or cache.
-#[expect(clippy::expect_used, reason = "Test fixtures must fail immediately if the bundled model catalog is invalid")]
+#[expect(
+    clippy::expect_used,
+    reason = "Test fixtures must fail immediately if the bundled model catalog is invalid"
+)]
 pub fn get_model_offline_for_tests(model: Option<&str>) -> String {
     if let Some(model) = model {
         return model.to_string();
@@ -26,7 +29,10 @@ pub fn get_model_offline_for_tests(model: Option<&str>) -> String {
 }
 
 /// Build `ModelInfo` without consulting remote state or cache.
-#[expect(clippy::expect_used, reason = "Test fixtures must fail immediately if the bundled model catalog is invalid")]
+#[expect(
+    clippy::expect_used,
+    reason = "Test fixtures must fail immediately if the bundled model catalog is invalid"
+)]
 pub fn construct_model_info_offline_for_tests(
     model: &str,
     config: &ModelsManagerConfig,

@@ -257,11 +257,7 @@ fn load_pet_path(value: &str) -> Result<Pet> {
     load_pet_manifest(&pet_dir, manifest_file, fallback_id)
 }
 
-fn load_pet_manifest(
-    pet_dir: &Path,
-    manifest_file: &str,
-    fallback_id: &str,
-) -> Result<Pet> {
+fn load_pet_manifest(pet_dir: &Path, manifest_file: &str, fallback_id: &str) -> Result<Pet> {
     let config_path = pet_dir.join(manifest_file);
     let raw = read_bounded(&config_path, MAX_MANIFEST_BYTES)?;
     let file: PetFile =

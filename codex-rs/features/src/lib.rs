@@ -519,9 +519,7 @@ pub fn user_settable_feature_for_key(key: &str) -> Option<Feature> {
 /// Requirements retain a bounded compatibility alias that is deliberately not
 /// accepted by current user-facing feature configuration.
 pub fn feature_requirement_for_key(key: &str) -> Option<Feature> {
-    match key {
-        _ => user_settable_feature_for_key(key),
-    }
+    user_settable_feature_for_key(key)
 }
 
 /// Feature definitions exposed by current catalogs and listing commands.

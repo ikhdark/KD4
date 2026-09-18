@@ -66,6 +66,10 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
         selectors.max_items = Some(READ_TOOL_OUTPUT_MAX_SELECTORS as u64);
         let mut output = read_tool_output_output_schema(file_selector_schema());
         output["properties"]["path"] = json!({"type": "string"});
+        #[expect(
+            clippy::expect_used,
+            reason = "read_tool_output_output_schema constructs an object with a required array"
+        )]
         output["required"]
             .as_array_mut()
             .expect("object schema")
@@ -277,8 +281,10 @@ mod tests {
         assert_eq!(result["path"], path.to_string_lossy().as_ref());
         assert_eq!(result["canonical_bytes"], 19);
         assert_eq!(result["canonical_sha256"].as_str().unwrap().len(), 64);
-        let spec = serde_json::to_value(ReadFileHandler.spec()).unwrap();
-        jsonschema::validator_for(&spec["output_schema"])
+        let ToolSpec::Function(spec) = ReadFileHandler.spec() else {
+            panic!("function tool expected")
+        };
+        jsonschema::validator_for(spec.output_schema.as_ref().unwrap())
             .unwrap()
             .validate(&result)
             .unwrap();
@@ -322,14 +328,16 @@ mod tests {
             .await
             .unwrap()
             .code_mode_result(&payload);
-        assert_eq!(result["results"][0]["text"], "before");
-        assert_eq!(result["results"][1]["value"]["total_matches"], 1);
+        assert_eq!(result["results"][1]["text"], "before");
+        assert_eq!(result["results"][0]["value"]["total_matches"], 1);
         assert_eq!(
-            result["results"][1]["value"]["hydrated_ranges"][0]["text"],
+            result["results"][0]["value"]["hydrated_ranges"][0]["text"],
             "before\nneedle\nafter\n"
         );
-        let spec = serde_json::to_value(ReadFileHandler.spec()).unwrap();
-        jsonschema::validator_for(&spec["output_schema"])
+        let ToolSpec::Function(spec) = ReadFileHandler.spec() else {
+            panic!("function tool expected")
+        };
+        jsonschema::validator_for(spec.output_schema.as_ref().unwrap())
             .unwrap()
             .validate(&result)
             .unwrap();

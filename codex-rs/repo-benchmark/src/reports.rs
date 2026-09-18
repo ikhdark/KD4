@@ -30,7 +30,7 @@ use crate::statistics::Observation;
 use crate::statistics::summarize;
 use crate::workloads::VerificationStatus;
 
-const REPORT_VERSION: u32 = 2;
+const REPORT_VERSION: u32 = 3;
 const RESULT_VERSION: u32 = 1;
 const BEHAVIOR_SCHEMA_VERSION: u64 = 2;
 const DIAGNOSTIC_TRACE_LIMIT: usize = 8;
@@ -52,7 +52,6 @@ struct FeatureCoverage {
     id: String,
     declared: Value,
     control: Value,
-    ablation_status: String,
     declared_verification: Value,
     configured_settings_by_variant: BTreeMap<Variant, BTreeMap<String, Option<bool>>>,
     configured_by_variant: BTreeMap<Variant, Option<bool>>,
@@ -75,8 +74,6 @@ struct Report {
     completion: Completion,
     comparisons: Vec<Comparison>,
     feature_coverage: Vec<FeatureCoverage>,
-    ablation_counts: BTreeMap<String, usize>,
-    coupled_controls: BTreeMap<String, Vec<String>>,
     measurement_notes: Vec<String>,
 }
 
@@ -102,29 +99,6 @@ pub fn write(prepared: &Prepared, result: &RunResult) -> Result<()> {
     );
     let source_result_sha256 = hash_file(&result_path)?;
     let feature_coverage = feature_coverage(prepared, result);
-    let mut ablation_counts = BTreeMap::from([
-        ("runtime_changed".to_string(), 0),
-        ("runtime_unchanged".to_string(), 0),
-        ("not_ablated".to_string(), 0),
-        ("configuration_unavailable".to_string(), 0),
-    ]);
-    let mut coupled_controls: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for feature in &feature_coverage {
-        *ablation_counts
-            .entry(feature.ablation_status.clone())
-            .or_default() += 1;
-        if feature.ablation_status == "runtime_changed" {
-            for (key, value) in &feature.configured_settings_by_variant[&Variant::ForkOn] {
-                if value != &feature.configured_settings_by_variant[&Variant::ForkOff][key] {
-                    coupled_controls
-                        .entry(key.clone())
-                        .or_default()
-                        .push(feature.id.clone());
-                }
-            }
-        }
-    }
-    coupled_controls.retain(|_, features| features.len() > 1);
     let mut report = Report {
         schema_version: REPORT_VERSION,
         behavior_schema_version: BEHAVIOR_SCHEMA_VERSION,
@@ -133,13 +107,8 @@ pub fn write(prepared: &Prepared, result: &RunResult) -> Result<()> {
         prepared: prepared.clone(),
         result: result.clone(),
         completion: completion(&result.attempts),
-        comparisons: summarize(&observations(&result.attempts))
-            .into_iter()
-            .filter(|comparison| !prepared.fork_only_on || comparison.kind == "overall")
-            .collect(),
+        comparisons: summarize(&observations(&result.attempts)),
         feature_coverage,
-        ablation_counts,
-        coupled_controls,
         measurement_notes: vec![
             "Behavior schema 2 compares exploratory effort in named units. Discovery metrics count recognized tool-call events, including a batch as one event. Complete session vectors are summed once across captured rollouts; any unavailable session measurement excludes that attempt for that metric. Unanchored turns and saturated counters are unavailable. Validation duration sums command wall time, not an elapsed union. Governor counts record interventions, not eligibility or mistakes. Planning counts do not establish plan quality, and wait counts do not establish user corrections; compare identical permission policies. Fewer actions do not prove better work or feature exercise.".into(),
             "Behavior comparisons have no significance test, acceptance gate or minimum detectable effect claim. Raw per-task distributions and paired differences are descriptive; causal attribution and model variance require independently repeated experiments.".into(),
@@ -147,7 +116,7 @@ pub fn write(prepared: &Prepared, result: &RunResult) -> Result<()> {
             "retained_process is a behavioral scenario only: fork and upstream clamp the requested yield interval differently. Its evidence is retained, but it contributes no comparable metrics.".into(),
             "One real-model attempt per task and variant is an observed comparison, not repeat-to-repeat model variance. Different tasks are not repetitions.".into(),
             "Live latency is time to a candidate that passes external verification; model-performed test execution is not established by verifier success.".into(),
-            "Fork-off versus reference measures drift, including instrumentation and fixed fork changes; it does not establish parity.".into(),
+            "The enabled fork is compared with reference as a whole; individual feature effects are not isolated.".into(),
             "Completed timing excludes failed, unverified, unrun, and warmup observations. Their original evidence and exclusion reasons remain visible.".into(),
             "Comparison tables reuse original sample IDs. Pairing requires the same workload, run cluster, and repetition; timestamps remain in result.attempts.".into(),
             "Python owns diagnostic and token definitions. Missing or partial metric evidence is excluded per metric, never replaced by zero. Scripted request count and serialized request bytes are volume proxies; scripted token analysis remains disabled.".into(),
@@ -156,12 +125,6 @@ pub fn write(prepared: &Prepared, result: &RunResult) -> Result<()> {
             "Execution durations are ceilings. Preparation, builds, resets, independent verification, cleanup and analysis are recorded outside execution budgets.".into(),
         ],
     };
-    if prepared.fork_only_on {
-        report
-            .measurement_notes
-            .retain(|note| !note.starts_with("Fork-off versus reference"));
-        report.measurement_notes.push("Fork-only-on selection compares the enabled fork with reference. No disabled-fork arm was scheduled, so drift and isolated feature effects are not measured.".into());
-    }
     report
         .measurement_notes
         .push(configuration_note(&result.attempts));
@@ -304,16 +267,15 @@ fn observations(attempts: &[Attempt]) -> Vec<Observation> {
 }
 
 fn configuration_note(attempts: &[Attempt]) -> String {
-    let hashes: BTreeSet<_> =
-        attempts
-            .iter()
-            .filter(|attempt| completed(attempt))
-            .filter_map(|attempt| {
-                attempt.diagnostics.as_ref()?.reports.first()?["runnerDiagnostics"]["configuration"]
+    let hashes: BTreeSet<_> = attempts
+        .iter()
+        .filter(|attempt| completed(attempt))
+        .filter_map(|attempt| {
+            attempt.diagnostics.as_ref()?.reports.first()?["runnerDiagnostics"]["configuration"]
                     ["sha256"]
                     .as_str()
-            })
-            .collect();
+        })
+        .collect();
     let missing = attempts
         .iter()
         .filter(|attempt| completed(attempt))
@@ -553,10 +515,11 @@ fn attempt_metrics(attempt: &Attempt) -> BTreeMap<String, f64> {
                 ),
             ] {
                 let summary = &first["canonical"][key];
-                if turns.is_some_and(|count| count > 0) && turns == summary["count"].as_u64() {
-                    if let Some(value) = summary["p50"].as_f64() {
-                        metrics.insert(name.into(), value);
-                    }
+                if turns.is_some_and(|count| count > 0)
+                    && turns == summary["count"].as_u64()
+                    && let Some(value) = summary["p50"].as_f64()
+                {
+                    metrics.insert(name.into(), value);
                 }
             }
         }
@@ -571,7 +534,7 @@ fn feature_coverage(prepared: &Prepared, result: &RunResult) -> Vec<FeatureCover
         let mut configured_by_variant = BTreeMap::new();
         let mut configured_settings_by_variant = BTreeMap::new();
         let mut observed_effective_by_variant = BTreeMap::new();
-        for variant in Variant::selected(prepared.fork_only_on) {
+        for variant in Variant::ALL.into_iter() {
             let settings: BTreeMap<String, Option<bool>> = keys.iter().map(|key| {
                 let value = prepared.overrides.get(&variant).and_then(|overrides| overrides.iter().find_map(|setting| {
                     let (name, value) = setting.split_once('=')?;
@@ -588,23 +551,13 @@ fn feature_coverage(prepared: &Prepared, result: &RunResult) -> Vec<FeatureCover
             let value = values.filter(|values| !values.is_empty()).and_then(|values| values.iter().all(|value| *value == values[0]).then_some(values[0]));
             observed_effective_by_variant.insert(variant, value);
         }
-        let ablation_status = if prepared.fork_only_on || feature["benchmark_control"]["kind"] != "runtime" {
-            "not_ablated"
-        } else if keys.is_empty() || [Variant::ForkOff, Variant::ForkOn].iter().any(|variant| configured_settings_by_variant[variant].values().any(Option::is_none)) {
-            "configuration_unavailable"
-        } else if configured_settings_by_variant[&Variant::ForkOff] == configured_settings_by_variant[&Variant::ForkOn] {
-            "runtime_unchanged"
-        } else {
-            "runtime_changed"
-        };
         FeatureCoverage {
             id, declared: feature.clone(), control: feature["benchmark_control"].clone(),
-            ablation_status: ablation_status.into(),
             declared_verification: feature["runtime_verification"].clone(),
             configured_settings_by_variant,
             configured_by_variant, observed_effective_by_variant,
             exercised: None, exercise_evidence: vec![],
-            note: "Ablation status describes configured changes, not exercise. Uncontrolled runtime changes remain in both fork builds; repository-only declarations need not execute in either arm. Declared verification is a test reference, not a gate result at this revision or benchmark exercise evidence.".into(),
+            note: "Configured settings do not establish exercise. Repository-only declarations need not execute in either variant. Declared verification is a test reference, not a gate result at this revision or benchmark exercise evidence.".into(),
         }
     }).collect()
 }
@@ -694,7 +647,8 @@ fn render(report: &Report) -> String {
         output.push_str("Project configuration comparison unavailable: no project config was captured during preparation. The fixed benchmark configuration does not establish equivalence to daily effective settings.\n\n");
     }
     let code_mode_hosts: Vec<_> =
-        Variant::selected(report.prepared.fork_only_on)
+        Variant::ALL
+            .into_iter()
             .map(|variant| {
                 (
                     variant,
@@ -838,38 +792,21 @@ fn render(report: &Report) -> String {
     output.push_str("\nFull distributions, p95 intervals, sample IDs, excluded observations and shared sample identities are preserved in report.json.\n\n## Feature coverage\n\n");
     let _ = writeln!(
         output,
-        "{} inventoried features: {} change runtime settings between fork arms; {} keep identical runtime settings; {} are not ablated; {} have unavailable configuration. These counts describe settings, not exercised features.\n",
-        report.feature_coverage.len(),
-        report.ablation_counts.get("runtime_changed").unwrap_or(&0),
-        report
-            .ablation_counts
-            .get("runtime_unchanged")
-            .unwrap_or(&0),
-        report.ablation_counts.get("not_ablated").unwrap_or(&0),
-        report
-            .ablation_counts
-            .get("configuration_unavailable")
-            .unwrap_or(&0)
+        "{} inventoried features. Configured settings do not establish which features were exercised.\n",
+        report.feature_coverage.len()
     );
-    for (control, features) in &report.coupled_controls {
-        let _ = writeln!(
-            output,
-            "Shared control `{}` changes {} together: {}. The comparison cannot attribute effects to individual features.\n",
-            cell(control),
-            features.len(),
-            cell(&features.join(", "))
-        );
-    }
-    let variants = Variant::selected(report.prepared.fork_only_on)
+    let variants = Variant::ALL
+        .into_iter()
         .map(Variant::name)
         .collect::<Vec<_>>()
         .join(" / ");
     let _ = writeln!(
         output,
-        "| Feature | Control / ablation | Configured {variants} | Declared verification (not a run result) |\n|---|---|---|---|"
+        "| Feature | Control | Configured {variants} | Declared verification (not a run result) |\n|---|---|---|---|"
     );
     for feature in &report.feature_coverage {
-        let states: Vec<_> = Variant::selected(report.prepared.fork_only_on)
+        let states: Vec<_> = Variant::ALL
+            .into_iter()
             .map(|variant| {
                 feature
                     .configured_by_variant
@@ -881,15 +818,10 @@ fn render(report: &Report) -> String {
             .collect();
         let _ = writeln!(
             output,
-            "| {} | {} / {} | {} | {} |",
+            "| {} | {} | {} | {} |",
             cell(&feature.id),
             cell(feature.control["kind"].as_str().unwrap_or("unavailable")),
-            feature.ablation_status,
-            if feature.ablation_status == "not_ablated" && !report.prepared.fork_only_on {
-                "not controlled in either fork arm".into()
-            } else {
-                states.join(" / ")
-            },
+            states.join(" / "),
             cell(&feature.declared_verification["path"].as_str().map_or_else(
                 || "unavailable".into(),
                 |path| {
@@ -904,7 +836,7 @@ fn render(report: &Report) -> String {
             ))
         );
     }
-    output.push_str("\nEnabled settings and declared test references are not exercise evidence or proof that gates passed at this revision. Exercise remains unavailable. Complete declarations, per-key settings, observed effective settings and fixed-difference explanations remain in JSON. Instrumentation and other fixed runtime modifications remain in both fork arms; repository-only declarations need not execute in either.\n\n## Diagnostics\n\nThese values come directly from the frozen Python analyzer. They are not recomputed in Rust. Each session retains its coverage and accounting basis; session rows are not summed, preventing duplicate cumulative usage.\n\n");
+    output.push_str("\nEnabled settings and declared test references are not exercise evidence or proof that gates passed at this revision. Exercise remains unavailable. Complete declarations, per-key settings, observed effective settings and fixed-difference explanations remain in JSON. Instrumentation and other fixed runtime modifications remain part of the fork; repository-only declarations need not execute in either variant.\n\n## Diagnostics\n\nThese values come directly from the frozen Python analyzer. They are not recomputed in Rust. Each session retains its coverage and accounting basis; session rows are not summed, preventing duplicate cumulative usage.\n\n");
     for attempt in &report.result.attempts {
         if attempt.scheduled.warmup {
             continue;
@@ -1316,20 +1248,20 @@ mod tests {
         );
         assert_eq!(counts.statuses["setup_failed"], 1);
         let comparisons = summarize(&observations(&attempts));
-        assert_eq!(comparisons[2].candidate_distribution.count, 0);
+        assert_eq!(comparisons[0].candidate_distribution.count, 0);
         assert!(
-            comparisons[2]
+            comparisons[0]
                 .exclusions
                 .iter()
                 .any(|excluded| excluded.sample_id == "auth")
         );
         assert!(
-            comparisons[2]
+            comparisons[0]
                 .exclusions
                 .iter()
                 .any(|excluded| excluded.sample_id == "unrun")
         );
-        assert!(comparisons[2].observed.is_none());
+        assert!(comparisons[0].observed.is_none());
     }
 
     #[test]
@@ -1367,6 +1299,23 @@ mod tests {
             failed_sessions: vec![],
             error: None,
         });
+        assert!(
+            configuration_note(&[sample.clone()]).contains("1 completed attempts without a hash")
+        );
+        sample.diagnostics.as_mut().unwrap().reports[0]["runnerDiagnostics"]["configuration"] =
+            json!({"sha256": "first"});
+        let mut changed_config = sample.clone();
+        changed_config.diagnostics.as_mut().unwrap().reports[0]["runnerDiagnostics"]["configuration"]
+            ["sha256"] = json!("second");
+        let note = configuration_note(&[sample.clone(), changed_config]);
+        assert!(note.contains("2 distinct captured effective-config hashes"));
+        assert!(note.contains("Configuration differs across measured attempts"));
+        assert!(note.contains("0 completed attempts without a hash"));
+        assert_eq!(
+            diagnostic_values(&sample.diagnostics.as_ref().unwrap().reports[0], true)["configuration"]
+                ["sha256"],
+            "first"
+        );
         let metrics = attempt_metrics(&sample);
         assert_eq!(metrics["observed_tool_items"], 7.0);
         assert_eq!(metrics["completed_tool_items"], 6.0);
@@ -1378,7 +1327,7 @@ mod tests {
         let comparisons = summarize(&observations(&[sample.clone()]));
         let comparison = comparisons
             .iter()
-            .find(|row| row.metric == "cache_hit_rate" && row.kind == "feature_effect")
+            .find(|row| row.metric == "cache_hit_rate" && row.kind == "overall")
             .unwrap();
         assert_eq!(comparison.unit, "fraction");
         assert_eq!(comparison.candidate_distribution.samples[0].value, 0.4);
@@ -1388,7 +1337,7 @@ mod tests {
             let comparisons = summarize(&observations(&[failed]));
             let comparison = comparisons
                 .iter()
-                .find(|row| row.metric == "observed_tool_items" && row.kind == "feature_effect")
+                .find(|row| row.metric == "observed_tool_items" && row.kind == "overall")
                 .unwrap();
             assert_eq!(comparison.candidate_distribution.count, 0);
             assert!(comparison.observed.is_none());
@@ -1434,23 +1383,6 @@ mod tests {
             failed_sessions: vec![],
             error: None,
         });
-        assert!(
-            configuration_note(&[sample.clone()]).contains("1 completed attempts without a hash")
-        );
-        sample.diagnostics.as_mut().unwrap().reports[0]["runnerDiagnostics"] =
-            json!({"configuration": {"sha256": "first"}});
-        let mut changed_config = sample.clone();
-        changed_config.diagnostics.as_mut().unwrap().reports[0]["runnerDiagnostics"]["configuration"]
-            ["sha256"] = json!("second");
-        let note = configuration_note(&[sample.clone(), changed_config]);
-        assert!(note.contains("2 distinct captured effective-config hashes"));
-        assert!(note.contains("Configuration differs across measured attempts"));
-        assert!(note.contains("0 completed attempts without a hash"));
-        assert_eq!(
-            diagnostic_values(&sample.diagnostics.as_ref().unwrap().reports[0], true)["configuration"]
-                ["sha256"],
-            "first"
-        );
         let metrics = attempt_metrics(&sample);
         assert_eq!(metrics["discovery_searches"], 5.0);
         assert_eq!(metrics["behavior_model_retries"], 0.0);

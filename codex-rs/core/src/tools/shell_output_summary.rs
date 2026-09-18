@@ -117,10 +117,8 @@ pub(crate) fn summarize_shell_output_for_model(
         .collect::<Vec<_>>();
     let gap_bytes: usize = selected
         .windows(2)
-        .filter_map(|pair| {
-            (pair[1].0 != pair[0].0 + 1)
-                .then(|| format!("\n... [{} lines omitted]", pair[1].0 - pair[0].0 - 1).len())
-        })
+        .filter(|pair| pair[1].0 != pair[0].0 + 1)
+        .map(|pair| format!("\n... [{} lines omitted]", pair[1].0 - pair[0].0 - 1).len())
         .sum();
     let prefixes: usize = selected
         .iter()

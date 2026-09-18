@@ -504,7 +504,7 @@ class PublishLocalCodexTestBase(unittest.TestCase):
         if observe_commands:
             commands = [
                 f"Set-PSBreakpoint -Command {ps_single_quote(name)} -Action {{ "
-                f"[IO.File]::WriteAllText({ps_single_quote(marker)}, 'invoked') }} | Out-Null"
+                f'[IO.File]::AppendAllText({ps_single_quote(marker)}, "invoked`n") }} | Out-Null'
                 for name, marker in observe_commands.items()
             ]
             parameters = []

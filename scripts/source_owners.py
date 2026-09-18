@@ -344,7 +344,12 @@ def _python_comment_free_source(source: str) -> str:
         for token in tokenize.generate_tokens(io.StringIO(source).readline):
             if token.type == tokenize.COMMENT:
                 continue
-            if token.type in {tokenize.NAME, tokenize.NUMBER, tokenize.OP, tokenize.STRING}:
+            if token.type in {
+                tokenize.NAME,
+                tokenize.NUMBER,
+                tokenize.OP,
+                tokenize.STRING,
+            }:
                 parts.append(token.string)
     except (tokenize.TokenError, SyntaxError):
         return source
@@ -546,7 +551,10 @@ def load_and_validate(
                 if source_fingerprints is not None:
                     # Retain only the digest and byte count across phases, not
                     # whole source files. Validation and hashing use one capture.
-                    source_fingerprints[candidate] = (hashlib.sha256(contents).digest(), len(contents))
+                    source_fingerprints[candidate] = (
+                        hashlib.sha256(contents).digest(),
+                        len(contents),
+                    )
         except (OSError, UnicodeError) as error:
             errors.append(f"{owner_id}: unreadable symbol evidence {raw_path}: {error}")
             return
@@ -935,7 +943,9 @@ def _query_graph(
     for source_id, owner in owners_by_id.items():
         for relationship in owner.get("relationships", []):
             target_owners = target_owner_ids(relationship["target"])
-            if source_id not in selected_ids and not target_owners.intersection(selected_ids):
+            if source_id not in selected_ids and not target_owners.intersection(
+                selected_ids
+            ):
                 continue
             relationships.append({"source": f"owner:{source_id}", **relationship})
     relationships = _deduplicate_graph_relationships(relationships)
@@ -1061,7 +1071,11 @@ def _architecture_index_is_usable(index: object, digest: str) -> bool:
 
 
 def load_architecture_index(
-    index_path: Path, digest: str, root: Path, *, refresh_sources: bool = True,
+    index_path: Path,
+    digest: str,
+    root: Path,
+    *,
+    refresh_sources: bool = True,
     read_metrics: dict[str, int] | None = None,
 ) -> dict | None:
     try:
@@ -1266,7 +1280,9 @@ def _budgeted_relationships(
 
 
 def _slice_source_snapshot(
-    root: Path, graph: dict, owners: list[dict],
+    root: Path,
+    graph: dict,
+    owners: list[dict],
     source_fingerprints: dict[Path, tuple[bytes, int]] | None = None,
 ) -> tuple[str, int, int]:
     """Hash the exact declared files that support a bounded architecture slice."""
@@ -1311,7 +1327,9 @@ def _slice_source_snapshot(
     return digest.hexdigest(), files_read, bytes_read
 
 
-def _focused_validation_routes(owners: list[dict], scenario: dict | None, focus: str | None) -> tuple[list[dict], int]:
+def _focused_validation_routes(
+    owners: list[dict], scenario: dict | None, focus: str | None
+) -> tuple[list[dict], int]:
     """Prefer declared scenario symbols, then task overlap; never invent a test filter."""
     focus_tokens = _ranking_tokens(focus)
     scenario_symbols = {
@@ -1322,13 +1340,19 @@ def _focused_validation_routes(owners: list[dict], scenario: dict | None, focus:
     selected = []
     omitted = 0
     for owner in owners:
-        routes = [route for route in owner.get("validation", []) if route.get("role") == "focused_tests"]
+        routes = [
+            route
+            for route in owner.get("validation", [])
+            if route.get("role") == "focused_tests"
+        ]
         ranked = []
         for route in routes:
             command = " ".join(route.get("argv", []))
             rank = (
                 any(symbol in command for symbol in scenario_symbols),
-                len(focus_tokens & _ranking_tokens(command + " " + route.get("id", ""))),
+                len(
+                    focus_tokens & _ranking_tokens(command + " " + route.get("id", ""))
+                ),
             )
             ranked.append((rank, route))
         best = max((rank for rank, _ in ranked), default=(False, 0))
@@ -1343,7 +1367,10 @@ def _bound_slice_output(result: dict, max_bytes: int) -> dict:
     if max_bytes < 4096:
         raise ValueError("max_bytes must be at least 4096")
     result["output_budget_bytes"] = max_bytes
-    while len((json.dumps(result, indent=2, sort_keys=True) + "\n").encode("utf-8")) > max_bytes:
+    while (
+        len((json.dumps(result, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+        > max_bytes
+    ):
         tests = result.get("tests_and_contracts", {})
         scenario = tests.get("representative_scenario")
         # Pop only suffixes so continuation offsets still describe an exact page.
@@ -1351,7 +1378,8 @@ def _bound_slice_output(result: dict, max_bytes: int) -> dict:
         candidates = [
             (len(json.dumps(result[facet]["relationships"][-1])), facet)
             for facet in ARCHITECTURE_FACETS
-            if facet in result and len(result[facet]["relationships"]) > 1
+            if facet in result
+            and len(result[facet]["relationships"]) > 1
             and result[facet]["relationships"][-1] != scenario
         ]
         if candidates:
@@ -1359,9 +1387,14 @@ def _bound_slice_output(result: dict, max_bytes: int) -> dict:
             section = result[facet]
             section["relationships"].pop()
             section["status"] = "partial"
-            section["omitted_relationships"] = section.get("omitted_relationships", 0) + 1
+            section["omitted_relationships"] = (
+                section.get("omitted_relationships", 0) + 1
+            )
             result["omitted_relationships"] += 1
-            continuation = next((item for item in result["continuations"] if item["facet"] == facet), None)
+            continuation = next(
+                (item for item in result["continuations"] if item["facet"] == facet),
+                None,
+            )
             if continuation is None:
                 continuation = {**result["continuation_context"], "facet": facet}
                 result["continuations"].append(continuation)
@@ -1404,7 +1437,9 @@ def architecture_slice(
     if offset < 0 or (offset and facet is None):
         raise ValueError("offset must be nonnegative and requires a facet")
     if offset and expected_snapshot is None:
-        raise ValueError("pagination requires expected_snapshot from the preceding slice")
+        raise ValueError(
+            "pagination requires expected_snapshot from the preceding slice"
+        )
     active_facets = (facet,) if facet is not None else ARCHITECTURE_FACETS
     if graph is None:
         graph = _query_graph(
@@ -1449,7 +1484,9 @@ def architecture_slice(
     )
     snapshot = f"slice-v4:{','.join(selected_ids)}:routing:{routing_digest}:sources:{source_snapshot}"
     if expected_snapshot is not None and snapshot != expected_snapshot:
-        raise ValueError("slice snapshot changed; restart pagination from the first page")
+        raise ValueError(
+            "slice snapshot changed; restart pagination from the first page"
+        )
     facets: dict[str, list[dict]] = {name: [] for name in ARCHITECTURE_FACETS}
     coverage: dict[str, set[str]] = {name: set() for name in ARCHITECTURE_FACETS}
     target_owner_ids = _target_owner_resolver(list(selected.values()))
@@ -1476,7 +1513,10 @@ def architecture_slice(
                     for item in invariant["evidence"]
                     if item["path"] in invariant.get("tests", [])
                 }
-                if invariant["kind"] == "semantic" and scenario_evidence & declared_scenarios:
+                if (
+                    invariant["kind"] == "semantic"
+                    and scenario_evidence & declared_scenarios
+                ):
                     scenario_contracts.append(invariant["statement"])
         coverage[facet].update(involved or {source_id})
         facets[facet].append(
@@ -1490,8 +1530,15 @@ def architecture_slice(
                 # Confidence is a manifest assertion, not a compiler receipt
                 # tied to this source state, target, and feature configuration.
                 "provenance": "declared",
-                **({"scenario_symbols": sorted(symbol for _, symbol in scenario_evidence)}
-                   if scenario_evidence else {}),
+                **(
+                    {
+                        "scenario_symbols": sorted(
+                            symbol for _, symbol in scenario_evidence
+                        )
+                    }
+                    if scenario_evidence
+                    else {}
+                ),
                 **(
                     {"behavioral_contracts": scenario_contracts}
                     if scenario_contracts
@@ -1597,8 +1644,11 @@ def architecture_slice(
         else:
             output[facet] = {
                 "status": (
-                    "established" if offset and not uncovered
-                    else "not_applicable" if reasons and not uncovered else "unknown"
+                    "established"
+                    if offset and not uncovered
+                    else "not_applicable"
+                    if reasons and not uncovered
+                    else "unknown"
                 ),
                 "relationships": [],
                 **({"not_applicable_reason": "; ".join(reasons)} if reasons else {}),
@@ -1624,18 +1674,21 @@ def architecture_slice(
             output[facet]["status"] = (
                 "partial" if output[facet]["relationships"] else "unknown"
             )
-            continuations.append({
-                "facet": facet,
-                "offset": next_offset,
-                "owners": selected_ids,
-                "focus": focus,
-                "max_relationships": max_relationships,
-                "max_bytes": max_bytes,
-                "expected_snapshot": snapshot,
-            })
-    omitted_relationships = sum(
-        output[facet].get("omitted_relationships", 0) for facet in active_facets
-    ) + graph["omitted"]["relationships"]
+            continuations.append(
+                {
+                    "facet": facet,
+                    "offset": next_offset,
+                    "owners": selected_ids,
+                    "focus": focus,
+                    "max_relationships": max_relationships,
+                    "max_bytes": max_bytes,
+                    "expected_snapshot": snapshot,
+                }
+            )
+    omitted_relationships = (
+        sum(output[facet].get("omitted_relationships", 0) for facet in active_facets)
+        + graph["omitted"]["relationships"]
+    )
 
     ranking_limitation = (
         "One relationship per nonempty facet is protected when the budget permits; "
@@ -1662,40 +1715,43 @@ def architecture_slice(
         "Ties are retained; this ranking does not prove test sufficiency. "
         "Use validation with the same --owner selections for every declared route."
     )
-    return _bound_slice_output({
-        "snapshot": snapshot,
-        "offset": offset,
-        "continuations": continuations,
-        "continuation_context": {
-            "owners": selected_ids,
-            "focus": focus,
-            "max_relationships": max_relationships,
-            "max_bytes": max_bytes,
-            "expected_snapshot": snapshot,
+    return _bound_slice_output(
+        {
+            "snapshot": snapshot,
+            "offset": offset,
+            "continuations": continuations,
+            "continuation_context": {
+                "owners": selected_ids,
+                "focus": focus,
+                "max_relationships": max_relationships,
+                "max_bytes": max_bytes,
+                "expected_snapshot": snapshot,
+            },
+            "freshness_scope": "selected owners and their incoming/outgoing relationship evidence",
+            **output,
+            "truncated": graph["status"] != "complete" or omitted_relationships > 0,
+            "omitted_relationships": omitted_relationships,
+            "material_unknowns": unknowns,
+            "limitations": [
+                "Manifest relationships are declarative; inspect exact source before mutation.",
+                "Non-primary symbol checks establish literal presence only, not a declaration or call edge.",
+                (
+                    "Follow each continuation with slice --facet, --offset, --expected-snapshot, "
+                    "the same --owner selections, --focus, --max-relationships, and --max-bytes. "
+                    "Restart from the first page if the snapshot changes."
+                ),
+                ranking_limitation,
+            ],
+            "metrics": {
+                "scope": "slice source reads and manifest bytes; excludes index loading and validation",
+                "tool_calls": 1,
+                "files_read": files_read + 1,
+                "bytes_read": bytes_read + manifest_bytes_read,
+                "late_relationship_discoveries": None,
+            },
         },
-        "freshness_scope": "selected owners and their incoming/outgoing relationship evidence",
-        **output,
-        "truncated": graph["status"] != "complete" or omitted_relationships > 0,
-        "omitted_relationships": omitted_relationships,
-        "material_unknowns": unknowns,
-        "limitations": [
-            "Manifest relationships are declarative; inspect exact source before mutation.",
-            "Non-primary symbol checks establish literal presence only, not a declaration or call edge.",
-            (
-                "Follow each continuation with slice --facet, --offset, --expected-snapshot, "
-                "the same --owner selections, --focus, --max-relationships, and --max-bytes. "
-                "Restart from the first page if the snapshot changes."
-            ),
-            ranking_limitation,
-        ],
-        "metrics": {
-            "scope": "slice source reads and manifest bytes; excludes index loading and validation",
-            "tool_calls": 1,
-            "files_read": files_read + 1,
-            "bytes_read": bytes_read + manifest_bytes_read,
-            "late_relationship_discoveries": None,
-        },
-    }, max_bytes)
+        max_bytes,
+    )
 
 
 def compact_slice_output(result: dict) -> dict:
@@ -1718,7 +1774,9 @@ def compact_slice_output(result: dict) -> dict:
         facet = dict(result[name])
         facet["relationships"] = [reference(item) for item in facet["relationships"]]
         if facet.get("representative_scenario") is not None:
-            facet["representative_scenario"] = reference(facet["representative_scenario"])
+            facet["representative_scenario"] = reference(
+                facet["representative_scenario"]
+            )
         compact[name] = facet
     compact["relationship_records"] = records
     compact["format"] = "compact-slice-v1"
@@ -1890,7 +1948,11 @@ def owners_for_paths(
 def owners_for_focus(manifest: dict, root: Path, focus: str) -> list[str]:
     """Resolve declared names and paths without reading repository sources."""
     paths = [token.strip("`\"'(),:;") for token in focus.replace("\\", "/").split()]
-    paths = [path for path in paths if "/" in path and not path.startswith(("/", "http:" , "https:"))]
+    paths = [
+        path
+        for path in paths
+        if "/" in path and not path.startswith(("/", "http:", "https:"))
+    ]
     # Free text may mention paths nobody owns; that is not an error, it is a
     # miss, and owner ids, aliases and phrases still get their turn below.
     selected = owners_for_paths(manifest, root, paths, unowned_paths=[])
@@ -1899,7 +1961,11 @@ def owners_for_focus(manifest: dict, root: Path, focus: str) -> list[str]:
     normalized_focus = " " + " ".join(re.findall(r"\w+", focus.casefold())) + " "
     scores = {}
     for owner in manifest["owners"]:
-        for label in [owner["id"], *owner.get("aliases", []), *owner.get("phrases", [])]:
+        for label in [
+            owner["id"],
+            *owner.get("aliases", []),
+            *owner.get("phrases", []),
+        ]:
             words = re.findall(r"\w+", label.casefold())
             if words and " " + " ".join(words) + " " in normalized_focus:
                 scores[owner["id"]] = max(scores.get(owner["id"], 0), len(words))
@@ -1943,20 +2009,39 @@ def main() -> int:
         "--focus",
         help="Slice-only task description used to rank architecture relationships.",
     )
-    parser.add_argument("--facet", choices=ARCHITECTURE_FACETS, help="Slice facet to page through.")
-    parser.add_argument("--offset", type=int, default=0, help="Relationships already read in --facet.")
-    parser.add_argument("--expected-snapshot", help="Reject a slice page if its source snapshot changed.")
-    parser.add_argument("--compact", action="store_true", help="Slice-only compact JSON with shared relationship records.")
-    parser.add_argument("--max-bytes", type=int, default=MAX_SLICE_OUTPUT_BYTES,
-                        help="Slice JSON byte budget, including metadata (minimum 4096).")
+    parser.add_argument(
+        "--facet", choices=ARCHITECTURE_FACETS, help="Slice facet to page through."
+    )
+    parser.add_argument(
+        "--offset", type=int, default=0, help="Relationships already read in --facet."
+    )
+    parser.add_argument(
+        "--expected-snapshot",
+        help="Reject a slice page if its source snapshot changed.",
+    )
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="Slice-only compact JSON with shared relationship records.",
+    )
+    parser.add_argument(
+        "--max-bytes",
+        type=int,
+        default=MAX_SLICE_OUTPUT_BYTES,
+        help="Slice JSON byte budget, including metadata (minimum 4096).",
+    )
     parser.add_argument(
         "--repo-root",
         type=Path,
         help="Repository root for declared paths (defaults to the manifest directory).",
     )
     args = parser.parse_args()
-    if args.command != "slice" and (args.facet or args.offset or args.expected_snapshot or args.compact):
-        parser.error("--facet, --offset, --expected-snapshot, and --compact are only valid with slice")
+    if args.command != "slice" and (
+        args.facet or args.offset or args.expected_snapshot or args.compact
+    ):
+        parser.error(
+            "--facet, --offset, --expected-snapshot, and --compact are only valid with slice"
+        )
     if args.paths and args.command not in {"query", "slice", "validation"}:
         parser.error("--path is only valid with query, slice, or validation")
     if args.command == "validation" and not (args.paths or args.owners):
@@ -2006,12 +2091,20 @@ def main() -> int:
             source_fingerprints: dict[Path, tuple[bytes, int]] = {}
             unowned_paths: list[str] = []
             owner_resolution = None
-            if args.command == "slice" and args.focus and not (args.owners or args.paths):
+            if (
+                args.command == "slice"
+                and args.focus
+                and not (args.owners or args.paths)
+            ):
                 args.owners = owners_for_focus(
                     tomllib.loads(manifest_bytes.decode("utf-8")), root, args.focus
                 )
                 owner_resolution = {
-                    "status": "selected" if len(args.owners) == 1 else "ambiguous" if args.owners else "unresolved",
+                    "status": "selected"
+                    if len(args.owners) == 1
+                    else "ambiguous"
+                    if args.owners
+                    else "unresolved",
                     "candidates": args.owners,
                     "basis": "declared paths, owner IDs, aliases, and phrases",
                 }
@@ -2045,7 +2138,9 @@ def main() -> int:
                             "repository_root": str(root),
                             "validation": [
                                 {"owner": owner["id"], **route}
-                                for owner in sorted(selected, key=lambda owner: owner["id"])
+                                for owner in sorted(
+                                    selected, key=lambda owner: owner["id"]
+                                )
                                 for route in owner.get("validation", [])
                             ],
                             "unowned_paths": sorted(set(unowned_paths)),
@@ -2067,7 +2162,10 @@ def main() -> int:
             # The index authenticates the manifest projection, not the current
             # sources. Revalidate the selected declaration closure on warm reads too.
             manifest, digest = load_and_validate(
-                args.manifest, root, owner_ids=args.owners, raw=manifest_bytes,
+                args.manifest,
+                root,
+                owner_ids=args.owners,
+                raw=manifest_bytes,
                 source_fingerprints=source_fingerprints,
             )
             if args.command == "query":
@@ -2141,10 +2239,18 @@ def main() -> int:
                     result["owner_resolution"] = owner_resolution
                     if owner_resolution["status"] != "selected":
                         result["material_unknowns"].append(
-                            "Ownership is " + owner_resolution["status"] + "; refine --focus or supply --owner/--path."
+                            "Ownership is "
+                            + owner_resolution["status"]
+                            + "; refine --focus or supply --owner/--path."
                         )
-                read_metrics["files_read"] += len(source_fingerprints) + result["metrics"]["files_read"] - 1
-                read_metrics["bytes_read"] += sum(size for _, size in source_fingerprints.values()) + result["metrics"]["bytes_read"] - len(manifest_bytes)
+                read_metrics["files_read"] += (
+                    len(source_fingerprints) + result["metrics"]["files_read"] - 1
+                )
+                read_metrics["bytes_read"] += (
+                    sum(size for _, size in source_fingerprints.values())
+                    + result["metrics"]["bytes_read"]
+                    - len(manifest_bytes)
+                )
                 result["metrics"]["command"] = {
                     "scope": "manifest/index loading, source validation, and slice construction; excludes output serialization",
                     **read_metrics,

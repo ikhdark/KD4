@@ -16,8 +16,6 @@ pub struct Options {
     pub operation: String,
     pub mode: Mode,
     pub explicit_mode: bool,
-    pub fork_only_on: bool,
-    pub explicit_variant_selection: bool,
     pub prepared: Option<PathBuf>,
     pub result: Option<PathBuf>,
     pub reference: Option<PathBuf>,
@@ -31,8 +29,6 @@ pub fn parse(args: Vec<String>) -> Result<Options> {
         operation: "run".into(),
         mode: Mode::Fast,
         explicit_mode: false,
-        fork_only_on: true,
-        explicit_variant_selection: false,
         prepared: None,
         result: None,
         reference: None,
@@ -54,35 +50,12 @@ pub fn parse(args: Vec<String>) -> Result<Options> {
         result.operation
     );
     for_token(&mut args, &mut result)?;
-    ensure!(
-        !result.explicit_variant_selection
-            || ["run", "prepare", "compare", "help"].contains(&result.operation.as_str()),
-        "variant selection is only valid for run/scan, prepare, or compare; rerun/import preserve the prepared selection"
-    );
     Ok(result)
 }
 
 fn for_token(args: &mut impl Iterator<Item = String>, result: &mut Options) -> Result<()> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--fork-only-on" | "--all-variants" | "fork" | "only" => {
-                if arg == "fork" {
-                    ensure!(
-                        args.next().as_deref() == Some("only"),
-                        "expected 'fork only on'"
-                    );
-                }
-                if arg == "fork" || arg == "only" {
-                    ensure!(args.next().as_deref() == Some("on"), "expected 'only on'");
-                }
-                let fork_only_on = arg != "--all-variants";
-                ensure!(
-                    !result.explicit_variant_selection || result.fork_only_on == fork_only_on,
-                    "--fork-only-on and --all-variants cannot be combined"
-                );
-                result.fork_only_on = fork_only_on;
-                result.explicit_variant_selection = true;
-            }
             "-fast" | "-full" => {
                 let mode = if arg == "-fast" {
                     Mode::Fast
@@ -156,7 +129,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
     let options = parse(args)?;
     if options.operation == "help" {
         println!(
-            "Repo Benchmark: one Rust benchmark, scripted then real-model execution.\n\njust repo-benchmark [scan] [-fast|-full] [--fork-only-on|--all-variants]\njust repo-benchmark prepare [-fast|-full] [--fork-only-on|--all-variants] [--reference CHECKOUT] [--fork-ref COMMIT]\njust repo-benchmark compare --prepared MANIFEST [-fast|-full]\njust repo-benchmark import --result RESULT\njust repo-benchmark rerun --result RESULT --attempt ID\njust repo-benchmark rerun --result RESULT --analysis-only\n\nFast: 1 live task. Full: 3 live tasks. Default: fork features on versus upstream, 2 variants.\n--fork-only-on (also: only on / fork only on): explicitly select the default.\n--all-variants: include fork features off, 3 variants.\nDefault reference: newest local stable upstream release tag; verified native builds are reused until the release or build inputs change. No automatic fetch.\nAll execution is sequential and stops when finite work finishes. No performance pass/fail verdict."
+            "Repo Benchmark: one Rust benchmark, scripted then real-model execution.\n\njust repo-benchmark [scan] [-fast|-full]\njust repo-benchmark prepare [-fast|-full] [--reference CHECKOUT] [--fork-ref COMMIT]\njust repo-benchmark compare --prepared MANIFEST [-fast|-full]\njust repo-benchmark import --result RESULT\njust repo-benchmark rerun --result RESULT --attempt ID\njust repo-benchmark rerun --result RESULT --analysis-only\n\nFast: 1 live task. Full: 3 live tasks. Fork features on versus upstream, 2 variants.\nDefault reference: newest local stable upstream release tag; verified native builds are reused until the release or build inputs change. No automatic fetch.\nAll execution is sequential and stops when finite work finishes. No performance pass/fail verdict."
         );
         return Ok(());
     }
@@ -176,11 +149,6 @@ pub fn run(args: Vec<String>) -> Result<()> {
                     !options.explicit_mode || prepared.mode == options.mode,
                     "mode differs from frozen schedule; prepare again"
                 );
-                ensure!(
-                    !options.explicit_variant_selection
-                        || options.fork_only_on == prepared.fork_only_on,
-                    "variant selection differs from frozen schedule; prepare again"
-                );
                 path
             } else {
                 ensure!(
@@ -190,7 +158,6 @@ pub fn run(args: Vec<String>) -> Result<()> {
                 prepare(PrepareOptions {
                     repo: std::env::current_dir()?,
                     mode: options.mode,
-                    fork_only_on: options.fork_only_on,
                     fork_ref: options.fork_ref,
                     reference_checkout: options.reference,
                 })?
@@ -242,7 +209,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
 mod tests {
     use super::*;
     fn args(values: &[&str]) -> Vec<String> {
-        values.iter().map(|s| s.to_string()).collect()
+        values.iter().map(ToString::to_string).collect()
     }
     #[test]
     fn exact_modes_and_default_are_enforced() -> Result<()> {
@@ -258,82 +225,34 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn fork_only_on_aliases_select_two_variants_in_both_modes() -> Result<()> {
-        assert!(parse(vec![])?.fork_only_on);
-        assert!(!parse(vec![])?.explicit_variant_selection);
+    fn benchmark_always_compares_enabled_fork_with_reference() -> Result<()> {
         for (flag, mode, live_count) in [("-fast", Mode::Fast, 2), ("-full", Mode::Full, 6)] {
-            for suffix in [
-                vec![],
+            let options = parse(args(&["scan", flag]))?;
+            assert_eq!(options.operation, "run");
+            assert_eq!(options.mode, mode);
+            let scheduled = crate::schedule::schedule(options.mode);
+            assert_eq!(scheduled.len(), 84 + live_count);
+            for variant in [
+                crate::schedule::Variant::ForkOn,
+                crate::schedule::Variant::Reference,
+            ] {
+                assert_eq!(
+                    scheduled.iter().filter(|a| a.variant == variant).count(),
+                    42 + live_count / 2
+                );
+            }
+        }
+        for operation in ["scan", "prepare", "compare", "rerun", "import"] {
+            for selection in [
+                vec!["--all-variants"],
                 vec!["--fork-only-on"],
                 vec!["only", "on"],
                 vec!["fork", "only", "on"],
             ] {
-                let mut values = vec!["scan", flag];
-                values.extend(suffix);
-                let options = parse(args(&values))?;
-                assert_eq!(options.operation, "run");
-                assert_eq!(options.mode, mode);
-                assert!(options.fork_only_on);
-                let scheduled = crate::schedule::schedule(options.mode, options.fork_only_on);
-                assert_eq!(scheduled.len(), 84 + live_count);
-                assert_eq!(
-                    scheduled
-                        .iter()
-                        .filter(|a| a.segment == crate::schedule::Segment::Scripted)
-                        .count(),
-                    84
-                );
-                assert!(
-                    scheduled
-                        .iter()
-                        .all(|a| a.variant != crate::schedule::Variant::ForkOff)
-                );
-                for variant in [
-                    crate::schedule::Variant::ForkOn,
-                    crate::schedule::Variant::Reference,
-                ] {
-                    assert_eq!(
-                        scheduled.iter().filter(|a| a.variant == variant).count(),
-                        42 + live_count / 2
-                    );
-                }
+                let mut values = vec![operation];
+                values.extend(selection);
+                assert!(parse(args(&values)).is_err(), "{values:?}");
             }
-        }
-        for values in [
-            vec!["scan", "only", "off"],
-            vec!["scan", "fork", "on"],
-            vec!["scan", "only"],
-            vec!["rerun", "--fork-only-on"],
-            vec!["import", "--fork-only-on"],
-            vec!["rerun", "--all-variants"],
-            vec!["import", "--all-variants"],
-            vec!["scan", "--all-variants", "only", "on"],
-            vec!["scan", "--fork-only-on", "--all-variants"],
-        ] {
-            assert!(parse(args(&values)).is_err(), "{values:?}");
-        }
-        Ok(())
-    }
-    #[test]
-    fn all_variants_requires_selection_and_saved_operations_inherit() -> Result<()> {
-        for (flag, count) in [("-fast", 129), ("-full", 135)] {
-            let options = parse(args(&["scan", flag, "--all-variants"]))?;
-            assert!(!options.fork_only_on);
-            assert!(options.explicit_variant_selection);
-            let scheduled = crate::schedule::schedule(options.mode, options.fork_only_on);
-            assert_eq!(scheduled.len(), count);
-            assert_eq!(
-                scheduled
-                    .iter()
-                    .filter(|a| a.variant == crate::schedule::Variant::ForkOff)
-                    .count(),
-                count / 3
-            );
-        }
-        for operation in ["run", "prepare", "compare", "rerun", "import"] {
-            let options = parse(args(&[operation]))?;
-            assert!(options.fork_only_on);
-            assert!(!options.explicit_variant_selection);
         }
         Ok(())
     }

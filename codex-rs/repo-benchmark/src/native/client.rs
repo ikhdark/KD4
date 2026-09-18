@@ -1,15 +1,27 @@
 use super::NativeAttemptRequest;
-use anyhow::{Context, Result, bail};
-use codex_app_server_test_client::{native_stdio_command, terminate_owned_process};
-use serde_json::{Value, json};
-use std::collections::{BTreeSet, VecDeque};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use codex_app_server_test_client::native_stdio_command;
+use codex_app_server_test_client::terminate_owned_process;
+use serde_json::Value;
+use serde_json::json;
+use std::collections::BTreeSet;
+use std::collections::VecDeque;
 use std::fmt;
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::io::BufRead;
+use std::io::BufReader;
+use std::io::Write;
+use std::process::Child;
+use std::process::Stdio;
+use std::sync::mpsc::Receiver;
+use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self};
+use std::thread::JoinHandle;
+use std::thread::{self};
+use std::time::Duration;
+use std::time::Instant;
 
 #[derive(Debug)]
 pub(super) struct DeadlineExpired;
@@ -241,17 +253,17 @@ impl NativeClient {
             if Instant::now() >= self.deadline {
                 return Err(DeadlineExpired.into());
             }
-            if tool_started && !interrupted {
-                if let Some(checkpoint) = cancellation_checkpoint.as_mut() {
-                    if let Some(evidence) = checkpoint()? {
-                        self.events.push(json!({"elapsedMs":self.started.elapsed().as_millis() as u64,"message":{"method":"repoBenchmark/cancellationStarted","params":evidence}}));
-                        self.rpc(
-                            "turn/interrupt",
-                            json!({"threadId":thread_id,"turnId":turn_id}),
-                        )?;
-                        interrupted = true;
-                    }
-                }
+            if tool_started
+                && !interrupted
+                && let Some(checkpoint) = cancellation_checkpoint.as_mut()
+                && let Some(evidence) = checkpoint()?
+            {
+                self.events.push(json!({"elapsedMs":self.started.elapsed().as_millis() as u64,"message":{"method":"repoBenchmark/cancellationStarted","params":evidence}}));
+                self.rpc(
+                    "turn/interrupt",
+                    json!({"threadId":thread_id,"turnId":turn_id}),
+                )?;
+                interrupted = true;
             }
             let message = if let Some(message) = self.pending.pop_front() {
                 message
@@ -282,10 +294,11 @@ impl NativeClient {
                         | "webSearch"
                         | "toolCall"
                 );
-                if method == "item/completed" && is_tool {
-                    if let Some(id) = item["id"].as_str() {
-                        tools.insert(id.to_owned());
-                    }
+                if method == "item/completed"
+                    && is_tool
+                    && let Some(id) = item["id"].as_str()
+                {
+                    tools.insert(id.to_owned());
                 }
                 tool_started |= method == "item/started" && is_tool;
             }

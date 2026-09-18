@@ -726,7 +726,10 @@ async fn independent_pooled_client_requests_keep_defaults_and_overrides() {
 }
 
 #[tokio::test]
-#[expect(clippy::await_holding_invalid_type, reason = "Hold construction ownership while polling competing callers to prove they wait for publication")]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Hold construction ownership while polling competing callers to prove they wait for publication"
+)]
 async fn cold_callers_wait_for_construction_and_recheck_published_client() {
     let pool = manual_redirect_pool();
     let guard = pool.client_build.lock().await;

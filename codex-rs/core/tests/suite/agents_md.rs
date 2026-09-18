@@ -116,7 +116,9 @@ fn instruction_fragments(request: &responses::ResponsesRequest) -> Vec<String> {
 
 fn expected_instruction_fragment(cwd: &AbsolutePathBuf, contents: &str) -> String {
     let cwd = PathUri::from_abs_path(cwd).inferred_native_path_string();
-    format!("# AGENTS.md instructions for {cwd}\n\n<AGENTS_MD_OBSERVATION>\n{FRESH_PROVENANCE}\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>")
+    format!(
+        "# AGENTS.md instructions for {cwd}\n\n<AGENTS_MD_OBSERVATION>\n{FRESH_PROVENANCE}\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>"
+    )
 }
 
 fn expected_provider_only_instruction_fragment(contents: &str) -> String {
@@ -162,7 +164,10 @@ fn assert_single_fresh_instruction_fragment_contains(
         "expected AGENTS.md contents {expected_contents:?}: {}",
         fragments[0]
     );
-    let body = fragments[0].split_once("<INSTRUCTIONS>\n").unwrap().1;
+    let body = fragments[0]
+        .split_once("<INSTRUCTIONS>\n")
+        .expect("agents.md fragment carries an <INSTRUCTIONS> header")
+        .1;
     assert!(!body.contains(FRESH_PROVENANCE));
 }
 

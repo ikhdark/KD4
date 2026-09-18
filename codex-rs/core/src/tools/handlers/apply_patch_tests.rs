@@ -559,6 +559,7 @@ async fn patch_workspace_verification_and_approval_share_one_permit() {
             .turn_environments = vec![environment.clone()];
         let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
         let cancellation = tokio_util::sync::CancellationToken::new();
+        *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
         let other_writer =
             crate::workspace_operation_gate::acquire_workspace_operation(&patch_cwd).await;
         let handler = ApplyPatchHandler::default();

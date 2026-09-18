@@ -202,7 +202,8 @@ fn f64_to_u64(value: f64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MetricsClient, MetricsConfig};
+    use crate::MetricsClient;
+    use crate::MetricsConfig;
     use opentelemetry_sdk::metrics::InMemoryMetricExporter;
     use std::time::Duration;
 

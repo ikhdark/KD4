@@ -794,7 +794,8 @@ fn normalize_tracked_path(path: &Path) -> PathBuf {
 
 #[cfg(windows)]
 fn windows_path_comparison_key(path: &std::ffi::OsStr) -> std::ffi::OsString {
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::OsStringExt;
     // Retain Windows case aliases without converting invalid native units to U+FFFD.
     let mut folded = Vec::new();
     for character in char::decode_utf16(path.encode_wide()) {

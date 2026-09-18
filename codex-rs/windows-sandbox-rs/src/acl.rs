@@ -924,4 +924,3 @@ pub(crate) mod native_deny_write_test {
         f()
     }
 }
-

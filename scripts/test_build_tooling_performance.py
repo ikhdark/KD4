@@ -853,15 +853,9 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             timeout=30,
         ).stdout.splitlines()
         expected_eol_attributes = [f"{path}: eol: lf" for path in expected_agent_files]
-        root_text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
-        normalized_root = " ".join(root_text.split())
 
         self.assertEqual(actual_agent_files, sorted(expected_agent_files))
         self.assertEqual(actual_eol_attributes, expected_eol_attributes)
-        self.assertIn(
-            "Read the root `AGENTS.md` in full",
-            normalized_root,
-        )
         source_map = REPO_ROOT / "SOURCEMAP.md"
         root_policy_bytes = (REPO_ROOT / "AGENTS.md").stat().st_size
         source_map_text = source_map.read_text(encoding="utf-8")

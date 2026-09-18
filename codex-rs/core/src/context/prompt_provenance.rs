@@ -951,7 +951,7 @@ mod tests {
             "remember café & quotes \"here\"",
             PromptContextCategory::Memory,
         );
-        let mut replay = original.clone();
+        let mut replay = original;
         replay[0].clear_internal_chat_message_metadata_passthrough();
         replay.push(message("developer", "different context", None));
         let recovered = sidecar.for_reprojected_items(&replay);

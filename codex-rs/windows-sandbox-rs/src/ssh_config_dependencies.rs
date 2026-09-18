@@ -82,9 +82,7 @@ fn include_paths(arg: &str, user_profile: &Path, ssh_dir: &Path) -> io::Result<V
     let pattern = pattern_path.to_string_lossy().replace('\\', "/");
     let paths =
         glob::glob(&pattern).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    paths
-        .map(|path| path.map_err(io::Error::from))
-        .collect()
+    paths.map(|path| path.map_err(io::Error::from)).collect()
 }
 
 fn directive(line: &str) -> Option<(String, Vec<String>)> {

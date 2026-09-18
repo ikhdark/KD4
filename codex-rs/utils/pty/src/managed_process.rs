@@ -103,9 +103,9 @@ fn reclaimable_reservation(
     match result {
         Ok(root) => Ok(Some(root)),
         Err(error)
-            if error
-                .get_ref()
-                .is_some_and(<dyn std::error::Error + Send + Sync>::is::<AdmissionCapacityExhausted>) =>
+            if error.get_ref().is_some_and(
+                <dyn std::error::Error + Send + Sync>::is::<AdmissionCapacityExhausted>,
+            ) =>
         {
             Ok(None)
         }

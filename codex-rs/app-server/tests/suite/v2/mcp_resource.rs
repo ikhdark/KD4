@@ -283,6 +283,7 @@ async fn orchestrator_skill_can_read_referenced_resource_without_an_executor() -
                 "main_resource": SKILL_MAIN_PROMPT_URI,
             }],
             "warnings": ["Orchestrator skill discovery stopped after 2 resource pages: failed to list orchestrator skill resources: resources/list failed for `codex_apps`: Mcp error: -32603: simulated later-page failure"],
+            "warnings_omitted": 0,
             "next_cursor": null,
         })
     );

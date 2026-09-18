@@ -22,7 +22,8 @@ configuration, sandboxing, and command-line usage.
 
 ## Windows standalone installer
 
-`powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/ikhdark/KD4/main/scripts/install/install.ps1 | iex"`
+`powershell -ExecutionPolicy ByPass -c "irm
+https://raw.githubusercontent.com/ikhdark/KD4/main/scripts/install/install.ps1 | iex"`
 
 Release archives are available from the
 [KD4 GitHub releases](https://github.com/ikhdark/KD4/releases/latest).

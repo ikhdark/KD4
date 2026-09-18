@@ -7517,10 +7517,9 @@ async fn overridden_remote_features_preserve_known_values_and_reject_malformed_u
         let config_path = home.path().join("config.toml");
         let config_bytes = b"# local client must not persist remote feature settings\n";
         std::fs::write(&config_path, config_bytes)?;
-        for feature in [Feature::CodeMode] {
-            app.config.features.set_enabled(feature, false)?;
-            app.chat_widget.set_feature_enabled(feature, false);
-        }
+        app.config.features.set_enabled(Feature::CodeMode, false)?;
+        app.chat_widget
+            .set_feature_enabled(Feature::CodeMode, false);
         app.config
             .permissions
             .set_permission_profile(PermissionProfile::read_only())?;

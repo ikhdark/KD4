@@ -80,7 +80,11 @@ mod tests {
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(normalized_prompt.contains("self-contained recovery checkpoint"));
         assert!(normalized_prompt.contains("including prohibitions and out-of-scope work"));
-        assert!(normalized_prompt.contains("remaining predicted change surface: owners, files, and affected contracts"));
+        assert!(
+            normalized_prompt.contains(
+                "remaining predicted change surface: owners, files, and affected contracts"
+            )
+        );
         assert!(normalized_prompt.contains("preserved invariants that still need verification"));
         assert!(normalized_prompt.contains("without rediscovering the repository"));
         assert!(
@@ -90,7 +94,10 @@ mod tests {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(normalized_prefix.contains("remain binding until superseded by an applicable instruction"));
+        assert!(
+            normalized_prefix
+                .contains("remain binding until superseded by an applicable instruction")
+        );
         assert!(normalized_prefix.contains("stale evidence alone does not retire them"));
         assert!(
             normalized_prefix.contains(

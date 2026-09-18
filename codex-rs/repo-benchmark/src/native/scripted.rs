@@ -18,6 +18,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -178,9 +179,12 @@ impl ScriptedProvider {
                 state.retained_session = session_id(&tool_outputs(&request, None));
                 drop(state);
                 let (lock, ready) = &*handler_cancellation;
+                let pending = lock
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("scripted cancellation state poisoned"))?;
                 let outcome = ready
-                    .wait_while(lock.lock().unwrap(), |outcome| outcome.is_none())
-                    .unwrap();
+                    .wait_while(pending, |outcome| outcome.is_none())
+                    .map_err(|_| anyhow::anyhow!("scripted cancellation state poisoned"))?;
                 if *outcome != Some(true) {
                     bail!("scripted cancellation stopped before an interrupted terminal");
                 }
@@ -219,11 +223,15 @@ impl ScriptedProvider {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("scripted provider state poisoned"))?;
-        if state.scenario.cancel_first()
-            && turn > 0
-            && *self.cancellation.0.lock().unwrap() != Some(true)
-        {
-            bail!("next scripted turn requires a confirmed interrupted terminal");
+        if state.scenario.cancel_first() && turn > 0 {
+            let confirmed = *self
+                .cancellation
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("scripted cancellation state poisoned"))?;
+            if confirmed != Some(true) {
+                bail!("next scripted turn requires a confirmed interrupted terminal");
+            }
         }
         state.turn = turn;
         state.step = 0;
@@ -240,7 +248,10 @@ impl ScriptedProvider {
         request: &super::NativeAttemptRequest,
         deadline: Instant,
     ) -> Result<Option<Value>> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("scripted provider state poisoned"))?;
         if state.scenario == ScriptedScenario::AbortRetained && state.retained_session.is_none() {
             return Ok(None);
         }
@@ -267,7 +278,7 @@ impl ScriptedProvider {
         let process = self
             .state
             .lock()
-            .unwrap()
+            .map_err(|_| anyhow::anyhow!("scripted provider state poisoned"))?
             .started_process
             .clone()
             .context("cancelled scenario never established a running child process")?;
@@ -294,7 +305,12 @@ impl ScriptedProvider {
     }
 
     pub fn confirm_interrupted(&self) {
-        *self.cancellation.0.lock().unwrap() = Some(true);
+        // A poisoned cancellation mutex still carries the flag the waiter reads.
+        *self
+            .cancellation
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(true);
         self.cancellation.1.notify_all();
     }
 
@@ -347,7 +363,11 @@ impl Drop for ScriptedProvider {
     fn drop(&mut self) {
         // Release an in-flight handler before the loopback server joins it,
         // including setup errors and attempt deadlines.
-        *self.cancellation.0.lock().unwrap() = Some(false);
+        *self
+            .cancellation
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(false);
         self.cancellation.1.notify_all();
     }
 }
@@ -435,38 +455,36 @@ impl State {
         let exec = tools.iter().find(|tool| tool.name == "exec" && tool.custom);
         let interactive = self.scenario == ScriptedScenario::RetainedProcess
             || (self.scenario == ScriptedScenario::AbortRetained && self.turn == 0);
-        if nested || direct.is_none() {
-            if let Some(exec) = exec {
-                let command_schema = tools.iter().find(|tool| tool.name == "exec_command");
-                let args = commands
-                    .iter()
-                    .map(|cmd| exec_command_args(cmd, interactive, yielding, command_schema))
-                    .collect::<Vec<_>>();
-                let code = if args.len() > 1 {
-                    format!(
-                        "const results = await Promise.all([{}]); for (const result of results) text(result);",
-                        args.iter()
-                            .map(|args| format!("tools.exec_command({args})"))
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    )
-                } else if self.scenario == ScriptedScenario::ExclusiveTools && self.step == 1 {
-                    format!(
-                        "const results = await Promise.all([tools.apply_patch({}), tools.exec_command({})]); for (const result of results) text(result); text(await tools.apply_patch({}));",
-                        json!(EXCLUSIVE_START),
-                        args[0],
-                        json!(EXCLUSIVE_FINISH)
-                    )
-                } else {
-                    format!("text(await tools.exec_command({}));", args[0])
-                };
-                self.record_adaptation(
-                    "commands packaged through advertised native code-mode exec",
-                );
-                return Ok(vec![
-                    exec.call(&format!("call-{}", self.serial), Value::String(code)),
-                ]);
-            }
+        if (nested || direct.is_none())
+            && let Some(exec) = exec
+        {
+            let command_schema = tools.iter().find(|tool| tool.name == "exec_command");
+            let args = commands
+                .iter()
+                .map(|cmd| exec_command_args(cmd, interactive, yielding, command_schema))
+                .collect::<Vec<_>>();
+            let code = if args.len() > 1 {
+                format!(
+                    "const results = await Promise.all([{}]); for (const result of results) text(result);",
+                    args.iter()
+                        .map(|args| format!("tools.exec_command({args})"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            } else if self.scenario == ScriptedScenario::ExclusiveTools && self.step == 1 {
+                format!(
+                    "const results = await Promise.all([tools.apply_patch({}), tools.exec_command({})]); for (const result of results) text(result); text(await tools.apply_patch({}));",
+                    json!(EXCLUSIVE_START),
+                    args[0],
+                    json!(EXCLUSIVE_FINISH)
+                )
+            } else {
+                format!("text(await tools.exec_command({}));", args[0])
+            };
+            self.record_adaptation("commands packaged through advertised native code-mode exec");
+            return Ok(vec![
+                exec.call(&format!("call-{}", self.serial), Value::String(code)),
+            ]);
         }
         let direct = direct.context(
             "native provider request advertises no supported command tool or code-mode exec",
@@ -558,8 +576,8 @@ impl State {
             self.exclusive_final_call = Some(id.clone());
             return Ok(vec![patch.call(&id, json!(EXCLUSIVE_FINISH))]);
         }
-        if let Some(id) = &self.exclusive_final_call {
-            if !request["input"]
+        if let Some(id) = &self.exclusive_final_call
+            && !request["input"]
                 .as_array()
                 .into_iter()
                 .flatten()
@@ -570,9 +588,8 @@ impl State {
                             .to_string()
                             .contains("Success. Updated the following files:")
                 })
-            {
-                bail!("native exclusive continuation omitted the final patch success result");
-            }
+        {
+            bail!("native exclusive continuation omitted the final patch success result");
         }
         if verify_exclusive {
             // A mutation can invalidate the combined code-mode result. Read the
@@ -654,7 +671,11 @@ impl CancellationProcess {
         loop {
             if let Some(status) = child.try_wait()? {
                 let mut output = String::new();
-                child.stdout.take().unwrap().read_to_string(&mut output)?;
+                child
+                    .stdout
+                    .take()
+                    .context("spawned probe was configured with a piped stdout")?
+                    .read_to_string(&mut output)?;
                 if !status.success() {
                     bail!("cancellation process probe failed: {status}");
                 }
@@ -748,10 +769,10 @@ fn advertised_tools(request: &Value) -> Vec<Tool> {
     }
     // Responses Lite carries the same tool declarations inside input items.
     for item in request["input"].as_array().into_iter().flatten() {
-        if item["type"] == "additional_tools" {
-            if let Some(items) = item["tools"].as_array() {
-                collect(items, None, &mut tools);
-            }
+        if item["type"] == "additional_tools"
+            && let Some(items) = item["tools"].as_array()
+        {
+            collect(items, None, &mut tools);
         }
     }
     tools

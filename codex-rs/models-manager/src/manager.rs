@@ -736,7 +736,10 @@ impl OpenAiModelsManager {
         }
     }
 
-    #[expect(clippy::await_holding_invalid_type, reason = "Serializes model catalog and cache refresh transactions across network and disk awaits")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serializes model catalog and cache refresh transactions across network and disk awaits"
+    )]
     async fn run_etag_refresh_worker(self: Arc<Self>, mut exit_guard: EtagRefreshWorkerExitGuard) {
         loop {
             let notice = {
@@ -923,7 +926,10 @@ impl OpenAiModelsManager {
         }
     }
 
-    #[expect(clippy::await_holding_invalid_type, reason = "Serializes model catalog and cache refresh transactions across network and disk awaits")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serializes model catalog and cache refresh transactions across network and disk awaits"
+    )]
     async fn fetch_and_update_models(
         &self,
         http_client_factory: &HttpClientFactory,
@@ -1119,7 +1125,10 @@ impl OpenAiModelsManager {
     }
 
     /// Attempt to satisfy the refresh from the cache when its complete identity and TTL match.
-    #[expect(clippy::await_holding_invalid_type, reason = "Serializes model catalog and cache refresh transactions across network and disk awaits")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serializes model catalog and cache refresh transactions across network and disk awaits"
+    )]
     async fn try_load_cache(&self) -> CoreResult<bool> {
         let _refresh = self.refresh_gate.lock().await;
         let load_identity = self.ensure_current_cache_identity().await;

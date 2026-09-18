@@ -1876,7 +1876,7 @@ mod tests {
                 enforce_residency: Some(Sourced::new(enforce_residency, enforce_source)),
                 network: None,
                 permissions: None,
-                models: Some(Sourced::new(models, source.clone())),
+                models: Some(Sourced::new(models, source)),
             }
         );
     }
@@ -2348,7 +2348,7 @@ mod tests {
                 field_name: "sandbox_mode",
                 candidate: "DangerFullAccess".into(),
                 allowed: "[ReadOnly]".into(),
-                requirement_source: source_location.clone(),
+                requirement_source: source_location,
             })
         );
 

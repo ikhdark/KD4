@@ -258,6 +258,9 @@ mod tests {
         assert!(run.description.contains(
             "Follow these special cases unless a higher-priority instruction conflicts."
         ));
-        assert!(!run.description.contains("conflict with any other instructions"));
+        assert!(
+            !run.description
+                .contains("conflict with any other instructions")
+        );
     }
 }

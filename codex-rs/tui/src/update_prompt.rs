@@ -250,12 +250,12 @@ impl WidgetRef for &UpdatePromptScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::custom_terminal::Terminal;
     use crate::test_backend::VT100Backend;
     use crate::tui::FrameRequester;
     use crossterm::event::KeyCode;
     use crossterm::event::KeyEvent;
     use crossterm::event::KeyModifiers;
-    use crate::custom_terminal::Terminal;
 
     fn new_prompt() -> UpdatePromptScreen {
         UpdatePromptScreen::new(

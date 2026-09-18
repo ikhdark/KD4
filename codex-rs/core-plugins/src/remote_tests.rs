@@ -4,7 +4,8 @@ use pretty_assertions::assert_eq;
 
 #[tokio::test]
 async fn recommended_catalog_preserves_status_and_classifies_truncated_bodies() {
-    use std::io::{Read, Write};
+    use std::io::Read;
+    use std::io::Write;
     for status in [200, 503] {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -51,7 +52,10 @@ async fn recommended_catalog_preserves_status_and_classifies_truncated_bodies() 
 
 #[tokio::test]
 async fn remote_marketplace_pagination_rejects_token_cycles() {
-    use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+    use wiremock::matchers::query_param;
+    use wiremock::matchers::query_param_is_missing;
 
     for endpoint in [
         "/ps/plugins/list",
@@ -141,7 +145,10 @@ async fn remote_marketplace_pagination_rejects_token_cycles() {
 
 #[tokio::test]
 async fn remote_marketplace_pagination_preserves_opaque_tokens_and_all_pages() {
-    use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+    use wiremock::matchers::query_param;
+    use wiremock::matchers::query_param_is_missing;
 
     for endpoint in [
         "/ps/plugins/list",

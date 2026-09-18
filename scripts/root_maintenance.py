@@ -321,12 +321,6 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
     "scripts/git_doctor.py": ("scripts.test_dev_environment",),
     "scripts/invoke-rust-perf-env.ps1": ("scripts.test_build_tooling_performance",),
     "scripts/install/install.ps1": ("scripts.test_build_tooling_policy",),
-    "scripts/investigation_eval/score_results.py": (
-        "scripts.investigation_eval.test_investigation_eval",
-    ),
-    "scripts/investigation_eval/validate_cases.py": (
-        "scripts.investigation_eval.test_investigation_eval",
-    ),
     "scripts/just-shell.py": ("scripts.test_build_tooling",),
     "scripts/kd4_model_attempt_analysis.py": ("scripts.test_kd4_perf_snapshot",),
     "scripts/publish-local-codex.ps1": (

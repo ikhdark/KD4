@@ -355,6 +355,19 @@ class SourceMapCheckTest(unittest.TestCase):
                 1,
             )
 
+    def test_rendered_snapshot_keeps_prettier_blank_line_after_begin(self) -> None:
+        # Prettier separates an HTML comment from the paragraph that follows it.
+        # Rendering them adjacently leaves every sync failing `format.py --check`.
+        for newline in ("\n", "\r\n"):
+            rendered = source_map_check.render_tracked_path_snapshot(
+                {"AGENTS.md"}, newline=newline
+            )
+            lines = rendered.split(newline)
+            self.assertEqual(lines[0], source_map_check.TRACKED_PATH_SNAPSHOT_BEGIN)
+            self.assertEqual(lines[1], "")
+            self.assertTrue(lines[2].startswith("Tracked repository path snapshot:"))
+            self.assertEqual(lines[3], source_map_check.TRACKED_PATH_SNAPSHOT_END)
+
     def test_sync_snapshot_preserves_target_when_replace_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             source_map = Path(temp_dir) / "SOURCEMAP.md"

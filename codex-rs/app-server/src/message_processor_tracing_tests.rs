@@ -4914,16 +4914,19 @@ fn interrupt_request_cancellation_releases_reservation_before_terminal() -> Resu
 #[test]
 #[serial(app_server_tracing)]
 fn registered_device_code_cancellation_respects_auth_commit_boundary() -> Result<()> {
-    use crate::outgoing_message::{OutgoingEnvelope, OutgoingMessage};
-    use codex_app_server_protocol::{
-        CancelLoginAccountParams, CancelLoginAccountResponse, CancelLoginAccountStatus,
-        LoginAccountParams, LoginAccountResponse, ServerNotification,
-    };
+    use crate::outgoing_message::OutgoingEnvelope;
+    use crate::outgoing_message::OutgoingMessage;
+    use codex_app_server_protocol::CancelLoginAccountParams;
+    use codex_app_server_protocol::CancelLoginAccountResponse;
+    use codex_app_server_protocol::CancelLoginAccountStatus;
+    use codex_app_server_protocol::LoginAccountParams;
+    use codex_app_server_protocol::LoginAccountResponse;
+    use codex_app_server_protocol::ServerNotification;
     use std::time::Duration;
-    use wiremock::{
-        Mock, ResponseTemplate,
-        matchers::{method, path},
-    };
+    use wiremock::Mock;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
 
     struct ReleaseWorker(Option<std::sync::mpsc::Sender<()>>);
     impl Drop for ReleaseWorker {
@@ -5045,10 +5048,12 @@ fn registered_device_code_cancellation_respects_auth_commit_boundary() -> Result
 #[test]
 #[serial(app_server_tracing)]
 fn registered_api_key_login_persists_before_reply_and_survives_shutdown() -> Result<()> {
-    use crate::outgoing_message::{OutgoingEnvelope, OutgoingMessage};
-    use codex_app_server_protocol::{
-        AccountUpdatedNotification, LoginAccountParams, LoginAccountResponse, ServerNotification,
-    };
+    use crate::outgoing_message::OutgoingEnvelope;
+    use crate::outgoing_message::OutgoingMessage;
+    use codex_app_server_protocol::AccountUpdatedNotification;
+    use codex_app_server_protocol::LoginAccountParams;
+    use codex_app_server_protocol::LoginAccountResponse;
+    use codex_app_server_protocol::ServerNotification;
     use std::time::Duration;
 
     for phase in ["success", "admitted_closed", "closed", "write_error"] {
@@ -5196,8 +5201,10 @@ fn acknowledged_goal_set_finishes_runtime_update_after_rpc_gate_cancellation() -
     run_current_thread_test_with_stack(
         "acknowledged_goal_set_finishes_runtime_update_after_rpc_gate_cancellation",
         async {
-            use crate::outgoing_message::{OutgoingEnvelope, OutgoingMessage};
-            use codex_app_server_protocol::{ServerNotification, ThreadGoalSetResponse};
+            use crate::outgoing_message::OutgoingEnvelope;
+            use crate::outgoing_message::OutgoingMessage;
+            use codex_app_server_protocol::ServerNotification;
+            use codex_app_server_protocol::ThreadGoalSetResponse;
             use std::time::Duration;
 
             let server = MockServer::start().await;
@@ -5506,7 +5513,8 @@ fn committed_goal_reaches_runtime_when_transport_stays_full_past_delivery_budget
     run_current_thread_test_with_stack(
         "committed_goal_reaches_runtime_when_transport_stays_full_past_delivery_budget",
         async {
-            use codex_app_server_protocol::{ServerNotification, ThreadGoalClearedNotification};
+            use codex_app_server_protocol::ServerNotification;
+            use codex_app_server_protocol::ThreadGoalClearedNotification;
             use std::time::Duration;
             let server = MockServer::start().await;
             wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -5635,10 +5643,11 @@ fn acknowledged_goal_clear_survives_rpc_cancellation_without_resurrecting_goal()
     run_current_thread_test_with_stack(
         "acknowledged_goal_clear_survives_rpc_cancellation_without_resurrecting_goal",
         async {
-            use crate::outgoing_message::{OutgoingEnvelope, OutgoingMessage};
-            use codex_app_server_protocol::{
-                ServerNotification, ThreadGoalClearResponse, ThreadGoalSetResponse,
-            };
+            use crate::outgoing_message::OutgoingEnvelope;
+            use crate::outgoing_message::OutgoingMessage;
+            use codex_app_server_protocol::ServerNotification;
+            use codex_app_server_protocol::ThreadGoalClearResponse;
+            use codex_app_server_protocol::ThreadGoalSetResponse;
             use std::time::Duration;
             let server = create_mock_responses_server_repeating_assistant("Done").await;
             let mut harness = TracingHarness::new_with_features(

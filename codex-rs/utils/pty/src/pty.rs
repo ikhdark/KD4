@@ -290,7 +290,8 @@ async fn spawn_process_portable(
                 let result = child.try_wait();
                 (child, result)
             })
-            .await {
+            .await
+            {
                 Ok(result) => result,
                 Err(error) => {
                     log::error!("PTY status worker failed: {error}");

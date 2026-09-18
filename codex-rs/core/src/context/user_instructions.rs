@@ -32,7 +32,10 @@ impl UserInstructions {
         let (start, end) = Self::type_markers();
         codex_context_fragments::RenderedContextFragment::new(
             self.role(),
-            format!("{start}{}{end}", self.body_with_observation(Some(observation))),
+            format!(
+                "{start}{}{end}",
+                self.body_with_observation(Some(observation))
+            ),
         )
     }
 

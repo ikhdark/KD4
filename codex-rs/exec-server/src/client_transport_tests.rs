@@ -207,7 +207,8 @@ fn noise_websocket_deadline_covers_tls_preparation_without_network_side_effects(
 
 #[test]
 fn plain_websockets_connect_while_tls_worker_is_occupied() -> Result<()> {
-    use crate::{NoiseRendezvousConnectArgs, RemoteExecServerConnectArgs};
+    use crate::NoiseRendezvousConnectArgs;
+    use crate::RemoteExecServerConnectArgs;
     use std::time::Duration;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

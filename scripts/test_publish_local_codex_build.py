@@ -95,6 +95,8 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             env["CARGO_TARGET_DIR"] = str(temp_path / "inherited-target")
 
             result = self.run_script(
+                "-Profile",
+                "release",
                 "-SourceExe",
                 str(fake_codex),
                 "-InstallDir",
@@ -126,7 +128,11 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             sidecar_timestamp = FIXTURE_TIME - 100
             self.touch_tracked_source(source_timestamp)
             built_dir = (
-                self.repo_root / "codex-rs" / "target" / "publish-release" / "release"
+                self.repo_root
+                / "codex-rs"
+                / "target"
+                / "publish-local-release"
+                / "local-release"
             )
             built_codex = built_dir / "codex.exe"
             built_code_mode_host = built_dir / "codex-code-mode-host.exe"
@@ -195,7 +201,11 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             fake_bin = temp_path / "bin"
             fake_bin.mkdir()
             built_dir = (
-                self.repo_root / "codex-rs" / "target" / "publish-release" / "release"
+                self.repo_root
+                / "codex-rs"
+                / "target"
+                / "publish-local-release"
+                / "local-release"
             )
             fake_cargo = fake_bin / "cargo.cmd"
             fake_cargo.write_text(
@@ -228,7 +238,7 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
                 self.repo_root
                 / "codex-rs"
                 / "target"
-                / "codex-local-publish-release.stamp"
+                / "codex-local-publish-local-release.stamp"
             )
             self.assertEqual(
                 result.returncode,
@@ -240,7 +250,7 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             self.assertIn("buildOnly: true", result.stdout)
             self.assertIn("builtCodexPath:", result.stdout)
             self.assertIn("buildStampPath:", result.stdout)
-            self.assertIn("fake cargo --config ", result.stdout)
+            self.assertIn("fake cargo build --target-dir ", result.stdout)
             self.assertIn(" build --target-dir ", result.stdout)
             self.assertNotIn("sourceSha256:", result.stdout)
             self.assertNotIn("targetPath:", result.stdout)
@@ -257,8 +267,16 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             fake_bin = temp_path / "bin"
             fake_bin.mkdir()
             build_count = temp_path / "cargo-build-count.txt"
+            snapshot_calls = temp_path / "snapshot-calls.txt"
+            observed = {"Get-LocalPublishBuildInputSnapshot": snapshot_calls}
+            mutate_during_build = temp_path / "mutate-during-build"
+            tracked_source = self.repo_root / "codex-rs" / "tracked-source.rs"
             built_dir = (
-                self.repo_root / "codex-rs" / "target" / "publish-release" / "release"
+                self.repo_root
+                / "codex-rs"
+                / "target"
+                / "publish-local-release"
+                / "local-release"
             )
             fake_cargo = fake_bin / "cargo.cmd"
             fake_cargo.write_text(
@@ -267,6 +285,7 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
                         "@echo off",
                         "echo fake cargo %*",
                         'if "%1"=="--version" exit /b 0',
+                        f'if exist "{mutate_during_build}" echo changed during cargo>"{tracked_source}"',
                         f'echo build>>"{build_count}"',
                         f'if not exist "{built_dir}" mkdir "{built_dir}"',
                         f'copy /y "%ComSpec%" "{built_dir / "codex.exe"}" >nul',
@@ -285,7 +304,9 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
                 str(install_dir),
             )
 
-            initial = self.run_script(*auto_skip_args, env=env)
+            initial = self.run_script(
+                *auto_skip_args, env=env, observe_commands=observed
+            )
             self.assertEqual(
                 initial.returncode,
                 0,
@@ -295,12 +316,15 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             self.assertIn(
                 "autoSkipBuildReason: source artifact missing", initial.stdout
             )
-            self.assertIn("fake cargo --config ", initial.stdout)
+            self.assertIn("fake cargo build --target-dir ", initial.stdout)
             self.assertEqual(
                 len(build_count.read_text(encoding="utf-8").splitlines()), 1
             )
+            self.assertEqual(snapshot_calls.read_text().splitlines(), ["invoked"] * 2)
 
-            cached = self.run_script(*auto_skip_args, env=env)
+            cached = self.run_script(
+                *auto_skip_args, env=env, observe_commands=observed
+            )
             self.assertEqual(
                 cached.returncode,
                 0,
@@ -312,13 +336,16 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
                 cached.stdout,
             )
             self.assertIn("buildCommand: <skipped>", cached.stdout)
-            self.assertNotIn("fake cargo --config ", cached.stdout)
+            self.assertNotIn("fake cargo build --target-dir ", cached.stdout)
             self.assertEqual(
                 len(build_count.read_text(encoding="utf-8").splitlines()), 1
             )
+            self.assertEqual(snapshot_calls.read_text().splitlines(), ["invoked"] * 3)
 
             (built_dir / "codex.exe").write_bytes(b"mutated release artifact")
-            artifact_invalidated = self.run_script(*auto_skip_args, env=env)
+            artifact_invalidated = self.run_script(
+                *auto_skip_args, env=env, observe_commands=observed
+            )
             self.assertEqual(
                 artifact_invalidated.returncode,
                 0,
@@ -329,10 +356,11 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
                 "autoSkipBuildReason: source artifact differs from stamped build",
                 artifact_invalidated.stdout,
             )
-            self.assertIn("fake cargo --config ", artifact_invalidated.stdout)
+            self.assertIn("fake cargo build --target-dir ", artifact_invalidated.stdout)
             self.assertEqual(
                 len(build_count.read_text(encoding="utf-8").splitlines()), 2
             )
+            self.assertEqual(snapshot_calls.read_text().splitlines(), ["invoked"] * 5)
 
             forced = self.run_script(
                 "-BuildOnly",
@@ -340,6 +368,7 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
                 "-InstallDir",
                 str(install_dir),
                 env=env,
+                observe_commands=observed,
             )
             self.assertEqual(
                 forced.returncode,
@@ -347,13 +376,16 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
                 f"stdout:\n{forced.stdout}\nstderr:\n{forced.stderr}",
             )
             self.assertNotIn("autoSkipBuild:", forced.stdout)
-            self.assertIn("fake cargo --config ", forced.stdout)
+            self.assertIn("fake cargo build --target-dir ", forced.stdout)
             self.assertEqual(
                 len(build_count.read_text(encoding="utf-8").splitlines()), 3
             )
+            self.assertEqual(snapshot_calls.read_text().splitlines(), ["invoked"] * 7)
 
             self.touch_tracked_source(FRESH_SOURCE_TIME)
-            invalidated = self.run_script(*auto_skip_args, env=env)
+            invalidated = self.run_script(
+                *auto_skip_args, env=env, observe_commands=observed
+            )
             self.assertEqual(
                 invalidated.returncode,
                 0,
@@ -364,9 +396,35 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
                 "autoSkipBuildReason: tracked publish inputs changed",
                 invalidated.stdout,
             )
-            self.assertIn("fake cargo --config ", invalidated.stdout)
+            self.assertIn("fake cargo build --target-dir ", invalidated.stdout)
             self.assertEqual(
                 len(build_count.read_text(encoding="utf-8").splitlines()), 4
+            )
+            self.assertEqual(snapshot_calls.read_text().splitlines(), ["invoked"] * 9)
+
+            # Reject an input change after the reused pre-build snapshot; a
+            # missing post-build scan must not be able to stamp this build.
+            self.touch_tracked_source(FRESH_SOURCE_TIME + 1)
+            mutate_during_build.touch()
+            changed_during_build = self.run_script(
+                *auto_skip_args, env=env, observe_commands=observed
+            )
+            self.assertNotEqual(changed_during_build.returncode, 0)
+            self.assertIn(
+                "Local publish inputs changed during the build",
+                changed_during_build.stdout + changed_during_build.stderr,
+            )
+            self.assertEqual(
+                build_count.read_text(encoding="utf-8").splitlines(), ["build"] * 5
+            )
+            self.assertEqual(snapshot_calls.read_text().splitlines(), ["invoked"] * 11)
+            self.assertFalse(
+                (
+                    self.repo_root
+                    / "codex-rs"
+                    / "target"
+                    / "codex-local-publish-local-release.stamp"
+                ).exists()
             )
 
             for result in (initial, cached, artifact_invalidated, forced, invalidated):
@@ -429,7 +487,7 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             )
             env = clean_env()
             env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
-            self.write_build_stamp("release", FIXTURE_TIME, fake_codex, env=env)
+            self.write_build_stamp("local-release", FIXTURE_TIME, fake_codex, env=env)
 
             result = self.run_script(
                 "-TestRun",
@@ -455,7 +513,7 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
                 result.stdout,
             )
             self.assertIn("buildCommand: <skipped>", result.stdout)
-            self.assertNotIn("fake cargo --config ", result.stdout)
+            self.assertNotIn("fake cargo build --target-dir ", result.stdout)
             self.assertIn(f'doctorCommand: "{fake_codex}" doctor --json', result.stdout)
             self.assertIn("doctor warning", result.stdout)
             self.assertIn(
@@ -641,10 +699,10 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             )
             self.assertIn(f"buildMetadataCommit: {expected_commit}", result.stdout)
             self.assertIn("buildMetadataDirty: false", result.stdout)
-            self.assertIn("buildMetadataProfile: release", result.stdout)
+            self.assertIn("buildMetadataProfile: local-release", result.stdout)
             self.assertIn(f"metadata commit={expected_commit}", result.stdout)
             self.assertIn("metadata dirty=false", result.stdout)
-            self.assertIn("metadata profile=release", result.stdout)
+            self.assertIn("metadata profile=local-release", result.stdout)
             timestamp = re.search(
                 r"^metadata timestamp=(.+)$", result.stdout, re.MULTILINE
             )

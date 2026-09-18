@@ -516,6 +516,10 @@ async fn handle_request_permissions_uses_tool_call_id_for_round_trip() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the turn state reads borrow from their active-turn guards"
+)]
 async fn delegated_user_input_preserves_answers_and_reports_interruption() {
     for outcome in ["cancelled", "closed", "empty", "answered", "interrupted"] {
         let (parent_session, parent_ctx, rx_events) =

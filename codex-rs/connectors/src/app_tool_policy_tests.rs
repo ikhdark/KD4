@@ -625,7 +625,6 @@ fn evaluator_matches_tool_title_for_user_config() {
                         },
                     )]),
                 }),
-                ..Default::default()
             },
         )]),
     };

@@ -117,7 +117,11 @@ pub fn write_bytes_atomically(write_path: &Path, contents: &[u8]) -> io::Result<
     temporary.write_all(contents)?;
     temporary.flush()?;
     temporary.as_file().sync_all()?;
-    temporary.persist(write_path).map_err(|error| error.error)?;
+    // Clear Windows temporary attributes, then retain cleanup on rename failure.
+    let (_file, path) = temporary.keep().map_err(|error| error.error)?;
+    let path = tempfile::TempPath::try_from_path(path)?;
+    // std's Windows rename supports replacing a file held by an open reader.
+    std::fs::rename(&path, write_path)?;
     sync_parent_directory(parent).map_err(|error| {
         io::Error::new(
             error.kind(),

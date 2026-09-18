@@ -1922,7 +1922,7 @@ async fn remote_workspace_evidence_tracks_content_deletions_and_capture_failures
                 }
                 "process/read" => {
                     let status = if current == 2 {
-                        "# branch.oid abc123\0# branch.head main\01 .D N... 100644 100644 000000 abc123 abc123 tracked.txt\0"
+                        "# branch.oid abc123\0# branch.head main\u{0}1 .D N... 100644 100644 000000 abc123 abc123 tracked.txt\0"
                     } else {
                         "# branch.oid abc123\0# branch.head main\0? tracked.txt\0"
                     };

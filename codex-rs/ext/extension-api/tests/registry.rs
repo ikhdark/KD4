@@ -173,7 +173,7 @@ async fn build_round_trips_every_contributor_category() {
     builder.turn_input_contributor(contributor.clone());
     builder.tool_contributor(contributor.clone());
     builder.tool_lifecycle_contributor(contributor.clone());
-    builder.turn_item_contributor(contributor.clone());
+    builder.turn_item_contributor(contributor);
     let registry = builder.build();
 
     assert_eq!(registry.thread_lifecycle_contributors().len(), 1);

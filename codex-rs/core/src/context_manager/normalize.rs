@@ -185,6 +185,10 @@ pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItem>) {
 
     // Find the orphan positions while IDs can still borrow from the history.
     // Retaining by position then avoids cloning every call ID before mutation.
+    #[expect(
+        clippy::needless_collect,
+        reason = "collecting indexes ends the history borrow before items.retain mutates it"
+    )]
     let orphan_indexes: Vec<usize> = items
         .iter()
         .enumerate()

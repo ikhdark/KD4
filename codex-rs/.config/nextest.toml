@@ -129,3 +129,10 @@ slow-timeout = { period = "1m", terminate-after = 2 }
 platform = 'cfg(windows)'
 filter = 'package(codex-core)'
 test-group = 'windows_core'
+
+[[profile.default.overrides]]
+# This regression creates 10,000 rollouts and scans them for every listing order.
+# Windows filesystem latency exceeds the default one-minute allowance.
+platform = "cfg(windows)"
+filter = "package(codex-rollout) & test(filesystem_listing_reaches_threads_beyond_the_former_scan_cap)"
+slow-timeout = { period = "1m", terminate-after = 5 }

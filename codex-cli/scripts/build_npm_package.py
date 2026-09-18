@@ -399,24 +399,33 @@ def copy_native_binaries(
                 )
             metadata_path = target_dir / "codex-package.json"
             if not metadata_path.is_file():
-                raise RuntimeError(f"Missing canonical package metadata: {metadata_path}")
+                raise RuntimeError(
+                    f"Missing canonical package metadata: {metadata_path}"
+                )
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             if metadata.get("target") != target_dir.name:
                 raise RuntimeError(
                     f"Canonical package target mismatch for {target_dir.name}"
                 )
-            if expected_version is not None and metadata.get("version") != expected_version:
+            if (
+                expected_version is not None
+                and metadata.get("version") != expected_version
+            ):
                 raise RuntimeError(
                     f"Canonical package version mismatch for {target_dir.name}: "
                     f"expected {expected_version}, got {metadata.get('version')!r}"
                 )
             inventory = metadata.get("files")
             if not isinstance(inventory, list) or not inventory:
-                raise RuntimeError(f"Canonical package has no file inventory: {metadata_path}")
+                raise RuntimeError(
+                    f"Canonical package has no file inventory: {metadata_path}"
+                )
             declared = {"codex-package.json"}
             for item in inventory:
                 if not isinstance(item, dict) or not isinstance(item.get("path"), str):
-                    raise RuntimeError(f"Invalid canonical package inventory: {metadata_path}")
+                    raise RuntimeError(
+                        f"Invalid canonical package inventory: {metadata_path}"
+                    )
                 relative = item["path"]
                 relative_path = Path(relative)
                 if relative_path.is_absolute() or ".." in relative_path.parts:
@@ -428,15 +437,18 @@ def copy_native_binaries(
                     raise RuntimeError(f"Missing canonical package file: {source}")
                 actual_size = source.stat().st_size
                 actual_digest = hashlib.sha256(source.read_bytes()).hexdigest()
-                if item.get("size") != actual_size or item.get("sha256") != actual_digest:
+                if (
+                    item.get("size") != actual_size
+                    or item.get("sha256") != actual_digest
+                ):
                     raise RuntimeError(
                         f"Canonical package digest mismatch: {target_dir.name}/{relative}"
                     )
                 declared.add(relative)
             expected_bundle_id = hashlib.sha256(
-                json.dumps(
-                    inventory, sort_keys=True, separators=(",", ":")
-                ).encode("utf-8")
+                json.dumps(inventory, sort_keys=True, separators=(",", ":")).encode(
+                    "utf-8"
+                )
             ).hexdigest()
             if metadata.get("bundleId") != expected_bundle_id:
                 raise RuntimeError(
@@ -464,10 +476,16 @@ def copy_native_binaries(
                 "ARM64": "aarch64-pc-windows-msvc",
                 "AARCH64": "aarch64-pc-windows-msvc",
             }.get(platform.machine().upper())
-            if expected_version is not None and os.name == "nt" and host_target == target_dir.name:
-                reported = subprocess.check_output(
-                    [str(codex_path), "--version"], text=True
-                ).strip().split()[-1]
+            if (
+                expected_version is not None
+                and os.name == "nt"
+                and host_target == target_dir.name
+            ):
+                reported = (
+                    subprocess.check_output([str(codex_path), "--version"], text=True)
+                    .strip()
+                    .split()[-1]
+                )
                 if reported != expected_version:
                     raise RuntimeError(
                         f"Native Codex version mismatch for {target_dir.name}: "
@@ -560,7 +578,9 @@ def smoke_test_npm_tarball(tarball_path: Path) -> None:
         installed = smoke_dir / "node_modules" / "@openai" / "codex"
         package_json = installed / "package.json"
         if not package_json.is_file():
-            raise RuntimeError("npm smoke install did not produce @openai/codex/package.json")
+            raise RuntimeError(
+                "npm smoke install did not produce @openai/codex/package.json"
+            )
         launcher = installed / "bin" / "codex.js"
         if launcher.is_file():
             subprocess.run(["node", "--check", str(launcher)], check=True)

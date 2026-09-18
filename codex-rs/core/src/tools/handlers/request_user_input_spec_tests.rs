@@ -21,8 +21,15 @@ fn default_available_modes() -> Vec<ModeKind> {
 
 #[test]
 fn request_user_input_tool_includes_questions_schema() {
+    let ToolSpec::Function(mut actual) =
+        create_request_user_input_tool("Ask the user to choose.".to_string())
+    else {
+        panic!("function tool expected");
+    };
+    // Output schema validity is exercised with actual replies by the handler tests.
+    assert!(actual.output_schema.take().is_some());
     assert_eq!(
-        create_request_user_input_tool("Ask the user to choose.".to_string()),
+        ToolSpec::Function(actual),
         ToolSpec::Function(ResponsesApiTool {
             name: "request_user_input".to_string(),
             description: "Ask the user to choose.".to_string(),

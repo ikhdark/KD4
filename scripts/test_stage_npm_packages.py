@@ -52,14 +52,18 @@ class CodexLauncherTests(unittest.TestCase):
 
     def write_manifest(self, targets: dict) -> None:
         (self.root / "package.json").write_text(
-            json.dumps({
-                "type": "module",
-                "version": "1.2.3",
-                "optionalDependencies": {
-                    self.native_target["package"]: "npm:@openai/codex@1.2.3-test-native"
-                },
-                "codexNativeTargets": targets,
-            }),
+            json.dumps(
+                {
+                    "type": "module",
+                    "version": "1.2.3",
+                    "optionalDependencies": {
+                        self.native_target[
+                            "package"
+                        ]: "npm:@openai/codex@1.2.3-test-native"
+                    },
+                    "codexNativeTargets": targets,
+                }
+            ),
             encoding="utf-8",
         )
 
@@ -133,7 +137,9 @@ class CodexLauncherTests(unittest.TestCase):
 
         result = self.run_launcher()
 
-        self.assert_startup_failure(result, "is installed but its native executable is missing")
+        self.assert_startup_failure(
+            result, "is installed but its native executable is missing"
+        )
         self.assertIn(str(self.native_path(package_root)), result.stderr)
         self.assertNotIn("Missing optional dependency", result.stderr)
 
@@ -153,7 +159,9 @@ class CodexLauncherTests(unittest.TestCase):
                 self.assertIn("Reinstall this KD4 package", result.stderr)
                 self.assertNotIn("Unsupported platform", result.stderr)
 
-    def test_optional_package_resolution_error_does_not_launch_bundled_binary(self) -> None:
+    def test_optional_package_resolution_error_does_not_launch_bundled_binary(
+        self,
+    ) -> None:
         package_root = self.root / "node_modules" / "@openai" / "codex-test-native"
         package_root.mkdir(parents=True)
         (package_root / "package.json").write_text(
@@ -254,7 +262,10 @@ class CodexLauncherTests(unittest.TestCase):
                     self.assertEqual(result.stderr, "")
                 else:
                     self.assertEqual(result.returncode, 143 if os.name == "nt" else -15)
-                    self.assertIn(f"Unable to forward SIGTERM to Codex: {error_detail}.", result.stderr)
+                    self.assertIn(
+                        f"Unable to forward SIGTERM to Codex: {error_detail}.",
+                        result.stderr,
+                    )
                     self.assertNotIn("\n    at ", result.stderr)
 
     def test_optional_package_launch_forwards_args_environment_and_exit_code(

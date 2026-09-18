@@ -6,7 +6,9 @@ use crate::TerminalSize;
 use crate::spawn_pipe_process_no_stdin;
 use crate::spawn_pty_process;
 use std::collections::HashMap;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::OwnedHandle;
 use std::path::Path;
 use std::time::Duration;
 

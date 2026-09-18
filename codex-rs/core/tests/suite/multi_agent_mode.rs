@@ -1078,11 +1078,17 @@ async fn assert_registered_wait_item_terminal_with_stalled_store(
         sqlx::query("ROLLBACK").execute(&mut *connection).await?;
         // Acquiring another writer transaction after release also observes cleanup
         // of the stalled no-op writer before checking the durable child state.
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await?;
         let state: (i64, i64) = sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM attempts WHERE json_extract(state, '$') = 'active'), (SELECT COUNT(*) FROM receipts)"
         ).fetch_one(&mut *connection).await?;
-        assert_eq!(state, (1, 0), "released maintenance must not later abandon or seal the child");
+        assert_eq!(
+            state,
+            (1, 0),
+            "released maintenance must not later abandon or seal the child"
+        );
         sqlx::query("ROLLBACK").execute(&mut *connection).await?;
     }
     drop(stalled_store);

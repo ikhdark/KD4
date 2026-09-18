@@ -1,6 +1,8 @@
 # codex-utils-pty
 
-Lightweight helpers for spawning interactive processes either under a PTY (pseudo terminal) or regular pipes. The public API is minimal and mirrors both backends so callers can switch based on their needs (e.g., enabling or disabling TTY).
+Lightweight helpers for spawning interactive processes either under a PTY (pseudo terminal) or
+regular pipes. The public API is minimal and mirrors both backends so callers can switch based on
+their needs (e.g., enabling or disabling TTY).
 
 ## API surface
 
@@ -26,7 +28,7 @@ use codex_utils_pty::combine_output_receivers;
 use codex_utils_pty::spawn_pty_process;
 use codex_utils_pty::TerminalSize;
 
-# tokio_test::block_on(async {
+## tokio_test::block_on(async {
 let env_map: HashMap<String, String> = std::env::vars().collect();
 let spawned = spawn_pty_process(
     "bash",
@@ -47,18 +49,20 @@ while let Ok(chunk) = output_rx.try_recv() {
     collected.extend_from_slice(&chunk);
 }
 let exit_code = spawned.exit_rx.await.unwrap_or(-1);
-# let _ = (collected, exit_code);
-# anyhow::Ok(())
-# });
+## let _ = (collected, exit_code);
+## anyhow::Ok(())
+## });
 ```
 
 Swap in `spawn_pipe_process` for a non-TTY subprocess; the rest of the API stays the same.
-Use `spawn_pipe_process_no_stdin` to force stdin closed (commands that read stdin will see EOF immediately).
+Use `spawn_pipe_process_no_stdin` to force stdin closed (commands that read stdin will see EOF
+immediately).
 
 ## Tests
 
-Unit tests live in `src/lib.rs` and cover both backends (PTY Python REPL and pipe-based stdin roundtrip). Run with:
+Unit tests live in `src/lib.rs` and cover both backends (PTY Python REPL and pipe-based stdin
+roundtrip). Run with:
 
-```
+```text
 just test -p codex-utils-pty --no-capture
 ```

@@ -810,7 +810,7 @@ pub(crate) async fn run_turn(
                 }
                 if needs_follow_up
                     && generation_budget_blocks_follow_up(
-                        logical_generation_budget,
+                        *logical_generation_budget,
                         next_generation_request.as_ref(),
                     )
                 {
@@ -1003,7 +1003,7 @@ pub(crate) async fn run_turn(
                         ));
                     }
                     match completion_pending_input_disposition(
-                        logical_generation_budget,
+                        *logical_generation_budget,
                         sess.input_queue.has_pending_input(&sess.active_turn).await,
                     ) {
                         CompletionPendingInputDisposition::Continue => {
@@ -1205,11 +1205,11 @@ impl LogicalGenerationBudget {
         self.terminal_generation_used = false;
     }
 
-    fn is_exhausted(&self) -> bool {
+    fn is_exhausted(self) -> bool {
         self.regular_generations >= MAX_REGULAR_LOGICAL_GENERATIONS && self.terminal_generation_used
     }
 
-    fn has_regular_generation_capacity(&self) -> bool {
+    fn has_regular_generation_capacity(self) -> bool {
         self.regular_generations < MAX_REGULAR_LOGICAL_GENERATIONS
     }
 
@@ -1232,14 +1232,14 @@ impl LogicalGenerationBudget {
         LogicalGenerationAdmission::Terminal { forced: true }
     }
 
-    fn can_admit(&self, terminal_requested: bool) -> bool {
-        let mut preview = *self;
+    fn can_admit(self, terminal_requested: bool) -> bool {
+        let mut preview = self;
         preview.admit(terminal_requested) != LogicalGenerationAdmission::Exhausted
     }
 }
 
 fn generation_budget_blocks_follow_up(
-    budget: &LogicalGenerationBudget,
+    budget: LogicalGenerationBudget,
     next_generation_request: Option<&GenerationRequestDisposition>,
 ) -> bool {
     next_generation_request
@@ -1254,7 +1254,7 @@ enum CompletionPendingInputDisposition {
 }
 
 fn completion_pending_input_disposition(
-    budget: &LogicalGenerationBudget,
+    budget: LogicalGenerationBudget,
     has_pending_input: bool,
 ) -> CompletionPendingInputDisposition {
     if !has_pending_input {

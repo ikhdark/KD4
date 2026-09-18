@@ -57,7 +57,9 @@ def run_version(command: Sequence[str]) -> str | None:
             line = line.strip()
             # Accept bare versions or the tool's name and optional "version";
             # banners and warnings can precede either output stream's version.
-            if re.match(r"^(?:[\w.-]+\s+(?:version\s+)?)?v?\d+\.\d+(?:[.\s+-]|$)", line):
+            if re.match(
+                r"^(?:[\w.-]+\s+(?:version\s+)?)?v?\d+\.\d+(?:[.\s+-]|$)", line
+            ):
                 return line
     return None
 

@@ -307,11 +307,15 @@ async fn registered_process_drop_outside_runtime_is_awaited_by_session_shutdown(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn registered_network_denial_cleanup_is_awaited_without_tracking_idle_watchers()
 -> anyhow::Result<()> {
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::FromRawHandle;
+    use std::os::windows::io::OwnedHandle;
     use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
-    };
+    use windows_sys::Win32::System::Threading::OpenProcess;
+    use windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::PROCESS_TERMINATE;
+    use windows_sys::Win32::System::Threading::TerminateProcess;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
     struct ChildGuard(OwnedHandle);
     impl ChildGuard {
         fn exited(&self) -> bool {

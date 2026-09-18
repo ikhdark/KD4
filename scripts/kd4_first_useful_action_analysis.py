@@ -84,7 +84,15 @@ def _percentile(values: Sequence[float], fraction: float) -> float:
 def _summary(values: Iterable[float]) -> dict[str, float | int | None]:
     samples = list(values)
     if not samples:
-        return {"count": 0, "p50": None, "p95": None, "min": None, "mean": None, "populationStdDev": None, "max": None}
+        return {
+            "count": 0,
+            "p50": None,
+            "p95": None,
+            "min": None,
+            "mean": None,
+            "populationStdDev": None,
+            "max": None,
+        }
     return {
         "count": len(samples),
         "p50": round(_percentile(samples, 0.50), 3),
@@ -147,8 +155,10 @@ def canonical_milestones(timing: Any) -> dict[str, float] | None:
         return {
             key: float(value)
             for key, value in milestones.items()
-            if isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(value) and value >= 0
+            if isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and value >= 0
         }
     return None
 
@@ -223,7 +233,9 @@ def analyze_records(
             schema_version = (
                 timing.get("schemaVersion") if isinstance(timing, dict) else None
             )
-            version_key = str(schema_version) if type(schema_version) is int else "missing"
+            version_key = (
+                str(schema_version) if type(schema_version) is int else "missing"
+            )
             schema_versions[version_key] = schema_versions.get(version_key, 0) + 1
             if milestones is not None:
                 canonical_rows.append(milestones)
@@ -338,18 +350,26 @@ def analyze_records(
         ("startToFirstVisibleOutputMs", "firstVisibleOutputMs"),
         ("startToFirstAgentMessageMs", "firstAgentMessageMs"),
     ):
-        canonical_metrics[metric] = _summary(row[key] for row in canonical_rows if key in row)
+        canonical_metrics[metric] = _summary(
+            row[key] for row in canonical_rows if key in row
+        )
     for metrics in (canonical_metrics, legacy_metrics):
         for summary in metrics.values():
             summary["eligibleTurnCount"] = completed_turns
-            summary["coverage"] = summary["count"] / completed_turns if completed_turns else None
+            summary["coverage"] = (
+                summary["count"] / completed_turns if completed_turns else None
+            )
     denominators = {
         "invalidJsonLines": record_count,
         "invalidTimestamps": record_count - exclusions["invalidJsonLines"],
         "incompleteTurns": started_turns,
         "supersededTurns": started_turns,
         "unterminatedTurns": started_turns,
-        "incompleteCanonicalMilestones": sum(count for version, count in schema_versions.items() if version != "missing" and int(version) >= CANONICAL_TIMING_SCHEMA_VERSION),
+        "incompleteCanonicalMilestones": sum(
+            count
+            for version, count in schema_versions.items()
+            if version != "missing" and int(version) >= CANONICAL_TIMING_SCHEMA_VERSION
+        ),
     }
     return {
         "schemaVersion": 1,
@@ -379,7 +399,11 @@ def analyze_records(
         "legacyReconstructed": legacy_metrics,
         "exclusions": exclusions,
         "exclusionRates": {
-            key: {"count": count, "denominator": denominators[key], "rate": count / denominators[key] if denominators[key] else None}
+            key: {
+                "count": count,
+                "denominator": denominators[key],
+                "rate": count / denominators[key] if denominators[key] else None,
+            }
             for key, count in exclusions.items()
         },
     }

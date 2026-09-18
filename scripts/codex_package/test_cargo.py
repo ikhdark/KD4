@@ -1519,11 +1519,20 @@ class SourceEvidenceTest(unittest.TestCase):
         )
 
     def test_tool_identity_uses_build_directory(self) -> None:
-        with mock.patch.object(
-            cargo_module.subprocess, "run", return_value=mock.Mock(stdout="cargo test")
-        ) as run:
+        with (
+            mock.patch.object(
+                cargo_module, "resolve_command", return_value=sys.executable
+            ) as resolve,
+            mock.patch.object(
+                cargo_module.subprocess,
+                "run",
+                return_value=mock.Mock(stdout="cargo test"),
+            ) as run,
+        ):
             identity = cargo_module.command_identity("cargo", "--version")
+        resolve.assert_called_once_with("cargo", env=None)
         self.assertEqual(identity["version"], "cargo test")
+        self.assertEqual(run.call_args.args[0], [sys.executable, "--version"])
         self.assertEqual(run.call_args.kwargs["cwd"], cargo_module.CODEX_RS_ROOT)
 
     def test_unreadable_untracked_source_is_unavailable(self) -> None:

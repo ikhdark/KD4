@@ -152,8 +152,10 @@ fn plugin_outcome(tool_exposure: Option<PluginToolExposure>) -> PluginLoadOutcom
         plugin_namespace: Some("example-plugin".to_string()),
         manifest_description: None,
         tool_exposure,
-        root: AbsolutePathBuf::from_absolute_path_checked(std::env::temp_dir().join("example-plugin"))
-            .expect("temporary path should be absolute"),
+        root: AbsolutePathBuf::from_absolute_path_checked(
+            std::env::temp_dir().join("example-plugin"),
+        )
+        .expect("temporary path should be absolute"),
         enabled: true,
         skill_roots: Vec::new(),
         disabled_skill_paths: HashSet::new(),

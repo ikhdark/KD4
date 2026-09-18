@@ -1,3 +1,5 @@
+# Repository instructions
+
 ## Repository identity and runtime boundary
 
 - This is the user's local fork of [`openai/codex`](https://github.com/openai/codex).
@@ -14,27 +16,39 @@
   replacing or updating the local binary, then restarting Desktop. Perform
   those activation steps only when the request includes them.
 
-#### Scope and workspace
-- A no-change result is valid and preferred when the requested capability already exists adequately. Before adding a mechanism, identify the concrete missing capability and prove that existing abstractions cannot satisfy it. Prefer reuse, consolidation, or deletion over adding parallel machinery.
-- Ask questions in plain language when clarity is needed, do not continue to ask questions after implementation has begun.
+### Scope and workspace
+
+- A no-change result is valid and preferred when the requested capability already exists adequately.
+  Before adding a mechanism, identify the concrete missing capability and prove that existing
+  abstractions cannot satisfy it. Prefer reuse, consolidation, or deletion over adding parallel
+  machinery.
+- Ask questions in plain language when clarity is needed, do not continue to ask questions after
+  implementation has begun.
 - When edits overlap, preserve independent changes and combine compatible behavior
   against the requested contract. Verify the combined runtime path; ask only when
   conflicting intended behavior cannot be resolved from current evidence.
 - Do not communicate with other agents from different sessions.
 - Do not over-engineer implementations.
-- Partial wiring of implemented code is forbidden, this is non-negotiable. End to end wiring is mandatory.
+- Partial wiring of implemented code is forbidden, this is non-negotiable. End to end wiring is
+  mandatory.
 - After a full suite run, rerun only tests affected by a fix.
-- Add no new frameworks, redesigns, cleanup projects, or extra acceptance checks unless a confirmed failure requires them.
+- Add no new frameworks, redesigns, cleanup projects, or extra acceptance checks unless a confirmed
+  failure requires them.
 
 ### Validation
-* Both of the following are mandatory*
-1. Every test must assert an expected result and fail for a plausible incorrect implementation of the behavior or logic under test.
+
+- Both of the following are mandatory*
+
+1. Every test must assert an expected result and fail for a plausible incorrect implementation of
+   the behavior or logic under test.
 2. Repair weak tests covering the changed behavior or blocking its validation.
    Report unrelated weaknesses encountered without starting a broader test audit.
-3. Do not run tests unless told to.
+3. Do not run tests more than twice, report if it fails after the first attempt.
 
-- When validation or tests report errors, warnings, or failures, let the current run finish and diagnose all reported issues before making any repair edits. Then apply all related fixes in one consolidated batch and rerun each affected test or validation check once. Do not rerun checks that already passed and are unaffected by the repairs.
-
+- When validation or tests report errors, warnings, or failures, let the current run finish and
+  diagnose all reported issues before making any repair edits. Then apply all related fixes in one
+  consolidated batch and rerun each affected test or validation check once. Do not rerun checks that
+  already passed and are unaffected by the repairs.
 
 ## Routing and task scope
 

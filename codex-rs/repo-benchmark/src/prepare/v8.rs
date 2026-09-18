@@ -1,14 +1,21 @@
 //! Source-pinned OpenAI V8 release assets, following setup-rusty-v8's trust chain.
 use super::environment::Environment;
-use super::provenance::{FileIdentity, command_output, git_path, hash_bytes, hash_file};
-use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use super::provenance::FileIdentity;
+use super::provenance::command_output;
+use super::provenance::git_path;
+use super::provenance::hash_bytes;
+use super::provenance::hash_file;
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
+use serde::Deserialize;
+use serde::Serialize;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -185,10 +192,10 @@ fn selected_features(tree: &str, version: &str) -> Result<BTreeSet<String>> {
         selections.len() == 1,
         "expected one V8 feature selection for the requested native binaries"
     );
-    Ok(selections
+    selections
         .into_iter()
         .next()
-        .expect("one feature selection"))
+        .context("expected one V8 feature selection for the requested native binaries")
 }
 
 fn artifact_names(target: &str, features: &BTreeSet<String>) -> Result<(String, String, String)> {
@@ -354,6 +361,11 @@ pub fn prepare(
         ])
         .env("RUSTUP_TOOLCHAIN", &environment.rust_toolchain)
         .env_remove("CARGO_TARGET_DIR");
+    // Several requested binaries can share one package; pass each package once.
+    #[expect(
+        clippy::needless_collect,
+        reason = "the set deduplicates packages shared by multiple requested binaries"
+    )]
     for package in requested
         .iter()
         .map(|(package, _)| *package)

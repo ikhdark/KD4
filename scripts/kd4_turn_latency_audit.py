@@ -182,7 +182,9 @@ def _discovery_input(text: str) -> str:
     # Decode literal command strings in function arguments and code-mode input.
     # This is deliberately not a shell/JavaScript interpreter.
     commands = []
-    for match in re.finditer(r'''(?:["']?(?:cmd|command)["']?)\s*:\s*("(?:\\.|[^"\\])*"|'[^'\r\n]*')''', text):
+    for match in re.finditer(
+        r"""(?:["']?(?:cmd|command)["']?)\s*:\s*("(?:\\.|[^"\\])*"|'[^'\r\n]*')""", text
+    ):
         value = match.group(1)
         try:
             commands.append(json.loads(value) if value.startswith('"') else value[1:-1])
@@ -383,7 +385,10 @@ def _source_discovery_report(events: list[dict[str, Any]]) -> dict[str, Any]:
                         "ordinal": first_search["ordinal"],
                     }
                 )
-            elif evidence_events[0]["ordinal"] - first_search["ordinal"] >= _LATE_EVIDENCE_DISCOVERY_STEPS:
+            elif (
+                evidence_events[0]["ordinal"] - first_search["ordinal"]
+                >= _LATE_EVIDENCE_DISCOVERY_STEPS
+            ):
                 signals.append(
                     {
                         "code": f"{evidence_kind}_evidence_late",
@@ -716,10 +721,16 @@ def _apply_detailed_tool_timing(
         record["detailedTimingMatch"] = match
         outcome = call.get("outcome")
         status = {
-            "success": "completed", "no_match": "completed",
-            "failure": "failed", "error": "failed", "timeout": "failed",
-            "rejected": "failed", "cancelled": "failed", "panic": "failed",
-            "yielded": "running", "skipped": "skipped",
+            "success": "completed",
+            "no_match": "completed",
+            "failure": "failed",
+            "error": "failed",
+            "timeout": "failed",
+            "rejected": "failed",
+            "cancelled": "failed",
+            "panic": "failed",
+            "yielded": "running",
+            "skipped": "skipped",
         }.get(outcome)
         if status is not None:
             record["status"] = status
@@ -924,7 +935,8 @@ def _turn_report(
     record: dict[str, Any],
     repo_root: Path,
     command_records: list[dict[str, Any]],
-    *, include_tokens: bool = True,
+    *,
+    include_tokens: bool = True,
 ) -> dict[str, Any]:
     timing = record["timing"]
     counters = timing.get("counters", {})
@@ -938,7 +950,9 @@ def _turn_report(
         for call in timing.get("toolCalls", [])
         if isinstance(call, dict)
     ]
-    analysis = analyze_timing(timing, status=record["status"], include_tokens=include_tokens)
+    analysis = analyze_timing(
+        timing, status=record["status"], include_tokens=include_tokens
+    )
     tokens = analysis["tokens"]
     token_intervals = _token_intervals(requests, tool_calls) if include_tokens else []
     relay = analysis["toolRelay"]
@@ -1034,7 +1048,9 @@ def _turn_report(
         "tokenIntervals": token_intervals,
         "observationalNonprogressTokens": _diagnostic_token_report(
             [timing.get("observationalNonprogressTokens", {})]
-        ) if include_tokens else {},
+        )
+        if include_tokens
+        else {},
         "observationalNonprogressLatency": nonprogress,
         "toolRelay": relay,
         "commandOrchestration": orchestration,
@@ -1091,7 +1107,9 @@ def _behavior_report(
     }
 
 
-def _behavior_metrics(report: dict[str, Any], records: list[dict[str, Any]]) -> dict[str, Any]:
+def _behavior_metrics(
+    report: dict[str, Any], records: list[dict[str, Any]]
+) -> dict[str, Any]:
     """Small, versioned session vector, computed before any display truncation."""
     coverage = report["coverage"]
     discovery = report["sourceDiscovery"]
@@ -1123,37 +1141,77 @@ def _behavior_metrics(report: dict[str, Any], records: list[dict[str, Any]]) -> 
             unavailable[name] = "incomplete_rollout_events"
     counters = [record["timing"].get("counters", {}) for record in records]
     for key in (
-        "executedValidationCount", "executedValidationDurationNs",
-        "suppressedValidationOutputCount", "modelRetryCount", "modelFallbackCount",
-        "noProgressDirectiveCount", "provenLoopActivationCount",
-        "planningGenerationCount", "planRevisionGenerationCount",
-        "planningFixedPointIterationCount", "approvalWaitCount", "permissionWaitCount",
-        "userInputWaitCount", "mcpElicitationWaitCount",
-        "toolOutputCanonicalTokenCount", "toolOutputModelTokenCount",
-        "toolOutputRecoveryCallCount", "toolOutputRecoveryRetruncationCount",
-        "toolOutputArtifactCreationCount", "toolOutputArtifactReuseCount",
-        "toolOutputOmittedSectionCount", "attributableRecoveryGenerationCount",
+        "executedValidationCount",
+        "executedValidationDurationNs",
+        "suppressedValidationOutputCount",
+        "modelRetryCount",
+        "modelFallbackCount",
+        "noProgressDirectiveCount",
+        "provenLoopActivationCount",
+        "planningGenerationCount",
+        "planRevisionGenerationCount",
+        "planningFixedPointIterationCount",
+        "approvalWaitCount",
+        "permissionWaitCount",
+        "userInputWaitCount",
+        "mcpElicitationWaitCount",
+        "toolOutputCanonicalTokenCount",
+        "toolOutputModelTokenCount",
+        "toolOutputRecoveryCallCount",
+        "toolOutputRecoveryRetruncationCount",
+        "toolOutputArtifactCreationCount",
+        "toolOutputArtifactReuseCount",
+        "toolOutputOmittedSectionCount",
+        "attributableRecoveryGenerationCount",
     ):
         reason = None
         if not complete_timing:
             reason = "incomplete_timing_coverage"
-        elif any(type(counter.get(key)) is not int or counter[key] < 0 for counter in counters):
+        elif any(
+            type(counter.get(key)) is not int or counter[key] < 0
+            for counter in counters
+        ):
             reason = "counter_unavailable"
-        elif any(type(counter.get("saturationCount")) is not int for counter in counters):
+        elif any(
+            type(counter.get("saturationCount")) is not int for counter in counters
+        ):
             reason = "saturation_status_unavailable"
         elif any(counter["saturationCount"] != 0 for counter in counters):
             reason = "saturated_counters"
         # Some runtime counters saturate directly without incrementing the
         # profile's saturationCount. Their maximum is only a lower bound.
-        elif any(counter[key] >= (2 ** (64 if key.endswith(("Ns", "TokenCount")) or key == "toolOutputOmittedSectionCount" else 32) - 1) for counter in counters):
+        elif any(
+            counter[key]
+            >= (
+                2
+                ** (
+                    64
+                    if key.endswith(("Ns", "TokenCount"))
+                    or key == "toolOutputOmittedSectionCount"
+                    else 32
+                )
+                - 1
+            )
+            for counter in counters
+        ):
             reason = "saturated_counters"
-        metrics[key] = sum(counter[key] for counter in counters) if reason is None else None
+        metrics[key] = (
+            sum(counter[key] for counter in counters) if reason is None else None
+        )
         if reason:
             unavailable[key] = reason
     tokens = report["populations"]["all"]["tokens"]
-    metrics["totalTokens"] = tokens["totalTokens"] if complete_timing and tokens.get("complete") is True else None
+    metrics["totalTokens"] = (
+        tokens["totalTokens"]
+        if complete_timing and tokens.get("complete") is True
+        else None
+    )
     if metrics["totalTokens"] is None:
-        unavailable["totalTokens"] = "token_analysis_disabled" if not report["tokenAnalysisEnabled"] else "incomplete_token_coverage"
+        unavailable["totalTokens"] = (
+            "token_analysis_disabled"
+            if not report["tokenAnalysisEnabled"]
+            else "incomplete_token_coverage"
+        )
     return {
         "behaviorSchemaVersion": BEHAVIOR_SCHEMA_VERSION,
         "evidenceMeta": {
@@ -1161,7 +1219,11 @@ def _behavior_metrics(report: dict[str, Any], records: list[dict[str, Any]]) -> 
             "producer": "kd4_turn_latency_audit",
             "operation": "behavior_metrics",
             "evidenceBearing": any(value is not None for value in metrics.values()),
-            "payloadCompleteness": "complete" if not unavailable else "partial" if any(value is not None for value in metrics.values()) else "unknown",
+            "payloadCompleteness": "complete"
+            if not unavailable
+            else "partial"
+            if any(value is not None for value in metrics.values())
+            else "unknown",
             "truncated": False,
             "approximate": True,
             "limitations": [
@@ -1169,10 +1231,18 @@ def _behavior_metrics(report: dict[str, Any], records: list[dict[str, Any]]) -> 
                 "Counters cover captured complete turns; child-thread coverage and task quality are unknown.",
                 "Output tokens are estimates; recovery generations establish sequence, not causality.",
             ],
-            "snapshot": "sha256:" + hashlib.sha256(json.dumps(
-                [(row["sha256"], row["byteLength"]) for row in coverage["snapshots"]],
-                separators=(",", ":"),
-            ).encode()).hexdigest() if coverage["snapshots"] else None,
+            "snapshot": "sha256:"
+            + hashlib.sha256(
+                json.dumps(
+                    [
+                        (row["sha256"], row["byteLength"])
+                        for row in coverage["snapshots"]
+                    ],
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            if coverage["snapshots"]
+            else None,
         },
         "discoveryClassifierVersion": 1,
         "configuration": report["runnerDiagnostics"]["configuration"],
@@ -1212,17 +1282,33 @@ def _startup_log_report(source: Path) -> dict[str, Any]:
             parse_errors += 1
             continue
         fields = event.get("fields")
-        if (event.get("target") == "codex_core::session::turn"
-                and isinstance(fields, dict)
-                and fields.get("message") == "startup timing snapshot frozen at first model send"):
+        if (
+            event.get("target") == "codex_core::session::turn"
+            and isinstance(fields, dict)
+            and fields.get("message")
+            == "startup timing snapshot frozen at first model send"
+        ):
             records.append(fields)
-    return {**analyze_startup_timing(records), "source": str(source.resolve()),
-            "snapshot": snapshot.metadata(), "parseErrorCount": parse_errors}
+    return {
+        **analyze_startup_timing(records),
+        "source": str(source.resolve()),
+        "snapshot": snapshot.metadata(),
+        "parseErrorCount": parse_errors,
+    }
 
 
-def analyze_session_path(source: Path | None, repo_root: Path, *, include_tokens: bool = True, runner_evidence: dict[str, Any] | None = None, startup_log: Path | None = None) -> dict[str, Any]:
+def analyze_session_path(
+    source: Path | None,
+    repo_root: Path,
+    *,
+    include_tokens: bool = True,
+    runner_evidence: dict[str, Any] | None = None,
+    startup_log: Path | None = None,
+) -> dict[str, Any]:
     source = existing_rollout_path(source) if source else None
-    files = ([source] if source.is_file() else discover_rollouts(source)) if source else []
+    files = (
+        ([source] if source.is_file() else discover_rollouts(source)) if source else []
+    )
     started_turns: set[str] = set()
     turn_starts: dict[str, dict[str, Any]] = {}
     unresolved_tools_by_turn: dict[str, list[str]] = collections.defaultdict(list)
@@ -1280,7 +1366,23 @@ def analyze_session_path(source: Path | None, repo_root: Path, *, include_tokens
                         )
                     continue
                 if runner_evidence is None:
-                    native_events.append({"message": item, "file": str(file), "line": line_number, "elapsedMs": ((_timestamp_ns(item.get("timestamp")) - first_timestamp_ns) / 1_000_000 if first_timestamp_ns is not None and _timestamp_ns(item.get("timestamp")) is not None else None)})
+                    native_events.append(
+                        {
+                            "message": item,
+                            "file": str(file),
+                            "line": line_number,
+                            "elapsedMs": (
+                                (
+                                    _timestamp_ns(item.get("timestamp"))
+                                    - first_timestamp_ns
+                                )
+                                / 1_000_000
+                                if first_timestamp_ns is not None
+                                and _timestamp_ns(item.get("timestamp")) is not None
+                                else None
+                            ),
+                        }
+                    )
                 payload = item.get("payload")
                 if not isinstance(payload, dict):
                     payload = {}
@@ -1437,7 +1539,9 @@ def analyze_session_path(source: Path | None, repo_root: Path, *, include_tokens
                         )
                 turn_id = payload.get("turn_id")
                 if turn_id and len(files) > 1:
-                    turn_id = json.dumps([str(file), str(turn_id)], separators=(",", ":"))
+                    turn_id = json.dumps(
+                        [str(file), str(turn_id)], separators=(",", ":")
+                    )
                 if payload_type == "task_started" and turn_id:
                     turn_id = str(turn_id)
                     active_turn_id = turn_id
@@ -1486,7 +1590,10 @@ def analyze_session_path(source: Path | None, repo_root: Path, *, include_tokens
                 schema_versions[str(timing.get("schemaVersion", "missing"))] += 1
         for pending in pending_tool_calls.values():
             pending_turn_id = pending.get("turnId")
-            if pending_turn_id is not None and str(pending_turn_id) not in terminal_turns:
+            if (
+                pending_turn_id is not None
+                and str(pending_turn_id) not in terminal_turns
+            ):
                 unresolved_tools_by_turn[str(pending_turn_id)].append(
                     str(pending.get("tool") or "unknown")
                 )
@@ -1687,7 +1794,12 @@ def analyze_session_path(source: Path | None, repo_root: Path, *, include_tokens
         tool_relay,
     )
     report["auditDecision"] = _audit_decision(report)
-    report["runnerDiagnostics"] = analyze_runner_evidence(runner_evidence if runner_evidence is not None else {"schemaVersion": 1, "events": native_events}, include_tokens=include_tokens)
+    report["runnerDiagnostics"] = analyze_runner_evidence(
+        runner_evidence
+        if runner_evidence is not None
+        else {"schemaVersion": 1, "events": native_events},
+        include_tokens=include_tokens,
+    )
     report["behaviorMetrics"] = _behavior_metrics(report, records)
     if startup_log is not None:
         report["startupTiming"] = _startup_log_report(startup_log)
@@ -1716,11 +1828,15 @@ def render_report(report: dict[str, Any]) -> str:
         )
         for name, summary in startup["durationSummariesNs"].items():
             if summary is not None:
-                lines.append(f"  {name}: mean={summary['total'] / summary['count'] / 1e6:.3f}ms "
-                             f"min={summary['min'] / 1e6:.3f}ms max={summary['max'] / 1e6:.3f}ms")
+                lines.append(
+                    f"  {name}: mean={summary['total'] / summary['count'] / 1e6:.3f}ms "
+                    f"min={summary['min'] / 1e6:.3f}ms max={summary['max'] / 1e6:.3f}ms"
+                )
         for row in startup["records"][:10]:
             if not row["valid"]:
-                lines.append(f"  excluded startup {row['correlationId']}: {', '.join(row['exclusionReasons'])}; diagnostics={row['diagnostics']}")
+                lines.append(
+                    f"  excluded startup {row['correlationId']}: {', '.join(row['exclusionReasons'])}; diagnostics={row['diagnostics']}"
+                )
         if startup["prewarmStatuses"]:
             lines.append(f"  prewarm statuses: {startup['prewarmStatuses']}")
         if not startup["available"]:
@@ -1952,7 +2068,9 @@ def render_report(report: dict[str, Any]) -> str:
         if not population or not population["turns"]:
             continue
         if population.get("sameAs") == "all":
-            lines.append(f"{name}: {population['turns']} turns; same measurements as all")
+            lines.append(
+                f"{name}: {population['turns']} turns; same measurements as all"
+            )
             continue
         ratio = population["modelToolRatio"]
         nonprogress = population["observationalNonprogressLatency"]
@@ -2132,10 +2250,14 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
         # Keep category totals once per turn; per-interval category detail and
         # explanatory definitions remain available in the full JSON report.
         bounded_turn["tokenIntervals"] = [
-            {**interval, "tokens": {
-                key: value for key, value in interval["tokens"].items()
-                if key not in ("promptCategories", "promptCategoryAttempts")
-            }}
+            {
+                **interval,
+                "tokens": {
+                    key: value
+                    for key, value in interval["tokens"].items()
+                    if key not in ("promptCategories", "promptCategoryAttempts")
+                },
+            }
             for interval in turn["tokenIntervals"][:_MAX_SUMMARY_TOKEN_INTERVALS]
         ]
         bounded_turn["omittedTokenIntervals"] = max(
@@ -2172,11 +2294,23 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
         bounded_population = {
             key: bounded_population[key]
             for key in (
-                "turns", "statusCounts", "machineDurationNs", "modelOnlyNs",
-                "toolOnlyNs", "orchestrationNs", "interactiveOnlyWaitNs",
-                "interactiveWaitUnionNs", "modelToolRatio", "modelShare", "decisionLatency",
-                "tokens", "observationalNonprogressLatency", "observationalNonprogressTokens",
-                "waitOnlyGenerationCount", "internallyDrainedWaitCount", "provenLoopActivationCount",
+                "turns",
+                "statusCounts",
+                "machineDurationNs",
+                "modelOnlyNs",
+                "toolOnlyNs",
+                "orchestrationNs",
+                "interactiveOnlyWaitNs",
+                "interactiveWaitUnionNs",
+                "modelToolRatio",
+                "modelShare",
+                "decisionLatency",
+                "tokens",
+                "observationalNonprogressLatency",
+                "observationalNonprogressTokens",
+                "waitOnlyGenerationCount",
+                "internallyDrainedWaitCount",
+                "provenLoopActivationCount",
             )
             if key in bounded_population
         }
@@ -2303,23 +2437,66 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
             # Complete category provenance and full totals remain in --json;
             # the bounded form keeps observed totals only for partial coverage,
             # since complete observations duplicate the top-level totals.
-            return {key: compact_tokens(item) for key, item in value.items()
-                    if not (key in ("observedTotals", "observedBlendedTokens", "observedCacheShare") and value.get("complete") is True)
-                    if not (key == "available" and "observedTotals" in value)
-                    if key not in ("promptCategoryEvidence", "accountingNote", "measurementNote", "providerTotals", "rankedPromptConsumers", "promptCategoryBasis", "promptCategoryCoverage", "billableDefinition", "blendedDefinition")}
+            return {
+                key: compact_tokens(item)
+                for key, item in value.items()
+                if not (
+                    key
+                    in ("observedTotals", "observedBlendedTokens", "observedCacheShare")
+                    and value.get("complete") is True
+                )
+                if not (key == "available" and "observedTotals" in value)
+                if key
+                not in (
+                    "promptCategoryEvidence",
+                    "accountingNote",
+                    "measurementNote",
+                    "providerTotals",
+                    "rankedPromptConsumers",
+                    "promptCategoryBasis",
+                    "promptCategoryCoverage",
+                    "billableDefinition",
+                    "blendedDefinition",
+                )
+            }
         return value
+
     result["tokenAnalysisEnabled"] = report.get("tokenAnalysisEnabled", True)
     runner = report.get("runnerDiagnostics", {})
-    result["runnerDiagnostics"] = {key: runner.get(key) for key in (
-        "schemaVersion", "attemptId", "status", "elapsedMs", "coverage", "logicalGenerations",
-        "physicalRequests", "directToolCount", "nestedToolCount", "cacheHitRate", "lastProgress", "toolDispatch", "requestRetention", "configuration")}
+    result["runnerDiagnostics"] = {
+        key: runner.get(key)
+        for key in (
+            "schemaVersion",
+            "attemptId",
+            "status",
+            "elapsedMs",
+            "coverage",
+            "logicalGenerations",
+            "physicalRequests",
+            "directToolCount",
+            "nestedToolCount",
+            "cacheHitRate",
+            "lastProgress",
+            "toolDispatch",
+            "requestRetention",
+            "configuration",
+        )
+    }
     activity = runner.get("toolActivity", {})
-    result["runnerDiagnostics"]["toolActivity"] = {key: value for key, value in activity.items() if key not in ("turns", "measurementNote")}
-    result["runnerDiagnostics"]["toolActivity"]["omittedTurns"] = len(activity.get("turns", []))
+    result["runnerDiagnostics"]["toolActivity"] = {
+        key: value
+        for key, value in activity.items()
+        if key not in ("turns", "measurementNote")
+    }
+    result["runnerDiagnostics"]["toolActivity"]["omittedTurns"] = len(
+        activity.get("turns", [])
+    )
     for key in ("failures", "symptoms", "pendingTools"):
         rows = runner.get(key, [])
         result["runnerDiagnostics"][key] = rows[:8]
-        result["runnerDiagnostics"]["omitted" + key[0].upper() + key[1:]] = max(0, len(rows) - 8)
+        result["runnerDiagnostics"]["omitted" + key[0].upper() + key[1:]] = max(
+            0, len(rows) - 8
+        )
     result = compact_tokens(result)
     # Retain nonzero and unavailable phases; full JSON keeps the phase vocabulary.
     relay = result["toolRelay"]
@@ -2327,11 +2504,16 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
     relay["phaseTotalsMs"] = {key: value for key, value in phases.items() if value != 0}
     relay["omittedZeroPhases"] = sum(value == 0 for value in phases.values())
     # Preserve the explicit available/null distinction for request volume.
-    result["runnerDiagnostics"]["capturedRequests"] = compact_tokens(runner.get("capturedRequests"))
+    result["runnerDiagnostics"]["capturedRequests"] = compact_tokens(
+        runner.get("capturedRequests")
+    )
     if "startupTiming" in report:
         startup = report["startupTiming"]
-        result["startupTiming"] = {key: value for key, value in startup.items()
-                                   if key not in ("records", "measurementNote")}
+        result["startupTiming"] = {
+            key: value
+            for key, value in startup.items()
+            if key not in ("records", "measurementNote")
+        }
         result["startupTiming"]["records"] = startup["records"][:10]
         result["startupTiming"]["omittedRecords"] = max(0, len(startup["records"]) - 10)
     return result
@@ -2380,7 +2562,9 @@ def resolve_rollout_source(source: str, sessions_root: Path | None = None) -> Pa
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "source", nargs="?", help="Rollout JSONL or JSONL.zst path, session directory, or exact session UUID"
+        "source",
+        nargs="?",
+        help="Rollout JSONL or JSONL.zst path, session directory, or exact session UUID",
     )
     parser.add_argument(
         "--sessions-root",
@@ -2402,16 +2586,47 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Emit bounded JSON without per-record diagnostic arrays",
     )
-    parser.add_argument("--runner-evidence", type=Path, help="Version 1 native runner evidence JSON for one attempt")
-    parser.add_argument("--startup-log", type=Path, help="App-server JSON stderr log containing startup timing traces (LOG_FORMAT=json)")
-    parser.add_argument("--tokens", choices=("on", "off"), default="on", help="Disable token computation for scripted execution")
+    parser.add_argument(
+        "--runner-evidence",
+        type=Path,
+        help="Version 1 native runner evidence JSON for one attempt",
+    )
+    parser.add_argument(
+        "--startup-log",
+        type=Path,
+        help="App-server JSON stderr log containing startup timing traces (LOG_FORMAT=json)",
+    )
+    parser.add_argument(
+        "--tokens",
+        choices=("on", "off"),
+        default="on",
+        help="Disable token computation for scripted execution",
+    )
     args = parser.parse_args(argv)
-    if args.source is None and args.runner_evidence is None and args.startup_log is None:
+    if (
+        args.source is None
+        and args.runner_evidence is None
+        and args.startup_log is None
+    ):
         parser.error("a source, --runner-evidence, or --startup-log is required")
     try:
-        source = resolve_rollout_source(args.source, args.sessions_root) if args.source else None
-        evidence = json.loads(args.runner_evidence.read_text(encoding="utf-8")) if args.runner_evidence else None
-        report = analyze_session_path(source, args.repo_root, include_tokens=args.tokens == "on", runner_evidence=evidence, startup_log=args.startup_log)
+        source = (
+            resolve_rollout_source(args.source, args.sessions_root)
+            if args.source
+            else None
+        )
+        evidence = (
+            json.loads(args.runner_evidence.read_text(encoding="utf-8"))
+            if args.runner_evidence
+            else None
+        )
+        report = analyze_session_path(
+            source,
+            args.repo_root,
+            include_tokens=args.tokens == "on",
+            runner_evidence=evidence,
+            startup_log=args.startup_log,
+        )
     except (FileNotFoundError, OSError, ValueError, TypeError) as error:
         parser.error(str(error))
     if args.json:

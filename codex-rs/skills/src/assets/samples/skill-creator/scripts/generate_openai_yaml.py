@@ -148,7 +148,10 @@ def parse_interface_overrides(raw_overrides):
             print(f"[ERROR] Unknown interface field '{key}'. Allowed: {allowed}")
             return None, None
         overrides[key] = value
-        if key not in ("display_name", "short_description") and key not in optional_order:
+        if (
+            key not in ("display_name", "short_description")
+            and key not in optional_order
+        ):
             optional_order.append(key)
     return overrides, optional_order
 
@@ -159,7 +162,9 @@ def write_openai_yaml(skill_dir, skill_name, raw_overrides):
         return None
 
     display_name = overrides.get("display_name") or format_display_name(skill_name)
-    short_description = overrides.get("short_description") or generate_short_description(display_name)
+    short_description = overrides.get(
+        "short_description"
+    ) or generate_short_description(display_name)
 
     if not (25 <= len(short_description) <= 64):
         print(
@@ -183,7 +188,7 @@ def write_openai_yaml(skill_dir, skill_name, raw_overrides):
     agents_dir.mkdir(parents=True, exist_ok=True)
     output_path = agents_dir / "openai.yaml"
     output_path.write_text("\n".join(interface_lines) + "\n")
-    print(f"[OK] Created agents/openai.yaml")
+    print("[OK] Created agents/openai.yaml")
     return output_path
 
 

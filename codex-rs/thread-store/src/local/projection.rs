@@ -565,8 +565,11 @@ pub(super) async fn initialize_from_store(
         } else {
             None
         };
-        let mut previous_version = projection.source_version.lock().await;
-        if source_version.is_none() || *previous_version != source_version {
+        // The operation permit serializes initialization; the version lock need
+        // not stay held while loading the durable history.
+        let source_changed =
+            source_version.is_none() || *projection.source_version.lock().await != source_version;
+        if source_changed {
             let history = store
                 .load_history(LoadThreadHistoryParams {
                     thread_id,
@@ -574,7 +577,7 @@ pub(super) async fn initialize_from_store(
                 })
                 .await?;
             projection.initialize(history.items.as_slice()).await?;
-            *previous_version = source_version;
+            *projection.source_version.lock().await = source_version;
         }
     }
     initialize_entry_from_store(store, thread_id, include_archived, &projection).await?;

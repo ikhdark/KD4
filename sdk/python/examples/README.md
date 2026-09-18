@@ -84,7 +84,8 @@ python examples/01_quickstart_constructor/async.py
 - `12_turn_params_kitchen_sink/`
   - structured output with a curated advanced `turn(...)` configuration
 - `13_model_select_and_turn_params/`
-  - list models, pick highest model + highest supported reasoning effort, run turns, print message and usage
+  - list models, pick highest model + highest supported reasoning effort, run turns, print message
+    and usage
 - `14_turn_controls/`
   - separate `steer()` and `interrupt()` demos with concise summaries
 - `15_login_and_account/`

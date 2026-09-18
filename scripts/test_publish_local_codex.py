@@ -466,7 +466,7 @@ $released = [MutexContender]::TryAcquire($script:mutexName)
         self.assertIn("publish-local-codex.ps1", commands)
         for argument in (
             "-AutoSkipBuild",
-            "-Profile release",
+            "-Profile local-release",
             "-Concise",
             "-CloseRunningTargetTimeoutSeconds 30",
             "-ConfigureDesktopLocalCli",

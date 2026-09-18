@@ -6704,7 +6704,9 @@ source_type=123
 #[test]
 fn async_marketplace_listing_yields_and_preserves_catalog_results() {
     use std::future::Future;
-    use std::task::{Context, Poll, Waker};
+    use std::task::Context;
+    use std::task::Poll;
+    use std::task::Waker;
     let home = TempDir::new().unwrap();
     write_openai_curated_marketplace(&curated_plugins_repo_path(home.path()), &["slack"]);
     let manager = PluginsManager::new(home.path().to_path_buf());

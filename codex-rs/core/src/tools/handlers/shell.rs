@@ -731,25 +731,25 @@ async fn run_exec_like_with_exit_code_inner(
         )));
     }
 
-    if !known_delta_hit && let Some(attempt_key) = attempt_key.as_ref() {
-        if let Err(blocked) = session
+    if !known_delta_hit
+        && let Some(attempt_key) = attempt_key.as_ref()
+        && let Err(blocked) = session
             .services
             .command_execution
             .begin_attempt_with_freshness(attempt_key, command_repaired, force_fresh)
             .await
-        {
-            if blocked.is_search_miss() {
-                return Ok(RunExecLikeResult {
-                    output: FunctionToolOutput::from_text(blocked.render_for_model(), Some(true)),
-                    exit_code: Some(1),
-                    validation_execution_outcome: ValidationExecutionOutcome::NotExecuted,
-                    canonical_output: Some(Vec::new()),
-                });
-            }
-            return Err(FunctionCallError::RespondToModel(
-                blocked.render_for_model(),
-            ));
+    {
+        if blocked.is_search_miss() {
+            return Ok(RunExecLikeResult {
+                output: FunctionToolOutput::from_text(blocked.render_for_model(), Some(true)),
+                exit_code: Some(1),
+                validation_execution_outcome: ValidationExecutionOutcome::NotExecuted,
+                canonical_output: Some(Vec::new()),
+            });
         }
+        return Err(FunctionCallError::RespondToModel(
+            blocked.render_for_model(),
+        ));
     }
 
     // Intercept apply_patch if present.

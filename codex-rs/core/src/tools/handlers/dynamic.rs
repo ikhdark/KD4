@@ -367,11 +367,16 @@ mod tests {
     #[tokio::test]
     async fn registered_dynamic_request_drop_retires_blocked_and_delivered_registration() {
         use crate::session::step_context::StepContext;
-        use crate::tools::context::{ToolCallSource, ToolDispatchState};
-        use crate::tools::router::{ToolCall, ToolRouter, ToolRouterParams};
+        use crate::tools::context::ToolCallSource;
+        use crate::tools::context::ToolDispatchState;
+        use crate::tools::router::ToolCall;
+        use crate::tools::router::ToolRouter;
+        use crate::tools::router::ToolRouterParams;
         use crate::turn_diff_tracker::TurnDiffTracker;
         use codex_protocol::dynamic_tools::DynamicToolSpec;
-        use codex_protocol::protocol::{Event, EventMsg, WarningEvent};
+        use codex_protocol::protocol::Event;
+        use codex_protocol::protocol::EventMsg;
+        use codex_protocol::protocol::WarningEvent;
         use std::time::Duration;
         use tokio_util::sync::CancellationToken;
 

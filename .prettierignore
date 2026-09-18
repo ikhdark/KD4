@@ -5,3 +5,7 @@ pnpm-lock.yaml
 prompt.md
 *_prompt.md
 *_instructions.md
+**/target/**
+.git/**
+.worktrees/**
+architecture_index.json

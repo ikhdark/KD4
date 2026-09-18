@@ -229,7 +229,10 @@ impl CodexAppsToolsCacheContext {
         }
     }
 
-    #[expect(clippy::expect_used, reason = "A panicked publication worker may have partially committed a generation; do not return fabricated success")]
+    #[expect(
+        clippy::expect_used,
+        reason = "A panicked publication worker may have partially committed a generation; do not return fabricated success"
+    )]
     pub(crate) async fn publish_if_newest_accepted(
         &self,
         ticket: CodexAppsToolsFetchTicket,
@@ -332,7 +335,10 @@ impl CodexAppsToolsCache {
             .load_full()
     }
 
-    #[expect(clippy::expect_used, reason = "A panicked initialization worker cannot provide the shared cache identity required by callers")]
+    #[expect(
+        clippy::expect_used,
+        reason = "A panicked initialization worker cannot provide the shared cache identity required by callers"
+    )]
     pub(crate) async fn context(
         &self,
         codex_home: PathBuf,

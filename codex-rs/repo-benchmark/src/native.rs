@@ -4,13 +4,19 @@
 mod client;
 mod scripted;
 
-use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use serde::Deserialize;
+use serde::Serialize;
+use serde_json::Value;
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::path::Path;
+use std::path::PathBuf;
+use std::time::Duration;
+use std::time::Instant;
 
 pub use scripted::ScriptedScenario;
 
@@ -202,7 +208,7 @@ fn execute(request: &NativeAttemptRequest, evidence: &mut NativeAttemptEvidence)
                 .to_owned();
             let cancel = request
                 .scenario
-                .is_some_and(|scenario| scenario.cancel_first())
+                .is_some_and(scripted::ScriptedScenario::cancel_first)
                 && turn_index == 0;
             let mut checkpoint = || {
                 scripted
@@ -417,8 +423,9 @@ fn verify_effective_config(
                 let mut reported_base = config.clone();
                 if base.get("config_version").is_none()
                     && reported_base.get("config_version") == Some(&json!(1))
+                    && let Some(reported_map) = reported_base.as_object_mut()
                 {
-                    reported_base.as_object_mut().unwrap().remove("config_version");
+                    reported_map.remove("config_version");
                 }
                 if reported_base != base {
                     bail!("reported user config differs from isolated config.toml");
@@ -437,7 +444,7 @@ fn verify_effective_config(
             | "legacyManagedConfigTomlFromFile"
             | "legacyManagedConfigTomlFromMdm"
                 // An otherwise empty layer can acquire the same schema marker.
-                if config.as_object().is_some_and(|map| map.is_empty())
+                if config.as_object().is_some_and(serde_json::Map::is_empty)
                     || config == &json!({"config_version": 1}) => {}
             _ => bail!("unexpected nonempty configuration layer: {name}"),
         }
@@ -458,8 +465,10 @@ fn merge_config(target: &mut Value, source: Value) -> Result<()> {
         .as_object_mut()
         .context("configuration must be an object")?;
     for (key, value) in source.as_object().context("override must be an object")? {
-        if value.is_object() && target.get(key).is_some_and(Value::is_object) {
-            merge_config(target.get_mut(key).unwrap(), value.clone())?;
+        if value.is_object()
+            && let Some(nested) = target.get_mut(key).filter(|slot| slot.is_object())
+        {
+            merge_config(nested, value.clone())?;
         } else {
             target.insert(key.clone(), value.clone());
         }

@@ -158,6 +158,10 @@ fn server_requested_retry_delay_below_the_ceiling_is_preserved() {
 async fn exhausted_retry_budget_without_fallback_returns_the_error() {
     let (session, turn_context, events) =
         crate::session::tests::make_session_and_context_with_rx().await;
+    session
+        .services
+        .model_client
+        .force_http_fallback(&turn_context.session_telemetry);
     assert!(!session.services.model_client.responses_websocket_enabled());
     let mut client_session = session.services.model_client.new_session();
     let mut retry_state = ResponsesStreamRetryState {

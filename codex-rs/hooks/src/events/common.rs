@@ -222,8 +222,11 @@ mod tests {
 
     #[test]
     fn serialization_failure_preserves_events_and_does_not_stop() {
-        use codex_protocol::protocol::{HookEventName, HookRunStatus, HookSource};
-        use codex_utils_absolute_path::test_support::{PathBufExt, test_path_buf};
+        use codex_protocol::protocol::HookEventName;
+        use codex_protocol::protocol::HookRunStatus;
+        use codex_protocol::protocol::HookSource;
+        use codex_utils_absolute_path::test_support::PathBufExt;
+        use codex_utils_absolute_path::test_support::test_path_buf;
         let events = super::serialization_failure_hook_events(
             vec![crate::engine::ConfiguredHandler {
                 event_name: HookEventName::SessionStart,

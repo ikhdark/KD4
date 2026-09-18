@@ -21,10 +21,13 @@ pins and installs one compatible runtime dependency automatically.
 ## `run()` vs `stream()`
 
 - `Thread.run(...)` starts a turn and returns `TurnResult`.
-- `TurnHandle.run()` / `AsyncTurnHandle.run()` consumes events for an existing turn handle and returns the same `TurnResult` shape.
-- `TurnHandle.stream()` / `AsyncTurnHandle.stream()` yields raw notifications (`Notification`) so you can react event-by-event.
+- `TurnHandle.run()` / `AsyncTurnHandle.run()` consumes events for an existing turn handle and
+  returns the same `TurnResult` shape.
+- `TurnHandle.stream()` / `AsyncTurnHandle.stream()` yields raw notifications (`Notification`) so
+  you can react event-by-event.
 
-Choose `run()` for most apps. Choose `stream()` for progress UIs, custom timeout logic, or custom parsing.
+Choose `run()` for most apps. Choose `stream()` for progress UIs, custom timeout logic, or custom
+parsing.
 
 ## Sync vs async clients
 
@@ -75,7 +78,8 @@ result = thread.run("Review only.", sandbox=Sandbox.read_only)
 The presets are:
 
 - `Sandbox.read_only`: read files without allowing writes.
-- `Sandbox.workspace_write`: the normal default for projects with a recorded trust decision; read files and write inside the workspace and configured writable roots.
+- `Sandbox.workspace_write`: the normal default for projects with a recorded trust decision; read
+  files and write inside the workspace and configured writable roots.
 - `Sandbox.full_access`: run without filesystem access restrictions.
 
 When `sandbox=` is omitted, Codex uses its configured default. A turn

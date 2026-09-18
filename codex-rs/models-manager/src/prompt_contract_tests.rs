@@ -254,11 +254,7 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
         id: "general-global-prompt",
         scope: PromptScope::LocalPolicy,
         expectation: AnchorExpectation::None,
-        anchors: &[
-            "KD4",
-            "repository source map",
-            "official session roots",
-        ],
+        anchors: &["KD4", "repository source map", "official session roots"],
     },
     PromptContract {
         id: "environment-neutral-global-prompt",

@@ -269,9 +269,7 @@ mod tests {
         assert!(description.contains("refresh missing/invalidated scopes"));
         assert!(description.contains("Reuse schemas, CLI usage, and results"));
         assert!(description.contains("resolve missing/stale schemas before calls"));
-        assert!(
-            description.contains("Use CLI `--help` only for uncertain arguments/subcommands")
-        );
+        assert!(description.contains("Use CLI `--help` only for uncertain arguments/subcommands"));
         assert!(description.contains("Nested tools: use a present schema"));
         assert!(description.contains("`resolve_tool(name)` when the name is known"));
         assert!(description.contains("or inspect `ALL_TOOL_NAMES`"));
@@ -283,7 +281,9 @@ mod tests {
         assert!(description.contains("hard 60s default deadline"));
         assert!(description.contains("After timeout, resume the returned live session/cell ID"));
         assert!(description.contains("never rerun live or uncertain effects"));
-        assert!(description.contains("Retry only if unstarted, safely repeatable after stopping, or tool-approved"));
+        assert!(description.contains(
+            "Retry only if unstarted, safely repeatable after stopping, or tool-approved"
+        ));
         assert!(description.contains("inspect every result"));
         assert!(description.contains("Finish discovery before dependent mutations"));
         assert!(description.contains("Separate status/file output"));
@@ -295,19 +295,17 @@ mod tests {
         assert!(description.contains(
             "Parallelize only when tools permit and build locks, outputs, and services are independent"
         ));
-        assert!(
-            description.contains("Propagate failures with `&&` or exit-code checks")
-        );
+        assert!(description.contains("Propagate failures with `&&` or exit-code checks"));
         assert!(description.contains("never mask them with `|| true`"));
-        assert!(
-            description.contains("Finish work/checks or report failures/blockers")
-        );
+        assert!(description.contains("Finish work/checks or report failures/blockers"));
         assert!(description.contains("Keep plans aligned with the request"));
         assert!(description.contains("For unchanged deterministic failures"));
         assert!(description.contains("resume live operations via documented waits"));
         assert!(!description.contains("never repeat the same call/poll"));
         assert!(description.contains("change route/state"));
-        assert!(description.contains("Read the complete enclosing unit before editing; refresh after intervening writes"));
+        assert!(description.contains(
+            "Read the complete enclosing unit before editing; refresh after intervening writes"
+        ));
         assert!(description.contains("relevant ranges for large files"));
         assert!(description.contains("whole files when small or required"));
         assert!(!description.contains("never whole files"));
@@ -322,9 +320,7 @@ mod tests {
         )));
         assert!(description.contains("smallest useful budget"));
         assert!(description.contains(r#"first-line `// @exec: {"max_output_tokens": 2000}`"#));
-        assert!(
-            description.contains("queues a model-visible message without yielding")
-        );
+        assert!(description.contains("queues a model-visible message without yielding"));
         // Retired guidance that pushed the model into wait rounds or extra
         // sampling passes must stay out of the contract.
         assert!(!description.contains("per settlement"));

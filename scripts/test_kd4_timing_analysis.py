@@ -469,15 +469,31 @@ class SharedTimingAnalysisTest(unittest.TestCase):
             [20, 12, 15, 10, None, 7, None],
         )
         self.assertEqual(report["directToolCount"], 7)
-        self.assertEqual(activity["durations"]["rgSearch"], {
-            "observedCount": 4, "measuredCount": 3, "missingOrInvalidCount": 1,
-            "observedTotalMs": 47, "totalMs": None, "minMs": 12, "maxMs": 20,
-        })
-        self.assertEqual(activity["durations"]["byKind"]["fileChange"]["measuredCount"], 0)
-        self.assertIsNone(activity["durations"]["byKind"]["fileChange"]["observedTotalMs"])
-        self.assertEqual(activity["durations"]["byKind"]["collabAgentToolCall"]["totalMs"], 7)
         self.assertEqual(
-            audit.bounded_summary(full)["runnerDiagnostics"]["toolActivity"]["durations"],
+            activity["durations"]["rgSearch"],
+            {
+                "observedCount": 4,
+                "measuredCount": 3,
+                "missingOrInvalidCount": 1,
+                "observedTotalMs": 47,
+                "totalMs": None,
+                "minMs": 12,
+                "maxMs": 20,
+            },
+        )
+        self.assertEqual(
+            activity["durations"]["byKind"]["fileChange"]["measuredCount"], 0
+        )
+        self.assertIsNone(
+            activity["durations"]["byKind"]["fileChange"]["observedTotalMs"]
+        )
+        self.assertEqual(
+            activity["durations"]["byKind"]["collabAgentToolCall"]["totalMs"], 7
+        )
+        self.assertEqual(
+            audit.bounded_summary(full)["runnerDiagnostics"]["toolActivity"][
+                "durations"
+            ],
             activity["durations"],
         )
         self.assertIn('"observedTotalMs": 47', audit.render_report(full))
@@ -493,9 +509,14 @@ class SharedTimingAnalysisTest(unittest.TestCase):
 
     def test_tool_durations_reject_bad_clocks_and_keep_search_failures(self):
         for start, end, expected in [
-            (10, 10, 0), (10, 35, 25), (None, 35, None),
-            (40, 35, None), (-1, 35, None), (True, 35, None),
-            (10, float("inf"), None), (float("nan"), 35, None),
+            (10, 10, 0),
+            (10, 35, 25),
+            (None, 35, None),
+            (40, 35, None),
+            (-1, 35, None),
+            (True, 35, None),
+            (10, float("inf"), None),
+            (float("nan"), 35, None),
         ]:
             with self.subTest(start=start, end=end):
                 events = []
@@ -504,20 +525,43 @@ class SharedTimingAnalysisTest(unittest.TestCase):
                     ("compound", "commandExecution", "rg needle src; python slow.py"),
                     ("mcp", "mcpToolCall", None),
                 ]:
-                    for ms, method in [(start, "item/started"), (end, "item/completed")]:
-                        events.append({"elapsedMs": ms, "message": {
-                            "method": method, "params": {"turnId": "t", "item": {
-                                "id": call_id, "type": kind, "command": command,
-                                "exitCode": 2, "status": "failed",
-                            }},
-                        }})
-                report = analysis.analyze_runner_evidence({"schemaVersion": 1, "events": events})
+                    for ms, method in [
+                        (start, "item/started"),
+                        (end, "item/completed"),
+                    ]:
+                        events.append(
+                            {
+                                "elapsedMs": ms,
+                                "message": {
+                                    "method": method,
+                                    "params": {
+                                        "turnId": "t",
+                                        "item": {
+                                            "id": call_id,
+                                            "type": kind,
+                                            "command": command,
+                                            "exitCode": 2,
+                                            "status": "failed",
+                                        },
+                                    },
+                                },
+                            }
+                        )
+                report = analysis.analyze_runner_evidence(
+                    {"schemaVersion": 1, "events": events}
+                )
                 durations = report["toolActivity"]["durations"]
                 self.assertEqual(durations["rgSearch"]["observedCount"], 1)
                 self.assertEqual(durations["rgSearch"]["totalMs"], expected)
-                self.assertEqual(durations["byKind"]["mcpToolCall"]["totalMs"], expected)
-                self.assertEqual(durations["rgSearch"]["measuredCount"], int(expected is not None))
-                self.assertEqual([row["durationMs"] for row in report["tools"]], [expected] * 3)
+                self.assertEqual(
+                    durations["byKind"]["mcpToolCall"]["totalMs"], expected
+                )
+                self.assertEqual(
+                    durations["rgSearch"]["measuredCount"], int(expected is not None)
+                )
+                self.assertEqual(
+                    [row["durationMs"] for row in report["tools"]], [expected] * 3
+                )
                 self.assertGreater(len(report["failures"]), 0)
 
     def test_native_tool_activity_distinguishes_missing_evidence_from_observed_zero(
@@ -1228,10 +1272,17 @@ class SharedTimingAnalysisTest(unittest.TestCase):
             params = event["message"]["params"]
             params["threadId"] = thread
             timing = params["turn"]["timing"]
-            timing["modelRequests"] = [{"generationIndex": 0, "tokenUsage": {
-                "inputTokens": tokens, "cachedInputTokens": 0,
-                "visibleOutputTokens": 10, "reasoningTokens": 5,
-            }}]
+            timing["modelRequests"] = [
+                {
+                    "generationIndex": 0,
+                    "tokenUsage": {
+                        "inputTokens": tokens,
+                        "cachedInputTokens": 0,
+                        "visibleOutputTokens": 10,
+                        "reasoningTokens": 5,
+                    },
+                }
+            ]
             timing["counters"]["modelRequestCount"] = 1
             timing["toolCalls"][0].update(retryCount=1, reentryCount=0)
             if nested:
@@ -1249,31 +1300,59 @@ class SharedTimingAnalysisTest(unittest.TestCase):
         self.assertEqual(runner["runtime"]["toolRelay"]["generationGroups"], 2)
         self.assertEqual(runner["runtime"]["toolRelay"]["batchGroups"], 0)
         self.assertEqual((runner["directToolCount"], runner["nestedToolCount"]), (1, 1))
-        self.assertEqual([row["threadId"] for row in runner["generations"]], ["parent", "child"])
-        self.assertEqual([row["threadId"] for row in runner["nativeToolCalls"]], ["parent", "child"])
+        self.assertEqual(
+            [row["threadId"] for row in runner["generations"]], ["parent", "child"]
+        )
+        self.assertEqual(
+            [row["threadId"] for row in runner["nativeToolCalls"]], ["parent", "child"]
+        )
         self.assertEqual(len(runner["terminalTurns"]), 2)
-        self.assertEqual(audit.bounded_summary(report)["runnerDiagnostics"]["coverage"]["nativeTimingProfiles"], 2)
+        self.assertEqual(
+            audit.bounded_summary(report)["runnerDiagnostics"]["coverage"][
+                "nativeTimingProfiles"
+            ],
+            2,
+        )
         del evidence["events"][1]["message"]["params"]["turn"]["timing"]
         evidence["events"].pop()
         partial = analysis.analyze_runner_evidence(evidence)
         self.assertFalse(partial["tokens"]["complete"])
         self.assertIsNone(partial["tokens"]["totalTokens"])
-        self.assertEqual(partial["tokenCoverage"]["missingTerminalTurnIds"], ['["child","turn-1"]'])
+        self.assertEqual(
+            partial["tokenCoverage"]["missingTerminalTurnIds"], ['["child","turn-1"]']
+        )
 
     def test_configuration_hash_uses_captured_values_not_layer_locations(self):
         evidence = self.evidence()
-        evidence["effectiveConfig"] = {"config": {"model": "test", "reasoning_phase_efforts": {"inspect": "low"}}, "layers": ["first-home"]}
+        evidence["effectiveConfig"] = {
+            "config": {"model": "test", "reasoning_phase_efforts": {"inspect": "low"}},
+            "layers": ["first-home"],
+        }
         first = audit.analyze_session_path(None, Path.cwd(), runner_evidence=evidence)
         config = first["behaviorMetrics"]["configuration"]
         self.assertRegex(config["sha256"], r"^[0-9a-f]{64}$")
-        self.assertEqual(audit.bounded_summary(first)["runnerDiagnostics"]["configuration"], config)
-        evidence["effectiveConfig"] = {"layers": ["second-home"], "config": {"reasoning_phase_efforts": {"inspect": "low"}, "model": "test"}}
-        self.assertEqual(analysis.analyze_runner_evidence(evidence)["configuration"], config)
-        evidence["effectiveConfig"]["config"]["reasoning_phase_efforts"]["inspect"] = "high"
-        self.assertNotEqual(analysis.analyze_runner_evidence(evidence)["configuration"]["sha256"], config["sha256"])
+        self.assertEqual(
+            audit.bounded_summary(first)["runnerDiagnostics"]["configuration"], config
+        )
+        evidence["effectiveConfig"] = {
+            "layers": ["second-home"],
+            "config": {"reasoning_phase_efforts": {"inspect": "low"}, "model": "test"},
+        }
+        self.assertEqual(
+            analysis.analyze_runner_evidence(evidence)["configuration"], config
+        )
+        evidence["effectiveConfig"]["config"]["reasoning_phase_efforts"]["inspect"] = (
+            "high"
+        )
+        self.assertNotEqual(
+            analysis.analyze_runner_evidence(evidence)["configuration"]["sha256"],
+            config["sha256"],
+        )
         for missing in (None, {}, {"config": None}):
             evidence["effectiveConfig"] = missing
-            self.assertIsNone(analysis.analyze_runner_evidence(evidence)["configuration"]["sha256"])
+            self.assertIsNone(
+                analysis.analyze_runner_evidence(evidence)["configuration"]["sha256"]
+            )
 
 
 if __name__ == "__main__":

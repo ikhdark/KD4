@@ -451,7 +451,10 @@ mod tests {
     -> anyhow::Result<()> {
         use crate::session::step_context::StepContext;
         use crate::tools::context::ToolDispatchState;
-        use crate::tools::router::{ToolCall, ToolCallSource, ToolRouter, ToolRouterParams};
+        use crate::tools::router::ToolCall;
+        use crate::tools::router::ToolCallSource;
+        use crate::tools::router::ToolRouter;
+        use crate::tools::router::ToolRouterParams;
         use codex_code_mode::FunctionCallOutputContentItem;
         use codex_rollout_trace::CodeCellRuntimeStatus;
         use codex_rollout_trace::RawTraceEvent;

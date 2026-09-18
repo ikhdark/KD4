@@ -659,7 +659,7 @@ async fn intersecting_workspace_transition_marks_stale_and_permits_suppressed_re
         "preserve the historical invocation"
     );
     let (_, stale_output) = textual_output_identity(&stale.items[1]).expect("stale output");
-    let notice: serde_json::Value = serde_json::from_str(&stale_output).expect("stale notice");
+    let notice: serde_json::Value = serde_json::from_str(stale_output).expect("stale notice");
     let force_fresh = notice["rerun"]["force_fresh"].as_bool().unwrap_or(false);
     assert!(force_fresh);
     assert!(stale_output.contains("\"rerun\":{\"force_fresh\":true}"));

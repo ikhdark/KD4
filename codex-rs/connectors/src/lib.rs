@@ -643,7 +643,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::await_holding_invalid_type, reason = "Serializes tests that mutate the shared connector directory cache")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serializes tests that mutate the shared connector directory cache"
+    )]
     async fn directory_scope_comes_from_the_cache_key() -> anyhow::Result<()> {
         let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
         clear_directory_memory_cache();
@@ -684,7 +687,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::await_holding_invalid_type, reason = "Serializes tests that mutate the shared connector directory cache")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serializes tests that mutate the shared connector directory cache"
+    )]
     async fn pagination_cycles_fail_without_publishing_partial_results() -> anyhow::Result<()> {
         let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
         let home = TempDir::new()?;
@@ -743,7 +749,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::await_holding_invalid_type, reason = "Serializes tests that mutate the shared connector directory cache")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serializes tests that mutate the shared connector directory cache"
+    )]
     async fn concurrent_directory_misses_share_one_refresh() -> anyhow::Result<()> {
         let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
         clear_directory_memory_cache();
@@ -866,7 +875,10 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::await_holding_invalid_type, reason = "Serializes tests that mutate the shared connector directory cache")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serializes tests that mutate the shared connector directory cache"
+    )]
     fn directory_cache_publication_yields_and_persists_fetched_connectors() -> anyhow::Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

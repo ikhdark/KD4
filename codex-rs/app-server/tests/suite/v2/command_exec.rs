@@ -74,7 +74,7 @@ async fn command_exec_without_streams_can_be_terminated() -> Result<()> {
             cwd: None,
             env: None,
             size: None,
-            sandbox_policy: None,
+            sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
             permission_profile: None,
         })
         .await?;
@@ -129,7 +129,7 @@ async fn command_exec_without_process_id_keeps_buffered_compatibility() -> Resul
             cwd: None,
             env: None,
             size: None,
-            sandbox_policy: None,
+            sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
             permission_profile: None,
         })
         .await?;
@@ -191,7 +191,7 @@ async fn command_exec_env_overrides_merge_with_server_environment_and_support_un
                 ("command_exec_remove".to_string(), None),
             ])),
             size: None,
-            sandbox_policy: None,
+            sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
             permission_profile: None,
         })
         .await?;
@@ -217,6 +217,15 @@ async fn command_exec_accepts_permission_profile() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    #[cfg(windows)]
+    {
+        let config_path = codex_home.path().join("config.toml");
+        let config = std::fs::read_to_string(&config_path)?;
+        std::fs::write(
+            config_path,
+            format!("{config}\n[windows]\nsandbox = \"unelevated\"\n"),
+        )?;
+    }
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
@@ -264,6 +273,15 @@ async fn command_exec_permission_profile_starts_selected_network_proxy() -> Resu
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    #[cfg(windows)]
+    {
+        let config_path = codex_home.path().join("config.toml");
+        let config = std::fs::read_to_string(&config_path)?;
+        std::fs::write(
+            config_path,
+            format!("{config}\n[windows]\nsandbox = \"unelevated\"\n"),
+        )?;
+    }
     insert_networked_permission_profile_config(
         codex_home.path(),
         /*default_permissions*/ None,
@@ -317,6 +335,15 @@ async fn command_exec_permission_profile_does_not_reuse_default_network_proxy() 
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    #[cfg(windows)]
+    {
+        let config_path = codex_home.path().join("config.toml");
+        let config = std::fs::read_to_string(&config_path)?;
+        std::fs::write(
+            config_path,
+            format!("{config}\n[windows]\nsandbox = \"unelevated\"\n"),
+        )?;
+    }
     insert_networked_permission_profile_config(codex_home.path(), Some("networked"))?;
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -371,6 +398,15 @@ async fn command_exec_legacy_policy_workspace_write_uses_request_cwd() -> Result
     std::fs::create_dir_all(&codex_home)?;
     std::fs::create_dir_all(&request_cwd)?;
     create_config_toml(&codex_home, &server.uri(), "never")?;
+    #[cfg(windows)]
+    {
+        let config_path = codex_home.join("config.toml");
+        let config = std::fs::read_to_string(&config_path)?;
+        std::fs::write(
+            config_path,
+            format!("{config}\n[windows]\nsandbox = \"unelevated\"\n"),
+        )?;
+    }
     let mut mcp = TestAppServer::builder()
         .with_codex_home(&codex_home)
         .without_auto_env()
@@ -493,7 +529,7 @@ async fn command_exec_returns_error_when_local_environment_is_disabled() -> Resu
             cwd: None,
             env: None,
             size: None,
-            sandbox_policy: None,
+            sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
             permission_profile: None,
         })
         .await?;
@@ -574,7 +610,7 @@ async fn command_exec_rejects_disable_timeout_with_timeout_ms() -> Result<()> {
             cwd: None,
             env: None,
             size: None,
-            sandbox_policy: None,
+            sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
             permission_profile: None,
         })
         .await?;
@@ -616,7 +652,7 @@ async fn command_exec_rejects_disable_output_cap_with_output_bytes_cap() -> Resu
             cwd: None,
             env: None,
             size: None,
-            sandbox_policy: None,
+            sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
             permission_profile: None,
         })
         .await?;
@@ -658,7 +694,7 @@ async fn command_exec_rejects_negative_timeout_ms() -> Result<()> {
             cwd: None,
             env: None,
             size: None,
-            sandbox_policy: None,
+            sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
             permission_profile: None,
         })
         .await?;
@@ -700,7 +736,7 @@ async fn command_exec_without_process_id_rejects_streaming() -> Result<()> {
             cwd: None,
             env: None,
             size: None,
-            sandbox_policy: None,
+            sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
             permission_profile: None,
         })
         .await?;
@@ -742,7 +778,7 @@ async fn command_exec_non_streaming_respects_output_cap() -> Result<()> {
             cwd: None,
             env: None,
             size: None,
-            sandbox_policy: None,
+            sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
             permission_profile: None,
         })
         .await?;
@@ -790,7 +826,7 @@ async fn command_exec_streaming_does_not_buffer_output() -> Result<()> {
             cwd: None,
             env: None,
             size: None,
-            sandbox_policy: None,
+            sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
             permission_profile: None,
         })
         .await?;
@@ -856,7 +892,7 @@ async fn command_exec_pipe_streams_output_and_accepts_write() -> Result<()> {
             cwd: None,
             env: None,
             size: None,
-            sandbox_policy: None,
+            sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
             permission_profile: None,
         })
         .await?;
@@ -934,7 +970,7 @@ async fn command_exec_tty_implies_streaming_and_reports_pty_output() -> Result<(
             cwd: None,
             env: None,
             size: None,
-            sandbox_policy: None,
+            sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
             permission_profile: None,
         })
         .await?;
@@ -1007,7 +1043,7 @@ async fn command_exec_tty_supports_initial_size_and_resize() -> Result<()> {
             cwd: None,
             env: None,
             size: Some(CommandExecTerminalSize::new(31, 101)),
-            sandbox_policy: None,
+            sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
             permission_profile: None,
         })
         .await?;
@@ -1095,6 +1131,7 @@ async fn command_exec_process_ids_are_connection_scoped_and_disconnect_terminate
             )),
             "processId": "shared-process",
             "streamStdoutStderr": true,
+            "sandboxPolicy": {"type": "dangerFullAccess"},
         })),
     )
     .await?;

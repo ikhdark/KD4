@@ -1205,7 +1205,7 @@ mod tests {
             internal_chat_message_metadata_passthrough: None,
         };
         session
-            .record_conversation_items(&turn, &[existing.clone()])
+            .record_conversation_items(&turn, std::slice::from_ref(&existing))
             .await;
         super::record_session_start_additional_contexts(
             &session,

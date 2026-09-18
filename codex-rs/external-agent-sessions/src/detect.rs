@@ -77,10 +77,10 @@ pub fn detect_recent_sessions(
     let mut migrations = Vec::new();
     let mut source_refreshes = Vec::new();
     for (_modified_at, path, source_path) in file_candidates {
-        match source_states
-            .get(source_path.as_path())
-            .map_or(Ok(None), super::ledger::ImportedSourceState::current_source_refresh)
-        {
+        match source_states.get(source_path.as_path()).map_or(
+            Ok(None),
+            super::ledger::ImportedSourceState::current_source_refresh,
+        ) {
             Ok(None) => {}
             Ok(Some(refresh)) => {
                 source_refreshes.push(refresh);

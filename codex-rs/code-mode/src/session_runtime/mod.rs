@@ -188,6 +188,10 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
             .map_err(|_| Error::CellIdSpaceExhausted)
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "cell preparation and task registration must finish before shutdown drains the registry"
+    )]
     async fn start_cell(
         &self,
         cell_id: CellId,
