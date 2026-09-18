@@ -124,6 +124,12 @@ def tracked_script_entrypoints() -> tuple[Path, ...]:
             continue
         if target in SCRIPT_AUDIT_EXCLUSIONS:
             continue
+        # Only extensionless files and candidate suffixes can become script
+        # kinds; script_kind_for_path discards every other suffix, so reading
+        # their first line would be wasted work on every inventory.
+        suffix = path.suffix.lower()
+        if suffix and suffix not in SCRIPT_CANDIDATE_SUFFIXES:
+            continue
         mode = metadata.split(" ", 1)[0]
         try:
             with path.open("rb") as script_file:

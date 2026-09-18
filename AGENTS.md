@@ -15,6 +15,9 @@
   those activation steps only when the request includes them.
 
 
+
+A no-change result is valid and preferred when the requested capability already exists adequately. Before adding a mechanism, identify the concrete missing capability and prove that existing abstractions cannot satisfy it. Prefer reuse, consolidation, or deletion over adding parallel machinery.
+
 #### Scope and workspace
 
 - Ask questions in plain language when clarity is needed, do not continue to ask questions after implementation has begun.

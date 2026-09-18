@@ -333,6 +333,67 @@ def _rust_declaration_source(source: str) -> str:
     return "".join(parts)
 
 
+def _python_comment_free_source(source: str) -> str:
+    """Drop comments from Python source; string literals stay, they can be evidence
+    (an environment variable or config key is used as a literal)."""
+    import io
+    import tokenize
+
+    parts: list[str] = []
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(source).readline):
+            if token.type == tokenize.COMMENT:
+                continue
+            if token.type in {tokenize.NAME, tokenize.NUMBER, tokenize.OP, tokenize.STRING}:
+                parts.append(token.string)
+    except (tokenize.TokenError, SyntaxError):
+        return source
+    return " ".join(parts)
+
+
+def _rust_comment_free_source(source: str) -> str:
+    """Drop `//` and nested `/* */` comments from Rust source; string literals stay."""
+    tokens = re.compile(
+        r'//[^\n]*|/\*|\b(?:br|cr|r)(?P<hashes>\#*)".*?"(?P=hashes)'
+        r'|"(?:\\.|[^"\\])*"|\'(?:\\(?:u\{[^}]*\}|x[0-9a-fA-F]{2}|.)|[^\'\\])\'',
+        re.DOTALL,
+    )
+    parts: list[str] = []
+    position = 0
+    while match := tokens.search(source, position):
+        parts.append(source[position : match.start()])
+        position = match.end()
+        if match.group() == "/*":
+            depth = 1
+            while depth:
+                marker = re.search(r"/\*|\*/", source[position:])
+                if marker is None:
+                    position = len(source)
+                    break
+                depth += 1 if marker.group() == "/*" else -1
+                position += marker.end()
+            parts.append(" ")
+        elif match.group().startswith("//"):
+            parts.append(" ")
+        else:
+            parts.append(match.group())
+    parts.append(source[position:])
+    return "".join(parts)
+
+
+def _evidence_symbol_present(path: Path, source: str, symbol: str) -> bool:
+    """Relationship evidence may be a use rather than a declaration, but a symbol
+    that survives only in a comment is not evidence of anything."""
+    if not symbol.isidentifier() or path.suffix not in {".rs", ".py"}:
+        return symbol in source
+    code = (
+        _rust_comment_free_source(source)
+        if path.suffix == ".rs"
+        else _python_comment_free_source(source)
+    )
+    return re.search(rf"(?<!\w)(?:r\#)?{re.escape(symbol)}(?!\w)", code) is not None
+
+
 def _has_primary_declaration(path: Path, source: str, symbol: str) -> bool:
     """Primary entries identify declarations; relationship evidence may be uses."""
     if not symbol.isidentifier() or path.suffix not in {".rs", ".py"}:
@@ -370,21 +431,44 @@ def _has_primary_declaration(path: Path, source: str, symbol: str) -> bool:
     )
 
 
-def _target_owner_ids(target: str, owners: list[dict]) -> set[str]:
-    """Resolve declared path endpoints to the most specific declared roots."""
-    if target.startswith("owner:"):
-        return {target[6:]}
-    if not target.startswith("path:"):
-        return set()
-    path = Path(target[5:])
-    matches = [
-        (len(Path(root).parts), owner["id"])
+def _target_owner_resolver(owners: list[dict]):
+    """Resolve declared path endpoints to the most specific declared roots.
+
+    Owner roots are prepared once and every target string is resolved once, so a
+    query over R relationships and O roots costs O + R instead of R * O."""
+    roots = [
+        (len(Path(root).parts), Path(root), owner["id"])
         for owner in owners
         for root in owner.get("roots", [])
-        if path.is_relative_to(Path(root))
     ]
-    specificity = max((depth for depth, _ in matches), default=-1)
-    return {owner_id for depth, owner_id in matches if depth == specificity}
+    cache: dict[str, frozenset[str]] = {}
+
+    def resolve(target: str) -> set[str]:
+        if target.startswith("owner:"):
+            return {target[6:]}
+        if not target.startswith("path:"):
+            return set()
+        cached = cache.get(target)
+        if cached is None:
+            path = Path(target[5:])
+            matches = [
+                (depth, owner_id)
+                for depth, root, owner_id in roots
+                if path.is_relative_to(root)
+            ]
+            specificity = max((depth for depth, _ in matches), default=-1)
+            cached = frozenset(
+                owner_id for depth, owner_id in matches if depth == specificity
+            )
+            cache[target] = cached
+        return set(cached)
+
+    return resolve
+
+
+def _target_owner_ids(target: str, owners: list[dict]) -> set[str]:
+    """Resolve one declared endpoint; prefer _target_owner_resolver in loops."""
+    return _target_owner_resolver(owners)(target)
 
 
 def load_and_validate(
@@ -470,7 +554,7 @@ def load_and_validate(
         present = (
             _has_primary_declaration(candidate, source, symbol)
             if primary
-            else symbol in source
+            else _evidence_symbol_present(candidate, source, symbol)
         )
         if not present:
             errors.append(f"{owner_id}: stale symbol evidence {raw_path}::{symbol}")
@@ -488,6 +572,7 @@ def load_and_validate(
     seen_ids: set[str] = set()
     phrases: dict[str, list[dict]] = {}
     symbols: dict[tuple[Path, str], list[tuple[dict, dict]]] = {}
+    target_owner_ids = _target_owner_resolver(owners)
     for owner in owners:
         owner_id = owner.get("id", "")
         validate_owner_paths = owner_id in selected_owner_ids
@@ -507,7 +592,7 @@ def load_and_validate(
         for relationship_index, relationship in enumerate(
             owner.get("relationships", [])
         ):
-            target_owners = _target_owner_ids(relationship.get("target", ""), owners)
+            target_owners = target_owner_ids(relationship.get("target", ""))
             if validate_owner_paths or target_owners & selected_owner_ids:
                 for evidence_index, evidence in enumerate(
                     relationship.get("evidence", [])
@@ -563,7 +648,7 @@ def load_and_validate(
             declared.extend(
                 evidence.get("path", "")
                 for relationship in owner.get("relationships", [])
-                if _target_owner_ids(relationship.get("target", ""), owners) & selected_owner_ids
+                if target_owner_ids(relationship.get("target", "")) & selected_owner_ids
                 for evidence in relationship.get("evidence", [])
             )
         for raw_path in declared:
@@ -846,9 +931,10 @@ def _query_graph(
         raise ValueError(f"unknown owner ids: {', '.join(unknown)}")
 
     relationships: list[dict] = []
+    target_owner_ids = _target_owner_resolver(manifest["owners"])
     for source_id, owner in owners_by_id.items():
         for relationship in owner.get("relationships", []):
-            target_owners = _target_owner_ids(relationship["target"], manifest["owners"])
+            target_owners = target_owner_ids(relationship["target"])
             if source_id not in selected_ids and not target_owners.intersection(selected_ids):
                 continue
             relationships.append({"source": f"owner:{source_id}", **relationship})
@@ -1006,11 +1092,12 @@ def _select_index_graph(
     unknown = sorted(set(selected_ids) - set(owners_by_id))
     if unknown:
         raise ValueError(f"unknown owner ids: {', '.join(unknown)}")
+    target_owner_ids = _target_owner_resolver(index["owners"])
     relationships = [
         relationship
         for relationship in index["relationships"]
         if relationship["source"].removeprefix("owner:") in selected_ids
-        or _target_owner_ids(relationship["target"], index["owners"]).intersection(selected_ids)
+        or target_owner_ids(relationship["target"]).intersection(selected_ids)
     ]
     relationships = _deduplicate_graph_relationships(relationships)
     relationship_count = len(relationships)
@@ -1365,10 +1452,11 @@ def architecture_slice(
         raise ValueError("slice snapshot changed; restart pagination from the first page")
     facets: dict[str, list[dict]] = {name: [] for name in ARCHITECTURE_FACETS}
     coverage: dict[str, set[str]] = {name: set() for name in ARCHITECTURE_FACETS}
+    target_owner_ids = _target_owner_resolver(list(selected.values()))
 
     for relationship in graph["relationships"]:
         source_id = relationship["source"].removeprefix("owner:")
-        target_ids = _target_owner_ids(relationship["target"], list(selected.values()))
+        target_ids = target_owner_ids(relationship["target"])
         involved = set(selected_ids) & ({source_id} | target_ids)
         facet = CATEGORY_FACETS[relationship["category"]]
         # A shared test file does not establish which scenario covers a
@@ -1803,7 +1891,9 @@ def owners_for_focus(manifest: dict, root: Path, focus: str) -> list[str]:
     """Resolve declared names and paths without reading repository sources."""
     paths = [token.strip("`\"'(),:;") for token in focus.replace("\\", "/").split()]
     paths = [path for path in paths if "/" in path and not path.startswith(("/", "http:" , "https:"))]
-    selected = owners_for_paths(manifest, root, paths)
+    # Free text may mention paths nobody owns; that is not an error, it is a
+    # miss, and owner ids, aliases and phrases still get their turn below.
+    selected = owners_for_paths(manifest, root, paths, unowned_paths=[])
     if selected:
         return selected
     normalized_focus = " " + " ".join(re.findall(r"\w+", focus.casefold())) + " "

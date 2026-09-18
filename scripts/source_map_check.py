@@ -207,11 +207,16 @@ def declared_non_rust_manifests(markdown: str) -> list[tuple[int, str]]:
 def repository_source_inventory(
     repo_root: Path, *, include_untracked: bool = True
 ) -> tuple[set[str], set[str]]:
+    # One listing answers everything the inventory needs: `--deleted` tags
+    # tracked paths missing from the working tree (R) and `--stage` exposes
+    # the index mode, so gitlinks (160000) drop out without a stat per path.
     args = [
         "git",
         "ls-files",
         "-t",
+        "--stage",
         "--cached",
+        "--deleted",
         "--exclude-standard",
         "-z",
     ]
@@ -229,18 +234,36 @@ def repository_source_inventory(
     if result.returncode != 0:
         detail = result.stderr.strip() or f"git ls-files exited {result.returncode}"
         raise ValueError(f"failed to enumerate repository sources: {detail}")
-    source_paths: set[str] = set()
-    tracked_source_paths: set[str] = set()
+    deleted_paths: set[str] = set()
+    entries: list[tuple[str, str]] = []
     for record in result.stdout.split("\0"):
         if not record:
             continue
         if len(record) < 3 or record[1] != " ":
             raise ValueError("git ls-files returned an invalid tagged path record")
-        path = PurePosixPath(record[2:]).as_posix()
-        if not (repo_root / path).is_file():
+        tag, body = record[0], record[2:]
+        if tag == "?":
+            path = PurePosixPath(body).as_posix()
+        else:
+            stage_fields, separator, path_text = body.partition("\t")
+            if not separator:
+                raise ValueError("git ls-files returned an invalid staged path record")
+            mode = stage_fields.split(" ", 1)[0]
+            path = PurePosixPath(path_text).as_posix()
+            if tag == "R":
+                deleted_paths.add(path)
+                continue
+            if mode == "160000":
+                # A submodule gitlink is a directory in the working tree.
+                continue
+        entries.append((tag, path))
+    source_paths: set[str] = set()
+    tracked_source_paths: set[str] = set()
+    for tag, path in entries:
+        if path in deleted_paths:
             continue
         source_paths.add(path)
-        if record[0] != "?":
+        if tag != "?":
             tracked_source_paths.add(path)
     return source_paths, tracked_source_paths
 

@@ -999,7 +999,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             "toolchain"
         ]
 
-        self.assertEqual(toolchain["channel"], "1.95.0")
+        self.assertEqual(toolchain["channel"], "1.98.1")
         self.assertEqual(toolchain["components"], ["clippy", "rustfmt", "rust-src"])
         self.assertNotIn("profile", toolchain)
         self.assertNotIn("targets", toolchain)
@@ -1214,7 +1214,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             REPO_ROOT / "codex-rs" / "scripts" / "setup-windows.ps1"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("$toolchain = '1.95.0'", setup_windows)
+        self.assertIn("$toolchain = '1.98.1'", setup_windows)
         self.assertIn(
             "& rustup toolchain install $toolchain --profile minimal",
             setup_windows,

@@ -909,6 +909,17 @@ def _validate_declared_paths(
             )
 
 
+def _stripped_source(
+    path: Path, text_cache: dict[Path, str], stripped_cache: dict[Path, str]
+) -> str:
+    """Read a file once and strip its comments once, however many items cite it."""
+    if path not in stripped_cache:
+        if path not in text_cache:
+            text_cache[path] = path.read_text(encoding="utf-8")
+        stripped_cache[path] = _executable_source_text(path, text_cache[path])
+    return stripped_cache[path]
+
+
 def _validate_evidence(
     *,
     feature_id: str,
@@ -916,8 +927,11 @@ def _validate_evidence(
     repo_root: Path,
     findings: list[Finding],
     text_cache: dict[Path, str],
+    stripped_cache: dict[Path, str] | None = None,
 ) -> Counter[str]:
     kinds: Counter[str] = Counter()
+    if stripped_cache is None:
+        stripped_cache = {}
     if not isinstance(evidence_items, list):
         findings.append(
             Finding(
@@ -997,9 +1011,7 @@ def _validate_evidence(
             continue
 
         try:
-            if path not in text_cache:
-                text_cache[path] = path.read_text(encoding="utf-8")
-            text = _executable_source_text(path, text_cache[path])
+            text = _stripped_source(path, text_cache, stripped_cache)
         except (OSError, UnicodeError) as exc:
             findings.append(
                 Finding(
@@ -1627,6 +1639,7 @@ def validate_manifest(
     status_counts: Counter[str] = Counter()
     runtime_status_counts: Counter[str] = Counter()
     text_cache: dict[Path, str] = {}
+    stripped_cache: dict[Path, str] = {}
     rust_manifest_cache: dict[Path, rust_test_runner.Manifest] = {}
     python_ast_cache: dict[Path, ast.Module] = {}
     feature_registry_cache: dict[str, dict[str, bool] | None] = {}
@@ -1828,6 +1841,7 @@ def validate_manifest(
                 repo_root=repo_root,
                 findings=findings,
                 text_cache=text_cache,
+                stripped_cache=stripped_cache,
             )
         else:
             if feature.get("evidence"):

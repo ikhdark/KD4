@@ -1296,7 +1296,7 @@ tests = ["codex-rs/agent-identity/src/lib.rs"]
 [[owners.validation]]
 id = "agent-assertion"
 cwd = "codex-rs"
-argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-agent-identity", "--lib", "authorization_header_for_agent_task_serializes_signed_agent_assertion"]
+argv = ["rustup", "run", "1.98.1", "cargo", "test", "-p", "codex-agent-identity", "--lib", "authorization_header_for_agent_task_serializes_signed_agent_assertion"]
 role = "focused_tests"
 
 [[owners]]
@@ -1368,7 +1368,7 @@ tests = ["codex-rs/plugin/src/namespace.rs"]
 [[owners.validation]]
 id = "plugin-namespace"
 cwd = "codex-rs"
-argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-plugin", "--lib", "namespace::tests"]
+argv = ["rustup", "run", "1.98.1", "cargo", "test", "-p", "codex-plugin", "--lib", "namespace::tests"]
 role = "focused_tests"
 
 [[owners]]
@@ -1454,37 +1454,37 @@ tests = ["codex-rs/core-plugins/src/remote_tests.rs", "codex-rs/core-plugins/src
 [[owners.validation]]
 id = "remote-plugin-install"
 cwd = "codex-rs"
-argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-core-plugins", "--lib", "install_remote_plugin_"]
+argv = ["rustup", "run", "1.98.1", "cargo", "test", "-p", "codex-core-plugins", "--lib", "install_remote_plugin_"]
 role = "focused_tests"
 
 [[owners.validation]]
 id = "remote-plugin-uninstall"
 cwd = "codex-rs"
-argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-core-plugins", "--lib", "uninstall_remote_plugin_preserves_paths_outside_the_canonical_cache"]
+argv = ["rustup", "run", "1.98.1", "cargo", "test", "-p", "codex-core-plugins", "--lib", "uninstall_remote_plugin_preserves_paths_outside_the_canonical_cache"]
 role = "focused_tests"
 
 [[owners.validation]]
 id = "remote-plugin-skill"
 cwd = "codex-rs"
-argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-core-plugins", "--lib", "fetch_remote_plugin_skill_detail_rejects_dot_segments_before_sending"]
+argv = ["rustup", "run", "1.98.1", "cargo", "test", "-p", "codex-core-plugins", "--lib", "fetch_remote_plugin_skill_detail_rejects_dot_segments_before_sending"]
 role = "focused_tests"
 
 [[owners.validation]]
 id = "remote-plugin-share"
 cwd = "codex-rs"
-argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-core-plugins", "--lib", "save_remote_plugin_share_"]
+argv = ["rustup", "run", "1.98.1", "cargo", "test", "-p", "codex-core-plugins", "--lib", "save_remote_plugin_share_"]
 role = "focused_tests"
 
 [[owners.validation]]
 id = "remote-plugin-share-targets"
 cwd = "codex-rs"
-argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-core-plugins", "--lib", "update_remote_plugin_share_targets_updates_targets"]
+argv = ["rustup", "run", "1.98.1", "cargo", "test", "-p", "codex-core-plugins", "--lib", "update_remote_plugin_share_targets_updates_targets"]
 role = "focused_tests"
 
 [[owners.validation]]
 id = "remote-plugin-share-delete"
 cwd = "codex-rs"
-argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-core-plugins", "--lib", "delete_remote_plugin_share_deletes_workspace_plugin"]
+argv = ["rustup", "run", "1.98.1", "cargo", "test", "-p", "codex-core-plugins", "--lib", "delete_remote_plugin_share_deletes_workspace_plugin"]
 role = "focused_tests"
 
 [[owners]]
@@ -1562,7 +1562,7 @@ tests = ["codex-rs/tui/src/session_log.rs"]
 [[owners.validation]]
 id = "session-log"
 cwd = "codex-rs"
-argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-tui", "--lib", "session_log::tests"]
+argv = ["rustup", "run", "1.98.1", "cargo", "test", "-p", "codex-tui", "--lib", "session_log::tests"]
 role = "focused_tests"
 
 [[owners]]
@@ -1627,7 +1627,7 @@ tests = ["codex-rs/tui/src/onboarding/auth.rs"]
 [[owners.validation]]
 id = "browser-login-attempt"
 cwd = "codex-rs"
-argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-tui", "--lib", "onboarding::auth::tests::browser_login_completion_respects_current_keyboard_attempt"]
+argv = ["rustup", "run", "1.98.1", "cargo", "test", "-p", "codex-tui", "--lib", "onboarding::auth::tests::browser_login_completion_respects_current_keyboard_attempt"]
 role = "focused_tests"
 
 [[owners]]
@@ -1727,19 +1727,19 @@ tests = ["codex-rs/tui/src/tui.rs", "codex-rs/tui/src/terminal_probe.rs", "codex
 [[owners.validation]]
 id = "terminal-restore"
 cwd = "codex-rs"
-argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-tui", "--lib", "with_restored_runs_callback_with_fixed_keep_raw_policy"]
+argv = ["rustup", "run", "1.98.1", "cargo", "test", "-p", "codex-tui", "--lib", "with_restored_runs_callback_with_fixed_keep_raw_policy"]
 role = "focused_tests"
 
 [[owners.validation]]
 id = "terminal-probe"
 cwd = "codex-rs"
-argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-tui", "--lib", "terminal_probe::"]
+argv = ["rustup", "run", "1.98.1", "cargo", "test", "-p", "codex-tui", "--lib", "terminal_probe::"]
 role = "focused_tests"
 
 [[owners.validation]]
 id = "pet-image-protocol"
 cwd = "codex-rs"
-argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-tui", "--lib", "pets::image_protocol::tests"]
+argv = ["rustup", "run", "1.98.1", "cargo", "test", "-p", "codex-tui", "--lib", "pets::image_protocol::tests"]
 role = "focused_tests"
 
 [[owners]]
@@ -1817,7 +1817,7 @@ tests = ["codex-rs/app-server-test-client/src/lib.rs"]
 [[owners.validation]]
 id = "initialize-handshake"
 cwd = "codex-rs"
-argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-app-server-test-client", "--lib", "initialize_advertises_supported_notification_opt_outs_and_finishes_handshake"]
+argv = ["rustup", "run", "1.98.1", "cargo", "test", "-p", "codex-app-server-test-client", "--lib", "initialize_advertises_supported_notification_opt_outs_and_finishes_handshake"]
 role = "focused_tests"
 
 [[owners]]
@@ -1896,7 +1896,7 @@ tests = ["codex-rs/uds/src/lib_tests.rs"]
 [[owners.validation]]
 id = "uds-round-trip"
 cwd = "codex-rs"
-argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-uds", "--lib", "lib_tests::stream_round_trips_data_between_listener_and_client", "--", "--exact", "--nocapture"]
+argv = ["rustup", "run", "1.98.1", "cargo", "test", "-p", "codex-uds", "--lib", "lib_tests::stream_round_trips_data_between_listener_and_client", "--", "--exact", "--nocapture"]
 role = "focused_tests"
 
 [[owners]]
@@ -2010,17 +2010,17 @@ tests = ["codex-rs/windows-sandbox-rs/src/winutil.rs", "codex-rs/windows-sandbox
 [[owners.validation]]
 id = "sandbox-sid"
 cwd = "codex-rs"
-argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-windows-sandbox", "--lib", "public_sid_conversion"]
+argv = ["rustup", "run", "1.98.1", "cargo", "test", "-p", "codex-windows-sandbox", "--lib", "public_sid_conversion"]
 role = "focused_tests"
 
 [[owners.validation]]
 id = "sandbox-dpapi"
 cwd = "codex-rs"
-argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-windows-sandbox", "--lib", "public_dpapi_roundtrip"]
+argv = ["rustup", "run", "1.98.1", "cargo", "test", "-p", "codex-windows-sandbox", "--lib", "public_dpapi_roundtrip"]
 role = "focused_tests"
 
 [[owners.validation]]
 id = "sandbox-named-pipe"
 cwd = "codex-rs"
-argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-windows-sandbox", "--lib", "invalid_named_pipe_name"]
+argv = ["rustup", "run", "1.98.1", "cargo", "test", "-p", "codex-windows-sandbox", "--lib", "invalid_named_pipe_name"]
 role = "focused_tests"

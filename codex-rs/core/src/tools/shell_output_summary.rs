@@ -186,72 +186,92 @@ struct LineClassification {
     status: bool,
 }
 
-fn classify_line(line: &str, lower: &mut String) -> LineClassification {
-    lower.clear();
-    lower.push_str(line);
-    lower.make_ascii_lowercase();
-    let trimmed = lower.trim_start();
+fn classify_line(line: &str) -> LineClassification {
+    let trimmed = line.trim_start();
     LineClassification {
-        critical: starts_with_diagnostic_label(trimmed, "error")
-            || starts_with_diagnostic_label(trimmed, "failed")
-            || starts_with_diagnostic_label(trimmed, "failure")
-            || starts_with_diagnostic_label(trimmed, "panic")
-            || starts_with_diagnostic_label(trimmed, "fatal")
-            || trimmed.starts_with("fail [")
-            || trimmed.strip_prefix("try ").is_some_and(|retry| {
-                retry.split_once(" fail [").is_some_and(|(attempt, _)| {
+        critical: starts_with_diagnostic_label_ascii_case(trimmed, "error")
+            || starts_with_diagnostic_label_ascii_case(trimmed, "failed")
+            || starts_with_diagnostic_label_ascii_case(trimmed, "failure")
+            || starts_with_diagnostic_label_ascii_case(trimmed, "panic")
+            || starts_with_diagnostic_label_ascii_case(trimmed, "fatal")
+            || starts_with_ascii_case(trimmed, "fail [")
+            || strip_prefix_ascii_case(trimmed, "try ").is_some_and(|retry| {
+                find_ascii_case(retry, " fail [").is_some_and(|separator| {
+                    let attempt = &retry[..separator];
                     !attempt.is_empty() && attempt.bytes().all(|byte| byte.is_ascii_digit())
                 })
             })
-            || trimmed.starts_with("failures:")
+            || starts_with_ascii_case(trimmed, "failures:")
             // Failed suites must survive later passing status lines in a
             // multi-package run, even when their detailed errors were omitted.
-            || lower.contains("test result: failed")
-            || trimmed.starts_with("panicked at ")
-            || lower.contains(" panicked at ")
-            || lower.contains(" error:")
+            || contains_ascii_case(line, "test result: failed")
+            || starts_with_ascii_case(trimmed, "panicked at ")
+            || contains_ascii_case(line, " panicked at ")
+            || contains_ascii_case(line, " error:")
             // TypeScript diagnostics use "error TS<digits>:" after a location.
-            || lower.split_once("error ts").is_some_and(|(_, code)| {
-                code.split_once(':').is_some_and(|(number, _)| {
+            || find_ascii_case(line, "error ts").is_some_and(|start| {
+                line[start + "error ts".len()..].split_once(':').is_some_and(|(number, _)| {
                     !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
                 })
             })
-            || lower.contains("npm err!"),
-        advisory: contains_word(lower, "warning")
+            || contains_ascii_case(line, "npm err!"),
+        advisory: contains_word_ascii_case(line, "warning")
             || trimmed.starts_with("-->")
-            || trimmed.starts_with("note:")
-            || trimmed.starts_with("help:"),
-        status: lower.contains("test result:")
-            || lower.contains("failures:")
-            || lower.contains("failed.")
-            || (contains_word(lower, "passed")
-                && (trimmed.starts_with("test ")
-                    || trimmed.starts_with("tests ")
-                    || trimmed.starts_with("suite ")
-                    || trimmed.split_once(" passed").is_some_and(|(count, _)| {
+            || starts_with_ascii_case(trimmed, "note:")
+            || starts_with_ascii_case(trimmed, "help:"),
+        status: contains_ascii_case(line, "test result:")
+            || contains_ascii_case(line, "failures:")
+            || contains_ascii_case(line, "failed.")
+            || (contains_word_ascii_case(line, "passed")
+                && (starts_with_ascii_case(trimmed, "test ")
+                    || starts_with_ascii_case(trimmed, "tests ")
+                    || starts_with_ascii_case(trimmed, "suite ")
+                    || find_ascii_case(trimmed, " passed").is_some_and(|separator| {
+                        let count = &trimmed[..separator];
                         !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit())
                     })))
-            || lower.contains("finished ")
-            || starts_with_diagnostic_label(trimmed, "error")
-            || trimmed.starts_with("summary:")
-            || trimmed.starts_with("summary ["),
+            || contains_ascii_case(line, "finished ")
+            || starts_with_diagnostic_label_ascii_case(trimmed, "error")
+            || starts_with_ascii_case(trimmed, "summary:")
+            || starts_with_ascii_case(trimmed, "summary ["),
     }
 }
 
-fn contains_word(line: &str, word: &str) -> bool {
+fn contains_word_ascii_case(line: &str, word: &str) -> bool {
     line.split(|character: char| {
         !character.is_alphanumeric() && character != '_' && character != '-'
     })
-    .any(|candidate| candidate == word)
+    .any(|candidate| candidate.eq_ignore_ascii_case(word))
 }
 
-fn starts_with_diagnostic_label(line: &str, label: &str) -> bool {
-    line.strip_prefix(label).is_some_and(|remainder| {
+fn starts_with_diagnostic_label_ascii_case(line: &str, label: &str) -> bool {
+    strip_prefix_ascii_case(line, label).is_some_and(|remainder| {
         matches!(
             remainder.as_bytes().first(),
             None | Some(b':') | Some(b'[') | Some(b'.') | Some(b' ')
         )
     })
+}
+
+fn starts_with_ascii_case(line: &str, prefix: &str) -> bool {
+    strip_prefix_ascii_case(line, prefix).is_some()
+}
+
+fn strip_prefix_ascii_case<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    line.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix.as_bytes()))
+        .then(|| &line[prefix.len()..])
+}
+
+fn contains_ascii_case(line: &str, needle: &str) -> bool {
+    find_ascii_case(line, needle).is_some()
+}
+
+fn find_ascii_case(line: &str, needle: &str) -> Option<usize> {
+    line.as_bytes()
+        .windows(needle.len())
+        .position(|candidate| candidate.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 // The selector retains at most 64 diagnostic groups and a fixed number of
@@ -267,7 +287,6 @@ struct LineSelection {
 fn select_lines(output: &str, line_count: usize, failed: bool, validation: bool) -> LineSelection {
     let mut groups: Vec<((&str, Option<&str>), usize)> = Vec::new();
     let mut groups_overflowed = false;
-    let mut lowercase = String::new();
     let mut lines = output.lines().enumerate().peekable();
     while let Some((index, line)) = lines.next() {
         let location = lines
@@ -275,9 +294,7 @@ fn select_lines(output: &str, line_count: usize, failed: bool, validation: bool)
             .map(|(_, next)| next.trim())
             .filter(|next| next.starts_with("-->"));
         let identity = (line.trim(), location);
-        if classify_line(line, &mut lowercase).critical
-            && !groups.iter().any(|(text, _)| *text == identity)
-        {
+        if classify_line(line).critical && !groups.iter().any(|(text, _)| *text == identity) {
             if groups.len() == MAX_DIAGNOSTIC_GROUPS {
                 groups_overflowed = true;
                 // Retain the latest distinct group as well as the stable prefix.
@@ -306,7 +323,7 @@ fn select_lines(output: &str, line_count: usize, failed: bool, validation: bool)
     let mut advisory_slots = MAX_FOCUS_MATCHES - critical.len();
     let mut statuses = VecDeque::new();
     for (index, line) in output.lines().enumerate() {
-        let classification = classify_line(line, &mut lowercase);
+        let classification = classify_line(line);
         if classification.advisory && advisory_slots > 0 && !indexes.contains(&index) {
             indexes.extend(
                 index.saturating_sub(FOCUS_CONTEXT_LINES)
@@ -452,13 +469,12 @@ mod optimization_tests {
     }
 
     #[test]
-    fn line_classification_reuses_normalization_without_retaining_previous_signals() {
-        let mut lowercase = String::new();
-        let classification = classify_line("  ERROR: warning; tests PASSED", &mut lowercase);
+    fn line_classification_is_case_insensitive_without_retained_scratch() {
+        let classification = classify_line("  ERROR: warning; tests PASSED");
         assert!(classification.critical);
         assert!(classification.advisory);
         assert!(classification.status);
-        let classification = classify_line("ordinary output", &mut lowercase);
+        let classification = classify_line("ordinary output");
         assert!(!classification.critical);
         assert!(!classification.advisory);
         assert!(!classification.status);

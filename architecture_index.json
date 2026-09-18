@@ -1,7 +1,7 @@
 {
-  "index_sha256": "360771c46128c22e9a0e40f07a35216ba39a830125371e1bb2fd913abfa1641a",
+  "index_sha256": "510e62f997b52978017f00536b51429dc03ff78467ecdaed6a3fb4dfc306ff2d",
   "index_version": 1,
-  "manifest_sha256": "c0a241b48703581f8187e8ffbbef53f704b817718f28d9d1d9e88a14948e99fb",
+  "manifest_sha256": "15c08453d1c909ec63ca5d555a814f81caf72c624f45c99a030fe20528474009",
   "omitted": {
     "relationships": 0
   },
@@ -64,7 +64,7 @@
           "argv": [
             "rustup",
             "run",
-            "1.95.0",
+            "1.98.1",
             "cargo",
             "test",
             "-p",
@@ -241,7 +241,7 @@
           "argv": [
             "rustup",
             "run",
-            "1.95.0",
+            "1.98.1",
             "cargo",
             "test",
             "-p",
@@ -826,7 +826,7 @@
           "argv": [
             "rustup",
             "run",
-            "1.95.0",
+            "1.98.1",
             "cargo",
             "test",
             "-p",
@@ -933,7 +933,7 @@
           "argv": [
             "rustup",
             "run",
-            "1.95.0",
+            "1.98.1",
             "cargo",
             "test",
             "-p",
@@ -949,7 +949,7 @@
           "argv": [
             "rustup",
             "run",
-            "1.95.0",
+            "1.98.1",
             "cargo",
             "test",
             "-p",
@@ -965,7 +965,7 @@
           "argv": [
             "rustup",
             "run",
-            "1.95.0",
+            "1.98.1",
             "cargo",
             "test",
             "-p",
@@ -981,7 +981,7 @@
           "argv": [
             "rustup",
             "run",
-            "1.95.0",
+            "1.98.1",
             "cargo",
             "test",
             "-p",
@@ -997,7 +997,7 @@
           "argv": [
             "rustup",
             "run",
-            "1.95.0",
+            "1.98.1",
             "cargo",
             "test",
             "-p",
@@ -1013,7 +1013,7 @@
           "argv": [
             "rustup",
             "run",
-            "1.95.0",
+            "1.98.1",
             "cargo",
             "test",
             "-p",
@@ -1670,7 +1670,7 @@
           "argv": [
             "rustup",
             "run",
-            "1.95.0",
+            "1.98.1",
             "cargo",
             "test",
             "-p",
@@ -1803,7 +1803,7 @@
           "argv": [
             "rustup",
             "run",
-            "1.95.0",
+            "1.98.1",
             "cargo",
             "test",
             "-p",
@@ -1819,7 +1819,7 @@
           "argv": [
             "rustup",
             "run",
-            "1.95.0",
+            "1.98.1",
             "cargo",
             "test",
             "-p",
@@ -1835,7 +1835,7 @@
           "argv": [
             "rustup",
             "run",
-            "1.95.0",
+            "1.98.1",
             "cargo",
             "test",
             "-p",
@@ -1918,7 +1918,7 @@
           "argv": [
             "rustup",
             "run",
-            "1.95.0",
+            "1.98.1",
             "cargo",
             "test",
             "-p",
@@ -2068,7 +2068,7 @@
           "argv": [
             "rustup",
             "run",
-            "1.95.0",
+            "1.98.1",
             "cargo",
             "test",
             "-p",
@@ -2192,7 +2192,7 @@
           "argv": [
             "rustup",
             "run",
-            "1.95.0",
+            "1.98.1",
             "cargo",
             "test",
             "-p",
@@ -2208,7 +2208,7 @@
           "argv": [
             "rustup",
             "run",
-            "1.95.0",
+            "1.98.1",
             "cargo",
             "test",
             "-p",
@@ -2224,7 +2224,7 @@
           "argv": [
             "rustup",
             "run",
-            "1.95.0",
+            "1.98.1",
             "cargo",
             "test",
             "-p",
@@ -4348,7 +4348,7 @@
       "target": "path:codex-rs/windows-sandbox-rs/src/winutil.rs"
     }
   ],
-  "repository_revision": "manifest:c0a241b48703581f8187e8ffbbef53f704b817718f28d9d1d9e88a14948e99fb:sources:a5c852c2fdd63450abb8c19e6414164f354f663637f2c3a504b330376fd07e58",
+  "repository_revision": "manifest:15c08453d1c909ec63ca5d555a814f81caf72c624f45c99a030fe20528474009:sources:de0b973b9227c50ef6da794db51704f9b7f4623b4c2ab60a8587d1f3bfca750a",
   "schema_version": 2,
   "status": "complete",
   "unresolved": []

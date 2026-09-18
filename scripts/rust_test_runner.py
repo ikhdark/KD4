@@ -1400,7 +1400,13 @@ def load_metadata(
     log_paths = "\n".join(f"Full {name}: {path}" for name in ("stdout", "stderr")
                           if (path := getattr(result, f"{name}_path", None)) is not None)
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
+        # Keep both streams: cargo puts warnings on stderr and can put the real
+        # error on stdout, so preferring one stream hides the other.
+        streams = [
+            (name, (getattr(result, name, None) or "").strip())
+            for name in ("stdout", "stderr")
+        ]
+        detail = "\n".join(f"{name}:\n{text}" for name, text in streams if text)
         raise RunnerError(f"cargo metadata --no-deps failed:\n{detail}\n{log_paths}")
     try:
         payload = json.loads(_stdout_text(result))
