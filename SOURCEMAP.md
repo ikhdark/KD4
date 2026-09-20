@@ -158,7 +158,10 @@ produce normalized inventory records, category evidence, and unresolved cases.
 Task-owned state retains coverage and content hashes; unchanged classifications
 are reused. Its CLI emits bounded summaries or the exact validated tracked list.
 Category rules establish matches, not runtime reachability; ambiguous categories
-remain unresolved until their consumers are inspected. Validate with
+remain unresolved until their consumers are inspected. Category `paths` use
+gitignore/globset glob semantics: `*` and `?` stay inside one path component and
+a `**` component matches zero or more components. Python's `fnmatch` matches
+neither rule and silently dropped a directory's own files from `dir/**/*.rs`. Validate with
 `python -m unittest scripts.test_source_inventory scripts.test_source_map_check`.
 
 ## Runtime architecture

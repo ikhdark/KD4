@@ -7,7 +7,7 @@ The state file belongs to the task: reuse it for subsequent queries.
 """
 
 import argparse
-import fnmatch
+import functools
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
@@ -33,6 +33,79 @@ def normalized_path(value):
     if path.is_absolute() or ".." in path.parts or not path.parts or ":" in path.parts[0]:
         raise ValueError(f"expected a repository-relative candidate path: {value!r}")
     return path.as_posix()
+
+
+
+def _translate_glob_component(component):
+    """Translate one path component; `*` and `?` never cross a separator."""
+    out = []
+    index = 0
+    while index < len(component):
+        char = component[index]
+        if char == "*":
+            while index < len(component) and component[index] == "*":
+                index += 1
+            out.append("[^/]*")
+            continue
+        if char == "?":
+            out.append("[^/]")
+        elif char == "[":
+            close = index + 1
+            if close < len(component) and component[close] in "!^":
+                close += 1
+            if close < len(component) and component[close] == "]":
+                close += 1
+            while close < len(component) and component[close] != "]":
+                close += 1
+            if close >= len(component):
+                out.append(re.escape("["))
+            else:
+                body = component[index + 1:close]
+                if body[:1] in ("!", "^"):
+                    body = "^" + body[1:]
+                out.append("[" + body.replace("\\", "\\\\") + "]")
+                index = close + 1
+                continue
+        else:
+            out.append(re.escape(char))
+        index += 1
+    return "".join(out)
+
+
+@functools.lru_cache(maxsize=None)
+def compile_path_glob(pattern):
+    """Compile a path glob using gitignore/globset semantics.
+
+    `*` and `?` match within a single path component. A `**` component matches
+    zero or more components, so `dir/**/*.rs` includes `dir/a.rs`, and `dir/*.rs`
+    excludes `dir/sub/a.rs`. Python's `fnmatch` gives neither behaviour: there
+    `*` crosses separators and a `**/` component requires an intervening
+    directory, which silently drops a directory's own files from a category.
+    """
+    parts = pattern.split("/")
+    out = []
+    index = 0
+    while index < len(parts):
+        part = parts[index]
+        last = index == len(parts) - 1
+        if part == "**":
+            if last:
+                out.append(".*")
+            else:
+                out.append("(?:[^/]+/)*")
+                index += 1
+                continue
+        else:
+            out.append(_translate_glob_component(part))
+        if not last:
+            out.append("/")
+        index += 1
+    return re.compile("(?s:" + "".join(out) + r")\Z")
+
+
+def path_matches_any(path, patterns):
+    """True when `path` matches any glob in `patterns`."""
+    return any(compile_path_glob(pattern).match(path) for pattern in patterns)
 
 
 def compile_categories(query):
@@ -68,7 +141,7 @@ def inventory(root, query, previous=None):
 
     for path in sorted(set(states) | set(requested)):
         matching = {name for name, (rule, _) in categories.items()
-                    if any(fnmatch.fnmatchcase(path, pattern) for pattern in rule["paths"])}
+                    if path_matches_any(path, rule["paths"])}
         selected = matching | requested.get(path, set())
         if not selected:
             continue

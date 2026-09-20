@@ -41,7 +41,7 @@ class SourceInventoryTests(unittest.TestCase):
                     "codex-rs/prompts/templates/compact/with_tool_output.md"]
         for path in actual:
             self.file(path)
-        query = {"categories": [{"name": "templates", "paths": ["codex-rs/*.md"]}],
+        query = {"categories": [{"name": "templates", "paths": ["codex-rs/**/*.md"]}],
                  "candidates": [{"path": p, "category": "templates"} for p in invented + actual + actual]}
         output, state = inventory.inventory(self.root, query)
         self.assertEqual(output["paths"], sorted(actual))
@@ -59,7 +59,7 @@ class SourceInventoryTests(unittest.TestCase):
         self.file("src/new name.rs", tracked=False)
         self.file("src/tracked.rs")
         self.file("nested/target/deep/build.rs", tracked=False)
-        query = {"categories": [{"name": "sources", "paths": ["*.rs"]}],
+        query = {"categories": [{"name": "sources", "paths": ["**/*.rs"]}],
                  "candidates": [{"path": "nested/target/deep/build.rs", "category": "sources"}]}
         real_run = inventory.repository_source_records.__globals__["subprocess"].run
         with mock.patch("scripts.source_map_check.subprocess.run", wraps=real_run) as run:
@@ -105,6 +105,50 @@ class SourceInventoryTests(unittest.TestCase):
         output, _ = inventory.inventory(self.root, query)
         self.assertEqual(output["count"], 0)
         self.assertEqual(output["unresolved"][0]["unresolved"], "runtime consumer requires inspection")
+
+    def test_path_globs_use_glob_semantics_not_fnmatch(self):
+        # `*` stays inside one component and a `**` component matches zero or
+        # more components. Python's fnmatch does neither, which silently
+        # dropped a directory's own files from `dir/**/*.rs` categories.
+        context = "codex-rs/core/src/context/"
+        direct = [context + "apps_instructions.rs",
+                  context + "available_skills_instructions.rs"]
+        nested = [context + "world_state/apps_instructions.rs",
+                  context + "world_state/apps_instructions_tests.rs"]
+        for path in direct + nested:
+            self.file(path)
+
+        query = {"categories": [{"name": "context", "paths": [context + "**/*.rs"]}]}
+        output, _ = inventory.inventory(self.root, query)
+        self.assertEqual(output["paths"], sorted(direct + nested))
+
+        query = {"categories": [{"name": "context", "paths": [context + "*.rs"]}]}
+        output, _ = inventory.inventory(self.root, query)
+        self.assertEqual(output["paths"], sorted(direct))
+
+    def test_compile_path_glob_semantics(self):
+        for pattern, path, expected in [
+            ("a/**/b", "a/b", True),
+            ("a/**/b", "a/x/b", True),
+            ("a/**/b", "a/x/y/b", True),
+            ("a/**/b", "a/bb", False),
+            ("**/*.rs", "x.rs", True),
+            ("**/*.rs", "a/b/x.rs", True),
+            ("**/*.rs", "x.md", False),
+            ("a/**", "a/x/y", True),
+            ("a/**", "a", False),
+            ("src/*.rs", "src/a.rs", True),
+            ("src/*.rs", "src/sub/a.rs", False),
+            ("*.rs", "src/a.rs", False),
+            ("src/?.rs", "src/a.rs", True),
+            ("src/?.rs", "src/ab.rs", False),
+            ("src/[ab].rs", "src/a.rs", True),
+            ("src/[!ab].rs", "src/a.rs", False),
+            ("a.b", "axb", False),
+        ]:
+            with self.subTest(pattern=pattern, path=path):
+                matched = bool(inventory.compile_path_glob(pattern).match(path))
+                self.assertEqual(matched, expected)
 
     def test_cli_retains_records_and_emits_only_summary_or_exact_paths(self):
         self.file("src/a.rs", "PROMPT " + "body" * 10000)
